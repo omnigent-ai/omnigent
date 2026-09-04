@@ -60,6 +60,13 @@ repos:
         # fights the tooling).
         exclude: ^(omnigent/server/static/web-ui/assets/|web/.*\.xcassets/|web/.*\.icon/)
 
+      - id: web-theme-palette-generation
+        name: web theme palette CSS generation
+        language: system
+        entry: bash -c 'test -x web/node_modules/.bin/prettier && cd web && node --experimental-strip-types scripts/generate-theme-palettes.mjs --check'
+        files: ^(pnpm-lock\.yaml|web/(package\.json|\.prettierrc\.json|scripts/generate-theme-palettes\.mjs|src/(themePalettes\.generated\.css|lib/themePalette\.ts)))$
+        pass_filenames: false
+
       - id: web-oxlint
         name: web oxlint
         language: system

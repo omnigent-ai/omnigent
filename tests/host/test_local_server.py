@@ -221,6 +221,24 @@ def test_server_config_signature_changes_with_features(
     assert sig_on == local_server.server_config_signature()
 
 
+def test_server_config_signature_changes_with_session_title_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    config_path = config_home / "config.yaml"
+    config_path.write_text("{}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    sig_default = local_server.server_config_signature()
+
+    config_path.write_text("session_title_instructions: Prefix titles with the current date.\n")
+    sig_custom = local_server.server_config_signature()
+
+    assert sig_default != sig_custom
+    assert sig_custom == local_server.server_config_signature()
+
+
 def test_remote_daemon_signature_ignores_local_server_features(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -650,7 +668,7 @@ def test_ensure_local_omnigent_server_spawn_records_and_returns_log_path(
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", sig_file)
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_LOG_REF_PATH", log_ref)
     # Point the persistent data dir at tmp so logs/server lands under tmp.
-    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
 
     class _Proc:
         pid = 9001

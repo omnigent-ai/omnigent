@@ -68,6 +68,7 @@ from rich.console import RenderableType
 from rich.markup import escape
 from rich.text import Text
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.spec.types import SkillSpec
 
 if TYPE_CHECKING:
@@ -112,11 +113,18 @@ def _is_recoverable_sse_transport_error(exc: BaseException) -> bool:
         httpx.ReadTimeout,
         httpx.ConnectError,
         httpx.ConnectTimeout,
+        # A peer that drops the connection while the request is still
+        # being sent surfaces as a write error — the same transient
+        # interruption as a read-side drop, just caught one syscall earlier.
+        httpx.WriteError,
+        httpx.WriteTimeout,
         httpcore.RemoteProtocolError,
         httpcore.ReadError,
         httpcore.ReadTimeout,
         httpcore.ConnectError,
         httpcore.ConnectTimeout,
+        httpcore.WriteError,
+        httpcore.WriteTimeout,
     )
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -493,9 +501,8 @@ def _render_startup_banner_ansi(
         ``None`` for the minimal banner.
     :returns: ANSI-styled string ready to be written to stdout.
     """
-    from omnigent.cli_auth import is_workspace_hosted_url
-    from omnigent.conversation_browser import display_server_url
     from omnigent.inner.banner import BannerLine, startup_banner_strings
+    from omnigent.server_url import display_server_url, is_workspace_hosted_url
 
     remote = _is_remote_server_url(server_url)
     # User-facing form of the URL: a Databricks workspace-hosted server is
@@ -1197,7 +1204,7 @@ def _server_event_to_sdk_event(event: object) -> object | None:
     if isinstance(event, CompletedEvent):
         return ResponseCompleted(response=_resp(event))
     if isinstance(event, FailedEvent):
-        return ResponseFailed(response=_resp(event))
+        return ResponseFailed(response=_resp(event), source=event.source)
     if isinstance(event, CancelledEvent):
         return ResponseCancelled(response=_resp(event))
     if isinstance(event, IncompleteEvent):
@@ -1891,12 +1898,12 @@ class _SessionsChatReplAdapter:
                     # online runners at create time and found none.
                     raise RuntimeError(
                         "This server has no online runner to run the turn. Start one "
-                        "against it with `omnigent host --server <url>` (or run the "
-                        "agent locally with `omnigent run <agent.yaml>`), then retry."
+                        f"against it with `{cli_invocation()} host --server <url>` (or run the "
+                        f"agent locally with `{cli_invocation()} run <agent.yaml>`), then retry."
                     )
                 raise RuntimeError(
                     "Sessions API dispatch requires a registered runner id. "
-                    "Start through `omnigent run <agent>` or pass --server so the CLI "
+                    f"Start through `{cli_invocation()} run <agent>` or pass --server so the CLI "
                     "can launch and bind a runner."
                 )
             if self._bound_runner_id == self._runner_id:
@@ -1910,10 +1917,15 @@ class _SessionsChatReplAdapter:
                     file=sys.stderr,
                     flush=True,
                 )
-            session = await self._client.sessions.bind_runner(
-                self._session_id,
-                runner_id=self._runner_id,
-            )
+            try:
+                session = await self._client.sessions.bind_runner(
+                    self._session_id,
+                    runner_id=self._runner_id,
+                )
+            except OmnigentError as exc:
+                session = await self._reconcile_runner_after_bind_failure(exc)
+                if session is None:
+                    raise
             self._hydrate_from_session_snapshot(session)
             self._clear_runner_recovery_error()
             if _dbg:
@@ -1922,6 +1934,38 @@ class _SessionsChatReplAdapter:
                     file=sys.stderr,
                     flush=True,
                 )
+
+    async def _reconcile_runner_after_bind_failure(
+        self, exc: OmnigentError
+    ) -> _SessionSnapshot | None:
+        """
+        Adopt the server's live runner after a stale-runner bind failure.
+
+        A dead runner that the server has relaunched under a new id leaves
+        the cached ``_runner_id`` stale, so the bind 400s forever. Re-read
+        the snapshot and rebind onto the runner the server now reports.
+
+        Only when the server owns relaunch (``runner_recover is None``); a
+        client-owned runner is driven by ``_recover_runner_if_needed``.
+
+        :param exc: The bind failure to recover from.
+        :returns: The rebind snapshot, or ``None`` to re-raise *exc*.
+        """
+        if self._runner_recover is not None:
+            return None
+        if not self._is_terminal_runner_recovery_error(exc):
+            return None
+        if self._session_id is None:
+            return None
+        snapshot = await self._client.sessions.get(self._session_id)
+        live_runner_id = snapshot.runner_id
+        if not live_runner_id or live_runner_id == self._runner_id:
+            return None
+        self._runner_id = live_runner_id
+        return await self._client.sessions.bind_runner(
+            self._session_id,
+            runner_id=live_runner_id,
+        )
 
     def _clear_runner_recovery_error(self) -> None:
         """
@@ -1966,6 +2010,41 @@ class _SessionsChatReplAdapter:
                 error=RetryErrorDetail(
                     code=code or "runner_recovery_failed",
                     message=message,
+                ),
+            )
+        )
+
+    def _emit_elicitation_resolve_error(self, exc: Exception) -> None:
+        """
+        Render an undeliverable elicitation verdict in the error panel.
+
+        Bounded transport retries can still end with the verdict
+        undelivered, which leaves the elicitation parked server-side and
+        the turn waiting on an answer that will never arrive. Emitting the
+        same typed error event normal streams use lets the existing REPL
+        renderer show it, so the user learns to re-answer rather than
+        sitting at an apparently live prompt.
+
+        :param exc: Last transport failure raised by the resolve POST,
+            e.g. an ``httpx.ConnectError``.
+        :returns: None.
+        """
+        if self._on_event is None:
+            return
+
+        from omnigent.server.schemas import ErrorEvent, RetryErrorDetail
+
+        self._on_event(
+            ErrorEvent(
+                type="response.error",
+                source="execution",
+                error=RetryErrorDetail(
+                    code="elicitation_resolve_failed",
+                    message=(
+                        f"Could not deliver your answer to the server: {exc}. "
+                        "The request is still waiting for an answer, and this "
+                        "prompt is gone, so answer it from the web UI."
+                    ),
                 ),
             )
         )
@@ -2562,23 +2641,42 @@ class _SessionsChatReplAdapter:
                 else:
                     resolve_payload["action"] = "decline"
 
-        try:
-            # URL-based elicitation: deliver the verdict to the
-            # elicitation's dedicated resolve URL rather than as an
-            # in-band ``approval`` session event. Same server-side
-            # effect (both converge on ``_resolve_elicitation``).
-            await self._client.sessions.resolve_elicitation(
-                session_id,
-                elicitation_id,
-                resolve_payload,
-            )
-        except OmnigentError as exc:
-            if exc.code == "not_found":
-                # Elicitation already resolved by another client (e.g. web
-                # UI approved while the terminal prompt was still open).
-                # The harness already received the verdict — treat as no-op.
+        # URL-based elicitation: deliver the verdict to the elicitation's
+        # dedicated resolve URL rather than as an in-band ``approval`` event.
+        # A transport error can happen after the server accepted the POST but
+        # before the client received its response, so retrying is safe: the
+        # server either accepts the retry or reports the elicitation resolved.
+        for attempt in range(3):
+            try:
+                await self._client.sessions.resolve_elicitation(
+                    session_id,
+                    elicitation_id,
+                    resolve_payload,
+                )
                 return
-            raise
+            except OmnigentError as exc:
+                if exc.code == "not_found":
+                    # Another client may have resolved it while the terminal
+                    # prompt was open, or the first POST reached the server.
+                    return
+                raise
+            except Exception as exc:
+                if not _is_recoverable_sse_transport_error(exc):
+                    raise
+                if attempt == 2:
+                    # One line here, postmortem behind DEBUG: the REPL
+                    # configures no log handlers, so a WARNING carrying
+                    # exc_info falls through to ``logging.lastResort`` and
+                    # paints a traceback over the TUI frame. Same split
+                    # ``_stream_pump`` makes for the same reason.
+                    _log.warning("Could not resolve elicitation after transport retries")
+                    _log.debug("elicitation resolve failed", exc_info=exc)
+                    # The elicitation is still parked server-side, so the
+                    # turn waits on a verdict that will never arrive. Say so
+                    # instead of leaving an apparently live prompt.
+                    self._emit_elicitation_resolve_error(exc)
+                    return
+                await asyncio.sleep(0.1 * (2**attempt))
 
     async def _prompt_schema_fields(
         self,
@@ -3870,7 +3968,7 @@ async def run_repl(
                 fmt.format_error(
                     ErrorBlock(
                         message=msg,
-                        source="llm",
+                        source=sdk_ev.source,
                         ctx=BlockContext(agent=None, depth=0, turn=0),
                     ),
                 )
@@ -4513,7 +4611,7 @@ async def run_repl(
         #   - the server is a Databricks workspace mount — a workspace build
         #     reports no meaningful version string (its /api/version returns a
         #     placeholder like "source"), so showing it is noise.
-        from omnigent.cli_auth import is_workspace_hosted_url
+        from omnigent.server_url import is_workspace_hosted_url
 
         _show_version = _header is not None and not (
             server_url is not None and is_workspace_hosted_url(server_url)
@@ -4814,7 +4912,7 @@ async def _cmd_theme(
     host.output(_build_preview(selected.name))
 
 
-_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 _EFFORT_CLEAR_ALIASES = {"default", "off", "reset"}
 
 
@@ -4880,7 +4978,8 @@ async def _cmd_effort(
         host.output(
             Text.from_markup(
                 "  [bold red]Invalid effort: "
-                f"{value} · expected none, minimal, low, medium, high, xhigh, max, or default[/]"
+                f"{value} · expected none, minimal, low, medium, high, "
+                "xhigh, max, ultra, or default[/]"
             )
         )
         return
@@ -5024,7 +5123,8 @@ def _build_model_readout_lines(
         else:
             lines.append("Active:  None  ·  None")
             lines.append(
-                "no model configured — run `omnigent setup --no-internal-beta` to add one"
+                f"no model configured — run `{cli_invocation()} setup --no-internal-beta` "
+                "to add one"
             )
         lines.append("usage: /model <name> · /model default | off | reset to clear")
         return lines
@@ -5266,7 +5366,7 @@ async def _cmd_model(
         host.output(
             Text.from_markup(
                 f"  [{fmt.muted}]Active provider: {active_label}. To use {target_label}, run "
-                f"`omnigent setup --no-internal-beta` and select it as the "
+                f"`{cli_invocation()} setup --no-internal-beta` and select it as the "
                 f"default, then restart. "
                 f"(You can still change the model within {active_label}: /model <model-name>.)"
                 f"[/{fmt.muted}]"
@@ -6057,6 +6157,19 @@ async def _cmd_compact(
     """Request proactive context compaction for the current conversation."""
     from rich.text import Text
 
+    from omnigent.harness_aliases import is_native_harness
+
+    _harness = getattr(session, "harness", None)
+    if _harness is not None and not is_native_harness(_harness):
+        host.output(
+            Text.from_markup(
+                f"  [{fmt.muted}]/compact is only available for native-TUI sessions "
+                f"(claude, codex, cursor, …). This session uses the "
+                f"{_harness} harness, which manages its own "
+                f"context window.[/{fmt.muted}]"
+            )
+        )
+        return
     if session.is_streaming:
         host.output(
             Text.from_markup(

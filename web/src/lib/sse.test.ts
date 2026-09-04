@@ -210,6 +210,53 @@ describe("parseEvent — session.status (background_task_count)", () => {
   });
 });
 
+describe("parseEvent — session.status (background_tasks detail)", () => {
+  function bgTasks(data: Record<string, unknown>) {
+    const ev = parseEvent("session.status", { conversation_id: "conv_a", status: "idle", ...data });
+    return (ev as SessionStatusEvent | null)?.backgroundTasks;
+  }
+
+  it("threads the per-shell detail so the UI can list the shells", () => {
+    expect(
+      bgTasks({
+        background_task_count: 2,
+        background_tasks: [
+          {
+            id: "a",
+            type: "shell",
+            status: "running",
+            description: "Wait for CI",
+            command: "sleep 120",
+          },
+          { description: "Build check" },
+        ],
+      }),
+    ).toEqual([
+      {
+        id: "a",
+        type: "shell",
+        status: "running",
+        description: "Wait for CI",
+        command: "sleep 120",
+      },
+      { description: "Build check" },
+    ]);
+  });
+
+  it("drops non-object entries and entries with no usable string field", () => {
+    expect(
+      bgTasks({ background_tasks: ["garbage", 5, null, { description: "keep me" }, { id: 42 }] }),
+    ).toEqual([{ description: "keep me" }]);
+  });
+
+  it("leaves detail undefined when absent, not an array, or empty after filtering", () => {
+    expect(bgTasks({})).toBeUndefined();
+    expect(bgTasks({ background_tasks: "nope" })).toBeUndefined();
+    expect(bgTasks({ background_tasks: [] })).toBeUndefined();
+    expect(bgTasks({ background_tasks: ["junk", 1] })).toBeUndefined();
+  });
+});
+
 describe("parseEvent — session.mcp_startup", () => {
   it("parses a per-server startup map for the MCP startup band", () => {
     const ev = parseEvent("session.mcp_startup", {
@@ -251,5 +298,27 @@ describe("parseEvent — session.mcp_startup", () => {
     expect(
       parseEvent("session.mcp_startup", { conversation_id: "conv_a", servers: "nope" }),
     ).toBeNull();
+  });
+});
+
+describe("parseEvent — response.output_item.done error level", () => {
+  it("lifts level: info onto the error event and omits it otherwise", () => {
+    const item = {
+      id: "err_1",
+      response_id: "resp_1",
+      type: "error",
+      source: "harness",
+      code: "codex_thread_reset",
+      message: "Codex started a fresh thread.",
+    };
+    const info = parseEvent("response.output_item.done", { item: { ...item, level: "info" } });
+    expect(info).toMatchObject({
+      type: "error",
+      error: { code: "codex_thread_reset", level: "info" },
+    });
+    const plain = parseEvent("response.output_item.done", { item });
+    const plainError = plain?.type === "error" ? plain.error : null;
+    expect(plainError).not.toBeNull();
+    expect(plainError).not.toHaveProperty("level");
   });
 });

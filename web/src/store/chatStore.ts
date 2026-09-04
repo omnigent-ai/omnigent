@@ -93,10 +93,11 @@ import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
-import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import { overlayTitleIntoCaches, type ConversationsInfiniteData } from "@/lib/sessionListCache";
 import { useTerminalActivityStore } from "./terminalActivity";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type {
+  BackgroundTaskInfo,
   ContentBlock,
   ModelUsage,
   NativeModelOption,
@@ -107,16 +108,26 @@ import type {
   SkillSummary,
 } from "@/lib/types";
 import { uploadFile } from "@/lib/filesApi";
+import { attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
-import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
-import { isCodexNativeModel } from "@/lib/codexNativeModels";
-import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
+import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
+import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
+import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { getOmnigentHostConfig } from "@/lib/host";
+// Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
+// and would form a routing↔store import cycle).
+import { emitInteractionPhase, startTimedInteraction } from "@/lib/analyticsEmit";
+import {
+  markSessionCreated,
+  onLiveBlock,
+  onResponseEnd,
+  onResponseStart,
+} from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent } from "@/lib/systemMessage";
-import { isNativeWrapper } from "@/lib/nativeCodingAgents";
+import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 
 export interface SendOptions {
   /**
@@ -272,6 +283,12 @@ export interface ConversationState {
   sessionStatus: SessionStatus;
   backgroundTaskCount: number;
   /**
+   * Per-shell detail behind `backgroundTaskCount`, kept in lockstep with it,
+   * so the UI can list each running background shell. Empty when none are
+   * tracked (or an older runner reported only the count).
+   */
+  backgroundTasks: BackgroundTaskInfo[];
+  /**
    * Why a still-`running` session is parked, e.g. "permission prompt".
    * Terminal-backed agents can block on a dialog the web UI does not
    * mirror, so the working indicator names it instead of shimmering with
@@ -363,6 +380,25 @@ export interface ConversationState {
    */
   codexPlanMode: boolean;
   /**
+   * Permission mode of a running claude-native session, e.g. ``"auto"``.
+   * Hydrated from ``omnigent.claude_native.permission_mode`` on bind
+   * (falling back to the launch flag) and updated by the composer's mode
+   * picker. Empty string when unknown — a non-Claude session, or a mode set
+   * via ``permissions.defaultMode`` that never reaches the launch args. The
+   * composer hides the picker rather than showing a guessed mode.
+   */
+  claudePermissionMode: string;
+  /**
+   * Approval mode of a running codex-native session, one of
+   * ``"ask-for-approval"``, ``"approve-for-me"``, ``"full-access"``,
+   * ``"read-only"`` (Codex's ``/permissions`` presets). Hydrated from the
+   * ``omnigent.codex_native.approval_mode`` read-back label on bind (runtime
+   * approval no longer rides launch args) and updated by the composer's picker
+   * or a live ``session.codex_approval_mode`` event. Empty string when unknown
+   * (non-codex session, or not yet observed).
+   */
+  codexApprovalMode: string;
+  /**
    * True when older items exist before the loaded history window. Binds
    * hydrate only the most recent page (see `fetchSessionItemsPage`);
    * scroll-up `loadMoreHistory` pages older until this goes false.
@@ -410,6 +446,14 @@ export interface ConversationState {
    * agent has no explicit model.
    */
   llmModel: string | null;
+  /**
+   * A model switch the harness has not confirmed yet: the requested model
+   * from the moment the PATCH lands until the harness's own report
+   * (``session.model``) or a ``model_change_not_applied`` error settles it.
+   * Drives the composer's pending indicator; never display state for the
+   * chip itself (the chip keeps showing ``llmModel`` — the truth).
+   */
+  pendingModelChange: string | null;
   /**
    * Effective brain harness for the active session (override-aware),
    * e.g. ``"claude-sdk"`` or ``"pi"``. Populated from the session
@@ -522,10 +566,11 @@ export interface ConversationState {
   /**
    * Per-MCP-server startup map for the bound session (codex-native).
    * Updated by `session.mcp_startup` SSE events while the harness boots
-   * its MCP servers; cleared back to `null` once every server settles
-   * `ready`. Failed/cancelled servers are retained so the page can say
-   * which servers never came up. Always `null` for sessions whose
-   * harness reports no MCP startup.
+   * its MCP servers; cleared back to `null` once no server is still
+   * `starting`. Settled failures/cancellations are setup diagnostics
+   * (host logs), never conversation content, so they are dropped rather
+   * than retained. Always `null` for sessions whose harness reports no
+   * MCP startup.
    */
   mcpStartup: Record<string, McpServerStartup> | null;
 
@@ -684,6 +729,7 @@ export interface ChatActions {
     elicitationId: string,
     action: "accept" | "decline" | "cancel",
     content?: Record<string, unknown>,
+    meta?: Record<string, unknown>,
   ) => Promise<void>;
   /**
    * Set sticky effort; PATCH only when the active session supports it.
@@ -694,8 +740,12 @@ export interface ChatActions {
    * Set the sticky model and PATCH it onto the current session. For
    * claude-native, the server also injects ``/model`` into the tmux
    * pane so the in-binary picker tracks the change.
+   *
+   * ``expectConfirmation`` marks the pick pending until the harness's own
+   * report (or a not-applied error) settles it — pass it for sessions
+   * whose chip renders the reported model (claude-/codex-native).
    */
-  setModel: (model: string | null) => Promise<void>;
+  setModel: (model: string | null, opts?: { expectConfirmation?: boolean }) => Promise<void>;
   /**
    * Set the active session's cost-control switch — optimistic local
    * flip, then PATCH; the server's canonical value (or a rollback on
@@ -728,6 +778,20 @@ export interface ChatActions {
    * active conversation.
    */
   setCodexPlanMode: (enabled: boolean) => Promise<void>;
+  /**
+   * Switch a running claude-native session's permission mode (e.g. to
+   * ``"auto"``). Rejects when the live TUI could not reach the mode, so
+   * callers surface the error rather than assuming the switch landed.
+   * No-ops when there is no active conversation.
+   */
+  setClaudePermissionMode: (mode: string) => Promise<void>;
+  /**
+   * Switch a running codex-native session's approval/sandbox mode (e.g. to
+   * ``"read-only"``). Rejects when the live Codex thread could not accept the
+   * update, so callers surface the error rather than assuming it landed.
+   * No-ops when there is no active conversation.
+   */
+  setCodexApprovalMode: (mode: string) => Promise<void>;
   /**
    * Fetch the next page of older messages and prepend them to `blocks`.
    *
@@ -979,6 +1043,27 @@ const BACKGROUND_FLUSH_COOLDOWN_MS = 5_000;
 const backgroundFlushInFlight = new Set<string>();
 const backgroundFlushCooldownUntil = new Map<string, number>();
 
+// Failure-scoped backoff for the silent sticky-apply PATCHes (effort/model): if
+// the backend errors they never persist and would re-fire on every rebind, so a
+// failure pauses them and the next success resumes. Reset in initChatStore.
+const STICKY_APPLY_BACKOFF_MS = 30_000;
+let stickyApplyBackoffUntil = 0;
+
+// Silent sticky applies pause for a cooldown after any failure — treated as a
+// transient backend-wide hiccup (a 404 here means the permission check didn't
+// succeed, a flaky permission service, not that the session is gone), so one
+// failure pauses every session. Explicit /model and /effort picks aren't gated.
+function stickyApplyBlocked(): boolean {
+  return Date.now() < stickyApplyBackoffUntil;
+}
+
+// Arm on failure only; the gate reopens by time, never on a success. During an
+// outage the ~10% of requests that succeed must not flap the gate open and leak
+// a fresh apply each time.
+function armStickyApplyBackoff(): void {
+  stickyApplyBackoffUntil = Date.now() + STICKY_APPLY_BACKOFF_MS;
+}
+
 // Remembers each File's successful upload so a retry reuses the server-assigned
 // file_id instead of re-uploading the blob (which would orphan the prior one).
 // Retries re-send the same File objects — background flush re-queues them on a
@@ -1112,6 +1197,7 @@ export function initChatStore(client: QueryClient): void {
   workspaceInvalidationTimers.clear();
   backgroundFlushInFlight.clear();
   backgroundFlushCooldownUntil.clear();
+  stickyApplyBackoffUntil = 0;
   // Drop every live conversation: their streams must not outlive the app (or,
   // in tests, leak into the next case).
   conversationRegistry.clear();
@@ -1236,6 +1322,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   status: "idle",
   sessionStatus: "idle",
   backgroundTaskCount: 0,
+  backgroundTasks: [],
   blockedOn: null,
   isNativeTerminalSession: false,
   nativeVendorOwnsModel: false,
@@ -1250,6 +1337,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   costControlModeOverride: null,
   subagentRoutingOverride: null,
   codexPlanMode: false,
+  claudePermissionMode: "",
+  codexApprovalMode: "",
   hasMoreHistory: false,
   loadingMoreHistory: false,
   oldestItemId: null,
@@ -1260,6 +1349,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   failedSendDraft: null,
   sendLatchedAt: null,
   llmModel: null,
+  pendingModelChange: null,
   sessionHarness: null,
   subAgentName: null,
   contextWindow: null,
@@ -1528,9 +1618,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const tempId = `pend_${pendingSeq}`;
     const pendingFileBlocks: MessageContentBlock[] = (files ?? []).map((file) => {
       const filename = file.name || "image.png";
+      // Key the placeholder id on the File's stable identity, not its name:
+      // pasted screenshots all arrive named "image.png", so a name-derived
+      // id would collide across attachments and strand a ghost chip (React
+      // dedupes on the shared key) until a refresh replaces it with the
+      // server's unique file_id.
+      const fileId = `pending:${attachmentKey(file)}`;
       return file.type.startsWith("image/")
-        ? { type: "input_image" as const, file_id: `pending:${filename}`, filename }
-        : { type: "input_file" as const, file_id: `pending:${filename}`, filename };
+        ? { type: "input_image" as const, file_id: fileId, filename }
+        : { type: "input_file" as const, file_id: fileId, filename };
     });
     const content: MessageContentBlock[] = [
       ...pendingFileBlocks,
@@ -1547,12 +1643,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
         },
       ],
-      // A new turn supersedes the prior turn's background-shell tally: the
-      // "N background tasks still running" label must give way to "Working…" the
-      // moment the user sends, not linger until the next status edge. The
-      // count is sticky (see the `session_status` handler) precisely so a
-      // trailing idle can't wipe it, so it has to be cleared explicitly here.
-      backgroundTaskCount: 0,
+      // A new turn does NOT supersede the background-shell tally: shells
+      // launched in an earlier turn keep running across the turn boundary, so
+      // the composer pill must stay lit alongside the "Working…" shimmer rather
+      // than blink off the moment the user sends. The count is sticky (see the
+      // `session_status` handler) and the next Stop hook re-reports it
+      // authoritatively. Only the parked-dialog reason clears — a fresh send is
+      // not parked on a dialog.
       blockedOn: null,
     }));
 
@@ -1632,6 +1729,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             patch.status = "idle";
             patch.sessionStatus = "idle";
             patch.backgroundTaskCount = 0;
+            patch.backgroundTasks = [];
           }
           return patch;
         });
@@ -1697,7 +1795,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           // instead of being left on a silent, empty composer.
           failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
         }
-        failSet({ status: "idle", sessionStatus: "idle", backgroundTaskCount: 0 });
+        failSet({
+          status: "idle",
+          sessionStatus: "idle",
+          backgroundTaskCount: 0,
+          backgroundTasks: [],
+        });
       } else {
         // Sent alongside an already-streaming turn (or a stranded latch): the
         // bubble is rolled back above, so without a block the message vanishes
@@ -1784,6 +1887,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             patch.status = "idle";
             patch.sessionStatus = "idle";
             patch.backgroundTaskCount = 0;
+            patch.backgroundTasks = [];
           }
           return patch;
         });
@@ -1848,6 +1952,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         status: "idle",
         sessionStatus: "idle",
         backgroundTaskCount: 0,
+        backgroundTasks: [],
         blockedOn: null,
       };
       if (s.activeResponse?.state === "streaming") {
@@ -1945,11 +2050,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     // Cold entry: bind its stream and hydrate history. `hydratePending` replays
     // the snapshot's un-consumed native messages — correct here because a fresh
-    // entry has no live optimistic bubbles to overwrite.
-    await bindStream(conversationId, entrySetter(entry), entryGetter(entry), true);
+    // entry has no live optimistic bubbles to overwrite. This is the only path
+    // that loads a session on switch (a live/current one paints instantly and
+    // returned above), so time it as the get_session CUJ.
+    const getInteraction = startTimedInteraction("get_session", conversationId);
+    try {
+      await bindStream(conversationId, entrySetter(entry), entryGetter(entry), true);
+      // bindStream catches a snapshot failure into `conversationLoadError`
+      // instead of throwing, so read it to report the real outcome.
+      if (entry.getState().conversationLoadError !== null) getInteraction.fail();
+      else getInteraction.complete();
+    } catch (error) {
+      getInteraction.fail();
+      throw error;
+    }
   },
 
-  submitApproval: async (elicitationId, action, content) => {
+  submitApproval: async (elicitationId, action, content, meta) => {
     const sessionId = get().conversationId;
     if (!sessionId) return;
     const targetSessionId =
@@ -1965,8 +2082,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // ``content`` rides through the response field so multi-choice
     // cards (AskUserQuestion) can render the selected label rather
     // than a generic "Approved" pill.
-    const responseValue: ElicitationBlock["response"] =
-      content === undefined ? { action } : { action, content };
+    const responseValue: ElicitationBlock["response"] = {
+      action,
+      ...(content === undefined ? {} : { content }),
+      ...(meta === undefined ? {} : { _meta: meta }),
+    };
     setActive((s) => ({
       blocks: s.blocks.map((b) =>
         b.type === "elicitation" && b.elicitationId === elicitationId
@@ -1974,12 +2094,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           : b,
       ),
     }));
+    // Human-in-the-loop decision: accept = granted, decline = rejected, cancel =
+    // dismissed without deciding. Fires on the user's action (live only).
+    emitInteractionPhase({
+      interactionId: elicitationId,
+      interactionKind: "approval",
+      phase: "complete",
+      status: action === "accept" ? "success" : action === "decline" ? "failure" : "cancelled",
+    });
     try {
-      await approveElicitation(
-        targetSessionId,
-        elicitationId,
-        content === undefined ? { action } : { action, content },
-      );
+      await approveElicitation(targetSessionId, elicitationId, {
+        action,
+        ...(content === undefined ? {} : { content }),
+        ...(meta === undefined ? {} : { _meta: meta }),
+      });
     } catch {
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons
@@ -2063,7 +2191,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  setModel: async (model) => {
+  setModel: async (model, opts) => {
     // `selectedModel` is the sticky pick; `sessionModelOverride` is this
     // session's applied override. An explicit `/model` sets both.
     modelPickRevision += 1;
@@ -2072,7 +2200,37 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     savePickerPref(PICKER_PREF_MODEL_KEY, model);
     const { conversationId } = get();
     if (conversationId) {
-      const session = await updateSession(conversationId, { modelOverride: model });
+      const expectConfirmation = opts?.expectConfirmation === true && model !== null;
+      if (expectConfirmation) {
+        // Reported-model sessions: the chip keeps the harness's model until
+        // its own report confirms the switch. Mark the ask pending BEFORE
+        // the PATCH: the PATCH is held open while the runner drives and
+        // CONFIRMS the switch, so the harness's `session.model` report
+        // usually arrives before the PATCH resolves — pending set after the
+        // response would miss that clear and strand the spinner. The
+        // `session.model` event or a `model_change_not_applied` error
+        // settles it; the timer is spinner hygiene for the case where
+        // neither ever arrives (e.g. the session fell asleep mid-ask) — it
+        // outlasts the server's 20 s runner-forward budget.
+        setterFor(conversationId)({ pendingModelChange: model });
+        setTimeout(() => {
+          setterFor(conversationId)((s) =>
+            s.pendingModelChange === model ? { pendingModelChange: null } : {},
+          );
+        }, 30_000);
+      }
+      let session;
+      try {
+        session = await updateSession(conversationId, { modelOverride: model });
+      } catch (err) {
+        // The ask never reached the server — nothing will confirm it.
+        if (expectConfirmation) {
+          setterFor(conversationId)((s) =>
+            s.pendingModelChange === model ? { pendingModelChange: null } : {},
+          );
+        }
+        throw err;
+      }
       // Server-canonical may differ from the optimistic write (e.g.
       // when a clear alias was sent) — refresh local state to match.
       const canonical = session.modelOverride ?? null;
@@ -2191,6 +2349,42 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       patchSet({ codexPlanMode: codexPlanModeFromSession(session) });
     } catch (err) {
       patchSet({ codexPlanMode: previous });
+      throw err;
+    }
+  },
+
+  setClaudePermissionMode: async (mode) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().claudePermissionMode;
+    // Pinned for the same reason as `setCostControlMode` — see there.
+    const patchSet = setterFor(conversationId);
+    // Optimistic, then reconciled against the mode the server confirms the
+    // pane landed on — which may differ from what was asked.
+    patchSet({ claudePermissionMode: mode });
+    try {
+      const session = await updateSession(conversationId, { claudePermissionMode: mode });
+      patchSet({ claudePermissionMode: claudePermissionModeFromSession(session) ?? "" });
+    } catch (err) {
+      patchSet({ claudePermissionMode: previous });
+      throw err;
+    }
+  },
+
+  setCodexApprovalMode: async (mode) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().codexApprovalMode;
+    // Pinned for the same reason as `setCostControlMode` — see there.
+    const patchSet = setterFor(conversationId);
+    // Optimistic, then reconciled against the mode the server confirms the
+    // Codex thread landed on.
+    patchSet({ codexApprovalMode: mode });
+    try {
+      const session = await updateSession(conversationId, { codexApprovalMode: mode });
+      patchSet({ codexApprovalMode: codexApprovalModeFromSession(session) ?? "" });
+    } catch (err) {
+      patchSet({ codexApprovalMode: previous });
       throw err;
     }
   },
@@ -2568,70 +2762,28 @@ conversationRegistry.subscribe((id) => {
 type NativeModelFamily = "claude" | "codex";
 
 /**
- * Resolve the native model family from a session wrapper label.
+ * Resolve the native model family from a session snapshot.
+ *
+ * The wrapper label is authoritative. Custom YAML agents carry no
+ * presentation label, so for label-less sessions the resolved harness is the
+ * fallback — mirroring the composer capability gates, so a custom
+ * codex-native session keeps its reported model in the composer label.
  *
  * :param session: Session snapshot from the API.
- * :returns: ``"claude"`` / ``"codex"`` for native wrappers, else ``null``.
+ * :returns: ``"claude"`` / ``"codex"`` for native sessions, else ``null``.
  */
-function nativeModelFamilyForSession(session: Pick<Session, "labels">): NativeModelFamily | null {
-  switch (session.labels?.["omnigent.wrapper"]) {
+function nativeModelFamilyForSession(
+  session: Pick<Session, "labels" | "harness">,
+): NativeModelFamily | null {
+  const wrapper = session.labels?.["omnigent.wrapper"];
+  switch (wrapper) {
     case "claude-code-native-ui":
       return "claude";
     case "codex-native-ui":
       return "codex";
     default:
-      return null;
+      return wrapper == null && session.harness === "codex-native" ? "codex" : null;
   }
-}
-
-/**
- * Whether a sticky model id can be applied to a native session family.
- *
- * :param family: Native model family from :func:`nativeModelFamilyForSession`.
- * :param model: Sticky model id / alias.
- * :returns: True only when the model is compatible with that native family.
- */
-function isNativeModelCompatible(
-  family: NativeModelFamily,
-  model: string,
-  session: Session,
-): boolean {
-  switch (family) {
-    case "claude": {
-      const options = session.codexModelOptions ?? [];
-      return (
-        isClaudeNativeModel(model) &&
-        options.some((option) => option.id === model || option.model === model)
-      );
-    }
-    case "codex":
-      return isCodexNativeModel(session.codexModelOptions ?? [], model);
-  }
-}
-
-/**
- * Recover a persisted native-model preference once its live catalog arrives.
- *
- * Bind snapshots deliberately invalidate runner-backed catalogs, so an empty
- * option list at bind time means "loading," not "removed." The in-memory
- * selection is cleared until compatibility can be checked; local storage keeps
- * the preference available for this delayed handoff.
- */
-function deferredNativeStickyModel(session: Session): string | null {
-  const family = nativeModelFamilyForSession(session);
-  if (
-    family === null ||
-    session.parentSessionId != null ||
-    session.costControlModeOverride === "on" ||
-    session.modelOverride != null
-  ) {
-    return null;
-  }
-  const stickyModel =
-    useChatStore.getState().selectedModel ?? loadPickerPref(PICKER_PREF_MODEL_KEY);
-  return stickyModel != null && isNativeModelCompatible(family, stickyModel, session)
-    ? stickyModel
-    : null;
 }
 
 /**
@@ -2679,6 +2831,11 @@ async function ensureBoundSession(
     // missed). Bind the stream FIRST, then post the first message.
     const session = await createSession(agentId, []);
     sessionId = session.id;
+    // Register the create_session span (see interactionTelemetry). This path
+    // sends no host params, so the server always makes an external ("computer")
+    // session — managed sandboxes are created by the New Chat dialog, which
+    // registers itself.
+    markSessionCreated(sessionId, "computer");
     // Claim the send chain for this id NOW, while it is still private to this
     // call. Everything below publishes it (the store write, the navigate
     // callback, the sidebar invalidation) and awaits network work, so a send
@@ -2819,6 +2976,23 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
 }
 
 /**
+ * An MCP startup map reduced to what the chat surface may show: the map
+ * while any server is still `starting`, else `null`. A settled round —
+ * all ready, or ended with failures/cancellations — renders nothing:
+ * failure notices are setup diagnostics that belong in host logs, not
+ * items in the conversation viewport. Applied at both intake points
+ * (SSE event and session snapshot) so a reload can't resurrect a notice
+ * the live handler would have dropped.
+ */
+function activeMcpStartup(
+  servers: Record<string, McpServerStartup> | null | undefined,
+): Record<string, McpServerStartup> | null {
+  if (!servers) return null;
+  const anyStarting = Object.values(servers).some((r) => r.status === "starting");
+  return anyStarting ? servers : null;
+}
+
+/**
  * Store fields derived from the session's agent binding, computed from a
  * session snapshot.
  *
@@ -2845,12 +3019,15 @@ function sessionBindingPatch(
   | "boundAgentId"
   | "boundAgentName"
   | "llmModel"
+  | "pendingModelChange"
   | "sessionModelOverride"
   | "sessionHarness"
   | "subAgentName"
   | "costControlModeOverride"
   | "subagentRoutingOverride"
   | "codexPlanMode"
+  | "claudePermissionMode"
+  | "codexApprovalMode"
   | "contextWindow"
   | "gitBranch"
   | "skills"
@@ -2859,30 +3036,36 @@ function sessionBindingPatch(
   | "sandboxStatus"
   | "mcpStartup"
 > {
-  const wrapper = session.labels?.["omnigent.wrapper"];
   return {
-    isNativeTerminalSession: isNativeWrapper(wrapper),
+    isNativeTerminalSession: isNativeTerminalSessionFn(session),
     // Native wrapper whose model lives in the vendor TUI (no Omnigent picker):
     // qwen/goose/cursor/pi/opencode. nativeModelFamilyForSession is non-null
     // only for claude-/codex-native, which keep the composer model label.
     nativeVendorOwnsModel:
-      isNativeWrapper(wrapper) && nativeModelFamilyForSession(session) === null,
+      isNativeTerminalSessionFn(session) && nativeModelFamilyForSession(session) === null,
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
     llmModel: session.llmModel ?? null,
+    pendingModelChange: null,
     sessionModelOverride: session.modelOverride ?? null,
     sessionHarness: session.harness ?? null,
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     subagentRoutingOverride: session.subagentRoutingOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
+    claudePermissionMode: isNativeTerminalSessionFn(session)
+      ? (claudePermissionModeFromSession(session) ?? "")
+      : "",
+    codexApprovalMode: isCodexNativeSession(session)
+      ? (codexApprovalModeFromSession(session) ?? "")
+      : "",
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
     skills: session.skills ?? [],
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
-    mcpStartup: session.mcpStartup ?? null,
+    mcpStartup: activeMcpStartup(session.mcpStartup),
   };
 }
 
@@ -3032,7 +3215,6 @@ async function bindStream(
     const items = page.items;
 
     // Sticky-pref handoff for CLI-created sessions with no override.
-    const nativeModelFamily = nativeModelFamilyForSession(session);
     // Binding-derived fields (isNativeTerminalSession, bound agent,
     // model/skills metadata) — shared with the session.agent_changed
     // refresh path; see sessionBindingPatch.
@@ -3046,56 +3228,23 @@ async function bindStream(
     const effectiveEffort = canApplyEffort
       ? (session.reasoningEffort ?? stickyEffort ?? null)
       : stickyEffort;
-    // Non-native: don't auto-apply the model, but keep the sticky pick so
-    // navigating back to a native session restores it.
-    const compatibleStickyModel =
-      nativeModelFamily !== null && stickyModel != null
-        ? isNativeModelCompatible(nativeModelFamily, stickyModel, session)
-          ? stickyModel
-          : null
-        : stickyModel;
-    const effectiveModel =
-      nativeModelFamily !== null ? (session.modelOverride ?? compatibleStickyModel) : stickyModel;
-    // The session's REAL effective override: the server's stored value,
-    // plus the sticky model the native handoff is about to apply. Unlike
-    // `effectiveModel`/`selectedModel` (which hold the unapplied sticky
-    // pick for non-native sessions), this is the session truth the `/model`
-    // readout shows, so a non-applied sticky pick is never mislabeled as
-    // an active "(override)".
-    // Intelligent routing owns model selection: never carry a sticky model
-    // onto a routing-enabled session. Leaving model_override null is what lets
-    // the server-side judge pick on the first turn; a silent sticky PATCH here
-    // would re-pin the session (e.g. to the last-used Opus) and trip the
-    // server's ``model_override is None`` routing guard. effectiveSessionOverride
-    // then resolves to null too, so the /model readout doesn't mislabel it.
-    const routingOn = session.costControlModeOverride === "on";
-    const willApplyStickyModel =
-      !isSubAgentSession &&
-      !routingOn &&
-      nativeModelFamily !== null &&
-      session.modelOverride == null &&
-      compatibleStickyModel != null;
-    const effectiveSessionOverride =
-      session.modelOverride ?? (willApplyStickyModel ? compatibleStickyModel : null);
+    // The sticky model is a UI PREFERENCE only: it pre-fills pickers but is
+    // never silently PATCHed onto a session and never rendered as the
+    // session's model. Display comes from the harness's reported model
+    // (`llmModel`); a request exists only when the user explicitly picks.
+    // (The old bind-time auto-apply wrote requests the pane was never asked
+    // to honor — removed with the reported-model semantics.)
     if (
       !isSubAgentSession &&
       canApplyEffort &&
       session.reasoningEffort == null &&
-      stickyEffort != null
+      stickyEffort != null &&
+      !stickyApplyBlocked()
     ) {
       updateSession(id, { reasoningEffort: stickyEffort }).catch((err: unknown) => {
+        armStickyApplyBackoff();
         console.warn(`Failed to apply sticky effort=${stickyEffort} to session ${id}:`, err);
       });
-    }
-    if (willApplyStickyModel) {
-      updateSession(id, { modelOverride: compatibleStickyModel, silent: true }).catch(
-        (err: unknown) => {
-          console.warn(
-            `Failed to apply sticky model=${compatibleStickyModel} to session ${id}:`,
-            err,
-          );
-        },
-      );
     }
 
     const snapshotBlocks = itemsToBlocks(items);
@@ -3115,18 +3264,6 @@ async function bindStream(
       const effectiveBindingPatch = catalogWonBindRace
         ? { ...bindingPatch, codexModelOptions: racedOptions! }
         : bindingPatch;
-      // The raced branch preserves the selection the deferred handoff
-      // applied — but only when that selection exists in the raced catalog.
-      // A sticky pick the handoff REJECTED (e.g. a removed alias) must not
-      // linger visually selected with no server override behind it.
-      const preservedModelValid =
-        !catalogWonBindRace ||
-        state.selectedModel == null ||
-        nativeModelFamily === null ||
-        isNativeModelCompatible(nativeModelFamily, state.selectedModel, {
-          ...session,
-          codexModelOptions: racedOptions!,
-        });
       const seenItemIds = new Set(
         state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
       );
@@ -3244,8 +3381,7 @@ async function bindStream(
               ...structuredErrorFields(session.lastTaskError),
             }
           : null;
-      resolvedStickyModel =
-        catalogWonBindRace && preservedModelValid ? state.selectedModel : effectiveModel;
+      resolvedStickyModel = stickyModel;
       return {
         ...effectiveBindingPatch,
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
@@ -3280,6 +3416,7 @@ async function bindStream(
         // live SSE edge that set this is long gone, so the count rides in on
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
+        backgroundTasks: session.backgroundTasks ?? [],
         blockedOn: null,
         // `selectedEffort` / `selectedModel` are app-global sticky picks, not
         // conversation state, so they are applied below — and only while this
@@ -3293,10 +3430,7 @@ async function bindStream(
         // Session truth for the `/model` readout — overrides the snapshot
         // value spread via `...bindingPatch` so the claude-native sticky
         // handoff (fired above, silent) shows immediately.
-        sessionModelOverride:
-          catalogWonBindRace && preservedModelValid
-            ? state.sessionModelOverride
-            : effectiveSessionOverride,
+        sessionModelOverride: session.modelOverride ?? null,
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
         sessionUsageByModel: session.usageByModel ?? null,
@@ -3439,6 +3573,7 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
+  patch.backgroundTasks = session.backgroundTasks ?? [];
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -3626,6 +3761,39 @@ function captureElicitationIdsByStatus(blocks: AnyBlock[]): {
   return { pending, autoResolved };
 }
 
+function blockWallClockS(block: AnyBlock): number | undefined {
+  return block.ctx.createdAtS ?? block.ctx.clientCreatedAtS;
+}
+
+/** Merge preserved itemless history back into a freshly loaded item window. */
+function mergeReconnectWindow(windowBlocks: AnyBlock[], tail: AnyBlock[]): AnyBlock[] {
+  const anchored: AnyBlock[] = [];
+  const liveTail: AnyBlock[] = [];
+  for (const block of tail) {
+    if (
+      block.ctx.itemId === null &&
+      (block.type === "elicitation" || block.type === "error") &&
+      blockWallClockS(block) !== undefined
+    ) {
+      anchored.push(block);
+    } else {
+      liveTail.push(block);
+    }
+  }
+
+  const merged = [...windowBlocks];
+  for (const block of anchored) {
+    const createdAtS = blockWallClockS(block)!;
+    const insertAt = merged.findIndex((candidate) => {
+      const candidateCreatedAtS = blockWallClockS(candidate);
+      return candidateCreatedAtS !== undefined && candidateCreatedAtS > createdAtS;
+    });
+    if (insertAt === -1) merged.push(block);
+    else merged.splice(insertAt, 0, block);
+  }
+  return [...merged, ...liveTail];
+}
+
 /**
  * Reconnect fallback when the disconnect gap outran the incremental
  * backfill cap: replace the history window wholesale from one fresh window
@@ -3637,10 +3805,11 @@ function captureElicitationIdsByStatus(blocks: AnyBlock[]): {
  * reachable via scroll-up, since `oldestItemId` / `hasMoreHistory` are
  * reset alongside) while the live tail the reconnected pump has already
  * delivered — newly committed items plus the active turn's replayed
- * in-flight ephemera — is kept after the window, along with
- * elicitation/error blocks (never items, so the fresh fetch can't
- * recreate them). Elicitation cards are then reconciled against the
- * snapshot's pending list (see `reconcileElicitationBlocks`).
+ * in-flight ephemera — is kept after the window. Itemless elicitation/error
+ * blocks cannot be recreated by the fetch, but they may be older than the
+ * fresh items, so wall-clock-stamped ones are merged back chronologically
+ * instead of blindly appended. Elicitation cards are then reconciled against
+ * the snapshot's pending list (see `reconcileElicitationBlocks`).
  */
 async function rehydrateWindowOnReconnect(
   id: string,
@@ -3673,7 +3842,10 @@ async function rehydrateWindowOnReconnect(
       tail.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
     const windowBlocks = freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId));
-    const merged = [...windowBlocks, ...withoutRebuiltUserInputCards(tail, windowBlocks)];
+    const merged = mergeReconnectWindow(
+      windowBlocks,
+      withoutRebuiltUserInputCards(tail, windowBlocks),
+    );
     return {
       ...reconnectStatusPatch(session, s),
       blocks:
@@ -3792,6 +3964,14 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
     const patch: Partial<ChatState> = reconnectStatusPatch(session, s);
+    // `session.input.consumed` is not replayed, so recovered user blocks are
+    // the durable equivalent of its FIFO acknowledgement.
+    const recoveredUserInputs = unseen.filter(
+      (b) => b.type === "user_message" && !isSystemUserContent(b.content),
+    ).length;
+    if (recoveredUserInputs > 0) {
+      patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
+    }
     let nextBlocks = s.blocks;
     if (unseen.length > 0) {
       // Splice the gap's committed items ahead of the active turn's
@@ -4450,6 +4630,12 @@ function revivePendingElicitationBlock(set: Setter, elicitationId: string): void
   });
 }
 
+// agent_run / tool_call / create_session telemetry is emitted from this pump's
+// live reduce-loop (see `onResponseStart` / `onResponseEnd` / `onLiveBlock` in
+// `interactionTelemetry.ts`) — the one place each stream frame is seen once,
+// live, in order. Create sites call `markSessionCreated`. `approval` above stays
+// a direct emit — it has no stream lifecycle.
+
 export async function pumpStreamEvents(
   id: string,
   body: ReadableStream<Uint8Array>,
@@ -4461,6 +4647,11 @@ export async function pumpStreamEvents(
   const stream = new BlockStream();
   const sseResult: SseStreamResult = { sawDone: false };
   const rawEvents = parseSseStream(body, sseResult);
+  // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
+  // both committed and still-buffered blocks. Lives for the whole stream
+  // (one SSE connection); bounded by item count like `blocks` itself.
+  const buffer: AnyBlock[] = [];
+  const seenItemIds = new Set<string>();
   // Tap the raw event stream for `session.*` side effects (sessionStatus,
   // pending-message promotion, interrupted decoration) before handing it
   // to the BlockStream reducer. The reducer is intentionally pure
@@ -4469,13 +4660,31 @@ export async function pumpStreamEvents(
   // A scheduled wake can stream before its new turn id arrives. Ignore the
   // rest of that message so it cannot attach to the completed prior turn.
   const ignoredWakeMessages = new Set<string>();
-  const events = tapLiveDeltas(tapSessionEvents(rawEvents, id), id, ignoredWakeMessages, set, get);
-
-  // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
-  // both committed and still-buffered blocks. Lives for the whole stream
-  // (one SSE connection); bounded by item count like `blocks` itself.
-  const buffer: AnyBlock[] = [];
-  const seenItemIds = new Set<string>();
+  const events = tapLiveDeltas(
+    tapSessionEvents(rawEvents, id, (elicitationId) => {
+      // A fast native approval can resolve in the few milliseconds between
+      // the reducer yielding its card and the next animation-frame flush.
+      // `handleSessionEvent` can only update committed blocks, so settle the
+      // buffered copy here instead of dropping that resolved edge.
+      const at = buffer.findIndex(
+        (block) =>
+          block.type === "elicitation" &&
+          block.elicitationId === elicitationId &&
+          block.status === "pending",
+      );
+      if (at === -1) return;
+      const target = buffer[at] as ElicitationBlock;
+      buffer[at] = {
+        ...target,
+        status: "responded",
+        response: { action: "auto_resolved" },
+      };
+    }),
+    id,
+    ignoredWakeMessages,
+    set,
+    get,
+  );
   // First content block of each response flushes synchronously (snappy
   // first-token paint); the rest batch.
   let paintedFirstContent = false;
@@ -4534,6 +4743,9 @@ export async function pumpStreamEvents(
         // New response: force-flush whatever is buffered, then land the
         // marker + lifecycle in one commit. Reset the first-paint latch.
         paintedFirstContent = false;
+        // agent_run start. This is the live turn edge — a revive reopens the
+        // turn via `set()` and emits no `response_start`, so it never double-opens.
+        onResponseStart(id, block.responseId);
         flush(block, {
           activeResponse: { responseId: block.responseId, state: "streaming", error: null },
           status: "streaming",
@@ -4679,6 +4891,9 @@ export async function pumpStreamEvents(
           const errorMsg = block.response?.error?.message ?? null;
           finalizeActive(set, block.status as ActiveResponse["state"], errorMsg);
         }
+        // agent_run complete + create_session settle. Read the finalized state so
+        // a `session.interrupted` cancelled (kept above) wins over block.status.
+        onResponseEnd(id, endedId, get().activeResponse?.state ?? block.status);
         // Turn over: drop any provisional preview never finalized by a
         // committed item (e.g. an interrupt where the partial item lands
         // after this event, or a stream drop). Normal messages already
@@ -4703,6 +4918,10 @@ export async function pumpStreamEvents(
         continue;
       }
 
+      // tool_call boundaries + create_session first-activity, from live blocks.
+      // Only fresh (non-deduped) blocks reach here, so each is observed once;
+      // history hydration takes the `reduceSync` path and never runs this loop.
+      onLiveBlock(id, block);
       buffer.push(block);
       if (!paintedFirstContent) {
         // First content of the response — paint it immediately so the
@@ -4904,8 +5123,8 @@ async function refetchRunnerBackedSessionState(
   if (options.modelOptionsResolved === true && (session.codexModelOptions ?? []).length > 0) {
     racedNativeModelOptions.set(conversationId, session.codexModelOptions ?? []);
   }
-  const stickyModel = deferredNativeStickyModel(session);
-  const alreadyApplied = stickyModel != null && currentState.sessionModelOverride === stickyModel;
+  // No sticky-model graft here: the sticky pick is a pure preference under
+  // the reported-model semantics, so a delayed catalog only hydrates state.
   const statePatch: Partial<ConversationState> =
     options.applyBindingPatch === true
       ? sessionBindingPatch(session)
@@ -4913,26 +5132,7 @@ async function refetchRunnerBackedSessionState(
           skills: session.skills ?? [],
           codexModelOptions: session.codexModelOptions ?? [],
         };
-  if (stickyModel != null) {
-    statePatch.sessionModelOverride = stickyModel;
-    // `selectedModel` is the cross-session sticky pick, so recover it only for
-    // the conversation on screen: a backgrounded session's delayed handoff must
-    // not overwrite a model the user has since picked elsewhere.
-    if (useChatStore.getState().conversationId === conversationId) {
-      rootSetState({ selectedModel: stickyModel });
-    }
-  }
   setterFor(conversationId)(statePatch);
-  if (stickyModel != null && !alreadyApplied) {
-    updateSession(conversationId, { modelOverride: stickyModel, silent: true }).catch(
-      (err: unknown) => {
-        console.warn(
-          `Failed to apply delayed sticky model=${stickyModel} to session ${conversationId}:`,
-          err,
-        );
-      },
-    );
-  }
 }
 
 /**
@@ -5054,11 +5254,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
 
   switch (event.type) {
     case "response_completed":
+    case "response_failed":
       // Prefer contextTokens (last sub-call total) for the context ring — on
       // tool-call turns, totalTokens is the billing sum across all sub-calls
       // which inflates the ring. contextTokens is set only by multi-sub-call
       // executors (e.g. openai-agents); for all others it is null and we fall
       // back to totalTokens, which equals contextTokens for single-call turns.
+      // A FAILED turn carries the usage the harness observed before dying
+      // (e.g. the prompt size from an aborted model call): apply it the same
+      // way, so the ring reflects real window fill instead of freezing at the
+      // previous successful turn's value. Executors that report nothing on
+      // failure leave usage null, which no-ops here.
       if (event.response.usage != null) {
         const ringTokens = event.response.usage.contextTokens ?? event.response.usage.totalTokens;
         if (ringTokens != null) {
@@ -5087,13 +5293,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "session_mcp_startup": {
-      // Mirror the harness's per-MCP-server startup map. Cleared once
-      // every server settles `ready` (the band disappears); failures and
-      // cancellations are retained so the page can say which servers
-      // never came up.
-      const records = Object.values(event.servers);
-      const allReady = records.length === 0 || records.every((r) => r.status === "ready");
-      applyToConversation({ mcpStartup: allReady ? null : event.servers });
+      // Mirror the harness's per-MCP-server startup map while the round
+      // is in flight; cleared once no server is still `starting`.
+      // Failures/cancellations are setup diagnostics (host logs), not
+      // conversation content — retaining them rendered an inline notice
+      // in the chat viewport and pinned the message-flow branch open.
+      applyToConversation({ mcpStartup: activeMcpStartup(event.servers) });
       return;
     }
     case "session_usage": {
@@ -5125,19 +5330,42 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     }
     case "session_model":
-      // A `/model` switch made inside a native terminal (Claude Code,
-      // codex, or cursor-agent). Reflect it in the picker for the open
-      // session. The server already
-      // persisted `model_override`, so a reload restores it; the
-      // cross-session sticky pref is intentionally left untouched (a
-      // terminal switch is a per-session choice, not a new default).
-      // Guard by conversation id so a late frame from a switched-away
-      // stream cannot overwrite the model for the currently-open session.
-      if (event.conversationId === useChatStore.getState().conversationId) {
-        // `selectedModel` is a sticky app-level pref, so it is set directly.
-        useChatStore.setState({ selectedModel: event.model });
+      // The harness's model report — the launch's own model, or a switch
+      // made inside the pane. The value is VERBATIM (the harness's own
+      // spelling); it lands on `llmModel`, the reported-model slot every
+      // display surface renders from. The request (`sessionModelOverride`)
+      // and the cross-session sticky are deliberately untouched: reports
+      // and requests are separate roles. The report also settles any
+      // pending switch: whatever the harness says it runs now IS the
+      // outcome of the ask.
+      applyToNamedConversation(event.conversationId, {
+        llmModel: event.model,
+        pendingModelChange: null,
+      });
+      return;
+    case "error":
+      // A `model_change_not_applied` error is the loud outcome of a model
+      // ask the pane never took: settle the pending indicator (the chip
+      // already shows the true model). The error block itself renders
+      // through the BlockStream reducer as usual.
+      if (event.error.code === "model_change_not_applied") {
+        applyToConversation((s) =>
+          s.pendingModelChange !== null ? { pendingModelChange: null } : {},
+        );
       }
-      applyToNamedConversation(event.conversationId, { sessionModelOverride: event.model });
+      return;
+    case "session_title":
+      // A `/rename` typed inside a native terminal. The server already
+      // persisted `title`, so a reload restores it; patch the caches the
+      // sidebar and session snapshot render from so the new name shows
+      // without waiting for the next list reconcile. Writes are keyed by
+      // the event's own conversation id, so no open-session guard is
+      // needed (this stream only carries the open session anyway).
+      // Sessions renamed while NOT open converge via the
+      // `WS /v1/sessions/updates` diff instead.
+      if (queryClient !== null) {
+        overlayTitleIntoCaches(queryClient, event.conversationId, event.title);
+      }
       return;
     case "session_reasoning_effort":
       // A thinking-level switch made inside a native terminal. The session's own
@@ -5156,11 +5384,25 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         useChatStore.setState({ selectedEffort: event.reasoningEffort });
       }
       return;
+    case "session_permission_mode":
+      // Pane-driven (in-TUI shift+tab) or UI-driven; either way the server
+      // has confirmed this is the session's live mode.
+      applyToNamedConversation(event.conversationId, {
+        claudePermissionMode: event.permissionMode,
+      });
+      return;
     case "session_collaboration_mode":
       // A Codex /plan switch made in either the web UI or native TUI.
       // Guard by conversation id so a late frame from an aborted stream
       // cannot paint Plan mode onto the newly-opened conversation.
       applyToNamedConversation(event.conversationId, { codexPlanMode: event.mode === "plan" });
+      return;
+    case "session_codex_approval_mode":
+      // A Codex approval switch made in the web picker or the native TUI's
+      // /permissions popup; the server has confirmed it's the live mode.
+      applyToNamedConversation(event.conversationId, {
+        codexApprovalMode: event.approvalMode,
+      });
       return;
     case "session_presence":
       // Full-state replacement — every presence event carries the
@@ -5278,12 +5520,21 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // after it appeared. So: an explicit count is authoritative (a Stop
         // hook's `0` clears it, so a finished shell drops the indicator on the
         // next turn end; a positive count sets it); `undefined` leaves it
-        // untouched; and a new turn (`running`) or a failure clears it —
-        // mirroring the server's `_publish_status`.
+        // untouched. A new `running` turn does NOT clear it — background shells
+        // outlive turn boundaries, so the pill stays lit alongside the "Working…"
+        // shimmer and the next Stop hook re-reports authoritatively. Only a
+        // failure clears it (a dead session may never post another count to drop
+        // a stale tally). Mirrors the server's `_publish_status`.
         if (event.backgroundTaskCount !== undefined) {
           patch.backgroundTaskCount = event.backgroundTaskCount;
-        } else if (event.status === "running" || event.status === "failed") {
+          // Detail rides with the authoritative count on the same edge, so it
+          // is authoritative too: a Stop hook that names its shells sets the
+          // list; an older runner that sent count-only clears it to []. Keeps
+          // the detail in lockstep with the number the pill shows.
+          patch.backgroundTasks = event.backgroundTasks ?? [];
+        } else if (event.status === "failed") {
           patch.backgroundTaskCount = 0;
+          patch.backgroundTasks = [];
         }
         if (event.responseId !== undefined && event.status === "running") {
           patch.status = "streaming";
@@ -5366,28 +5617,48 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             patch.pendingUserMessages = [];
           }
         }
-        // Surface the error inline when the harness reports a terminal failure
-        // with a structured error payload (e.g. token expiration on startup).
-        // `response.failed` / `response.error` handle mid-turn failures, but
-        // startup failures only emit `session.status: failed` — nothing
-        // converts that into a visible ErrorBlock. Synthesize one here so the
-        // user sees the message without having to reload.
-        if (
-          event.status === "failed" &&
-          event.error != null &&
-          !s.blocks.some((b) => b.type === "error")
-        ) {
+        // Surface terminal-native failures carried only by session status.
+        // Deduplicate repeated status edges for one response, but preserve the
+        // same failure on later turns so each rejected prompt has a visible error.
+        const statusError = event.error;
+        const hasMatchingStatusError =
+          statusError != null &&
+          s.blocks.some(
+            (block) =>
+              block.type === "error" &&
+              block.ctx.responseId === (event.responseId ?? "") &&
+              block.code === statusError.code &&
+              block.message === statusError.message,
+          );
+        if (event.status === "failed" && statusError != null && !hasMatchingStatusError) {
           patch.blocks = [
             ...s.blocks,
             {
               type: "error",
-              ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
-              message: event.error.message,
+              ctx: {
+                agent: null,
+                depth: 0,
+                turn: 0,
+                timestamp: 0,
+                responseId: event.responseId ?? "",
+                itemId: null,
+              },
+              message: statusError.message,
               source: "",
-              code: event.error.code,
-              ...structuredErrorFields(event.error),
+              code: statusError.code,
+              ...structuredErrorFields(statusError),
             } satisfies ErrorBlock,
           ];
+        }
+        // A `runner_disconnected` card is an observation ("can't reach the
+        // runner"), not a turn result: any live status edge from the runner
+        // proves it is reachable again, so the stale card goes.
+        if (event.status !== "failed") {
+          const current = patch.blocks ?? s.blocks;
+          const reachable = current.filter(
+            (b) => !(b.type === "error" && b.code === "runner_disconnected"),
+          );
+          if (reachable.length !== current.length) patch.blocks = reachable;
         }
         return patch;
       });
@@ -5903,9 +6174,13 @@ function applyChildSessionUpdated(
 async function* tapSessionEvents(
   events: AsyncIterable<StreamEvent>,
   conversationId: string,
+  onElicitationResolved?: (elicitationId: string) => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
     handleSessionEvent(event, conversationId);
+    if (event.type === "elicitation_resolved") {
+      onElicitationResolved?.(event.elicitationId);
+    }
     pushSseEvent(conversationId, event);
     yield event;
   }

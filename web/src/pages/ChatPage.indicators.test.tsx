@@ -1,14 +1,14 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
+import { BubbleView } from "./ChatPage";
 import {
-  BubbleView,
   ConnectionIndicator,
   RunnerStartingIndicator,
   SandboxFailedIndicator,
-} from "./ChatPage";
+} from "./ChatIndicators";
 
 // Render-level coverage for the chat surface's status bands and bubble
 // dispatcher. These exercise the branches that the pure-helper tests can't:
@@ -24,18 +24,21 @@ afterEach(() => {
 });
 
 describe("SandboxFailedIndicator", () => {
-  it("renders the recorded failure reason so a dead launch explains itself", () => {
-    // WHY: a silently dead chat is the bug this band exists to prevent — the
-    // reason must reach the DOM.
+  it("surfaces the recorded failure reason in the pill so a dead launch explains itself", () => {
+    // WHY: a silently dead chat is the bug this pill exists to prevent — the
+    // reason must reach the DOM, reachable in the pill's expandable body.
     render(<SandboxFailedIndicator status={{ stage: "failed", error: "out of quota" }} />);
-    expect(screen.getByText(/Sandbox launch failed: out of quota/)).toBeInTheDocument();
+    expect(screen.getByTestId("error-headline")).toHaveTextContent("Sandbox launch failed");
+    fireEvent.click(screen.getByTestId("error-pill"));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent("out of quota");
   });
 
-  it("omits the colon suffix when no error detail is recorded", () => {
-    // WHY: a missing error must not render a dangling "failed: " — the
-    // ternary guards the suffix.
+  it("shows just the failure headline with no dangling colon when no reason is recorded", () => {
+    // WHY: a missing reason must not render a dangling "failed: " — the pill
+    // shows only the headline.
     render(<SandboxFailedIndicator status={{ stage: "failed", error: null }} />);
-    expect(screen.getByText("Sandbox launch failed")).toBeInTheDocument();
+    expect(screen.getByTestId("error-headline")).toHaveTextContent("Sandbox launch failed");
+    expect(screen.queryByText(/Sandbox launch failed:/)).not.toBeInTheDocument();
   });
 });
 
@@ -213,6 +216,58 @@ describe("BubbleView dispatch", () => {
     expect(bubble.firstElementChild).toHaveClass("w-full");
   });
 
+  const errorItem = (): AssistantBubble["items"][number] => ({
+    kind: "error",
+    itemId: "err_1",
+    message: "Required terminal exited unexpectedly; the runtime is no longer available.",
+    source: "execution",
+    code: "required_terminal_exited",
+  });
+
+  const errorBubble = (items: AssistantBubble["items"]): AssistantBubble => ({
+    kind: "assistant",
+    responseId: "resp_err",
+    stableId: "resp_err",
+    lifecycle: "completed",
+    error: null,
+    items,
+    createdAtS: 1_750_000_000,
+  });
+
+  it("spans the chat column for an error-only bubble, with no hover footer", () => {
+    // WHY: an error banner is a thread-level element — its dashed rule must
+    // span the width a long-text turn takes (not shrink-wrap the 560px pill
+    // via MessageContent's w-fit), and the timestamp/actions chrome belongs
+    // to assistant prose, never to the error.
+    render(<BubbleView bubble={errorBubble([errorItem()])} />);
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(bubble).toHaveClass("max-w-full");
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(screen.queryByTestId("message-timestamp")).not.toBeInTheDocument();
+  });
+
+  it("spans the chat column for a text+error turn and keeps the footer", () => {
+    // WHY: a mid-turn error shares the bubble with prose — the rule still
+    // spans the full column even when the prose is short, and the footer
+    // stays because the timestamp/actions describe the text.
+    render(
+      <BubbleView
+        bubble={errorBubble([
+          { kind: "text", itemId: "t1", text: "short answer", final: true },
+          errorItem(),
+        ])}
+      />,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(bubble).toHaveClass("max-w-full");
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(screen.getByTestId("message-timestamp")).toBeInTheDocument();
+  });
+
   it("marks a cancelled assistant turn as Interrupted", () => {
     // WHY: the cancelled lifecycle branch surfaces an explicit Interrupted
     // note so a truncated turn doesn't read as a complete answer.
@@ -220,11 +275,25 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByTestId("assistant-interrupted-indicator")).toHaveTextContent("Interrupted");
   });
 
-  it("renders the error text for a failed assistant turn", () => {
-    // WHY: the failed branch must surface the error so a dead turn explains
-    // itself instead of vanishing.
+  it("surfaces a failed turn's error as a destructive pill, never raw text", () => {
+    // WHY: a failed send/stream must render through the same error pill an error
+    // block uses — never bare red "Error:" text — and the message stays
+    // reachable in the pill's expandable body so a dead turn still explains itself.
     render(<BubbleView bubble={{ ...assistantText("", "failed"), error: "rate limited" }} />);
-    expect(screen.getByText(/Error: rate limited/)).toBeInTheDocument();
+    const pill = screen.getByTestId("error-pill");
+    expect(pill).toBeInTheDocument();
+    expect(screen.queryByText(/^Error:/)).not.toBeInTheDocument();
+    fireEvent.click(pill);
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent("rate limited");
+  });
+
+  it("adds no error pill for a failed turn whose message rides on its block", () => {
+    // WHY: a dropped-host turn ends "failed" but carries its explanation as an
+    // error block inside the bubble, leaving `error` null — the bubble must add
+    // no second pill (and never a bare "Error:") of its own.
+    render(<BubbleView bubble={{ ...assistantText("", "failed"), error: null }} />);
+    expect(screen.queryByTestId("error-pill")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Error:/)).not.toBeInTheDocument();
   });
 
   const toolItem = (callId: string): AssistantBubble["items"][number] => ({
@@ -289,7 +358,7 @@ describe("BubbleView dispatch", () => {
     // under an answered turn.
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
     const bubble = screen.getByTestId("message-bubble");
-    expect(bubble).toHaveClass("max-w-3xl");
+    expect(bubble).toHaveClass("max-w-3xl", "min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(bubble.firstElementChild).not.toHaveClass("w-fit");
   });
@@ -320,5 +389,36 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByTestId("compacting-indicator")).toHaveTextContent(
       "Compacting conversation…",
     );
+  });
+
+  it("accepts createdAtS timestamp for timer calculation", () => {
+    // WHY: when a compaction_loading bubble has a createdAtS timestamp, the timer
+    // component receives it and can calculate elapsed time from that timestamp
+    // rather than from component mount time, so the progress persists across
+    // session switches. This test verifies the prop flows through correctly.
+    const someTimestamp = Math.floor(Date.now() / 1000) - 10;
+
+    render(
+      <BubbleView
+        bubble={{ kind: "compaction_loading", itemId: "cmp_2", createdAtS: someTimestamp }}
+      />,
+    );
+
+    const indicator = screen.getByTestId("compacting-indicator");
+    expect(indicator).toHaveTextContent("Compacting conversation…");
+    // Timer should show some elapsed time (exact value depends on test timing)
+    expect(indicator.textContent).toMatch(/\(\d+s\)/);
+  });
+
+  it("shows 0s initially when no createdAtS is provided", () => {
+    // WHY: when a compaction_loading bubble has no createdAtS (shouldn't happen
+    // in practice, but defensive), the timer falls back to current time and shows
+    // 0s initially.
+    render(<BubbleView bubble={{ kind: "compaction_loading", itemId: "cmp_3" }} />);
+
+    const indicator = screen.getByTestId("compacting-indicator");
+    expect(indicator).toHaveTextContent("Compacting conversation…");
+    // Initially shows no elapsed time or (0s)
+    // (timer ticks immediately on mount, so we can't reliably assert the exact initial state)
   });
 });

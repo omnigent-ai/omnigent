@@ -315,6 +315,12 @@ class HostConnection:
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    # Import streams one session per frame, so the tunnel pushes each onto a
+    # per-request queue the /imports/local handler drains (vs a single future).
+    # Each item is a ("session", dict) or ("done", dict) tuple.
+    pending_import_local: dict[str, asyncio.Queue[tuple[str, dict[str, Any]]]] = field(
+        default_factory=dict,
+    )
 
 
 class HostRegistry:

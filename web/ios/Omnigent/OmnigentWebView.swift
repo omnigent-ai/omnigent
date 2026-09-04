@@ -8,6 +8,13 @@ struct OmnigentWebView: UIViewRepresentable {
   @ObservedObject var settings: SettingsStore
   let loadFailed: (URL, String) -> Void
   let loadSucceeded: () -> Void
+  /// Compose and push the current server-picker payload to the SPA.
+  let pushServerPicker: () -> Void
+  /// Switch the shell to a picker-listed server. The owner validates the
+  /// target against the managed/recent allow list before acting.
+  let requestSwitchServer: (String) -> Void
+  /// Return the shell to its "connect to server" setup page.
+  let openServerSetup: () -> Void
 
   func makeCoordinator() -> Coordinator {
     Coordinator(self)
@@ -179,6 +186,22 @@ struct OmnigentWebView: UIViewRepresentable {
           try { callback(mode); } catch {}
         }
       });
+      const serverPickerWaiters = new Set();
+      defineEmit("__omnigentNativeEmitServerPicker", (payload) => {
+        if (!payload || typeof payload !== "object") return;
+        if (typeof payload.currentOrigin !== "string" || !payload.currentOrigin) return;
+        const cleanList = (value) =>
+          Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : [];
+        const info = {
+          currentOrigin: payload.currentOrigin,
+          managedServers: cleanList(payload.managedServers),
+          recentServers: cleanList(payload.recentServers),
+        };
+        for (const resolve of serverPickerWaiters) {
+          try { resolve(info); } catch {}
+        }
+        serverPickerWaiters.clear();
+      });
       const insetCallbacks = new Set();
       // Cache the last footprint so a subscriber that registers AFTER native
       // first emitted (the React app mounts later than document-start) still
@@ -285,6 +308,31 @@ struct OmnigentWebView: UIViewRepresentable {
           if (lastInsets) { try { callback(lastInsets); } catch {} }
           return () => insetCallbacks.delete(callback);
         },
+        getServerPicker() {
+          // Always fetch fresh rather than caching: the picker re-reads on
+          // every menu open so a runtime MDM profile change appears without a
+          // reload, matching the Electron shell's per-call read. Native
+          // answers each request with an emit, resolving every waiter.
+          const pending = new Promise((resolve) => { serverPickerWaiters.add(resolve); });
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "requestServerPicker",
+          });
+          return pending;
+        },
+        switchServer(url) {
+          if (typeof url === "string") {
+            window.webkit.messageHandlers.omnigentNative.postMessage({
+              method: "switchServer",
+              url,
+            });
+          }
+          return Promise.resolve();
+        },
+        openServerSetup() {
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "openServerSetup",
+          });
+        },
       });
     })();
     """
@@ -307,6 +355,7 @@ struct OmnigentWebView: UIViewRepresentable {
     private var rootBounces = 0
     private static let maxRootBounces = 1
     private var urlObservation: NSKeyValueObservation?
+    private let oidcLoginManager = OidcLoginManager()
 
     init(_ parent: OmnigentWebView) {
       self.parent = parent
@@ -329,6 +378,7 @@ struct OmnigentWebView: UIViewRepresentable {
     func detach() {
       parent.model.cancelServerSwitcherWatchdog()
       urlObservation = nil
+      oidcLoginManager.cancel()
       webView = nil
     }
 
@@ -448,6 +498,13 @@ struct OmnigentWebView: UIViewRepresentable {
         parent.model.serverSwitcherHidden = (body["hidden"] as? NSNumber)?.boolValue ?? true
       case "setSidebarOpen":
         parent.model.serverSwitcherHidden = (body["open"] as? NSNumber)?.boolValue ?? true
+      case "requestServerPicker":
+        parent.pushServerPicker()
+      case "switchServer":
+        guard let urlString = body["url"] as? String else { return }
+        parent.requestSwitchServer(urlString)
+      case "openServerSetup":
+        parent.openServerSetup()
       case "setViewMode":
         let mode: WebViewMode = (body["mode"] as? String) == "terminal" ? .terminal : .chat
         parent.model.viewMode = mode
@@ -461,9 +518,22 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+      if let url = webView.url,
+        ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+        url.omnigentOrigin != pinnedOrigin
+      {
+        webView.stopLoading()
+        startLogin(in: webView)
+        return
+      }
       parent.model.isLoading = true
       parent.model.currentURL = webView.url ?? parent.model.currentURL
       parent.model.serverSwitcherHidden = true
+      // Hide the Chat/Terminal bar for the load too: the incoming page pushes
+      // its own truth via setViewMode once it mounts (current SPAs keep it
+      // hidden — the switcher lives in their header), so a stale visible bar
+      // from the previous page must not float over the new one while it boots.
+      parent.model.bottomBarVisible = false
       parent.model.armServerSwitcherWatchdog()
     }
 
@@ -544,6 +614,19 @@ struct OmnigentWebView: UIViewRepresentable {
         return
       }
 
+      if navigationAction.targetFrame?.isMainFrame == true,
+        ["http", "https"].contains(scheme),
+        url.omnigentOrigin != pinnedOrigin
+      {
+        if navigationAction.navigationType == .linkActivated {
+          openExternal(url)
+        } else {
+          startLogin(in: webView)
+        }
+        decisionHandler(.cancel)
+        return
+      }
+
       if ["http", "https", "about", "blob", "data"].contains(scheme) {
         decisionHandler(.allow)
         return
@@ -611,6 +694,17 @@ struct OmnigentWebView: UIViewRepresentable {
         return
       }
       promptForExternalURL(url, scheme: scheme)
+    }
+
+    private func startLogin(in webView: WKWebView) {
+      guard let pinnedOrigin else { return }
+      oidcLoginManager.start(
+        origin: pinnedOrigin,
+        cookieStore: webView.configuration.websiteDataStore.httpCookieStore
+      ) { [weak self, weak webView] in
+        guard let self, let webView, let pinnedURL = self.pinnedURL else { return }
+        webView.load(URLRequest(url: pinnedURL))
+      }
     }
 
     private func promptForExternalURL(_ url: URL, scheme: String) {

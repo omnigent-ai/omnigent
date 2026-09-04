@@ -34,6 +34,11 @@ adds native niceties:
   window can also be opened against a **different server** (see "Multiple
   servers" below). Notifications and the dock badge are app-wide (one badge
   for all windows); a notification click focuses the window that fired it.
+- **macOS Managed Preferences for MDM-provided servers.** Administrators can
+  publish an HTTPS `serverUrls` list in the `ai.omnigent.desktop` preference
+  domain. The connect screen and in-app switcher show those choices under
+  **Provided by your organization** without auto-connecting or preventing a
+  manually entered server. See [Managed Preferences](docs/managed-preferences.md).
 - **A dock / taskbar badge showing the number of unread sessions** at all
   times (macOS dock badge, Linux Unity launcher count, via
   `app.setBadgeCount`). A session becomes "unread" when it finishes a turn
@@ -42,8 +47,18 @@ adds native niceties:
   the badge.
 - **The standard native menu** (App / Edit / View / Window / Help) built from
   Electron's menu roles, so the usual text-editing shortcuts — Cmd/Ctrl-A,
-  C, V, X, Z — work inside the webview's text fields. Our custom actions —
-  **New Window**, **New Window on Different Server…**, and
+  C, V, X, Z — work inside the webview's text fields. **Settings…** uses the
+  native `Cmd+,` accelerator on macOS (`Ctrl+,` elsewhere) and routes the
+  focused connected window through the SPA without reloading it. On macOS,
+  **About Omnigent** opens a shell-owned modal showing the platform app and
+  detected CLI versions; the CLI section points users to `omni update`.
+  **Check for Updates…** in
+  the Server menu opens the same modal and starts a check. **Update now** in the
+  shell update prompt opens the modal, hides the prompt, and starts the download;
+  the modal shows live progress and then offers **Restart to update**. Packaged macOS builds
+  resolve the running app's native icon so the modal uses the current
+  `Assets.car`/Liquid Glass appearance rather than the development PNG. Our other custom actions
+  — **New Window**, **New Window on Different Server…**, and
   **Change Server…** — live in a dedicated **Server** submenu. On macOS a
   **Notifications** submenu turns the notification sound on/off (**Play
   Notification Sound**, **off by default** — the user opts in) and picks which
@@ -82,8 +97,9 @@ adds native niceties:
 
 ## How it works (zero UI duplication)
 
-The desktop app does **not** ship a copy of the web UI. It bundles only a tiny
-"connect to server" page (`setup/index.html`). On launch:
+The desktop app does **not** ship a copy of the server web UI. It bundles small
+shell-owned pages for connecting to a server and native utilities such as the
+About modal. On launch:
 
 1. If no server URL is saved yet, it shows the setup page (one input +
    Connect). You enter your Omnigent server URL (default
@@ -110,6 +126,26 @@ Open another view with **Server → New Window** (`Cmd/Ctrl+N`). It clones the
 focused window's current URL onto a new window against the same server, so two
 conversations can be watched at once.
 
+## Debugging a packaged macOS build
+
+Developer Tools are disabled by default in the production app. To opt in, quit
+Omnigent, set its macOS user default, and reopen it:
+
+```bash
+defaults write ai.omnigent.desktop DeveloperMode -bool true
+```
+
+The **Debug → Developer Tools** menu is then available in the packaged app. To
+turn production debugging off again, quit Omnigent and remove the override:
+
+```bash
+defaults delete ai.omnigent.desktop DeveloperMode
+```
+
+Development (`pnpm --dir web/electron dev`) builds keep Developer Tools enabled
+without this preference. The override is intentionally macOS-only and does not
+relax production update security checks.
+
 The native enhancements live on the web side in
 [`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts). It detects the
 Electron shell at runtime (the preload exposes `window.omnigentDesktop`
@@ -124,13 +160,18 @@ electron/
   package.json             # Electron + electron-builder deps and build config
   src/main.js              # main process: window, settings, menu, IPC, badge, notify
   src/preload.js           # contextBridge: window.omnigentDesktop + omnigentSetup
+  src/about_window.js      # shell-owned About modal + guarded update IPC
+  src/about_preload.js     # narrow contextBridge for the About modal
+  src/managed_preferences.js # read/validate macOS MDM server choices
   src/find_preload.js      # contextBridge for the find bar: window.omnigentFind
   src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
   setup/index.html         # the bundled "connect to server" setup page
+  about/index.html         # bundled About UI opened from the macOS app menu
   find/index.html          # the bundled find-in-page bar (Cmd/Ctrl+F)
   icons/                   # app icons
+  docs/managed-preferences.md # public MDM configuration contract
 ```
 
 Native niceties beyond notifications/badge: a right-click context menu
@@ -245,6 +286,10 @@ against its local Chromium, and the result is posted back.
   conversation's page keeps running when the user switches away; views are
   destroyed only on explicit close or window teardown. Each child view keeps
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
+  Page-initiated `window.open` / `target=_blank` never spawns a window: an
+  http(s) target navigates the same view in place (still allowlist-checked on
+  an agent-locked view), and right-click offers "Open Link in Browser" /
+  "Copy Link Address".
 - `src/browserViewBounds.js` — converts the placeholder's renderer CSS pixels to
   window device-independent pixels (they diverge after `Cmd+/Cmd-` zoom).
 - `src/main.js` — instantiates one registry **per shell window** and injects it
@@ -367,6 +412,22 @@ server (see below), Connect, and you're in.
 > **not** run the Vite dev server. To develop the web UI itself with hot
 > reload, run `pnpm run dev` (plain Vite in a browser) from `web/` as usual.
 
+### Test desktop updates
+
+To override the current version used by development update checks, launch the
+unpackaged app with a valid semantic version:
+
+```bash
+OMNIGENT_DESKTOP_VERSION_OVERRIDE=0.9.0 pnpm start
+```
+
+The override controls both the **Current version** shown in update prompts and
+the baseline `electron-updater` uses to decide whether a production release is
+newer. It does not change Electron's real app/package version. Packaged builds
+ignore it. `pnpm start` rebuilds the shell-owned update overlay before launching
+it. Unpackaged runs read `dev-app-update.yml`, which intentionally checks the
+same production HTTPS update server as packaged builds.
+
 ## Build a distributable
 
 From `web/electron/`:
@@ -374,7 +435,7 @@ From `web/electron/`:
 ```bash
 pnpm run build             # current platform
 pnpm run build:mac         # .dmg + .zip (signed if an identity is available, not notarized)
-pnpm run build:mac:release # .dmg + .zip, signed + notarized (requires credentials, see below)
+pnpm run build:mac:release # .dmg + .zip; app and DMG signed + notarized (see below)
 pnpm run build:linux       # AppImage + .deb
 pnpm run build:win         # NSIS installer
 ```
@@ -394,7 +455,7 @@ build:
 | ------------------------------------------------------------------ | -------------------------------------------------------------------- |
 | none                                                               | ad-hoc–signed app; runs locally, other Macs see a Gatekeeper warning |
 | Developer ID cert                                                  | signed app; downloads still warn until notarized                     |
-| Developer ID cert + Apple notarization creds (`build:mac:release`) | signed + notarized; installs cleanly everywhere                      |
+| Developer ID cert + Apple notarization creds (`build:mac:release`) | app and DMG signed + notarized; installs cleanly everywhere          |
 
 ### 1. Get a signing certificate
 
@@ -446,17 +507,21 @@ then:
 pnpm run build:mac:release
 ```
 
-This is the same build with `mac.notarize=true` switched on; expect the
-notarization step to add a few minutes (Apple-side processing). Verify the
+This release build signs and notarizes the app first so both the DMG and ZIP
+contain a trusted app. It then signs each finished DMG, submits it to Apple,
+and staples and validates the resulting ticket. Expect the notarization steps
+to add a few minutes per architecture (Apple-side processing). Verify the
 result with:
 
 ```bash
 spctl -a -vv dist/mac-arm64/Omnigent.app   # → "accepted, source=Notarized Developer ID"
+codesign --verify --verbose=2 dist/Omnigent-*-arm64.dmg
+xcrun stapler validate -v dist/Omnigent-*-arm64.dmg
 ```
 
-`build:mac:release` **fails loudly** if signing or notarization
-credentials are missing — that's intentional, so a release artifact can't
-silently ship unsigned.
+`build:mac:release` **fails loudly** if signing or notarization credentials
+are missing, if Apple rejects a DMG, or if stapling fails. That's intentional,
+so a release artifact can't silently ship unsigned or unnotarized.
 
 ## Getting a server to point at
 
@@ -638,13 +703,13 @@ server in the desktop app — the way a browser deep link opens a page:
 
 ```
 omnigent://localhost:8000/c/conv_abc              → http://localhost:8000/c/conv_abc
-omnigent://my-workspace.cloud.databricks.com/c/x → https://…/ml/omnigents/c/x
+omnigent://my-workspace.cloud.databricks.com/c/x → https://…/omnigent/c/x
 ```
 
 The link names a server by **host** (with port if non-default) and carries no
 `http`/`https` — the shell infers the scheme with the same rule the setup page
 uses (`http` for loopback, `https` for a remote host), so a deep link and a
-pasted URL can never disagree. The Databricks workspace mount (`/ml/omnigents`)
+pasted URL can never disagree. The Databricks workspace mount (`/omnigent`)
 is **not** in the link; it is server-determined and discovered the same way a
 pasted workspace URL is. v1 accepts only `/c/<session_id>`; other paths are
 ignored.

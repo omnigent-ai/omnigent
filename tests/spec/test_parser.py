@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from omnigent.errors import OmnigentError
-from omnigent.spec.parser import discover_host_skills, parse
+from omnigent.spec.parser import _parse_skill, discover_host_skills, parse
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
@@ -90,6 +90,7 @@ def test_parse_full_config(tmp_path: Path) -> None:
     assert spec.llm.model == "openai/gpt-5.4"
     # executor.model is the canonical source — verify consolidation
     assert spec.executor.model == "openai/gpt-5.4"
+    assert spec.executor.reasoning_effort == "medium"
     assert spec.llm.extra == {
         "max_completion_tokens": 4096,
         "reasoning_effort": "medium",
@@ -99,6 +100,44 @@ def test_parse_full_config(tmp_path: Path) -> None:
     assert spec.interaction.modalities.output == ["text"]
     assert spec.tools.agents == ["researcher", "critic"]
     assert spec.params == {"max_results": 10, "prefer_recent": True}
+
+
+def test_parse_llm_reasoning_effort_lifted_to_executor(tmp_path: Path) -> None:
+    """The deprecated ``llm.reasoning_effort`` lifts to the canonical field.
+
+    Mirrors the model/connection consolidation: ``executor.reasoning_effort``
+    is the source of truth, populated from the ``llm:`` block for back-compat.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "eff-llm",
+        "llm": {"model": "openai/gpt-5.4", "reasoning_effort": "xhigh"},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.executor.reasoning_effort == "xhigh"
+    assert spec.llm is not None
+    assert spec.llm.extra.get("reasoning_effort") == "xhigh"
+
+
+def test_parse_executor_reasoning_effort_supersedes_llm(tmp_path: Path) -> None:
+    """When both are set, executor.reasoning_effort wins and llm is synced to it."""
+    config = {
+        "spec_version": 1,
+        "name": "eff-both",
+        "executor": {
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk"},
+            "model": "openai/gpt-5.4",
+            "reasoning_effort": "high",
+        },
+        "llm": {"model": "openai/gpt-5.4", "reasoning_effort": "low"},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.executor.reasoning_effort == "high"
+    assert spec.llm is not None
+    assert spec.llm.extra.get("reasoning_effort") == "high"
 
 
 def test_parse_llm_missing_model(tmp_path: Path) -> None:
@@ -640,6 +679,133 @@ _UPSTREAM_BAD_ARGUMENT_HINT = (
 )
 
 
+# The literal ``description:`` line from the ``dev-productivity`` plugin's
+# ``simplify`` skill. Claude Code loads it; strict YAML rejects it because a
+# plain scalar may not contain ``": "`` — so every user with that plugin
+# installed silently lost the skill from Omnigent's menus.
+_UPSTREAM_COLON_IN_DESCRIPTION = (
+    "description: Refines already-working code for clarity, consistency, and "
+    "maintainability while preserving behavior. Targets code the user wants "
+    "cleaned up, not code that was just written: finishing an implementation, "
+    "bug fix, or refactor does not call for this skill."
+)
+
+
+def test_parse_skill_accepts_unquoted_colon_in_description(
+    tmp_path: Path,
+) -> None:
+    """
+    A description carrying an unquoted ``": "`` still yields a skill.
+
+    Authors write prose in ``description:`` without quoting it, and prose
+    contains colons. Claude Code accepts that; if Omnigent insists on strict
+    YAML the skill vanishes from its menus with only a log line to say why.
+    """
+    skill_dir = tmp_path / "simplify"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(f"---\nname: simplify\n{_UPSTREAM_COLON_IN_DESCRIPTION}\n---\nContent.")
+
+    skill = _parse_skill(skill_md)
+
+    assert skill.name == "simplify"
+    # The whole line survives verbatim — the text after the colon is part of
+    # the description, not a nested mapping.
+    assert skill.description == _UPSTREAM_COLON_IN_DESCRIPTION.removeprefix("description: ")
+    assert skill.content == "Content."
+
+
+def test_parse_skill_colon_recovery_keeps_other_yaml_errors_loud(
+    tmp_path: Path,
+) -> None:
+    """
+    Recovery is scoped to the colon case; other malformed YAML still raises.
+
+    ``argument-hint: [industry] [--rows N]`` breaks on the flow sequence, not
+    on a colon. Quoting must not paper over it, or a genuinely broken
+    frontmatter would be read as prose and its fields silently misparsed.
+    """
+    skill_dir = tmp_path / "bad-yaml"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        f"---\nname: bad-yaml\ndescription: x\n{_UPSTREAM_BAD_ARGUMENT_HINT}\n---\nContent."
+    )
+
+    with pytest.raises(OmnigentError, match=r"invalid YAML frontmatter"):
+        _parse_skill(skill_md)
+
+
+def test_parse_skill_colon_recovery_leaves_other_keys_alone(
+    tmp_path: Path,
+) -> None:
+    """
+    A colon in a non-description key still raises, keeping the skill hidden.
+
+    ``user-invocable: false: internal only`` is invalid YAML. Quoting it would
+    make the value the truthy string ``"false: internal only"``, so a skill its
+    author marked internal would appear in the user's ``/`` menu. Recovery is
+    scoped to ``description`` precisely so that cannot happen.
+    """
+    skill_dir = tmp_path / "internal-skill"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: internal-skill\ndescription: orchestrates\n"
+        "user-invocable: false: internal only\n---\nContent."
+    )
+
+    with pytest.raises(OmnigentError, match=r"invalid YAML frontmatter"):
+        _parse_skill(skill_md)
+
+
+def test_parse_skill_colon_recovery_does_not_absorb_indented_keys(
+    tmp_path: Path,
+) -> None:
+    """
+    A mis-indented setting is not folded into a recovered description.
+
+    Continuation lines fold into a plain scalar, but an indented
+    ``user-invocable: false`` is a mis-indented setting, not prose. Absorbing
+    it would drop the flag and publish an internal skill, so the run stops
+    there and the file is rejected instead.
+    """
+    skill_dir = tmp_path / "indented-key"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: indented-key\ndescription: orchestrates things: internally\n"
+        "  user-invocable: false\n---\nContent."
+    )
+
+    with pytest.raises(OmnigentError, match=r"invalid YAML frontmatter"):
+        _parse_skill(skill_md)
+
+
+def test_parse_skill_colon_recovery_folds_wrapped_prose(
+    tmp_path: Path,
+) -> None:
+    """
+    A wrapped description recovers, and later keys keep their own meaning.
+
+    The continuation line is prose, so it folds with a single space the way a
+    YAML plain scalar would; ``user-invocable`` is a sibling key rather than
+    part of the description and still parses as a boolean.
+    """
+    skill_dir = tmp_path / "wrapped"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: wrapped\ndescription: Use when foo: bar\n"
+        "  and also when baz qux\nuser-invocable: false\n---\nContent."
+    )
+
+    skill = _parse_skill(skill_md)
+
+    assert skill.description == "Use when foo: bar and also when baz qux"
+    assert skill.user_invocable is False
+
+
 def test_parse_skill_invalid_yaml_frontmatter_in_bundle_raises(
     agent_dir: Path,
 ) -> None:
@@ -771,6 +937,41 @@ def test_discover_host_skills_skips_unreadable_skill_file(
     msg = skip_records[0].message
     assert str(bad_md) in msg
     assert "could not be read" in msg
+
+
+def _write_skill(skill_dir: Path, name: str) -> None:
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(f"---\nname: {name}\ndescription: d\n---\nBody.")
+
+
+def test_discover_skills_in_namespace_directories(agent_dir: Path) -> None:
+    """
+    A folder under ``skills/`` without its own ``SKILL.md`` groups
+    skills one level deeper: ``skills/<ns>/<skill>/SKILL.md`` must be
+    discovered alongside flat ``skills/<skill>/SKILL.md`` entries.
+    """
+    skills = agent_dir / "skills"
+    _write_skill(skills / "flat", "flat")
+    _write_skill(skills / "ops" / "deploy", "deploy")
+    _write_skill(skills / "ops" / "rollback", "rollback")
+
+    assert [s.name for s in parse(agent_dir).skills] == ["flat", "deploy", "rollback"]
+
+
+def test_discover_skills_namespace_depth_is_bounded(agent_dir: Path) -> None:
+    """
+    Namespace descent stops after one level and never enters dot-dirs,
+    so a cloned skill pack's ``.git`` tree or a deeply nested layout
+    cannot be walked (host skill dirs are user-managed).
+    """
+    skills = agent_dir / "skills"
+    _write_skill(skills / "ops" / "deploy", "deploy")
+    _write_skill(skills / "ops" / "too" / "deep", "deep")
+    _write_skill(skills / ".git" / "hidden", "hidden")
+    _write_skill(skills / ".direct-hidden", "direct-hidden")
+    _write_skill(skills / "ops" / ".nested-hidden", "nested-hidden")
+
+    assert [s.name for s in parse(agent_dir).skills] == ["deploy"]
 
 
 # ── top-level ``skills:`` field (host-skill filter) ──────────────
@@ -962,8 +1163,13 @@ def test_discover_host_skills_skips_yaml_syntax_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """
-    Host skills whose frontmatter contains invalid YAML (e.g.
-    unquoted colons) are skipped gracefully.
+    Host skills whose frontmatter contains invalid YAML are skipped
+    gracefully.
+
+    Uses the flow-sequence case rather than an unquoted colon: prose colons
+    are recovered now (see
+    ``test_parse_skill_accepts_unquoted_colon_in_description``), so they no
+    longer exercise the skip path.
 
     :param tmp_path: Temporary directory for test fixtures.
     :param monkeypatch: Pytest monkeypatch for isolating ``Path.home()``.
@@ -978,9 +1184,8 @@ def test_discover_host_skills_skips_yaml_syntax_error(
     skills_dir = fake_home / ".claude" / "skills"
     broken = skills_dir / "broken-yaml"
     broken.mkdir(parents=True)
-    # Unquoted colon in description triggers yaml.scanner.ScannerError.
     (broken / "SKILL.md").write_text(
-        "---\nname: broken-yaml\ndescription: TRIGGER when: code imports foo\n---\nContent."
+        f"---\nname: broken-yaml\ndescription: x\n{_UPSTREAM_BAD_ARGUMENT_HINT}\n---\nContent."
     )
 
     agent_root = tmp_path / "project"
@@ -1836,6 +2041,25 @@ def test_parse_os_env_sandbox_with_cwd_allow_hidden(tmp_path: Path) -> None:
     assert spec.os_env is not None
     assert spec.os_env.sandbox is not None
     assert spec.os_env.sandbox.cwd_allow_hidden == [".venv", ".cache"]
+
+
+def test_parse_os_env_sandbox_cwd_allow_hidden_wildcard(tmp_path: Path) -> None:
+    """The explicit wildcard survives parsing for trusted workspaces."""
+    config = {
+        "spec_version": 1,
+        "name": "allow-all-hidden",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": "linux_bwrap", "cwd_allow_hidden": ["*"]},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.cwd_allow_hidden == ["*"]
 
 
 def test_parse_os_env_sandbox_cwd_allow_hidden_empty_list_preserved(
@@ -4027,3 +4251,38 @@ def test_sub_agent_source_rel_dir_uses_directory_not_yaml_name(tmp_path: Path) -
     (child,) = spec.sub_agents
     assert child.name == "Deep Researcher"
     assert child.source_rel_dir == "web-researcher"
+
+
+def test_parse_executor_reasoning_effort(tmp_path: Path) -> None:
+    """``executor.reasoning_effort`` is lifted onto the concrete field.
+
+    It sits beside ``executor.model`` in the YAML because it is the same
+    kind of setting — a harness-level default for the agent — and a spec
+    that declares one must not have it silently dropped the way a stray
+    key under ``executor.config`` would be.
+    """
+    config = {
+        "spec_version": 1,
+        "executor": {
+            "type": "omnigent",
+            "model": "claude-opus-5",
+            "reasoning_effort": "high",
+            "config": {"harness": "claude-native"},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.executor.reasoning_effort == "high"
+    assert spec.executor.model == "claude-opus-5"
+    # It is a concrete field, not smuggled into the free-form config bag.
+    assert "reasoning_effort" not in spec.executor.config
+
+
+def test_parse_executor_reasoning_effort_absent(tmp_path: Path) -> None:
+    """A spec that declares no effort leaves the field ``None``."""
+    config = {"spec_version": 1, "executor": {"type": "omnigent"}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.executor.reasoning_effort is None

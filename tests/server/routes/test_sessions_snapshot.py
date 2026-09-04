@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -346,6 +347,105 @@ async def test_session_snapshot_uses_child_spec_metadata(
     assert child.context_window == 100_000
     assert child.harness == "codex"
     assert cache_loads == [True, True, True, True]
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A child session whose ``sub_agent_name`` no longer resolves in the
+    parent bundle publishes the PARENT's identity, model and context window,
+    and warns.
+
+    Reporting the parent is long-standing: this path already retained the
+    parent spec and published its name, model and context window on a miss.
+    What the snapshot did not do was say so. The warning is the new part, and
+    it is what makes this the same answer the runner-side consumers of
+    ``_find_spec_by_name`` give across a separate process boundary.
+
+    Both halves are asserted: the warning must be emitted AND the parent's
+    values must be published — a silent fallback satisfies neither.
+
+    :param monkeypatch: Pytest monkeypatch, used to stub runner lookups.
+    :param caplog: Pytest log capture, used to confirm the unresolved
+        sub-agent is reported rather than passed over in silence.
+    """
+    parent_spec = AgentSpec(
+        spec_version=1,
+        name="advisor",
+        executor=ExecutorSpec(
+            config={"harness": "codex"},
+            model="openai-codex/gpt-5.6-sol:high",
+            context_window=200_000,
+        ),
+        # No sub_agents: "executor" (recorded on the child conversation row)
+        # cannot resolve — simulates a spec edit removing the sub-agent
+        # after the child session was created.
+    )
+    conversations = {
+        "conv_parent": Conversation(
+            id="conv_parent",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            agent_id="ag_advisor",
+        ),
+        "conv_child": Conversation(
+            id="conv_child",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            parent_conversation_id="conv_parent",
+            agent_id="ag_advisor",
+            kind="sub_agent",
+            sub_agent_name="executor",
+        ),
+    }
+    conv_store = _ConversationStore([], conversations=conversations)
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            assert agent_id == "ag_advisor"
+            return type(
+                "StoredAgent",
+                (),
+                {
+                    "id": agent_id,
+                    "name": "advisor-row",
+                    "bundle_location": "bundle",
+                    "session_id": None,
+                },
+            )()
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool = True) -> Any:
+            assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
+            return type("LoadedAgent", (), {"spec": parent_spec})()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes._sessions.orchestration"):
+        child = await _get_session_snapshot(
+            conv_store,  # type: ignore[arg-type]
+            "conv_child",
+            agent_store=_AgentStore(),  # type: ignore[arg-type]
+            agent_cache=_AgentCache(),  # type: ignore[arg-type]
+        )
+
+    assert "'executor'" in caplog.text and "did not resolve" in caplog.text, (
+        f"The unresolved sub-agent must be warned about; got {caplog.text!r}."
+    )
+    # The PARENT spec is what the session actually runs on, so it is what the
+    # snapshot reports: the spec's own name ("advisor"), not the agent ROW's
+    # name ("advisor-row") and not the recorded child name ("executor").
+    assert child.agent_name == "advisor"
+    assert child.llm_model == "openai-codex/gpt-5.6-sol:high"
+    assert child.context_window == 200_000
 
 
 @pytest.mark.asyncio
@@ -771,7 +871,7 @@ async def test_session_snapshot_includes_model_options_from_runner(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
                         "models": [
@@ -823,7 +923,7 @@ async def test_session_snapshot_includes_model_options_from_runner(
         session_id,
     )
 
-    assert f"/v1/sessions/{session_id}/codex-model-options" in fake_client.get_calls
+    assert f"/v1/sessions/{session_id}/model-options" in fake_client.get_calls
     assert [m.id for m in snapshot.model_options] == ["gpt-5.5"]
     assert snapshot.model_options[0].displayName == "GPT-5.5"
     assert [
@@ -841,6 +941,12 @@ async def test_session_snapshot_includes_model_options_from_runner(
 async def test_kiro_session_snapshot_loads_runner_model_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """An older runner without the unified route still fills the picker.
+
+    The fake runner 404s ``/model-options`` (it predates the unified
+    route), so the server's loader must drop to the legacy harness-named
+    route and serve its rows — the compat lane until 0.11.0.
+    """
     from omnigent.server.routes import sessions as _mod
 
     _mod._runner_skills_cache.clear()
@@ -849,9 +955,8 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
     _mod._model_options_inflight.clear()
 
     class _FakeResponse:
-        status_code = 200
-
-        def __init__(self, payload: dict[str, object]) -> None:
+        def __init__(self, payload: dict[str, object], status_code: int = 200) -> None:
+            self.status_code = status_code
             self._payload = payload
 
         def json(self) -> dict[str, object]:
@@ -866,6 +971,8 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
+            if url.endswith("/model-options"):
+                return _FakeResponse({"detail": "Not Found"}, status_code=404)
             if url.endswith("/kiro-model-options"):
                 return _FakeResponse(
                     {
@@ -908,6 +1015,8 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
     await _drain_model_options(session_id)
     snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
 
+    # The unified route was tried first, then the legacy alias filled in.
+    assert f"/v1/sessions/{session_id}/model-options" in fake_client.get_calls
     assert f"/v1/sessions/{session_id}/kiro-model-options" in fake_client.get_calls
     assert [model.id for model in snapshot.model_options] == ["provider-latest"]
     assert snapshot.model_options[0].model_dump()["description"] == (
@@ -948,7 +1057,7 @@ async def test_claude_session_snapshot_loads_launch_time_model_aliases(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/claude-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
                         "models": [
@@ -993,7 +1102,7 @@ async def test_claude_session_snapshot_loads_launch_time_model_aliases(
     await _drain_model_options(session_id)
     snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
 
-    assert f"/v1/sessions/{session_id}/claude-model-options" in fake_client.get_calls
+    assert f"/v1/sessions/{session_id}/model-options" in fake_client.get_calls
     assert [(m.id, m.displayName) for m in snapshot.model_options] == [
         ("opus", "Opus 4.10"),
         ("haiku", "Haiku 4.5"),
@@ -1127,7 +1236,7 @@ async def test_session_snapshot_fetches_live_cursor_model_options(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/cursor-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
                         "models": [
@@ -1174,10 +1283,7 @@ async def test_session_snapshot_fetches_live_cursor_model_options(
 
     assert [m.id for m in snapshot.model_options] == ["provider-latest"]
     assert snapshot.model_options[0].displayName == "Provider Latest"
-    assert (
-        "/v1/sessions/4747fb03a3b45bb1f96bf130f4d704e5/cursor-model-options"
-        in fake_client.get_calls
-    )
+    assert "/v1/sessions/4747fb03a3b45bb1f96bf130f4d704e5/model-options" in fake_client.get_calls
     assert "4747fb03a3b45bb1f96bf130f4d704e5" in _mod._model_options_cache
 
 
@@ -1229,7 +1335,7 @@ async def test_snapshot_refresh_scopes_cached_options_to_cursor(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith(f"/{wrapper_name}-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
                         "models": [
@@ -1278,10 +1384,7 @@ async def test_snapshot_refresh_scopes_cached_options_to_cursor(
         "3626053dfa9668a8604cc06e0b590ae0",
     )
 
-    assert (
-        f"/v1/sessions/3626053dfa9668a8604cc06e0b590ae0/{wrapper_name}-model-options"
-        in fake_client.get_calls
-    )
+    assert "/v1/sessions/3626053dfa9668a8604cc06e0b590ae0/model-options" in fake_client.get_calls
     assert [m.id for m in snapshot.model_options] == ["fresh-model"]
     assert snapshot.model_options[0].displayName == "Fresh Model"
 
@@ -1321,7 +1424,7 @@ async def test_session_snapshot_serves_cached_model_options_while_runner_offline
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse({"models": [{"id": "gpt-5.5", "displayName": "GPT-5.5"}]})
             return _FakeResponse({"status": "idle"})
 
@@ -1403,7 +1506,7 @@ async def test_session_snapshot_refetches_stale_model_options_after_relaunch(
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse({"models": [{"id": self.model_id}]})
             return _FakeResponse({"status": "idle"})
 
@@ -1577,7 +1680,7 @@ async def test_session_snapshot_retries_empty_model_options(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(self._codex_payloads.pop(0))
             return _FakeResponse({"status": "idle"})
 
@@ -1614,9 +1717,7 @@ async def test_session_snapshot_retries_empty_model_options(
     # Two codex-model-options calls means the empty catalog was not cached;
     # one call would recreate the missing-picker regression.
     assert (
-        fake_client.get_calls.count(
-            "/v1/sessions/a17f935755fe66e4a0f42878eee28820/codex-model-options"
-        )
+        fake_client.get_calls.count("/v1/sessions/a17f935755fe66e4a0f42878eee28820/model-options")
         == 2
     )
     assert [m.id for m in snapshot.model_options] == ["gpt-5.5"]
@@ -1691,7 +1792,7 @@ async def test_session_snapshot_retries_503_model_options(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return self._codex_responses.pop(0)
             return _FakeResponse({"status": "idle"})
 
@@ -1728,9 +1829,7 @@ async def test_session_snapshot_retries_503_model_options(
     # Two calls proves the transient 503 did not terminate discovery; one
     # call would leave the cache cold forever until another snapshot request.
     assert (
-        fake_client.get_calls.count(
-            "/v1/sessions/a5cf1ddab988dcc43e643401b70c56d0/codex-model-options"
-        )
+        fake_client.get_calls.count("/v1/sessions/a5cf1ddab988dcc43e643401b70c56d0/model-options")
         == 2
     )
     assert [m.id for m in snapshot.model_options] == ["gpt-5.4"]

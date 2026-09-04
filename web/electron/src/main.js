@@ -1,8 +1,8 @@
 // Omnigent desktop shell — Electron edition.
 //
 // A deliberately thin Electron wrapper around the existing web UI. It bundles
-// ONLY a tiny "connect to server" setup page; the real application UI is the
-// SPA served by the Omnigent server itself. At startup we read a persisted
+// small shell-owned surfaces (setup, About, update notices); the real
+// application UI is the SPA served by the Omnigent server itself. At startup we read a persisted
 // server URL and, if present, load it directly so the user lands in the same
 // UI they'd see in a browser — now with OS-native notifications and a
 // dock/taskbar badge (wired up on the web side via `src/lib/nativeBridge.ts`,
@@ -32,6 +32,7 @@ const {
 const { autoUpdater } = require("electron-updater");
 const { createDesktopUpdater } = require("./desktop_updater");
 const { createUpdateOverlay } = require("./update_overlay");
+const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -39,25 +40,123 @@ const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const {
   normalizeUrl,
+  normalizeRecentServers,
   expandDatabricksWorkspaceUrl,
+  normalizeSavedServerUrl,
   fetchServerManifest,
+  isDatabricksManagedServerUrl,
   PRE_MANIFEST_BASELINE,
+  LOCAL_HOSTS,
 } = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
+const { registerWorkspaceRootBounce } = require("./workspace-root-bounce");
+const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner");
+const { createReturnBanner } = require("./return_banner");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
+const { isDeveloperModeEnabled } = require("./developer_mode");
+const {
+  excludingManagedServers,
+  getDatabricksInternalFeaturesEnabled,
+  getManagedServerUrls,
+} = require("./managed_preferences");
+const arca = require("./arca");
+const isaac = require("./isaac");
+const { createArcaConnectFlow } = require("./arca_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
+const {
+  SETTINGS_PATH,
+  focusedConnectedWindow,
+  aboutMenuItem,
+  macApplicationMenu,
+  settingsMenuItem,
+} = require("./settingsNavigation");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
 
+/** Shell-owned About page opened from the application menu. */
+const ABOUT_PAGE = path.join(__dirname, "..", "about", "index.html");
+
 /** The setup page's file:// URL, for verifying IPC sender frames. */
 const SETUP_PAGE_URL = pathToFileURL(SETUP_PAGE);
+
+/** The gated server selector (built by web's `build:server-selector-v2`). */
+const SERVER_SELECTOR_V2_PAGE = path.join(
+  __dirname,
+  "..",
+  "server-selector-v2",
+  "server-selector-v2.html",
+);
+const SERVER_SELECTOR_V2_PAGE_URL = pathToFileURL(SERVER_SELECTOR_V2_PAGE);
+
+/** True when OMNIGENT_SERVER_SELECTOR_V2 forces the wizard on (CI/dev override). */
+function serverSelectorV2EnvForced() {
+  return process.env.OMNIGENT_SERVER_SELECTOR_V2 === "1";
+}
+
+/**
+ * Whether to show the React server selector instead of the classic static
+ * setup page. The env var forces it on (dev/CI); otherwise it's the persisted
+ * View → Experiments toggle (settings.json `server_selector_v2`). Default: off.
+ */
+function serverSelectorV2Enabled() {
+  return serverSelectorV2EnvForced() || loadSettings().server_selector_v2 === true;
+}
+
+/** Which setup page to load — the server selector when enabled. */
+function setupPagePath() {
+  return serverSelectorV2Enabled() ? SERVER_SELECTOR_V2_PAGE : SETUP_PAGE;
+}
+
+/**
+ * The wizard's Vite dev-server URL, used only in an unpackaged build with the
+ * wizard enabled. Defaults to the fixed port the `dev:server-selector-v2` script
+ * pins (see web/vite.server-selector-v2.config.ts);
+ * OMNIGENT_SERVER_SELECTOR_V2_DEV_URL overrides it. Null when not applicable, so
+ * a packaged build always loads the file://.
+ */
+function serverSelectorV2DevUrl() {
+  if (app.isPackaged || !serverSelectorV2Enabled()) return null;
+  return (
+    process.env.OMNIGENT_SERVER_SELECTOR_V2_DEV_URL ||
+    "http://localhost:5174/server-selector-v2.html"
+  );
+}
+
+/**
+ * Load the setup page (or server selector) into `win`, appending `search`
+ * (a query string without the leading "?", or empty).
+ *
+ * In dev with the wizard flag on, try the Vite dev server over http (so the
+ * wizard gets HMR — it still runs in this window, keeping the omnigentSetup
+ * bridge). If that server isn't running, loadURL rejects and we fall back to
+ * the bundled file:// page. Prod always loads file://. Returns the load promise.
+ *
+ * Deferred to the next tick: this is often called from inside a `did-fail-load`
+ * handler (a dead saved server bouncing back to setup). Navigating a webContents
+ * synchronously while the failed load is still tearing down is unreliable —
+ * Electron can drop the new navigation and strand the window on the error page
+ * (seen in dev when BOTH the server and the Vite dev server are down). Letting
+ * the failing load settle first makes the fallback land every time.
+ */
+function loadSetupPage(win, search = "") {
+  const loadFile = () => win.loadFile(setupPagePath(), search ? { search } : undefined);
+  const devUrl = serverSelectorV2DevUrl();
+  const run = () => {
+    if (win.isDestroyed()) return Promise.resolve();
+    if (devUrl) return win.loadURL(search ? `${devUrl}?${search}` : devUrl).catch(loadFile);
+    return loadFile();
+  };
+  return new Promise((resolve) => {
+    setTimeout(() => resolve(run()), 0);
+  });
+}
 
 /** Absolute path to the bundled find-in-page bar page. */
 const FIND_PAGE = path.join(__dirname, "..", "find", "index.html");
@@ -91,6 +190,69 @@ const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
 
 /**
+ * Development builds always expose debugging. Packaged macOS builds require
+ * `defaults write ai.omnigent.desktop DeveloperMode -bool true` before launch.
+ */
+function developerModeEnabled() {
+  return isDeveloperModeEnabled({
+    isPackaged: app.isPackaged,
+    platform: process.platform,
+    getUserDefault:
+      typeof systemPreferences.getUserDefault === "function"
+        ? systemPreferences.getUserDefault.bind(systemPreferences)
+        : undefined,
+  });
+}
+
+/** Read the current macOS MDM-provided server list without persisting it. */
+function managedServerUrls() {
+  return getManagedServerUrls({
+    platform: process.platform,
+    getUserDefault:
+      typeof systemPreferences.getUserDefault === "function"
+        ? systemPreferences.getUserDefault.bind(systemPreferences)
+        : undefined,
+  });
+}
+
+/**
+ * Whether the MDM-managed Databricks-internal-features flag is set. Read from
+ * macOS on every call (never persisted), so profile changes apply live.
+ */
+function databricksInternalFeaturesEnabled() {
+  return getDatabricksInternalFeaturesEnabled({
+    platform: process.platform,
+    getUserDefault:
+      typeof systemPreferences.getUserDefault === "function"
+        ? systemPreferences.getUserDefault.bind(systemPreferences)
+        : undefined,
+  });
+}
+
+/**
+ * The Arca connect console: a shell-owned modal that asks consent by showing
+ * the exact command, then streams its live output (replaces the bare native
+ * dialog — same trust model, full transparency). The flow also de-duplicates:
+ * a repeat connect while one is in flight re-focuses the existing console and
+ * shares its outcome, so a refreshed SPA can always get back to it.
+ */
+const arcaConnectFlow = createArcaConnectFlow({
+  BrowserWindow,
+  ipcMain,
+  pagePath: path.join(__dirname, "..", "arca-connect", "index.html"),
+  preloadPath: path.join(__dirname, "arca_connect_preload.js"),
+  startConnect: (serverUrl, onOutput) => arca.startArcaConnect(serverUrl, { onOutput }),
+  commandLine: (serverUrl) => {
+    try {
+      return `arca ${arca.buildConnectArgs(serverUrl).join(" ")}`;
+    } catch {
+      return "arca ssh isaac omni host …"; // the run itself re-validates and fails loud
+    }
+  },
+  log: (message) => console.log(`[omnigent] ${message}`),
+});
+
+/**
  * Quit-safety timeouts (see the before-quit handler near the end of this
  * file). `let` (not const) so tests can shrink them via testApi.setQuitTimeouts
  * to exercise the force-exit safety nets without waiting seconds in real
@@ -98,6 +260,9 @@ const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
  */
 let quitCleanupTimeoutMs = 10000;
 let quitInstallFallbackMs = 3000;
+// Away-banner delay, `let` for the same reason: wiring tests shrink it via
+// testApi.setAwayBannerDelayMs instead of waiting out the real delay.
+let awayBannerDelayMs = AWAY_BANNER_DELAY_MS;
 
 /**
  * Permissions the SPA legitimately needs and we auto-grant. The dictation
@@ -581,7 +746,7 @@ function pinWindow(win, origin) {
 /**
  * Record (or clear) the full server URL a window is connected to. The pinned
  * `origin` drops any path, but the host/server CLI commands need the exact URL
- * the user connected with (e.g. a Databricks ``…/ml/omnigents`` mount), so the
+ * the user connected with (e.g. a Databricks ``…/omnigent`` mount), so the
  * window keeps both.
  *
  * @param {BrowserWindow} win
@@ -664,6 +829,33 @@ function activeWindow() {
   return windows.keys().next().value ?? null;
 }
 
+/**
+ * Effective version for development update checks and UI. Packaged builds
+ * always use Electron's real app version.
+ */
+function configureDesktopVersion() {
+  const override = !app.isPackaged
+    ? process.env.OMNIGENT_DESKTOP_VERSION_OVERRIDE?.trim()
+    : undefined;
+  if (!override) return app.getVersion();
+
+  try {
+    // electron-updater stores a SemVer instance here and reads it when deciding
+    // eligibility. Reuse its constructor so comparisons keep the expected type.
+    const Version = autoUpdater.currentVersion.constructor;
+    const version = new Version(override);
+    autoUpdater.currentVersion = version;
+    return version.version;
+  } catch (err) {
+    throw new Error(
+      `OMNIGENT_DESKTOP_VERSION_OVERRIDE must be a valid semantic version (received ${JSON.stringify(override)})`,
+      { cause: err },
+    );
+  }
+}
+
+const currentDesktopVersion = configureDesktopVersion();
+
 // Desktop auto-update orchestration lives in its own module; the main process
 // only composes it with its main-process dependencies and wires the four thin
 // seams below (startup init, the Updates menu, the update IPC surface, and the
@@ -682,13 +874,34 @@ const updater = createDesktopUpdater({
   isPinnedOriginSender,
   pinnedOrigin,
   iconPath: ICON_PNG,
-  // Dev builds always use the local dev feed (dev-app-update.yml ->
-  // 127.0.0.1:8765); packaged builds always use the baked app-update.yml.
-  // Tying this to !app.isPackaged — not an env var — closes a redirect attack:
-  // an OMNIGENT_FORCE_DEV_UPDATE_CONFIG-style env var could otherwise point a
-  // packaged (production) app at an untrusted HTTP local feed and push a
-  // malicious update. A packaged build can never be redirected to the dev feed.
+  getCurrentVersion: () => currentDesktopVersion,
+  onInstallReadyChange: () => buildMenu(),
+  // Dev builds use dev-app-update.yml, which mirrors the production HTTPS
+  // endpoint; packaged builds always use their baked app-update.yml. Tying
+  // this to !app.isPackaged — not an env var — ensures a packaged app can
+  // never be redirected to a repository-local update configuration.
   forceDevUpdateConfig: !app.isPackaged,
+});
+
+// Shell-owned About window: available from the native application menu even
+// while the parent is on setup or an external sign-in page.
+const aboutWindow = createAboutWindow({
+  BrowserWindow,
+  ipcMain,
+  nativeTheme,
+  updater,
+  getDesktopVersion: () => currentDesktopVersion,
+  getAppIconDataUrl: () =>
+    resolveAppIconDataUrl({
+      app,
+      nativeImage,
+      fallbackIconPath: ICON_PNG,
+    }),
+  getCliStatus: () => omnigentCli.getCliStatus(loadSettings().omnigent_path),
+  onDesktopDownloadStarted: (parent) => updateOverlay.suppress(parent),
+  onClosed: (parent) => updateOverlay.unsuppress(parent),
+  aboutPage: ABOUT_PAGE,
+  preloadPath: path.join(__dirname, "about_preload.js"),
 });
 
 // Shell-owned update toast: renders the reused web UpdateBanner in a transparent
@@ -698,9 +911,26 @@ const updateOverlay = createUpdateOverlay({
   ipcMain,
   nativeTheme,
   updater,
+  openAbout: (parent) => aboutWindow.open(parent),
   overlayPage: UPDATE_OVERLAY_PAGE,
   preloadPath: path.join(__dirname, "update_overlay_preload.js"),
 });
+
+// Shell-owned "return to your server?" banner: offered when a window has sat
+// on a foreign page (e.g. an SSO login) instead of its pinned server — see
+// away_banner.js. Like the update overlay it ships with the desktop app so it
+// works against any server bundle (and against foreign pages, which get an
+// inert bridge).
+const returnBanner = createReturnBanner({
+  BrowserWindow,
+  ipcMain,
+  bannerPage: path.join(__dirname, "..", "return-banner", "index.html"),
+  preloadPath: path.join(__dirname, "return_banner_preload.js"),
+  onGoBack: (win) => awayWatches.get(win)?.reset(),
+});
+
+/** Per-window away-watch handles (win → {reset, dispose}); see away_banner.js. */
+const awayWatches = new Map();
 
 // ---------------------------------------------------------------------------
 // Persisted settings (the saved server URL and the recently-connected server
@@ -755,6 +985,28 @@ function resolvedCliPath() {
   const resolved = omnigentCli.resolveCliPath(configured);
   cachedCli = { configuredPath: configured, path: resolved ? resolved.path : null };
   return cachedCli.path;
+}
+
+/**
+ * CLI command for desktop host enrollment on `serverUrl`. Databricks-internal
+ * windows use `isaac omni` behind the same effective gate as Arca (MDM flag +
+ * Databricks-managed HTTPS server); every other window keeps the configured /
+ * auto-detected public Omnigent CLI. Returns null when the selected launcher
+ * is unavailable.
+ *
+ * @param {string | null | undefined} serverUrl
+ * @returns {string | {
+ *   executable: string,
+ *   prefixArgs: string[],
+ *   displayName: string,
+ * } | null}
+ */
+function hostCliCommand(serverUrl) {
+  const useIsaac = databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl);
+  if (!useIsaac) return resolvedCliPath();
+  const isaacPath = isaac.resolveIsaacPath();
+  if (!isaacPath) return null;
+  return { executable: isaacPath, prefixArgs: ["omni"], displayName: "isaac omni" };
 }
 
 /**
@@ -976,10 +1228,10 @@ function hardenOauthPopup(child) {
 
 /**
  * Join a basename-less SPA path (e.g. ``/c/conv_abc``) onto a server URL that
- * may carry a workspace mount (e.g. ``https://host/ml/omnigents/``). The path
- * is an ABSOLUTE in-app route, but it lives UNDER the server's mount —
+ * may carry a workspace mount (e.g. ``https://host/omnigent/``). The path is
+ * an ABSOLUTE in-app route, but it lives UNDER the server's mount —
  * ``new URL("/c/x", serverUrl)`` would resolve against the ORIGIN and drop
- * ``/ml/omnigents`` — so we string-concatenate: strip the server URL's trailing
+ * ``/omnigent`` — so we string-concatenate: strip the server URL's trailing
  * slash, append the path. The SPA's react-router basename then matches
  * ``${mount}/c/:id``. Shared by createWindow (cold open) and loadServerUrl
  * (re-pointing an existing window) so the mount-aware join is in one place.
@@ -1008,6 +1260,61 @@ function loadServerUrl(win, serverUrl, routePath) {
   pinWindow(win, originOf(serverUrl));
   setWindowServerUrl(win, serverUrl);
   return win.loadURL(routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
+}
+
+/**
+ * Wire server-load failure fallbacks for a shell window.
+ *
+ * @param {BrowserWindow} win
+ */
+function registerNavigationFallbacks(win) {
+  // Server unreachable / DNS failure / TLS error → fall back to the setup
+  // page with the failure shown, instead of stranding the user on Chromium's
+  // raw error surface with no way back. The saved server_url is left intact:
+  // the server may simply be down, and Connect retries it.
+  win.webContents.on(
+    "did-fail-load",
+    (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      if (!isMainFrame) return;
+      if (errorCode === ERR_ABORTED) return;
+      // A failure report for a URL the window is no longer pinned to (the
+      // window was re-pointed while the failing load was in flight) must
+      // not yank the window off its new destination.
+      const failedOrigin = originOf(validatedURL ?? "");
+      if (failedOrigin !== windows.get(win)?.origin) return;
+      const params = new URLSearchParams({
+        error: `${errorDescription || "load failed"} (${errorCode})`,
+        // The failure often happens on a deep SPA route (e.g. /chat/…);
+        // prefill the setup form with just the server origin — that's what
+        // the user connects to — not the full path that happened to fail.
+        url: failedOrigin ? failedOrigin + "/" : (validatedURL ?? ""),
+      });
+      if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
+      pinWindow(win, null); // back on the setup page → no trusted origin
+      void loadSetupPage(win, params.toString());
+    },
+  );
+
+  // HTTP 4xx/5xx commits as a successful navigation in Chromium (empty body
+  // → black window), so did-fail-load never fires. did-navigate is
+  // main-frame-only and carries httpResponseCode; reuse the setup-page
+  // fallback so the user sees the status and can change server / retry.
+  win.webContents.on("did-navigate", (_event, url, httpResponseCode, httpStatusText) => {
+    if (httpResponseCode < 400) return;
+    const state = windows.get(win);
+    const failedOrigin = originOf(url ?? "");
+    if (failedOrigin !== state?.origin) return;
+    const status = httpStatusText
+      ? `${httpResponseCode} ${httpStatusText}`
+      : `HTTP ${httpResponseCode}`;
+    const params = new URLSearchParams({
+      error: status,
+      url: state.serverUrl ?? url ?? "",
+    });
+    if (state.ephemeral) params.set("ephemeral", "1");
+    pinWindow(win, null);
+    void loadSetupPage(win, params.toString());
+  });
 }
 
 /**
@@ -1056,13 +1363,27 @@ function createWindow(targetUrl, opts = {}) {
     // .drag-strip). Other platforms keep their native frame — `hiddenInset`
     // is macOS-only and a frameless window without `titleBarOverlay` would
     // lose its window controls there.
-    ...(process.platform === "darwin" ? { titleBarStyle: "hiddenInset" } : {}),
+    ...(process.platform === "darwin"
+      ? {
+          titleBarStyle: "hiddenInset",
+          // Drop the native traffic lights ~4px from their hiddenInset default so
+          // they center in the 2.25rem (36px) title-bar strip, level with the
+          // Search/Settings/toggle cluster and the chat-header icons (both
+          // centered there — see the [data-electron-mac] rules in index.css).
+          // x:19 preserves hiddenInset's horizontal inset; y centers the ~14px
+          // controls ((36-14)/2 ≈ 11). Adjust y by ±1 if it reads off on device.
+          trafficLightPosition: { x: 16, y: 17 },
+        }
+      : {}),
     webPreferences: {
       // Security: the SPA is remote/untrusted relative to the shell, so we
       // keep Node out of the renderer and isolate the preload's context.
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      // Packaged builds expose DevTools only after the macOS user explicitly
+      // opts in through the DeveloperMode user default.
+      devTools: developerModeEnabled(),
       // Electron passes HTML5 drag-drop through to the page by default (no
       // native handler intercepts it), so images drop onto the composer
       // textbox with no extra work.
@@ -1071,7 +1392,8 @@ function createWindow(targetUrl, opts = {}) {
   });
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
-  const saved = loadSettings().server_url;
+  // CLI config stores the API mount; Electron boots the browser-facing SPA.
+  const saved = normalizeSavedServerUrl(loadSettings().server_url);
   // serverUrl: the window's server IDENTITY for host/server CLI commands
   // (``omnigent host --server``, ``omnigent login``, ``serverAuthed``) — the
   // origin or origin+mount, WITHOUT the conversation path. Prefer an explicit
@@ -1108,6 +1430,20 @@ function createWindow(targetUrl, opts = {}) {
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
   });
+  registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
+  // Show the return banner when the window navigates away from its server
+  // (e.g. SSO) and stays away. The watch's on-away URL is the last committed
+  // page on the server — subpage, mount path, and query args included.
+  awayWatches.set(
+    win,
+    registerServerAwayWatch(win.webContents, {
+      getPinnedOrigin: () => pinnedOrigin(win),
+      delayMs: awayBannerDelayMs,
+      debugLog: (message) => console.warn(`[omnigent] ${message}`),
+      onAway: (returnUrl) => returnBanner.show(win, returnUrl ?? windows.get(win)?.serverUrl),
+      onReturn: () => returnBanner.hide(win),
+    }),
+  );
   if (destination) {
     // Learn the server's version alongside the load. Every window that opens
     // straight onto a server (normal app launch with a saved URL, a deep link,
@@ -1119,7 +1455,20 @@ function createWindow(targetUrl, opts = {}) {
         if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
       });
     }
-    void win.loadURL(destination);
+    void win
+      .loadURL(destination)
+      .then(() => {
+        // A saved server can predate the recents list. Backfill it only after
+        // a successful cold load; explicit targets may be conversation URLs.
+        if (!ephemeral && !explicit && serverUrl) {
+          const settings = loadSettings();
+          rememberRecentServer(settings, serverUrl);
+          saveSettings(settings);
+        }
+      })
+      .catch(() => {
+        // Load failure falls back via did-fail-load → setup page w/ error.
+      });
   } else {
     // ?ephemeral=1 only changes the setup page's copy (the window's
     // WindowState is the source of truth for persistence behavior).
@@ -1131,7 +1480,7 @@ function createWindow(targetUrl, opts = {}) {
       search.set("error", "saved server URL in settings.json is not a valid URL");
       search.set("url", serverUrl);
     }
-    void win.loadFile(SETUP_PAGE, search.size > 0 ? { search: search.toString() } : undefined);
+    void loadSetupPage(win, search.toString());
   }
 
   // Page-initiated window.open / target=_blank: web links open in the
@@ -1176,32 +1525,7 @@ function createWindow(targetUrl, opts = {}) {
   // Fires only for window.open the handler above allowed (OAuth popups).
   win.webContents.on("did-create-window", (child) => hardenOauthPopup(child));
 
-  // Server unreachable / DNS failure / TLS error → fall back to the setup
-  // page with the failure shown, instead of stranding the user on Chromium's
-  // raw error surface with no way back. The saved server_url is left intact:
-  // the server may simply be down, and Connect retries it.
-  win.webContents.on(
-    "did-fail-load",
-    (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
-      if (!isMainFrame) return;
-      if (errorCode === ERR_ABORTED) return;
-      // A failure report for a URL the window is no longer pinned to (the
-      // window was re-pointed while the failing load was in flight) must
-      // not yank the window off its new destination.
-      const failedOrigin = originOf(validatedURL ?? "");
-      if (failedOrigin !== windows.get(win)?.origin) return;
-      const params = new URLSearchParams({
-        error: `${errorDescription || "load failed"} (${errorCode})`,
-        // The failure often happens on a deep SPA route (e.g. /chat/…);
-        // prefill the setup form with just the server origin — that's what
-        // the user connects to — not the full path that happened to fail.
-        url: failedOrigin ? failedOrigin + "/" : (validatedURL ?? ""),
-      });
-      if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
-      pinWindow(win, null); // back on the setup page → no trusted origin
-      void win.loadFile(SETUP_PAGE, { search: params.toString() });
-    },
-  );
+  registerNavigationFallbacks(win);
 
   // Databricks workspace-hosted Omnigent renders inside the workspace's
   // top-nav chrome (the SPA is a workspace page). On a dedicated desktop
@@ -1219,6 +1543,8 @@ function createWindow(targetUrl, opts = {}) {
     } catch {
       /* registry already torn down */
     }
+    awayWatches.get(win)?.dispose();
+    awayWatches.delete(win);
     windows.delete(win);
     updateBadge(); // drop this window's contribution from the app-wide badge
   });
@@ -1754,7 +2080,7 @@ function changeServer() {
   }
   if (win) {
     pinWindow(win, null); // back on the setup page → no trusted origin
-    void win.loadFile(SETUP_PAGE, ephemeral ? { search: "ephemeral=1" } : undefined);
+    void loadSetupPage(win, ephemeral ? "ephemeral=1" : "");
   }
 }
 
@@ -1768,24 +2094,36 @@ function changeServer() {
 
 function buildMenu() {
   const isMac = process.platform === "darwin";
+  const aboutItem = aboutMenuItem("Omnigent", () => {
+    aboutWindow.open(activeWindow());
+  });
+  const settingsItem = settingsMenuItem(() => {
+    const target = focusedConnectedWindow(BrowserWindow.getFocusedWindow(), windows);
+    sendOpenPath(target, SETTINGS_PATH);
+  });
 
   /** @type {Electron.MenuItemConstructorOptions[]} */
   const template = [];
 
-  // macOS app menu (About/Services/Hide/Quit), named "Omnigent" via the
-  // app name set below. Non-mac platforms have no app menu.
+  // Settings belongs in the macOS app menu. Keep the standard app roles that
+  // Electron's composite appMenu role would otherwise provide.
   if (isMac) {
-    template.push({ role: "appMenu" });
+    template.push(macApplicationMenu(app.name, aboutItem, settingsItem));
   }
 
   /** @type {Electron.MenuItemConstructorOptions[]} */
   const serverSubmenu = [
+    ...(!isMac ? [settingsItem, { type: "separator" }] : []),
+    {
+      id: "new_session",
+      label: "New Session",
+      accelerator: "CmdOrCtrl+N",
+      click: () => sendOpenPath(activeWindow(), "/"),
+    },
     {
       id: "new_window",
       label: "New Window",
-      // Own the standard new-window accelerator here — there is no
-      // role-based File menu in this app.
-      accelerator: "CmdOrCtrl+N",
+      accelerator: "CmdOrCtrl+Shift+N",
       click: () => newWindow(),
     },
     {
@@ -1802,52 +2140,21 @@ function buildMenu() {
       click: () => changeServer(),
     },
     { type: "separator" },
-    // Manual update check, surfaced as a production item here so shipped
-    // .app users can trigger it from the menubar. Download/install still
-    // flows through the in-app Settings UI / UpdateBanner (and the native
-    // consent dialog when driven from a server page).
+    // Keep update checks in the shell-owned About modal so the menu, update
+    // prompt, and About item all converge on one status/progress surface.
     {
       id: "check_for_updates",
       label: "Check for Updates…",
-      click: async () => {
-        // Surface the two silent outcomes of a manual menubar check with a
-        // native dialog: "no update" (otherwise only the renderer banner
-        // hears it, which the user may not be looking at) and "check failed"
-        // (the promise rejects and was previously swallowed). An available
-        // update is left to the in-app UpdateBanner to avoid a double notify.
-        try {
-          await updater.checkForUpdates({ manual: true });
-          const status = updater.getStatus();
-          if (status.state === "none") {
-            await dialog.showMessageBox(activeWindow(), {
-              type: "info",
-              title: "Omnigent",
-              message: "You're up to date!",
-              detail: `Omnigent ${app.getVersion()} is the latest version.`,
-              buttons: ["OK"],
-            });
-          }
-        } catch (err) {
-          await dialog.showMessageBox(activeWindow(), {
-            type: "warning",
-            title: "Omnigent",
-            message: "Couldn't check for updates",
-            detail: String(err?.message ?? err),
-            buttons: ["OK"],
-          });
-        }
+      click: () => {
+        aboutWindow.open(activeWindow());
+        void updater.checkForUpdates({ manual: true }).catch(() => {});
       },
     },
     {
       id: "restart_to_update",
       label: "Restart to Update",
+      visible: updater.getStatus().state === "downloaded",
       click: async () => {
-        // Production install path: the UpdateBanner toast is dismissible (and
-        // a user may have closed it), so the menubar must still offer a way to
-        // install a downloaded update. installUpdateNow() quits the app to
-        // hand off to the installer; it returns false when nothing is ready
-        // (e.g. the toast was for an update since skipped or not downloaded),
-        // which we surface with a native dialog instead of silently no-op'ing.
         if (!updater.installUpdateNow()) {
           await dialog.showMessageBox(activeWindow(), {
             type: "info",
@@ -1900,7 +2207,10 @@ function buildMenu() {
     ],
   });
   // Standard View roles (Reload/zoom/fullscreen). Developer Tools lives in
-  // the Debug menu (dev only), so this menu is identical in dev and release.
+  // the opt-in Debug menu, so this menu is identical in normal releases.
+  // (The server-selector-v2 toggle lives in the setup pages themselves — the
+  // classic page's CLI modal and the V2 page's cog menu — via the
+  // omnigent:set-server-selector-v2 IPC, not here.)
   template.push({
     label: "View",
     submenu: [
@@ -1915,15 +2225,15 @@ function buildMenu() {
     ],
   });
   template.push({ role: "windowMenu" });
+  if (!isMac) {
+    template.push({ label: "Help", submenu: [aboutItem] });
+  }
 
-  // Debug menu (dev only, !app.isPackaged): consolidates every debug-only /
-  // non-production affordance behind a single top-level menu — the macOS
-  // notification-sound settings (sound playback uses `afplay`, so macOS-only)
-  // and the developer tools. Restart-to-update now lives in the production
-  // Server menu (it's a needed install path, not a debug affordance, once the
-  // UpdateBanner toast is dismissible). Hidden in the shipped .app. Placed
-  // last so it never displaces the standard menus users expect.
-  if (!app.isPackaged) {
+  // Consolidate non-production affordances behind one top-level menu. It is
+  // always present in development and can be explicitly enabled in a packaged
+  // macOS app through the DeveloperMode user default. Restart-to-update stays
+  // in the production Server menu because it is a normal install path.
+  if (developerModeEnabled()) {
     /** @type {Electron.MenuItemConstructorOptions[]} */
     const debugSubmenu = [];
 
@@ -2002,7 +2312,27 @@ function isSetupPageSender(event) {
   } catch {
     return false;
   }
-  return url.protocol === "file:" && url.pathname === SETUP_PAGE_URL.pathname;
+  // Compare by origin+pathname, ignoring the query — the setup page is loaded
+  // with ?error=…/?url=…/?ephemeral=1 variants, so a full-string match would
+  // reject those frames.
+  //
+  // Dev only: the wizard served over http by its Vite dev server (see
+  // loadSetupPage / serverSelectorV2DevUrl). The helper is null in a packaged
+  // build, so this can never trust an http origin in prod.
+  const devUrl = serverSelectorV2DevUrl();
+  if (devUrl) {
+    try {
+      const dev = new URL(devUrl);
+      if (url.origin === dev.origin && url.pathname === dev.pathname) return true;
+    } catch {
+      // Malformed dev URL — fall through to the file:// check.
+    }
+  }
+  return (
+    url.protocol === "file:" &&
+    (url.pathname === SETUP_PAGE_URL.pathname ||
+      url.pathname === SERVER_SELECTOR_V2_PAGE_URL.pathname)
+  );
 }
 
 /**
@@ -2043,6 +2373,29 @@ function isPinnedOriginSender(event) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Deny-all permission handlers for an agent view's storage partition.
+ *
+ * SECURITY: agent views live on per-conversation partitions (storage isolation
+ * — see browserViewRegistry), NOT on `session.defaultSession`, so the shell's
+ * permission handlers (registerPermissions) do not cover them. A session with
+ * NO handler auto-grants every permission request in Electron, so each new
+ * partition gets an explicit deny-all before its first page loads. Agent-
+ * visited pages never legitimately need mic/camera/notifications from the
+ * shell; on defaultSession they were already denied (grants require the
+ * pinned server origin), so deny-all preserves the old posture. Re-installing
+ * on a partition that already has the handlers is an idempotent no-op, so no
+ * per-partition memo is kept (a failed install is retried on the next view).
+ *
+ * @param {string | undefined} partition
+ */
+function hardenAgentPartition(partition) {
+  if (!partition) return;
+  const ses = session.fromPartition(partition);
+  ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
+  ses.setPermissionCheckHandler(() => false);
+}
+
+/**
  * Build the per-conversation WebContentsView registry for a shell window
  * (positions child views in `win.contentView`, pings back via `win.webContents`).
  *
@@ -2051,7 +2404,12 @@ function isPinnedOriginSender(event) {
  */
 function createBrowserRegistryForWindow(win) {
   return createBrowserViewRegistry({
-    WebContentsViewCtor: (opts) => new WebContentsView(opts),
+    WebContentsViewCtor: (opts) => {
+      // Harden the view's partition before construction so no page can race a
+      // permission request ahead of the deny-all handlers.
+      hardenAgentPartition(opts && opts.webPreferences && opts.webPreferences.partition);
+      return new WebContentsView(opts);
+    },
     createBoundsController: createBrowserViewBoundsController,
     attachToHost: (view) => win.contentView.addChildView(view),
     detachFromHost: (view) => win.contentView.removeChildView(view),
@@ -2070,6 +2428,11 @@ function createBrowserRegistryForWindow(win) {
       } catch {
         return 1;
       }
+    },
+    copyTextToClipboard: (text) => clipboard.writeText(text),
+    openUrlExternal: (url) => void shell.openExternal(url),
+    showContextMenu: (items) => {
+      Menu.buildFromTemplate(items).popup({ window: win });
     },
   });
 }
@@ -2091,15 +2454,39 @@ function registerIpc() {
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
   // global, so connecting from one window doesn't hijack another.
-  ipcMain.handle("omnigent:set-server-url", async (event, url) => {
+  ipcMain.handle("omnigent:set-server-url", async (event, url, opts) => {
     if (!isSetupPageSender(event)) {
       // A server page must never be able to re-point which server is saved.
       throw new Error("set-server-url is only available to the setup page");
     }
-    const normalized = normalizeUrl(url); // throws → rejects → setup page shows error
-    // Bare Databricks workspace URLs serve a 404 at the root; expand them to
-    // the Omnigent UI mount so the user can paste just the workspace host.
+    // A managed choice is already validated and may name a workspace mount;
+    // preserve it exactly. The shared expansion is a no-op for paths, while a
+    // managed workspace root still gets the normal mount discovery.
+    const managedTarget = managedServerUrls().find((candidate) => candidate === url);
+    const normalized = managedTarget ?? normalizeUrl(url); // throws → setup page shows error
     const target = await expandDatabricksWorkspaceUrl(normalized);
+
+    // Guard against navigating to (and pinning as trusted) a non-Omnigent site
+    // the user typed by mistake. Managed choices are pre-validated; local hosts
+    // are the user's own machine — both skip the check. For a remote URL we
+    // probe the well-known manifest; if it doesn't look like an Omnigent server
+    // and the user hasn't confirmed, ask the page to warn before proceeding.
+    // Soft (not a hard block): older Omnigent servers predate the manifest, so
+    // a second click must still let them through. force skips the re-probe.
+    //
+    // ONLY when the server selector is active: the classic static setup page
+    // calls setServerUrl(url) with no opts and can't handle a {needsConfirm}
+    // reply (it just expects navigation), so guarding it there would silently
+    // swallow the connect. The server selector is the only caller that
+    // understands the confirm handshake.
+    const isLocal = LOCAL_HOSTS.has(new URL(target).hostname);
+    if (serverSelectorV2Enabled() && !managedTarget && !isLocal && !opts?.force) {
+      const manifest = await fetchServerManifest(target);
+      if (manifest.manifestVersion < 1) {
+        return { needsConfirm: true, url: target };
+      }
+    }
+
     const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
     // Multi-server windows connect without touching the saved server —
     // the connection lives and dies with the window.
@@ -2159,9 +2546,78 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("get-recent-servers is only available to the setup page");
     }
-    const recents = loadSettings().recent_servers;
-    // Same hand-edited-settings tolerance as rememberRecentServer.
-    return Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [];
+    const managed = managedServerUrls();
+    return excludingManagedServers(normalizeRecentServers(loadSettings().recent_servers), managed);
+  });
+
+  // Setup page → drop one recent server from settings.json. Returns the
+  // remaining recents (managed-excluded), matching get-recent-servers, so the
+  // page can reconcile its list.
+  ipcMain.handle("omnigent:forget-recent-server", (event, url) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("forget-recent-server is only available to the setup page");
+    }
+    const managed = managedServerUrls();
+    const settings = loadSettings();
+    const remaining = normalizeRecentServers(settings.recent_servers).filter((u) => u !== url);
+    settings.recent_servers = remaining;
+    saveSettings(settings);
+    return excludingManagedServers(remaining, managed);
+  });
+
+  // Setup page → reachability/validity probe for a server the user just added.
+  // Advisory only (never gates Join): resolves one of
+  //   "ok"        — responded and looks like an Omnigent server (has the manifest)
+  //   "reachable" — responded, but the manifest is absent (old/unknown server)
+  //   "unreachable" — no response (network error / timeout / bad URL)
+  ipcMain.handle("omnigent:check-server", async (event, url) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("check-server is only available to the setup page");
+    }
+    let origin;
+    try {
+      origin = new URL(normalizeUrl(url)).origin;
+    } catch {
+      return { status: "unreachable" };
+    }
+    // Manifest present → definitively an Omnigent server.
+    const manifest = await fetchServerManifest(origin);
+    if (manifest.manifestVersion >= 1) return { status: "ok" };
+    // No manifest: distinguish "host answered" from "nothing there" with a
+    // liveness fetch (any HTTP response counts as reachable). Short timeout;
+    // a 4xx/5xx still means something is listening.
+    try {
+      await fetch(origin, { redirect: "manual", signal: AbortSignal.timeout(3000) });
+      return { status: "reachable" };
+    } catch {
+      return { status: "unreachable" };
+    }
+  });
+
+  // Setup page → toggle the revamped server selector (settings.server_selector_v2)
+  // and reload the sending window to the chosen page. Both setup pages drive
+  // this: the classic page's CLI modal switches TO the new one, the V2 page's
+  // cog menu switches back. No-op when the env var forces the choice.
+  ipcMain.handle("omnigent:set-server-selector-v2", (event, enabled) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("set-server-selector-v2 is only available to the setup page");
+    }
+    if (serverSelectorV2EnvForced()) return; // env wins; can't be toggled off
+    const settings = loadSettings();
+    settings.server_selector_v2 = enabled === true;
+    saveSettings(settings);
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win && !win.isDestroyed()) void loadSetupPage(win);
+  });
+
+  // Setup page → organization-provided server choices from macOS Managed
+  // Preferences. Re-read on every request so policy removal is never copied
+  // into or masked by settings.json.
+  ipcMain.handle("omnigent:get-managed-servers", (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("get-managed-servers is only available to the setup page");
+    }
+    return managedServerUrls();
   });
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
@@ -2183,11 +2639,13 @@ function registerIpc() {
       return null;
     }
     const win = BrowserWindow.fromWebContents(event.sender);
-    const recents = loadSettings().recent_servers;
+    const managedServers = managedServerUrls();
+    const recents = excludingManagedServers(loadSettings().recent_servers, managedServers);
     return {
       // isPinnedOriginSender guarantees the sender window is tracked.
       currentOrigin: windows.get(win).origin,
-      recentServers: Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [],
+      managedServers,
+      recentServers: recents,
       // The connected server's manifest, forwarded so the SPA branches on the
       // same document the shell did rather than re-fetching it (and so an
       // older shell, which simply omits this field, is detectable as absent —
@@ -2197,19 +2655,18 @@ function registerIpc() {
   });
 
   // SPA title-bar server picker → re-point the SENDING window to another
-  // server. Only URLs already in the persisted recent-servers list are
-  // accepted: pinning is a privilege grant (notifications, badge, protocol
-  // grants), so a server page must never be able to pin a window to an
-  // arbitrary origin of its choosing — only to servers the user previously
-  // connected to by hand.
+  // server. Only URLs in the persisted recent list or the current managed list
+  // are accepted: pinning is a privilege grant (notifications, badge, protocol
+  // grants), so a server page must never choose an arbitrary origin.
   ipcMain.handle("omnigent:switch-server", (event, url) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("switch-server is only available to a connected server page");
     }
     const recents = loadSettings().recent_servers;
-    const known = Array.isArray(recents) && recents.includes(url);
-    if (!known) {
-      throw new Error("switch-server target must be a previously-connected server");
+    const knownRecent = Array.isArray(recents) && recents.includes(url);
+    const knownManaged = managedServerUrls().includes(url);
+    if (!knownRecent && !knownManaged) {
+      throw new Error("switch-server target must be a recent or managed server");
     }
     const win = BrowserWindow.fromWebContents(event.sender);
     const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
@@ -2257,7 +2714,11 @@ function registerIpc() {
     const ephemeral = windows.get(win)?.ephemeral === true;
     pinWindow(win, null); // back on the setup page → no trusted origin
     setWindowServerUrl(win, null);
-    void win.loadFile(SETUP_PAGE, ephemeral ? { search: "ephemeral=1" } : undefined);
+    // "Connect to new server…" from a connected window goes straight to the
+    // server list, skipping the landing/mode intro (that's for first run).
+    const params = new URLSearchParams({ step: "server" });
+    if (ephemeral) params.set("ephemeral", "1");
+    void loadSetupPage(win, params.toString());
   });
 
   // Find bar → run/continue a search in its parent window. Empty text
@@ -2399,7 +2860,10 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("get-cli-status is only available to the setup page");
     }
-    return omnigentCli.getCliStatus(loadSettings().omnigent_path);
+    return {
+      ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+      customizationDisabled: databricksInternalFeaturesEnabled(),
+    };
   });
 
   // Setup page → set an explicit path to the `omnigent` binary. Persisted only
@@ -2410,6 +2874,13 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("set-cli-path is only available to the setup page");
     }
+    if (databricksInternalFeaturesEnabled()) {
+      return {
+        ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+        customizationDisabled: true,
+        accepted: false,
+      };
+    }
     return applyCliPath(configuredPath);
   });
 
@@ -2419,6 +2890,7 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("browse-cli-path is only available to the setup page");
     }
+    if (databricksInternalFeaturesEnabled()) return null;
     const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
     const result = await dialog.showOpenDialog(win ?? undefined, {
       title: "Locate the Omnigent CLI binary",
@@ -2438,7 +2910,15 @@ function registerIpc() {
     if (!cliPath) {
       return { ok: false, error: "The omnigent CLI was not found. Install it or set its path." };
     }
-    return serverManager.startLocalServer(cliPath);
+    // Stream the server's startup log lines to the setup page as it boots.
+    const onLine = (line) => {
+      try {
+        event.sender.send("omnigent:local-server-setup-log", { line });
+      } catch {
+        /* window torn down mid-start */
+      }
+    };
+    return serverManager.startLocalServer(cliPath, onLine);
   });
 
   // SPA → this machine's identity: is the CLI installed, and its host id. Both
@@ -2450,7 +2930,10 @@ function registerIpc() {
       console.warn("[omnigent] host-get-identity from untrusted sender dropped");
       return null;
     }
-    return { cliInstalled: Boolean(resolvedCliPath()), hostId: omnigentCli.localHostId() };
+    return {
+      cliInstalled: Boolean(hostCliCommand(senderServerUrl(event))),
+      hostId: omnigentCli.localHostId(),
+    };
   });
 
   // SPA (in-app Settings → Local CLI) → is the CLI installed and runnable,
@@ -2460,7 +2943,10 @@ function registerIpc() {
       console.warn("[omnigent] cli-get-status from untrusted sender dropped");
       return null;
     }
-    return omnigentCli.getCliStatus(loadSettings().omnigent_path);
+    return {
+      ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+      customizationDisabled: databricksInternalFeaturesEnabled(),
+    };
   });
 
   // SPA → reset to auto-detected (clear the override). Chooses no path itself,
@@ -2473,13 +2959,21 @@ function registerIpc() {
     if (!isPinnedOriginSender(event)) {
       throw new Error("cli-reset-path is only available to a connected server page");
     }
+    if (databricksInternalFeaturesEnabled()) {
+      return {
+        ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+        customizationDisabled: true,
+      };
+    }
     return clearCliPath();
   });
 
   // Updater IPC surface (get/set config, get status, check/download/install).
   // The module owns the handlers and their trusted-sender + consent gates.
   updater.registerIpc();
+  aboutWindow.registerIpc();
   updateOverlay.registerIpc();
+  returnBanner.registerIpc();
 
   // Mirror the web app's in-app theme onto the native side so the update
   // overlay, native dialogs, and menus track the theme switcher (not just the
@@ -2501,9 +2995,16 @@ function registerIpc() {
     }
     const serverUrl = senderServerUrl(event);
     if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
-    const cliPath = resolvedCliPath();
-    if (!cliPath) {
-      return { ok: false, error: "The omnigent CLI was not found. Install it or set its path." };
+    const cliCommand = hostCliCommand(serverUrl);
+    if (!cliCommand) {
+      const internal =
+        databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl);
+      return {
+        ok: false,
+        error: internal
+          ? "The isaac CLI was not found. Install it before connecting this machine."
+          : "The omnigent CLI was not found. Install it or set its path.",
+      };
     }
     let result;
     if (action === "start" || action === "restart") {
@@ -2520,18 +3021,63 @@ function registerIpc() {
       }
       // Ensure the CLI is authenticated for a remote server first (local needs
       // none) — otherwise the host connect would just fail on a 401.
-      const auth = await serverManager.ensureServerAuth(cliPath, serverUrl);
-      if (!auth.ok) result = { ok: false, error: auth.error };
+      const auth = await serverManager.ensureServerAuth(cliCommand, serverUrl);
+      if (!auth.ok) result = { ok: false, error: auth.error, authError: auth.authError };
       else if (action === "start")
-        result = await serverManager.ensureHostConnected(cliPath, serverUrl);
-      else result = await serverManager.restartHost(cliPath, serverUrl);
+        result = await serverManager.ensureHostConnected(cliCommand, serverUrl);
+      else result = await serverManager.restartHost(cliCommand, serverUrl);
     } else if (action === "stop") {
-      result = await serverManager.disconnectHost(cliPath, serverUrl);
+      result = await serverManager.disconnectHost(cliCommand, serverUrl);
     } else {
       result = { ok: false, error: `unknown host action '${action}'` };
     }
     broadcastHostStatus();
     return result;
+  });
+
+  // SPA → desktop feature gates the server can't know about, currently just
+  // the MDM-managed Databricks-internal flag (Arca). Scoped per window: the
+  // flag reads true only when the window's own server is Databricks-managed
+  // (a workspace mount or a Databricks App) — internal features must not
+  // light up against arbitrary self-hosted servers. Read fresh per call so
+  // applying/removing the profile takes effect without a restart.
+  ipcMain.handle("omnigent:get-desktop-features", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      console.warn("[omnigent] get-desktop-features from untrusted sender dropped");
+      return null;
+    }
+    return {
+      databricksInternalFeatures:
+        databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(senderServerUrl(event)),
+    };
+  });
+
+  // SPA → connect the user's Arca instance (Databricks-internal sandbox) to
+  // the window's server as a host, by running `isaac omni host --background`
+  // on the instance over `arca ssh`. Gated three ways: pinned-origin sender,
+  // the MDM flag re-checked HERE (the renderer is not trusted to have checked
+  // it), and user consent in the shell-owned connect console — which shows
+  // the exact command and streams its live output (arca_connect_window.js).
+  // A connect already in flight is re-surfaced (console focused, outcome
+  // shared), never refused; the runner itself enforces CONNECT_TIMEOUT_MS so
+  // a wedged command always settles. No local process outlives the connect:
+  // the enrolled host keeps its own outbound tunnel from the Arca box.
+  ipcMain.handle("omnigent:arca-connect", async (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("arca-connect is only available to a connected server page");
+    }
+    if (!databricksInternalFeaturesEnabled()) {
+      return { ok: false, error: "Arca support is not enabled on this machine." };
+    }
+    const serverUrl = senderServerUrl(event);
+    if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
+    // Same scope as get-desktop-features, re-checked here: an Arca box may
+    // only be enrolled against a Databricks-managed server.
+    if (!isDatabricksManagedServerUrl(serverUrl)) {
+      return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
+    }
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return arcaConnectFlow.run(win, serverUrl);
   });
 
   // Push a status ping when a host child connects or exits on its own (no
@@ -2639,20 +3185,17 @@ function focusAndRestore(win) {
 }
 
 /**
- * Tell a pinned window's SPA to navigate in-place to an in-app path
- * (`/c/<id>`), without a reload — reuses the SPA's router, the same path a
- * notification click routes (basename-less; the embedded build's
- * `basenamedRouting` rebases it under the mount). Main→renderer only; the page
- * cannot invoke it. The caller (reuse-inplace) only sends when the window's
- * top-level page IS the pinned server (SPA listener mounted); this is
- * defense-in-depth on top of that.
+ * Tell a pinned window's SPA to navigate in-place to a basename-less app path
+ * (`/c/<id>`, `/settings`), without a reload. The embedded build's
+ * `basenamedRouting` rebases it under the mount. Main→renderer only; the page
+ * cannot invoke it. Callers send only while the pinned app is visible.
  *
  * @param {BrowserWindow | null | undefined} win
  * @param {string} routePath
  */
 function sendOpenPath(win, routePath) {
   if (!win || win.isDestroyed()) return;
-  console.log(`[omnigent] deep-link: send open-path ${routePath}`);
+  console.log(`[omnigent] send open-path ${routePath}`);
   try {
     win.webContents.send("omnigent:open-path", routePath);
   } catch {
@@ -2760,7 +3303,7 @@ function drainPendingDeepLinks() {
  * (expandDatabricksWorkspaceUrl) runs ONLY after the user consents to an
  * UNKNOWN server — so clicking (or the OS dispatching) a link to an
  * attacker-chosen host makes no HTTP request until the user has agreed. The
- * probe is safe post-consent because it can only append a path (`/ml/omnigents`)
+ * probe is safe post-consent because it can only append a path (`/omnigent`)
  * under the SAME origin — it never changes the origin the user approved.
  *
  * @param {string} raw The raw `omnigent://...` URL.
@@ -2775,7 +3318,7 @@ async function handleDeepLink(raw) {
   // same origin, so approving the origin is approving the server.
   const targetOrigin = parsed.origin;
   // A KNOWN server: reuse its recorded URL (already mount-bearing, e.g.
-  // `https://host/ml/omnigents`) so we SKIP the probe entirely. null for an
+  // `https://host/omnigent`) so we SKIP the probe entirely. null for an
   // unknown server — the mount is discovered AFTER consent (see consent-unknown).
   const known = findKnownServerUrl(targetOrigin);
 
@@ -2953,12 +3496,7 @@ if (!gotLock) {
       // open. Skip while a deep link is being handled (or queued) — it opens
       // its own window, and racing a default window here would double-open at
       // cold start (whenReady skipped its own createWindow for the pending link).
-      if (
-        BrowserWindow.getAllWindows().length === 0 &&
-        !deepLinkInFlight &&
-        pendingDeepLinks.length === 0
-      )
-        createWindow();
+      if (windows.size === 0 && !deepLinkInFlight && pendingDeepLinks.length === 0) createWindow();
     });
   });
 
@@ -2987,6 +3525,13 @@ if (!gotLock) {
   // pidfile that the next launch reuses or `omnigent server stop` reclaims.
   let quitCleanupDone = false;
   let quitCleanupStarted = false;
+  let quitForceExitTimer = null;
+  const clearQuitForceExitTimer = () => {
+    if (quitForceExitTimer === null) return;
+    clearTimeout(quitForceExitTimer);
+    quitForceExitTimer = null;
+  };
+  app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
     if (quitCleanupDone) return;
     // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
@@ -2999,12 +3544,12 @@ if (!gotLock) {
     // unref'd so the cap itself can't hold the event loop open; app.exit()
     // bypasses before-quit/will-quit, so it's the guaranteed way out when
     // app.quit() proves unreliable.
-    const cap = setTimeout(() => {
-      if (quitCleanupDone) return;
+    quitForceExitTimer = setTimeout(() => {
+      quitForceExitTimer = null;
       quitCleanupDone = true;
       app.exit(0);
     }, quitCleanupTimeoutMs);
-    if (typeof cap.unref === "function") cap.unref();
+    if (typeof quitForceExitTimer.unref === "function") quitForceExitTimer.unref();
 
     // resolvedCliPath() is evaluated inside the async IIFE so a throw (a future
     // change to settings/CLI resolution) becomes a rejection caught below,
@@ -3018,22 +3563,17 @@ if (!gotLock) {
       .finally(() => {
         if (quitCleanupDone) return; // the hard cap already forced the exit
         quitCleanupDone = true;
-        clearTimeout(cap);
-        // Hand off to a user-approved install if one is pending; otherwise
-        // complete the deferred quit. quitAndInstall() re-issues app.quit()
-        // (via setImmediate) only when it can actually install — so if the
-        // staged update is gone and install() returns false, fall back to a
-        // plain quit and then a forced exit after a short grace, rather than
-        // leave the app up waiting for an update that won't install. The
-        // installer is spawned synchronously inside quitAndInstall(), so by
-        // the time the fallback fires the update is already underway (or was
-        // never going to install) — force-exiting only ensures we quit.
-        if (updater.quitAndInstallIfPending()) {
-          const fallback = setTimeout(() => app.exit(0), quitInstallFallbackMs);
-          if (typeof fallback.unref === "function") fallback.unref();
-        } else {
-          app.quit();
-        }
+        // Re-entering app.quit() while Electron is unwinding the prevented quit
+        // can stop after before-quit, so resume on the next event-loop turn.
+        setImmediate(() => {
+          if (updater.quitAndInstallIfPending()) {
+            clearQuitForceExitTimer();
+            const fallback = setTimeout(() => app.exit(0), quitInstallFallbackMs);
+            if (typeof fallback.unref === "function") fallback.unref();
+          } else {
+            app.quit();
+          }
+        });
       });
   });
 }

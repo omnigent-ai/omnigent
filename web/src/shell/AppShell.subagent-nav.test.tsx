@@ -22,16 +22,19 @@
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseConversationsModule from "@/hooks/useConversations";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 // Match the AppShell.test.tsx mocks except DO NOT mock SubagentsPanel —
 // we want the real one so its <Link> renders.
-vi.mock("@/hooks/useConversations", () => ({
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseConversationsModule>()),
   useConversations: vi.fn(),
   useStopSession: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
 }));
@@ -51,6 +54,11 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
     isSuccess: true,
     isLoading: false,
   })),
+}));
+// AppShell reads the GitHub info to gate the rail's GitHub tab; keep it
+// loading here so no network-backed query fires.
+vi.mock("@/hooks/useGithub", () => ({
+  useGithubInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
 }));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module — childSessionsQueryKey, MAX_TREE_DEPTH, and
@@ -89,7 +97,6 @@ vi.mock("./FileViewer", () => ({
 vi.mock("./InlineTerminalsSection", () => ({
   InlineTerminalsSection: () => <div data-testid="inline-terminals-section" />,
 }));
-vi.mock("./TodoPanel", () => ({ TodoPanel: () => <div data-testid="todo-panel" /> }));
 vi.mock("./FilesPanelDrawer", () => ({
   FilesPanelDrawer: () => <div data-testid="files-panel-drawer" />,
 }));
@@ -143,8 +150,32 @@ beforeEach(() => {
 });
 
 describe("click sub-agent in rail (real SubagentsPanel)", () => {
-  it("keeps the right-rail tab on Subagents (does NOT shift to Files)", async () => {
-    // Setup: parent has one child sub-agent. User starts on parent
+  it("keeps the Agents tab and rail width across root, child, and sibling navigation", async () => {
+    const children = [
+      {
+        id: "conv_child",
+        title: null,
+        task_summary: null,
+        tool: "researcher",
+        session_name: null,
+        current_task_status: null,
+        busy: false,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+      },
+      {
+        id: "conv_sibling",
+        title: null,
+        task_summary: null,
+        tool: "researcher",
+        session_name: null,
+        current_task_status: null,
+        busy: false,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+      },
+    ];
+    // Setup: parent has two child sub-agents. User starts on parent
     // with the Agents tab selected; URL has ?file=foo.txt (stale from
     // a previous file-viewer interaction).
     //
@@ -160,19 +191,7 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     vi.mocked(useChildSessions).mockImplementation((id) => {
       if (id === "conv_root") {
         return {
-          children: [
-            {
-              id: "conv_child",
-              title: null,
-              task_summary: null,
-              tool: "researcher",
-              session_name: null,
-              current_task_status: null,
-              busy: false,
-              last_message_preview: null,
-              pending_elicitations_count: 0,
-            },
-          ],
+          children,
           isLoading: false,
           error: null,
         };
@@ -202,12 +221,10 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
           error: null,
         } as never;
       }
-      // Simulate the real-world race: when the user navigates to a
-      // child, ``useSession(conv_child)`` is loading on first render
-      // — so ``activeSession`` is null. AppShell's
-      // ``rootSessionId = activeSession?.parentSessionId ?? conversationId``
-      // therefore briefly resolves to ``conv_child`` itself.
-      if (id === "conv_child") {
+      // Simulate the real-world race: when the user navigates to a child,
+      // ``useSession(conv_child)`` is loading on first render. Without the
+      // sticky root, the fallback would briefly resolve to the child itself.
+      if (id === "conv_child" || id === "conv_sibling") {
         return { session: null, isLoading: true, error: null } as never;
       }
       return { session: null, isLoading: false, error: null };
@@ -218,19 +235,8 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     // production (its useChildSessions queries write here). The sticky
     // root holds across the parent→child click only while the target is
     // a known member of the last root's cached tree.
-    qc.setQueryData(childSessionsQueryKey("conv_root"), [
-      {
-        id: "conv_child",
-        title: null,
-        task_summary: null,
-        tool: "researcher",
-        session_name: null,
-        current_task_status: null,
-        busy: false,
-        last_message_preview: null,
-        pending_elicitations_count: 0,
-      },
-    ]);
+    qc.setQueryData(childSessionsQueryKey("conv_root"), children);
+    writeSessionWorkspaceState("conv_root", { widthPx: 500 });
     render(
       <QueryClientProvider client={qc}>
         <TooltipProvider>
@@ -263,17 +269,96 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
 
     // SubagentsPanel renders now that the tab is selected.
     const childRows = screen.getAllByTestId("subagent-row");
-    // Exactly one child row should render for this fixture's one child;
-    // zero means the panel never loaded, and more than one means duplicate
-    // or unrelated rows could hide the navigation target.
-    expect(childRows).toHaveLength(1);
+    expect(childRows).toHaveLength(2);
     expect(childRows[0]).toHaveAttribute("href", "/c/conv_child");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
     fireEvent.click(childRows[0]);
 
     // After navigation: the same rail Agents tab we clicked must STILL be
     // mounted and selected, not just any matching tab elsewhere in the shell.
     expect(agentsTab.isConnected).toBe(true);
     expect(agentsTab).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
+
+    fireEvent.click(screen.getAllByTestId("subagent-row")[1]);
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
+
+    fireEvent.click(screen.getByTestId("subagent-main-row"));
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
+  });
+
+  it("restores a saved width while a cold-loaded session snapshot is unresolved", () => {
+    vi.mocked(useChildSessions).mockReturnValue({
+      children: [],
+      isLoading: true,
+      error: null,
+    });
+    vi.mocked(useSession).mockReturnValue({
+      session: null,
+      isLoading: true,
+      error: null,
+    } as never);
+    writeSessionWorkspaceState("conv_cold", { widthPx: 500 });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_cold"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<div data-testid="page" />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
+  });
+
+  it("does not persist width under a cold-loaded child's tentative key", () => {
+    vi.mocked(useChildSessions).mockReturnValue({
+      children: [],
+      isLoading: true,
+      error: null,
+    });
+    vi.mocked(useSession).mockReturnValue({
+      session: null,
+      isLoading: true,
+      error: null,
+    } as never);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_cold_child"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<div data-testid="page" />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.keyDown(screen.getByRole("separator", { name: "Resize panel" }), {
+      key: "ArrowLeft",
+    });
+    expect(readSessionWorkspaceState("conv_cold_child").widthPx).toBeUndefined();
   });
 
   it("shows the Agents tab with count 1 while a childless session's initial fetch is loading", () => {

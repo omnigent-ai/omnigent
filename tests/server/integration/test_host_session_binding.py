@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -48,6 +49,7 @@ from omnigent.stores.host_store import HostStore
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
+    build_agent_bundle,
     create_test_agent,
     install_fake_modal_launcher,
 )
@@ -557,6 +559,88 @@ async def test_managed_session_create_with_repo_workspace_binds_cloned_dir(
     assert snapshot.status_code == 200, snapshot.text
     assert snapshot.json()["workspace"] == "/root/workspace/myrepo"
     del tunnels
+
+
+async def test_managed_multipart_bundle_create_end_to_end(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Multipart ``POST /v1/sessions`` with ``host_type="managed"`` uploads
+    a bundle AND provisions a sandbox in one call — the gap this feature
+    closes. The freshly-created session-scoped agent is what the managed
+    runner runs on the sandbox, so the same background launch as the JSON
+    path binds the session to a sandbox host with a runner. Also confirms
+    the caller owns the session (grant happens BEFORE the managed launch
+    is scheduled, so a launch failure can't orphan an unowned row).
+    """
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        """Spawn the fake sandbox host when the launcher 'starts' it."""
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
+    install_fake_modal_launcher(monkeypatch, fake)
+
+    bundle = build_agent_bundle(name="managed-multipart-e2e-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"host_type": "managed"})},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["session_id"]
+
+    # The uploaded bundle's session-scoped agent is what runs on the
+    # provisioned sandbox — the background launch binds the session the
+    # same way the JSON path does.
+    conv = await _wait_for_managed_binding(env, session_id)
+    tunnels = [await future for future in host_futures]
+    assert len(tunnels) == 1
+    assert conv.host_id is not None
+    assert conv.workspace == "/root/workspace"
+    assert conv.runner_id is not None
+    assert conv.runner_id.startswith("runner_token_")
+
+    host = env.host_store.get_host(conv.host_id)
+    assert host is not None
+    assert host.user_id == RESERVED_USER_LOCAL
+    assert host.status == "online"
+    assert host.sandbox_provider == "modal"
+    assert host.sandbox_id == "sb-fake-1"
+    del tunnels
+
+
+async def test_managed_multipart_bundle_create_rejects_path_workspace(
+    managed_session_env: ManagedSessionEnv,
+) -> None:
+    """
+    A multipart managed create with a filesystem-path workspace is
+    rejected at metadata validation — a managed workspace is a git
+    repository URL, mirroring the JSON path's contract — before any
+    sandbox provisioning is scheduled.
+    """
+    bundle = build_agent_bundle(name="managed-multipart-badws-agent")
+    resp = await managed_session_env.client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"host_type": "managed", "workspace": "/tmp/w"})},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert resp.status_code >= 400, resp.text
+    assert "git repository URL" in resp.text
 
 
 async def test_managed_session_create_validator_errors_serialize_as_422(
@@ -1302,17 +1386,28 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
 async def test_managed_launch_fails_when_runner_never_connects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Initial managed launch settlement also depends on the runner tunnel."""
+    """Initial managed launch settlement also depends on the runner tunnel.
+
+    A launch that fails here — after the host is already online — must tear
+    the fresh sandbox down, not just settle the tracker and leave the Job
+    running with a live launch token and no one who will ever use it.
+    """
     from omnigent.server.routes import sessions as sessions_module
 
     session_id = "1a41e11887aca4570e42c0be40f24833"
+    host_id = "3c8cdcdb61903904849174c864620a5c"
     conv = SimpleNamespace(id=session_id)
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
     stages: list[tuple[str, str | None]] = []
+    terminated: list[object] = []
+    sentinel_host = object()
 
     async def _launch_runner(*_args: object, **_kwargs: object) -> object:
         return sessions_module._HostLaunchAttempt(runner_id="runner_never_connects")
+
+    async def _fake_terminate(host: object, *_args: object, **_kwargs: object) -> None:
+        terminated.append(host)
 
     class _HostRegistry:
         def get(self, _host_id: str) -> object:
@@ -1322,17 +1417,23 @@ async def test_managed_launch_fails_when_runner_never_connects(
         async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> None:
             del timeout_s
 
+    class _HostStore:
+        def get_host(self, requested_id: str) -> object:
+            assert requested_id == host_id
+            return sentinel_host
+
     monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
         lambda _sid, stage, error=None: stages.append((stage, error)),
     )
+    monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
 
     await sessions_module._bind_and_launch_managed_runner(
         session_id=session_id,
         managed=ManagedHostLaunch(
-            host_id="3c8cdcdb61903904849174c864620a5c",
+            host_id=host_id,
             workspace="/root/workspace",
         ),
         sandbox_config=ManagedSandboxDeployment.single(
@@ -1346,7 +1447,7 @@ async def test_managed_launch_fails_when_runner_never_connects(
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
         ),
-        host_store=SimpleNamespace(),
+        host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=_HostRegistry(),  # type: ignore[arg-type]
         tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
     )
@@ -1356,6 +1457,151 @@ async def test_managed_launch_fails_when_runner_never_connects(
     assert launch.settled.is_set()
     assert launch.error == "managed runner did not connect after launch"
     assert stages[-1] == ("failed", "managed runner did not connect after launch")
+    assert terminated == [sentinel_host]
+
+
+async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that refuses the harness is a fresh sandbox that will never
+    serve this session, so it must be torn down the same as the
+    delete-during-provisioning branch already is.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "3f3aa440b7274531a889fa4c25f4bb1b"
+    host_id = "b4e372ad19634c62966a2c56aab8cfab"
+    conv = SimpleNamespace(id=session_id)
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+    stages: list[tuple[str, str | None]] = []
+    terminated: list[object] = []
+    sentinel_host = object()
+
+    async def _launch_runner(*_args: object, **_kwargs: object) -> object:
+        return sessions_module._HostLaunchAttempt(
+            runner_id="runner_refused_harness",
+            error_code=sessions_module._HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            error="harness not configured on the sandbox host",
+        )
+
+    async def _fake_terminate(host: object, *_args: object, **_kwargs: object) -> None:
+        terminated.append(host)
+
+    class _HostRegistry:
+        def get(self, _host_id: str) -> object:
+            return object()
+
+    class _HostStore:
+        def get_host(self, requested_id: str) -> object:
+            assert requested_id == host_id
+            return sentinel_host
+
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(
+        sessions_module,
+        "_publish_sandbox_status",
+        lambda _sid, stage, error=None: stages.append((stage, error)),
+    )
+    monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
+
+    await sessions_module._bind_and_launch_managed_runner(
+        session_id=session_id,
+        managed=ManagedHostLaunch(
+            host_id=host_id,
+            workspace="/root/workspace",
+        ),
+        sandbox_config=ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://managed-test.example.com",
+                launcher_factory=lambda: FakeSandboxLauncher(),
+                token_ttl_s=3600,
+            )
+        ),
+        tracker=tracker,
+        conversation_store=SimpleNamespace(
+            set_host_id=lambda _sid, _host_id, _workspace: conv,
+        ),
+        host_store=_HostStore(),  # type: ignore[arg-type]
+        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        tunnel_registry=None,
+    )
+
+    launch = tracker.get(session_id)
+    assert launch is not None
+    assert launch.settled.is_set()
+    assert launch.error == "harness not configured on the sandbox host"
+    assert stages[-1] == ("failed", "harness not configured on the sandbox host")
+    assert terminated == [sentinel_host]
+
+
+async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed runner connect on a RELAUNCH generation must not tear down
+    the host row: unlike a first launch, ``managed.host_id`` here is an
+    existing, persistent identity, not something freshly minted for this
+    attempt. Deleting it on a slow connect would destroy the user's host
+    binding, not just clean up an orphaned Job.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "d3a6e13f0dbf4b6ea4b6e37f4a76f2a9"
+    host_id = "9e6cf6f52ebb4a2c9c9a1a5f8e8f5f42"
+    conv = SimpleNamespace(id=session_id)
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+    terminated: list[object] = []
+
+    async def _launch_runner(*_args: object, **_kwargs: object) -> object:
+        return sessions_module._HostLaunchAttempt(runner_id="runner_never_connects")
+
+    async def _fake_terminate(host: object, *_args: object, **_kwargs: object) -> None:
+        terminated.append(host)
+
+    class _HostRegistry:
+        def get(self, _host_id: str) -> object:
+            return object()
+
+    class _TunnelRegistry:
+        async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> None:
+            del timeout_s
+
+    class _HostStore:
+        def get_host(self, _requested_id: str) -> object:
+            # Should never be called: relaunch_host being set must short-circuit
+            # before the lookup, not just before the terminate call.
+            raise AssertionError("get_host should not be called for a relaunch failure")
+
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(sessions_module, "_publish_sandbox_status", lambda *_a, **_kw: None)
+    monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
+
+    await sessions_module._bind_and_launch_managed_runner(
+        session_id=session_id,
+        managed=ManagedHostLaunch(host_id=host_id, workspace="/root/workspace"),
+        sandbox_config=ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://managed-test.example.com",
+                launcher_factory=lambda: FakeSandboxLauncher(),
+                token_ttl_s=3600,
+            )
+        ),
+        tracker=tracker,
+        conversation_store=SimpleNamespace(
+            set_host_id=lambda _sid, _host_id, _workspace: conv,
+        ),
+        host_store=_HostStore(),  # type: ignore[arg-type]
+        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
+        relaunch_host=object(),  # type: ignore[arg-type]
+    )
+
+    launch = tracker.get(session_id)
+    assert launch is not None
+    assert launch.settled.is_set()
+    assert launch.error == "managed runner did not connect after launch"
+    assert terminated == []
 
 
 async def test_cancel_managed_launch_tasks_returns_while_provision_parked(

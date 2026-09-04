@@ -1,7 +1,8 @@
 // Inline status indicators for non-tool, non-text, non-reasoning blocks.
 // Each is small enough to live in one file.
 //
-// - ErrorBanner: destructive Alert with `[source]` + code + message.
+// - ErrorBanner: centered destructive pill with an expandable message body;
+//   `level="info"` renders it as a neutral notice instead.
 // - RetryIndicator: muted one-liner about an in-flight retry.
 // - CompactionMarker: permanent marker shown after compaction completes.
 //   The in-progress state renders as a Shimmer in ChatPage, mirroring
@@ -13,7 +14,10 @@ import {
   CheckIcon,
   ChevronRightIcon,
   CopyIcon,
+  InfoIcon,
+  Loader2Icon,
   RotateCcwIcon,
+  RotateCwIcon,
   ShieldXIcon,
   ShrinkIcon,
   XIcon,
@@ -46,6 +50,8 @@ interface ErrorBannerProps {
   cause?: string;
   /** Concrete next step to fix it, e.g. a command to run. */
   remediation?: string;
+  /** `"info"` renders a neutral notice (no failure tone) instead of a destructive error. */
+  level?: "error" | "info";
   /** Reconnect the existing session without replaying or duplicating user input. */
   onRetry?: () => Promise<void>;
 }
@@ -67,6 +73,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   context_length_exceeded: "The conversation grew past the model's context window.",
   executor_error: "The agent runtime hit an error while running the turn.",
   workspace_missing: "The session workspace no longer exists on the host.",
+  codex_thread_reset:
+    "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([
@@ -127,25 +135,30 @@ function parseErrorMessage(rawMessage: string): ParsedErrorMessage {
 }
 
 /**
- * Loud destructive banner for `error` blocks.
+ * Centered destructive pill for `error` blocks: a truncated headline row over
+ * a dashed rule; the whole pill toggles the expanded message body.
  *
  * When the runner classified the failure it passes `title` / `cause` /
- * `remediation`, and the banner renders a clear card: headline, plain-English
- * cause, a "Try this" remediation line, and the raw diagnostics folded into a
+ * `remediation`, and the expanded body shows the plain-English cause, a
+ * "Try this" remediation line, and the raw diagnostics folded into a
  * collapsible. Otherwise it falls back to a code→sentence map (so even an
  * unclassified failure reads as English) and finally to the raw message/code —
  * never a blank panel.
  */
 export function ErrorBanner({
   message,
-  source,
   code,
   title,
   cause,
   remediation,
+  level,
   onRetry,
 }: ErrorBannerProps) {
-  const headline = title || FAILURE_CODE_DESCRIPTIONS[code] || "Something went wrong";
+  const notice = level === "info";
+  const tone = notice ? "var(--muted-foreground)" : "var(--destructive)";
+  const StatusIcon = notice ? InfoIcon : AlertCircleIcon;
+  const headline =
+    title || FAILURE_CODE_DESCRIPTIONS[code] || (notice ? "Notice" : "Something went wrong");
   const parsed = useMemo(() => parseErrorMessage(message), [message]);
   const messageText = useMemo(() => {
     const parts: string[] = [];
@@ -215,6 +228,7 @@ export function ErrorBanner({
           aria-atomic="true"
           className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
         >
+          <Loader2Icon aria-hidden="true" className="animate-spin" />
           Reconnecting
         </Badge>
       </div>
@@ -244,91 +258,107 @@ export function ErrorBanner({
   };
 
   return (
-    <Alert
-      variant="destructive"
-      className={cn(
-        TOOL_SURFACE_WIDTH_CLASS,
-        "block overflow-hidden rounded-2xl border-destructive/30 bg-destructive/[0.045] p-4 text-destructive sm:p-5",
-      )}
-    >
-      <div className="min-w-0 max-w-full">
-        <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto_auto] items-start gap-x-2">
+    <div className="relative mb-[24px] flex w-full flex-col items-center px-[16px]">
+      <span
+        aria-hidden="true"
+        className="pointer-events-none absolute top-[20px] right-0 left-0 h-px"
+        style={{
+          background: `repeating-linear-gradient(to right, color-mix(in srgb, ${tone} 32%, transparent) 0 2px, transparent 2px 6px)`,
+        }}
+      />
+      <div
+        data-testid="error-pill"
+        data-level={notice ? "info" : "error"}
+        onClick={() => setExpanded((value) => !value)}
+        onMouseEnter={() => setHeaderHovered(true)}
+        onMouseLeave={() => setHeaderHovered(false)}
+        onPointerDown={() => {
+          headerPointerDownRef.current = true;
+          setHeaderFocusVisible(false);
+        }}
+        onPointerUp={() => {
+          headerPointerDownRef.current = false;
+        }}
+        onPointerCancel={() => {
+          headerPointerDownRef.current = false;
+        }}
+        className="group/error relative z-10 w-[560px] max-w-full cursor-pointer rounded-[12px] p-[8px] text-foreground"
+        style={{
+          background: `color-mix(in srgb, ${tone} 4%, var(--app-shell-bg, var(--background)))`,
+          border: `1px solid color-mix(in srgb, ${tone} 32%, transparent)`,
+        }}
+      >
+        <div className="flex w-full min-w-0 items-start gap-[4px]">
           <button
             type="button"
             aria-expanded={expanded}
             aria-controls={expanded ? messageId : undefined}
-            onClick={() => setExpanded((value) => !value)}
-            onMouseEnter={() => setHeaderHovered(true)}
-            onMouseLeave={() => setHeaderHovered(false)}
-            onPointerDown={() => {
-              headerPointerDownRef.current = true;
-              setHeaderFocusVisible(false);
+            onClick={(event) => {
+              event.stopPropagation();
+              setExpanded((value) => !value);
             }}
-            onPointerUp={() => {
-              headerPointerDownRef.current = false;
-            }}
-            onPointerCancel={() => {
-              headerPointerDownRef.current = false;
+            onKeyDown={(event) => {
+              setHeaderFocusVisible(event.currentTarget.matches(":focus-visible"));
             }}
             onFocus={(event) => {
               setHeaderFocusVisible(
                 !headerPointerDownRef.current && event.currentTarget.matches(":focus-visible"),
               );
             }}
-            onKeyDown={(event) => {
-              setHeaderFocusVisible(event.currentTarget.matches(":focus-visible"));
-            }}
             onBlur={() => {
               headerPointerDownRef.current = false;
               setHeaderFocusVisible(false);
             }}
-            className="group/header -m-1 grid min-w-0 cursor-pointer grid-cols-[1.25rem_minmax(0,1fr)] items-start gap-x-3 rounded-lg p-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            className="flex min-w-0 flex-1 cursor-pointer items-start rounded-lg bg-transparent text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           >
             <span
               data-testid="error-leading-slot"
-              className="mt-0.5 flex size-5 shrink-0 items-center justify-center"
+              className="mt-[4px] mr-[4px] flex h-[18px] w-[18px] shrink-0 items-center justify-center"
             >
               {showDisclosureIcon ? (
                 <ChevronRightIcon
                   data-testid="error-disclosure-icon"
                   className={cn(
-                    "size-4 text-foreground transition-transform duration-150 animate-in fade-in",
+                    "size-4 text-muted-foreground transition-transform duration-150 animate-in fade-in group-hover/error:text-foreground",
                     expanded && "rotate-90",
                   )}
                   aria-hidden="true"
                 />
               ) : (
-                <AlertCircleIcon
+                <StatusIcon
                   data-testid="error-status-icon"
-                  className="size-4 animate-in fade-in duration-150"
+                  className={cn(
+                    "size-[18px] duration-150 animate-in fade-in",
+                    notice ? "text-muted-foreground" : "text-destructive",
+                  )}
                   aria-hidden="true"
                 />
               )}
             </span>
-            <AlertTitle className="min-w-0 pr-1 text-sm font-semibold leading-6 text-destructive sm:text-base">
-              <span
-                data-testid="error-headline"
-                className={cn(
-                  "block min-w-0",
-                  expanded ? "break-words [overflow-wrap:anywhere]" : "truncate",
-                )}
-              >
-                {headline}
-                {source ? (
-                  <span className="font-normal text-destructive/75"> · {source}</span>
-                ) : null}
-              </span>
-            </AlertTitle>
+            <span
+              data-testid="error-headline"
+              title={headline}
+              className={cn(
+                "mr-[4px] min-w-0 flex-1 truncate whitespace-nowrap leading-6",
+                notice ? "text-foreground" : "text-destructive",
+              )}
+            >
+              {headline}
+            </span>
           </button>
           {retryable ? (
             <Button
               type="button"
               variant="ghost"
               size="xs"
-              onClick={() => void retry()}
-              className="mt-0.5 shrink-0 text-muted-foreground hover:text-foreground"
+              onClick={(event) => {
+                event.stopPropagation();
+                void retry();
+              }}
+              style={{ fontSize: "var(--text-13, 13px)" }}
+              className="h-6 shrink-0 gap-1 rounded-[var(--control-radius,var(--radius-lg))] px-2 leading-5 text-muted-foreground hover:bg-muted hover:text-foreground"
             >
-              <RotateCcwIcon aria-hidden="true" />
+              <RotateCwIcon className="size-3.5" aria-hidden="true" />
               Retry
             </Button>
           ) : null}
@@ -337,11 +367,14 @@ export function ErrorBanner({
             type="button"
             variant="ghost"
             size="icon-xs"
-            aria-label="Dismiss error"
-            onClick={() => setDismissed(true)}
-            className="mt-0.5 shrink-0 text-muted-foreground hover:text-foreground"
+            aria-label={notice ? "Dismiss notice" : "Dismiss error message"}
+            onClick={(event) => {
+              event.stopPropagation();
+              setDismissed(true);
+            }}
+            className="size-6 shrink-0 rounded-[var(--control-radius,var(--radius-lg))] text-muted-foreground hover:bg-muted hover:text-foreground"
           >
-            <XIcon aria-hidden="true" />
+            <XIcon className="size-4" aria-hidden="true" />
           </Button>
         </div>
         {retryError ? (
@@ -349,54 +382,63 @@ export function ErrorBanner({
             role="status"
             aria-live="assertive"
             aria-atomic="true"
-            className="mt-2 break-words pl-8 text-sm text-destructive [overflow-wrap:anywhere]"
+            onClick={(event) => event.stopPropagation()}
+            className="mx-[4px] mt-[8px] text-sm leading-5 break-words text-destructive [overflow-wrap:anywhere]"
           >
             {retryError}
           </div>
         ) : null}
         {expanded ? (
-          <AlertDescription
+          <div
             id={messageId}
-            className="mt-6 min-w-0 max-w-full overflow-hidden text-foreground [text-wrap:wrap]"
+            onClick={(event) => event.stopPropagation()}
+            className="mt-[12px] min-w-0 max-w-full cursor-auto overflow-hidden text-foreground [text-wrap:wrap]"
           >
-            <section aria-labelledby={`${messageId}-label`} className="min-w-0 space-y-2">
-              <h4 id={`${messageId}-label`} className="text-sm font-medium text-muted-foreground">
-                Message
-              </h4>
-              <div className="relative min-w-0">
-                <div
-                  data-testid="error-message-content"
-                  className="max-w-full min-w-0 whitespace-pre-wrap break-words pr-10 font-mono text-sm leading-6 text-foreground [overflow-wrap:anywhere] [text-wrap:wrap]"
+            <section aria-labelledby={`${messageId}-label`} className="min-w-0">
+              <div className="mx-[4px] flex items-center justify-between gap-2">
+                <h4
+                  id={`${messageId}-label`}
+                  className="text-sm leading-4 font-medium text-muted-foreground"
                 >
-                  {messageText}
-                </div>
+                  Message
+                </h4>
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon-xs"
-                  className="absolute top-0 right-0 text-muted-foreground hover:text-foreground"
-                  aria-label={copiedTarget === "message" ? "Message copied" : "Copy message"}
+                  className="size-6 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  aria-label={
+                    copiedTarget === "message" ? "Error message copied" : "Copy error message"
+                  }
                   onClick={() => void copy("message", messageText)}
+                  componentId="diagnostics.status.copy"
                 >
                   {copiedTarget === "message" ? (
-                    <CheckIcon aria-hidden="true" />
+                    <CheckIcon className="size-3.5" aria-hidden="true" />
                   ) : (
-                    <CopyIcon aria-hidden="true" />
+                    <CopyIcon className="size-3.5" aria-hidden="true" />
                   )}
                 </Button>
+              </div>
+              <div
+                data-testid="error-message-content"
+                className="mx-[4px] mt-[4px] max-w-full min-w-0 font-mono text-sm leading-6 break-words whitespace-pre-wrap text-foreground [overflow-wrap:anywhere] [text-wrap:wrap]"
+              >
+                {messageText}
               </div>
             </section>
             {diagnostics.length > 0 ? (
               <Collapsible
                 open={diagnosticsOpen}
                 onOpenChange={setDiagnosticsOpen}
-                className="mt-6 border-t border-destructive/15 pt-4"
+                className="-mx-[8px] -mb-[8px] mt-[12px] w-[calc(100%+16px)] border-t"
+                style={{ borderColor: "var(--sidebar-edge-border, var(--border))" }}
               >
                 <CollapsibleTrigger asChild>
                   <button
                     type="button"
                     aria-controls={diagnosticsOpen ? diagnosticsId : undefined}
-                    className="flex w-full cursor-pointer items-center justify-between gap-3 rounded-md py-1 text-left text-sm font-medium text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                    className="flex w-full cursor-pointer items-center justify-between gap-3 px-[12px] py-[8px] text-left text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
                   >
                     <span>View diagnostics</span>
                     <ChevronRightIcon
@@ -408,8 +450,12 @@ export function ErrorBanner({
                     />
                   </button>
                 </CollapsibleTrigger>
-                <CollapsibleContent id={diagnosticsId} className="min-w-0 pt-4">
-                  <Tabs value={activeDiagnostics} onValueChange={setActiveDiagnostics}>
+                <CollapsibleContent id={diagnosticsId} className="min-w-0 px-[12px] pb-[12px]">
+                  <Tabs
+                    value={activeDiagnostics}
+                    onValueChange={setActiveDiagnostics}
+                    componentId="diagnostics.status.tabs"
+                  >
                     {diagnostics.length > 1 ? (
                       <TabsList
                         variant="line"
@@ -447,6 +493,7 @@ export function ErrorBanner({
                                 : `Copy ${item.label.toLowerCase()}`
                             }
                             onClick={() => void copy(item.id, item.content)}
+                            componentId="diagnostics.status.diagnostic_copy"
                           >
                             {copiedTarget === item.id ? (
                               <CheckIcon aria-hidden="true" />
@@ -461,10 +508,10 @@ export function ErrorBanner({
                 </CollapsibleContent>
               </Collapsible>
             ) : null}
-          </AlertDescription>
+          </div>
         ) : null}
       </div>
-    </Alert>
+    </div>
   );
 }
 

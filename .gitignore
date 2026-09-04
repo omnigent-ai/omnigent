@@ -6,6 +6,11 @@ node_modules/
 .pnpm-debug.log*
 reviews/
 
+# repro/resolve-agent workspace artifact — the machine-readable handoff.
+# Rides in the PR Demo section / CI artifact bundle, never in the diff.
+# Gitignored so a stray `git add` can't sweep it into a PR.
+.omnigent/
+
 # Generated artifact; never committed.
 .pytest_cache/
 __pycache__/
@@ -23,8 +28,10 @@ omnigent/_build_info.py
 .tmp*
 .*/
 
-# Exception: track .github/ (CI workflows).
+# Exception: track .github/ (CI workflows) and Storybook configuration.
 !.github/
+!web/.storybook/
+!web/.storybook/**
 
 # Exception: track .claude/skills/ (project-wide dev-time skills for Claude Code).
 # The .*/ rule above would otherwise exclude everything under .claude/.
@@ -66,10 +73,9 @@ output/playwright/
 # tests/e2e_ui/visual/snapshots/ is committed.
 tests/e2e_ui/visual/snapshot_failures/
 
-# web SPA build output, emitted into the server's static dir by
-# `npm run build` / the e2e_ui test fixture. Regenerated on demand;
-# never committed.
+# Web build outputs. Regenerated on demand; never committed.
 omnigent/server/static/web-ui/
+web/storybook-static/
 
 # macOS Finder metadata — never useful to commit.
 .DS_Store
@@ -86,3 +92,4 @@ omnigent/server/static/web-ui/
 # DAB local state directory (created by `databricks bundle deploy`).
 deploy/databricks/.databricks/
 web/package-lock.json
+recordings/

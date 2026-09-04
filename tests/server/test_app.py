@@ -8,6 +8,7 @@ they live here following the source ↔ test directory mirroring rule.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from dataclasses import dataclass
 from io import BytesIO
@@ -15,7 +16,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from PIL import Image
 
 from omnigent.native_coding_agents import (
@@ -463,7 +464,13 @@ def _branding_png(color: tuple[int, int, int, int]) -> bytes:
     return output.getvalue()
 
 
-def _build_branding_app(db_uri: str, tmp_path: Path, label: str) -> FastAPI:
+def _build_branding_app(
+    db_uri: str,
+    tmp_path: Path,
+    label: str,
+    *,
+    server_config: dict[str, object] | None = None,
+) -> FastAPI:
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
     artifact_store = LocalArtifactStore(str(tmp_path / f"artifacts-{label}"))
@@ -476,6 +483,25 @@ def _build_branding_app(db_uri: str, tmp_path: Path, label: str) -> FastAPI:
             artifact_store=artifact_store,
             cache_dir=tmp_path / f"cache-{label}",
         ),
+        server_config=server_config,
+    )
+
+
+def test_session_title_instructions_are_wired_into_coordinator(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "custom-titles",
+        server_config={"session_title_instructions": "Prefix titles with the current date."},
+    )
+
+    assert (
+        app.state.background_title_coordinator._additional_instructions
+        == "Prefix titles with the current date."
     )
 
 
@@ -803,6 +829,107 @@ async def test_health_unbound_fork_of_coding_session_reads_offline(
     assert sessions[chat_fork.id]["runner_online"] is True
 
 
+def test_generic_credentials_route_does_not_shadow_detected(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """The generic ``/hosts/{id}/credentials/{provider}`` route must not shadow
+    the literal ``/hosts/{id}/credentials/detected`` owned by ``create_hosts_router``.
+
+    Regression guard for the mount order: the credentials router carries a
+    ``{provider}`` path param, and Starlette matches routes in registration order
+    with no literal-over-parameter priority. If the credentials router is
+    registered before the hosts router, ``…/credentials/detected`` resolves to the
+    generic handler and the credential-adoption endpoint breaks.
+    """
+    from starlette.routing import Match
+
+    from omnigent.server.app import create_app
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        host_store=HostStore(db_uri),
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+
+    def endpoint_for(path: str) -> str | None:
+        scope = {"type": "http", "method": "GET", "path": path}
+        for route in app.router.routes:
+            match, _ = route.matches(scope)
+            if match == Match.FULL:
+                return getattr(getattr(route, "endpoint", None), "__name__", None)
+        return None
+
+    # The literal wins over the generic {provider} param, and github still routes
+    # to the generic broker handler.
+    assert endpoint_for("/v1/hosts/h1/credentials/detected") == "detect_host_credentials"
+    assert endpoint_for("/v1/hosts/h1/credentials/github") == "host_credential"
+
+
+@pytest.mark.asyncio
+async def test_health_unbound_imported_session_reads_offline(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """
+    An unbound imported transcript reads offline; a plain session online.
+
+    Both are unbound (no runner, no host). The ``omnigent.import.source``
+    label is the difference: an import has no live executor anywhere, so it
+    must launch a runner on a host first and reads ``runner_online: false``
+    (routing the open view to the resume picker). A plain unbound session
+    resumes in-process and stays online. Regression guard for the
+    ``imported`` branch of ``_bulk_session_liveness``.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    host_store = HostStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+
+    imported = conversation_store.create_conversation()
+    conversation_store.set_labels(imported.id, {"omnigent.import.source": "claude"})
+    plain = conversation_store.create_conversation()
+
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        host_store=host_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+    )
+    ids = f"{imported.id},{plain.id}"
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(f"/health?session_ids={ids}")
+
+    assert resp.status_code == 200
+    sessions = resp.json()["sessions"]
+    # Imported → offline (needs a host). A True here means the unbound branch
+    # ignored the import marker (the pre-fix behavior).
+    assert sessions[imported.id]["runner_online"] is False
+    # Plain unbound session → reachable in-process.
+    assert sessions[plain.id]["runner_online"] is True
+
+
 @dataclass(frozen=True)
 class _SeedStores:
     """
@@ -1023,17 +1150,26 @@ def test_ensure_default_acp_agents_seeds_configured_agent(
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
-def test_ensure_default_acp_agents_seeds_installed_builtin_cli(
+def test_ensure_default_acp_agents_seeds_builtin_cli_rows_without_a_local_binary(
     seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A builtin ACP CLI harness whose binary is on PATH seeds a picker built-in."""
+    """Every builtin ACP CLI row seeds even when no vendor CLI is on this host.
+
+    The vendor CLI runs on the *executing* host (the attached runner), not on the
+    server, so the server's own PATH says nothing about launchability. The picker
+    hides a row the selected host can't run via that host's ``configured_harnesses``
+    readiness map — the same way natives are seeded unconditionally and filtered.
+
+    **What breaks if this fails**: on a remote server (no vendor CLI in its
+    container) Devin and Grok vanish from the New Chat picker even though the Mac
+    runner attached to it has them installed — the row is never seeded, so no
+    per-host filter can bring it back.
+    """
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
-    # Every builtin ACP CLI resolves on PATH in this test.
-    monkeypatch.setattr(
-        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/local/bin/x"
-    )
+    # No vendor CLI resolves here — the remote-server / app-container shape.
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
 
     server_app._ensure_default_acp_agents(
         seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
@@ -1041,17 +1177,70 @@ def test_ensure_default_acp_agents_seeds_installed_builtin_cli(
     # Keyed by the catalog id (a valid slug), not the display label.
     for key in ACP_CLI_HARNESSES:
         assert seed_stores.agent_store.get_by_name(key) is not None, (
-            f"installed builtin ACP CLI {key!r} was not seeded"
+            f"builtin ACP CLI {key!r} was not seeded"
         )
 
 
-def test_ensure_default_acp_agents_noop_when_nothing_set_up(
+def test_ensure_default_acp_agents_configured_agent_beats_same_slug_builtin(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured agent whose slug is a builtin row id keeps its own command.
+
+    ``AcpAgentEntry(name="Devin")`` slugifies to ``devin``, which is also a
+    catalog row id, so both sources seed the same :func:`builtin_agent_id`. The
+    row must be skipped rather than seeded second and overwriting the user's
+    entry — while an unrelated row (``grok``) still seeds alongside.
+
+    **What breaks if this fails**: picking "Devin" in the web picker silently
+    runs the fixed row argv (account-default model) instead of the command the
+    user configured, e.g. ``devin acp --model swe-1-7-medium``.
+    """
+    import io
+    import tarfile
+
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+    from omnigent.spec import load
+
+    entry = AcpAgentEntry(slug="devin", name="Devin", command="devin acp --model swe-1-7-medium")
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
+    # Both vendor CLIs are installed, so the devin row would otherwise seed too.
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/local/bin/x"
+    )
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    seeded = seed_stores.agent_store.get_by_name("devin")
+    assert seeded is not None
+    assert seeded.id == builtin_agent_id("devin"), "both sources key the same id"
+    assert seed_stores.agent_store.get_by_name("grok") is not None, (
+        "a non-colliding builtin row must still seed"
+    )
+
+    # Presence is not enough — assert the surviving row launches the *configured*
+    # harness, since the bug was an overwrite that kept the name and lost the spec.
+    bundle = seed_stores.artifact_store.get(seeded.bundle_location)
+    assert bundle is not None
+    dest = tmp_path / "seeded"
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tf:
+        tf.extractall(dest, filter="data")
+    assert load(dest).executor.config["harness"] == "acp:devin"
+
+
+def test_ensure_default_acp_agents_seeds_no_slug_rows_without_acp_config(
     seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No configured agents + no installed builtin CLI → nothing seeded.
+    """An empty ``acp:`` block seeds no ``acp:<slug>`` row — only catalog rows.
 
-    **What breaks if this fails**: a remote server (no ``acp:`` config, ACP CLIs
-    absent) shows phantom ACP picker rows that can't launch there.
+    Unlike a builtin row, a configured agent's launch command is resolved from the
+    host's own ``acp:`` block at spawn time, so a slug this host never defined could
+    not launch anywhere. Only the fixed catalog rows are host-independent.
+
+    **What breaks if this fails**: the picker grows a row for a slug no config
+    defines, and choosing it fails at spawn with an unresolvable ACP command.
     """
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 
@@ -1061,9 +1250,13 @@ def test_ensure_default_acp_agents_noop_when_nothing_set_up(
     server_app._ensure_default_acp_agents(
         seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
     )
-    assert seed_stores.agent_store.get_by_name("devin") is None
-    for key in ACP_CLI_HARNESSES:
-        assert seed_stores.agent_store.get_by_name(key) is None
+    assert seed_stores.agent_store.get_by_name("kilocode") is None, (
+        "a slug absent from config must not be seeded"
+    )
+    seeded = {
+        key for key in ACP_CLI_HARNESSES if seed_stores.agent_store.get_by_name(key) is not None
+    }
+    assert seeded == set(ACP_CLI_HARNESSES), "catalog rows are host-independent and always seed"
 
 
 def test_ensure_default_acp_agents_survives_unreadable_config(
@@ -1390,6 +1583,117 @@ def test_ensure_default_polly_agent_repairs_stale_cache(
     assert repaired != "STALE CACHED SPEC"
 
 
+def test_ensure_default_polly_agent_repairs_lost_bundle_blob(
+    seed_stores: _SeedStores,
+) -> None:
+    """
+    A matching-hash re-seed restores a bundle blob lost from the store.
+
+    The matching-hash fast path trusts the artifact store without
+    checking the blob is present. If the row survives but the bundle is
+    gone (artifacts pruned, or the DB restored without the matching
+    store), every restart re-computes the same hash, matches the stored
+    ``bundle_location``, and returns without re-``put``-ing — so boot can
+    never self-heal and each session launch raises ``failed to load
+    agent spec``. The seeder must re-``put`` on the matching path when
+    the store is missing the blob. Without the fix this test fails: the
+    blob stays absent and the reload raises ``KeyError``.
+    """
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    agent = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert agent is not None
+    assert seed_stores.artifact_store.exists(agent.bundle_location)
+
+    # Lose the blob while the row survives, and drop the local cache so
+    # nothing masks the missing bundle at load time.
+    seed_stores.artifact_store.delete(agent.bundle_location)
+    seed_stores.agent_cache.evict(agent.id)
+    assert not seed_stores.artifact_store.exists(agent.bundle_location)
+
+    # Re-seed: source unchanged → hash matches the row (the fast path).
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    # The fast path re-put the lost bundle: the store has it again and a
+    # fresh load succeeds instead of raising.
+    assert seed_stores.artifact_store.exists(agent.bundle_location)
+    reloaded = seed_stores.agent_cache.load(agent.id, agent.bundle_location)
+    assert reloaded.spec is not None
+    # Row untouched on the matching path: same location, no version bump.
+    still = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert still is not None
+    assert still.bundle_location == agent.bundle_location
+    assert still.version == agent.version
+
+
+def test_ensure_default_polly_agent_repairs_legacy_prefixed_bundle_location(
+    seed_stores: _SeedStores,
+) -> None:
+    """
+    The lost-blob repair targets the row's own ``bundle_location``, so it
+    also heals a legacy ``ag_``-prefixed one.
+
+    Rows seeded before the binary-uuid migration keep an ``ag_``-prefixed
+    left segment in ``bundle_location`` while ``id`` is bare hex (the
+    migration excluded ``bundle_location`` as a physical artifact key), and
+    they reach the matching-hash path through the sha-segment compare.
+
+    What breaks if this fails: keying the repair off ``f"{id}/{hash}"``
+    probes and writes a key nothing reads, so an upgraded deployment whose
+    built-in blob was pruned keeps raising ``failed to load agent spec`` on
+    every session launch while boot leaves an orphan bundle behind.
+    """
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    agent = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert agent is not None
+    bundle_hash = agent.bundle_location.rsplit("/", 1)[-1]
+    bundle_bytes = seed_stores.artifact_store.get(agent.bundle_location)
+
+    # Rewrite the row into the pre-migration shape: bare-hex id, blob and
+    # location under the ``ag_``-prefixed physical key.
+    legacy_loc = f"ag_{agent.id}/{bundle_hash}"
+    seed_stores.artifact_store.put(legacy_loc, bundle_bytes)
+    seed_stores.artifact_store.delete(agent.bundle_location)
+    legacy = seed_stores.agent_store.update(agent.id, legacy_loc)
+    assert legacy is not None
+
+    # Lose the blob while the row survives, and drop the local cache so
+    # nothing masks the missing bundle at load time.
+    seed_stores.artifact_store.delete(legacy_loc)
+    seed_stores.agent_cache.evict(agent.id)
+    assert not seed_stores.artifact_store.exists(legacy_loc)
+
+    # Re-seed: source unchanged -> hash matches the row (the fast path).
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    # Repaired at the key the loader reads, and nothing written to the
+    # bare-hex key the row does not point at.
+    assert seed_stores.artifact_store.exists(legacy_loc)
+    assert not seed_stores.artifact_store.exists(f"{agent.id}/{bundle_hash}")
+    reloaded = seed_stores.agent_cache.load(agent.id, legacy_loc)
+    assert reloaded.spec is not None
+    # Row untouched on the matching path: same location, no version bump.
+    still = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert still is not None
+    assert still.bundle_location == legacy_loc
+    assert still.version == legacy.version
+
+
 def test_tar_gz_dir_is_order_independent(tmp_path: Path) -> None:
     """
     Same content, different file-creation order → identical bundle bytes.
@@ -1651,3 +1955,76 @@ def test_load_debug_routers_collects_entries() -> None:
     _router, prefix, tags = entries[0]
     assert prefix == "/debug"
     assert tags == ["debug"]
+
+
+def test_session_id_from_request_parses_session_path() -> None:
+    """The exception handlers read the session id off the request path.
+
+    A ``/v1/sessions/<id>/…`` path yields the id (threaded into the 500 log so
+    the debug-logs row is correlated); anything else yields ``None``.
+    """
+    from types import SimpleNamespace
+
+    def _req(path: str) -> object:
+        return SimpleNamespace(url=SimpleNamespace(path=path))
+
+    parse = server_app._session_id_from_request
+    assert parse(_req("/v1/sessions/conv_abc/events")) == "conv_abc"  # type: ignore[arg-type]
+    assert parse(_req("/v1/sessions/conv_abc")) == "conv_abc"  # type: ignore[arg-type]
+    assert parse(_req("/health")) is None  # type: ignore[arg-type]
+    assert parse(_req("/v1/sessions")) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
+    app: FastAPI,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    ``RUNNER_UNAVAILABLE`` logs a stateful WARN; other 5xx keep ERROR.
+
+    Both arms are asserted together because the point is the contrast:
+    downgrading every 5xx would hide genuine faults just as effectively
+    as an offline session's polling buried them.
+
+    :param app: The real application, for its registered handlers.
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    handler = app.exception_handlers[OmnigentError]
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+            "raw_path": b"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+        offline = await handler(
+            request,
+            OmnigentError(
+                "runner 'runner_token_x' is offline",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ),
+        )
+        fault = await handler(request, OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR))
+
+    # The wire contract is untouched: only the log level moves.
+    assert offline.status_code == 503
+    assert fault.status_code == 500
+
+    records = [r for r in caplog.records if r.name == "omnigent.server.app"]
+    assert len(records) == 2, f"expected one record per error, got {records}"
+    unavailable, internal = records
+    assert unavailable.levelno == logging.WARNING
+    # Raised deliberately from a known site, so a stack adds no information.
+    assert unavailable.exc_info is None
+    assert "Internal error" not in unavailable.getMessage()
+    assert internal.levelno == logging.ERROR
+    assert internal.exc_info is not None

@@ -254,16 +254,22 @@ describe("FilesPanel working folder directory", () => {
 });
 
 describe("FilesPanel working folder header role", () => {
-  // The "Working folder" header is a static label in every mode — it is not a
-  // collapse toggle. Collapsing was removed: the panel's content is the whole
-  // point of the panel, so there is nothing to collapse to. The content is
-  // always visible and the header never carries aria-expanded.
+  // The scope heading is static in every mode — it is not a collapse toggle.
+  // Collapsing was removed: the panel's content is the whole point of the
+  // panel, so there is nothing to collapse to. The content is always visible.
   it("renders the header as a static label (no toggle button) in the standalone card", () => {
     renderPanel({ conversationId: "conv_header_card", files: [] });
     expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
-    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Working folder" })).toBeInTheDocument();
     // Content is always shown — the tree search box is part of it.
     expect(screen.getByRole("searchbox", { name: "Search all files" })).toBeInTheDocument();
+  });
+
+  it("labels the changed-files scope with a Changes heading", () => {
+    renderPanel({ conversationId: "conv_header_changes", files: [], flatView: true });
+    expect(screen.getByRole("heading", { name: "Changes" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Working folder" })).toBeNull();
+    expect(screen.getByRole("searchbox", { name: "Search changed files" })).toBeInTheDocument();
   });
 
   it("renders the header as a static label (no toggle button) in frameless (inline rail) mode", () => {
@@ -295,7 +301,7 @@ describe("FilesPanel working folder header role", () => {
     );
 
     expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
-    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Working folder" })).toBeInTheDocument();
     expect(screen.getByRole("searchbox", { name: "Search all files" })).toBeInTheDocument();
   });
 
@@ -303,7 +309,7 @@ describe("FilesPanel working folder header role", () => {
     renderPanel({ conversationId: "conv_header_drawer", files: [], onClose: vi.fn() });
     // The drawer adds an X close button; the title is a plain label everywhere.
     expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
-    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Working folder" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Close files" })).toBeInTheDocument();
   });
 });
@@ -1393,6 +1399,32 @@ describe("FilesPanel browse location", () => {
     expect(trigger).toHaveTextContent("/home/user/proj");
   });
 
+  it("opens a file at an absolute browse location by its absolute path", () => {
+    // Regression: after navigating OUTSIDE the workspace (e.g. /etc), the tree
+    // lists files by bare name relative to that location. Opening one must
+    // hand the viewer the file's ABSOLUTE path (/etc/hosts) -- otherwise the
+    // viewer looks the bare name up under the workspace root and 404s.
+    const onFileSelect = vi.fn();
+    renderPanel({
+      conversationId: "conv_open_abs",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+      onFileSelect,
+    });
+
+    // Re-rooting to /etc swaps the listing for one whose file is bare-named.
+    useAllFilesMock.mockImplementation((_id: unknown, _opts: unknown, location?: string) =>
+      location === "/etc" ? allFilesResult([file("hosts")]) : allFilesResult([]),
+    );
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+
+    fireEvent.click(screen.getByText("hosts"));
+
+    expect(onFileSelect).toHaveBeenCalledWith("/etc/hosts");
+  });
+
   it("re-roots both the tree and search when a directory is picked", () => {
     // The bug this feature fixes is a tree showing one directory while search
     // reports on another, so both queries must move together.
@@ -1415,6 +1447,62 @@ describe("FilesPanel browse location", () => {
       expect.anything(),
       "/etc",
     );
+  });
+
+  it("restores the browsed location across unmount/remount (file-viewer round trip)", () => {
+    // Opening a file swaps the panel for the FileViewer, unmounting it.
+    // Closing the viewer must land back in the directory the file was opened
+    // from, not snap to the workspace root.
+    const first = renderPanel({
+      conversationId: "conv_viewer_roundtrip",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    expect(useAllFilesMock).toHaveBeenLastCalledWith(
+      "conv_viewer_roundtrip",
+      expect.anything(),
+      "/etc",
+    );
+
+    first.unmount();
+    renderPanel({
+      conversationId: "conv_viewer_roundtrip",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+
+    expect(useAllFilesMock).toHaveBeenLastCalledWith(
+      "conv_viewer_roundtrip",
+      expect.anything(),
+      "/etc",
+    );
+  });
+
+  it("keeps a remembered location scoped to its own conversation", () => {
+    // The cache must not leak one session's directory into another: a
+    // different conversation opens at ITS root, exactly as before.
+    const first = renderPanel({
+      conversationId: "conv_loc_owner",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    first.unmount();
+
+    renderPanel({
+      conversationId: "conv_loc_other",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_loc_other", expect.anything(), "");
   });
 
   it("surfaces a refused location instead of an empty tree", () => {

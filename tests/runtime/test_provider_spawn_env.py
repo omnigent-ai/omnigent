@@ -20,12 +20,14 @@ subprocess spawn, no real CLI.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml as _yaml
 
+from omnigent.errors import OmnigentError
 from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
@@ -324,6 +326,64 @@ def test_codex_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_CODEX_WIRE_API"] == "responses"
 
 
+def test_codex_rejects_chat_only_openrouter_before_harness_spawn(config_home: Path) -> None:
+    """A chat-only OpenRouter route fails before Codex can make a bad request."""
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "openrouter": {
+                    "kind": "gateway",
+                    "default": True,
+                    "openai": _key_family(
+                        "https://openrouter.ai/api/v1",
+                        "sk-or-test",
+                        "stealth/ox-alpha",
+                        wire_api="chat",
+                    ),
+                }
+            }
+        },
+    )
+    spec = _make_spec(harness="codex")
+
+    with pytest.raises(OmnigentError) as raised:
+        _build_codex_spawn_env(spec, workdir=None)
+
+    message = str(raised.value).lower()
+    assert "codex" in message
+    assert "chat" in message
+    assert "responses" in message
+    assert "openrouter.ai/api/v1" in message
+
+
+def test_codex_accepts_explicit_responses_wire_at_same_provider_url(config_home: Path) -> None:
+    """The chat-wire guard does not reject a Responses-capable route by vendor name."""
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "openrouter": {
+                    "kind": "gateway",
+                    "default": True,
+                    "openai": _key_family(
+                        "https://openrouter.ai/api/v1",
+                        "sk-or-test",
+                        "openai/gpt-5",
+                        wire_api="responses",
+                    ),
+                }
+            }
+        },
+    )
+    spec = _make_spec(harness="codex")
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CODEX_GATEWAY_BASE_URL"] == "https://openrouter.ai/api/v1"
+    assert env["HARNESS_CODEX_WIRE_API"] == "responses"
+
+
 def test_codex_falls_back_to_first_available_openai_credential(
     config_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -502,6 +562,35 @@ def test_pi_uses_anthropic_global_default(config_home: Path) -> None:
     assert env["HARNESS_PI_GATEWAY_HOST"] == "https://anthropic.example.com"
     assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
     assert env["HARNESS_PI_MODEL"] == "claude-default-model"
+
+
+def test_pi_gateway_routing_log_reports_the_resolved_base_url(
+    config_home: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    The runner's routing log reports pi's plural ``_BASE_URLS`` key.
+
+    pi's generic-provider path emits only ``HARNESS_PI_GATEWAY_BASE_URLS``
+    (per-family JSON), so a log that reads just the singular
+    ``HARNESS_PI_GATEWAY_BASE_URL`` says ``base_url=None`` on a run that
+    routed fine. Failure means that fallback is gone and the line is
+    misleading again.
+    """
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    _write_config(config_home, _anthropic_default_config())
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        env = _build_spawn_env_from_spec(_make_spec(harness="pi"), "pi")
+
+    assert env is not None
+    assert "HARNESS_PI_GATEWAY_BASE_URL" not in env  # only the plural key is set
+    line = next(
+        rec.getMessage() for rec in caplog.records if "gateway routing" in rec.getMessage()
+    )
+    # Compare against the env value itself: the line must carry the plural
+    # key's URLs, not just some host substring.
+    assert f"base_url={env['HARNESS_PI_GATEWAY_BASE_URLS']}" in line
 
 
 def test_pi_threads_generic_openai_wire_api(config_home: Path) -> None:
@@ -1334,7 +1423,7 @@ def test_kimi_spawn_env_threads_spec_model_only(config_home: Path) -> None:
     """The kimi builder only emits ``HARNESS_KIMI_MODEL`` (when set) and
     ``HARNESS_KIMI_CWD`` (when workdir given). Upstream kimi has no per-spawn
     provider override, so no HARNESS_KIMI_GATEWAY_* / _DATABRICKS_PROFILE
-    env vars are emitted — provider routing lives in ``~/.kimi/config.toml``."""
+    env vars are emitted — provider routing lives in ``~/.kimi-code/config.toml``."""
     _write_config(config_home, {"providers": {}})
     spec = _make_spec(harness="kimi", model="kimi-k2-turbo")
 
@@ -1364,7 +1453,7 @@ def test_kimi_no_provider_emits_no_gateway_vars(config_home: Path) -> None:
 
     A regression here would either steal an ambient OPENAI_API_KEY (mis-billing)
     or point at a stale URL the user never configured. Upstream kimi reads its
-    provider config from ``~/.kimi/config.toml``; Omnigent never injects."""
+    provider config from ``~/.kimi-code/config.toml``; Omnigent never injects."""
     _write_config(config_home, {"providers": {}})
     spec = _make_spec(harness="kimi")
 
@@ -1384,7 +1473,7 @@ def test_kimi_ignores_global_default_provider(config_home: Path) -> None:
     global default. For kimi we DO NOT — upstream has no per-spawn provider
     override flag, so silently injecting a key the executor can't pass to the
     subprocess would be misleading (and would mis-bill the user against an
-    OpenAI key when their ``~/.kimi/config.toml`` actually points at
+    OpenAI key when their ``~/.kimi-code/config.toml`` actually points at
     Moonshot). The builder emits no gateway vars regardless of what's
     configured."""
     _write_config(config_home, _openai_default_config())
@@ -1412,7 +1501,7 @@ def test_kimi_declared_auth_raises(
 
     Upstream kimi has no per-spawn provider override (no ``--config-file`` /
     ``--mcp-config-file``), so declared auth can't be threaded. Silently
-    launching against whatever ambient ``~/.kimi/config.toml`` resolves to
+    launching against whatever ambient ``~/.kimi-code/config.toml`` resolves to
     would be a confused-deputy / mis-attribution risk, so the builder raises
     instead. Regression guard for the originally-dead ``OmnigentError``."""
     from omnigent.errors import OmnigentError

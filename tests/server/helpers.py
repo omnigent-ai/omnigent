@@ -217,6 +217,8 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.resources: dict[str, object] | None = None
         self.pvc_mounts: list[dict[str, object]] | None = None
         self.secret_mounts: list[dict[str, object]] | None = None
+        self.pod_ready_timeout_s: int | None = None
+        self.runtime_class: str | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -553,9 +555,9 @@ def install_fake_kubernetes_launcher(
 
     The managed flow constructs ``KubernetesSandboxLauncher(image=…, env=…,
     namespace=…, secret_name=…, service_account=…, node_selector=…,
-    kubeconfig=…, in_cluster=…, resources=…, pvc_mounts=…)``; the shim records those
-    constructor args on the fake and hands it back, so production code runs
-    unmodified against it.
+    kubeconfig=…, in_cluster=…, resources=…, pvc_mounts=…, secret_mounts=…,
+    pod_ready_timeout_s=…, runtime_class=…)``; the shim records those constructor args on the
+    fake and hands it back, so production code runs unmodified against it.
 
     :param monkeypatch: The test's ``pytest.MonkeyPatch``.
     :param fake: The fake launcher to substitute.
@@ -575,6 +577,8 @@ def install_fake_kubernetes_launcher(
         resources: dict[str, object] | None = None,
         pvc_mounts: list[dict[str, object]] | None = None,
         secret_mounts: list[dict[str, object]] | None = None,
+        pod_ready_timeout_s: int | None = None,
+        runtime_class: str | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
@@ -588,6 +592,8 @@ def install_fake_kubernetes_launcher(
         fake.resources = resources
         fake.pvc_mounts = pvc_mounts
         fake.secret_mounts = secret_mounts
+        fake.pod_ready_timeout_s = pod_ready_timeout_s
+        fake.runtime_class = runtime_class
         return fake
 
     monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)

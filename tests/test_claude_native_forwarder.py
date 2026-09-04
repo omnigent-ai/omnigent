@@ -1701,6 +1701,105 @@ async def test_forwarder_posts_compaction_in_progress_on_precompact_hook(
 
 
 @pytest.mark.asyncio
+async def test_compact_refusal_in_progress_precedes_failed_same_poll(
+    tmp_path: Path,
+) -> None:
+    """
+    A same-poll ``/compact`` refusal posts ``in_progress`` BEFORE ``failed``.
+
+    Regression for the stranded spinner: the ``PreCompact`` hook (→
+    ``in_progress``, which raises the spinner) is forwarded AFTER transcript
+    items each poll, and Claude writes the refusal (transcript) and the
+    ``PreCompact`` (hook) close enough to land in one poll. If the dismissal
+    fired during the transcript phase it would clear nothing, then the hook
+    would raise a spinner that never clears. The dismissal is deferred to
+    after the hook phase, so the ordered posts are ``in_progress`` then
+    ``failed`` — a net-dismissed spinner.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    # The two records Claude writes for a declined /compact: the command echo
+    # and the standalone refusal stdout.
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "compact-cmd",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<command-name>/compact</command-name>\n<command-args></command-args>"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "local_command",
+                        "uuid": "compact-stdout",
+                        "isMeta": False,
+                        "content": (
+                            "<local-command-stdout>Not enough messages to compact."
+                            "</local-command-stdout>"
+                        ),
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-session"},
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # Collect compaction-status posts until both edges are seen.
+        statuses: list[str] = []
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while "failed" not in statuses and asyncio.get_running_loop().time() < deadline:
+            request = await _get_recorded_request(server)
+            if request["body"].get("type") == "external_compaction_status":
+                statuses.append(request["body"]["data"]["status"])
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    # in_progress (spinner raised by the hook) must land before failed
+    # (the deferred dismissal), so the net effect is a dismissed spinner.
+    assert statuses == ["in_progress", "failed"], (
+        f"expected in_progress then failed, got {statuses!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_forwarder_posts_compaction_completed_on_compact_session_start(
     tmp_path: Path,
 ) -> None:
@@ -3501,54 +3600,92 @@ async def test_forwarder_does_not_mirror_when_hook_payload_lacks_session_id(
     assert "PATCH" not in methods, f"unexpected PATCH(es): {drained}"
 
 
-@pytest.mark.parametrize(
-    ("model", "expected"),
-    [
-        ("claude-opus-4-8", "opus"),
-        ("anthropic/claude-opus-4-7", "opus"),
-        # The default Sonnet (4.6) collapses to the generic "sonnet" alias —
-        # the row it is bound to.
-        ("databricks-claude-sonnet-4-6", "sonnet"),
-        ("claude-sonnet-4-6", "sonnet"),
-        ("claude-haiku-4-5", "haiku"),
-        # Fable (the tier above Opus) collapses to its own alias — a miss
-        # here means a TUI switch to claude-fable-5 never reaches the picker.
-        ("claude-fable-5", "fable"),
-        ("databricks-claude-fable-5", "fable"),
-        # Sonnet 5 routes to its own opt-in picker slot, not the generic
-        # "sonnet" row — both ids contain the substring "sonnet", so a miss
-        # here means a TUI switch to the newer Sonnet generation would
-        # wrongly light up the default-Sonnet row instead.
-        ("anthropic/claude-sonnet-5", "sonnet_5"),
-        ("databricks-claude-sonnet-5", "sonnet_5"),
-        # Unknown family or empty → None (don't surface an unrenderable id).
-        ("gpt-5-4-mini", None),
-        ("", None),
-        (None, None),
-    ],
-)
-def test_model_alias_for_collapses_concrete_id_to_tier_alias(
-    model: str | None, expected: str | None
+@pytest.mark.asyncio
+async def test_forward_model_from_status_posts_the_status_model_verbatim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    ``_model_alias_for`` maps a concrete transcript model id to the
-    picker's tier alias so a TUI ``/model`` switch lands on a picker
-    row. Covers Anthropic + Databricks-gateway id shapes and the
-    no-match / empty cases (caller skips the post on ``None``).
+    The statusLine's model posts VERBATIM — the harness's own spelling,
+    never collapsed to a picker alias — and dedupes on repeat polls.
+
+    A family collapse here is how a routed Opus 4.9 rendered as the
+    ``opus`` row holding 4.8; the verbatim report is what makes the web's
+    exact-match highlight truthful for every generation and provider
+    spelling.
     """
-    assert forwarder._model_alias_for(model) == expected
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge_dir: {"model": "databricks-claude-opus-4-9", "context_window_size": 200000},
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    dedupe = forwarder._ForwardDedupeState()
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_model_from_status(
+            client, session_id="conv_abc", bridge_dir=tmp_path, dedupe=dedupe
+        )
+        await forwarder._forward_model_from_status(
+            client, session_id="conv_abc", bridge_dir=tmp_path, dedupe=dedupe
+        )
+
+    model_posts = [r for r in requests if r["type"] == "external_model_change"]
+    assert model_posts == [
+        {"type": "external_model_change", "data": {"model": "databricks-claude-opus-4-9"}}
+    ]
+    assert dedupe.posted_model == "databricks-claude-opus-4-9"
 
 
 @pytest.mark.asyncio
-async def test_forwarder_mirrors_tui_model_switch_after_baseline(tmp_path: Path) -> None:
+async def test_model_reports_keep_generation_and_context_marker(tmp_path: Path) -> None:
     """
-    A TUI-side ``/model`` switch is POSTed as ``external_model_change``;
-    the spawn-default baseline is NOT (seed-first).
+    Reports preserve the generation and the ``[1m]`` marker byte-for-byte.
 
-    The first assistant entry establishes the baseline model silently —
-    so a passive spawn default never clobbers a pending silent model
-    handoff — and a later assistant entry on a different model posts a
-    single ``external_model_change`` carrying the normalized tier alias.
+    Two same-family models of different generations (a routed 4.9 beside a
+    pinned 4.8) and a 1M-context variant must each post as themselves —
+    any normalization would let the record claim a model the pane is not
+    on.
+    """
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    dedupe = forwarder._ForwardDedupeState()
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for model in (
+            "databricks-claude-opus-4-8",
+            "databricks-claude-opus-4-9",
+            "databricks-claude-opus-4-9[1m]",
+        ):
+            await forwarder._post_model_change_if_new(
+                client, session_id="conv_abc", dedupe=dedupe, model=model
+            )
+
+    assert [r["data"]["model"] for r in requests] == [
+        "databricks-claude-opus-4-8",
+        "databricks-claude-opus-4-9",
+        "databricks-claude-opus-4-9[1m]",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forwarder_reports_the_launch_model_then_a_switch(tmp_path: Path) -> None:
+    """
+    EVERY observation posts, verbatim: the first is the launch report.
+
+    The first assistant entry names the model the session spawned on —
+    posting it is what seeds ``reported_model`` so surfaces show the
+    pane's truth within seconds of launch — and a later assistant entry
+    on a different model posts that new model, byte-for-byte.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -3607,9 +3744,10 @@ async def test_forwarder_mirrors_tui_model_switch_after_baseline(tmp_path: Path)
             retry_tracker=retry_tracker,
             dedupe=dedupe,
         )
-        # First observation seeds the baseline WITHOUT posting a change.
-        assert "external_model_change" not in [r["type"] for r in requests]
-        assert dedupe.posted_model == "opus"
+        # The first observation IS the launch report — posted verbatim.
+        launch_posts = [r for r in requests if r["type"] == "external_model_change"]
+        assert [p["data"] for p in launch_posts] == [{"model": "claude-opus-4-8"}]
+        assert dedupe.posted_model == "claude-opus-4-8"
 
         # User switches model inside the terminal.
         with transcript_path.open("a", encoding="utf-8") as fh:
@@ -3627,8 +3765,172 @@ async def test_forwarder_mirrors_tui_model_switch_after_baseline(tmp_path: Path)
 
     model_posts = [r for r in requests if r["type"] == "external_model_change"]
     assert len(model_posts) == 1
-    assert model_posts[0]["data"] == {"model": "sonnet_5"}
-    assert dedupe.posted_model == "sonnet_5"
+    assert model_posts[0]["data"] == {"model": "claude-sonnet-5"}
+    assert dedupe.posted_model == "claude-sonnet-5"
+
+
+@pytest.mark.asyncio
+async def test_forwarder_mirrors_tui_rename_on_first_observation(tmp_path: Path) -> None:
+    """
+    A ``/rename`` posts ``external_session_title`` on the FIRST observation.
+
+    Unlike the model mirror there is no spawn default to protect: a
+    ``custom-title`` record exists only because the operator renamed the
+    session, so it is a real change worth posting immediately.
+
+    The second phase rewinds the byte cursor so the same ``custom-title``
+    record is read again — the restart / rewind path the dedupe exists
+    for. A steady-state poll reads only past its cursor and would never
+    re-see the record, so rewinding is what actually exercises the guard.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "custom-title", "customTitle": "auth-refactor", "sessionId": "s1"})
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    retry_tracker = forwarder._PostRetryTracker()
+    dedupe = forwarder._ForwardDedupeState()
+
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Accept every forwarder POST and record its payload.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: 202 for every event.
+        """
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+        title_posts = [r for r in requests if r["type"] == "external_session_title"]
+        assert len(title_posts) == 1
+        assert title_posts[0]["data"] == {"title": "auth-refactor"}
+        assert dedupe.posted_title == "auth-refactor"
+
+        # Rewind to the top of the file so the rename record is re-read,
+        # as a restart / cursor rewind would. The dedupe must swallow it.
+        requests.clear()
+        rewound = forwarder.TranscriptForwardState(
+            transcript_path=transcript_path,
+            line_cursor=0,
+            byte_offset=0,
+            cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+        )
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=rewound,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+
+    assert [r for r in requests if r["type"] == "external_session_title"] == []
+
+
+@pytest.mark.asyncio
+async def test_forwarder_retries_title_post_after_transient_failure(tmp_path: Path) -> None:
+    """
+    A failed ``external_session_title`` POST is retried on a later poll.
+
+    ``observed_title`` is sticky across polls, so a poll whose incremental
+    window carries no ``custom-title`` record still reconciles the observed
+    title against the last POSTed one — the rename is not lost once the
+    original poll's window is gone.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "custom-title", "customTitle": "auth-refactor", "sessionId": "s1"})
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    retry_tracker = forwarder._PostRetryTracker()
+    dedupe = forwarder._ForwardDedupeState()
+
+    fail_titles = True
+    title_posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Fail title posts while ``fail_titles`` is set; accept everything else.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: 500 for the first title post, else 202.
+        """
+        payload = json.loads(request.content.decode("utf-8"))
+        if payload["type"] == "external_session_title":
+            title_posts.append(payload)
+            if fail_titles:
+                return httpx.Response(500, json={})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+        # The POST failed, so the baseline stays behind the observation.
+        assert len(title_posts) == 1
+        assert dedupe.observed_title == "auth-refactor"
+        assert dedupe.posted_title is None
+
+        # Next poll: no new rename in the window, but the retry still fires.
+        fail_titles = False
+        with transcript_path.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "hi"}}
+                )
+                + "\n"
+            )
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+
+    assert len(title_posts) == 2
+    assert dedupe.posted_title == "auth-refactor"
 
 
 @pytest.mark.asyncio
@@ -3702,25 +4004,240 @@ async def test_forwarder_retries_model_post_after_transient_failure(tmp_path: Pa
                 dedupe=dedupe,
             )
 
-        # Poll 1: baseline "opus" seeded, no model POST.
+        # Poll 1: the launch report is attempted and fails transiently.
         await _poll()
-        assert model_posts == []
-        assert dedupe.posted_model == "opus"
+        assert model_posts == [{"model": "claude-opus-4-8"}]
+        assert dedupe.posted_model is None  # NOT advanced — POST failed
+        assert dedupe.observed_model == "claude-opus-4-8"  # but remembered
 
-        # Poll 2: user switches to Sonnet 5; the POST fails transiently.
-        with transcript_path.open("a", encoding="utf-8") as fh:
-            fh.write(_assistant("a2", "claude-sonnet-5") + "\n")
-        await _poll()
-        assert model_posts == [{"model": "sonnet_5"}]  # attempted once
-        assert dedupe.posted_model == "opus"  # NOT advanced — POST failed
-        assert dedupe.observed_model == "sonnet_5"  # but remembered
-
-        # Poll 3: a plain user turn (no message.model) still retries.
+        # Poll 2: a plain user turn (no message.model) still retries the drop.
         with transcript_path.open("a", encoding="utf-8") as fh:
             fh.write(_user("u1") + "\n")
         await _poll()
-        assert model_posts == [{"model": "sonnet_5"}, {"model": "sonnet_5"}]  # retried
-        assert dedupe.posted_model == "sonnet_5"  # now committed
+        assert model_posts == [{"model": "claude-opus-4-8"}, {"model": "claude-opus-4-8"}]
+        assert dedupe.posted_model == "claude-opus-4-8"  # now committed
+
+        # Poll 3: a TUI switch posts the new model verbatim.
+        with transcript_path.open("a", encoding="utf-8") as fh:
+            fh.write(_assistant("a2", "claude-sonnet-5") + "\n")
+        await _poll()
+        assert model_posts[-1] == {"model": "claude-sonnet-5"}
+        assert dedupe.posted_model == "claude-sonnet-5"
+
+
+@pytest.mark.asyncio
+async def test_forwarder_mirrors_in_pane_permission_mode_switch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Both the launch mode and a later shift+tab reach the session label.
+
+    Claude Code emits no event on a mode change, so the pane footer is polled.
+    The launch mode is posted as well: a manual-mode session has no mode label
+    and no launch flag, so skipping it would leave the web picker with nothing
+    to render. Repeat polls of an unchanged footer stay quiet.
+    """
+    bridge_dir = tmp_path / "bridge"
+    pane_mode: str | None = "default"
+    reads = 0
+
+    def _fake_read(_bridge_dir: Path) -> str | None:
+        """Serve the pane's current mode, counting each capture."""
+        nonlocal reads
+        reads += 1
+        return pane_mode
+
+    monkeypatch.setattr(forwarder, "read_permission_mode", _fake_read)
+    # Reads are throttled off a monotonic deadline; zero the interval so each
+    # call in this test performs a capture instead of returning early.
+    monkeypatch.setattr(forwarder, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0)
+    dedupe = forwarder._ForwardDedupeState()
+
+    posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Accept every POST and record its payload."""
+        posts.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def _poll() -> None:
+            """Run one permission-mode mirror pass."""
+            await forwarder._forward_permission_mode_from_pane(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                dedupe=dedupe,
+            )
+
+        # Poll 1: the launch mode is posted, so the picker has a mode to show.
+        await _poll()
+        assert [p["type"] for p in posts] == ["external_permission_mode_change"]
+        assert posts[0]["data"] == {"permission_mode": "default"}
+        assert dedupe.posted_permission_mode == "default"
+
+        # Poll 2: unchanged footer is a no-op, not a repeat POST.
+        await _poll()
+        assert len(posts) == 1
+
+        # Poll 3: the user presses shift+tab into auto mode.
+        pane_mode = "auto"
+        await _poll()
+        assert posts[-1]["data"] == {"permission_mode": "auto"}
+        assert dedupe.posted_permission_mode == "auto"
+
+        # Poll 4: still auto — the switch isn't re-posted every poll.
+        await _poll()
+        assert len(posts) == 2
+
+        # A footerless pane reads as unknown and must not post a reversal.
+        pane_mode = None
+        await _poll()
+        assert len(posts) == 2
+        assert dedupe.posted_permission_mode == "auto"
+    assert reads == 5
+
+
+@pytest.mark.asyncio
+async def test_forwarder_posts_manual_launch_mode_so_picker_renders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A manual-mode launch publishes a mode, keeping the picker reachable.
+
+    Manual is the default, and launching into it writes no
+    ``--permission-mode`` arg and no mode label, leaving the pane footer as the
+    only source. The first poll must post it: with no mode stored the web
+    picker hides itself, and manual becomes a state no one can switch out of.
+    """
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setattr(forwarder, "read_permission_mode", lambda _bridge_dir: "default")
+    monkeypatch.setattr(forwarder, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0)
+    dedupe = forwarder._ForwardDedupeState()
+
+    posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Accept the POST and record its payload."""
+        posts.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_permission_mode_from_pane(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            dedupe=dedupe,
+        )
+
+    assert posts == [
+        {"type": "external_permission_mode_change", "data": {"permission_mode": "default"}}
+    ]
+    assert dedupe.posted_permission_mode == "default"
+
+
+@pytest.mark.asyncio
+async def test_forwarder_retries_permission_mode_post_after_transient_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failed mode POST is retried, so the switch isn't silently dropped.
+
+    The pane is the source of truth but the poll window moves on; if a 503
+    advanced the baseline, the web picker would stay stale until the user
+    switched modes again.
+    """
+    pane_mode = "default"
+
+    def _fake_read(_bridge_dir: Path) -> str | None:
+        """Serve the pane's current mode."""
+        return pane_mode
+
+    monkeypatch.setattr(forwarder, "read_permission_mode", _fake_read)
+    monkeypatch.setattr(forwarder, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0)
+    dedupe = forwarder._ForwardDedupeState()
+
+    posts: list[dict[str, Any]] = []
+    fail_modes = {"plan"}
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Fail the first ``plan`` POST with 503; accept everything else."""
+        payload = json.loads(request.content.decode("utf-8"))
+        posts.append(payload)
+        mode = payload["data"]["permission_mode"]
+        if mode in fail_modes:
+            fail_modes.discard(mode)
+            return httpx.Response(503, json={})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def _poll() -> None:
+            """Run one permission-mode mirror pass."""
+            await forwarder._forward_permission_mode_from_pane(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=tmp_path / "bridge",
+                dedupe=dedupe,
+            )
+
+        await _poll()  # the launch mode lands
+        assert dedupe.posted_permission_mode == "default"
+
+        pane_mode = "plan"
+        await _poll()
+        assert len(posts) == 2
+        assert dedupe.posted_permission_mode == "default"  # NOT advanced — POST failed
+
+        await _poll()
+        assert [p["data"] for p in posts] == [
+            {"permission_mode": "default"},
+            {"permission_mode": "plan"},
+            {"permission_mode": "plan"},
+        ]
+        assert dedupe.posted_permission_mode == "plan"  # now committed
+
+
+@pytest.mark.asyncio
+async def test_forwarder_throttles_permission_mode_pane_reads(tmp_path: Path) -> None:
+    """
+    Pane reads are spaced by the throttle, not run on every poll.
+
+    Unlike the file-backed model mirror sharing this loop, each read spawns a
+    ``tmux capture-pane`` subprocess. The poll loop is far tighter than the
+    throttle, so an unthrottled read would spawn processes continuously for a
+    signal that only changes when a human presses shift+tab.
+    """
+    reads = 0
+
+    def _fake_read(_bridge_dir: Path) -> str | None:
+        """Count captures; the mode itself is irrelevant here."""
+        nonlocal reads
+        reads += 1
+        return "default"
+
+    with patch.object(forwarder, "read_permission_mode", _fake_read):
+        dedupe = forwarder._ForwardDedupeState()
+        transport = httpx.MockTransport(lambda _req: httpx.Response(202, json={}))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            for _ in range(5):
+                await forwarder._forward_permission_mode_from_pane(
+                    client=client,
+                    session_id="conv_abc",
+                    bridge_dir=tmp_path / "bridge",
+                    dedupe=dedupe,
+                )
+
+    # Five back-to-back polls inside one throttle window capture once.
+    assert reads == 1
+    assert dedupe.permission_mode_next_read > 0.0
 
 
 def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprint(
@@ -5168,6 +5685,122 @@ async def test_effort_sync_swallows_patch_failure() -> None:
     # Attempted exactly once and the 503 swallowed (no exception escaped the await).
     assert len(captured) == 1
     assert captured[0].method == "PATCH"
+
+
+async def _run_dismiss_stranded_spinner(
+    *,
+    bridge_dir: Path,
+    seq: int,
+    status: int = 200,
+) -> list[_CapturedRequest]:
+    """
+    Drive ``_maybe_dismiss_stranded_compaction_spinner`` against a mock AP.
+
+    :param bridge_dir: Bridge dir holding the compaction state.
+    :param seq: The refused compaction's ``PreCompact`` seq to dismiss.
+    :param status: HTTP status the mock endpoint returns.
+    :returns: Every request the helper issued, in order.
+    """
+    captured: list[_CapturedRequest] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record the request and return a canned response."""
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        captured.append(_CapturedRequest(method=request.method, path=request.url.path, body=body))
+        return httpx.Response(status, json={"queued": False})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._maybe_dismiss_stranded_compaction_spinner(
+            client, session_id="conv_x", bridge_dir=bridge_dir, seq=seq
+        )
+    return captured
+
+
+async def test_compact_refusal_dismisses_stranded_spinner(tmp_path: Path) -> None:
+    """
+    A ``/compact`` refusal posts ``failed`` and drops the refused token.
+
+    Claude fired ``PreCompact`` (raising the spinner) but declined to
+    compact, so no completion signal follows. The forwarder must dismiss
+    the "Compacting…" spinner with ``external_compaction_status: failed``
+    and clear the dangling ``PreCompact`` token for that seq.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+    seq = forwarder._read_compaction_state(bridge_dir).pending.seq
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=seq)
+
+    assert captured == [
+        _CapturedRequest(
+            method="POST",
+            path="/v1/sessions/conv_x/events",
+            body={"type": "external_compaction_status", "data": {"status": "failed"}},
+        )
+    ], f"expected one failed compaction-status POST, got {captured!r}"
+    # Dangling token cleared so a later genuine compaction reconciles cleanly.
+    assert forwarder._read_compaction_state(bridge_dir).pending is None
+
+
+async def test_compact_refusal_without_pending_token_no_ops(tmp_path: Path) -> None:
+    """
+    A refusal whose ``PreCompact`` was missed posts nothing.
+
+    No pending token means the ``PreCompact`` was never observed, so no
+    spinner is up and a ``failed`` post would be spurious.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=1)
+
+    assert captured == [], f"expected no POST without a pending token, got {captured!r}"
+
+
+async def test_compact_refusal_does_not_dismiss_a_different_compaction(tmp_path: Path) -> None:
+    """
+    A stale refusal seq never dismisses a later genuine compaction's token.
+
+    Regression for the flag-leak hazard: a refusal armed for seq N must not
+    fire against a fresh seq N+1 minted by a subsequent real ``/compact`` —
+    doing so would clear that live spinner and discard its boundary token.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # A genuine, later compaction is pending (seq 1); the refusal we're
+    # flushing was armed for a missed earlier compaction (seq 0).
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+    live_seq = forwarder._read_compaction_state(bridge_dir).pending.seq
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=live_seq - 1)
+
+    assert captured == [], f"a stale refusal seq must post nothing, got {captured!r}"
+    # The genuine compaction's token is untouched.
+    assert forwarder._read_compaction_state(bridge_dir).pending.seq == live_seq
+
+
+async def test_compact_refusal_swallows_post_failure(tmp_path: Path) -> None:
+    """A failed dismissal POST is best-effort — attempted, logged, never raised."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+    seq = forwarder._read_compaction_state(bridge_dir).pending.seq
+
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=seq, status=503)
+
+    # Attempted once, the 503 swallowed. The token is still cleared (the
+    # spinner-owning PreCompact will never complete regardless).
+    assert len(captured) == 1
+    assert captured[0].method == "POST"
+    assert forwarder._read_compaction_state(bridge_dir).pending is None
 
 
 def test_usage_from_status_state_surfaces_cumulative_cost() -> None:
@@ -7512,7 +8145,21 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
     assert request["path"] == "/v1/sessions/conv_abc/events"
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle", "background_task_count": 1},
+        "data": {
+            "status": "idle",
+            "background_task_count": 1,
+            # Per-shell detail rides alongside the count so the UI can name the
+            # running shells (see BackgroundTaskInfo / _normalize_background_task).
+            "background_tasks": [
+                {
+                    "id": "abc123",
+                    "type": "shell",
+                    "status": "running",
+                    "description": "Wait for CI",
+                    "command": "sleep 120",
+                }
+            ],
+        },
     }
 
 
@@ -7918,6 +8565,29 @@ def test_generic_503_without_not_confirmed_body_never_exhausts() -> None:
     exc = _http_status_error(503, {"error": "internal_error"})
     for _ in range(10):
         assert tracker.record_failure("k", exc).exhausted is False
+
+
+def test_unbounded_transient_retries_keep_delay_capped_without_overflow() -> None:
+    # A transport-level failure is neither permanent nor not-confirmed, so it
+    # retries with no give-up budget and `attempts` grows without bound. The
+    # backoff exponent must be clamped before `2 ** n` is evaluated: min()
+    # computes both operands, so an unclamped exponent overflows float at
+    # attempt ~1025 and raises OverflowError out of record_failure.
+    tracker = forwarder._PostRetryTracker(base_delay_s=1.0, max_delay_s=30.0)
+    exc = httpx.RequestError("Databricks token refresh returned no token")
+    for _ in range(2000):
+        decision = tracker.record_failure("k", exc)
+        assert decision.exhausted is False
+        assert decision.delay_s <= 30.0
+    # The schedule still saturates at the cap instead of decaying.
+    assert decision.delay_s == 30.0
+
+
+def test_backoff_schedule_unchanged_below_the_cap() -> None:
+    tracker = forwarder._PostRetryTracker(base_delay_s=1.0, max_delay_s=30.0)
+    exc = httpx.RequestError("boom")
+    delays = [tracker.record_failure("k", exc).delay_s for _ in range(6)]
+    assert delays == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
 
 
 def test_permanent_4xx_still_exhausts_at_three() -> None:

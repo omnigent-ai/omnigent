@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
@@ -25,14 +25,8 @@ vi.mock("./FilesPanel", () => ({
     <div data-testid="files-panel-stub" data-flat-view={String(flatView)} />
   ),
 }));
-vi.mock("./InlineTerminalsSection", () => ({
-  InlineTerminalsSection: () => <div data-testid="terminals-stub" />,
-}));
 vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
-}));
-vi.mock("./TodoPanel", () => ({
-  TodoPanel: () => <div data-testid="todos-stub" />,
 }));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
   BrowserPane: ({ conversationId }: { conversationId: string }) => (
@@ -86,8 +80,8 @@ function renderWorkspace(
     selectedFilePath?: string | null;
     openFiles?: string[];
     changedCount?: number;
+    showGithubTab?: boolean;
     showBrowserTab?: boolean;
-    showShellsTab?: boolean;
     openTerminals?: string[];
     selectedTerminalKey?: string | null;
     maximized?: boolean;
@@ -109,15 +103,11 @@ function renderWorkspace(
         rightRailTab={overrides.rightRailTab ?? "files"}
         onRightRailTabChange={onRightRailTabChange}
         showFilesPanel
+        showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
         changedCount={overrides.changedCount ?? 0}
-        showShellsTab={overrides.showShellsTab ?? false}
-        terminalsLength={0}
         subagentsWorking={0}
         agentCount={1}
-        todosSupported={false}
-        todosCompleted={0}
-        todosTotal={0}
         rootSessionId={null}
         selectedFilePath={overrides.selectedFilePath ?? null}
         openFiles={overrides.openFiles ?? []}
@@ -165,11 +155,17 @@ describe("WorkspacePanel surface presentation", () => {
     const filesTab = screen.getByRole("tab", { name: "Files" });
     const changesTab = screen.getByRole("tab", { name: "Changes" });
     const agentsTab = screen.getByRole("tab", { name: "Agents 1" });
-    expect(filesTab).toHaveClass("size-8", "p-0");
+    // Icon-only tabs carry their accessible name (queried above) plus a hover
+    // tooltip, never a native title attribute. Exact size/padding classes are
+    // intentionally not asserted — brittle styling detail, not behaviour.
     expect(filesTab).not.toHaveAttribute("title");
-    expect(changesTab).toHaveClass("size-8", "p-0");
-    expect(agentsTab).toHaveClass("size-8", "p-0");
+    expect(changesTab).not.toHaveAttribute("title");
     expect(agentsTab).not.toHaveAttribute("title");
+  });
+
+  it("has no static Shells nav tab — shells open only as closable soft tabs", () => {
+    renderWorkspace({ openTerminals: [] });
+    expect(screen.queryByRole("tab", { name: /shells/i })).toBeNull();
   });
 
   it("badges the Changes tab (not Files) with the changed-file count", () => {
@@ -313,7 +309,7 @@ describe("WorkspacePanel shell tabs", () => {
 
   it("renders a tab per open shell labeled by name · session", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
-    renderWorkspace({ showShellsTab: true, openTerminals: [termKey] });
+    renderWorkspace({ openTerminals: [termKey] });
 
     // The label resolves through the terminals cache (name · session), not the
     // raw tab key. A failure means the strip didn't render or didn't resolve
@@ -321,17 +317,32 @@ describe("WorkspacePanel shell tabs", () => {
     expect(screen.getByText("zsh · u-g9qopr")).toBeInTheDocument();
   });
 
-  it("surfaces the active shell's xterm in the content slot", () => {
+  it("sizes shell tab pills to the same 24px height as file tabs", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     renderWorkspace({
-      showShellsTab: true,
+      openFiles: ["src/App.tsx"],
+      openTerminals: [termKey],
+    });
+
+    const fileTab = screen.getByText("App.tsx").closest("[role='button']");
+    const shellTab = screen.getByText("zsh · u-g9qopr").closest("[role='button']");
+    expect(fileTab).toHaveClass("h-[24px]");
+    expect(shellTab).toHaveClass("h-[24px]");
+    expect(shellTab).not.toHaveClass("h-[32px]");
+  });
+
+  it("surfaces the active shell's xterm in the content slot", async () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    renderWorkspace({
       openTerminals: [termKey],
       selectedTerminalKey: termKey,
     });
 
     // The selected shell tab owns the single content slot — its terminal id is
     // attached, and neither the files scope view nor a file viewer mounts.
-    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
+    // findByTestId waits for the lazy TerminalView chunk to resolve through
+    // its Suspense boundary.
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
   });
@@ -339,7 +350,6 @@ describe("WorkspacePanel shell tabs", () => {
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     const { openTerminalTab } = renderWorkspace({
-      showShellsTab: true,
       openTerminals: [termKey],
     });
 
@@ -351,7 +361,6 @@ describe("WorkspacePanel shell tabs", () => {
   it("closes a shell via onCloseTerminal (and does not also open it) when the x is clicked", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     const { openTerminalTab, onCloseTerminal } = renderWorkspace({
-      showShellsTab: true,
       openTerminals: [termKey],
     });
 
@@ -364,7 +373,6 @@ describe("WorkspacePanel shell tabs", () => {
   it("keeps the static nav tabs inactive while a shell tab is active", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     renderWorkspace({
-      showShellsTab: true,
       openTerminals: [termKey],
       selectedTerminalKey: termKey,
     });
@@ -434,12 +442,15 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // Launches the first declared shell and opens the created terminal's tab.
     expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
+
+    // The menu closes on its own after the launch.
+    await waitFor(() => expect(screen.queryByRole("menuitem", { name: /shell/i })).toBeNull());
   });
 
-  it("launches the default shell directly when several are declared (type selection is optional)", async () => {
-    // Multiple declared terminals → "Shell" nests a submenu to pick a type, but
-    // clicking it directly launches the default (declared[0]) without forcing a
-    // selection.
+  it("names the current default in the Shell item and launches it on click when several are declared", async () => {
+    // Multiple declared terminals → the "Shell" item names the default inline
+    // ("Shell (zsh)") and clicking it launches that default; the OTHER types
+    // live behind a separate "Other shells" chevron.
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
@@ -455,16 +466,48 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
     const { openTerminalTab } = renderWorkspace({ showBrowserTab: false });
 
-    // Open the "+" menu and click the "Shell" submenu trigger directly.
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: /shell/i }));
+    // The default's type is shown inline in the row's label.
+    const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
+    fireEvent.click(shellItem);
 
     // Launches the default (first-declared) shell without a further pick.
     expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
+
+    // The menu closes on its own after the launch.
+    await waitFor(() => expect(screen.queryByRole("menuitem", { name: /shell/i })).toBeNull());
+
+    // Focus is not restored to the "+" trigger on close — that focus return is
+    // what re-opened its tooltip for a frame (the visible flash after launch).
+    expect(screen.getByRole("button", { name: "Open new" })).not.toHaveFocus();
   });
 
-  it("remembers the picked shell type as the new default (persisted + check-marked)", async () => {
+  it("does not launch on the multi-shell row when the session is offline", async () => {
+    // The row is disabled on an offline session. Its click handler is a
+    // sub-trigger's onClick (which Radix runs before its own disabled check), so
+    // the handler guards on shellDisabled itself — a click must not fire create.
+    useSessionAgentMock.mockReturnValue({
+      data: { terminals: ["zsh", "bash", "fish"] },
+    } as unknown as ReturnType<typeof useSessionAgent>);
+    const mutate = vi.fn();
+    useCreateTerminalMock.mockReturnValue({
+      mutate,
+      isPending: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+
+    renderWorkspace({ liveness: { kind: "local_stranded" } });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
+    expect(shellItem).toHaveTextContent(/offline/i);
+    expect(shellItem).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(shellItem);
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it("lists only the OTHER types in the flyout and remembers a pick as the new default (persisted)", async () => {
     window.localStorage.removeItem("omnigent:preferred-shell");
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
@@ -478,18 +521,26 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
     renderWorkspace({ showBrowserTab: false });
 
-    // Open the submenu (ArrowRight — a plain click on "Shell" launches the
-    // default instead) and pick "bash", which persists as the preferred type.
+    // Open the flyout off the "Shell (zsh)" row (ArrowRight reveals the
+    // submenu). It lists only the non-default types — zsh is already named in
+    // the row itself.
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    const shellTrigger = await screen.findByRole("menuitem", { name: /shell/i });
-    shellTrigger.focus();
-    fireEvent.keyDown(shellTrigger, { key: "ArrowRight" });
-    fireEvent.click(await screen.findByRole("menuitem", { name: /^bash$/i }));
+    const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
+    shellItem.focus();
+    fireEvent.keyDown(shellItem, { key: "ArrowRight" });
+    expect(await screen.findByText("Other shells")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /^Other shells$/i })).toBeNull();
+    expect(await screen.findByRole("menuitem", { name: /^bash$/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /^fish$/i })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /^zsh$/i })).toBeNull();
+
+    // Pick "bash": launches it and persists as the preferred type (app-global).
+    fireEvent.click(screen.getByRole("menuitem", { name: /^bash$/i }));
     expect(mutate).toHaveBeenCalledWith("bash", expect.any(Object));
     expect(window.localStorage.getItem("omnigent:preferred-shell")).toBe("bash");
 
-    // A fresh menu seeds its default from the persisted pick — clicking "Shell"
-    // now launches bash without opening the submenu.
+    // A fresh menu seeds its default from the persisted pick — the row now reads
+    // "Shell (bash)" and launches bash on click.
     cleanup();
     mutate.mockClear();
     useSessionAgentMock.mockReturnValue({
@@ -497,7 +548,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     } as unknown as ReturnType<typeof useSessionAgent>);
     renderWorkspace({ showBrowserTab: false });
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: /shell/i }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /shell \(bash\)/i }));
     expect(mutate).toHaveBeenCalledWith("bash", expect.any(Object));
 
     window.localStorage.removeItem("omnigent:preferred-shell");

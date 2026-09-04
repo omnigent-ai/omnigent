@@ -24,6 +24,8 @@ function copyTextWithExecCommand(text: string): boolean {
   }
 
   const selection = document.getSelection();
+  const previouslyFocused =
+    document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const selectedRanges = selection
     ? Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index))
     : [];
@@ -31,12 +33,6 @@ function copyTextWithExecCommand(text: string): boolean {
 
   textArea.value = text;
   textArea.setAttribute("readonly", "");
-  // Mark this as a transient clipboard helper. The iOS shell hides the native
-  // Liquid Glass bar whenever an editable element is focused (it reads that as
-  // the keyboard opening); focusing this textarea to run execCommand would
-  // otherwise dismiss the bar for the rest of the session. Editable-focus
-  // detection excludes elements carrying this marker.
-  textArea.setAttribute("data-clipboard-helper", "");
   textArea.style.position = "fixed";
   textArea.style.top = "0";
   textArea.style.left = "0";
@@ -64,6 +60,9 @@ function copyTextWithExecCommand(text: string): boolean {
   } finally {
     document.removeEventListener("copy", handleCopy);
     textArea.remove();
+    if (previouslyFocused?.isConnected) {
+      previouslyFocused.focus({ preventScroll: true });
+    }
     if (selection) {
       selection.removeAllRanges();
       for (const range of selectedRanges) {

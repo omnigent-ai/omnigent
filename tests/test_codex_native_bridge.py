@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
 
+from omnigent import codex_native_bridge
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
     cancel_pending_mcp_startup,
@@ -20,9 +22,11 @@ from omnigent.codex_native_bridge import (
     read_bridge_startup_error,
     read_bridge_state,
     read_codex_config_model,
+    read_codex_home_config_model,
     read_mcp_startup,
     read_policy_hook_config,
     settle_pending_mcp_startup,
+    update_active_turn_id,
     update_mcp_server_startup,
     write_bridge_startup_error,
     write_bridge_state,
@@ -64,8 +68,24 @@ def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
             thread_id="thread_test",
             codex_home=str(bridge_dir / "codex-home"),
             active_turn_id=active_turn_id,
+            cwd=str(bridge_dir),
         ),
     )
+
+
+def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None:
+    """Bridge state retains the cwd used for web-driven Codex turns."""
+    _seed_active_turn(tmp_path, "turn_1")
+
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.cwd == str(tmp_path)
+
+    clear_active_turn_id_if_matches(tmp_path, "turn_1")
+
+    updated = read_bridge_state(tmp_path)
+    assert updated is not None
+    assert updated.cwd == str(tmp_path)
 
 
 @pytest.fixture
@@ -103,6 +123,18 @@ def test_read_codex_config_model_returns_top_level_model(bridge_dir: Path) -> No
     _write_config(bridge_dir, 'model_provider = "databricks"\nmodel = "gpt-5.4"\n')
 
     assert read_codex_config_model(bridge_dir) == "gpt-5.4"
+
+
+def test_read_codex_home_config_model_reads_a_codex_home_directly(bridge_dir: Path) -> None:
+    """A ``CODEX_HOME`` path yields the same model as the bridge-dir reader.
+
+    The runner's model-options endpoint holds the live bridge state's
+    ``codex_home``, not the bridge dir, and needs the session's model to
+    mark which catalog row this session actually launched on.
+    """
+    _write_config(bridge_dir, 'model = "gpt-5.6-luna"\n')
+
+    assert read_codex_home_config_model(codex_home_for_bridge_dir(bridge_dir)) == "gpt-5.6-luna"
 
 
 def test_read_codex_config_model_none_when_missing(bridge_dir: Path) -> None:
@@ -265,6 +297,58 @@ def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path)
     assert clear_active_turn_id_if_matches(bridge_dir, "turn_1") is True
 
 
+def test_active_turn_compare_and_clear_is_atomic_with_concurrent_update(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clearing turn A cannot overwrite a concurrent turn-B state update."""
+    _seed_active_turn(bridge_dir, "turn_a")
+    original_write = codex_native_bridge._write_bridge_state_unlocked
+    clear_write_entered = threading.Event()
+    release_clear_write = threading.Event()
+    update_finished = threading.Event()
+    clear_result: list[bool] = []
+
+    def blocking_write(path: Path, state: CodexNativeBridgeState) -> None:
+        """Hold turn A's clear after its read while it owns the state lock."""
+        if state.active_turn_id is None:
+            clear_write_entered.set()
+            assert release_clear_write.wait(timeout=5.0)
+        original_write(path, state)
+
+    monkeypatch.setattr(codex_native_bridge, "_write_bridge_state_unlocked", blocking_write)
+
+    def clear_turn_a() -> None:
+        """Clear turn A through the compare-and-swap helper."""
+        clear_result.append(clear_active_turn_id_if_matches(bridge_dir, "turn_a"))
+
+    def publish_turn_b() -> None:
+        """Publish the newer turn B and signal when its locked update lands."""
+        update_active_turn_id(bridge_dir, "turn_b")
+        update_finished.set()
+
+    clear_thread = threading.Thread(target=clear_turn_a)
+    update_thread = threading.Thread(target=publish_turn_b)
+    clear_thread.start()
+    assert clear_write_entered.wait(timeout=5.0)
+    update_thread.start()
+    try:
+        assert not update_finished.wait(timeout=0.1), (
+            "turn B wrote while turn A's compare-and-clear still held the state lock"
+        )
+    finally:
+        release_clear_write.set()
+        clear_thread.join(timeout=5.0)
+        update_thread.join(timeout=5.0)
+
+    assert not clear_thread.is_alive()
+    assert not update_thread.is_alive()
+    assert clear_result == [True]
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.active_turn_id == "turn_b"
+
+
 def test_bridge_startup_error_round_trips_and_is_cleared(bridge_dir: Path) -> None:
     """
     The startup-error breadcrumb round-trips, and ``clear_bridge_state``
@@ -379,3 +463,59 @@ def test_clear_bridge_state_removes_mcp_startup(bridge_dir: Path) -> None:
     clear_bridge_state(bridge_dir)
 
     assert read_mcp_startup(bridge_dir) == {}
+
+
+# ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
+
+
+def test_prepare_bridge_dir_writes_owner_pid_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prepare_bridge_dir records the creating pid so the periodic sweep can
+    prune the dir only when its owner is provably dead."""
+    import os
+
+    from omnigent.codex_native_bridge import prepare_bridge_dir
+
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
+
+    bridge_dir = prepare_bridge_dir("bridge_owner")
+
+    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
+    import os
+    import subprocess
+    import sys
+
+    from omnigent.codex_native_bridge import prune_orphaned_bridge_dirs
+
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", root)
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    dead_dir = root / "deadowner"
+    dead_dir.mkdir()
+    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+
+    live_dir = root / "liveowner"
+    live_dir.mkdir()
+    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    unmarked_dir = root / "unmarked"
+    unmarked_dir.mkdir()
+
+    pruned = prune_orphaned_bridge_dirs()
+
+    assert pruned == 1
+    assert not dead_dir.exists()
+    assert live_dir.exists()
+    assert unmarked_dir.exists()

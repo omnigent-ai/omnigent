@@ -30,10 +30,9 @@ enum WorkspaceChromeScript {
   /// JS that installs ``css`` into the current document, at most once.
   ///
   /// The caller injects this on every finished main-frame load of the pinned
-  /// origin, and must NOT gate it on the URL's path. The workspace serves the SPA
-  /// on more than one mount (`/ml/omnigents` for the desktop shells, `/omnigent`
-  /// in `omnigent/conversation_browser.py`) and an auth redirect can land on
-  /// neither, so a path guard leaves the workspace switcher visible — from there a
+  /// origin, and must NOT gate it on the URL's path. An auth redirect can land on
+  /// a path other than the `/omnigent` mount, so a path guard leaves the workspace
+  /// switcher visible — from there a
   /// user navigates into another workspace app with no way back. Do not
   /// reintroduce a path guard.
   static var source: String {

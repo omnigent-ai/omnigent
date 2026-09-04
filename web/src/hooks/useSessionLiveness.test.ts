@@ -234,6 +234,16 @@ describe("useSessionLiveness — derivation truth table", () => {
       });
     });
 
+    it("imported session skips the grace → local_stranded even when fresh", () => {
+      // An import has no runner booting, so the cold-boot grace must not apply:
+      // a fresh import reads local_stranded at once (offering the resume
+      // picker) instead of "Connecting…" for the whole grace window. Same
+      // inputs as the just-created case above, which is `starting`.
+      expect(
+        derive(false, null, conv({ host_id: null, created_at: freshCreatedAt(), imported: true })),
+      ).toEqual({ kind: "local_stranded" });
+    });
+
     it("starting wins over host_offline for a fresh host-bound session", () => {
       // The grace precedes the host_offline check: a new host-bound session
       // whose host hasn't registered yet must not flash "host offline" either.
@@ -339,6 +349,7 @@ describe("useSessionLiveness — derivation truth table", () => {
         created_at: 123,
         host_resumable: false,
         kind: undefined,
+        imported: false,
       });
       // hostResumable flows through so an off-sidebar resumable host can
       // classify host_asleep rather than dead-ending on host_offline.

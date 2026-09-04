@@ -26,6 +26,11 @@ _ATTACHMENT_MARKER_RE = re.compile(
     rf"^(?:\[Attached(?: file)?: .+\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN})$"
 )
 
+# Generated titles stay compact by default, while explicit user formats and
+# manually assigned titles have room for structured identifiers.
+DEFAULT_GENERATED_TITLE_MAX_CHARS = 100
+USER_SESSION_TITLE_MAX_CHARS = 200
+
 # ── Conversation ──────────────────────────────────────
 
 
@@ -103,9 +108,16 @@ class Conversation:
         (alongside the runner-binding primitive of the Alpha
         runner-state design). Both paths validate the value against
         the supported set; invalid values fail with ``invalid_input``.
-    :param model_override: Per-session LLM model override,
-        e.g. ``"claude-opus-4-7"``. ``None`` means use the agent
-        default from the spec's ``llm.model``. Mutable via
+    :param reported_model: The model the harness last REPORTED the
+        session is actually on, verbatim in the harness's own
+        spelling, e.g. ``"claude-opus-4-8[1m]"``. Written only by
+        harness reports (native ``external_model_change`` events or
+        SDK terminal-response usage); never by user picks. The only
+        model value UI surfaces display. ``None`` means no report has
+        arrived yet.
+    :param model_override: Per-session LLM model override — the user's
+        REQUEST, e.g. ``"claude-opus-4-7"``. ``None`` means use the
+        agent default from the spec's ``llm.model``. Mutable via
         ``PATCH /v1/sessions/{id}`` and the REPL's ``/model``
         command. Mirrors the persistence shape of
         ``reasoning_effort`` so the web UI and the TUI stay
@@ -221,6 +233,7 @@ class Conversation:
     session_usage: dict[str, Any] = field(default_factory=dict)
     reasoning_effort: str | None = None
     model_override: str | None = None
+    reported_model: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
@@ -371,11 +384,16 @@ class ErrorData(BaseModel):
         ``"native_terminal_start_failed"``.
     :param message: Human-readable error message, e.g.
         ``"Native Codex requires the 'codex' CLI on PATH."``.
+    :param level: Rendering level. ``"info"`` renders the banner as a neutral
+        notice (e.g. codex started a fresh thread) rather than a failure;
+        ``None`` / ``"error"`` is the destructive default and is omitted from
+        the wire so existing error items are unchanged.
     """
 
-    source: Literal["llm", "execution", "tool"]
+    source: Literal["llm", "execution", "tool", "harness"]
     code: str
     message: str
+    level: Literal["error", "info"] | None = None
 
     @field_validator("code", "message")
     @classmethod

@@ -522,12 +522,13 @@ async def _save_config(page) -> None:
 
 
 def test_start_session_select_permission_mode(seeded_session: tuple[str, str]) -> None:
-    """Picking a non-default permission mode rides along to the create call.
+    """A launched permission mode reaches create and seeds the next session.
 
     Selecting "Accept edits" in the Claude Code config modal
     must (a) update the permission select as immediate feedback and
     (b) reach ``POST /v1/sessions`` as
-    ``terminal_launch_args: ["--permission-mode", "acceptEdits"]``.
+    ``terminal_launch_args: ["--permission-mode", "acceptEdits"]``, then
+    (c) remain selected when the user opens the next New Session screen.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_permission_mode(base_url, session_id))
@@ -582,7 +583,7 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await expect(perm).to_be_visible()
             await perm.click()
             perm_labels = (
-                "Default",
+                "Manual",
                 "Auto",
                 "Accept edits",
                 "Plan",
@@ -605,6 +606,15 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
             assert body.get("terminal_launch_args") == ["--permission-mode", "acceptEdits"], body
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            await _open_entry_config(page, "ag_claude_e2e")
+            await expect(
+                page.get_by_test_id("new-chat-landing-config-permission")
+            ).to_contain_text("Accept edits")
         finally:
             await browser.close()
 
@@ -1202,6 +1212,82 @@ async def _drive_remembers_last_picked_host(base_url: str, session_id: str) -> N
             await browser.close()
 
 
+def test_start_session_preserves_unavailable_remembered_host(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Mac-only host snapshots do not displace a remembered VM."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_preserves_unavailable_remembered_host(base_url, session_id))
+
+
+async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id: str) -> None:
+    alpha_id, _alpha_name = _HOST_ALPHA
+    beta_id, beta_name = _HOST_BETA
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        route_state = {"include_remembered": False, "requests": 0}
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            async def handle_hosts(route: Route) -> None:
+                route_state["requests"] += 1
+                body = (
+                    _two_hosts_body()
+                    if route_state["include_remembered"]
+                    else json.dumps(
+                        {
+                            "hosts": [
+                                {
+                                    "host_id": alpha_id,
+                                    "name": _HOST_ALPHA[1],
+                                    "owner": "e2e",
+                                    "status": "online",
+                                }
+                            ]
+                        }
+                    )
+                )
+                await route.fulfill(status=200, content_type="application/json", body=body)
+
+            # Registered after the common route so this stateful handler wins.
+            await page.route("**/v1/hosts", handle_hosts)
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:last-host-choice",
+                    "{beta_id}"
+                );"""
+            )
+
+            # ChatPage and Sidebar warm the shared host-query cache while the
+            # stub exposes only the Mac. No landing draft exists on this path.
+            await page.goto(f"{base_url}/c/{session_id}")
+            await page.get_by_test_id("new-chat-button").wait_for(state="visible", timeout=30_000)
+            await _wait_until(lambda: route_state["requests"] >= 2)
+
+            # NewChat mounts with cached Mac-only data and completes another
+            # Mac-only request. Neither snapshot may silently replace the saved
+            # VM with the local default.
+            requests_before_open = route_state["requests"]
+            await page.get_by_test_id("new-chat-button").click()
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await _wait_until(lambda: route_state["requests"] > requests_before_open)
+            await expect(chip).to_contain_text("Choose host")
+
+            # A later host refresh reports the continuously preferred VM again.
+            # The empty slot lets that saved choice heal automatically.
+            route_state["include_remembered"] = True
+            requests_before_focus = route_state["requests"]
+            await page.evaluate("window.dispatchEvent(new Event('visibilitychange'))")
+            await _wait_until(lambda: route_state["requests"] > requests_before_focus)
+            await expect(chip).to_contain_text(beta_name)
+        finally:
+            await browser.close()
+
+
 def _managed_info_body() -> str:
     """Stub body for ``GET /v1/info``: a managed deployment offering a sandbox.
 
@@ -1642,6 +1728,18 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             assert body["agent_id"] == "ag_claude_e2e", body
             assert body.get("model_override") == "opus", body
             assert body.get("reasoning_effort") == "high", body
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            await _open_entry_config(page, "ag_claude_e2e")
+            await expect(page.get_by_test_id("new-chat-landing-config-model")).to_contain_text(
+                "Opus 4.8"
+            )
+            await expect(page.get_by_test_id("new-chat-landing-config-effort")).to_contain_text(
+                "High"
+            )
         finally:
             await browser.close()
 
@@ -1708,8 +1806,12 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
             )
             await _open_entry_config(page, "ag_codex_e2e")
             model = page.get_by_test_id("new-chat-landing-config-model")
-            await expect(model).to_contain_text("Default (gpt-live-default)")
-            await _pick_config_select(page, "new-chat-landing-config-model", "gpt-live-fast")
+            # The Default row names the catalog's default by its DISPLAY name —
+            # the same shared labeling the in-session gear uses.
+            await expect(model).to_contain_text("Default (GPT Live Default)")
+            # Codex options render decorated display names (same as claude),
+            # so pick by the display name; the create still sends the id.
+            await _pick_config_select(page, "new-chat-landing-config-model", "GPT Live Fast")
             await _save_config(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
@@ -1882,14 +1984,15 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
 
 
 def test_start_session_bypass_sandbox(seeded_session: tuple[str, str]) -> None:
-    """Arming DANGEROUS Codex full-bypass rides along to the create.
+    """Codex full-bypass reaches create and seeds the next session.
 
     Bypass is the most-permissive option in the Codex config modal's Approval
     dropdown — Codex's ``--dangerously-bypass-approvals-and-sandbox`` stance.
     It reads back like Claude's "Bypass permissions": a plain dropdown pick with
     no warning banner. When armed, the create ``POST /v1/sessions`` must carry
     the ``omnigent.codex_native.bypass_sandbox: "1"`` conversation label so the
-    runner launches Codex with the bypass flag.
+    runner launches Codex with the bypass flag. After returning to New Session,
+    the same dropdown must still show bypass rather than resetting to Default.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_bypass_sandbox(base_url, session_id))
@@ -1956,6 +2059,15 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
             # label alongside the codex-native wrapper labels.
             labels = body.get("labels") or {}
             assert labels.get("omnigent.codex_native.bypass_sandbox") == "1", body
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            await _open_entry_config(page, "ag_codex_e2e")
+            await expect(page.get_by_test_id("new-chat-landing-config-approval")).to_contain_text(
+                "Bypass approvals & sandbox"
+            )
         finally:
             await browser.close()
 

@@ -179,6 +179,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
               checked={isPublic}
               onCheckedChange={handlePublicToggle}
               disabled={grant.isPending || revoke.isPending}
+              componentId="diagnostics.permissions.public_toggle"
             />
           </div>
         )}
@@ -231,7 +232,12 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
             <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
               Level
             </label>
-            <Select value={newLevel} onValueChange={setNewLevel}>
+            <Select
+              value={newLevel}
+              onValueChange={setNewLevel}
+              componentId="diagnostics.permissions.grant_level"
+              valueHasNoPii
+            >
               <SelectTrigger className="mt-1 w-24">
                 <SelectValue />
               </SelectTrigger>
@@ -242,7 +248,13 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
               </SelectContent>
             </Select>
           </div>
-          <Button type="submit" size="sm" loading={grant.isPending} disabled={!newUserId.trim()}>
+          <Button
+            type="submit"
+            size="sm"
+            loading={grant.isPending}
+            disabled={!newUserId.trim()}
+            componentId="diagnostics.permissions.grant"
+          >
             <UserPlusIcon className="mr-1 size-3.5" />
             Grant
           </Button>
@@ -499,7 +511,13 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
   }, [sessionId, rebasePath]);
 
   return (
-    <Button variant="ghost" size="sm" onClick={handleCopy} className="gap-1.5 text-primary">
+    <Button
+      variant="ghost"
+      size="sm"
+      onClick={handleCopy}
+      className="gap-1.5 text-primary"
+      componentId="diagnostics.permissions.copy_link"
+    >
       {copied ? <CheckIcon className="size-3.5" /> : <LinkIcon className="size-3.5" />}
       {copied ? "Copied!" : "Copy link"}
     </Button>
@@ -623,6 +641,7 @@ function GrantRow({
           onClick={() => onRevoke(permission.user_id)}
           disabled={busy}
           className="shrink-0 text-muted-foreground hover:text-destructive"
+          componentId="diagnostics.permissions.revoke"
         >
           <Trash2Icon className="size-3.5" />
           <span className="sr-only">Revoke</span>

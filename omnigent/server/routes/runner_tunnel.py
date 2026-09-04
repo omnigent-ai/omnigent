@@ -23,6 +23,7 @@ from ipaddress import ip_address
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 
+from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -35,7 +36,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
@@ -471,6 +472,12 @@ def create_runner_tunnel_router(
                 runner_id,
                 frame.runner_version,
                 frame.harnesses,
+                extra=debug_event(
+                    "runner_tunnel",
+                    phase="connected",
+                    runner_id=runner_id,
+                    version=frame.runner_version,
+                ),
             )
 
             # 6. Start tunnel helper tasks. The sender task is the
@@ -538,6 +545,7 @@ def create_runner_tunnel_router(
                         )
                         continue
                     if isinstance(task_error, WebSocketDisconnect):
+                        shutdown_state.note_tunnel_close_code(getattr(task_error, "code", None))
                         _logger.warning(
                             "Tunnel helper task disconnected for runner %s: %s "
                             "(code=%s, reason=%r)",
@@ -578,11 +586,18 @@ def create_runner_tunnel_router(
                         )
 
         except WebSocketDisconnect as exc:
+            shutdown_state.note_tunnel_close_code(getattr(exc, "code", None))
             _logger.warning(
                 "Runner %s websocket disconnected (code=%s, reason=%r)",
                 runner_id,
                 getattr(exc, "code", None),
                 getattr(exc, "reason", None),
+                extra=debug_event(
+                    "runner_tunnel",
+                    phase="disconnected",
+                    runner_id=runner_id,
+                    code=getattr(exc, "code", None),
+                ),
             )
             if on_runner_disconnect is not None:
                 try:
@@ -593,7 +608,11 @@ def create_runner_tunnel_router(
                         runner_id,
                     )
         except Exception:
-            _logger.exception("Tunnel error for runner %s", runner_id)
+            _logger.exception(
+                "Tunnel error for runner %s",
+                runner_id,
+                extra=debug_event("runner_tunnel", phase="error", runner_id=runner_id),
+            )
             if session is not None:
                 registry.deregister(runner_id, session)
             else:

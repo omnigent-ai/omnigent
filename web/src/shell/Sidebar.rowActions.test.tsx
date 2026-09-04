@@ -8,13 +8,14 @@
 
 import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 
 // Controllable rename mutation so the double-click test can assert the
 // committed title was forwarded to the PATCH. `isMobile` toggles the mocked
@@ -52,6 +53,7 @@ const mocks = vi.hoisted(() => {
     // Projects surfaced by the picker + the move-to-project mutation, so the
     // mobile in-place project view test can assert both the list and the pick.
     projects: [] as string[],
+    projectIcons: {} as Record<string, string | null | undefined>,
     moveToProject: { mutate: vi.fn() },
     leave: { mutate: vi.fn(), isPending: false },
     // The signed-in viewer. Rows with no `owner` read as owned by them; a row
@@ -106,7 +108,13 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: mocks.projects.map((name: string) => ({ id: `p_${name}`, name })) }),
+  useProjects: () => ({
+    data: mocks.projects.map((name: string) => ({
+      id: `p_${name}`,
+      name,
+      icon: mocks.projectIcons[name],
+    })),
+  }),
   // A non-empty `useProjects` renders a project folder, which queries its
   // sessions — return the collapsed (disabled) shape so the folder is inert
   // (this suite keeps its test row unfiled; the picker only needs the name).
@@ -201,6 +209,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
     server_version: null,
@@ -257,6 +266,7 @@ beforeEach(() => {
   mocks.moveToProject.mutate.mockReset();
   mocks.leave.mutate.mockReset();
   mocks.projects = [];
+  mocks.projectIcons = {};
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
   useConvMock.mockReset();
@@ -302,11 +312,11 @@ describe("quick pin/unpin hover button", () => {
     renderSidebar();
 
     const rowLink = screen.getByRole("link", { name: "My Session" });
-    expect(rowLink).not.toHaveClass("md:pr-14");
+    expect(rowLink).not.toHaveClass("md:pr-20");
 
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
 
-    expect(rowLink).toHaveClass("md:pr-14");
+    expect(rowLink).toHaveClass("md:pr-20");
   });
 
   it("sizes the project-folder header controls to match the session-row kebab", () => {
@@ -344,6 +354,33 @@ describe("quick pin/unpin hover button", () => {
       expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
       expect(button).not.toHaveClass("size-7");
     }
+  });
+
+  it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
+    // The "New project" (+) button is the only way to create a project, so its
+    // group-header wrapper must stay visible wherever hover is unavailable —
+    // phones AND touch tablets at `md`+ widths — rather than fade out like the
+    // desktop-only session-header controls. jsdom doesn't evaluate media
+    // queries, so assert the responsive classes: base `flex` (shown at every
+    // breakpoint) with the fade + hover/focus reveals gated on hover
+    // capability, not just the `md` width.
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    const wrapper = screen.getByTestId("new-project").closest(".transition-opacity");
+    expect(wrapper).not.toBeNull();
+    // Visible without hover: base display is `flex`, never `hidden`, and the
+    // fade is not applied by viewport width alone.
+    expect(wrapper).toHaveClass("flex");
+    expect(wrapper).not.toHaveClass("hidden");
+    expect(wrapper).not.toHaveClass("md:opacity-0");
+    // Hover-capable desktop: fades out until the header is hovered / focused /
+    // a menu opens.
+    expect(wrapper).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100",
+    );
   });
 
   it("hides the Projects list-actions kebab when there are no projects", () => {
@@ -452,6 +489,19 @@ describe("quick pin/unpin hover button", () => {
     // classes actually take effect), rather than a block (which would not).
     expect(quickButton).toHaveClass("md:inline-flex");
     expect(quickButton).not.toHaveClass("md:block");
+  });
+
+  it("drops the row kebab on mobile, revealing it only from md up", () => {
+    // The per-row "..." menu is desktop-only: on mobile the chat page's own
+    // header menu covers these per-session actions, so the row kebab is hidden
+    // (`hidden`) and only surfaces from `md` up (`md:inline-flex`). It reveals
+    // like the quick-pin button — flex, not block — so its glyph stays
+    // centered.
+    renderSidebar();
+
+    const kebab = screen.getByTestId("conversation-actions");
+    expect(kebab).toHaveClass("hidden", "md:inline-flex");
+    expect(kebab).not.toHaveClass("md:block");
   });
 });
 
@@ -689,10 +739,53 @@ describe("leave a shared session", () => {
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar(undefined, serverInfo({ single_user: true }));
 
+    // The default filter is "My sessions", which scopes out this owner:other
+    // row; the single-user menu still offers "All sessions", so switch to it to
+    // surface the row this test is about.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-all"));
+
     fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
 
     expect(screen.queryByTestId("leave-conversation")).toBeNull();
     expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+  });
+});
+
+describe("quick-archive owner gate", () => {
+  // Archive is owner-only: the kebab renders its Archive item disabled for
+  // non-owners ("Only the session owner can archive this session"). The hover
+  // quick button must enforce the same gate — so a non-owner never gets the
+  // affordance the menu deliberately blocks.
+  it("hides the quick-archive button on a shared row the viewer doesn't own", () => {
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar();
+    // Non-owned rows live on the "Shared with me" tab (activates on mousedown).
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
+    expect(screen.queryByTestId("quick-archive-conversation")).toBeNull();
+
+    // The kebab still carries the (disabled) Archive item — the gate hides only
+    // the quick button, not the explanatory menu entry.
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("archive-conversation")).toHaveAttribute("data-disabled");
+  });
+
+  it("shows the quick-archive button on a row the viewer owns", () => {
+    mockConversations([CONV]);
+    renderSidebar();
+
+    expect(screen.getByTestId("quick-archive-conversation")).toBeInTheDocument();
   });
 });
 
@@ -794,7 +887,7 @@ describe("mobile in-place project picker", () => {
     // actions are gone, and the picker (search + project list) plus a Back
     // control are shown.
     fireEvent.click(moveItem);
-    expect(screen.getByPlaceholderText("Search projects")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Search or create project")).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /Sprint 42/ })).toBeInTheDocument();
     expect(screen.getByTestId("project-picker-back")).toBeInTheDocument();
     // The main actions are no longer rendered — the body was replaced, not
@@ -807,7 +900,7 @@ describe("mobile in-place project picker", () => {
     fireEvent.click(screen.getByTestId("project-picker-back"));
     expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
     expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
-    expect(screen.queryByPlaceholderText("Search projects")).toBeNull();
+    expect(screen.queryByPlaceholderText("Search or create project")).toBeNull();
   });
 
   it("moves the session into a picked project just like desktop", () => {
@@ -824,6 +917,106 @@ describe("mobile in-place project picker", () => {
       id: "conv_1",
       project: "Sprint 42",
     });
+  });
+
+  it("creates a project from a typed name that matches nothing", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    fireEvent.change(screen.getByPlaceholderText("Search or create project"), {
+      target: { value: "Roadmap" },
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: /Create Roadmap/ }));
+
+    // The move resolves-or-creates the project id server-side, so filing into a
+    // brand-new name uses the same mutation contract as picking an existing one.
+    expect(mocks.moveToProject.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      project: "Roadmap",
+    });
+  });
+
+  it("offers no create row when the typed name already exists", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    fireEvent.change(screen.getByPlaceholderText("Search or create project"), {
+      target: { value: "sprint 42" },
+    });
+    expect(screen.queryByRole("menuitem", { name: /Create/ })).toBeNull();
+  });
+
+  it("orders decorative project icons and a folder fallback before their names", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42", "Legacy project"];
+    mocks.projectIcons = { "Sprint 42": "🚀" };
+    mockConversations([{ ...CONV, labels: { omni_project: "Sprint 42" } }]);
+    mocks.pinnedStore.set([CONV.id]);
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    const iconRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    const emoji = iconRow.firstElementChild;
+    expect(emoji).toHaveAttribute("data-testid", "project-icon");
+    expect(emoji).toHaveAttribute("aria-hidden", "true");
+    expect(emoji).toHaveTextContent("🚀");
+    expect(emoji?.nextElementSibling).toHaveTextContent("Sprint 42");
+
+    const fallback = screen.getByRole("menuitem", { name: "Legacy project" }).firstElementChild;
+    expect(fallback?.tagName.toLowerCase()).toBe("svg");
+    expect(fallback).toHaveAttribute("aria-hidden", "true");
+    expect(fallback?.nextElementSibling).toHaveTextContent("Legacy project");
+
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    expect(removeItem.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(removeItem.firstElementChild).toHaveTextContent("🚀");
+  });
+
+  it("uses project names and the Remove label for desktop picker typeahead", async () => {
+    mocks.projects = ["Alpha", "Sprint 42"];
+    mocks.projectIcons = { "Sprint 42": "🚀" };
+    mockConversations([{ ...CONV, labels: { omni_project: "Sprint 42" } }]);
+    mocks.pinnedStore.set([CONV.id]);
+    const view = renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const moveTrigger = screen.getByTestId("move-to-project");
+    moveTrigger.focus();
+    fireEvent.keyDown(moveTrigger, { key: "ArrowRight" });
+
+    const alphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const sprintRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    expect(alphaRow.firstElementChild?.tagName.toLowerCase()).toBe("svg");
+    expect(alphaRow.firstElementChild).toHaveAttribute("aria-hidden", "true");
+    expect(alphaRow.firstElementChild?.nextElementSibling).toHaveTextContent("Alpha");
+    expect(sprintRow.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(sprintRow.firstElementChild?.nextElementSibling).toHaveTextContent("Sprint 42");
+    await waitFor(() => expect(alphaRow).toHaveFocus());
+    fireEvent.keyDown(alphaRow, { key: "s" });
+    await waitFor(() => expect(sprintRow).toHaveFocus());
+
+    view.unmount();
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const freshMoveTrigger = screen.getByTestId("move-to-project");
+    freshMoveTrigger.focus();
+    fireEvent.keyDown(freshMoveTrigger, { key: "ArrowRight" });
+
+    const freshAlphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    await waitFor(() => expect(freshAlphaRow).toHaveFocus());
+    fireEvent.keyDown(freshAlphaRow, { key: "r" });
+    await waitFor(() => expect(removeItem).toHaveFocus());
   });
 
   it("keeps the desktop side-flyout submenu (no in-place swap)", () => {
@@ -959,6 +1152,7 @@ describe("right-click context menu", () => {
     fireEvent.contextMenu(links[0]);
     fireEvent.click(screen.getByTestId("rename-conversation"));
     const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    expect(input).toHaveAttribute("maxLength", String(USER_SESSION_TITLE_MAX_CHARS));
     fireEvent.change(input, { target: { value: "Renamed A" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_a", title: "Renamed A" });

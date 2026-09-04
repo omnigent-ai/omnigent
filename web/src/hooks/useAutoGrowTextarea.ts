@@ -13,8 +13,8 @@ import { type RefObject, useLayoutEffect, useRef } from "react";
  * transcript's scroll viewport is correspondingly taller, and the browser
  * clamps its ``scrollTop`` against that larger viewport's smaller maximum.
  * The clamp sticks once the composer springs back, so every re-measure shunts
- * the transcript down a line. Pinning the wrapper's height keeps the collapse
- * inside the composer.
+ * the transcript down a line. Pinning and clipping the wrapper keeps the
+ * collapse inside the composer.
  */
 function measureTextarea(
   ta: HTMLTextAreaElement,
@@ -24,8 +24,12 @@ function measureTextarea(
   const wrapper = ta.parentElement;
   const wrapperHeight = wrapper?.getBoundingClientRect().height ?? 0;
   const restoreHeight = wrapper?.style.height ?? "";
+  const restoreOverflow = wrapper?.style.overflow ?? "";
   const pinned = wrapper !== null && wrapperHeight > 0;
-  if (pinned) wrapper.style.height = `${wrapperHeight}px`;
+  if (pinned) {
+    wrapper.style.height = `${wrapperHeight}px`;
+    wrapper.style.overflow = "hidden";
+  }
   try {
     ta.style.height = "auto";
     if (ta.scrollHeight === 0) {
@@ -49,9 +53,11 @@ function measureTextarea(
     );
     onGrowth?.(Math.max(0, height - resting));
   } finally {
-    // Released before the next layout, so the composer resizes in one step
-    // from its old height to its new one.
-    if (pinned) wrapper.style.height = restoreHeight;
+    // Release both guards before the next layout so the composer resizes once.
+    if (pinned) {
+      wrapper.style.height = restoreHeight;
+      wrapper.style.overflow = restoreOverflow;
+    }
   }
 }
 

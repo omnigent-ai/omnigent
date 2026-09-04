@@ -185,20 +185,28 @@ function beginSessionHostResolve(url: string): Promise<void> | null {
   return resolveSessionHost(decodeURIComponent(match[1]));
 }
 
+// Requests whose target host lives in a JSON body, not the URL, so
+// {@link hostScopeForUrl} can't see it: the session create (POST /v1/sessions)
+// and the host-mediated local import (POST /v1/imports/local[/stream]).
+const BODY_HOST_KEYED_RE = /\/v1\/(?:sessions(?:\?|$)|imports\/local(?:[/?]|$))/;
+
 /**
- * The create endpoint (``POST /v1/sessions``) carries its target host_id in the
- * request body, not the URL, so {@link hostScopeForUrl} can't see it. Left unkeyed,
- * the create round-robins and can miss the replica holding the host's runner
- * tunnel — the server notifies the runner inline over that pod-local tunnel, so
- * an off-replica create fails with "runner is offline". Recover the host_id from
- * a JSON create body so the create is pinned like every other host-scoped
- * request. Bundled (multipart) creates are hostless here — they only write rows
- * and bind the runner via a separate ``POST /v1/hosts/{id}/runners`` — and a
- * sandbox create carries ``host_type`` but no ``host_id``; both yield null.
+ * Recover the target host_id from a JSON request body for a body-host-keyed
+ * request ({@link isBodyHostKeyedRequest}), or null when the body names none.
+ *
+ * These requests carry the host in the body, not the URL, so left unkeyed they
+ * round-robin and can miss the replica holding that host's runner tunnel. A
+ * session create fails "runner is offline" (the server notifies the runner
+ * inline over its pod-local tunnel); an import fails "host is not connected"
+ * (the import reads the host's transcripts over that same tunnel). Keying by the
+ * body host_id pins both to the right replica like every other host-scoped
+ * request. Bundled (multipart) creates are hostless here (non-string body) and a
+ * managed-sandbox create carries ``host_type`` but no ``host_id``; both yield
+ * null → unkeyed (see {@link isBodyHostKeyedRequest}).
  */
-function hostIdForCreateBody(url: string, body: BodyInit | null | undefined): string | null {
+function hostIdFromBody(url: string, body: BodyInit | null | undefined): string | null {
   if (typeof body !== "string") return null;
-  if (!/\/v1\/sessions(?:\?|$)/.test(url)) return null;
+  if (!BODY_HOST_KEYED_RE.test(url)) return null;
   try {
     const hostId = (JSON.parse(body) as { host_id?: unknown }).host_id;
     return typeof hostId === "string" && hostId ? hostId : null;
@@ -208,29 +216,27 @@ function hostIdForCreateBody(url: string, body: BodyInit | null | undefined): st
 }
 
 /**
- * Whether this request is a session create keyable only by its own body host_id.
+ * Whether this request is keyable only by its own body host_id, never the modal.
  *
- * A MANAGED SANDBOX create should never ride the modal host. The modal is a
- * cache-affinity hint for reads, but a create has a side effect pinned to a
- * replica: the managed launch task it spawns lives on whichever pod served it,
- * and that task needs the new host's tunnel in its LOCAL registry to send
- * ``host.launch_runner``. A managed create carries no ``host_id`` (the host does
- * not exist yet), so keying it to the modal host routes the launch task to a
- * replica unrelated to the session — the sandbox boots, its tunnel registers on
- * the default replica, and the launch task never sees it, so no runner is ever
- * spawned. Unkeyed, the create lands on the same default replica the host will
- * dial back to.
+ * The modal host is a cache-affinity hint for reads, but these requests have a
+ * side effect pinned to a replica and must key by their OWN target host:
  *
- * A create that NAMES a host in its body keeps its key (see
- * {@link hostIdForCreateBody}) — that host is a real target whose runner the
- * server notifies inline over its pod-local tunnel, so an off-replica create
- * would fail. A bundled (multipart) create has a non-string body and so is not
- * matched here: it only writes rows and binds the runner via a separate
- * ``POST /v1/hosts/{id}/runners`` (which keys itself from the URL), so it spawns
- * no replica-pinned launch task and may keep riding the modal.
+ * - A session create's managed launch task lives on whichever pod served it and
+ *   needs the new host's tunnel in its LOCAL registry to send
+ *   ``host.launch_runner``. A managed create carries no ``host_id`` (the host
+ *   doesn't exist yet) → null → unkeyed, landing on the same default replica the
+ *   host will dial back to. A create that NAMES a host keeps that key.
+ * - A local import reads the chosen host's transcripts over its tunnel, which is
+ *   registered on the replica keyed by that host_id — never the importing user's
+ *   modal host (null / a different host for a fresh user), which is why an
+ *   unkeyed import lands off-replica and 409s "host is not connected".
+ *
+ * A bundled (multipart) create has a non-string body and is not matched: it only
+ * writes rows and binds the runner via a separate ``POST /v1/hosts/{id}/runners``
+ * (keyed from the URL), so it spawns no replica-pinned work and may ride the modal.
  */
-function isSessionCreate(url: string, body: BodyInit | null | undefined): boolean {
-  return typeof body === "string" && /\/v1\/sessions(?:\?|$)/.test(url);
+function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined): boolean {
+  return typeof body === "string" && BODY_HOST_KEYED_RE.test(url);
 }
 
 // Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared
@@ -246,6 +252,41 @@ let identityPromise: Promise<string | null> | null = null;
 // Hardcoding "/login" here previously sent OIDC users to an accounts
 // password form that had no connection to their IdP.
 let serverLoginUrl: string | null = null;
+// Set the moment we hand the browser to the login page. Assigning
+// `location.href` starts a navigation but does NOT stop this document:
+// requests already in flight keep landing, and every 401 among them used
+// to re-assign the same URL, so one logged-out page load queued ~28
+// navigations. Boot also reads this to skip mounting the app when the
+// session is already on its way out (see `isLoginRedirectPending`).
+let loginRedirectPending = false;
+
+/**
+ * Hand the browser to `loginUrl`, at most once per document.
+ *
+ * :param loginUrl: Login path from the capabilities probe or `/v1/me`.
+ * :returns: True if this call started the navigation, False if one was
+ *     already under way.
+ */
+function redirectToLogin(loginUrl: string): boolean {
+  if (loginRedirectPending) return false;
+  loginRedirectPending = true;
+  const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
+  window.location.href = `${loginUrl}?return_to=${returnTo}`;
+  return true;
+}
+
+/**
+ * Whether a login redirect is under way.
+ *
+ * The navigation is asynchronous, so this document keeps running until
+ * the login page commits. Boot checks this before mounting React —
+ * otherwise the app renders and fans its queries out against a session
+ * we already know is invalid, and each one 401s behind the pending
+ * navigation. Always false in header mode, which has no login page.
+ */
+export function isLoginRedirectPending(): boolean {
+  return loginRedirectPending;
+}
 
 /**
  * Whether the current page IS the login or register page, so we
@@ -290,10 +331,7 @@ export async function resolveIdentity(): Promise<string | null> {
           if (data.login_url) {
             serverLoginUrl = data.login_url;
             if (!isOnLoginPath()) {
-              const returnTo = encodeURIComponent(
-                window.location.pathname + window.location.search,
-              );
-              window.location.href = `${data.login_url}?return_to=${returnTo}`;
+              redirectToLogin(data.login_url);
               return null;
             }
           }
@@ -408,14 +446,15 @@ export async function authenticatedFetch(
     // host isn't known yet must send NO key rather than the modal — the modal
     // is the wrong guess for a SPECIFIC session, so it would route to a replica
     // that doesn't hold the tunnel; a keyless miss re-addresses instead. Only
-    // an unscoped route (list / updates) may ride the modal — a JSON create may
-    // not (see {@link isSessionCreate}): it is keyable ONLY by its own body
-    // host_id, so a managed sandbox create (no host_id yet) stays unkeyed.
+    // an unscoped route (list / updates) may ride the modal — a JSON request
+    // whose target host is in the body may not (see {@link isBodyHostKeyedRequest}):
+    // it is keyable ONLY by that body host_id (a managed create with none stays
+    // unkeyed).
     const scope = hostScopeForUrl(url);
     if (scope.scoped) {
       derivedHostId = scope.hostId;
-    } else if (isSessionCreate(url, init?.body)) {
-      derivedHostId = hostIdForCreateBody(url, init?.body);
+    } else if (isBodyHostKeyedRequest(url, init?.body)) {
+      derivedHostId = hostIdFromBody(url, init?.body);
     } else {
       derivedHostId = modalHostId();
     }
@@ -504,10 +543,11 @@ export async function authenticatedFetch(
     // the default for a bare local server, so we surface the 401 to
     // the caller instead. (serverLoginUrl from the /v1/me probe is a
     // fallback for the brief window before capabilities resolves.)
+    // Once-only (see redirectToLogin): a burst of 401s from one page load
+    // all reach here, and re-assigning the same URL per failure just piles
+    // up navigations to a page we're already going to.
     const loginUrl = getCachedServerInfo()?.login_url ?? serverLoginUrl;
-    if (loginUrl) {
-      window.location.href = `${loginUrl}?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`;
-    }
+    if (loginUrl) redirectToLogin(loginUrl);
   }
   return res;
 }

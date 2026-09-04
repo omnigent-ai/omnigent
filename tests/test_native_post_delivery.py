@@ -83,8 +83,18 @@ def _read_records(path: Path) -> list[dict[str, object]]:
             False,
         ),
         (httpx.PoolTimeout("no slot", request=httpx.Request("POST", "http://test")), False),
+        # Auth flows can fail before yielding the request to the transport.
+        # httpx leaves those RequestErrors unbound, proving no bytes were sent.
+        (httpx.RequestError("auth failed before send"), False),
         # Request was sent and no response was seen — the server may have
         # committed it. Ambiguous: a retry could duplicate.
+        (
+            httpx.RequestError(
+                "transport failed after binding",
+                request=httpx.Request("POST", "http://test"),
+            ),
+            True,
+        ),
         (httpx.ReadTimeout("no response", request=httpx.Request("POST", "http://test")), True),
         (httpx.WriteError("write failed", request=httpx.Request("POST", "http://test")), True),
         (

@@ -1701,14 +1701,19 @@ async def test_sessions_native_clears_in_flight_on_lazy_spec_error() -> None:
     pm = _FakeProcessManager(harness_client)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
-        # Before the harness streams response.created the two setup-phase
-        # resolutions run: return None (uncached spec → default harness) so the
-        # turn streams without populating _session_spec_cache. Once streaming
-        # has started the only caller is the lazy dispatch resolution — fail it.
+        # Setup-phase call: return a real spec so _resolve_harness_config picks
+        # the test harness and the turn can start. _resolve_harness_config does
+        # NOT populate _session_spec_cache, so _resolve_turn_spec_lazy still
+        # calls us after response.created — and we raise there to exercise the
+        # error path.
         del agent_id, session_id
         if created.is_set():
             raise RuntimeError("transient lazy spec resolution failure")
-        return None
+        return AgentSpec(
+            spec_version=1,
+            name="t",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+        )
 
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
@@ -2068,6 +2073,17 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
                     (),
                     {"status_code": 200, "json": lambda self: {"data": []}},
                 )()
+            if path.endswith("/child_sessions"):
+                # Restart recovery lists the session's children; an empty
+                # list ends the scan after this single read.
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "status_code": 200,
+                        "json": lambda self: {"data": [], "has_more": False},
+                    },
+                )()
             raise AssertionError(f"unexpected metadata callback: {path}")
 
     server_client = _ServerClient()
@@ -2125,7 +2141,13 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
     assert first_response.json()["session_init_protocol_version"] == 2
     assert resolver_calls == 1
     assert len(pm.get_client_calls) == 1
-    assert server_client.get_paths == [f"/v1/sessions/{session_id}/items"]
+    # The envelope supplies session metadata, so the only snapshot-style
+    # callback is the history read; restart recovery adds one read of the
+    # durable child-session list, which is empty here.
+    assert server_client.get_paths == [
+        f"/v1/sessions/{session_id}/child_sessions",
+        f"/v1/sessions/{session_id}/items",
+    ]
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from packaging.version import Version
 
 import omnigent._platform as _platform
 from omnigent.onboarding import harness_install as hi
@@ -126,6 +127,21 @@ def test_kimi_required_cli_returns_install_spec() -> None:
     spec = hi.required_cli_for_harness("kimi")
     assert spec is not None
     assert spec.binary == "kimi"
+
+
+@pytest.mark.parametrize(
+    "harness",
+    ["antigravity-native", "native-antigravity", "agy-native", "native-agy"],
+)
+def test_antigravity_native_aliases_require_agy_cli(
+    monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    """Every native agy spelling fails early when its CLI is unavailable."""
+    monkeypatch.setattr(hi.shutil, "which", lambda _name: None)
+    spec = hi.required_cli_for_harness(harness)
+    assert spec is not None
+    assert spec.binary == "agy"
+    assert hi.missing_harness_cli(harness) == spec
 
 
 def test_kimi_only_upstream_binary_satisfies_readiness(
@@ -369,13 +385,17 @@ def test_antigravity_install_spec_launches_auth_service_no_npm() -> None:
     assert spec.auth_hint is not None
 
 
-def test_harness_setup_hint_antigravity_surfaces_sign_in() -> None:
+@pytest.mark.parametrize(
+    "harness",
+    ["antigravity-native", "native-antigravity", "agy-native", "native-agy"],
+)
+def test_harness_setup_hint_antigravity_surfaces_sign_in(harness: str) -> None:
     """A not-yet-signed-in agy is fixed by launching ``agy`` itself, so the
     launch hint names the installer AND the "run agy to sign in" step —
     otherwise a user who already has agy installed gets a misleading
     install-only hint.
     """
-    hint = hi.harness_setup_hint("antigravity-native")
+    hint = hi.harness_setup_hint(harness)
     assert "antigravity.google/cli/install.sh" in hint
     assert "agy" in hint
     assert "sign" in hint.lower()
@@ -1281,11 +1301,12 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
         (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
         (OPENAI_FAMILY, "0.137.0", None),
-        (hi.PI_KEY, "0.79.0", None),
+        (hi.PI_KEY, "0.84.2", None),
         (hi.QWEN_KEY, "0.18.1", None),
         (hi.GOOSE_KEY, "1.38.0", None),
         (hi.HERMES_KEY, "0.17.0", None),
         (hi.KIRO_KEY, "2.10.0", None),
+        (GEMINI_FAMILY, "1.1.13", None),
     ],
 )
 def test_versioned_specs_declare_bounds(
@@ -1406,6 +1427,57 @@ def test_the_kimi_floor_accepts_the_cli_this_spec_installs(
     assert hi.harness_cli_installed(hi.KIMI_KEY) is True
 
 
+@pytest.mark.parametrize("version", ["0.7.0", "0.32.0"])
+def test_the_kimi_floor_accepts_the_floor_and_the_reported_version(
+    monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    """The declared floor itself, and the build from #4278, must read as installed.
+
+    ``test_the_kimi_floor_accepts_the_cli_this_spec_installs`` covers the
+    general case at 0.34.0, and the default-floors parametrize covers 0.6.0 /
+    0.34.0. Neither pins the two values that carry the regression:
+
+    * ``0.7.0`` is the floor itself. An off-by-one there — ``>`` where the
+      comparison should be ``>=`` — rejects the exact version this spec
+      declares as supported, and every existing test still passes.
+    * ``0.32.0`` is the version the reporter ran when setup showed
+      "Kimi Code x Needs upgrade". Pinning the reported build is what makes
+      this a regression test for #4278 rather than for the floor in general.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{version}\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+
+
+def test_the_kimi_floor_stays_in_the_kimi_code_version_series() -> None:
+    """The kimi floor must name a ``kimi-code`` release, not a ``kimi-cli`` one.
+
+    ``test_the_kimi_floor_accepts_the_cli_this_spec_installs`` pins one shipping
+    version, so it catches the wrong-project regression only while ``kimi-code``
+    stays below that version. This guards the mistake itself: the two projects
+    share the ``kimi`` name and only their numbering tells them apart —
+    ``kimi-cli`` starts at 1.x, while the ``kimi-code`` binary this spec
+    installs is still a 0.x series. A floor re-derived from ``kimi-cli``'s
+    release list (#4278) is unreachable for every real install, so setup reads
+    "Needs upgrade" no matter how current the user's CLI is.
+
+    When ``kimi-code`` itself ships 1.0, this assertion is the deliberate stop:
+    raise the bound here alongside the floor rather than dropping the guard.
+    """
+    spec = hi.harness_install_spec(hi.KIMI_KEY)
+    assert spec is not None
+    assert spec.min_version is not None
+    assert Version(spec.min_version) < Version("1.0.0")
+
+
 def test_the_hermes_floor_accepts_the_shipping_version_line(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1445,19 +1517,6 @@ def test_harness_cli_installed_true_when_version_in_range(
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_cli_installed(hi.OPENCODE_KEY) is True
-
-
-def test_harness_cli_installed_ignores_upper_bound_for_unversioned_specs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Harnesses without a version declaration are not probed with ``--version``."""
-    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
-
-    def _explode(*a: object, **k: object) -> None:
-        raise AssertionError("version probe spawned for an unversioned harness")
-
-    monkeypatch.setattr(hi.subprocess, "run", _explode)
-    assert hi.harness_cli_installed(GEMINI_FAMILY) is True
 
 
 @pytest.mark.parametrize(

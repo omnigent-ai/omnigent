@@ -7,6 +7,7 @@ import contextlib
 import errno
 import logging
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -22,18 +23,21 @@ from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
+    HostRetryableConnectionError,
     _build_runner_env,
     _RunnerHandle,
     run_host_process,
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportLocalFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -71,6 +75,22 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture(autouse=True)
+def _isolated_model_catalog_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Point the shared model-catalog store at a per-test directory.
+
+    The model-options lanes read and write the on-disk catalog store; a
+    test must never touch (or be poisoned by) the developer's real
+    ``~/.omnigent`` cache. Only the store's directory seam is redirected —
+    ``OMNIGENT_DATA_DIR`` itself stays untouched so log-path tests keep
+    seeing the real default layout.
+    """
+    store_dir = tmp_path_factory.mktemp("model_catalog_store")
+    monkeypatch.setattr("omnigent.model_catalog_store._data_dir", lambda: store_dir)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep these tests from forking a real runner zygote.
 
@@ -86,24 +106,97 @@ def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(ZYGOTE_ENABLED_ENV_VAR, "0")
 
 
-async def test_handle_model_options_uses_host_claude_configuration(
+async def test_handle_model_options_serves_the_claude_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The launch picker is resolved on the host that will start Claude."""
+    """The launch picker is the harness-probed catalog, resolved on the host.
+
+    The probe's rows pass through with the harness's own default marked,
+    the endpoint's routable set rides along, and the second request is
+    served from the fingerprint store — the harness is probed once.
+    """
     from omnigent import claude_native
 
-    monkeypatch.setattr(claude_native, "resolve_native_claude_config", lambda *, spec: None)
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gw.example"},
+        routable_models=(
+            "system.ai.claude-sonnet-5",
+            "system.ai.claude-sonnet-5[1m]",
+        ),
+    )
     monkeypatch.setattr(
         claude_native,
-        "claude_native_model_options",
-        lambda config: [
+        "resolve_native_claude_config",
+        lambda *, spec, refresh_models=True: config,
+    )
+    probe_calls: list[int] = []
+
+    async def _fake_probe(_config: object) -> claude_native.ClaudeModelProbe:
+        probe_calls.append(1)
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {
+                    "id": "sonnet",
+                    "model": "system.ai.claude-sonnet-5",
+                    "displayName": "Sonnet 5",
+                }
+            ],
+            default_model="system.ai.claude-sonnet-5",
+            default_label="Sonnet 5",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    host = _make_host_process()
+
+    first = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_1", harness="claude-native"),
+    )
+    second = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_2", harness="claude-native"),
+    )
+
+    assert first == HostModelOptionsResultFrame(
+        request_id="req_1",
+        status="ok",
+        models=[
             {
                 "id": "sonnet",
-                "model": "system.ai.claude-sonnet-4-6[1m]",
-                "displayName": "Sonnet 4.6",
+                "model": "system.ai.claude-sonnet-5",
+                "displayName": "Sonnet 5",
+                "isDefault": True,
             }
         ],
+        routable_models=[
+            "system.ai.claude-sonnet-5",
+            "system.ai.claude-sonnet-5[1m]",
+        ],
     )
+    assert second.models == first.models
+    assert probe_calls == [1]
+    _cleanup_host(host)
+
+
+async def test_handle_model_options_claude_probe_failure_is_an_honest_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No Claude catalog means an empty answer that says why.
+
+    There is no configured/static fallback lane left: a probe that cannot
+    run yields an honest empty listing with the reason, never invented
+    rows.
+    """
+    from omnigent import claude_native
+
+    monkeypatch.setattr(
+        claude_native,
+        "resolve_native_claude_config",
+        lambda *, spec, refresh_models=True: None,
+    )
+
+    async def _failed_probe(_config: object) -> None:
+        return None
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _failed_probe)
     host = _make_host_process()
 
     result = await host._handle_model_options(
@@ -113,277 +206,66 @@ async def test_handle_model_options_uses_host_claude_configuration(
     assert result == HostModelOptionsResultFrame(
         request_id="req_models",
         status="ok",
+        models=[],
+        error="the claude model probe failed — see the host log",
+    )
+    _cleanup_host(host)
+
+
+async def test_handle_model_options_uses_host_pi_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi's launch picker uses only models configured through Omnigent."""
+    from omnigent import pi_native_credentials
+
+    monkeypatch.setattr(
+        pi_native_credentials,
+        "pi_native_model_options",
+        lambda: [
+            {
+                "id": "omnigent-openai/system.ai.gpt-5-6-sol",
+                "model": "omnigent-openai/system.ai.gpt-5-6-sol",
+                "displayName": "omnigent-openai/GPT 5.6 Sol",
+            }
+        ],
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_pi_models", harness="pi-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_pi_models",
+        status="ok",
         models=[
             {
-                "id": "sonnet",
-                "model": "system.ai.claude-sonnet-4-6[1m]",
-                "displayName": "Sonnet 4.6",
+                "id": "omnigent-openai/system.ai.gpt-5-6-sol",
+                "model": "omnigent-openai/system.ai.gpt-5-6-sol",
+                "displayName": "omnigent-openai/GPT 5.6 Sol",
             }
         ],
     )
 
 
-async def test_handle_model_options_uses_codex_provider_catalog(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("failure", ["raises", "resolves_nothing"])
+async def test_handle_model_options_codex_probe_failure_is_an_honest_empty(
+    monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    """The Codex launch picker comes from the host's resolved provider catalog."""
+    """No Codex catalog means an empty answer that says why.
+
+    There is no curated/provider fallback lane left: whether the catalog
+    machinery raises or resolves nothing, the picker gets an honest empty
+    listing with the reason, never invented rows.
+    """
     from omnigent import codex_native_app_server
-    from omnigent.model_catalog import ModelEntry, ModelListing
 
-    def _fake_list_models_for_worker(spec: object, harness: str) -> ModelListing:
-        assert harness == "codex-native"
-        assert spec.executor.config["profile"] == "oss"
-        return ModelListing(
-            source="static",
-            verified=False,
-            models=(
-                ModelEntry(id="gpt-live-default", family="openai"),
-                ModelEntry(id="gpt-live-fast", family="openai"),
-            ),
-            note="test catalog",
-        )
+    async def _no_catalog(**_kwargs: object) -> list[dict[str, object]] | None:
+        if failure == "raises":
+            raise RuntimeError("codex probe unavailable")
+        return None
 
-    monkeypatch.setattr(
-        "omnigent.model_catalog.list_models_for_worker",
-        _fake_list_models_for_worker,
-    )
-    monkeypatch.setattr(
-        codex_native_app_server,
-        "resolve_native_codex_launch",
-        lambda *, model: codex_native_app_server.NativeCodexLaunch(
-            config_overrides=[],
-            model="gpt-live-fast",
-            profile="oss",
-        ),
-    )
-    host = _make_host_process()
-
-    result = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
-    )
-
-    assert result == HostModelOptionsResultFrame(
-        request_id="req_models",
-        status="ok",
-        models=[
-            {"id": "gpt-live-default", "displayName": "gpt-live-default"},
-            {"id": "gpt-live-fast", "displayName": "gpt-live-fast", "isDefault": True},
-        ],
-    )
-
-
-async def test_handle_model_options_does_not_invent_codex_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A catalog entry is not a default unless Codex resolves it as one."""
-    from omnigent import codex_native_app_server
-    from omnigent.model_catalog import ModelEntry, ModelListing
-
-    monkeypatch.setattr(
-        "omnigent.model_catalog.list_models_for_worker",
-        lambda spec, harness: ModelListing(
-            source="static",
-            verified=False,
-            models=(ModelEntry(id="gpt-live", family="openai"),),
-            note="test catalog",
-        ),
-    )
-    monkeypatch.setattr(
-        codex_native_app_server,
-        "resolve_native_codex_launch",
-        lambda *, model: codex_native_app_server.NativeCodexLaunch(
-            config_overrides=[],
-            model=None,
-            profile=None,
-        ),
-    )
-    host = _make_host_process()
-
-    result = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
-    )
-
-    assert result.models == [{"id": "gpt-live", "displayName": "gpt-live"}]
-
-
-async def test_handle_model_options_uses_databricks_catalog_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The Databricks profile path labels its effective catalog default."""
-    from omnigent import codex_native_app_server
-    from omnigent.model_catalog import ModelEntry, ModelListing
-
-    monkeypatch.setattr(
-        "omnigent.model_catalog.list_models_for_worker",
-        lambda spec, harness: ModelListing(
-            source="gateway",
-            verified=True,
-            models=(
-                ModelEntry(id="databricks-gpt-default", family="openai"),
-                ModelEntry(id="databricks-gpt-fast", family="openai"),
-            ),
-            note="test catalog",
-        ),
-    )
-
-    def _fake_resolve_catalog_model(provider: str, *, family: str) -> SimpleNamespace:
-        assert provider == "databricks"
-        assert family == "openai"
-        return SimpleNamespace(model_id="databricks-gpt-default")
-
-    monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
-        _fake_resolve_catalog_model,
-    )
-    monkeypatch.setattr(
-        codex_native_app_server,
-        "resolve_native_codex_launch",
-        lambda *, model: codex_native_app_server.NativeCodexLaunch(
-            config_overrides=[],
-            model=None,
-            profile="oss",
-        ),
-    )
-    host = _make_host_process()
-
-    result = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
-    )
-
-    assert result.models == [
-        {
-            "id": "databricks-gpt-default",
-            "displayName": "databricks-gpt-default",
-            "isDefault": True,
-        },
-        {"id": "databricks-gpt-fast", "displayName": "databricks-gpt-fast"},
-    ]
-
-
-async def test_handle_model_options_filters_direct_openai_through_codex_catalog(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Direct OpenAI availability is intersected with Codex compatibility."""
-    from omnigent import codex_native_app_server
-    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
-
-    monkeypatch.setattr(
-        "omnigent.model_catalog.list_models_for_worker",
-        lambda spec, harness: ModelListing(
-            source="openai-compatible",
-            verified=True,
-            models=tuple(
-                ModelEntry(id=model_id, family="openai")
-                for model_id in (
-                    "coding-compatible",
-                    "audio-preview",
-                    "realtime-preview",
-                    "image-preview",
-                    "embedding-preview",
-                    "moderation-preview",
-                )
-            ),
-            note="test OpenAI catalog",
-        ),
-    )
-    monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_model_provider",
-        lambda spec, harness: ResolvedModelProvider(
-            kind="key",
-            family="openai",
-            base_url="https://api.openai.com",
-            detail="test OpenAI key",
-        ),
-    )
-    monkeypatch.setattr(
-        codex_native_app_server,
-        "resolve_native_codex_launch",
-        lambda *, model: codex_native_app_server.NativeCodexLaunch(
-            config_overrides=[],
-            model=None,
-            profile=None,
-        ),
-    )
-
-    async def _fake_codex_options() -> list[dict[str, object]]:
-        return [
-            {
-                "id": "coding-compatible",
-                "model": "coding-compatible",
-                "displayName": "Coding Compatible",
-                "isDefault": True,
-            },
-            {
-                "id": "coding-unavailable",
-                "model": "coding-unavailable",
-                "displayName": "Coding Unavailable",
-                "isDefault": False,
-            },
-        ]
-
-    monkeypatch.setattr(
-        codex_native_app_server,
-        "discover_codex_model_options",
-        _fake_codex_options,
-    )
-    host = _make_host_process()
-
-    result = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
-    )
-
-    assert result.models == [
-        {
-            "id": "coding-compatible",
-            "displayName": "Coding Compatible",
-            "isDefault": True,
-        }
-    ]
-
-
-async def test_handle_model_options_tolerates_codex_discovery_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Discovery failures keep the implicit default without unsafe model rows."""
-    from omnigent import codex_native_app_server
-    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
-
-    monkeypatch.setattr(
-        "omnigent.model_catalog.list_models_for_worker",
-        lambda spec, harness: ModelListing(
-            source="openai-compatible",
-            verified=True,
-            models=(ModelEntry(id="unverified-model", family="openai"),),
-            note="test OpenAI catalog",
-        ),
-    )
-    monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_model_provider",
-        lambda spec, harness: ResolvedModelProvider(
-            kind="key",
-            family="openai",
-            base_url="https://api.openai.com",
-            detail="test OpenAI key",
-        ),
-    )
-    monkeypatch.setattr(
-        codex_native_app_server,
-        "resolve_native_codex_launch",
-        lambda *, model: codex_native_app_server.NativeCodexLaunch(
-            config_overrides=[],
-            model=None,
-            profile=None,
-        ),
-    )
-
-    async def _failed_codex_options() -> list[dict[str, object]]:
-        raise TimeoutError("test discovery timeout")
-
-    monkeypatch.setattr(
-        codex_native_app_server,
-        "discover_codex_model_options",
-        _failed_codex_options,
-    )
+    monkeypatch.setattr(codex_native_app_server, "codex_launch_catalog", _no_catalog)
     host = _make_host_process()
 
     result = await host._handle_model_options(
@@ -394,124 +276,9 @@ async def test_handle_model_options_tolerates_codex_discovery_failure(
         request_id="req_models",
         status="ok",
         models=[],
+        error="the codex model probe failed — see the host log",
     )
-
-
-async def test_handle_model_options_marks_only_first_codex_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Malformed Codex catalogs cannot mark multiple picker rows as default."""
-    from omnigent import codex_native_app_server
-    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
-
-    model_ids = ("coding-first", "coding-second")
-    monkeypatch.setattr(
-        "omnigent.model_catalog.list_models_for_worker",
-        lambda spec, harness: ModelListing(
-            source="openai-compatible",
-            verified=True,
-            models=tuple(ModelEntry(id=model_id, family="openai") for model_id in model_ids),
-            note="test OpenAI catalog",
-        ),
-    )
-    monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_model_provider",
-        lambda spec, harness: ResolvedModelProvider(
-            kind="key",
-            family="openai",
-            base_url="https://api.openai.com",
-            detail="test OpenAI key",
-        ),
-    )
-    monkeypatch.setattr(
-        codex_native_app_server,
-        "resolve_native_codex_launch",
-        lambda *, model: codex_native_app_server.NativeCodexLaunch(
-            config_overrides=[],
-            model=None,
-            profile=None,
-        ),
-    )
-
-    async def _multiple_codex_defaults() -> list[dict[str, object]]:
-        return [
-            {"model": model_id, "displayName": model_id, "isDefault": True}
-            for model_id in model_ids
-        ]
-
-    monkeypatch.setattr(
-        codex_native_app_server,
-        "discover_codex_model_options",
-        _multiple_codex_defaults,
-    )
-    host = _make_host_process()
-
-    result = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
-    )
-
-    assert result.models == [
-        {"id": "coding-first", "displayName": "coding-first", "isDefault": True},
-        {"id": "coding-second", "displayName": "coding-second"},
-    ]
-
-
-async def test_handle_model_options_keeps_custom_gateway_catalog(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Custom gateway ids remain selectable without Codex alias filtering."""
-    from omnigent import codex_native_app_server
-    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
-
-    monkeypatch.setattr(
-        "omnigent.model_catalog.list_models_for_worker",
-        lambda spec, harness: ModelListing(
-            source="openai-compatible",
-            verified=True,
-            models=(ModelEntry(id="gateway-coding-model", family="openai"),),
-            note="test gateway catalog",
-        ),
-    )
-    monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_model_provider",
-        lambda spec, harness: ResolvedModelProvider(
-            kind="gateway",
-            family="openai",
-            base_url="https://gateway.example/v1",
-            detail="test gateway",
-        ),
-    )
-    monkeypatch.setattr(
-        codex_native_app_server,
-        "resolve_native_codex_launch",
-        lambda *, model: codex_native_app_server.NativeCodexLaunch(
-            config_overrides=[],
-            model="gateway-coding-model",
-            profile=None,
-        ),
-    )
-
-    async def _unexpected_codex_options() -> list[dict[str, object]]:
-        raise AssertionError("custom gateways must not use the OpenAI compatibility filter")
-
-    monkeypatch.setattr(
-        codex_native_app_server,
-        "discover_codex_model_options",
-        _unexpected_codex_options,
-    )
-    host = _make_host_process()
-
-    result = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
-    )
-
-    assert result.models == [
-        {
-            "id": "gateway-coding-model",
-            "displayName": "gateway-coding-model",
-            "isDefault": True,
-        }
-    ]
+    _cleanup_host(host)
 
 
 async def test_handle_model_options_rejects_unsupported_harness() -> None:
@@ -538,17 +305,21 @@ async def test_handle_model_options_reports_the_endpoints_wider_catalog(
     monkeypatch.setattr(
         claude_native,
         "resolve_native_claude_config",
-        lambda *, spec: claude_native.ClaudeNativeUcodeConfig(
+        lambda *, spec, refresh_models=True: claude_native.ClaudeNativeUcodeConfig(
             env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5"},
             model="system.ai.claude-opus-5",
             routable_models=("system.ai.claude-opus-5", "system.ai.claude-opus-4-8"),
         ),
     )
-    monkeypatch.setattr(
-        claude_native,
-        "claude_native_model_options",
-        lambda config: [{"id": "opus", "model": "system.ai.claude-opus-5"}],
-    )
+
+    async def _fake_probe(_config: object) -> claude_native.ClaudeModelProbe:
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[{"id": "opus", "model": "system.ai.claude-opus-5"}],
+            default_model="system.ai.claude-opus-5",
+            default_label="Opus",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
     host = _make_host_process()
 
     result = await host._handle_model_options(
@@ -559,6 +330,7 @@ async def test_handle_model_options_reports_the_endpoints_wider_catalog(
         "system.ai.claude-opus-5",
         "system.ai.claude-opus-4-8",
     ]
+    _cleanup_host(host)
 
 
 def _make_host_process() -> HostProcess:
@@ -915,6 +687,7 @@ async def test_handle_launch_prints_exact_runner_log_path(
     tmp (no write to the developer's real ``~/.omnigent``).
     """
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     host = _make_host_process()
     workspace = tmp_path / "project"
     workspace.mkdir()
@@ -980,12 +753,22 @@ class _FakeTunnel:
         self.sent.append(data)
 
     async def recv(self) -> str:
-        """Simulate an immediate disconnect.
-
-        :returns: Never returns.
-        :raises ConnectionError: Always — ends the serve loop.
-        """
+        """Simulate an immediate disconnect after hello."""
         raise ConnectionError("test disconnect")
+
+
+class _ConnectionErrorTunnel:
+    """Tunnel that returns one server connection error after host.hello."""
+
+    def __init__(self, frame: HostConnectionErrorFrame) -> None:
+        self.frame = frame
+        self.sent: list[str] = []
+
+    async def send(self, data: str) -> None:
+        self.sent.append(data)
+
+    async def recv(self) -> str:
+        return encode_host_frame(self.frame)
 
 
 class _RecordingWS:
@@ -1017,6 +800,60 @@ async def _cancel(task: asyncio.Task[None]) -> None:
         await task
 
 
+def test_unavailable_harness_quick_probe_is_ttl_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The quick probe resolves each unavailable harness once per TTL.
+
+    The readiness loop wakes every 5s; re-probing every unavailable
+    harness with a full shutil.which PATH scan on each wakeup burns a
+    sustained CPU core on hosts where each PATH stat is expensive. Within
+    the TTL the cached verdict serves the cadence; expiry re-probes so a
+    new install still surfaces.
+    """
+    from omnigent.host import connect as connect_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(connect_mod, "harness_is_configured", lambda h: calls.append(h) or False)
+    connect_mod._invalidate_quick_probe_cache()
+    try:
+        previous = {"goose-native": False, "qwen-native": False}
+
+        # Burst of quick probes well inside the TTL.
+        for _ in range(12):
+            assert connect_mod._unavailable_harness_became_ready(previous) is False
+        # Each harness resolved exactly ONCE — the cadence served from cache.
+        assert sorted(calls) == ["goose-native", "qwen-native"]
+
+        # A harness that becomes configured is seen once the verdict expires.
+        monkeypatch.setattr(connect_mod, "harness_is_configured", lambda h: h == "goose-native")
+        monkeypatch.setattr(connect_mod, "HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S", 0.0)
+        assert connect_mod._unavailable_harness_became_ready(previous) is True
+    finally:
+        connect_mod._invalidate_quick_probe_cache()
+        monkeypatch.undo()
+
+
+def test_quick_probe_cache_survives_configured_flip_within_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Within the TTL a cached miss is authoritative — an external install
+    surfaces on the next expiry, not the next 5s tick."""
+    from omnigent.host import connect as connect_mod
+
+    state = {"configured": False}
+    monkeypatch.setattr(connect_mod, "harness_is_configured", lambda _h: state["configured"])
+    connect_mod._invalidate_quick_probe_cache()
+    try:
+        assert connect_mod._unavailable_harness_became_ready({"goose-native": False}) is False
+        state["configured"] = True
+        # Still inside the TTL: cached miss wins.
+        assert connect_mod._unavailable_harness_became_ready({"goose-native": False}) is False
+        # Expiry re-probes and sees the install.
+        monkeypatch.setattr(connect_mod, "HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S", 0.0)
+        assert connect_mod._unavailable_harness_became_ready({"goose-native": False}) is True
+    finally:
+        connect_mod._invalidate_quick_probe_cache()
+
+
 async def test_live_host_refreshes_harness_readiness_without_reconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1040,9 +877,11 @@ async def test_live_host_refreshes_harness_readiness_without_reconnect(
         0.01,
     )
     host = _make_host_process()
+    host._configured_harnesses = {"pi": False}
+    host._gateway_inference = {"codex": True}
     ws = _RecordingWS()
 
-    task = asyncio.create_task(host._harness_readiness_loop(ws, {"pi": False}))
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
     try:
         await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
     finally:
@@ -1070,9 +909,11 @@ async def test_live_host_full_refresh_detects_auth_completion(
         0.01,
     )
     host = _make_host_process()
+    host._configured_harnesses = {"codex": "needs-auth"}
+    host._gateway_inference = {"codex": True}
     ws = _RecordingWS()
 
-    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": "needs-auth"}))
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
     try:
         await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
     finally:
@@ -1102,9 +943,11 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
         0.01,
     )
     host = _make_host_process()
+    host._configured_harnesses = {"codex": "needs-auth"}
+    host._gateway_inference = {"codex": True}
     ws = _RecordingWS()
 
-    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": "needs-auth"}))
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
     try:
         # Let at least two full refreshes recompute-and-compare before stopping.
         for _ in range(400):
@@ -1137,9 +980,11 @@ async def test_live_host_repushes_when_only_gateway_inference_changes(
         0.01,
     )
     host = _make_host_process()
+    host._configured_harnesses = {"codex": True}
+    host._gateway_inference = {"codex": False}
     ws = _RecordingWS()
 
-    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": True}))
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
     try:
         await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
     finally:
@@ -1166,6 +1011,7 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     can surface the cause to the user verbatim.
     """
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     host = _make_host_process()
     workspace = tmp_path / "project"
     workspace.mkdir()
@@ -1423,6 +1269,57 @@ async def test_unreported_exit_flushes_after_reconnect(
     # The queue drained — a retained entry would re-send on every
     # reconnect forever.
     assert host._unreported_exits == {}
+
+
+async def test_capability_probe_timeout_does_not_block_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A hung startup probe degrades to unknown metadata after its deadline."""
+    host = _make_host_process()
+    never = asyncio.Event()
+
+    async def _blocked(*, startup: bool) -> None:
+        del startup
+        await never.wait()
+
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _blocked)
+    monkeypatch.setattr(host, "_probe_gateway_inference", _blocked)
+    monkeypatch.setattr("omnigent.host.connect._HOST_CAPABILITY_INIT_TIMEOUT_S", 0.01)
+
+    await host._initialize_capabilities()
+
+    assert host._configured_harnesses is None
+    assert host._gateway_inference is None
+    assert "capability discovery timed out" in capsys.readouterr().err
+
+
+async def test_capability_probe_failure_does_not_block_registration(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Optional startup discovery fails visibly but hello still reaches the server."""
+
+    def _denied() -> dict[str, bool]:
+        raise PermissionError(13, "Permission denied", "/usr/local/bin/codex")
+
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _denied)
+    monkeypatch.setattr(
+        "omnigent.host.connect.gateway_inference_map",
+        lambda: {"codex": False},
+    )
+    host = _make_host_process()
+    await host._initialize_capabilities()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses is None
+    assert hello.gateway_inference == {"codex": False}
+    assert "Permission denied: '/usr/local/bin/codex'" in capsys.readouterr().err
 
 
 async def test_hello_advertises_installed_version() -> None:
@@ -2270,6 +2167,48 @@ def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
     assert env["MY_GATEWAY_URL"] == "https://llm.internal.example.com"
     # Anything unnamed stays behind the allowlist.
     assert "UNLISTED_SECRET" not in env
+
+
+def test_dispatch_trace_context_reaches_runner_but_not_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The dispatch-blessed caller trace context must reach runner (and thus
+    harness) subprocesses via the OMNIGENT_OTEL_ allowlist prefix, but a
+    long-lived host daemon must NOT inherit it: the daemon outlives the
+    dispatch and is reused, so a stale caller context stuck to it would
+    funnel every later run into the first caller's dead trace.
+    """
+    from omnigent.cli import _build_host_daemon_env
+    from omnigent.runtime.telemetry import (
+        DISPATCH_TRACEPARENT_ENV_VAR,
+        DISPATCH_TRACESTATE_ENV_VAR,
+    )
+
+    traceparent = "00-9fb2e1cf8fbe9c5ecb7742f04c351500-662a3348b2576ccf-01"
+
+    runner_env = _build_runner_env(
+        {
+            "PATH": "/usr/bin:/bin",
+            DISPATCH_TRACEPARENT_ENV_VAR: traceparent,
+            DISPATCH_TRACESTATE_ENV_VAR: "vendor=abc",
+        },
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+    assert runner_env[DISPATCH_TRACEPARENT_ENV_VAR] == traceparent
+    assert runner_env[DISPATCH_TRACESTATE_ENV_VAR] == "vendor=abc"
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv(DISPATCH_TRACEPARENT_ENV_VAR, traceparent)
+    monkeypatch.setenv(DISPATCH_TRACESTATE_ENV_VAR, "vendor=abc")
+    for server_url in (None, "https://example.databricksapps.com"):
+        daemon_env = _build_host_daemon_env(server_url=server_url)
+        assert DISPATCH_TRACEPARENT_ENV_VAR not in daemon_env
+        assert DISPATCH_TRACESTATE_ENV_VAR not in daemon_env
 
 
 def test_build_runner_env_passthrough_survives_remote_daemon_hop(
@@ -3165,10 +3104,7 @@ class _DroppedTunnel:
     """
 
     def __init__(self, frames_before_drop: int = 0) -> None:
-        """Store the inbound-frame script.
-
-        :param frames_before_drop: Frames to serve before dropping.
-        """
+        """Store the inbound-frame script."""
         self._frames_left = frames_before_drop
 
     async def send(self, data: str | bytes) -> None:
@@ -3179,11 +3115,7 @@ class _DroppedTunnel:
         """
 
     async def recv(self) -> str:
-        """Serve scripted frames, then fail like an abrupt close.
-
-        :returns: An undecodable frame while any are scripted.
-        :raises ConnectionClosedError: Once the script is exhausted.
-        """
+        """Serve scripted frames, then drop."""
         if self._frames_left > 0:
             self._frames_left -= 1
             return "not-a-decodable-frame"
@@ -3249,16 +3181,18 @@ class _ConnectSpy:
         """
         self._exceptions = exceptions
         self.call_count = 0
+        self.calls: list[dict[str, object]] = []
 
     def __call__(self, url: str, **kwargs: object) -> _HandshakeFailingConnect | _AcceptingConnect:
         """Return an async-CM scripting the handshake for this call.
 
         :param url: Tunnel URL passed by production (ignored).
-        :param kwargs: Connect kwargs passed by production (ignored).
+        :param kwargs: Connect kwargs passed by production (recorded).
         :returns: A context manager whose ``__aenter__`` raises the
             queued exception, or completes the handshake for a ``None``
             entry.
         """
+        self.calls.append(kwargs)
         exc = self._exceptions[min(self.call_count, len(self._exceptions) - 1)]
         self.call_count += 1
         if exc is None or isinstance(exc, int):
@@ -3266,7 +3200,7 @@ class _ConnectSpy:
         return _HandshakeFailingConnect(exc)
 
 
-def _invalid_status(status_code: int) -> InvalidStatus:
+def _invalid_status(status_code: int, body: bytes = b"") -> InvalidStatus:
     """Build a real :class:`InvalidStatus` for a rejected WS upgrade.
 
     Matches what ``websockets`` raises when the server answers the
@@ -3274,10 +3208,13 @@ def _invalid_status(status_code: int) -> InvalidStatus:
 
     :param status_code: HTTP status on the upgrade response, e.g.
         ``403``.
+    :param body: Optional response body the server sent with the refusal
+        (what ``_refuse_upgrade`` emits), so a test can assert it is
+        surfaced to the operator.
     :returns: An ``InvalidStatus`` whose ``response.status_code`` is
         *status_code*.
     """
-    return InvalidStatus(Response(status_code, "", Headers()))
+    return InvalidStatus(Response(status_code, "", Headers(), body))
 
 
 def _patch_connect(monkeypatch: pytest.MonkeyPatch, spy: _ConnectSpy) -> None:
@@ -3673,43 +3610,41 @@ async def test_connected_host_auth_rejection_prints_notice_once(
     assert err.count(f"HTTP {status}") == 1
 
 
-async def test_fresh_host_still_fails_loud_on_auth_rejection(
+@pytest.mark.parametrize("status", [401, 403])
+async def test_fresh_host_retries_auth_rejection_before_failing_loud(
     monkeypatch: pytest.MonkeyPatch,
+    status: int,
 ) -> None:
-    """A never-connected host still fails loud on 401/403.
+    """A never-connected host retries auth errors before failing loud.
 
-    The connected-host retry keys on a prior successful upgrade. A host
-    that has NEVER connected and is rejected with 401/403 is genuinely
-    unauthenticated / unauthorized — it must still raise HostConnectError
-    on the first attempt (→ exit 1 with the fix printed), not loop.
+    Databricks OAuth can refresh after daemon start but before a later
+    tunnel upgrade. The host gets a few attempts, then still raises a
+    clear credential failure instead of looping forever.
     """
-    spy = _ConnectSpy([_invalid_status(403)])
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    spy = _ConnectSpy([_invalid_status(status)])
     _patch_connect(monkeypatch, spy)
     host = _host()
 
     with pytest.raises(HostConnectError):
         await host.run()
 
-    # Exactly one attempt → no silent retry for the fresh-host case.
-    assert spy.call_count == 1
+    assert spy.call_count == 3
 
 
 @pytest.mark.parametrize(
     "status,expected",
     [
-        (401, "HTTP 401"),
-        (403, "HTTP 403"),
         (404, "permanent"),
     ],
 )
 async def test_run_fails_loud_on_permanent_4xx(
     monkeypatch: pytest.MonkeyPatch, status: int, expected: str
 ) -> None:
-    """A permanent 4xx upgrade rejection fails loud on the first attempt.
+    """A non-auth permanent 4xx upgrade rejection fails loud immediately.
 
-    401/403/other-4xx mean unauthenticated / unauthorized / wrong-or-old
-    server — reconnecting can never succeed, so run() must raise
-    HostConnectError immediately rather than backing off.
+    A wrong or old server cannot recover through reconnecting, so run()
+    must raise HostConnectError rather than backing off.
     """
     spy = _ConnectSpy([_invalid_status(status)])
     _patch_connect(monkeypatch, spy)
@@ -3720,8 +3655,6 @@ async def test_run_fails_loud_on_permanent_4xx(
 
     # Message identifies the specific permanent failure.
     assert expected in str(excinfo.value)
-    # Exactly one attempt → no silent reconnect/backoff. If >1, the 4xx
-    # was misclassified as transient and the loop kept retrying.
     assert spy.call_count == 1
 
 
@@ -3738,6 +3671,7 @@ async def test_auth_rejection_suggests_omnigent_login(
     server URL, so the user can copy-paste it.
     """
     server_url = "https://app.example.databricks.com"
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
     spy = _ConnectSpy([_invalid_status(status)])
     _patch_connect(monkeypatch, spy)
     host = _host(server_url=server_url)
@@ -3797,6 +3731,50 @@ async def test_run_reconnects_on_transient_upgrade_failure(
 
     # 2 = transient attempt + cancel attempt → it genuinely reconnected.
     assert spy.call_count == 2
+
+
+async def test_reconnect_uses_shorter_handshake_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only reconnects use the shorter open timeout; cold startup stays tolerant."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    spy = _ConnectSpy([None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    assert [call["open_timeout"] for call in spy.calls] == [10.0, 3.0]
+
+
+async def test_host_records_accepted_connection_and_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host reports lifecycle metrics only after an accepted upgrade."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    spy = _ConnectSpy([None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    connected: list[tuple[str, bool]] = []
+    disconnected: list[tuple[str, BaseException | None]] = []
+    monkeypatch.setattr(
+        "omnigent.host.connect.record_websocket_connected",
+        lambda kind, *, reconnect: connected.append((kind, reconnect)),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.record_websocket_disconnected",
+        lambda kind, error, **_kwargs: disconnected.append((kind, error)),
+    )
+
+    await _host().run()
+
+    assert connected == [("host", False)]
+    assert len(disconnected) == 1
+    assert disconnected[0][0] == "host"
+    assert isinstance(disconnected[0][1], ConnectionClosedError)
 
 
 def _refused_exc() -> ConnectionRefusedError:
@@ -3953,6 +3931,46 @@ def test_run_host_process_exits_nonzero_on_fatal(
     assert "HTTP 403" in err
 
 
+async def test_run_host_process_invalid_host_id_exits_actionably(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed configured identity is a user error, not a CLI crash."""
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "not-a-uuid")
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-test")
+
+    with pytest.raises(SystemExit) as excinfo:
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert excinfo.value.code == HOST_FATAL_EXIT_CODE
+    err = capsys.readouterr().err
+    assert "Could not start host" in err
+    assert "OMNIGENT_HOST_ID" in err
+    assert "not-a-uuid" in err
+
+
+def test_run_host_process_mirrors_structured_logs_on_foreground_tty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Foreground ``omnigent host`` mirrors logs like ``omnigent server``."""
+    monkeypatch.delenv("OMNIGENT_LOG_TO_STDERR", raising=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+
+    with patch(
+        "omnigent.host.connect.configure_process_logging",
+        return_value=tmp_path / "host.log",
+    ) as configure_logging:
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    configure_logging.assert_called_once_with("host", log_to_stderr=True)
+
+
 def test_run_host_process_announces_session_log_dir_on_start(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3966,6 +3984,7 @@ def test_run_host_process_announces_session_log_dir_on_start(
     advertised dir resolves under tmp.
     """
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     # A single CancelledError ends the connect loop cleanly (no fatal exit),
     # so run_host_process returns after printing the startup banner.
     _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
@@ -3978,6 +3997,56 @@ def test_run_host_process_announces_session_log_dir_on_start(
     out = capsys.readouterr().out
     assert "Session logs: ~/.omnigent/logs/runner/" in out
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
+
+
+async def test_run_sweeps_orphaned_native_bridge_dirs_on_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host startup reclaims native bridge dirs orphaned by a crashed runner.
+
+    A runner that dies uncleanly (SIGKILL / crash / host restart mid-run)
+    never runs its explicit-delete cleanup, and if no new runner ever
+    launches on the machine the runner-side startup sweep never fires
+    either — so ``~/.omnigent`` grows without bound. The host daemon's own
+    (re)start is the reliable moment to reap: ``run()`` must invoke the
+    cross-harness bridge-dir sweep before entering the connect loop.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+    sweeps: list[int] = []
+    monkeypatch.setattr(
+        "omnigent.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        lambda: sweeps.append(1) or 3,
+    )
+    host = _host()
+
+    await host.run()
+
+    assert sweeps == [1]
+
+
+async def test_run_survives_a_failing_native_bridge_dir_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raising bridge-dir sweep must not abort host startup.
+
+    The sweep is best-effort housekeeping; a broken bridge module or an
+    unreadable bridge root must never prevent the host from registering.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+
+    def _boom() -> int:
+        raise OSError("bridge root unreadable")
+
+    monkeypatch.setattr(
+        "omnigent.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        _boom,
+    )
+    host = _host()
+
+    # Startup completes (run returns via the clean cancel) despite the raise.
+    await host.run()
 
 
 async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
@@ -4000,6 +4069,7 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
     original_popen = subprocess.Popen
     spawned: list[subprocess.Popen[bytes]] = []
     spawn_started = threading.Event()
+    release_spawn = threading.Event()
 
     def _slow_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
         """Spawn a long-lived process, signalling once it exists.
@@ -4015,6 +4085,10 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
         )
         spawned.append(proc)
         spawn_started.set()
+        # Stay inside the shielded spawn until the test has issued its cancel.
+        # Returning here immediately let a loaded machine finish the launch
+        # before the cancel landed, so the cancel missed the leak window.
+        release_spawn.wait(10.0)
         return proc
 
     frame = HostLaunchRunnerFrame(
@@ -4029,6 +4103,7 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
         # so we exercise the real leak window rather than a pre-spawn cancel.
         await asyncio.to_thread(spawn_started.wait, 10.0)
         task.cancel()
+        release_spawn.set()
         with pytest.raises(asyncio.CancelledError):
             await task
 
@@ -4042,25 +4117,287 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
     assert spawned[0].poll() is not None, "abandoned runner was leaked, still alive"
 
 
+async def test_handle_model_options_serves_codex_probe_rows_and_caches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Databricks-routed Codex request is answered by the harness probe.
+
+    The probe rows pass through verbatim with their ids as the routable
+    set, and the second request is served from the fingerprint cache —
+    the harness is booted once.
+    """
+    from omnigent import codex_native_app_server
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model="databricks-gpt-5-4",
+            profile="oss",
+        ),
+    )
+    probe_calls: list[int] = []
+
+    async def _fake_probe(**_kwargs: object) -> list[dict[str, object]]:
+        probe_calls.append(1)
+        return [
+            {"id": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol"},
+            {"id": "gpt-5.4", "displayName": "gpt-5.4", "isDefault": True},
+        ]
+
+    monkeypatch.setattr(codex_native_app_server, "probe_codex_model_options", _fake_probe)
+    host = _make_host_process()
+
+    first = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_1", harness="codex-native"),
+    )
+    second = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_2", harness="codex-native"),
+    )
+
+    assert first == HostModelOptionsResultFrame(
+        request_id="req_1",
+        status="ok",
+        models=[
+            {"id": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol"},
+            {"id": "gpt-5.4", "displayName": "gpt-5.4", "isDefault": True},
+        ],
+        routable_models=["gpt-5.6-sol", "gpt-5.4"],
+    )
+    assert second.models == first.models
+    assert probe_calls == [1]
+    _cleanup_host(host)
+
+
+async def test_handle_model_options_serves_claude_sdk_endpoint_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK-mode Claude is a pass-through client, so the endpoint listing is
+    the harness truth — served in the exact wire spelling the SDK sends."""
+    from omnigent.model_catalog import ModelEntry, ModelListing
+
+    def _fake_listing(spec: object, harness: str) -> ModelListing:
+        assert harness == "claude-sdk"
+        return ModelListing(
+            source="gateway",
+            verified=True,
+            models=(
+                ModelEntry(id="databricks-claude-sonnet-5", family="claude"),
+                ModelEntry(id="databricks-claude-opus-4-8", family="claude"),
+            ),
+            note="test catalog",
+        )
+
+    monkeypatch.setattr("omnigent.model_catalog.list_models_for_worker", _fake_listing)
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_sdk", harness="claude-sdk"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_sdk",
+        status="ok",
+        models=[
+            {"id": "databricks-claude-sonnet-5", "displayName": "databricks-claude-sonnet-5"},
+            {"id": "databricks-claude-opus-4-8", "displayName": "databricks-claude-opus-4-8"},
+        ],
+        routable_models=["databricks-claude-sonnet-5", "databricks-claude-opus-4-8"],
+    )
+    _cleanup_host(host)
+
+
+async def test_handle_model_options_claude_sdk_rides_the_probe_when_endpoints_list_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subscription SDK launch serves the claude CLI's probed rows.
+
+    Subscription providers list nothing endpoint-side (the curated
+    stand-ins are gone), and the SDK drives the claude CLI — so the CLI's
+    probed listing is the truth for this lane too.
+    """
+    from omnigent.host.connect import ModelOptionsResult
+    from omnigent.model_catalog import ModelListing
+
+    def _fake_listing(spec: object, harness: str) -> ModelListing:
+        assert harness == "claude-sdk"
+        return ModelListing(
+            source="static",
+            verified=False,
+            models=(),
+            note="the claude CLI login exposes no model-listing API before launch",
+        )
+
+    monkeypatch.setattr("omnigent.model_catalog.list_models_for_worker", _fake_listing)
+    host = _make_host_process()
+
+    async def _fake_probed() -> ModelOptionsResult:
+        return ModelOptionsResult(
+            models=[{"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"}],
+            routable_models=[],
+        )
+
+    monkeypatch.setattr(host, "_probed_claude_model_options", _fake_probed)
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_sdk_sub", harness="claude-sdk"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_sdk_sub",
+        status="ok",
+        models=[{"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"}],
+        routable_models=[],
+    )
+    _cleanup_host(host)
+
+
+async def test_model_options_frame_replies_off_the_receive_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow probe must not stall the tunnel receive loop.
+
+    ``_handle_raw_message`` returns while the probe is still blocked; the
+    reply frame arrives from the dispatched task once the probe finishes.
+    """
+    from omnigent import codex_native_app_server
+    from omnigent.host.frames import encode_host_frame
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile="oss",
+        ),
+    )
+    release_probe = asyncio.Event()
+
+    async def _slow_probe(**_kwargs: object) -> list[dict[str, object]]:
+        await release_probe.wait()
+        return [{"id": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol"}]
+
+    monkeypatch.setattr(codex_native_app_server, "probe_codex_model_options", _slow_probe)
+    host = _make_host_process()
+    ws = _RecordingWS()
+    raw = encode_host_frame(HostModelOptionsFrame(request_id="req_slow", harness="codex-native"))
+
+    # Starting the frame task returns immediately — the receive loop is free
+    # while the probe blocks; the reply arrives from the frame's own task.
+    host._start_frame_task(ws, raw)  # type: ignore[arg-type] — duck-typed ws
+    await asyncio.sleep(0.05)
+    assert ws.sent == []
+
+    release_probe.set()
+    await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    reply = decode_host_frame(ws.sent[0])
+    assert isinstance(reply, HostModelOptionsResultFrame)
+    assert reply.request_id == "req_slow"
+    assert reply.status == "ok"
+    assert reply.models == [{"id": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol"}]
+    _cleanup_host(host)
+
+
+async def test_dns_errno_failure_is_not_a_recycle(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Windows errno 11001 (getaddrinfo failed) is not close code 1001.
+
+    The old substring classifier matched "1001" inside "11001", so a
+    sustained DNS outage (VPN down) classified every failure as an explicit
+    recycle and reconnected at the 0.5s prompt cadence indefinitely — 2
+    attempts/second, 122k attempts overnight in the field report.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
+    dns_failure = OSError(11001, "getaddrinfo failed")
+    spy = _ConnectSpy([dns_failure, dns_failure, dns_failure, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await host.run()
+
+    assert spy.call_count == 4
+    reconnects = [
+        record.message for record in caplog.records if "Reconnecting in" in record.message
+    ]
+    assert len(reconnects) == 3
+    assert not any("(recycle" in r for r in reconnects), (
+        "a DNS resolution failure must take the backoff ladder, not the prompt recycle cadence"
+    )
+
+
+@pytest.mark.parametrize("port", [502, 1001, 1012])
+async def test_endpoint_port_is_not_a_recycle(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    port: int,
+) -> None:
+    """Standalone numbers in transport errors are not protocol status codes."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    failure = OSError(f"Connect call failed ('203.0.113.1', {port})")
+    spy = _ConnectSpy([failure, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await _host().run()
+
+    reconnects = [
+        record.message for record in caplog.records if "Reconnecting in" in record.message
+    ]
+    assert len(reconnects) == 1
+    assert "(recycle" not in reconnects[0]
+
+
+async def test_sustained_recycle_failures_fall_back_to_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A sustained run of recycle-classified failures is an outage, not a cycle.
+
+    The prompt cadence exists for a brief ingress recycle; when the same
+    classification fires attempt after attempt without a connection ever
+    establishing (proxy 502 while the server is down), the daemon must back
+    off instead of hammering the endpoint twice a second forever.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECYCLE_PROMPT_MAX_STREAK", 3)
+    # Raised AT CONNECT TIME (never accepted): an ingress-classified outage.
+    rejected = _invalid_status(502)
+    spy = _ConnectSpy([rejected] * 6 + [asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await host.run()
+
+    assert spy.call_count == 7
+    reconnects = [
+        record.message for record in caplog.records if "Reconnecting in" in record.message
+    ]
+    assert len(reconnects) == 6
+    prompt = [i for i, r in enumerate(reconnects) if "(recycle" in r]
+    # The first _RECYCLE_PROMPT_MAX_STREAK attempts are prompt; every attempt
+    # after that takes the backoff ladder.
+    assert prompt == [0, 1, 2], f"prompt cadence must stop after the streak cap: {prompt}"
+
+
 async def test_silent_connect_streak_escalates_and_slows_reconnects(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Accepted-but-silent connections escalate past a bounded streak.
-
-    An endpoint that accepts the upgrade and never sends a frame used to
-    classify every drop as a benign ingress recycle and hammer it at the
-    prompt cadence forever (observed: ~6s cycles for 7 hours, silently).
-    Past the streak the host must log ONE error, warn the terminal once,
-    and drop to normal backoff.
-    """
+    """Repeated accepted-but-silent connections escalate to slow backoff."""
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._SILENT_CONNECT_ESCALATE_ATTEMPTS", 3)
     monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
     monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
-    # Five accepted-silent connections (threshold 3), then stop.
     spy = _ConnectSpy([None, None, None, None, None, asyncio.CancelledError()])
     _patch_connect(monkeypatch, spy)
     host = _host()
@@ -4068,14 +4405,13 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
         await host.run()
 
-    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(errors) == 1, "must escalate exactly once per episode"
+    errors = [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert len(errors) == 1
     assert "3 consecutive connections but never responded" in errors[0].message
-    # The terminal notice reached stderr exactly once.
     assert capsys.readouterr().err.count("never responded") == 1
-    # Cadence flip: below the threshold the drops ride the recycle fast
-    # path; at/after it they must not.
-    reconnects = [r.message for r in caplog.records if "Reconnecting in" in r.message]
+    reconnects = [
+        record.message for record in caplog.records if "Reconnecting in" in record.message
+    ]
     assert len(reconnects) == 5
     assert "(recycle — prompt reconnect)" in reconnects[1]
     assert "(recycle — prompt reconnect)" not in reconnects[-1]
@@ -4085,18 +4421,12 @@ async def test_inbound_frame_resets_silent_connect_streak(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """One received frame proves the endpoint alive and resets the streak.
-
-    Only CONSECUTIVE silent connections may escalate — a healthy
-    connection in between (any inbound frame, even one the dispatcher
-    ignores) restarts the count, so ordinary recycles never trip it.
-    """
+    """Any inbound frame resets consecutive silent-connection accounting."""
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._SILENT_CONNECT_ESCALATE_ATTEMPTS", 3)
     monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
     monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
-    # 2 silent, one frame-serving (resets), 2 silent: never 3 in a row.
     spy = _ConnectSpy([None, None, 1, None, None, asyncio.CancelledError()])
     _patch_connect(monkeypatch, spy)
     host = _host()
@@ -4105,7 +4435,70 @@ async def test_inbound_frame_resets_silent_connect_streak(
         await host.run()
 
     assert host._silent_connect_streak == 2
-    assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert not [record for record in caplog.records if record.levelno == logging.ERROR]
+
+
+async def test_connection_error_frame_fails_loudly_on_live_receive_path() -> None:
+    """A non-retryable server error escapes the live receive loop."""
+    host = _host()
+    tunnel = _ConnectionErrorTunnel(
+        HostConnectionErrorFrame(
+            stage="registration",
+            error="database unavailable",
+            retryable=False,
+        )
+    )
+
+    with pytest.raises(HostConnectError, match="registration: database unavailable"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    assert len(tunnel.sent) == 1
+    assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
+    assert host._frame_tasks == set()
+
+
+async def test_retryable_connection_error_escapes_live_receive_path() -> None:
+    """A retryable server error reaches the reconnect loop's exception class."""
+    host = _host()
+    tunnel = _ConnectionErrorTunnel(
+        HostConnectionErrorFrame(
+            stage="registration",
+            error="database restarting",
+            retryable=True,
+        )
+    )
+
+    with pytest.raises(HostRetryableConnectionError, match="registration: database restarting"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    assert host._frame_tasks == set()
+
+
+async def test_capabilities_are_initialized_once_across_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconnect handshakes reuse startup metadata instead of rerunning probes."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    calls = {"readiness": 0, "gateway": 0}
+
+    def _readiness() -> dict[str, bool]:
+        calls["readiness"] += 1
+        return {"pi": True}
+
+    def _gateway() -> dict[str, bool]:
+        calls["gateway"] += 1
+        return {"codex": True}
+
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _readiness)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", _gateway)
+    spy = _ConnectSpy([None, None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    assert spy.call_count == 3
+    assert calls == {"readiness": 1, "gateway": 1}
 
 
 class _FakeZygote:
@@ -4458,3 +4851,609 @@ def test_direct_spawn_keeps_the_workspace_off_sys_path(
     _host, popen_argvs = _spawn_with_fake_zygote(monkeypatch, tmp_path, zygote)
 
     assert popen_argvs[0][1:] == ["-P", "-m", "omnigent.runner._entry"]
+
+
+async def test_on_resume_from_suspend_aborts_live_tunnel() -> None:
+    """A detected wake aborts the live tunnel and flags a prompt reconnect.
+
+    ``_on_resume_from_suspend`` runs synchronously on the event loop; with a
+    live ``self._ws`` it must abort the transport — so ``_serve_frames``'
+    blocked ``recv`` raises at once instead of waiting out the ~90s keepalive —
+    and set the woke flag that ``run`` reads to skip the reconnect backoff.
+
+    :returns: None.
+    """
+    host = _make_host_process()
+
+    class _Transport:
+        """asyncio-transport stub that records an ``abort()``."""
+
+        def __init__(self) -> None:
+            self.aborted = False
+
+        def abort(self) -> None:
+            """Record the forced close.
+
+            :returns: None.
+            """
+            self.aborted = True
+
+    transport = _Transport()
+    host._ws = SimpleNamespace(transport=transport)  # type: ignore[assignment]
+
+    host._on_resume_from_suspend(3600.0)
+
+    assert transport.aborted is True
+    assert host._woke_from_suspend is True
+
+
+async def test_on_resume_from_suspend_noop_without_live_tunnel() -> None:
+    """With no live tunnel the resume hook does nothing and sets no flag.
+
+    A wake during a reconnect backoff has no socket to abort; the flag must
+    stay clear so an unrelated later drop is not spuriously reclassified as a
+    prompt reconnect.
+
+    :returns: None.
+    """
+    host = _make_host_process()
+    assert host._ws is None
+
+    host._on_resume_from_suspend(3600.0)
+
+    assert host._woke_from_suspend is False
+
+
+async def test_run_reconnects_promptly_after_suspend(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """After a wake, run() aborts the dead tunnel and reconnects at once.
+
+    Drives the real reconnect loop against a *loopback* server, where an
+    abrupt drop is NOT auto-classified as a benign ingress recycle — so a
+    prompt reconnect here is attributable to the suspend-resume path, not the
+    recycle heuristic. A fake watcher fires a resume once the tunnel is live;
+    the real ``_on_resume_from_suspend`` aborts it, and the loop must reconnect
+    (not hang or exit) and attribute the drop to the resume.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Log capture fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+
+    class _BlockingTunnel:
+        """Accepted tunnel whose ``recv()`` blocks until the transport aborts."""
+
+        def __init__(self) -> None:
+            self._dead = asyncio.Event()
+            self.transport = SimpleNamespace(abort=self._dead.set)
+
+        async def send(self, data: str | bytes) -> None:
+            """Accept the ``host.hello`` frame silently.
+
+            :param data: Encoded frame payload (ignored).
+            :returns: None.
+            """
+            del data
+
+        async def recv(self) -> str:
+            """Block until aborted, then fail like a dropped connection.
+
+            :returns: Never returns a frame.
+            :raises ConnectionClosedError: Once the transport is aborted.
+            """
+            await self._dead.wait()
+            raise ConnectionClosedError(None, None)
+
+    class _BlockingConnect:
+        """Async-CM for a successful upgrade to a blocking tunnel."""
+
+        def __init__(self, tunnel: _BlockingTunnel) -> None:
+            self._tunnel = tunnel
+
+        async def __aenter__(self) -> _BlockingTunnel:
+            """Complete the handshake with the blocking tunnel.
+
+            :returns: The blocking tunnel.
+            """
+            return self._tunnel
+
+        async def __aexit__(self, *exc_info: object) -> bool:
+            """No-op async-CM exit.
+
+            :param exc_info: Standard ``__aexit__`` triple (unused).
+            :returns: ``False`` so the disconnect propagates.
+            """
+            del exc_info
+            return False
+
+    tunnel = _BlockingTunnel()
+    connect_calls = {"n": 0}
+
+    def _connect(url: str, **kwargs: object) -> object:
+        """Serve one live tunnel, then stop the loop.
+
+        :param url: Tunnel URL (ignored).
+        :param kwargs: Connect kwargs (ignored).
+        :returns: A blocking-tunnel CM on the first call; a CM that cancels
+            the loop thereafter.
+        """
+        del url, kwargs
+        connect_calls["n"] += 1
+        if connect_calls["n"] == 1:
+            return _BlockingConnect(tunnel)
+        return _HandshakeFailingConnect(asyncio.CancelledError())
+
+    host = _make_host_process()  # loopback server_url (http://localhost:8000)
+
+    async def _fake_watch(on_resume: object, **_kwargs: object) -> None:
+        """Simulate a wake once the first tunnel is live, then idle.
+
+        :param on_resume: The host's real resume hook.
+        :param _kwargs: Ignored watcher tuning args.
+        :returns: None.
+        """
+        # Wait until _serve_frames has set self._ws so there is a live socket
+        # to abort (otherwise the resume hook would be a no-op).
+        while host._ws is None:
+            await asyncio.sleep(0)
+        on_resume(3600.0)  # type: ignore[operator]
+        await asyncio.Event().wait()
+
+    import websockets.asyncio.client as ws_client
+
+    import omnigent.runner._entry as entry_mod
+
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
+    monkeypatch.setattr(ws_client, "connect", _connect)
+    monkeypatch.setattr("omnigent.host.connect.watch_for_resume", _fake_watch)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await host.run()
+
+    # Two connects: the initial live tunnel + the prompt reconnect after wake.
+    assert connect_calls["n"] == 2
+    # The disconnect was attributed to the resume, and the flag was consumed.
+    assert any("resumed from suspend" in r.message for r in caplog.records)
+    assert host._woke_from_suspend is False
+
+
+def test_post_connect_auth_rejection_escalates_without_going_fatal(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A 401/403 AFTER the host has connected retries forever (never fatal),
+    but a sustained streak escalates the operator message from a transient-
+    network hint to a re-auth prompt that names ``omnigent login`` — so a
+    permanently-rejected credential surfaces instead of looping silently.
+    """
+    from omnigent.host.connect import _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+    host = _make_host_process()
+    host._ever_connected = True
+
+    # First rejection: retryable (None), framed as a transient network blip.
+    assert host._classify_http_status(403) is None
+    first = capsys.readouterr().err
+    assert "network dropped" in first
+    assert "omnigent login" not in first
+
+    # Streak climbs toward — but not to — the escalation threshold: stays quiet
+    # so a brief VPN outage never raises a false re-auth alarm.
+    for _ in range(2, _AUTH_REJECT_ESCALATE_ATTEMPTS):
+        assert host._classify_http_status(403) is None
+    assert "omnigent login" not in capsys.readouterr().err
+
+    # Crossing the threshold escalates — names the real remedy — and is STILL
+    # retryable (no fatal error, so a recoverable daemon is never killed).
+    assert host._classify_http_status(403) is None
+    escalated = capsys.readouterr().err
+    assert "omnigent login http://localhost:8000" in escalated
+    assert "no longer a transient network blip" in escalated
+    assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+
+async def test_launch_harness_probe_runs_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The readiness probe must not run inline on the daemon's event loop.
+
+    It shells out to ``<cli> --version``, so inline a hung CLI would stall the
+    keepalive pong the server counts as liveness.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    loop_thread_id = threading.get_ident()
+    probe_thread_ids: list[int] = []
+
+    def _record_thread(harness: str) -> bool:
+        probe_thread_ids.append(threading.get_ident())
+        return False
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _record_thread)
+
+    result = await host._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="req_probe_thread",
+            binding_token="token_abc",
+            workspace=str(workspace),
+            harness="codex",
+        )
+    )
+
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    assert probe_thread_ids, "the harness probe should still run"
+    assert loop_thread_id not in probe_thread_ids, (
+        "harness readiness probe ran on the event loop thread"
+    )
+
+
+async def test_fatal_upgrade_error_surfaces_server_refusal_body() -> None:
+    """A refusal that carries a body (what ``_refuse_upgrade`` sends, e.g. the
+    server's malformed-host-id 400) is surfaced verbatim — the client passes the
+    server's own reason through instead of guessing from the status code.
+    """
+    host = _make_host_process()
+    server_reason = (
+        "Invalid host id 'superagent-databricks-host': host ids must be UUIDs. "
+        "Set OMNIGENT_HOST_ID to a UUID (or unset it to have one generated) and reconnect."
+    )
+    err = host._fatal_upgrade_error(_invalid_status(400, server_reason.encode()))
+    assert err is not None  # 400 is a permanent refusal, not retried
+    assert server_reason in str(err)
+    assert "HTTP 400" in str(err)
+
+
+async def test_fatal_upgrade_error_bodyless_4xx_falls_back_to_generic() -> None:
+    """A permanent 4xx with no body (a bare pre-accept close carries none) still
+    yields an actionable, generic message rather than an empty one.
+    """
+    host = _make_host_process()
+    err = host._fatal_upgrade_error(_invalid_status(400))
+    assert err is not None
+    assert "HTTP 400" in str(err)
+    assert "the server rejected the host tunnel request" in str(err)
+
+
+async def test_handle_launch_supersedes_previous_runner_for_same_session(
+    tmp_path: Path,
+) -> None:
+    """A relaunch for a session tears down that session's previous runner.
+
+    The server rotates the binding token on every relaunch, so without
+    this the host accumulates one live runner per attempt — each with a
+    transcript forwarder tailing the same session (the #5182 leak).
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        first = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_a",
+                workspace=str(workspace),
+                session_id="conv_super",
+            )
+        )
+        first_handle = host._runners[first.runner_id]
+        second = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_b",
+                workspace=str(workspace),
+                session_id="conv_super",
+            )
+        )
+
+    assert first.status == "launched" and second.status == "launched"
+    # The superseded runner is untracked at once; its termination runs
+    # detached, so poll-wait briefly for the process to go down.
+    assert first.runner_id not in host._runners
+    for _ in range(70):
+        if first_handle.proc.poll() is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert first_handle.proc.poll() is not None, (
+        "the previous runner for the session must be terminated on relaunch"
+    )
+    assert second.runner_id in host._runners
+    _cleanup_host(host)
+
+
+async def test_handle_launch_leaves_other_sessions_runners_alone(
+    tmp_path: Path,
+) -> None:
+    """Supersession is scoped to the frame's session: no cross-session kills."""
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        first = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_a2",
+                workspace=str(workspace),
+                session_id="conv_one",
+            )
+        )
+        second = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_b2",
+                workspace=str(workspace),
+                session_id="conv_two",
+            )
+        )
+
+    assert first.runner_id in host._runners
+    assert second.runner_id in host._runners
+    assert host._runners[first.runner_id].proc.poll() is None
+    _cleanup_host(host)
+
+
+async def test_handle_launch_spawn_failure_preserves_previous_runner(
+    tmp_path: Path,
+) -> None:
+    """A failed relaunch spawn must not have killed the session's runner.
+
+    Supersession runs only after the replacement is alive: trading a
+    working runner for a spawn failure would leave the session with
+    nothing (worse than the leak this fixes).
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    calls = {"n": 0}
+
+    def _popen_second_fails(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OSError("fork failed")
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_popen_second_fails):
+        first = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_keep",
+                workspace=str(workspace),
+                session_id="conv_keep",
+            )
+        )
+        second = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_fail",
+                workspace=str(workspace),
+                session_id="conv_keep",
+            )
+        )
+
+    assert second.status == "failed"
+    assert first.runner_id in host._runners, (
+        "a failed replacement spawn must leave the previous runner tracked"
+    )
+    assert host._runners[first.runner_id].proc.poll() is None, (
+        "a failed replacement spawn must leave the previous runner alive"
+    )
+    _cleanup_host(host)
+
+
+async def test_supersede_stop_does_not_block_the_launch(
+    tmp_path: Path,
+) -> None:
+    """A SIGTERM-ignoring old runner can't head-of-line block the relaunch.
+
+    The termination round (5s grace, then SIGKILL) runs detached; the
+    launch handler must return while the stubborn process is still up.
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    calls = {"n": 0}
+
+    def _popen_first_stubborn(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Ignores SIGTERM: only the detached round's SIGKILL ends it.
+            return original_popen(
+                ["bash", "-c", 'trap "" TERM; sleep 30'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_popen_first_stubborn):
+        first = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_stub",
+                workspace=str(workspace),
+                session_id="conv_stub",
+            )
+        )
+        first_handle = host._runners[first.runner_id]
+        started = time.monotonic()
+        second = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_new",
+                workspace=str(workspace),
+                session_id="conv_stub",
+            )
+        )
+        elapsed = time.monotonic() - started
+
+    assert second.status == "launched"
+    assert elapsed < 3.0, (
+        f"the launch must not wait out the old runner's termination grace (took {elapsed:.1f}s)"
+    )
+    # The stubborn process survives SIGTERM but the detached round's
+    # SIGKILL takes it down within its 5s grace + margin.
+    for _ in range(80):
+        if first_handle.proc.poll() is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert first_handle.proc.poll() is not None, (
+        "the detached stop must eventually SIGKILL a SIGTERM-ignoring runner"
+    )
+    _cleanup_host(host)
+
+
+async def test_handle_import_local_all_streams_a_frame_per_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``source="all"`` streams one session frame each (tagged), then a done frame."""
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    # The cross-harness selector already merged/ranked; the handler just loads.
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "c1"), ("codex", "x1")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title=f"{source} title",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_all", source="all", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # One frame per session, each tagged with its own source + title + the total.
+    assert {
+        (f.session.external_session_id, f.session.source, f.session.title) for f in session_frames
+    } == {("c1", "claude", "claude title"), ("x1", "codex", "codex title")}
+    assert all(f.total == 2 for f in session_frames)
+    assert len(done_frames) == 1 and done_frames[0].status == "ok"
+
+
+async def test_handle_import_local_reports_unreadable_sessions_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session that fails to load sends no frame but is counted on the done frame."""
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "good"), ("claude", "corrupt")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        if session_id == "corrupt":
+            raise ValueError("truncated transcript")
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title="ok",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_fail", source="all", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # Only the readable session got a frame; the corrupt one is counted, not sent.
+    assert [f.session.external_session_id for f in session_frames] == ["good"]
+    assert len(done_frames) == 1
+    assert done_frames[0].status == "ok" and done_frames[0].failed == 1

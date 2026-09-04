@@ -27,11 +27,18 @@ Consumer (SSE endpoint, async):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any
 
+from omnigent.debug_logging import (
+    audit_event_logger,
+    debug_event,
+    debug_sink_enabled,
+    sse_event_logger,
+)
 from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
@@ -78,7 +85,126 @@ def _enqueue_or_overflow(
     queue.put_nowait(_OVERFLOW)
 
 
-def publish(conversation_id: str, event: dict[str, Any]) -> None:
+# ── SSE-event debug logging (table-only; see omnigent.debug_logging) ──────────
+# Frequent, low-signal events not worth a debug-log row.
+_SSE_SKIP_TYPES = frozenset(
+    {"session.terminal.activity", "session.heartbeat", "response.heartbeat"}
+)
+# Failure events logged at WARNING so the table's level column flags them.
+_SSE_WARN_TYPES = frozenset(
+    {"response.failed", "response.error", "turn.failed", "response.policy_denied"}
+)
+# Terminal SSE events → the turn's outcome. Emitted once per turn as a
+# first-class ``turn_finished`` audit row (session-scoped), so turn success /
+# failure is queryable without inferring it from the raw SSE stream.
+_TURN_OUTCOME_BY_EVENT_TYPE = {
+    "response.completed": "completed",
+    "response.failed": "failed",
+    "response.cancelled": "cancelled",
+    "response.incomplete": "incomplete",
+}
+# Top-level event fields safe to log — stable identifiers, closed enums, and
+# pure numerics only. Deliberately excludes human/LLM-authored free text
+# (``reason`` — PolicyDeniedEvent's deny reason is LLM-generated and can quote
+# the content it evaluated — and ``blocked_on``, a free-form "human phrase") and
+# ``tool_name`` (author-defined for custom/MCP tools; ``call_id`` still
+# correlates a call to its result without naming the tool), alongside the
+# content fields dropped in _sse_safe_attributes.
+_SSE_SAFE_KEYS = (
+    "status",
+    "call_id",
+    "message_id",
+    "phase",
+    "attempt",
+    "max_attempts",
+    "sequence_number",
+    "index",
+    "final",
+    "model",
+    "context_tokens",
+    "context_window",
+    "total_cost_usd",
+)
+
+
+def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
+    """Extract only safe identifiers/dimensions from an SSE event.
+
+    A strict whitelist: content and free-text fields (``delta`` text, tool
+    ``arguments`` / outputs, message/reasoning ``data``, ``error.message``,
+    human/LLM-authored ``reason`` / ``blocked_on``, and ``tool_name``) are never
+    read, so no model response or user content reaches the debug table.
+    """
+    attrs: dict[str, object] = {}
+    for key in _SSE_SAFE_KEYS:
+        value = event.get(key)
+        if value is not None and not isinstance(value, (dict, list)):
+            attrs[key] = value
+    response = event.get("response")
+    if isinstance(response, dict) and isinstance(response.get("id"), str):
+        attrs["response_id"] = response["id"]
+    elif isinstance(event.get("response_id"), str):
+        attrs["response_id"] = event["response_id"]
+    item = event.get("item")
+    if isinstance(item, dict):
+        if isinstance(item.get("id"), str):
+            attrs["item_id"] = item["id"]
+        if isinstance(item.get("type"), str):
+            attrs["item_type"] = item["type"]
+    error = event.get("error")
+    if isinstance(error, dict):
+        if error.get("code") is not None:
+            attrs["error_code"] = error["code"]
+        if error.get("source") is not None:
+            attrs["error_source"] = error["source"]
+    return attrs
+
+
+def _log_sse_event(conversation_id: str, event: dict[str, Any]) -> None:
+    """Mirror one emitted SSE event to the debug-log table (best-effort).
+
+    No-op unless the debug-log sink is enabled. Logs the event name and safe
+    ids only (never content); heartbeats / terminal-activity are skipped, and
+    failure events go at WARNING. Never raises into :func:`publish`.
+    """
+    with contextlib.suppress(Exception):
+        if not debug_sink_enabled():
+            return
+        event_type = event.get("type")
+        if not isinstance(event_type, str) or event_type in _SSE_SKIP_TYPES:
+            return
+        level = logging.WARNING if event_type in _SSE_WARN_TYPES else logging.INFO
+        extra = debug_event(event_type, session_id=conversation_id)
+        extra["attributes"] = _sse_safe_attributes(event)
+        sse_event_logger().log(level, "sse %s", event_type, extra=extra)
+        _log_turn_outcome(conversation_id, event_type, event)
+
+
+def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, Any]) -> None:
+    """Emit a first-class ``turn_finished`` audit row on a terminal SSE event.
+
+    One row per turn (terminal events fire once), carrying the outcome plus safe
+    ids, so turn success/failure rate is a direct query rather than an inference
+    over the raw stream. Table-only via the audit logger; caller already gated on
+    :func:`debug_sink_enabled` and wrapped in ``suppress``.
+    """
+    outcome = _TURN_OUTCOME_BY_EVENT_TYPE.get(event_type)
+    if outcome is None:
+        return
+    extra = debug_event("turn_finished", session_id=conversation_id, outcome=outcome)
+    attributes = extra["attributes"]
+    if isinstance(attributes, dict):
+        response = event.get("response")
+        if isinstance(response, dict) and isinstance(response.get("id"), str):
+            attributes["response_id"] = response["id"]
+        error = event.get("error")
+        if isinstance(error, dict) and error.get("code") is not None:
+            attributes["error_code"] = str(error["code"])
+    level = logging.WARNING if outcome in ("failed", "incomplete") else logging.INFO
+    audit_event_logger().log(level, "turn %s", outcome, extra=extra)
+
+
+def publish(conversation_id: str, event: dict[str, Any]) -> int:
     """
     Broadcast an event to every active subscriber of the given
     conversation (called from sync workflow thread). The event
@@ -101,7 +227,18 @@ def publish(conversation_id: str, event: dict[str, Any]) -> None:
         the Omnigent route layer validates each emitted dict against
         the union before serializing, so an unmodelled event
         fails loud at the SSE boundary.
+    :returns: The number of subscriber slots the event was dispatched
+        toward (``0`` when nothing was listening or the event was
+        suppressed). A slow subscriber's queue may still overflow after
+        dispatch, so a positive count is presence, not delivery. Callers
+        that need a live listener — e.g. the browser action bridge — use
+        this to fail fast instead of awaiting a response that can never
+        arrive; most callers ignore it.
     """
+    # Mirror the emitted event to the debug-log table (best-effort, table-only,
+    # no-op unless the sink is enabled). Done first so it captures every event
+    # the server produces — including ones with no live subscriber.
+    _log_sse_event(conversation_id, event)
     # Track reconnect state and centrally suppress or rewrite native deltas
     # before they reach subscribers.
     live_event = inflight_text.record_publish(conversation_id, event)
@@ -112,11 +249,31 @@ def publish(conversation_id: str, event: dict[str, Any]) -> None:
     # always a text delta, never an elicitation, so this still runs.
     pending_elicitations.record_publish(conversation_id, event)
     if live_event is None:
-        return
+        return 0
     with _lock:
         subs = list(_subscribers.get(conversation_id, ()))
     for queue, loop in subs:
         loop.call_soon_threadsafe(_enqueue_or_overflow, queue, live_event)
+    return len(subs)
+
+
+def has_subscribers(conversation_id: str) -> bool:
+    """
+    Return whether any live subscriber is currently registered for
+    the given conversation.
+
+    Because this stream has no buffer and no replay, an event
+    published while this returns ``False`` is lost — callers can use
+    that to fail fast instead of awaiting a response that can never
+    arrive (e.g. a browser action dispatched to a session no renderer
+    is watching).
+
+    :param conversation_id: The conversation to check,
+        e.g. ``"conv_abc123"``.
+    :returns: ``True`` when at least one subscriber slot is registered.
+    """
+    with _lock:
+        return bool(_subscribers.get(conversation_id))
 
 
 def close(conversation_id: str) -> None:

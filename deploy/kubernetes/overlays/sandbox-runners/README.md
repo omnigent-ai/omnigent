@@ -1,42 +1,43 @@
 # Kubernetes sandbox runners (on-demand host Pods)
 
 This Kustomize overlay turns on the **`kubernetes`** managed-sandbox provider: a
-`host_type: managed` session spawns one **runner Pod** that runs `omnigent host`
-as its container entrypoint and dials back to the server over the existing
-launch-token tunnel. It layers the RBAC + config the provider needs onto the
-base server deployment.
+`host_type: managed` session spawns a **batch/v1 Job** whose child Pod runs
+`omnigent host` as its container entrypoint and dials back to the server over the
+existing launch-token tunnel. It layers the RBAC + config the provider needs onto
+the base server deployment.
 
 ## Launch model: entrypoint-as-host
 
-The runner Pod's container command **is** the host. An **init container**
-prepares the workspace (`mkdir` + optional `git clone`); the **main container**
-then runs `omnigent host` under a tiny PID-1 reaper. The host re-parents runner
-processes to PID 1, which the reaper reaps; SIGTERM is forwarded for graceful
-shutdown.
+The runner is launched as a **batch/v1 Job** (one Pod, `backoffLimit: 6`). The
+Job's child Pod runs `omnigent host` as its container command. An **init
+container** prepares the workspace (`mkdir` + optional `git clone`); the **main
+container** then runs `omnigent host` under a tiny PID-1 reaper. The host
+re-parents runner processes to PID 1, which the reaper reaps; SIGTERM is
+forwarded for graceful shutdown.
 
-The launch token is delivered through a **per-Pod Kubernetes Secret** referenced
+The launch token is delivered through a **per-Job Kubernetes Secret** referenced
 by the Pod's `secretKeyRef` — it never enters the Pod spec, a command line, or
 an audit log. The launcher creates that Secret at provision and deletes it
-alongside the Pod at terminate.
+alongside the Job at terminate.
 
 Because the host is **never started by `exec`-ing into an already-running
 container**, this provider needs **no `pods/exec` grant** — and avoids the
 exec-into-running-container class of runtime issues entirely. The server SA's
-rights are the minimum the launcher calls: create/get/delete Pods, get
-`pods/log` (start-failure diagnostics only), create/delete Secrets (the per-Pod
-token), and list events.
+rights are the minimum the launcher calls: create/get/delete Jobs,
+list/get Pods (to poll the Job's child), get `pods/log` (start-failure
+diagnostics only), create/delete Secrets (the per-Job token), and list events.
 
 ## Two-namespace, least-blast-radius design
 
 | Namespace | Holds |
 |---|---|
 | `omnigent` | the server, its DB/PVC, its Secrets, the `omnigent-server` SA |
-| `omnigent-sandboxes` | runner Pods, the per-Pod token Secrets, the harness-creds Secret, the powerless `omnigent-runner` SA, the scoped Role + RoleBinding |
+| `omnigent-sandboxes` | runner Jobs (and their child Pods), the per-Job token Secrets, the harness-creds Secret, the powerless `omnigent-runner` SA, the scoped Role + RoleBinding |
 
-The server SA's Pod/Secret rights are a **namespaced Role** bound (cross-namespace)
-to `omnigent-sandboxes` only — so a compromised server can manage runner Pods but
-**cannot** delete the server/DB Pods, read the server's Secrets, or execute
-commands inside any Pod. The runner namespace enforces Pod Security `restricted`;
+The server SA's Job/Pod/Secret rights are a **namespaced Role** bound
+(cross-namespace) to `omnigent-sandboxes` only — so a compromised server can
+manage runner Jobs but **cannot** delete the server/DB Pods, read the server's
+Secrets, or execute commands inside any Pod. The runner namespace enforces Pod Security `restricted`;
 the generated runner Pod is already restricted-compliant (non-root uid 1000, drop
 `ALL` caps, `seccompProfile: RuntimeDefault`, no privilege escalation).
 
@@ -83,7 +84,7 @@ runner Pod unexpectedly carries no credential:
   (`omnigent/server/managed_hosts.py`), e.g. "agent … is not a genuine built-in;
   omitting agent label".
 - A name that is not a valid label value logs a `WARNING` from
-  `build_pod_manifest` (`omnigent/onboarding/sandboxes/kubernetes.py`), e.g.
+  `build_job_manifest` (`omnigent/onboarding/sandboxes/kubernetes.py`), e.g.
   "agent … is not a valid omnigent.ai/agent value; runner Pod … stays
   unclassified". Note the gate upstream will already have logged this agent as
   classified, so this is the line that explains the missing label.
@@ -210,6 +211,7 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 | `env` | Optional list of SERVER env-var names to inject as literal Pod env (prefer `secret_name` for credentials). |
 | `node_selector` | Optional extra node labels, merged with a default `kubernetes.io/arch: amd64` — set that key to `arm64` to schedule runners on arm64 nodes. |
 | `resources` | Optional `requests` / `limits` (`cpu` / `memory`) override. |
+| `pod_ready_timeout_s` | Optional override for how long to wait for a runner Pod to reach `Running` (schedule + image pull + init container) before failing the launch — default 90s. Raise it for deployments whose host image regularly takes longer to pull. Also settable via env: `OMNIGENT_K8S_POD_READY_TIMEOUT_S` (this key takes precedence when both are set). |
 | `in_cluster` | Optional cluster-config source: `true` (in-cluster SA only), `false` (kubeconfig only), omit (try in-cluster, then kubeconfig). |
 | `kubeconfig` | Optional kubeconfig path for the out-of-cluster fallback (env: `OMNIGENT_KUBERNETES_KUBECONFIG`). |
 | `pvc_mounts` | Optional pre-created PersistentVolumeClaims mounted into every runner Pod — see [Persistent storage mounts](#persistent-storage-mounts-pvc_mounts). |

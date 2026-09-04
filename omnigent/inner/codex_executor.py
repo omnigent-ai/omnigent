@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, cast
 
+from omnigent import _native_forwarder_health as native_forwarder_health
 from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary
 from omnigent.codex_model_vocabulary import (
@@ -115,6 +116,11 @@ CodexToolExecutor: TypeAlias = Callable[
 # but keep waiting — a long-running tool or model call can legitimately
 # block events far longer than any fixed deadline.
 _TURN_EVENT_WARN_SECONDS = 600.0
+# The idle wait polls on this shorter interval so a fatal gateway error the
+# stderr loop sets mid-wait is acted on promptly, rather than only when the
+# 600s warn window elapses. Chosen to divide the warn window evenly so the
+# warning cadence is unchanged.
+_TURN_EVENT_POLL_SECONDS = 5.0
 _TURN_COMPLETED_DRAIN_SECONDS = 1.0
 # Wall-clock budget for the ``codex --version`` probe. A broken codex
 # build that blocks (e.g. on stdin) must not stall session startup — on
@@ -124,8 +130,13 @@ _STDERR_CHUNK_LIMIT = 65536
 _STREAM_READ_CHUNK_SIZE = 65536
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
 # Symlinks (not copies) so credential refreshes in the real home propagate
-# to running sessions without any action from Omnigent.
-_CODEX_HOME_SYMLINK_FILES = ("auth.json",)
+# to running sessions without any action from Omnigent. ``.credentials.json``
+# is codex's OAuth store for remote (``url =``) MCP servers; without it a
+# private home starts those servers unauthenticated while stdio ones work.
+# ``memories_1.sqlite`` is Codex's memories database; without it a private
+# home starts with no memories and past-conversation context is lost. The ``_1``
+# suffix is Codex's schema version — update if Codex migrates to a newer schema.
+_CODEX_HOME_SYMLINK_FILES = ("auth.json", ".credentials.json", "memories_1.sqlite")
 _CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md", "hooks.json")
 # Name of the hooks file inside a CODEX_HOME. Symlinked from the user's home
 # by default; generated as a merged regular file when subagent routing is on.
@@ -143,7 +154,16 @@ _CODEX_HOME_COPY_FILES = ("config.toml",)
 # otherwise re-materialize tens of MB into every private home. Sharing the
 # one real cache dedupes it across sessions; codex's own writes land in the
 # shared cache exactly as they would without the private home.
-_CODEX_HOME_SYMLINK_DIRS = (Path("plugins") / "cache",)
+_CODEX_HOME_SYMLINK_DIRS = (
+    Path("plugins") / "cache",
+    # Cross-process lock guarding ``.credentials.json``; shared so a token
+    # refresh in one session cannot race another into a stale refresh token.
+    Path("mcp-oauth-locks"),
+    # Memories directory and user-defined rules: symlinked so sessions see the
+    # same memories and rules as the real home without replicating them.
+    Path("memories"),
+    Path("rules"),
+)
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 
@@ -152,6 +172,62 @@ _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 # the codex CLI uses its subscription auth (``auth.json``) rather than a
 # developer API key that would charge separately.
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
+
+# The codex CLI logs a rejected gateway request to stderr as
+# ``unexpected status <code> <reason>: {...}, url: <url>`` and precedes it with
+# ``Reconnecting... N/5`` retry lines. These parse that shape so the head can
+# attribute the real gateway error to a turn that otherwise emits no events.
+_CODEX_STDERR_STATUS_RE = re.compile(
+    r"unexpected status (?P<code>\d{3})(?:\s+(?P<reason>[A-Za-z][A-Za-z ]*?))?\s*[:,]"
+)
+_CODEX_STDERR_URL_RE = re.compile(r"url:\s*(?P<url>\S+)")
+_CODEX_STDERR_RETRY_EXHAUSTED_RE = re.compile(
+    r"Reconnecting\.{0,3}\s*(?P<n>\d+)\s*/\s*(?P<total>\d+)"
+)
+# HTTP statuses that are not transient — a retry can never fix them, so the
+# head fails the turn fast instead of riding the full idle watchdog.
+_CODEX_STDERR_FATAL_STATUSES: frozenset[int] = frozenset({401, 403})
+
+
+class _CodexGatewayError:
+    """A parsed gateway rejection read off the codex CLI's stderr.
+
+    ``code`` is the HTTP status; ``fatal`` marks an auth-class status that a
+    retry cannot fix (the turn should fail fast rather than stall).
+    """
+
+    __slots__ = ("code", "fatal", "reason", "url")
+
+    def __init__(self, code: int, reason: str | None, url: str | None) -> None:
+        self.code = code
+        self.reason = reason
+        self.url = url
+        self.fatal = code in _CODEX_STDERR_FATAL_STATUSES
+
+    def detail(self, *, model: str | None = None) -> str:
+        """A concise, actionable one-line cause for the turn-failure message."""
+        reason = f" {self.reason}" if self.reason else ""
+        target = f" for {model}" if model else ""
+        where = f" at {self.url}" if self.url else ""
+        hint = " (auth likely expired/misconfigured)" if self.fatal else ""
+        return f"gateway returned {self.code}{reason}{target}{where}{hint}"
+
+
+def _parse_codex_gateway_error(line: str) -> _CodexGatewayError | None:
+    """Return a parsed gateway rejection from a codex stderr *line*, else None.
+
+    Only lines carrying an ``unexpected status <code>`` shape are classified;
+    ordinary stderr (including the ``Reconnecting`` retry lines) returns None.
+    """
+    match = _CODEX_STDERR_STATUS_RE.search(line)
+    if match is None:
+        return None
+    code = int(match.group("code"))
+    raw_reason = match.group("reason")
+    reason = raw_reason.strip() if raw_reason else None
+    url_match = _CODEX_STDERR_URL_RE.search(line)
+    url = url_match.group("url").rstrip(",") if url_match else None
+    return _CodexGatewayError(code, reason, url)
 
 
 def _extract_codex_last_turn_usage(params: object, model: str | None) -> dict[str, object] | None:
@@ -429,6 +505,15 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
             "PYTHONUTF8",
             "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
             "DATABRICKS_CODEX_TOKEN",  # env_key in ~/.codex/config.toml's DB provider
+            # Service-principal M2M credentials, so a Databricks-gateway
+            # ``auth.command`` can mint an OAuth token from the SP on each
+            # refresh. Only DATABRICKS_BEARER survived before, forcing a
+            # pre-minted (expiring) token or an inlined secret; these let the
+            # standard client-credentials mint work on a non-interactive host.
+            # DATABRICKS_CONFIG_PROFILE / DATABRICKS_TOKEN are deliberately NOT
+            # here (they stay host secrets, gated behind env_passthrough).
+            "DATABRICKS_CLIENT_ID",
+            "DATABRICKS_CLIENT_SECRET",
             *_CODEX_OMNIGENT_LAUNCH_ENV_VARS,
         ),
         deny_exact=_CODEX_ENV_DENY_EXACT,
@@ -728,6 +813,8 @@ def _populate_codex_home_config(
 
     - ``auth.json`` is **symlinked** so OAuth token refreshes written to
       the real home propagate to running sessions without delay.
+    - ``memories_1.sqlite`` is **symlinked** so sessions can read memories
+      generated by the background memory pipeline from prior conversations.
     - ``config.toml`` is **copied** so an in-TUI ``/model`` command writes
       only to the session's own private copy and never mutates the shared
       ``~/.codex/config.toml``. This keeps model selection and cost-policy
@@ -739,6 +826,8 @@ def _populate_codex_home_config(
       trust keys reference.
     - ``AGENTS.md``, ``AGENTS.override.md`` are **symlinked** so instructions
       are respected.
+    - ``memories/`` and ``rules/`` are **symlinked** so file-based memories
+      and user-defined rules are visible in each session.
 
     :param target_dir: The per-conversation temp ``CODEX_HOME``
         directory. Must already exist.
@@ -849,6 +938,8 @@ def _populate_codex_home_config(
 def materialize_codex_provider_config(
     codex_home: Path,
     config_overrides: Iterable[str],
+    *,
+    retry_policy: RetryPolicy | None = None,
 ) -> list[str]:
     """Move generated provider definitions into a private Codex config.
 
@@ -859,6 +950,8 @@ def materialize_codex_provider_config(
 
     :param codex_home: Private session ``CODEX_HOME`` directory.
     :param config_overrides: Pending Codex config override strings.
+    :param retry_policy: Omnigent retry policy to apply through Codex's native
+        provider settings. ``None`` uses :class:`RetryPolicy` defaults.
     :returns: Overrides safe to retain in subprocess arguments.
     """
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -872,9 +965,9 @@ def materialize_codex_provider_config(
             provider_overrides.append(override)
         else:
             argv_overrides.append(override)
-    if not provider_overrides:
-        if config_path.is_file() and not config_path.is_symlink():
-            os.chmod(config_path, 0o600)
+    if not provider_overrides and not config_path.is_file():
+        return argv_overrides
+    if not provider_overrides and config_path.is_symlink():
         return argv_overrides
 
     import tomlkit
@@ -882,6 +975,10 @@ def materialize_codex_provider_config(
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     document = tomlkit.parse(existing) if existing else tomlkit.document()
     providers = document.get("model_providers")
+    if providers is None and not provider_overrides:
+        if config_path.is_file() and not config_path.is_symlink():
+            os.chmod(config_path, 0o600)
+        return argv_overrides
     if providers is None:
         document["model_providers"] = tomlkit.table()
         providers = document["model_providers"]
@@ -895,6 +992,21 @@ def materialize_codex_provider_config(
             raise ValueError("Codex provider override must define model_providers")
         for provider_name, provider_config in generated.items():
             providers[provider_name] = provider_config
+
+    policy = retry_policy if retry_policy is not None else RetryPolicy()
+    for provider_name, provider_config in list(providers.items()):
+        if not isinstance(provider_config, MutableMapping):
+            continue
+        if isinstance(provider_config, tomlkit.items.InlineTable):
+            inline_provider = tomlkit.inline_table()
+            for key, value in provider_config.items():
+                inline_provider[key] = value
+            providers[provider_name] = inline_provider
+            provider_config = inline_provider
+        provider_config["request_max_retries"] = policy.max_retries
+        provider_config["stream_max_retries"] = policy.max_retries
+        if policy.timeout_per_request_s is not None:
+            provider_config["stream_idle_timeout_ms"] = int(policy.timeout_per_request_s * 1000)
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
     try:
@@ -1971,6 +2083,119 @@ def _result_text(result: CodexToolResult) -> str:
         return str(result)
 
 
+def _codex_builtin_tool_request(
+    item: CodexParams,
+    *,
+    completed: bool = False,
+) -> ToolCallRequest | None:
+    """Translate a structured Codex built-in item into an observed tool request.
+
+    Codex executes these tools itself, so the request is observational: the
+    adapter must display and persist it without dispatching it back to Codex.
+    ``completed`` distinguishes the live start from the durable lifecycle
+    update emitted alongside the result. Malformed items return ``None``.
+
+    :param item: Codex ``commandExecution`` or ``fileChange`` item.
+    :param completed: Whether Codex has completed the item.
+    :returns: A correlated observed request, or ``None`` for an invalid item.
+    """
+
+    call_id = item.get("id")
+    item_type = item.get("type")
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    if item_type == "commandExecution":
+        command = item.get("command")
+        if not isinstance(command, str) or not command:
+            return None
+        args: ToolArgs = {"command": command}
+        cwd = item.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            args["cwd"] = cwd
+        return ToolCallRequest(
+            name="shell",
+            args=args,
+            metadata={
+                "call_id": call_id,
+                "internally_executed": True,
+                "observed_call_completed": completed,
+            },
+        )
+    if item_type == "fileChange":
+        changes = item.get("changes")
+        if not isinstance(changes, list) or not changes:
+            return None
+        paths = [
+            change.get("path")
+            for change in changes
+            if isinstance(change, dict) and isinstance(change.get("path"), str)
+        ]
+        if not paths:
+            return None
+        return ToolCallRequest(
+            name="apply_patch",
+            # Match codex-native: retain every structured change, including
+            # diffs, so consumers can render more than the first changed path.
+            args={"changes": changes},
+            metadata={
+                "call_id": call_id,
+                "internally_executed": True,
+                "observed_call_completed": completed,
+            },
+        )
+    return None
+
+
+def _codex_builtin_tool_completion(item: CodexParams) -> ToolCallComplete | None:
+    """Translate a completed Codex built-in item into a correlated result.
+
+    :param item: Completed Codex ``commandExecution`` or ``fileChange`` item.
+    :returns: The observed result, or ``None`` for an invalid item.
+    """
+
+    request = _codex_builtin_tool_request(item, completed=True)
+    if request is None:
+        return None
+    status = ToolCallStatus.SUCCESS
+    error: str | None = None
+    result = ""
+    if item.get("type") == "commandExecution":
+        output = item.get("aggregatedOutput")
+        result = output if isinstance(output, str) else ""
+        exit_code = item.get("exitCode")
+        if isinstance(exit_code, int) and exit_code != 0:
+            status = ToolCallStatus.ERROR
+            error = f"Command exited with status {exit_code}."
+            suffix = f"[exit code: {exit_code}]"
+            result = f"{result}\n{suffix}" if result else suffix
+    else:
+        changes = item.get("changes")
+        assert isinstance(changes, list)
+        summaries: list[str] = []
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            path = change.get("path")
+            kind = change.get("kind")
+            kind_type = kind.get("type") if isinstance(kind, dict) else None
+            if isinstance(path, str):
+                label = kind_type if isinstance(kind_type, str) and kind_type else "change"
+                summaries.append(f"{label} {path}")
+        result = "\n".join(summaries)
+        if item.get("status") in {"failed", "declined"}:
+            status = ToolCallStatus.ERROR
+            error = f"File change ended with status {item['status']}."
+    duration = item.get("durationMs")
+    return ToolCallComplete(
+        name=request.name,
+        status=status,
+        result=result,
+        error=error,
+        duration_ms=float(duration) if isinstance(duration, (int, float)) else 0.0,
+        metadata=request.metadata,
+    )
+
+
 def _dynamic_tool_result_payload(result: CodexToolResult) -> CodexParams:
     classification = classify_tool_result(result)
     return {
@@ -2013,6 +2238,7 @@ class _CodexAppServerSession:
         env: dict[str, str],
         tool_executor: CodexToolExecutor | None,
         codex_config_overrides: list[str] | None = None,
+        retry_policy: RetryPolicy | None = None,
         disable_native_tools: bool = False,
         bundle_dir: Path | None = None,
         skills_filter: str | list[str] = "all",
@@ -2022,6 +2248,7 @@ class _CodexAppServerSession:
         self._env = env
         self._tool_executor = tool_executor
         self._codex_config_overrides = list(codex_config_overrides or [])
+        self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._disable_native_tools = disable_native_tools
         self._bundle_dir = bundle_dir
         self._skills_filter = skills_filter
@@ -2042,6 +2269,16 @@ class _CodexAppServerSession:
         # field (it is silently dropped), hence the separate settings update.
         self._applied_effort: str | None = None
         self._recent_stderr: list[str] = []
+        # Auth-class gateway rejection tracking, read off the CLI's stderr so a
+        # turn that emits no events fails fast with the real cause instead of
+        # stalling to the idle watchdog. ``_pending`` holds a parsed fatal
+        # (401/403) rejection; ``_saw_retries_exhausted`` records a final
+        # ``Reconnecting N/N``. Fast-fail arms (``_fatal_gateway_error``) only
+        # when BOTH are seen, so a blip the CLI recovers from can't kill a
+        # healthy turn. All three reset at turn start.
+        self._pending_fatal_gateway_error: _CodexGatewayError | None = None
+        self._saw_retries_exhausted = False
+        self._fatal_gateway_error: _CodexGatewayError | None = None
         self._recent_events: list[CodexMessage] = []
         self._process_cwd: Path | None = None
         # Private CODEX_HOME so the subprocess never writes to the user's ~/.codex/.
@@ -2051,6 +2288,9 @@ class _CodexAppServerSession:
         # on the next ``turn/completed`` so each TurnComplete carries the
         # usage for the turn that just finished.
         self._last_turn_usage: dict[str, object] | None = None
+        # Serialize concurrent writes to the subprocess stdin so that parallel
+        # tool-call responses don't interleave bytes on the pipe.
+        self._stdin_lock = asyncio.Lock()
 
     async def start(self) -> None:
         if self._started:
@@ -2118,6 +2358,7 @@ class _CodexAppServerSession:
         self._codex_config_overrides = materialize_codex_provider_config(
             self._codex_home_dir,
             self._codex_config_overrides,
+            retry_policy=self._retry_policy,
         )
         if router_bridge_dir is not None:
             write_codex_router_hooks_file(
@@ -2335,6 +2576,14 @@ class _CodexAppServerSession:
         await self.start()
         assert self._proc is not None
 
+        # Fresh turn: forget any prior turn's gateway-error signals and clear
+        # the shared watchdog slot so a resolved earlier failure can't be
+        # misattributed to this turn.
+        self._pending_fatal_gateway_error = None
+        self._saw_retries_exhausted = False
+        self._fatal_gateway_error = None
+        native_forwarder_health.note_post_success()
+
         is_new_thread = self.thread_id is None
         if is_new_thread:
             params: CodexParams = {
@@ -2450,7 +2699,10 @@ class _CodexAppServerSession:
                 break
 
         message_buffers: dict[str, str] = {}
+        last_reasoning_item_id: str | None = None
         pending_tool_results: dict[str, _PendingToolResult] = {}
+        observed_builtin_tool_ids: set[str] = set()
+        completed_builtin_tool_ids: set[str] = set()
         final_response = ""
         observed_turn_id: str | None = None
 
@@ -2498,14 +2750,30 @@ class _CodexAppServerSession:
             while True:
                 event_task = asyncio.ensure_future(self._events.get())
                 idle_seconds = 0.0
+                seconds_since_warn = 0.0
+                fatal_gateway_error: _CodexGatewayError | None = None
+                # Poll on the shorter of the two intervals so a fatal gateway
+                # error set mid-wait is acted on promptly; when a test shrinks
+                # the warn window below the poll interval, poll at the warn
+                # window so the warning cadence is preserved.
+                poll_interval = min(_TURN_EVENT_POLL_SECONDS, _TURN_EVENT_WARN_SECONDS)
                 try:
                     while True:
-                        done, _ = await asyncio.wait(
-                            {event_task}, timeout=_TURN_EVENT_WARN_SECONDS
-                        )
+                        done, _ = await asyncio.wait({event_task}, timeout=poll_interval)
                         if event_task in done:
                             break
-                        idle_seconds += _TURN_EVENT_WARN_SECONDS
+                        # The stderr loop sets this once the CLI has exhausted
+                        # its retries on an auth-class gateway rejection. Fail
+                        # fast with the real cause rather than stalling to the
+                        # idle watchdog on a turn that will never emit events.
+                        if self._fatal_gateway_error is not None:
+                            fatal_gateway_error = self._fatal_gateway_error
+                            break
+                        idle_seconds += poll_interval
+                        seconds_since_warn += poll_interval
+                        if seconds_since_warn < _TURN_EVENT_WARN_SECONDS:
+                            continue
+                        seconds_since_warn = 0.0
                         pending_tool_summaries = [
                             {
                                 "call_id": call_id,
@@ -2531,12 +2799,38 @@ class _CodexAppServerSession:
                     with suppress(BaseException):
                         await event_task
                     raise
+                if fatal_gateway_error is not None:
+                    event_task.cancel()
+                    with suppress(BaseException):
+                        await event_task
+                    try:
+                        await asyncio.wait_for(self.interrupt_turn(), timeout=0.5)
+                    except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
+                        logger.debug("Codex auth-failure turn interrupt failed: %s", exc)
+                    yield ExecutorError(
+                        message=fatal_gateway_error.detail(model=model), retryable=False
+                    )
+                    return
                 message = event_task.result()
 
                 self._record_event(message)
                 raw_method = message.get("method")
                 method: str | None = raw_method if isinstance(raw_method, str) else None
                 params = message.get("params", {})
+
+                if method == "item/started":
+                    if not _event_turn_matches(params):
+                        continue
+                    item = params.get("item", {})
+                    if not isinstance(item, dict):
+                        continue
+                    request = _codex_builtin_tool_request(item)
+                    if request is not None:
+                        call_id = request.metadata["call_id"]
+                        if isinstance(call_id, str) and call_id not in observed_builtin_tool_ids:
+                            observed_builtin_tool_ids.add(call_id)
+                            yield request
+                    continue
 
                 if method == "item/tool/call":
                     if not _event_turn_matches(params):
@@ -2615,6 +2909,18 @@ class _CodexAppServerSession:
                     raw_reasoning_delta = params.get("delta")
                     if not isinstance(raw_reasoning_delta, str) or not raw_reasoning_delta:
                         continue
+                    # Each reasoning paragraph streams as its own item, so a
+                    # new itemId marks a paragraph boundary. Surface it as a
+                    # reasoning_started marker: downstream reducers flush the
+                    # prior paragraph's held tail and insert a separator.
+                    raw_reasoning_item_id = params.get("itemId")
+                    if isinstance(raw_reasoning_item_id, str) and raw_reasoning_item_id:
+                        if (
+                            last_reasoning_item_id is not None
+                            and raw_reasoning_item_id != last_reasoning_item_id
+                        ):
+                            yield ReasoningChunk(delta="", event_type="reasoning_started")
+                        last_reasoning_item_id = raw_reasoning_item_id
                     yield ReasoningChunk(delta=raw_reasoning_delta, event_type="reasoning_text")
                     continue
 
@@ -2628,6 +2934,21 @@ class _CodexAppServerSession:
                     item_type: str | None = (
                         raw_item_type if isinstance(raw_item_type, str) else None
                     )
+                    builtin_completion = _codex_builtin_tool_completion(item)
+                    if builtin_completion is not None:
+                        call_id = builtin_completion.metadata["call_id"]
+                        if not isinstance(call_id, str) or call_id in completed_builtin_tool_ids:
+                            continue
+                        completed_builtin_tool_ids.add(call_id)
+                        # The start remains a live in-progress observation. Re-emit
+                        # its completed form here because the relay deliberately
+                        # persists only completed function calls.
+                        request = _codex_builtin_tool_request(item, completed=True)
+                        if request is not None:
+                            observed_builtin_tool_ids.add(call_id)
+                            yield request
+                        yield builtin_completion
+                        continue
                     if item_type == "agentMessage":
                         raw_completed_id = item.get("id")
                         if not isinstance(raw_completed_id, str):
@@ -2839,8 +3160,9 @@ class _CodexAppServerSession:
 
     async def _send_message(self, payload: CodexMessage) -> None:
         assert self._proc is not None and self._proc.stdin is not None
-        self._proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
-        await self._proc.stdin.drain()
+        async with self._stdin_lock:
+            self._proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
+            await self._proc.stdin.drain()
 
     @staticmethod
     async def _iter_stream_chunks(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:
@@ -2901,8 +3223,30 @@ class _CodexAppServerSession:
                 if len(self._recent_stderr) > 20:
                     self._recent_stderr.pop(0)
                 logger.debug("codex app-server stderr: %s", text)
+                self._note_stderr_gateway_error(text)
         except asyncio.CancelledError:
             raise
+
+    def _note_stderr_gateway_error(self, text: str) -> None:
+        """Attribute (and, when fatal, arm fast-fail for) a gateway rejection.
+
+        The gateway cause is recorded into the shared watchdog slot the moment
+        it is seen, so a stalled turn surfaces the real error. An auth-class
+        (401/403) rejection arms fast-fail only once the CLI has also exhausted
+        its own retry budget (a final ``Reconnecting N/N``); the two signals can
+        arrive in either order, so both are tracked and fast-fail arms when both
+        hold — a single blip the CLI recovers from never kills a healthy turn.
+        """
+        retry = _CODEX_STDERR_RETRY_EXHAUSTED_RE.search(text)
+        if retry is not None and retry.group("n") == retry.group("total"):
+            self._saw_retries_exhausted = True
+        error = _parse_codex_gateway_error(text)
+        if error is not None:
+            native_forwarder_health.record_transport_failure(error.detail())
+            if error.fatal:
+                self._pending_fatal_gateway_error = error
+        if self._pending_fatal_gateway_error is not None and self._saw_retries_exhausted:
+            self._fatal_gateway_error = self._pending_fatal_gateway_error
 
 
 @dataclass
@@ -2927,6 +3271,7 @@ class _AppSessionFactory(Protocol):
         env: dict[str, str],
         tool_executor: CodexToolExecutor | None,
         codex_config_overrides: list[str] | None,
+        retry_policy: RetryPolicy,
         disable_native_tools: bool,
         bundle_dir: Path | None,
         skills_filter: str | list[str],
@@ -2940,6 +3285,7 @@ def _default_app_session_factory(
     env: dict[str, str],
     tool_executor: CodexToolExecutor | None,
     codex_config_overrides: list[str] | None,
+    retry_policy: RetryPolicy,
     disable_native_tools: bool,
     bundle_dir: Path | None,
     skills_filter: str | list[str],
@@ -2950,6 +3296,7 @@ def _default_app_session_factory(
         env=env,
         tool_executor=tool_executor,
         codex_config_overrides=codex_config_overrides,
+        retry_policy=retry_policy,
         disable_native_tools=disable_native_tools,
         bundle_dir=bundle_dir,
         skills_filter=skills_filter,
@@ -3270,6 +3617,7 @@ class CodexExecutor(Executor):
             env=self._env,
             tool_executor=self._tool_executor,
             codex_config_overrides=self._codex_config_overrides,
+            retry_policy=self._retry_policy,
             disable_native_tools=self._disable_native_tools,
             bundle_dir=self._bundle_dir,
             skills_filter=self._skills_filter,

@@ -20,6 +20,7 @@ Tool categories:
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import json
 import logging
@@ -46,10 +47,7 @@ if TYPE_CHECKING:
 
 import httpx
 
-from omnigent._wrapper_labels import (
-    CLAUDE_NATIVE_WRAPPER_VALUE,
-    CODEX_NATIVE_WRAPPER_VALUE,
-)
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.model_override import (
     harness_supports_model_override,
@@ -74,6 +72,7 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelTaskTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.download_file import DownloadFileTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.os_env import (
@@ -91,6 +90,8 @@ from omnigent.tools.builtins.spawn import (
     _ACTIVITY_MAX_CHARS,
     _CLOSED_TITLE_INFIX,
     _HISTORY_DEFAULT_TAIL,
+    _bound_history_content_chars,
+    _clamp_history_content_chars,
     _clamp_tail_items,
 )
 from omnigent.tools.builtins.sys_terminal import (
@@ -296,6 +297,12 @@ _SESSION_QUERY_TOOLS = frozenset(
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
 
+# The title bound the rename tool advertises to the LLM — read once from the
+# tool schema so the dispatcher can never drift from the published contract.
+_SESSION_RENAME_TITLE_MAX_CHARS: int = SysSessionRenameTool().get_schema()["function"][
+    "parameters"
+]["properties"]["title"]["maxLength"]
+
 # Grantee sentinel for an anonymous, public read-only share. Mirrors the
 # server's RESERVED_USER_PUBLIC; only specs with
 # ``agent_session_sharing: public`` may grant it (enforced in
@@ -317,12 +324,11 @@ _SHARE_PUBLIC_POLICY = "public"
 _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 
 # Priority 5f.1b: web_search — the first-party search builtin. Runner-local
-# so a non-OpenAI model's web_search function call resolves to the spec's
-# configured backend (google / perplexity / nimble) via WebSearchTool.invoke.
-# (OpenAI models use the native web_search_preview passthrough and never reach
-# this path.) Without this entry the call fell through to the spec-callable
-# branch and errored "tool unavailable" — the gap behind the non-OpenAI
-# web_search known-failure.
+# so non-OpenAI-harness web_search calls resolve to the spec's configured
+# backend (google / perplexity / nimble) via WebSearchTool.invoke.
+# (OpenAI Responses-compatible harnesses use the native web_search_preview
+# passthrough and never reach this path.) Without this entry the call fell
+# through to the spec-callable branch and errored "tool unavailable".
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 
 # nimble_research — Nimble Agent API v2 research runs (start → poll → result).
@@ -408,15 +414,7 @@ _SCHEDULED_TASK_TOOLS = frozenset(
 # result back. Execution lives HERE (not in Tool.invoke) because the browser
 # protocol needs the runner's ``server_client`` and ``ToolContext`` carries
 # none. See omnigent/tools/builtins/browser.py for the schema-only classes.
-_BROWSER_TOOLS = frozenset(
-    {
-        "browser_navigate",
-        "browser_snapshot",
-        "browser_click",
-        "browser_type",
-        "browser_screenshot",
-    }
-)
+_BROWSER_TOOLS = BROWSER_TOOL_NAMES
 
 # Runner-side outer HTTP read timeout for a browser action POST. The read
 # budget (60s) MUST exceed the server-side browser-action await (30s) so the
@@ -464,14 +462,44 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
     # and see ONLY this relay surface — without this union member the
-    # feature is dead for its real target. The relay still filters
-    # ``ToolManager(spec).get_tool_schemas()``, so browser schemas appear
-    # only when the spec declares the builtins (see builtins/__init__.py).
+    # feature is dead for its real target. ToolManager auto-registers these
+    # framework-owned schemas for every spec, so the native relay surface is
+    # session-static and always includes them.
     | _BROWSER_TOOLS
     # Memory builtins are relayed to native harnesses too — unlike web_search,
     # native harnesses have no built-in long-term memory of their own.
     | _HINDSIGHT_TOOLS
+    # Skills ride the relay for the same reason memory does: ``load_skill`` is
+    # what discovers host-scope skills (``.agents/skills`` and friends), and a
+    # native session's only tool surface is this relay.
+    | _SKILL_TOOLS
 )
+
+
+def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
+    """Drop the ``browser_*`` tool schemas from a tool-schema list.
+
+    Used for request-driven harnesses when the turn's dispatch says no
+    renderer is subscribed to the session stream. Native harnesses use a
+    session-scoped relay surface instead of the per-turn schema list, so they
+    retain the browser tools and rely on the server's prompt failure path.
+    Handles both the nested OpenAI shape
+    (``{"function": {"name": ...}}``) and the flat relay shape
+    (``{"name": ...}``).
+
+    :param schemas: Tool schemas in either supported shape.
+    :returns: The same list minus any ``browser_*`` entries.
+    """
+    kept: list[_JsonObject] = []
+    for schema in schemas:
+        name: object = schema.get("name")
+        if not isinstance(name, str):
+            function = _string_object_dict(schema.get("function"))
+            name = function.get("name") if function is not None else None
+        if isinstance(name, str) and name in _BROWSER_TOOLS:
+            continue
+        kept.append(schema)
+    return kept
 
 
 def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
@@ -593,7 +621,10 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         finally:
             _os_env.close()
     except Exception:  # noqa: BLE001 — OS env setup is best-effort for schema only
-        _logger.debug("Could not create OSEnvironment for native relay OS tool schemas")
+        _logger.debug(
+            "Could not create OSEnvironment for native relay OS tool schemas",
+            extra={"session_id": runner_primary_session_id()},
+        )
 
     return schemas
 
@@ -604,9 +635,239 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
 # sys_os_write, e.g. following the ``build-omnigent`` skill).
 _AGENT_CONFIG_SUBDIR = ".omnigent/agent-configs"
 
-# Broad page size for the sys_agent_list fan-out reads. Orchestrators want
-# the full launchable surface in one call, not a 20-row default page.
+# Broad internal page size for discovery fan-out reads.
 _AGENT_LIST_PAGE_LIMIT = 1000
+
+_DISCOVERY_LIST_MAX_LIMIT = 100
+# Match the existing default ceiling for ``sys_os_shell`` output. Discovery
+# tools stay below the same Omnigent-owned budget instead of guessing a
+# harness-specific limit.
+_DISCOVERY_LIST_OUTPUT_MAX_CHARS = 100_000
+_DISCOVERY_CURSOR_MAX_CHARS = 40_000
+_DISCOVERY_START = "start"
+_DISCOVERY_AT = "at"
+_DISCOVERY_END = "end"
+_DiscoveryState = tuple[str, str | None]
+
+
+def _discovery_list_window(
+    args: _JsonObject,
+    tool_name: str,
+    page_sections: tuple[str, ...],
+    filters: _JsonObject,
+) -> tuple[int | None, dict[str, _DiscoveryState], bool] | str:
+    """Validate discovery pagination and decode its opaque continuation cursor."""
+    limit = args.get("limit")
+    if "limit" in args and (
+        not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or not 1 <= limit <= _DISCOVERY_LIST_MAX_LIMIT
+    ):
+        return json.dumps(
+            {
+                "error": (
+                    f"{tool_name}: 'limit' must be an integer between 1 and "
+                    f"{_DISCOVERY_LIST_MAX_LIMIT}"
+                )
+            }
+        )
+    cursor = args.get("cursor")
+    state: dict[str, _DiscoveryState] = dict.fromkeys(page_sections, (_DISCOVERY_START, None))
+    if cursor is None:
+        return cast(int | None, limit), state, False
+    if not isinstance(cursor, str) or not cursor:
+        return json.dumps({"error": f"{tool_name}: 'cursor' must be a non-empty string"})
+    if len(cursor) > _DISCOVERY_CURSOR_MAX_CHARS:
+        return json.dumps({"error": f"{tool_name}: pagination cursor is too long"})
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        raw = base64.b64decode(cursor + padding, altchars=b"-_", validate=True)
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    if not isinstance(payload, dict) or set(payload) != {"v", "tool", "filters", "sections"}:
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    if payload.get("v") != 1:
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    if payload.get("tool") != tool_name:
+        return json.dumps({"error": f"{tool_name}: cursor was minted by a different tool"})
+    if payload.get("filters") != filters:
+        return json.dumps({"error": f"{tool_name}: cursor uses different filter arguments"})
+    sections = payload.get("sections")
+    if not isinstance(sections, dict) or set(sections) != set(page_sections):
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    for name in state:
+        value = sections.get(name)
+        if not isinstance(value, list) or len(value) != 2:
+            return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        tag, position = value
+        if tag in {_DISCOVERY_START, _DISCOVERY_END}:
+            if position is not None:
+                return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        elif tag == _DISCOVERY_AT:
+            if not isinstance(position, str) or not position:
+                return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        else:
+            return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        state[name] = (tag, cast(str | None, position))
+    return cast(int | None, limit), state, True
+
+
+def _encode_discovery_cursor(
+    tool_name: str,
+    filters: _JsonObject,
+    state: dict[str, _DiscoveryState],
+) -> str | None:
+    """Serialize a discovery continuation cursor without exposing its shape."""
+    payload = json.dumps(
+        {
+            "v": 1,
+            "tool": tool_name,
+            "filters": filters,
+            "sections": {name: list(value) for name, value in state.items()},
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    cursor = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return cursor if len(cursor) <= _DISCOVERY_CURSOR_MAX_CHARS else None
+
+
+@dataclass(frozen=True)
+class _DiscoveryPage:
+    """Rows and continuation state from one discovery source."""
+
+    rows: list[_JsonObject]
+    has_more: bool
+    next_after: str | None = None
+    failed: bool = False
+
+
+def _parse_discovery_page(body: object) -> _DiscoveryPage:
+    """Validate the server envelope before trusting its continuation state."""
+    if not isinstance(body, dict):
+        return _DiscoveryPage([], False, failed=True)
+    data = body.get("data")
+    if not isinstance(data, list):
+        return _DiscoveryPage([], False, failed=True)
+    rows: list[_JsonObject] = []
+    for row in data:
+        if not isinstance(row, dict):
+            return _DiscoveryPage([], False, failed=True)
+        row_id = row.get("id")
+        if not isinstance(row_id, str) or not row_id:
+            return _DiscoveryPage([], False, failed=True)
+        rows.append(row)
+    has_more = body.get("has_more", False)
+    last_id = body.get("last_id")
+    if not isinstance(has_more, bool):
+        return _DiscoveryPage([], False, failed=True)
+    if last_id is not None and (not isinstance(last_id, str) or not last_id):
+        return _DiscoveryPage([], False, failed=True)
+    if has_more and last_id is None:
+        return _DiscoveryPage([], False, failed=True)
+    return _DiscoveryPage(rows, has_more, cast(str | None, last_id))
+
+
+def _bounded_discovery_result(
+    sections: dict[str, list[_JsonObject]],
+    *,
+    limit: int | None,
+    cursor_state: dict[str, _DiscoveryState],
+    continued: bool,
+    source_pages: dict[str, _DiscoveryPage],
+    page_sections: tuple[str, ...] | None = None,
+    tool_name: str,
+    filters: _JsonObject,
+) -> str:
+    """Keep a small legacy result intact, otherwise return a fitting page."""
+    complete = json.dumps(sections)
+    if (
+        limit is None
+        and not continued
+        and not any(page.failed for page in source_pages.values())
+        and not any(page.has_more for page in source_pages.values())
+        and len(complete) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS
+    ):
+        return complete
+
+    requested_limit = limit or _DISCOVERY_LIST_MAX_LIMIT
+    paged = page_sections or tuple(sections)
+
+    def _candidate(candidate_limit: int) -> str | None:
+        page = dict(sections)
+        has_more: dict[str, bool] = {}
+        next_state = dict(cursor_state)
+        for name in paged:
+            rows = sections[name]
+            page_rows = rows[:candidate_limit]
+            page[name] = page_rows
+            source_page = source_pages[name]
+            if source_page.failed:
+                # A failed read proves neither progress nor exhaustion. Keep
+                # the incoming position so the continuation retries it.
+                has_more[name] = True
+                continue
+            has_more[name] = len(rows) > candidate_limit or source_page.has_more
+            if not has_more[name]:
+                next_state[name] = (_DISCOVERY_END, None)
+            elif page_rows:
+                if name == "local_configs":
+                    position = _optional_string(page_rows[-1].get("path"))
+                else:
+                    identifier = "agent_id" if name == "builtins" else "session_id"
+                    position = _optional_string(page_rows[-1].get(identifier))
+                if position is not None:
+                    next_state[name] = (_DISCOVERY_AT, position)
+            elif source_page.has_more and source_page.next_after is not None:
+                next_state[name] = (_DISCOVERY_AT, source_page.next_after)
+        metadata: dict[str, object] = {
+            "limit": candidate_limit,
+            "has_more": has_more,
+        }
+        if any(has_more.values()):
+            cursor = _encode_discovery_cursor(tool_name, filters, next_state)
+            if cursor is None:
+                return None
+            metadata["next_cursor"] = cursor
+        return json.dumps({**page, "page": metadata})
+
+    # Cursor size depends on the last returned row, so serialized page size is
+    # not monotonic in the row limit. Check the bounded public range directly.
+    for candidate_limit in range(requested_limit, 0, -1):
+        candidate = _candidate(candidate_limit)
+        if candidate is not None and len(candidate) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS:
+            return candidate
+
+    empty_page = _candidate(0)
+    if empty_page is None:
+        return json.dumps(
+            {
+                "error": (
+                    f"Discovery continuation exceeds the {_DISCOVERY_CURSOR_MAX_CHARS}-character "
+                    "cursor limit."
+                )
+            }
+        )
+    if len(empty_page) > _DISCOVERY_LIST_OUTPUT_MAX_CHARS:
+        kind = "fixed_section"
+        oversized_sections = [
+            name for name, rows in sections.items() if name not in paged and rows
+        ]
+    else:
+        kind = "paginated_row"
+        oversized_sections = [name for name in paged if sections[name]]
+    return json.dumps(
+        {
+            "error": (
+                f"Discovery result exceeds the {_DISCOVERY_LIST_OUTPUT_MAX_CHARS}-character "
+                "output limit even at the smallest page."
+            ),
+            "page": {"has_more": {name: source_pages[name].has_more for name in paged}},
+            "oversized": {"kind": kind, "sections": oversized_sections},
+        }
+    )
+
 
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
@@ -715,7 +976,11 @@ async def _execute_local_python_tool(
         )
         return await asyncio.to_thread(manager.call_tool, tool_name, args, ctx)
     except Exception as exc:
-        _logger.exception("runner local Python tool dispatch failed for %s", tool_name)
+        _logger.exception(
+            "runner local Python tool dispatch failed for %s",
+            tool_name,
+            extra={"session_id": conversation_id},
+        )
         return f"Error: {type(exc).__name__}: {exc}"
     finally:
         manager.shutdown()
@@ -1114,6 +1379,60 @@ async def _session_turn_actor(
     return actor if isinstance(actor, str) and actor else None
 
 
+async def _patch_subagent_label(
+    server_client: httpx.AsyncClient, child_session_id: str, key: str, value: str
+) -> str | None:
+    """
+    Write one runner-owned sub-agent label on a child session.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param child_session_id: Child session id, e.g. ``"conv_abc123"``.
+    :param key: Label key, e.g. ``"omnigent.subagent.dispatch_id"``.
+    :param value: Label value, e.g. ``"subagent_a1b2c3d4e5f6"``.
+    :returns: A short failure description, or ``None`` on success.
+    """
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{child_session_id}",
+            json={"labels": {key: value}},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        return f"{type(exc).__name__}: {exc}"
+    if resp.status_code >= 400:
+        return f"{resp.status_code} {resp.text[:200]}"
+    return None
+
+
+async def _record_subagent_receipt(
+    server_client: httpx.AsyncClient, child_session_id: str, work_id: str
+) -> None:
+    """
+    Mark a dispatch id as one that will never be delivered as a new result.
+
+    Written when the parent drains the turn's result, and when a continued
+    turn was stamped but its send failed. Best effort: a lost receipt costs
+    one duplicate delivery after a runner restart, whereas a lost result
+    would never reach the parent.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param child_session_id: Child session id, e.g. ``"conv_abc123"``.
+    :param work_id: Dispatch id, e.g. ``"subagent_a1b2c3d4e5f6"``.
+    :returns: None.
+    """
+    from omnigent.runner import app as _runner_app
+
+    error = await _patch_subagent_label(
+        server_client, child_session_id, _runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY, work_id
+    )
+    if error is not None:
+        _logger.warning(
+            "Failed to record sub-agent delivery receipt for child=%s: %s",
+            child_session_id,
+            error,
+        )
+
+
 async def _post_child_message_event(
     server_client: httpx.AsyncClient,
     session_id: str,
@@ -1183,6 +1502,127 @@ def _subagent_model_from_args(args: _JsonObject) -> str | None:
     return validate_model_override(raw_model)
 
 
+async def _inherited_parent_model(
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    sub_agent_name: str,
+    agent_spec: AgentSpec | None,
+    child_harness: str | None,
+) -> str | None:
+    """
+    Resolve the parent session's model for a dispatch that names none.
+
+    A user who selects a model for a session expects the whole session —
+    including the sub-agents it fans out to — to run on it; without
+    inheritance a dispatch that omits ``args.model`` silently lands on the
+    worker/provider default. Inheritance is best-effort and skips quietly
+    (unlike the explicit ``args.model`` path, which fails loud) because the
+    caller asked for nothing:
+
+    - a sub-agent spec that pins its own ``executor.model`` keeps it — the
+      worker's author chose that model deliberately;
+    - a child harness without model-override plumbing runs its default;
+    - a parent model outside the child harness's family (e.g. a Claude
+      selection dispatched to a codex worker) is not forced across vendors.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The parent session id.
+    :param sub_agent_name: Name of the sub-agent being dispatched.
+    :param agent_spec: Parent agent's spec.
+    :param child_harness: The child's resolved harness, e.g. ``"claude-sdk"``.
+    :returns: The parent's effective model to inherit, or ``None`` when
+        inheritance does not apply.
+    """
+    sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
+    spec_model = getattr(getattr(sub_spec, "executor", None), "model", None)
+    if isinstance(spec_model, str) and spec_model:
+        return None
+    if not harness_supports_model_override(child_harness):
+        return None
+    try:
+        resp = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=10.0)
+    except (httpx.HTTPError, RuntimeError):
+        return None
+    if resp.status_code != 200:
+        return None
+    snap = _string_object_dict(resp.json())
+    if snap is None:
+        return None
+    # Effective selection: an explicit per-session override wins over the
+    # spec/CLI-resolved model; both may be absent.
+    raw_model = snap.get("model_override") or snap.get("llm_model")
+    if not isinstance(raw_model, str) or not raw_model:
+        return None
+    try:
+        parent_model = validate_model_override(raw_model)
+    except ValueError:
+        return None
+    if child_harness is not None and model_family_mismatch(child_harness, parent_model):
+        _logger.debug(
+            "sys_session_send: not inheriting parent model %r for sub-agent %r "
+            "(family mismatch with harness %s); child runs its default",
+            parent_model,
+            sub_agent_name,
+            child_harness,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        return None
+    return parent_model
+
+
+def _subagent_reasoning_effort_from_args(args: _JsonObject) -> str | None:
+    """
+    Extract the optional ``reasoning_effort`` from
+    ``sys_session_send`` args.
+
+    :param args: Decoded tool arguments, e.g.
+        ``{"args": {"input": "fix the bug", "reasoning_effort": "high"}}``.
+    :returns: The requested effort, or ``None`` when absent.
+    :raises ValueError: If ``reasoning_effort`` is present but is not a
+        non-empty string.
+    """
+    raw_message = args.get("args")
+    if not isinstance(raw_message, dict):
+        return None
+    raw_effort = raw_message.get("reasoning_effort")
+    if raw_effort is None:
+        return None
+    if not isinstance(raw_effort, str) or not raw_effort:
+        raise ValueError("'reasoning_effort' must be a non-empty string when provided")
+    return raw_effort
+
+
+def _validate_subagent_reasoning_effort(effort: str, harness: str | None) -> str:
+    """
+    Validate *effort* against the child harness's declared effort family.
+
+    A harness whose family is ``NONE`` has no effort plumbing, and an
+    unrecognized one cannot be checked at all — the caller asked for this
+    explicitly, so reject rather than accept-and-drop. (Delivery of a
+    persisted effort takes the opposite tack and filters quietly; see the
+    reasoning guard in :mod:`omnigent.runner.app`.)
+
+    :param effort: Requested effort, e.g. ``"high"``.
+    :param harness: Resolved child harness, e.g. ``"claude-native"``.
+    :returns: The canonical effort that harness accepts.
+    :raises ValueError: If the harness supports no effort override, or
+        the value falls outside its vocabulary.
+    """
+    from omnigent.reasoning_effort import efforts_for_harness, validate_effort
+
+    canonical = canonicalize_harness(harness) if harness is not None else None
+    supported = efforts_for_harness(harness)
+    if not supported:
+        raise ValueError(
+            f"harness {canonical or harness or 'unknown'!r} does not support "
+            "a reasoning-effort override"
+        )
+    validated = validate_effort(effort, canonical or harness or "unknown", supported)
+    assert validated is not None
+    return validated
+
+
 def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
     """
     Extract the optional ``file_ids`` from ``sys_session_send`` args.
@@ -1227,17 +1667,23 @@ async def _teardown_failed_child(
     also reclaims any files copied into it before the failure — leaving an
     empty child behind would poison a retry with the same ``(agent, title)``
     (the next send would attach to the phantom instead of spawning clean)
-    and orphan the copied file rows. Used on both the copy/content failure
-    and the message-post failure paths so they tear down identically.
+    and orphan the copied file rows. A continued child keeps its session,
+    so its already-stamped dispatch id gets a delivery receipt instead;
+    otherwise a runner restart would replay the previous turn's result as
+    this turn's. Used on both the copy/content failure and the
+    message-post failure paths so they tear down identically.
 
     :returns: ``None`` when no server cleanup was needed or cleanup
         succeeded, otherwise a parent-visible warning string.
     """
     from omnigent.runner import app as _runner_app
 
+    entry = _runner_app.get_subagent_work(child_session_id)
     _runner_app.unregister_child_session(child_session_id)
     _runner_app.unregister_subagent_work(child_session_id)
     if not created_child:
+        if entry is not None:
+            await _record_subagent_receipt(server_client, child_session_id, entry.work_id)
         return None
 
     last_error = ""
@@ -1385,9 +1831,32 @@ def _find_subagent_spec(sub_agent_name: str, agent_spec: AgentSpec | None) -> Ag
     """
     if agent_spec is None:
         return None
-    for sub_agent in agent_spec.sub_agents:
-        if sub_agent.name == sub_agent_name:
+    # Defensive access: resolvers hand us legacy / test spec objects that are
+    # only structurally AgentSpec-shaped, and ``_has_subagent`` routes its
+    # existence check through here, so a stub without ``sub_agents`` must miss
+    # rather than raise.
+    for sub_agent in getattr(agent_spec, "sub_agents", None) or []:
+        if getattr(sub_agent, "name", None) == sub_agent_name:
             return sub_agent
+    # Built-in web_fetch researcher: ``WebFetchTool.__init__`` appends
+    # ``__web_researcher`` to the owner's live ``sub_agents`` in memory but
+    # never serializes it, so it is absent from the runner's re-parsed spec.
+    # Reconstruct it deterministically -- the same pure builder the
+    # child-boot resolver (``workflow.py::_find_spec_by_name``) uses -- so
+    # this lookup and the dispatch gate agree the sub-agent exists. Without
+    # it, ``_has_subagent`` returns True while ``_subagent_harness`` /
+    # ``_subagent_allowed_harnesses`` (both routed through here) return
+    # ``None``, i.e. the gate and the spec lookup disagree about the same
+    # name. Reconstruction is gated inside the helper on the tree actually
+    # declaring ``web_fetch``, so a caller-supplied name cannot coerce an
+    # arbitrary parent into a shell-capable researcher.
+    from omnigent.tools.builtins.web_fetch import (
+        RESEARCHER_NAME,
+        reconstruct_researcher_spec,
+    )
+
+    if sub_agent_name == RESEARCHER_NAME:
+        return reconstruct_researcher_spec(agent_spec)
     return None
 
 
@@ -1569,6 +2038,7 @@ def _normalize_subagent_model(
             sub_agent_name,
             harness,
             provider.kind,
+            extra={"session_id": runner_primary_session_id()},
         )
     return normalized
 
@@ -1592,6 +2062,28 @@ async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
 
     catalog = await asyncio.to_thread(catalog_for_spec, agent_spec)
     return json.dumps(catalog)
+
+
+def _subagent_launching_message(agent: str, title: object, task_id: str) -> str:
+    """
+    Tool-result text for a sub-agent dispatch whose turn is still running.
+
+    Pre-announces the wake notice on the tool-result channel so the model
+    recognises it as runtime-originated when it later arrives as a message.
+
+    :param agent: Sub-agent name, e.g. ``"researcher"``.
+    :param title: Child instance title supplied at dispatch.
+    :param task_id: The child session id, doubling as the task handle.
+    :returns: A one-line ``[System: ...]`` status string.
+    """
+    return (
+        f"[System: sub-agent {agent} title {title!r} launching as task "
+        f"{task_id}. Result will appear in your inbox; call sys_read_inbox to "
+        "check or sys_cancel_task to interrupt it. When it finishes, the "
+        "runtime posts a `[System: sub-agent ... finished ...]` wake notice "
+        "into this session; that notice comes from the runtime, not from a "
+        "person.]"
+    )
 
 
 async def _execute_subagent_tool(
@@ -1650,6 +2142,11 @@ async def _execute_subagent_tool(
         return f"Error: sys_session_send invalid 'model': {exc}"
 
     try:
+        reasoning_effort = _subagent_reasoning_effort_from_args(args)
+    except ValueError as exc:
+        return f"Error: sys_session_send invalid 'reasoning_effort': {exc}"
+
+    try:
         file_ids = _subagent_file_ids_from_args(args)
     except ValueError as exc:
         return f"Error: sys_session_send invalid 'file_ids': {exc}"
@@ -1694,6 +2191,12 @@ async def _execute_subagent_tool(
                 "Error: sys_session_send 'harness' applies only when a "
                 "sub-agent session is first created; it cannot change an "
                 "existing session. Re-send without 'harness' to continue "
+                f"session {target_session_id!r}."
+            )
+        if reasoning_effort is not None:
+            return (
+                "Error: sys_session_send 'reasoning_effort' applies only when a "
+                "sub-agent session is first created; it cannot change an existing "
                 f"session {target_session_id!r}."
             )
         if cost_budget is not None:
@@ -1772,6 +2275,7 @@ async def _execute_subagent_tool(
     assert not isinstance(existing, str)
     created_child = False
     child_wrapper_label: str | None = None
+    work_id = _runner_app.new_subagent_work_id()
     if existing is not None:
         child_session_id = existing.get("id")
         if not isinstance(child_session_id, str) or not child_session_id:
@@ -1795,6 +2299,14 @@ async def _execute_subagent_tool(
                 f"{child_session_id}. Re-send without 'file_ids' to "
                 "continue it, or sys_session_close it first to spawn a "
                 "fresh session with the requested files."
+            )
+        if reasoning_effort is not None:
+            return (
+                f"Error: sys_session_send 'reasoning_effort' applies only when a "
+                f"sub-agent session is first created; {sub_agent_name!r} title "
+                f"{session_name!r} already exists as {child_session_id}. Re-send "
+                "without 'reasoning_effort' to continue it, or "
+                "sys_session_close it first to spawn a fresh session."
             )
         if cost_budget is not None:
             return (
@@ -1826,6 +2338,7 @@ async def _execute_subagent_tool(
                 "after completion."
             )
     else:
+        _auto_ordinal = False
         if not session_name:
             # No title hint — auto-generate a structured session name
             # (e.g. "researcher-1"). Recover ordinals from existing
@@ -1852,6 +2365,7 @@ async def _execute_subagent_tool(
                 str(sub_agent_name),
             )
             session_name = f"{sub_agent_name}-{ordinal}"
+            _auto_ordinal = True
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
         # Apply an allowlisted per-dispatch harness override. The sub-agent
         # spec must explicitly opt in via executor.config.allowed_harnesses,
@@ -1925,6 +2439,7 @@ async def _execute_subagent_tool(
             "parent_session_id": conversation_id,
             "title": f"{sub_agent_name}:{session_name}",
             "sub_agent_name": sub_agent_name,
+            "labels": {_runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id},
         }
         if harness_override_canonical is not None:
             create_body["harness_override"] = harness_override_canonical
@@ -1954,9 +2469,115 @@ async def _execute_subagent_tool(
                 agent_spec=agent_spec,
                 harness=child_harness,
             )
-        resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
-        if resp.status_code >= 400:
-            return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
+        else:
+            # No explicit per-dispatch model: inherit the parent session's
+            # selection so the user's chosen model governs the whole session
+            # tree. Best-effort — skipped when the sub-agent spec pins its
+            # own model, the harness has no override plumbing, or the parent
+            # model's family cannot run on the child harness.
+            inherited = await _inherited_parent_model(
+                server_client=server_client,
+                conversation_id=conversation_id,
+                sub_agent_name=str(sub_agent_name),
+                agent_spec=agent_spec,
+                child_harness=child_harness,
+            )
+            if inherited is not None:
+                create_body["model_override"] = _normalize_subagent_model(
+                    inherited,
+                    sub_agent_name=str(sub_agent_name),
+                    agent_spec=agent_spec,
+                    harness=child_harness,
+                )
+        # A dispatch that names no effort inherits the sub-agent spec's
+        # ``executor.reasoning_effort``, so a worker's default is declared
+        # once in its config instead of depending on the orchestrator
+        # remembering to pass it on every dispatch.
+        effective_effort = reasoning_effort
+        effort_source = "sys_session_send"
+        if effective_effort is None:
+            sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
+            # ``getattr``: sub-specs also arrive as structural stubs that
+            # carry only the fields a caller needed.
+            spec_effort = getattr(getattr(sub_spec, "executor", None), "reasoning_effort", None)
+            if isinstance(spec_effort, str) and spec_effort:
+                effective_effort = spec_effort
+                effort_source = f"sub-agent {sub_agent_name!r} spec"
+        if effective_effort is not None:
+            try:
+                create_body["reasoning_effort"] = _validate_subagent_reasoning_effort(
+                    effective_effort,
+                    child_harness,
+                )
+            except ValueError as exc:
+                return f"Error: invalid 'reasoning_effort' from {effort_source}: {exc}"
+
+        # Best-effort retry for auto-ordinal name collisions: a 409 means
+        # another runner (or a restart race) already created a child with
+        # this ordinal. Bump and retry. Not watertight — the server's
+        # (parent, title) check is SELECT-then-INSERT with no DB unique
+        # constraint, so truly concurrent creates can still race past it.
+        _max_ordinal_retries = 5 if _auto_ordinal else 0
+        _create_timeout_exc: httpx.ReadTimeout | None = None
+        resp: httpx.Response | None = None
+        try:
+            for _ordinal_attempt in range(_max_ordinal_retries + 1):
+                resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
+                if (
+                    resp.status_code == 409
+                    and _auto_ordinal
+                    and _ordinal_attempt < _max_ordinal_retries
+                ):
+                    ordinal = _runner_app.next_subagent_ordinal(
+                        conversation_id,
+                        str(sub_agent_name),
+                    )
+                    session_name = f"{sub_agent_name}-{ordinal}"
+                    create_body["title"] = f"{sub_agent_name}:{session_name}"
+                    continue
+                break
+        except httpx.ReadTimeout as _exc:
+            _create_timeout_exc = _exc
+        if _create_timeout_exc is not None:
+            # The read deadline elapsed after the server may have committed the
+            # child session — child_session_id is unknown to us, but the
+            # (parent, agent, title) triple is. Reconcile: look up the created
+            # child by its expected title so we can reap its process cluster.
+            # Guard the entire reconcile path against further transport errors
+            # (the server may still be wedged) so any failure still returns
+            # the descriptive string instead of propagating.
+            _reap_warning: str = ""
+            try:
+                _leaked = await _find_existing_child_session(
+                    server_client=server_client,
+                    conversation_id=conversation_id,
+                    agent=str(sub_agent_name),
+                    title=str(session_name),
+                )
+                if isinstance(_leaked, dict):
+                    _leaked_id = _leaked.get("id") or _leaked.get("session_id")
+                    if isinstance(_leaked_id, str) and _leaked_id:
+                        _reap_warning = (
+                            await _teardown_failed_child(
+                                server_client,
+                                _leaked_id,
+                                created_child=True,
+                            )
+                            or ""
+                        )
+            except Exception:  # noqa: BLE001 — reconcile is best-effort; any transport error still returns the descriptive string
+                pass
+            _suffix = f" {_reap_warning}" if _reap_warning else ""
+            return (
+                f"Error: timed out waiting for child session create response "
+                f"({sub_agent_name!r} / {session_name!r}); the server may have "
+                f"committed the session — reaping any orphaned cluster.{_suffix} "
+                "Retry the same send to continue in a fresh child."
+            )
+        if resp is None or resp.status_code >= 400:
+            status = resp.status_code if resp is not None else 0
+            text = resp.text[:200] if resp is not None else "(no response)"
+            return f"Error: failed to create child session: {status} {text}"
         child_data = _string_object_dict(resp.json())
         if child_data is None:
             return "Error: server returned malformed child session data"
@@ -2033,6 +2654,15 @@ async def _execute_subagent_tool(
     # title/tool/session_name are known here (we set the title above), so
     # even a cold status update carries a display name. Cleaned up when
     # the child session ends.
+    if not created_child:
+        # A new child carries this turn's id in its create body; a continued
+        # child keeps its session, so the id is written first. A missing
+        # stamp would let the previous turn's receipt mask this turn's result.
+        stamp_error = await _patch_subagent_label(
+            server_client, child_session_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+        )
+        if stamp_error is not None:
+            return f"Error: failed to record sub-agent dispatch: {stamp_error}"
     _runner_app.register_child_session(
         child_session_id,
         parent_session_id=conversation_id,
@@ -2047,6 +2677,7 @@ async def _execute_subagent_tool(
         title=session_name,
         wrapper_label=child_wrapper_label,
         created_by=dispatch_created_by,
+        work_id=work_id,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -2125,12 +2756,7 @@ async def _execute_subagent_tool(
             "agent": sub_agent_name,
             "title": session_name,
             "status": "launching",
-            "message": (
-                f"[System: sub-agent {sub_agent_name} title {session_name!r} "
-                f"launching as task {child_session_id}. Result will appear in "
-                "your inbox; call sys_read_inbox to check or sys_cancel_task "
-                "to interrupt it.]"
-            ),
+            "message": _subagent_launching_message(sub_agent_name, session_name, child_session_id),
         }
     )
 
@@ -2157,6 +2783,12 @@ async def _send_to_existing_session(
     fan-out and work mappings, posts the message, and returns a
     ``running`` handle immediately — the completion lands in the parent's
     ``sys_read_inbox`` queue, matching named-mode send.
+
+    The child's ``(agent, title)`` identity, carried by the handle, the
+    launching tool result, and the completion wake notice, comes from
+    the ``"<agent>:<title>"`` title when it has one, and otherwise from
+    the snapshot's ``sub_agent_name`` / ``agent_name`` with the verbatim
+    title, so a ``sys_session_create`` child is named like a named one.
 
     :param target_session_id: The existing child session id, e.g.
         ``"conv_abc123"``.
@@ -2198,8 +2830,18 @@ async def _send_to_existing_session(
                 "message": "target sub-agent session is closed; create a new session to continue.",
             }
         )
-    parsed = _parse_session_title(snap_data.get("title"))
-    agent_label = parsed.agent or "agent"
+    display_title = title_without_closed_marker(_optional_string(snap_data.get("title")))
+    parsed = _parse_session_title(display_title)
+    # A sys_session_create child keeps its verbatim title and has no
+    # sub_agent_name, so when the title does not parse as "<agent>:<title>"
+    # the identity comes from the snapshot's agent fields instead.
+    agent_label = (
+        parsed.agent
+        or _optional_string(snap_data.get("sub_agent_name"))
+        or _optional_string(snap_data.get("agent_name"))
+        or "agent"
+    )
+    instance_title = parsed.title if parsed.title is not None else (display_title or "")
     existing_work = _runner_app.get_subagent_work(target_session_id)
     if existing_work is not None and existing_work.status in ("launching", "running", "waiting"):
         return (
@@ -2211,27 +2853,34 @@ async def _send_to_existing_session(
             f"Error: session {target_session_id!r} is already running; "
             "wait for completion before sending again"
         )
+    work_id = _runner_app.new_subagent_work_id()
+    stamp_error = await _patch_subagent_label(
+        server_client, target_session_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+    )
+    if stamp_error is not None:
+        return f"Error: failed to record sub-agent dispatch: {stamp_error}"
     _runner_app.register_child_session(
         target_session_id,
         parent_session_id=conversation_id,
-        title=snap_data.get("title") or "",
+        title=display_title or "",
         tool=agent_label,
-        session_name=parsed.title or "",
+        session_name=instance_title,
     )
     _runner_app.register_subagent_work(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
         agent=agent_label,
-        title=parsed.title or "",
+        title=instance_title,
         wrapper_label=_session_wrapper_label(snap_data),
         created_by=created_by,
+        work_id=work_id,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
-        title=snap_data.get("title") or "",
+        title=display_title or "",
         tool=agent_label,
-        session_name=parsed.title or "",
+        session_name=instance_title,
         publish_event=publish_event,
     )
 
@@ -2243,12 +2892,10 @@ async def _send_to_existing_session(
             created_by=created_by,
         )
     except httpx.HTTPError as exc:
-        _runner_app.unregister_child_session(target_session_id)
-        _runner_app.unregister_subagent_work(target_session_id)
+        await _teardown_failed_child(server_client, target_session_id, created_child=False)
         return f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
     if msg_resp.status_code >= 400:
-        _runner_app.unregister_child_session(target_session_id)
-        _runner_app.unregister_subagent_work(target_session_id)
+        await _teardown_failed_child(server_client, target_session_id, created_child=False)
         return (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )
@@ -2260,14 +2907,9 @@ async def _send_to_existing_session(
             "conversation_id": target_session_id,
             "kind": "sub_agent",
             "agent": agent_label,
-            "title": parsed.title,
+            "title": instance_title,
             "status": "launching",
-            "message": (
-                f"[System: sub-agent {agent_label} title {parsed.title!r} "
-                f"launching as task {target_session_id}. Result will appear in "
-                "your inbox; call sys_read_inbox to check or sys_cancel_task "
-                "to interrupt it.]"
-            ),
+            "message": _subagent_launching_message(agent_label, instance_title, target_session_id),
         }
     )
 
@@ -2278,15 +2920,23 @@ def _build_session_create_body(
     title: object,
     message: object,
     model: object = None,
+    reasoning_effort: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
     ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
     what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title``, ``message``, and
-    ``model`` are included when provided; the message becomes the child's
-    first queued user turn via ``initial_items``.
+    top-level or sibling session). A non-empty ``title``, ``message``,
+    ``model``, and ``reasoning_effort`` are included when provided; the
+    message becomes the child's first queued user turn via
+    ``initial_items``.
+
+    ``model`` and ``reasoning_effort`` are passed through unvalidated:
+    this path never resolves the child's harness (the agent is named by
+    id and resolved server-side), so neither can be checked against the
+    harness's capabilities here. The server validates both against their
+    vocabularies at create.
 
     :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
     :param conversation_id: The caller's session id — the forced parent.
@@ -2296,6 +2946,8 @@ def _build_session_create_body(
         non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
+    :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
+        written as ``reasoning_effort`` on the session.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
@@ -2306,6 +2958,8 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2445,6 +3099,18 @@ async def _execute_session_create(
             }
         )
     if has_config_path:
+        # The multipart create carries only the config bundle, so an effort
+        # passed here would never reach the child. Refuse instead of dropping it.
+        if args.get("reasoning_effort") is not None:
+            return json.dumps(
+                {
+                    "error": (
+                        "sys_session_create 'reasoning_effort' is supported only "
+                        "with 'agent_id'; the 'config_path' create cannot carry "
+                        "it. Set the effort in the config you upload instead."
+                    )
+                }
+            )
         return await _session_create_from_config_path(
             str(config_path),
             args,
@@ -2460,6 +3126,7 @@ async def _execute_session_create(
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
+        reasoning_effort=args.get("reasoning_effort"),
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -2827,16 +3494,13 @@ async def _execute_web_search_tool(
     runs its synchronous ``invoke`` off the event loop (the backend makes a
     blocking HTTP call).
 
-    ``llm_provider`` is inferred exactly as ``ToolManager._create_web_search``
-    does, so the dispatch path preserves the same invariants as session setup:
-
-    - **OpenAI models** keep the native ``web_search_preview`` passthrough; if a
-      ``web_search`` function call ever reached this path, ``invoke()`` raises
-      (its built-in fence) and the third-party backend is never run. In normal
-      operation OpenAI models never emit a ``web_search`` function call, so this
-      is defensive — but it keeps the promise rather than silently weakening it.
-    - **``databricks-*`` models** skip provider inference (they don't support
-      ``web_search_preview``) and run in function-tool mode.
+    ``llm_provider`` comes from the same helper session setup uses
+    (:func:`~omnigent.llms.routing.web_search_native_passthrough_provider`),
+    so dispatch preserves the session-setup invariants: on OpenAI
+    Responses-compatible harnesses the native ``web_search_preview``
+    passthrough is kept (``invoke()`` raises its fence if a function call
+    ever reaches this path — defensive, the provider executes server-side);
+    every other harness/model runs in function-tool mode.
 
     :param args: Parsed LLM arguments — ``query`` (required).
     :param agent_spec: Parent agent's spec; carries the web_search config + model.
@@ -2849,14 +3513,14 @@ async def _execute_web_search_tool(
     from omnigent.tools.builtins.web_search import WebSearchTool
 
     config = _web_search_config_from_spec(agent_spec)
-    # Mirror ToolManager._create_web_search's provider inference (same skip for
-    # databricks-*, same OpenAI passthrough fence) so dispatch honors session-setup invariants.
-    llm_provider: str | None = None
-    model = getattr(getattr(agent_spec, "executor", None), "model", None)
-    if model and not model.startswith("databricks-"):
-        from omnigent.llms.routing import parse_model_string
+    # Same helper as ToolManager._create_web_search, so dispatch and
+    # session-setup advertisement cannot drift.
+    from omnigent.llms.routing import web_search_native_passthrough_provider
 
-        llm_provider = parse_model_string(model).provider
+    executor = getattr(agent_spec, "executor", None)
+    llm_provider = web_search_native_passthrough_provider(
+        getattr(executor, "model", None), getattr(executor, "harness_kind", None)
+    )
     tool = WebSearchTool(config=config, llm_provider=llm_provider)
     ctx = ToolContext(
         task_id=task_id or "web_search",
@@ -3064,11 +3728,12 @@ def _has_subagent(
     """
     if agent_spec is None:
         return False
-    # AP-style spec: sub_agents list
-    sub_agents = getattr(agent_spec, "sub_agents", None) or []
-    for sa in sub_agents:
-        if getattr(sa, "name", None) == sub_agent_name:
-            return True
+    # AP-style spec: sub_agents list, including the synthesized
+    # ``__web_researcher``. Routed through the single resolver so the gate
+    # and every downstream harness / allowlist lookup agree about whether a
+    # name exists (see :func:`_find_subagent_spec`).
+    if _find_subagent_spec(sub_agent_name, agent_spec) is not None:
+        return True
     # Omnigent inner loader: tools dict with AgentTool entries
     tools = getattr(agent_spec, "tools", None)
     if isinstance(tools, dict) and sub_agent_name in tools:
@@ -3180,6 +3845,7 @@ async def _timer_loop(
                     timer_id,
                     conversation_id,
                     exc_info=True,
+                    extra={"session_id": conversation_id},
                 )
             if not repeat:
                 break
@@ -3483,6 +4149,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "timezone",
     "model_override",
     "reasoning_effort",
+    "permission_mode",
     "workspace",
     "host_id",
 )
@@ -3491,9 +4158,12 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "name",
     "prompt",
     "rrule",
+    "agent_id",
     "timezone",
     "model_override",
     "reasoning_effort",
+    "permission_mode",
+    "max_cost_usd",
     "workspace",
     "host_id",
     "state",
@@ -3611,19 +4281,24 @@ def _parse_session_title(raw_title: str | None) -> _ParsedTitle:
     return _ParsedTitle(agent=head, title=tail)
 
 
-def _truncate_activity(text: str | None) -> str | None:
+def _truncate_activity(
+    text: str | None,
+    *,
+    max_chars: int = _ACTIVITY_MAX_CHARS,
+) -> str | None:
     """
-    Truncate text to ``_ACTIVITY_MAX_CHARS`` to bound peek prompt size.
+    Truncate text to ``max_chars`` to bound peek prompt size.
 
     :param text: The text to truncate, or ``None``.
+    :param max_chars: Maximum characters retained before the marker.
     :returns: The (possibly truncated) text, or ``None`` when the input
         is ``None``.
     """
     if text is None:
         return None
-    if len(text) <= _ACTIVITY_MAX_CHARS:
+    if len(text) <= max_chars:
         return text
-    return text[:_ACTIVITY_MAX_CHARS] + " [truncated]"
+    return text[:max_chars] + " [truncated]"
 
 
 def _text_from_api_content(content: object) -> str:
@@ -3644,7 +4319,11 @@ def _text_from_api_content(content: object) -> str:
     return " ".join(parts)
 
 
-def _project_api_item(item: _JsonObject) -> _JsonObject:
+def _project_api_item(
+    item: _JsonObject,
+    *,
+    max_chars: int = _ACTIVITY_MAX_CHARS,
+) -> _JsonObject:
     """
     Project a REST API conversation item into the compact peek shape.
 
@@ -3655,6 +4334,7 @@ def _project_api_item(item: _JsonObject) -> _JsonObject:
     the same as the in-process tool's.
 
     :param item: One API item dict from the items endpoint.
+    :param max_chars: Maximum characters retained in each content field.
     :returns: A compact dict — ``{type, tool, args}`` for tool calls,
         ``{type, output}`` for tool results, ``{type, role, text}`` for
         messages.
@@ -3664,17 +4344,26 @@ def _project_api_item(item: _JsonObject) -> _JsonObject:
         return {
             "type": "function_call",
             "tool": _optional_string(item.get("name")),
-            "args": _truncate_activity(_optional_string(item.get("arguments"))),
+            "args": _truncate_activity(
+                _optional_string(item.get("arguments")),
+                max_chars=max_chars,
+            ),
         }
     if itype == "function_call_output":
         output = item.get("output")
         rendered = output if isinstance(output, str) else json.dumps(output)
-        return {"type": "function_call_output", "output": _truncate_activity(rendered)}
+        return {
+            "type": "function_call_output",
+            "output": _truncate_activity(rendered, max_chars=max_chars),
+        }
     if itype == "message":
         return {
             "type": "message",
             "role": _optional_string(item.get("role")),
-            "text": _truncate_activity(_text_from_api_content(item.get("content"))),
+            "text": _truncate_activity(
+                _text_from_api_content(item.get("content")),
+                max_chars=max_chars,
+            ),
         }
     return {"type": itype}
 
@@ -3698,8 +4387,8 @@ async def _execute_session_query_tool(
 
     - ``sys_session_list`` → ``GET /v1/sessions/{caller}/child_sessions``
     - ``sys_session_get_history`` → ``GET /v1/sessions/{target}/items``
-    - ``sys_session_get_info`` → ``GET /v1/sessions/{target}`` (plus a
-      best-effort ``GET /v1/runners/{id}/status`` for connectivity)
+    - ``sys_session_get_info`` → ``GET /v1/sessions/{target}`` (plus
+      best-effort runner connectivity and host readiness lookups)
     - ``sys_session_close`` → ``GET`` the target snapshot then ``PATCH
       /v1/sessions/{target}`` with a tombstoned title
     - ``sys_session_share`` → ``PUT /v1/sessions/{target}/permissions``
@@ -3738,7 +4427,24 @@ async def _execute_session_query_tool(
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
     if tool_name == "sys_session_list":
-        return await _session_list_via_rest(conversation_id, server_client, args.get("agent_name"))
+        agent_name = args.get("agent_name")
+        window = _discovery_list_window(
+            args,
+            tool_name,
+            ("sessions",),
+            {"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        )
+        if isinstance(window, str):
+            return window
+        limit, cursor_state, continued = window
+        return await _session_list_via_rest(
+            conversation_id,
+            server_client,
+            agent_name,
+            limit=limit,
+            cursor_state=cursor_state,
+            continued=continued,
+        )
     if tool_name == "sys_session_get_history":
         return await _session_get_history_via_rest(args, server_client)
     if tool_name == "sys_session_get_info":
@@ -3776,6 +4482,23 @@ async def _runner_online_or_none(
     return online if isinstance(online, bool) else None
 
 
+async def _host_harnesses_or_none(
+    host_id: str | None,
+    server_client: httpx.AsyncClient,
+) -> _JsonObject | None:
+    """Return the bound host's reported harness readiness, best-effort."""
+    if not host_id:
+        return None
+    try:
+        resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
+        if resp.status_code != 200:
+            return None
+        readiness = resp.json().get("configured_harnesses")
+    except Exception:  # noqa: BLE001
+        return None
+    return readiness if isinstance(readiness, dict) else None
+
+
 async def _session_get_info_via_rest(
     args: _JsonObject,
     conversation_id: str,
@@ -3787,13 +4510,15 @@ async def _session_get_info_via_rest(
     Resolves the target from ``args["session_id"]`` (falling back to the
     caller's own ``conversation_id`` when omitted), fetches the session
     snapshot, and projects the metadata fields — status, title, agent
-    binding, runner binding, host, reasoning effort, effective model,
+    binding, runner binding, host and its reported harness readiness,
+    reasoning effort, effective model,
     parent linkage, workspace / git branch, persisted last-activity time,
     and the outstanding approval prompts (the prompts themselves plus a
     count). Runner connectivity
     is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
-    the lookup fails or no runner is bound). The full transcript is
+    the lookup fails or no runner is bound); host readiness is likewise
+    best-effort via ``GET /v1/hosts/{id}``. The full transcript is
     intentionally omitted — that is what ``sys_session_get_history`` returns.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
@@ -3830,6 +4555,11 @@ async def _session_get_info_via_rest(
     pending = pending_value if isinstance(pending_value, list) else []
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
+    snap_host_id = _optional_string(snap.get("host_id"))
+    runner_online, configured_harnesses = await asyncio.gather(
+        _runner_online_or_none(snap_runner_id, server_client),
+        _host_harnesses_or_none(snap_host_id, server_client),
+    )
     return json.dumps(
         {
             "session_id": snap.get("id"),
@@ -3847,8 +4577,9 @@ async def _session_get_info_via_rest(
             # unchanged.
             "agent_name": public_agent_name(snap_agent_name),
             "runner_id": snap.get("runner_id"),
-            "runner_online": await _runner_online_or_none(snap_runner_id, server_client),
+            "runner_online": runner_online,
             "host_id": snap.get("host_id"),
+            "configured_harnesses": configured_harnesses,
             "parent_session_id": snap.get("parent_session_id"),
             "sub_agent_name": snap.get("sub_agent_name"),
             "reasoning_effort": snap.get("reasoning_effort"),
@@ -4051,11 +4782,23 @@ async def _execute_agent_tool(
     if server_client is None:
         return json.dumps({"error": f"{tool_name} requires server access"})
     if tool_name == "sys_agent_list":
+        window = _discovery_list_window(
+            args,
+            tool_name,
+            ("builtins", "session_agents", "local_configs"),
+            {},
+        )
+        if isinstance(window, str):
+            return window
+        limit, cursor_state, continued = window
         return await _agent_list_via_rest(
             server_client,
             agent_spec=agent_spec,
             conversation_id=conversation_id,
             runner_workspace=runner_workspace,
+            limit=limit,
+            cursor_state=cursor_state,
+            continued=continued,
         )
     session_id = args.get("session_id")
     if not isinstance(session_id, str) or not session_id:
@@ -4232,9 +4975,12 @@ async def _agent_download_via_rest(
 async def _agent_list_fetch(
     path: str,
     server_client: httpx.AsyncClient,
-) -> list[_JsonObject]:
+    *,
+    after: str | None,
+    limit: int,
+) -> _DiscoveryPage:
     """
-    Fetch one page of a paginated list endpoint, returning its ``data``.
+    Fetch one cursor page of a paginated list endpoint.
 
     Best-effort: returns ``[]`` on transport error or non-200 so a single
     failing source degrades ``sys_agent_list`` to "that section is empty"
@@ -4243,21 +4989,24 @@ async def _agent_list_fetch(
     :param path: The list endpoint path, e.g. ``"/v1/agents"`` or
         ``"/v1/sessions"``.
     :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: The ``data`` list from the paginated response (possibly
-        empty).
+    :param after: Server cursor from the previous page, if any.
+    :param limit: Maximum number of source rows to fetch.
+    :returns: Rows and server continuation metadata.
     """
     try:
-        resp = await server_client.get(
-            path,
-            params={"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"},
-            timeout=30.0,
-        )
+        params: dict[str, str | int] = {"limit": limit, "order": "desc"}
+        if after is not None:
+            params["after"] = after
+        resp = await server_client.get(path, params=params, timeout=30.0)
     except Exception:  # noqa: BLE001
-        return []
+        return _DiscoveryPage([], False, failed=True)
     if resp.status_code != 200:
-        return []
-    body = _string_object_dict(resp.json())
-    return _json_object_list(body.get("data")) if body is not None else []
+        return _DiscoveryPage([], False, failed=True)
+    try:
+        body = resp.json()
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return _DiscoveryPage([], False, failed=True)
+    return _parse_discovery_page(body)
 
 
 def _scan_local_agent_configs(configs_dir: Path) -> list[_JsonObject]:
@@ -4419,6 +5168,9 @@ async def _agent_list_via_rest(
     agent_spec: AgentSpec | None,
     conversation_id: str | None,
     runner_workspace: Path | None,
+    limit: int | None,
+    cursor_state: dict[str, _DiscoveryState],
+    continued: bool,
 ) -> str:
     """
     List launchable agents across built-ins, session-bound, and local.
@@ -4448,19 +5200,70 @@ async def _agent_list_via_rest(
         resolution of the local-config scan.
     :param conversation_id: The caller's session id, for os_env cwd.
     :param runner_workspace: The runner workspace, authoritative cwd.
-    :returns: JSON ``{builtins, session_agents, local_configs}``.
+    :param limit: Optional maximum rows returned from each source. When
+        omitted, the complete legacy result is preserved while it fits.
+    :param cursor_state: Opaque continuation positions for each source.
+    :returns: The legacy complete JSON result while it fits, otherwise a
+        bounded page with continuation metadata.
     """
-    builtins_raw = await _agent_list_fetch("/v1/agents", server_client)
-    sessions_raw = await _agent_list_fetch("/v1/sessions", server_client)
+    source_limit = limit or _AGENT_LIST_PAGE_LIMIT
+    builtins_page = (
+        _DiscoveryPage([], False)
+        if cursor_state["builtins"][0] == _DISCOVERY_END
+        else await _agent_list_fetch(
+            "/v1/agents",
+            server_client,
+            after=cursor_state["builtins"][1],
+            limit=source_limit,
+        )
+    )
+    sessions_page = (
+        _DiscoveryPage([], False)
+        if cursor_state["session_agents"][0] == _DISCOVERY_END
+        else await _agent_list_fetch(
+            "/v1/sessions",
+            server_client,
+            after=cursor_state["session_agents"][1],
+            limit=source_limit,
+        )
+    )
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
     assert spec.cwd is not None
     configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
     local_configs = await asyncio.to_thread(_scan_local_agent_configs, configs_dir)
-    listing = _project_agent_list(builtins_raw, sessions_raw, local_configs)
+    local_state, local_after = cursor_state["local_configs"]
+    if local_state == _DISCOVERY_END:
+        remaining_configs = []
+    elif local_after is not None:
+        remaining_configs = [
+            row for row in local_configs if str(row.get("path", "")) > local_after
+        ]
+    else:
+        remaining_configs = local_configs
+    listing = _project_agent_list(
+        builtins_page.rows,
+        sessions_page.rows,
+        remaining_configs[:source_limit],
+    )
     listing["builtins"] = _in_spawn_family(
         listing["builtins"], await _spawn_family(server_client, conversation_id)
     )
-    return json.dumps(listing)
+    return _bounded_discovery_result(
+        listing,
+        limit=limit,
+        cursor_state=cursor_state,
+        continued=continued,
+        tool_name="sys_agent_list",
+        filters={},
+        source_pages={
+            "builtins": builtins_page,
+            "session_agents": sessions_page,
+            "local_configs": _DiscoveryPage(
+                listing["local_configs"],
+                len(listing["local_configs"]) < len(remaining_configs),
+            ),
+        },
+    )
 
 
 def _project_agent_list(
@@ -4511,6 +5314,10 @@ async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     agent_name: object = None,
+    *,
+    limit: int | None,
+    cursor_state: dict[str, _DiscoveryState],
+    continued: bool,
 ) -> str:
     """
     Return the two-view session list: ``sub_agents`` + global ``sessions``.
@@ -4528,11 +5335,33 @@ async def _session_list_via_rest(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter for the global
         ``sessions`` view; ignored for ``sub_agents``.
-    :returns: JSON ``{"sub_agents": [...], "sessions": [...]}``.
+    :param limit: Optional maximum rows returned from the global sessions view. When
+        omitted, the complete legacy result is preserved while it fits.
+    :param cursor_state: Opaque continuation position for the global sessions view.
+    :returns: The legacy complete JSON result while it fits, otherwise a
+        bounded page with continuation metadata.
     """
     sub_agents = await _collect_sub_agents(conversation_id, server_client)
-    sessions = await _collect_global_sessions(server_client, agent_name)
-    return json.dumps({"sub_agents": sub_agents, "sessions": sessions})
+    sessions_page = (
+        _DiscoveryPage([], False)
+        if cursor_state["sessions"][0] == _DISCOVERY_END
+        else await _collect_global_sessions(
+            server_client,
+            agent_name,
+            after=cursor_state["sessions"][1],
+            limit=limit or _AGENT_LIST_PAGE_LIMIT,
+        )
+    )
+    return _bounded_discovery_result(
+        {"sub_agents": cast(list[_JsonObject], sub_agents), "sessions": sessions_page.rows},
+        limit=limit,
+        cursor_state=cursor_state,
+        continued=continued,
+        tool_name="sys_session_list",
+        filters={"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        source_pages={"sessions": sessions_page},
+        page_sections=("sessions",),
+    )
 
 
 async def _rename_current_session_via_rest(
@@ -4540,12 +5369,11 @@ async def _rename_current_session_via_rest(
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
 ) -> str:
-    """Conditionally rename the calling session through the server API.
+    """Rename the calling session through the server API.
 
-    Automatic naming is framework metadata, never a prerequisite for the
-    user's turn. Every failure therefore becomes a tool-result envelope so a
-    missing route, unavailable server, or malformed response cannot abort the
-    harness session.
+    Session naming is metadata, never a prerequisite for the user's turn.
+    Every failure therefore becomes a tool-result envelope so a missing route,
+    unavailable server, or malformed response cannot abort the harness session.
     """
     if server_client is None:
         return json.dumps({"error": "sys_session_rename requires server access"})
@@ -4554,10 +5382,60 @@ async def _rename_current_session_via_rest(
     title = args.get("title")
     if not isinstance(title, str):
         return json.dumps({"error": "sys_session_rename requires a string 'title'"})
+    # Enforce exactly the bounds the tool schema advertises to the LLM.
+    max_chars = _SESSION_RENAME_TITLE_MAX_CHARS
+    if len(title) < 2 or len(title) > max_chars:
+        return json.dumps({"error": f"sys_session_rename title must be 2-{max_chars} characters"})
+    if "\n" in title or "\r" in title:
+        return json.dumps({"error": "sys_session_rename title must be a single line"})
+    normalized_title = " ".join(title.split())
+    if len(normalized_title) < 2:
+        return json.dumps({"error": f"sys_session_rename title must be 2-{max_chars} characters"})
+    # Only a top-level session may rename itself: a sub-agent's title is its
+    # (parent, title) continuation address for sys_session_send, so a child
+    # rename would corrupt sibling addressing. Refuse explicitly, matching
+    # the old seed-gated endpoint's response for child sessions.
     try:
-        response = await server_client.post(
-            f"/v1/sessions/{conversation_id}/auto-title",
-            json={"title": title},
+        info_response = await server_client.get(
+            f"/v1/sessions/{conversation_id}",
+            # Skip the transcript and the runner/host liveness lookup — the
+            # probe only needs parent_session_id.
+            params={"include_items": "false", "include_liveness": "false"},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_rename failed: {exc}"})
+    if info_response.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"sys_session_rename returned {info_response.status_code}",
+                "detail": info_response.text[:200],
+            }
+        )
+    try:
+        info_payload = info_response.json()
+    except ValueError as exc:
+        return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
+    # Fail closed: only a payload that positively shows a parentless session
+    # may proceed — a malformed or version-skewed snapshot must not let a
+    # child rename slip through and corrupt its continuation address. Exactly
+    # None means top-level; a non-empty string means child; anything else
+    # (empty string, wrong type) is malformed and blocks the rename.
+    if not isinstance(info_payload, dict) or "parent_session_id" not in info_payload:
+        return json.dumps(
+            {"error": "sys_session_rename could not verify the session is top-level"}
+        )
+    parent_session_id = info_payload["parent_session_id"]
+    if parent_session_id is not None:
+        if isinstance(parent_session_id, str) and parent_session_id:
+            return json.dumps({"renamed": False, "title": None, "reason": "not_top_level"})
+        return json.dumps(
+            {"error": "sys_session_rename could not verify the session is top-level"}
+        )
+    try:
+        response = await server_client.patch(
+            f"/v1/sessions/{conversation_id}",
+            json={"title": normalized_title},
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -4575,7 +5453,10 @@ async def _rename_current_session_via_rest(
         return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
     if not isinstance(payload, dict):
         return json.dumps({"error": "sys_session_rename returned a non-object response"})
-    return json.dumps(payload)
+    updated_title = payload.get("title")
+    if not isinstance(updated_title, str):
+        return json.dumps({"error": "sys_session_rename response omitted the updated title"})
+    return json.dumps({"renamed": True, "title": updated_title, "reason": None})
 
 
 async def _collect_sub_agents(
@@ -4629,6 +5510,7 @@ async def _collect_sub_agents(
                 "sys_session_list sibling enrichment failed for parent %s",
                 parent_id,
                 exc_info=True,
+                extra={"session_id": conversation_id},
             )
     return result
 
@@ -4668,7 +5550,10 @@ async def _resolve_runner_online_map(
 async def _collect_global_sessions(
     server_client: httpx.AsyncClient,
     agent_name: object,
-) -> list[_JsonObject]:
+    *,
+    after: str | None,
+    limit: int,
+) -> _DiscoveryPage:
     """
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
 
@@ -4683,38 +5568,50 @@ async def _collect_global_sessions(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter; applied only when a
         non-empty string.
-    :returns: The projected global session entries.
+    :param after: Server cursor from the previous page, if any.
+    :param limit: Maximum number of source rows to fetch.
+    :returns: Projected global session entries and continuation metadata.
     """
-    params: dict[str, str | int] = {"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"}
+    params: dict[str, str | int] = {"limit": limit, "order": "desc"}
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
+    if after is not None:
+        params["after"] = after
     try:
         resp = await server_client.get("/v1/sessions", params=params, timeout=30.0)
     except Exception:  # noqa: BLE001
-        return []
+        return _DiscoveryPage([], False, failed=True)
     if resp.status_code != 200:
-        return []
-    body = _string_object_dict(resp.json())
-    if body is None:
-        return []
-    rows = _json_object_list(body.get("data"))
+        return _DiscoveryPage([], False, failed=True)
+    try:
+        body = resp.json()
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return _DiscoveryPage([], False, failed=True)
+    page = _parse_discovery_page(body)
+    if page.failed:
+        return page
+    rows = page.rows
     online = await _resolve_runner_online_map(rows, server_client)
-    return [
-        {
-            "session_id": r.get("id"),
-            # Hide the internal ``-native-ui`` wrapper name (e.g.
-            # ``pi-native-ui`` -> ``Pi``) in the global listing too, matching
-            # ``sys_session_get_info``. The server-side ``agent_name`` filter
-            # above still receives the caller's raw argument unchanged.
-            "agent_name": public_agent_name(_optional_string(r.get("agent_name"))),
-            "title": r.get("title"),
-            "status": r.get("status"),
-            "runner_id": r.get("runner_id"),
-            "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
-            "parent_session_id": r.get("parent_session_id"),
-        }
-        for r in rows
-    ]
+    return _DiscoveryPage(
+        [
+            {
+                "session_id": r.get("id"),
+                # Hide the internal ``-native-ui`` wrapper name (e.g.
+                # ``pi-native-ui`` -> ``Pi``) in the global listing too, matching
+                # ``sys_session_get_info``. The server-side ``agent_name`` filter
+                # above still receives the caller's raw argument unchanged.
+                "agent_name": public_agent_name(_optional_string(r.get("agent_name"))),
+                "title": r.get("title"),
+                "status": r.get("status"),
+                "runner_id": r.get("runner_id"),
+                "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
+                "parent_session_id": r.get("parent_session_id"),
+            }
+            for r in rows
+        ],
+        page.has_more,
+        page.next_after,
+    )
 
 
 def _child_rows_to_entries(
@@ -4787,7 +5684,7 @@ async def _session_get_history_via_rest(
     may read).
 
     :param args: Parsed tool arguments; requires ``conversation_id``,
-        optional ``tail_items``.
+        optional ``tail_items`` and ``content_max_chars``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON peek result, or a JSON error object.
     """
@@ -4799,6 +5696,15 @@ async def _session_get_history_via_rest(
     tail_items = _clamp_tail_items(args.get("tail_items", _HISTORY_DEFAULT_TAIL))
     if isinstance(tail_items, str):
         return tail_items
+    content_max_chars = _clamp_history_content_chars(
+        args.get("content_max_chars", _ACTIVITY_MAX_CHARS),
+    )
+    if isinstance(content_max_chars, str):
+        return content_max_chars
+    content_max_chars = _bound_history_content_chars(
+        tail_items=tail_items,
+        content_max_chars=content_max_chars,
+    )
     try:
         resp = await server_client.get(
             f"/v1/sessions/{target_id}/items",
@@ -4816,7 +5722,9 @@ async def _session_get_history_via_rest(
     data: list[_JsonObject] = resp.json().get("data", [])
     # ``order="desc"`` returns newest-first; reverse to chronological so
     # the LLM reads top-to-bottom (matches the in-process peek).
-    items: list[_JsonObject] = [_project_api_item(it) for it in reversed(data)]
+    items: list[_JsonObject] = [
+        _project_api_item(it, max_chars=content_max_chars) for it in reversed(data)
+    ]
     meta = await _fetch_peek_meta(target_id, server_client)
     # A parked elicitation never lands in the conversation store (it
     # lives only in the Omnigent server's pending-elicitations index, replayed
@@ -4974,6 +5882,10 @@ async def _session_close_via_rest(
             json={
                 "title": new_title,
                 "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                # archived=True triggers the server's _spawn_archive_stop reaper,
+                # which stops the child's harness / tmux / bridge cluster.
+                # Without this the child's OS-process cluster is never reaped.
+                "archived": True,
             },
             timeout=30.0,
         )
@@ -5151,7 +6063,7 @@ async def execute_tool(
                 args,
                 session_inbox=session_inbox,
                 session_async_tasks=session_async_tasks,
-                harness_client=harness_client or httpx.AsyncClient(),
+                harness_client=harness_client,
                 server_client=server_client,
                 terminal_registry=terminal_registry,
                 resource_registry=resource_registry,
@@ -5317,7 +6229,12 @@ async def execute_tool(
             output = await _execute_uc_function_tool(tool_name, args, agent_spec=agent_spec)
         else:
             output = await _execute_spec_callable_tool(tool_name, args, agent_spec=agent_spec)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
+        _logger.exception(
+            "tool %s failed",
+            tool_name,
+            extra={"session_id": conversation_id},
+        )
         output = f"Error: {type(exc).__name__}: {exc}"
 
     return output
@@ -5480,6 +6397,7 @@ async def dispatch_tool_locally(
             tool_name,
             call_id,
             exc,
+            extra={"session_id": conversation_id},
         )
 
     return output
@@ -5713,7 +6631,11 @@ async def _execute_os_env_tool(
         else:
             return f"Error: {tool_name} not implemented"
     except Exception as exc:
-        _logger.exception("runner OSEnvironment dispatch failed for %s", tool_name)
+        _logger.exception(
+            "runner OSEnvironment dispatch failed for %s",
+            tool_name,
+            extra={"session_id": conversation_id},
+        )
         return json.dumps({"error": str(exc)})
     finally:
         if os_env is not None:
@@ -6155,6 +7077,7 @@ async def _publish_terminal_created_event(
                 conversation_id,
                 terminal_name,
                 session_key,
+                extra={"session_id": conversation_id},
             )
             return
         resource = session_resource_view_to_dict(view)
@@ -6480,6 +7403,7 @@ async def _post_subagent_policy_verdict(
             "Sub-agent inbox TOOL_RESULT policy evaluation failed for parent=%s child=%s",
             conversation_id,
             _subagent_child_id(payload),
+            extra={"session_id": conversation_id},
         )
         return None
     if resp.status_code >= 400:
@@ -6489,6 +7413,7 @@ async def _post_subagent_policy_verdict(
             conversation_id,
             resp.status_code,
             resp.text,
+            extra={"session_id": conversation_id},
         )
         return None
     try:
@@ -6497,6 +7422,7 @@ async def _post_subagent_policy_verdict(
         _logger.warning(
             "Sub-agent inbox TOOL_RESULT policy evaluation returned non-JSON for parent=%s",
             conversation_id,
+            extra={"session_id": conversation_id},
         )
         return None
 
@@ -6527,6 +7453,7 @@ def _apply_subagent_policy_verdict(
             _logger.warning(
                 "Sub-agent inbox TOOL_RESULT policy data must be str; got %s",
                 type(transformed).__name__,
+                extra={"session_id": runner_primary_session_id()},
             )
         return _SubagentInboxEvaluation(
             {
@@ -6537,6 +7464,7 @@ def _apply_subagent_policy_verdict(
     _logger.warning(
         "Sub-agent inbox TOOL_RESULT policy evaluation returned unknown result=%r",
         result,
+        extra={"session_id": runner_primary_session_id()},
     )
     return _SubagentInboxEvaluation(
         _subagent_policy_failure_payload(payload),
@@ -6585,11 +7513,20 @@ async def _evaluate_subagent_inbox_output(
     return _apply_subagent_policy_verdict(payload, verdict)
 
 
-def _cleanup_drained_subagent_work(payload: _JsonObject) -> None:
+async def _cleanup_drained_subagent_work(
+    payload: _JsonObject, *, server_client: httpx.AsyncClient | None
+) -> None:
     """
     Remove terminal sub-agent work after its inbox item is drained.
 
+    Also writes the delivered-id receipt on the child session so a runner
+    restart does not re-queue this turn's result. The write is best effort:
+    a lost receipt costs one duplicate delivery after a restart, whereas a
+    lost result would never reach the parent.
+
     :param payload: Drained inbox payload.
+    :param server_client: HTTP client pointed at the Omnigent server, or
+        ``None`` when the drain runs without server access.
     :returns: None.
     """
     if payload.get("type") != "sub_agent":
@@ -6609,6 +7546,8 @@ def _cleanup_drained_subagent_work(payload: _JsonObject) -> None:
         work_id=work_id,
         remember_drained_delivery=True,
     )
+    if server_client is not None:
+        await _record_subagent_receipt(server_client, child_id, work_id)
 
 
 async def _drain_inbox(
@@ -6646,6 +7585,7 @@ async def _drain_inbox(
                     "malformed terminal-idle inbox item ignored: %s",
                     exc,
                     exc_info=True,
+                    extra={"session_id": conversation_id},
                 )
                 items.append(f"[System: malformed terminal_idle inbox item ignored — {exc}]")
             continue
@@ -6658,7 +7598,7 @@ async def _drain_inbox(
         if evaluation.retry_original:
             retry_payloads.append(payload)
         else:
-            _cleanup_drained_subagent_work(evaluation.payload)
+            await _cleanup_drained_subagent_work(evaluation.payload, server_client=server_client)
     for payload in retry_payloads:
         inbox.put_nowait(payload)
     return "\n\n".join(items) if items else "Inbox is empty — no completed tasks."
@@ -6714,12 +7654,14 @@ async def _evaluate_async_tool_call_policy(
             "async PHASE_TOOL_CALL policy evaluate returned %d for %s; denying",
             resp.status_code,
             evaluation_id,
+            extra={"session_id": conversation_id},
         )
     except Exception:  # noqa: BLE001
         _logger.warning(
             "async PHASE_TOOL_CALL policy evaluate failed for %s; denying",
             evaluation_id,
             exc_info=True,
+            extra={"session_id": conversation_id},
         )
     return False
 
@@ -6873,7 +7815,8 @@ def _spawn_async_tool(
                 }
             )
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
+            _logger.exception("async tool %s failed", target_tool)
             session_inbox.put_nowait(
                 {
                     "handle_id": handle_id,
@@ -6998,6 +7941,160 @@ async def _execute_task_lifecycle_tool(
     )
 
 
+def _cached_subagent_cancel_result(task_id: str, status: str) -> str:
+    """Return the cached terminal status for a sub-agent cancel."""
+    return json.dumps(
+        {
+            "cancelled": status == "cancelled",
+            "task_id": task_id,
+            "status": status,
+        }
+    )
+
+
+def _best_effort_cancel_result(task_id: str, status: str) -> str:
+    """Return an explicit unconfirmed cancel for harnesses without a hard-stop."""
+    return json.dumps(
+        {
+            "cancel_requested": True,
+            "cancel_confirmed": False,
+            "best_effort": True,
+            "task_id": task_id,
+            "status": status,
+            "message": (
+                "Interrupt forwarded, but no runner-side hard-stop is wired for "
+                "this harness; the child may keep running and no terminal inbox "
+                "status is guaranteed."
+            ),
+        }
+    )
+
+
+def _unconfirmed_hard_stop_result(task_id: str, *, status: str) -> str:
+    """Return an explicit failed-to-confirm hard-stop.
+
+    A ``stop_session`` 503 is a kill failure, not proof the pane is gone
+    (Claude already maps ``TmuxSessionNotAdvertised`` to 204; ``_uniform_stop``
+    503s any ``RuntimeError``, including a transient tmux error on a live
+    pane). Callers must not treat this as a cached terminal / ``absent``
+    result.
+    """
+    return json.dumps(
+        {
+            "cancelled": False,
+            "cancel_requested": True,
+            "cancel_confirmed": False,
+            "best_effort": True,
+            "task_id": task_id,
+            "status": status,
+            "message": (
+                "Hard-stop failed; the native worker may still be running. "
+                "Cleanup is not confirmed."
+            ),
+        }
+    )
+
+
+async def _native_child_pane_alive(task_id: str, wrapper_label: str | None) -> bool:
+    """Probe whether a failed native child's pane still answers.
+
+    ``failed`` does not say whether the harness process is still resident: a
+    required-terminal exit fails the entry after the process died, while a
+    harness-side failure can leave the pane alive. A failed entry earns a
+    hard-stop only when its registered pane is verifiably alive; a dead pane
+    is already gone, so the cached terminal failure is the truthful answer.
+    A later ``stop_session`` 503 is *not* used as a gone signal — that status
+    means the kill attempt failed (see :func:`_unconfirmed_hard_stop_result`).
+
+    The probe reads this runner's terminal registry, which sees the child's
+    pane only because sub-agent sessions run co-located on the parent's
+    runner. If that ever changes, this returns ``False`` and a live failed
+    child degrades to the cached status instead of a hard-stop.
+    """
+    from omnigent.runner.native.interrupt import native_agent_for_cancel
+    from omnigent.runtime import get_terminal_registry
+
+    agent = native_agent_for_cancel(wrapper_label)
+    if agent is None:
+        return False
+    try:
+        instance = get_terminal_registry().get(task_id, agent.terminal_name, "main")
+    except RuntimeError:
+        return False
+    if instance is None:
+        return False
+    try:
+        return await instance.is_alive()
+    except (OSError, RuntimeError):
+        return False
+
+
+async def _post_session_stop(
+    server_client: httpx.AsyncClient, task_id: str
+) -> tuple[int | None, str | None]:
+    """Hard-stop one stop-capable native child through the server.
+
+    :returns: ``(status_code, error)``. ``error`` is ``None`` on 2xx.
+        Transport failures use ``status_code is None``.
+    """
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{task_id}/events",
+            json={"type": "stop_session", "data": {}},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        return None, f"Error: sys_cancel_task stop_session failed: {type(exc).__name__}: {exc}"
+    if resp.status_code >= 400:
+        return resp.status_code, (
+            f"Error: sys_cancel_task stop_session returned {resp.status_code}: {resp.text[:200]}"
+        )
+    return resp.status_code, None
+
+
+async def _cancel_evicted_native_subagent(
+    task_id: str,
+    *,
+    conversation_id: str,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Stop an owned stop-capable native child after its work entry was evicted.
+
+    Ownership is still verified against the snapshot's ``parent_session_id``
+    and the wrapper must name a harness with a runner-side hard-stop — an
+    evicted entry means the parent no longer knows the child's state, so
+    trusting the caller's task id alone could stop someone else's session.
+    """
+    from omnigent.runner.native.interrupt import native_cancel_capability
+
+    if server_client is None:
+        return "Error: sys_cancel_task requires server access for sub-agent tasks"
+    try:
+        resp = await server_client.get(f"/v1/sessions/{task_id}", timeout=10.0)
+    except httpx.HTTPError as exc:
+        return f"Error: sys_cancel_task lookup failed: {type(exc).__name__}: {exc}"
+    if resp.status_code != 200:
+        return f"Error: no in-flight task with task_id {task_id}"
+    snapshot = resp.json()
+    labels = snapshot.get("labels") if isinstance(snapshot, dict) else None
+    wrapper = labels.get(_SESSION_WRAPPER_LABEL_KEY) if isinstance(labels, dict) else None
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("parent_session_id") != conversation_id
+        or not isinstance(wrapper, str)
+        or native_cancel_capability(wrapper) != "stop"
+    ):
+        return f"Error: no in-flight task with task_id {task_id}"
+    # A 503 is a failed kill, not proof the pane is gone. Report an explicit
+    # unconfirmed result rather than ``absent`` / a cached terminal status.
+    status_code, stop_error = await _post_session_stop(server_client, task_id)
+    if stop_error is not None:
+        if status_code == 503:
+            return _unconfirmed_hard_stop_result(task_id, status="unknown")
+        return stop_error
+    return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
+
+
 async def _cancel_subagent_task(
     args: _JsonObject,
     *,
@@ -7007,23 +8104,25 @@ async def _cancel_subagent_task(
     """
     Cancel a running sub-agent worker, routing by the child's harness.
 
-    Only ``claude-native`` has a runner-side hard-stop, so the cancel
-    event is chosen per harness — the child runner's ``stop_session``
-    handler 204 no-ops for every other harness, so posting it there
-    would silently do nothing:
+    The cancel event is chosen from ``native_cancel_capability``, which
+    mirrors the child runner's ``NativeInterruptRunner.stop`` dispatch
+    (Claude plus the ``_UNIFORM_STOP`` natives):
 
-    * ``claude-native`` — POST ``stop_session``. The child runner
-      hard-kills the worker's tmux pane via ``_handle_claude_native_stop``
-      and marks the work entry cancelled, delivering a terminal payload to
-      the parent inbox and auto-waking it. A bare interrupt (Escape) only
-      cancelled the current turn and left the worker process alive; a stop
-      frees it.
-    * everything else (in-process harnesses, ``codex-native``) — POST
-      ``interrupt``, the path those harnesses actually honor. For an
-      in-process child the runner marks the turn cancelled (via
-      ``_interrupted_sessions`` → ``_on_proxy_stream_end``) and wakes the
-      parent. ``codex-native`` has no runner-side stop yet, so its cancel
-      stays best-effort (see message).
+    * stop-capable natives — POST ``stop_session``: the child runner
+      hard-stops the worker, marks the work entry cancelled, delivers a
+      terminal payload to the parent inbox and auto-wakes it. A bare
+      interrupt only cancelled the current turn and left the worker
+      process alive; a stop frees it. A ``failed`` stop-capable entry
+      still routes when its pane answers the liveness probe — failed
+      does not mean exited. A dead pane returns the cached terminal
+      failure without a stop attempt (already gone). A live pane whose
+      ``stop_session`` returns 503 is reported as an unconfirmed /
+      best-effort cancel: the kill failed and the worker may still be
+      running.
+    * best-effort natives (Codex, Pi, Antigravity, OpenCode) and
+      in-process harnesses — POST ``interrupt``. No runner-side
+      hard-stop is wired for them, so the result is reported
+      best-effort rather than implying process termination.
 
     :param args: Tool arguments containing ``task_id`` or
         ``handle_id``, e.g. ``{"task_id": "conv_child456"}``.
@@ -7033,6 +8132,7 @@ async def _cancel_subagent_task(
     :returns: JSON cancellation result.
     """
     from omnigent.runner import app as _runner_app
+    from omnigent.runner.native.interrupt import native_cancel_capability
 
     task_id = args.get("task_id") or args.get("handle_id")
     if not task_id:
@@ -7040,29 +8140,31 @@ async def _cancel_subagent_task(
     if conversation_id is None:
         return "Error: sys_cancel_task requires conversation_id"
     entry = _runner_app.get_subagent_work(str(task_id))
-    if entry is None or entry.parent_session_id != conversation_id:
+    if entry is None:
+        return await _cancel_evicted_native_subagent(
+            str(task_id),
+            conversation_id=conversation_id,
+            server_client=server_client,
+        )
+    if entry.parent_session_id != conversation_id:
         return f"Error: no in-flight task with task_id {task_id}"
     # A dispatched child sits in ``launching`` until its runtime emits a real
     # busy edge (see ``mark_subagent_work_started``). Cancellation must still
     # route to the child during that window — otherwise cancelling a slow-to-
-    # start sub-agent would silently no-op and leave it running. Only terminal
-    # states (``completed`` / ``failed`` / ``cancelled``) short-circuit here.
-    if entry.status not in ("launching", "running", "waiting"):
-        return json.dumps(
-            {
-                "cancelled": entry.status == "cancelled",
-                "task_id": task_id,
-                "status": entry.status,
-            }
-        )
+    # start sub-agent would silently no-op and leave it running. A failed
+    # stop-capable native entry still falls through when its pane is alive.
+    capability = native_cancel_capability(entry.wrapper_label)
+    can_stop_failed = (
+        capability == "stop"
+        and entry.status == "failed"
+        and await _native_child_pane_alive(str(task_id), entry.wrapper_label)
+    )
+    if entry.status not in ("launching", "running", "waiting") and not can_stop_failed:
+        return _cached_subagent_cancel_result(str(task_id), entry.status)
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
 
-    # claude-native is the only harness with a runner-side hard-stop; every
-    # other harness 204 no-ops on stop_session, so route them to interrupt.
-    event_type = (
-        "stop_session" if entry.wrapper_label == CLAUDE_NATIVE_WRAPPER_VALUE else "interrupt"
-    )
+    event_type = "stop_session" if capability == "stop" else "interrupt"
 
     try:
         resp = await server_client.post(
@@ -7074,6 +8176,8 @@ async def _cancel_subagent_task(
     except httpx.HTTPError as exc:
         return f"Error: sys_cancel_task {event_type} failed: {type(exc).__name__}: {exc}"
     if resp.status_code >= 400:
+        if capability == "stop" and resp.status_code == 503:
+            return _unconfirmed_hard_stop_result(str(task_id), status=entry.status)
         return (
             f"Error: sys_cancel_task {event_type} returned {resp.status_code}: {resp.text[:200]}"
         )
@@ -7081,21 +8185,8 @@ async def _cancel_subagent_task(
     updated = _runner_app.get_subagent_work(str(task_id)) or entry
     if updated.status == "cancelled":
         return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
-    if updated.wrapper_label == CODEX_NATIVE_WRAPPER_VALUE:
-        return json.dumps(
-            {
-                "cancel_requested": True,
-                "cancel_confirmed": False,
-                "best_effort": True,
-                "task_id": task_id,
-                "status": updated.status,
-                "message": (
-                    "Interrupt forwarded, but a runner-side hard-stop is not wired "
-                    "for codex-native workers yet; the child may keep running and no "
-                    "terminal inbox status is guaranteed."
-                ),
-            }
-        )
+    if capability == "best_effort":
+        return _best_effort_cancel_result(str(task_id), updated.status)
     return json.dumps(
         {
             "cancel_requested": True,
@@ -7159,9 +8250,9 @@ def _execute_skill_tool(
     """
     Runner-local handler for ``load_skill`` and ``read_skill_file``.
 
-    Instantiates the tool with the agent spec's bundled skills
-    plus host-scope discovery from the runner workspace, then
-    invokes it.
+    Both tools are built from one registry — the agent spec's bundled
+    skills merged with host-scope discovery from the runner workspace —
+    so anything ``load_skill`` can load, ``read_skill_file`` can read.
 
     :param tool_name: ``"load_skill"`` or ``"read_skill_file"``.
     :param args: Parsed JSON arguments from the LLM.
@@ -7181,15 +8272,14 @@ def _execute_skill_tool(
     # agent's own bundle to ship a skills/ directory.
     bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
 
-    tool: Tool
-    if tool_name == "load_skill":
-        tool = LoadSkillTool(
-            bundled_skills,
-            agent_root=runner_workspace,
-            skills_filter=skills_filter,
-        )
-    else:
-        tool = ReadSkillFileTool(bundled_skills)
+    # Both tools must resolve the same registry: a skill load_skill can load
+    # from host scope must have its files readable too.
+    load_tool = LoadSkillTool(
+        bundled_skills,
+        agent_root=runner_workspace,
+        skills_filter=skills_filter,
+    )
+    tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)
 
     arguments_json = json.dumps(args)
     from omnigent.tools.base import ToolContext

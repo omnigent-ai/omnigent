@@ -1,10 +1,17 @@
-"""Owned static model fallbacks for CLI surfaces without discovery."""
+"""Owned static model tables for Smart Routing and background titles.
+
+Pre-launch picker listings carry no static stand-ins anymore — the live
+harness probes (see ``omnigent.host.connect``) are their source of truth.
+What remains here is the router's operational data: rankings, arm menus,
+probed exclusions that no discovery API can provide, plus the economy-tier
+arms background session-title generation pins per harness family.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from omnigent.onboarding.provider_config import CLI_CONFIG_KIND, SUBSCRIPTION_KIND
+from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 
 
 @dataclass(frozen=True)
@@ -17,56 +24,44 @@ class StaticModelFallback:
     discovery_gap: str
 
 
-_CLAUDE_SUBSCRIPTION_MODELS = (
-    "claude-fable-5",
-    "claude-opus-5",
-    "claude-opus-4-8",
-    "claude-sonnet-5",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5",
+#: Curated preference ORDER for codex's current arms — a ranking hint only
+#: (preferred first), consumed by the Databricks live-discovery ranker to
+#: sort servable ids. It never invents picker rows: ids absent from the live
+#: listing are simply not ranked by it.
+_CODEX_ARM_PREFERENCE = StaticModelFallback(
+    model_ids=("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.5"),
+    owner="Databricks model discovery (omnigent.databricks_model_discovery)",
+    provenance="Omnigent's release-curated Codex arm ordering",
+    discovery_gap="a workspace listing ranks models by neither recency nor capability",
 )
 
-#: Codex's own model slugs, which spell the version with a DOT
-#: (``gpt-5.6-sol``). These reach codex's ChatGPT-account backend directly, so
-#: the Databricks serving spelling (``databricks-gpt-5-6-sol``, hyphens only)
-#: is rejected here with a 400 — unlike the gateway catalogs below, which are
-#: correctly hyphenated. Ordered cheapest-safe default first.
-_CODEX_MODELS = ("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.5")
-
-_STATIC_MODEL_FALLBACKS = {
-    (SUBSCRIPTION_KIND, "claude"): StaticModelFallback(
-        model_ids=_CLAUDE_SUBSCRIPTION_MODELS,
-        owner="Claude subscription adapter",
-        provenance="Omnigent's release-curated Claude Code alias catalog",
-        discovery_gap="Claude subscription logins expose no model-listing API",
-    ),
-    (SUBSCRIPTION_KIND, "codex"): StaticModelFallback(
-        model_ids=_CODEX_MODELS,
-        owner="Codex subscription adapter",
-        provenance="Omnigent's release-curated Codex alias catalog",
-        discovery_gap="Codex subscription availability is not exposed before launch",
-    ),
-    (CLI_CONFIG_KIND, "codex"): StaticModelFallback(
-        model_ids=_CODEX_MODELS,
-        owner="Codex CLI-config adapter",
-        provenance="Omnigent's release-curated Codex alias catalog",
-        discovery_gap=(
-            "Custom model_provider entries live in Codex config.toml and cannot "
-            "be enumerated on this catalog path"
-        ),
-    ),
+_STATIC_MODEL_FALLBACKS: dict[tuple[str, str], StaticModelFallback] = {
+    (SUBSCRIPTION_KIND, "codex"): _CODEX_ARM_PREFERENCE,
 }
 
 
 def static_model_fallback(provider_kind: str, cli: str) -> StaticModelFallback | None:
-    """Return the owned fallback for a provider kind and CLI, if registered."""
+    """Return the owned fallback table for a provider kind and CLI, if registered."""
     return _STATIC_MODEL_FALLBACKS.get((provider_kind, cli))
 
 
-#: Codex's launch default when nothing else names a model. The bundled OpenAI
-#: catalog's newest row is a bare family alias (``gpt-5.6``) that codex rejects,
-#: so a codex launch defaults to a concrete variant from its own catalog.
-CODEX_DEFAULT_MODEL = _STATIC_MODEL_FALLBACKS[(SUBSCRIPTION_KIND, "codex")].model_ids[0]
+#: Codex's launch default when nothing else names a model. The bundled
+#: OpenAI catalog's newest row is a bare family alias (``gpt-5.6``) that
+#: codex rejects, so a codex launch defaults to a concrete variant from
+#: codex's own catalog — dotted spelling, since the Databricks hyphenated
+#: form 400s against codex's own backend.
+_CODEX_LAUNCH_DEFAULT = StaticModelFallback(
+    model_ids=("gpt-5.6-sol",),
+    owner="Codex native launch (omnigent.inner.codex_executor)",
+    provenance="codex's own catalog slug for the cheapest current arm",
+    discovery_gap=(
+        "the launch default is resolved before any app-server probe can "
+        "answer, and codex rejects the bundled catalog's newest row (a bare "
+        "family alias)"
+    ),
+)
+
+CODEX_DEFAULT_MODEL = _CODEX_LAUNCH_DEFAULT.model_ids[0]
 
 
 # ── Smart Routing ───────────────────────────────────────────────────────────
@@ -204,3 +199,39 @@ SMART_ROUTING_PI_EXCLUDED = _SMART_ROUTING_FALLBACKS["pi_excluded"].model_ids
 CODEX_CATALOG_CLONE_SOURCE_SLUG = _SMART_ROUTING_FALLBACKS["codex_catalog_clone_source"].model_ids[
     0
 ]
+
+#: Cheapest current arm per CLI family for background session titles. Title
+#: calls are tiny (<=64 output tokens, no tools, low effort), so they always
+#: run on the family's cheapest arm regardless of the session's model.
+_BACKGROUND_TITLE_FALLBACKS: dict[str, StaticModelFallback] = {
+    "claude": StaticModelFallback(
+        model_ids=("haiku",),
+        owner="Background session titles (omnigent.runner.background_titles.service)",
+        provenance=(
+            "claude's bare family alias resolves to the cheapest current Haiku "
+            "on Anthropic-direct and AI-Gateway paths alike"
+        ),
+        discovery_gap=(
+            "a background title never consults the session's live model catalog, "
+            "and no discovery API ranks arms by cost"
+        ),
+    ),
+    "codex": StaticModelFallback(
+        model_ids=("gpt-5.6-luna",),
+        owner="Background session titles (omnigent.runner.background_titles.service)",
+        provenance=(
+            "codex's own dotted catalog slug for its cheapest current arm — the "
+            "gateway's hyphenated spelling 400s on codex's backend"
+        ),
+        discovery_gap=(
+            "a background title never consults the session's live model catalog, "
+            "and no discovery API ranks arms by cost"
+        ),
+    ),
+}
+
+#: The claude-family arm background session titles pin.
+BACKGROUND_TITLE_CLAUDE_ECONOMY_MODEL = _BACKGROUND_TITLE_FALLBACKS["claude"].model_ids[0]
+
+#: The codex-family arm background session titles pin.
+BACKGROUND_TITLE_CODEX_ECONOMY_MODEL = _BACKGROUND_TITLE_FALLBACKS["codex"].model_ids[0]

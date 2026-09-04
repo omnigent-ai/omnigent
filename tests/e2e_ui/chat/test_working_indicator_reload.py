@@ -9,6 +9,7 @@ reload instead of falling back to the empty-session start screen.
 from __future__ import annotations
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 
@@ -657,6 +658,7 @@ def test_prior_fold_holds_through_followup_send(
     assert fold.count() == 2
 
 
+@pytest.mark.nightly
 def test_settled_fold_holds_through_scheduled_wake(
     page: Page,
     seeded_session: tuple[str, str],
