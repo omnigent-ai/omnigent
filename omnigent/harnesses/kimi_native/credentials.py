@@ -29,8 +29,8 @@ import logging
 import os
 import re
 import shlex
-import shutil
 import sys
+import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -179,6 +179,7 @@ def render_kimi_hooks_toml(*, bridge_dir: Path, python_executable: str | None = 
 
 def _workspace_trust_record(workspace: Path) -> tuple[str, str]:
     """Return Kimi 0.41's canonical root and workspace-trust filename."""
+    # Native terminals are disabled on Windows, so trust roots here are POSIX-only.
     root = os.path.abspath(os.fspath(workspace)).replace("\\", "/")
     canonical_root = root.rstrip("/") or root
     basename = canonical_root.rsplit("/", maxsplit=1)[-1]
@@ -190,8 +191,8 @@ def _workspace_trust_record(workspace: Path) -> tuple[str, str]:
     return canonical_root, f"wd_{slug}_{digest}"
 
 
-def _materialize_workspace_trust_dir(session_home: Path, user_home: Path) -> Path:
-    """Create a real session trust directory and copy existing user records."""
+def _materialize_workspace_trust_dir(session_home: Path) -> Path:
+    """Create an empty, real session trust directory."""
     trust_dir = session_home / _WORKSPACE_TRUST_DIR
     if trust_dir.is_symlink():
         trust_dir.unlink()
@@ -199,15 +200,6 @@ def _materialize_workspace_trust_dir(session_home: Path, user_home: Path) -> Pat
     with contextlib.suppress(OSError):
         os.chmod(trust_dir, 0o700)
 
-    user_trust_dir = user_home / _WORKSPACE_TRUST_DIR
-    if user_trust_dir.is_dir():
-        with contextlib.suppress(OSError):
-            for source in user_trust_dir.iterdir():
-                destination = trust_dir / source.name
-                if not source.is_file() or destination.exists() or destination.is_symlink():
-                    continue
-                with contextlib.suppress(OSError):
-                    shutil.copyfile(source, destination)
     return trust_dir
 
 
@@ -215,12 +207,15 @@ def _seed_workspace_trust(trust_dir: Path, workspace: Path) -> None:
     """Write Kimi's session-scoped trust record for *workspace* atomically."""
     root, record_name = _workspace_trust_record(workspace)
     record_path = trust_dir / record_name
-    tmp = record_path.with_name(record_path.name + ".tmp")
     payload = {"root": root, "trustedAt": time.time_ns() // 1_000_000}
-    tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-    with contextlib.suppress(OSError):
-        os.chmod(tmp, 0o600)
-    os.replace(tmp, record_path)
+    fd, tmp_name = tempfile.mkstemp(dir=trust_dir)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+        os.replace(tmp_path, record_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def build_kimi_session_home(
@@ -274,7 +269,7 @@ def build_kimi_session_home(
     with contextlib.suppress(OSError):
         (session_home / "sessions").mkdir(exist_ok=True)
 
-    trust_dir = _materialize_workspace_trust_dir(session_home, user_home)
+    trust_dir = _materialize_workspace_trust_dir(session_home)
     _seed_workspace_trust(trust_dir, workspace)
 
     hooks = render_kimi_hooks_toml(bridge_dir=bridge_dir, python_executable=python_executable)
