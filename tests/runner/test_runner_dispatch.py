@@ -11316,3 +11316,109 @@ def test_response_failed_event_llm_source_is_preserved() -> None:
     )
     payload = _json.loads(raw.decode().split("data: ", 1)[1])
     assert payload["source"] == "llm"
+
+
+@pytest.mark.asyncio
+async def test_continuation_drain_reports_buffered_message_drained() -> None:
+    """The continuation drain publishes a drain marker per persisted item.
+
+    A message buffered against an active turn is acknowledged to the
+    server as ``buffered`` — delivered, not consumed. When
+    ``_check_and_start_next_turn`` later drains it into the continuation
+    turn (the moment the loop actually gets the message), the runner must
+    publish ``session.input.drained`` carrying the forwarded
+    ``persisted_item_id`` so the server can upgrade the item's delivered
+    state to the canonical ``session.input.consumed`` for clients. Before
+    this marker existed, the server had no consumption signal at all and
+    (wrongly) published consumed at POST time.
+
+    Determinism mirrors the multiturn-defer test above: turn 1 blocks
+    mid-stream (``release``) so the second message provably buffers, then
+    the continuation runs to completion.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.conftest import _drain_session_event_queue
+
+    conv_id = "conv_steer_drain_marker"
+    started = asyncio.Event()
+    release = asyncio.Event()
+    turns = [_sse_text_turn("TURN_ONE"), _sse_text_turn("CONTINUATION")]
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return a non-native scaffold spec so the buffering path runs.
+
+        :param agent_id: Agent id requested by the runner (unused).
+        :param session_id: Session id (unused).
+        :returns: A minimal scaffold spec bound to the test harness.
+        """
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="scaffold-drain-marker-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_GatedTwoTurnHarnessClient(turns, started, release)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    drained_events: list[dict[str, Any]] = []
+    try:
+        async with _runner_test_client(app) as http:
+            resp1 = await http.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_scaffold",
+                    "model": "x",
+                    "content": [{"type": "input_text", "text": "start the long turn"}],
+                },
+            )
+            assert resp1.status_code == 202
+            await asyncio.wait_for(started.wait(), timeout=10.0)
+
+            # Steered follow-up: buffers against the live turn, carrying the
+            # server's persisted item id exactly like a real forward does.
+            resp2 = await http.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_scaffold",
+                    "model": "x",
+                    "content": [{"type": "input_text", "text": "steer me in"}],
+                    "persisted_item_id": "item_steered_1",
+                },
+            )
+            assert resp2.status_code == 202
+            assert resp2.json()["status"] == "buffered"
+
+            # Parked, not consumed: no drain marker may exist yet.
+            drained_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            assert all(e.get("type") != "session.input.drained" for e in drained_events)
+
+            # End turn 1; the continuation drain consumes the buffered copy.
+            release.set()
+            deadline = asyncio.get_running_loop().time() + 10.0
+            while asyncio.get_running_loop().time() < deadline:
+                drained_events.extend(
+                    _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+                )
+                if any(e.get("type") == "session.input.drained" for e in drained_events):
+                    break
+                await asyncio.sleep(0.02)
+    finally:
+        release.set()
+
+    markers = [e for e in drained_events if e.get("type") == "session.input.drained"]
+    assert markers == [{"type": "session.input.drained", "item_id": "item_steered_1"}], (
+        f"expected exactly one drain marker for the steered item, got {markers}; "
+        f"no marker means the server can never upgrade delivered → consumed."
+    )

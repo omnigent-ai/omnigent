@@ -80,6 +80,7 @@ from omnigent.runtime import (
     inflight_text,
     pending_elicitations,
     pending_inputs,
+    unconsumed_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import (
@@ -271,6 +272,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_error_event,
     _publish_external_conversation_item,
     _publish_input_consumed,
+    _publish_input_delivered,
     _publish_sandbox_status,
     _publish_status,
     _publish_terminal_pending,
@@ -1138,6 +1140,10 @@ def _build_session_response(
         # hydrates the optimistic bubble. Empty for non-native sessions
         # (their message is already persisted into ``items``).
         pending_inputs=pending_inputs.snapshot_for(conv.id),
+        # Replay ids of steered messages still awaiting harness
+        # consumption, so a cold load renders them in the same
+        # intermediate state the live input.delivered event drives.
+        unconsumed_input_ids=unconsumed_inputs.snapshot_for(conv.id),
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
@@ -5367,9 +5373,29 @@ async def _forward_event_to_runner(
                 f"Runner rejected the message: {_reject_detail}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
-        # Publish input.consumed AFTER the forward succeeds —
-        # the runner has the message and will start the turn.
-        _publish_input_consumed(session_id, persisted_items[0])
+        # Publish the input acknowledgment AFTER the forward succeeds.
+        # The runner's 202 body says what happened to a message: "accepted"
+        # started a fresh turn with it (the loop has it — consumed), while
+        # "buffered" parked it for an already-running turn the loop has
+        # verifiably NOT seen yet. Publishing input.consumed for a parked
+        # message would tell every client the agent has it — the steered
+        # bubble would render exactly like a committed one — so a buffered
+        # message gets the intermediate input.delivered instead, and the
+        # canonical input.consumed follows when the relay observes the
+        # runner's session.input.drained marker for this item.
+        _steer_buffered = False
+        if body.type == "message":
+            try:
+                _steer_buffered = _forward_resp.json().get("status") == "buffered"
+            except ValueError:
+                # Non-JSON 202 body (older/stub runner) — treat as a fresh
+                # turn, which preserves the pre-delivered behavior.
+                _steer_buffered = False
+        if _steer_buffered:
+            unconsumed_inputs.record(session_id, persisted_items[0].id, persisted_items[0])
+            _publish_input_delivered(session_id, persisted_items[0])
+        else:
+            _publish_input_consumed(session_id, persisted_items[0])
         _logger.info(
             "turn dispatched to runner for session=%s",
             session_id,
@@ -6333,6 +6359,34 @@ async def _relay_runner_stream_once(
                             session_id,
                             event.get("pending") is True,
                         )
+                        continue
+
+                    # Runner-internal drain marker: a message that was parked
+                    # for an active turn (acknowledged "buffered", published
+                    # as session.input.delivered) was actually drained into a
+                    # turn — the agent loop has it now. Resolve the
+                    # intermediate state and publish the canonical
+                    # session.input.consumed with the persisted item's full
+                    # payload so clients promote the pending bubble. Handled
+                    # exclusively here; the raw marker is never forwarded.
+                    if evt_type == "session.input.drained":
+                        _drained_id = event.get("item_id")
+                        if isinstance(_drained_id, str) and _drained_id:
+                            _drained_item = unconsumed_inputs.resolve(session_id, _drained_id)
+                            if _drained_item is not None:
+                                _publish_input_consumed(session_id, _drained_item)
+                            else:
+                                # Entry already gone — a terminal-status clear
+                                # or TTL beat the marker. Live clients settle
+                                # the bubble on that same terminal edge, so
+                                # there is nothing to publish here.
+                                _logger.debug(
+                                    "Relay: drain marker for unknown item %s on "
+                                    "session=%s (already cleared)",
+                                    _drained_id,
+                                    session_id,
+                                    extra={"session_id": session_id},
+                                )
                         continue
 
                     # Track the turn's response_id from lifecycle
