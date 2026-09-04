@@ -8695,6 +8695,64 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(useChatStore.getState().abortController).toBeNull();
   });
 
+  it("surfaces a visible error block when a 401 give-up hits a turn it never started", async () => {
+    seedSession("conv_401cold", []);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        return mockResponse({}, { ok: false, status: 401 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    // Cold reconnect: the tab reattached to a turn it never started, so there
+    // is no locally initiated activeResponse for the give-up to mark failed.
+    useChatStore.setState({
+      conversationId: "conv_401cold",
+      abortController: controller,
+      sessionStatus: "running",
+    });
+
+    const loop = startStreamPump("conv_401cold", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(6_000);
+    await loop;
+
+    // The give-up must not leave a silent blank turn: with nothing local to
+    // mark failed, a visible client error block is appended instead.
+    const errors = useChatStore.getState().blocks.filter((b) => b.type === "error");
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as { message: string }).message).toMatch(/dropped/i);
+    // Only the server may declare the session failed; local lifecycle settles.
+    expect(useChatStore.getState().sessionStatus).toBe("running");
+    expect(useChatStore.getState().status).toBe("idle");
+  });
+
+  it("marks a locally initiated turn failed on a 401 give-up without adding an error block", async () => {
+    seedSession("conv_401live", []);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        return mockResponse({}, { ok: false, status: 401 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_401live",
+      abortController: controller,
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_in_flight", state: "streaming", error: null },
+    });
+
+    const loop = startStreamPump("conv_401live", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(6_000);
+    await loop;
+
+    // The in-flight bubble carries the failure; no redundant error block.
+    expect(useChatStore.getState().activeResponse?.state).toBe("failed");
+    expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toHaveLength(0);
+  });
+
   it("rides out a handful of transient 404s (backend restart) without failing the session", async () => {
     seedSession("conv_404flap", []);
     const sinks: StreamSink[] = [];
