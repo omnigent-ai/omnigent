@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -543,6 +544,30 @@ def test_resolve_provider_cli_config_default(
     assert provider.cli == "codex"
     assert "codex-gateway" in provider.detail
     assert "Databricks" in provider.detail
+
+
+def test_resolve_provider_kimi_uses_cli_config_despite_omnigent_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Kimi resolves through its own CLI instead of an Omnigent provider."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  openrouter:\n"
+        "    kind: gateway\n"
+        "    default: pi\n"
+        "    openai:\n"
+        "      base_url: https://openrouter.ai/api/v1\n"
+        "      api_key: $OPENROUTER_API_KEY\n",
+    )
+
+    provider = resolve_model_provider(_worker_spec("kimi-native"), "kimi-native")
+
+    assert provider.kind == "cli-config"
+    assert provider.cli == "kimi"
+    assert "Kimi CLI config" in provider.detail
 
 
 @pytest.mark.parametrize("harness", ["cursor", "cursor-native", "native-cursor"])
@@ -2086,6 +2111,47 @@ def test_cursor_listing_uses_live_cli_base_models(
     assert listing.verified is True
     assert [m.id for m in listing.models] == ["provider-latest"]
     assert "live models advertised" in listing.note
+
+
+def test_kimi_listing_uses_cli_owned_model_catalog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A Kimi worker lists aliases from the CLI that owns its provider config."""
+    from omnigent import kimi_native
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    commands: list[list[str]] = []
+
+    def _run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "providers": {"litellm": {"type": "openai"}},
+                    "models": {
+                        "litellm/k3": {"provider": "litellm", "model": "k3"},
+                        "litellm/k3-256k": {
+                            "provider": "litellm",
+                            "model": "k3-256k",
+                        },
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(model_catalog.subprocess, "run", _run)
+    monkeypatch.setattr(kimi_native, "resolve_kimi_executable", lambda: "kimi")
+
+    listing = list_models_for_worker(_worker_spec("kimi-native"), "kimi-native")
+
+    assert commands == [["kimi", "provider", "list", "--json"]]
+    assert listing.source == "cli"
+    assert listing.verified is True
+    assert [model.id for model in listing.models] == ["litellm/k3", "litellm/k3-256k"]
+    assert "Kimi CLI" in listing.note
 
 
 def test_cursor_listing_failure_is_empty_and_retryable(
