@@ -1778,7 +1778,7 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
     [
         (hi.OPENCODE_KEY, "2.0.18", "2.1.0"),
         (hi.CURSOR_KEY, "2026.06.02", None),
-        (hi.KIMI_KEY, "0.7.0", None),
+        (hi.KIMI_KEY, "0.41.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
         (OPENAI_FAMILY, "0.137.0", None),
         (hi.PI_KEY, "0.84.2", None),
@@ -1884,7 +1884,7 @@ def test_the_codex_launch_floor_accepts_the_ci_pinned_cli(
     assert hi.harness_cli_installed(OPENAI_FAMILY) is True
 
 
-def test_the_kimi_floor_accepts_the_cli_this_spec_installs(
+def test_the_kimi_floor_accepts_the_supported_cli(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A current ``kimi-code`` build must read as installed, not too-low.
@@ -1900,7 +1900,7 @@ def test_the_kimi_floor_accepts_the_cli_this_spec_installs(
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
             return subprocess.CompletedProcess(
-                args=argv, returncode=0, stdout="0.34.0\n", stderr=""
+                args=argv, returncode=0, stdout="0.41.0\n", stderr=""
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
@@ -1908,23 +1908,14 @@ def test_the_kimi_floor_accepts_the_cli_this_spec_installs(
     assert hi.harness_cli_installed(hi.KIMI_KEY) is True
 
 
-@pytest.mark.parametrize("version", ["0.7.0", "0.32.0"])
-def test_the_kimi_floor_accepts_the_floor_and_the_reported_version(
-    monkeypatch: pytest.MonkeyPatch, version: str
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [("0.40.9", False), ("0.41.0", True)],
+)
+def test_the_kimi_floor_requires_the_workspace_trust_format_version(
+    monkeypatch: pytest.MonkeyPatch, version: str, expected: bool
 ) -> None:
-    """The declared floor itself, and the build from #4278, must read as installed.
-
-    ``test_the_kimi_floor_accepts_the_cli_this_spec_installs`` covers the
-    general case at 0.34.0, and the default-floors parametrize covers 0.6.0 /
-    0.34.0. Neither pins the two values that carry the regression:
-
-    * ``0.7.0`` is the floor itself. An off-by-one there — ``>`` where the
-      comparison should be ``>=`` — rejects the exact version this spec
-      declares as supported, and every existing test still passes.
-    * ``0.32.0`` is the version the reporter ran when setup showed
-      "Kimi Code x Needs upgrade". Pinning the reported build is what makes
-      this a regression test for #4278 rather than for the floor in general.
-    """
+    """Only Kimi versions with the 0.41 workspace-trust format are supported."""
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
@@ -1935,7 +1926,7 @@ def test_the_kimi_floor_accepts_the_floor_and_the_reported_version(
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
-    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is expected
 
 
 def test_the_kimi_floor_stays_in_the_kimi_code_version_series() -> None:
@@ -2020,17 +2011,17 @@ def test_parse_harness_cli_version_normalizes_date_versions(raw: str, expected: 
     "key,outdated,satisfying",
     [
         (hi.CURSOR_KEY, "2026.05.24", "2026.06.22"),
-        (hi.KIMI_KEY, "0.6.0", "0.34.0"),
+        (hi.KIMI_KEY, "0.40.9", "0.41.0"),
         (hi.HERMES_KEY, "0.16.9", "0.19.1"),
     ],
 )
-def test_harness_cli_installed_enforces_default_post_2026_06_01_floors(
+def test_harness_cli_installed_enforces_declared_minimum_versions(
     monkeypatch: pytest.MonkeyPatch,
     key: str,
     outdated: str,
     satisfying: str,
 ) -> None:
-    """Cursor and Kimi default to the first release after 2026-06-01."""
+    """Versioned harnesses reject known-outdated builds and accept supported ones."""
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:

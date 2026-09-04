@@ -128,7 +128,7 @@ _HERMES_MIN_VERSION = "0.17.0"
 _KIRO_MIN_VERSION = "2.10.0"
 _CLAUDE_MIN_VERSION = "2.1.161"
 _CURSOR_MIN_VERSION = "2026.06.02"
-_KIMI_MIN_VERSION = "0.7.0"
+_KIMI_MIN_VERSION = "0.41.0"
 _ANTIGRAVITY_MIN_VERSION = "1.1.13"
 
 # OpenCode native harness CLI (``opencode serve`` plus the ``--server`` TUI),

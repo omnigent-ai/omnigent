@@ -216,8 +216,8 @@ def test_build_session_home_workspace_trust_cannot_escape_to_global_home(
     assert global_after == global_before, "workspace trust write escaped into the global Kimi home"
     session_trust_dir = session_home / "workspace-trust"
     assert not session_trust_dir.is_symlink()
-    assert (session_trust_dir / existing.name).read_bytes() == global_before[existing.name]
-    assert len(list(session_trust_dir.iterdir())) == 2
+    assert not (session_trust_dir / existing.name).exists()
+    assert len(list(session_trust_dir.iterdir())) == 1
 
 
 @pytest.mark.parametrize("context", [None, "invalid", '{"pipeline":"repro-agent","run_id":"123"}'])
