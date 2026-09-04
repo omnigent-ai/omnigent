@@ -887,6 +887,37 @@ def test_kimi_readiness_keys_off_binary_and_credential(
     assert harness_is_configured("kimi-code") is True
 
 
+def test_kimi_native_outdated_diagnosis_preserves_headless_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kimi 0.40.9 remains headless-ready but native reports an actionable upgrade."""
+    import omnigent.onboarding.kimi_auth as _ka
+
+    version = "0.40.9"
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(_ka, "kimi_auth_configured", lambda: True)
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{version}\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+
+    assert harness_is_configured("kimi") is True
+    result = configured_harness_map()
+    assert result["kimi-native"] == HARNESS_VERSION_TOO_LOW
+    hint = hi.harness_setup_hint("kimi-native")
+    assert "installed 0.40.9" in hint
+    assert "required >=0.41.0" in hint
+    assert "code.kimi.com/kimi-code/install.sh" in hint
+
+    version = "0.41.0"
+    assert harness_is_configured("kimi-native") is True
+
+
 def test_cursor_readiness_keys_off_api_key(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -965,6 +996,8 @@ def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
         "native-cursor",
         "kiro-native",
         "native-kiro",
+        "kimi-native",
+        "native-kimi",
     ):
         assert result[harness] == HARNESS_VERSION_TOO_LOW, (
             f"{harness} should report version-too-low, not binary-missing"
