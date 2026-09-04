@@ -312,9 +312,14 @@ export function hydrateLocalConversation(
   if (skill !== null) {
     // Slash command: the server resolves the skill and emits its own receipt +
     // echo, which `sendSlashCommand` renders. Drop the plain-text placeholder
-    // bubble first so it isn't duplicated by the command's own echo.
+    // bubble so it isn't duplicated, and clear the create-window "streaming"
+    // status (set by `beginLocalConversation`, no `sendLatchedAt`) so
+    // `sendSlashCommand` arms its own latch and owns the failure-settle — else a
+    // failed command would strand the conversation in "streaming" (see B1).
     setterFor(realId)((s) => ({
       pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== pendingMsgTempId),
+      status: "idle",
+      sendLatchedAt: null,
     }));
     void store.sendSlashCommand(skill.name, skill.args, agentId, { pinnedConversationId: realId });
     return;
@@ -1848,10 +1853,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // into the running task's inbox. Keep `activeResponse` untouched in
     // that case so the in-flight bubble keeps its "streaming" lifecycle
     // until its own `response.completed` arrives.
+    //
+    // `reusePendingTempId` is the navigate-first first turn: the entry was
+    // pre-set to "streaming" by `beginLocalConversation` (for the create-window
+    // shimmer) but has no `sendLatchedAt`. Treat it as NOT-already-streaming so
+    // this send arms the latch and owns the failure-settle — otherwise a failed
+    // first turn would strand the conversation in "streaming" with no watchdog.
     const alreadyStreaming =
-      pinnedId === null
-        ? get().status === "streaming"
-        : setterForState(pinnedId)?.status === "streaming";
+      opts?.reusePendingTempId != null
+        ? false
+        : pinnedId === null
+          ? get().status === "streaming"
+          : setterForState(pinnedId)?.status === "streaming";
     if (!alreadyStreaming) {
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
@@ -2035,12 +2048,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       // Settle the conversation this send targeted, wherever the user is now:
       // its bubble must roll back and its status must not stay "streaming"
-      // forever. When the throw came from session setup itself
-      // (`postedSessionId` never resolved) there is no target conversation, so
-      // it belongs to the active one — the landing composer's own failure.
-      const failSet = postedSessionId === null ? setActive : setterFor(postedSessionId);
+      // forever. Target `postedSessionId ?? submitConversationId` (mirroring the
+      // draft restore above): a bind failure throws before `postedSessionId` is
+      // assigned, but the pin/submit id already names the session — so a failed
+      // navigate-first first turn settles the REAL new session, not whatever
+      // chat the user has since switched to. Null id (the landing composer's own
+      // failure) falls back to the active conversation.
+      const failTarget = postedSessionId ?? submitConversationId;
+      const failSet = failTarget === null ? setActive : setterFor(failTarget);
       const failGet = (): ChatState =>
-        postedSessionId === null ? get() : (setterForState(postedSessionId) ?? get());
+        failTarget === null ? get() : (setterForState(failTarget) ?? get());
       // Roll back the optimistic bubble — no server idle will fire.
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
@@ -2178,10 +2195,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const message = err instanceof Error ? err.message : String(err);
       // Settle the conversation this command targeted, wherever the user is
       // now: its echo must roll back and its status must not stay "streaming"
-      // forever. A throw from session setup itself (`postedSessionId` never
-      // resolved) has no target conversation, so it belongs to the active one —
-      // the landing composer's own failure. Mirrors `send`'s catch.
-      const failSet = postedSessionId === null ? setActive : setterFor(postedSessionId);
+      // forever. Target `postedSessionId ?? submitConversationId` (mirrors
+      // `send`'s catch): a bind failure throws before `postedSessionId` is set,
+      // but the pin/submit id already names the session, so a failed pinned
+      // command settles the real session, not the visible one. Null → active.
+      const failTarget = postedSessionId ?? submitConversationId;
+      const failSet = failTarget === null ? setActive : setterFor(failTarget);
       // Roll back the optimistic echo — no receipt will reconcile it.
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
