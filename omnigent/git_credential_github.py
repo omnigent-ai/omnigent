@@ -59,6 +59,19 @@ from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 _TIMEOUT_S = 15.0
 
 
+def _in_sandbox() -> bool:
+    """Whether we're running inside a managed sandbox (host image sets ``IS_SANDBOX=1``).
+
+    The broker host integrations auto-materialize the owner's credentials into
+    the host's git / gh config. That's only ever wanted in a managed sandbox — a
+    disposable, per-session filesystem. A local ``omnigent host`` shares the
+    developer's real ``~/.gitconfig`` / ``~/.config/gh``, so every auto-apply must
+    be a no-op there. ``IS_SANDBOX=1`` is baked into the managed host image and
+    the k8s pod spec; it is absent on a local host.
+    """
+    return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
+
+
 def _read_git_request() -> dict[str, str]:
     """Parse git's ``key=value`` credential request from stdin (blank-line terminated)."""
     fields: dict[str, str] = {}
@@ -161,7 +174,12 @@ def configure_host_git(server_url: str, host_id: str) -> None:
     prior (inconclusive) clone probe may have installed, restoring the ambient
     helper. Only a connected owner, or an inconclusive probe (``None``,
     fail-closed like the clone), takes over github.com.
+
+    Sandbox-only (see :func:`_in_sandbox`): a no-op outside a managed sandbox, so
+    a local ``omnigent host`` never rewrites the developer's real ``~/.gitconfig``.
     """
+    if not _in_sandbox():
+        return
     token = (os.environ.get(_HOST_TOKEN_ENV_VAR) or "").strip()
     if not token:
         return
@@ -267,6 +285,8 @@ def configure_host_gh(server_url: str, host_id: str) -> bool:
 
     :returns: ``True`` when gh was authenticated; ``False`` otherwise.
     """
+    if not _in_sandbox():
+        return False
     token = (os.environ.get(_HOST_TOKEN_ENV_VAR) or "").strip()
     if not token:
         return False
@@ -314,8 +334,10 @@ def start_host_gh_refresh(server_url: str, host_id: str) -> threading.Thread | N
     covers a session that stays live without ever suspending.)
 
     :returns: The started daemon thread, or ``None`` when disabled (a
-        non-positive interval) — the return is mainly for tests.
+        non-positive interval, or outside a managed sandbox) — mainly for tests.
     """
+    if not _in_sandbox():
+        return None
     interval = _gh_refresh_interval_s()
     if interval <= 0:
         return None

@@ -12,6 +12,13 @@ import omnigent.git_credential_github as h
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 
 
+@pytest.fixture(autouse=True)
+def _force_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The broker host integrations are sandbox-only; default every test to the
+    # in-sandbox path. The not-in-sandbox no-op test clears IS_SANDBOX explicitly.
+    monkeypatch.setenv("IS_SANDBOX", "1")
+
+
 def test_get_prints_credentials_for_github(monkeypatch: pytest.MonkeyPatch) -> None:
     cred = {"connected": True, "username": "x-access-token", "token": "T"}
     monkeypatch.setattr(h, "_fetch", lambda *a, **k: cred)
@@ -257,6 +264,27 @@ def test_configure_host_gh_noop_without_token(monkeypatch: pytest.MonkeyPatch, t
     monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh"))
     assert h.configure_host_gh("http://srv", "host1") is False
     assert not (tmp_path / "gh" / "hosts.yml").exists()
+
+
+def test_host_integrations_are_noops_outside_sandbox(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    # NOT in a managed sandbox → every auto-apply is a complete no-op even for a
+    # connected owner, so a local `omnigent host` never touches the developer's
+    # real ~/.gitconfig or ~/.config/gh.
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh"))
+    calls: list[object] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(
+        h, "_fetch", lambda *a, **k: {"connected": True, "token": "t", "login": "o"}
+    )
+    h.configure_host_git("http://srv", "host1")
+    assert h.configure_host_gh("http://srv", "host1") is False
+    assert h.start_host_gh_refresh("http://srv", "host1") is None
+    assert calls == []  # no git config writes
+    assert not (tmp_path / "gh" / "hosts.yml").exists()  # no hosts.yml write
 
 
 def test_gh_refresh_interval_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
