@@ -2233,6 +2233,74 @@ def test_azure_service_principal_fields_are_classified_as_sp(
     assert sp_sections == {"azure-sp"}
 
 
+def test_federated_oidc_machine_auth_types_are_classified_as_sp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Federated-OIDC machine flows are classified as SPs, not user profiles.
+
+    Machine flows like ``github-oidc`` / ``env-oidc`` carry no
+    client_secret pair, so the credential heuristic alone would miss them
+    and drop them in the "user" bucket — where they could outrank a real
+    U2M/PAT profile for the same host, the same mis-ranking this ordering
+    exists to prevent. They must be recognized by ``auth_type``.
+    """
+    from omnigent.inner.databricks_executor import (
+        _databrickscfg_host_matches_and_sp_sections,
+    )
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[gh-oidc]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = github-oidc\n"
+        "[env-oidc]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = env-oidc\n"
+        "[DEFAULT]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = databricks-cli\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    _matches, sp_sections = _databrickscfg_host_matches_and_sp_sections(
+        "https://example.databricks.com"
+    )
+    assert sp_sections == {"gh-oidc", "env-oidc"}
+
+
+def test_section_with_explicit_empty_host_does_not_inherit_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit empty ``host =`` overrides inheritance to no host.
+
+    Key-presence, not truthiness: a section that writes ``host =`` (empty)
+    has opted out of the workspace, so it must not fall back to [DEFAULT]'s
+    host and spuriously match — matching ConfigParser's own semantics.
+    """
+    from omnigent.inner.databricks_executor import (
+        _databrickscfg_host_matches_and_sp_sections,
+    )
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[blank-host]\n"
+        "host =\n"
+        "auth_type = databricks-cli\n"
+        "[inherits]\n"
+        "auth_type = databricks-cli\n"
+        "[DEFAULT]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = databricks-cli\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    matches, _sp = _databrickscfg_host_matches_and_sp_sections("https://example.databricks.com")
+    # `inherits` (no host key) inherits DEFAULT's host and matches; DEFAULT
+    # itself matches; `blank-host` (explicit empty) opted out and does not.
+    assert "blank-host" not in matches
+    assert set(matches) == {"inherits", "DEFAULT"}
+
+
 def test_resolve_auth_for_host_selects_user_token_over_sp_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

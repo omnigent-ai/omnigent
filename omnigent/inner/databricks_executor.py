@@ -894,29 +894,38 @@ def _read_databrickscfg_no_inheritance() -> configparser.ConfigParser | None:
 def _section_is_service_principal(options: configparser.SectionProxy) -> bool:
     """Whether a ``~/.databrickscfg`` section holds M2M service-principal creds.
 
-    A section is a service principal when it carries client credentials —
-    the generic ``client_id`` + ``client_secret`` or the Azure
-    ``azure_client_id`` + ``azure_client_secret`` pair — (or an explicit
-    machine ``auth_type`` such as ``oauth-m2m``) and no user-interactive
-    ``auth_type`` overrides that.
+    A section is a service principal when it names a machine (M2M)
+    ``auth_type`` — the OAuth-M2M/Azure secret and federated-OIDC flows —
+    or carries client credentials (the generic ``client_id`` +
+    ``client_secret`` or the Azure ``azure_client_id`` +
+    ``azure_client_secret`` pair), and no user-interactive ``auth_type``
+    overrides that.
 
     :param options: The section mapping (a ``ConfigParser`` section).
     :returns: ``True`` when the section is an M2M service principal.
     """
-    # auth_type literals mirror the databricks-sdk's known types. A future SDK
-    # auth type not listed here falls through to the client-credentials
-    # heuristic below, which still catches M2M SP sections.
+    # auth_type literals mirror the databricks-sdk's known types. Interactive
+    # (user) types short-circuit to non-SP; the machine set covers M2M secret
+    # and federated-OIDC flows (which carry no client_secret pair, so the
+    # heuristic below would miss them). A future SDK machine type not listed
+    # still falls through to the client-credentials heuristic.
     user_auth_types = {"databricks-cli", "external-browser", "pat", "runtime"}
+    machine_auth_types = {
+        "oauth-m2m",
+        "azure-client-secret",
+        "github-oidc",
+        "github-oidc-azure",
+        "env-oidc",
+        "file-oidc",
+        "azure-devops-oidc",
+    }
     auth_type = options.get("auth_type", "").strip().lower()
     if auth_type in user_auth_types:
         return False
     has_client_secret_pair = ("client_id" in options and "client_secret" in options) or (
         "azure_client_id" in options and "azure_client_secret" in options
     )
-    return (
-        auth_type in {"oauth-m2m", "azure-client-secret", "github-oidc-azure"}
-        or has_client_secret_pair
-    )
+    return auth_type in machine_auth_types or has_client_secret_pair
 
 
 def _databrickscfg_host_matches_and_sp_sections(host: str) -> tuple[list[str], set[str]]:
@@ -957,8 +966,11 @@ def _databrickscfg_host_matches_and_sp_sections(host: str) -> tuple[list[str], s
             # Ordered last, below, to mirror the file-order walk that keeps
             # [DEFAULT] a fallback behind named sections.
             continue
-        # A named section with no host of its own inherits [DEFAULT]'s host.
-        section_host = options.get("host", "") or default_host
+        # A named section with no host *key* of its own inherits [DEFAULT]'s
+        # host. Key-presence (not truthiness): an explicit ``host =`` (empty)
+        # overrides inheritance to no host, matching ConfigParser semantics —
+        # so an empty host does not fall back and does not match.
+        section_host = options.get("host", default_host)
         if _norm(section_host) == wanted:
             matches.append(section)
     if default_host and _norm(default_host) == wanted:
