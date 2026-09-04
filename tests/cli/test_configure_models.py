@@ -11,10 +11,10 @@ add/set-default/remove write paths surfaces here rather than silently.
 ``configure harnesses`` is a **three-level** picker. Level 1 shows every
 harness on a single compact row — the name on the left, then an aligned
 ``✓``/``✗`` status column — in 0.3 priority order: ``1=Claude``,
-``2=Codex``, ``3=Cursor``, ``4=OpenCode``, ``5=Hermes``, ``6=Pi``,
-``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Copilot``, ``11=Kiro``,
-``12=Kimi Code``, ``13=Import from OpenClaw``, ``14=Custom ACP agent``,
-``15=Quit``. There is no "More" folding — every harness is visible at once —
+``2=Codex``, ``3=Genie``, ``4=Cursor``, ``5=OpenCode``, ``6=Hermes``, ``7=Pi``,
+``8=Antigravity``, ``9=Qwen Code``, ``10=Goose``, ``11=Copilot``, ``12=Kiro``,
+``13=Kimi Code``, ``14=Import from OpenClaw``, ``15=Custom ACP agent``,
+``16=Quit``. There is no "More" folding — every harness is visible at once —
 and the actionable hint (install command / next step)
 renders only for the highlighted row, as the selector's description line.
 Selecting a harness drills into level 2 — its configured credentials, then ``+ Add a
@@ -135,6 +135,16 @@ def _harnesses_installed(monkeypatch):
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_logged_in",
         lambda family: True,
+    )
+    # Mock databricks_sdk_installed to return True since it's now an optional
+    # extra and may not be installed in the test environment.
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_sdk_installed",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.configure_models.databricks_sdk_installed",
+        lambda: True,
     )
 
 
@@ -651,9 +661,13 @@ def test_add_menu_databricks_option_gated_on_extra(monkeypatch) -> None:
         "Requires the Databricks extra — select for the install command."
     )
 
-    # With the SDK present (the dev/CI env — no patch), the description
-    # explains the routing instead of demanding an install.
-    monkeypatch.undo()
+    # With the SDK present, the description explains the routing instead of
+    # demanding an install. Explicitly mock to return True since the SDK might
+    # not be installed in the test environment (it's now an optional extra).
+    monkeypatch.setattr(
+        "omnigent.onboarding.configure_models.databricks_sdk_installed",
+        lambda: True,
+    )
     options = add_menu_options()
     databricks = next(o for o in options if o.label.endswith("Databricks — workspace"))
     assert "Unity AI Gateway" in databricks.description
@@ -1737,6 +1751,7 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
     expected = [
         "Claude",
         "Codex",
+        "Genie",
         "Cursor",
         "OpenCode",
         "Hermes",
@@ -1771,6 +1786,27 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
     for row in expected:
         assert row in rendered
     assert "more" not in rendered.lower()
+
+
+def test_overview_genie_row_appears_at_position_3(isolated_config, monkeypatch) -> None:
+    """The Genie row appears at position 3 (right after Codex) in the overview.
+
+    Genie is Databricks' fork of the Codex CLI, shares the OpenAI-family
+    provider, and drilling into it manages that shared provider (same as Codex).
+    This test verifies the row appears in the correct position and that selecting
+    it routes to the OpenAI-family provider manager.
+    """
+    called: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.cli_config._manage_harness_providers",
+        lambda *a, **k: called.append(a[0] if a else None),
+    )
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="3\nq\n")
+    assert result.exit_code == 0, result.output
+    # Selecting position 3 (Genie) routes to _manage_harness_providers with
+    # OPENAI_FAMILY, the shared provider family with Codex.
+    assert called == ["openai"], f"Expected ['openai'] but got {called}"
 
 
 def test_overview_lists_configured_acp_agents_as_rows(isolated_config, monkeypatch) -> None:
@@ -1911,7 +1947,7 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["15", "", "", "q"]) + "\n"
+    stdin = "\n".join(["16", "", "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1933,7 +1969,7 @@ def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) 
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["15", "", str(selected), "", "q"]) + "\n"
+    stdin = "\n".join(["16", "", str(selected), "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1950,7 +1986,7 @@ def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
     selected = isolated_config / "package.json"
     selected.write_text('{"name": "unrelated"}', encoding="utf-8")
 
-    stdin = "\n".join(["15", "", str(selected), "2", "q"]) + "\n"
+    stdin = "\n".join(["16", "", str(selected), "2", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -2034,7 +2070,7 @@ def test_missing_cursor_cli_drillin_shows_install_and_login(isolated_config, mon
         lambda key: key != "cursor",
     )
 
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="3\n1\nq\nq\n")
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="4\n1\nq\nq\n")
 
     assert result.exit_code == 0, result.output
     assert "curl https://cursor.com/install -fsS | bash" in result.output
@@ -2137,18 +2173,18 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
 @pytest.mark.parametrize(
     "choice,manager_attr",
     [
-        ("4", "_manage_opencode_harness"),
-        ("5", "_manage_hermes_harness"),
-        ("8", "_manage_qwen_harness"),
-        ("9", "_manage_goose_harness"),
-        # 10-11 are the builtin ACP CLI rows (Devin, Grok Build — sorted by id);
+        ("5", "_manage_opencode_harness"),
+        ("6", "_manage_hermes_harness"),
+        ("9", "_manage_qwen_harness"),
+        ("10", "_manage_goose_harness"),
+        # 11-12 are the builtin ACP CLI rows (Devin, Grok Build — sorted by id);
         # every row after them shifted down by two when that block landed.
-        ("10", "_show_acp_cli_harness"),
         ("11", "_show_acp_cli_harness"),
-        ("12", "_manage_copilot_harness"),
-        ("13", "_manage_kiro_harness"),
-        ("14", "_manage_kimi_harness"),
-        ("16", "_add_acp_agent"),
+        ("12", "_show_acp_cli_harness"),
+        ("13", "_manage_copilot_harness"),
+        ("14", "_manage_kiro_harness"),
+        ("15", "_manage_kimi_harness"),
+        ("17", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(
@@ -2439,9 +2475,9 @@ def test_configure_harnesses_pi_page_sets_explicit_pi_default(isolated_config) -
             f,
         )
 
-    # L1 6=Pi → L2 (1=anthropic 2=openai 3=+Add): select openai (2) → L3
+    # L1 7=Pi → L2 (1=anthropic 2=openai 3=+Add): select openai (2) → L3
     # 1=Make default for Pi → back to L2 q=back → L1 q=exit.
-    stdin = "\n".join(["6", "2", "1", "q", "q"]) + "\n"
+    stdin = "\n".join(["7", "2", "1", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2491,9 +2527,9 @@ def test_configure_harnesses_pi_page_excludes_subscription_rows(isolated_config)
             f,
         )
 
-    # L1 6=Pi → L2 renders its rows → q=back → L1 q=exit. The L2 frame is
+    # L1 7=Pi → L2 renders its rows → q=back → L1 q=exit. The L2 frame is
     # cleared on exit under a TTY but the numbered fallback echoes options.
-    stdin = "\n".join(["6", "q", "q"]) + "\n"
+    stdin = "\n".join(["7", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2539,8 +2575,8 @@ def test_configure_harnesses_add_databricks_under_pi_scopes_to_pi(
     # Databricks position within the Pi add menu, computed live.
     pi_opts = add_menu_options_for_family(PI_SURFACE)
     db = next(i for i, o in enumerate(pi_opts) if o.kind == DATABRICKS_KIND) + 1
-    # L1 6=Pi → L2 1=+Add → add menu <db>=Databricks → URL → q → q.
-    stdin = "\n".join(["6", "1", str(db), "https://example.cloud.databricks.com", "q", "q"]) + "\n"
+    # L1 7=Pi → L2 1=+Add → add menu <db>=Databricks → URL → q → q.
+    stdin = "\n".join(["7", "1", str(db), "https://example.cloud.databricks.com", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2792,7 +2828,7 @@ def test_cursor_set_api_key_paste_writes_block_and_secret(
     config) and the config references it via ``keychain:cursor``.
     """
     # L1 Cursor → Cursor SDK → Set API key → paste key → back through both menus.
-    stdin = "\n".join(["3", "2", "1", "crsr_test_key_123", "q", "q", "q"]) + "\n"
+    stdin = "\n".join(["4", "2", "1", "crsr_test_key_123", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2813,7 +2849,7 @@ def test_cursor_adopt_env_api_key_writes_env_ref(
     """
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_env_key_456")
     # L1 Cursor → Cursor SDK → Set API key → adopt detected env key → back.
-    stdin = "\n".join(["3", "2", "1", "y", "q", "q", "q"]) + "\n"
+    stdin = "\n".join(["4", "2", "1", "y", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2833,7 +2869,7 @@ def test_cursor_remove_api_key_drops_block_and_secret(
         yaml.safe_dump({"cursor": {"api_key_ref": "keychain:cursor"}}, f)
 
     # L1 Cursor → Cursor SDK → Remove → back through both menus.
-    stdin = "\n".join(["3", "2", "2", "q", "q", "q"]) + "\n"
+    stdin = "\n".join(["4", "2", "2", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2851,7 +2887,7 @@ def test_cursor_set_api_key_non_crsr_declined_is_not_stored(
     both the secret store and the config untouched.
     """
     # L1 Cursor → Cursor SDK → Set → decline the non-crsr_ warning → back.
-    stdin = "\n".join(["3", "2", "1", "sk-not-a-cursor-key", "n", "q", "q", "q"]) + "\n"
+    stdin = "\n".join(["4", "2", "1", "sk-not-a-cursor-key", "n", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2904,7 +2940,7 @@ def test_cursor_drillin_offers_install_when_sdk_missing(
     through to the key menu, then backs out.
     """
     # Cursor → Cursor SDK → show command → back through both menus.
-    stdin = "\n".join(["3", "2", "3", "q", "q", "q"]) + "\n"
+    stdin = "\n".join(["4", "2", "3", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
     out = result.output
@@ -2920,7 +2956,7 @@ def test_cursor_key_settable_when_sdk_missing(isolated_config, _cursor_sdk_absen
     choice 2), then sets the key — which must persist as it does with the SDK.
     """
     # Cursor → Cursor SDK → set key anyway → Set → paste key → back.
-    stdin = "\n".join(["3", "2", "2", "1", "crsr_key_no_sdk", "q", "q", "q"]) + "\n"
+    stdin = "\n".join(["4", "2", "2", "1", "crsr_key_no_sdk", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2950,7 +2986,7 @@ def test_cursor_install_now_invokes_runner_without_index(
     monkeypatch.setattr("omnigent.onboarding.cursor_auth.subprocess.run", _run)
 
     # Cursor → Cursor SDK → install now → back through both menus.
-    stdin = "\n".join(["3", "2", "1", "q", "q", "q"]) + "\n"
+    stdin = "\n".join(["4", "2", "1", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2996,9 +3032,9 @@ def test_antigravity_set_api_key_paste_writes_block_and_secret(
     Proves the api-key path: the secret lands in the store (never plaintext in
     config) and the config references it via ``keychain:antigravity``.
     """
-    # L1 7=Antigravity → antigravity menu 1=Set API key →
+    # L1 8=Antigravity → antigravity menu 1=Set API key →
     # paste key (AIza → no warn) → antigravity menu q=back → L1 q=quit.
-    stdin = "\n".join(["7", "1", "AIza_test_key_123", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "1", "AIza_test_key_123", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3018,9 +3054,9 @@ def test_antigravity_adopt_env_api_key_writes_env_ref(
     at the live environment variable so the key never leaves the user's shell.
     """
     monkeypatch.setenv("GEMINI_API_KEY", "AIza_env_key_456")
-    # L1 7=Antigravity → 1=Set API key →
+    # L1 8=Antigravity → 1=Set API key →
     # "y" adopt detected $GEMINI_API_KEY → q back → q quit.
-    stdin = "\n".join(["7", "1", "y", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "1", "y", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3036,11 +3072,11 @@ def test_antigravity_sign_in_runs_agy_auth_service(
     login = Mock(return_value=True)
     monkeypatch.setattr("omnigent.onboarding.harness_install.harness_login", login)
 
-    # L1 7=Antigravity → 2=Sign in → q back → q quit.
+    # L1 8=Antigravity → 2=Sign in → q back → q quit.
     result = CliRunner().invoke(
         cli,
         ["setup", "--no-internal-beta"],
-        input="\n".join(["7", "2", "q", "q"]) + "\n",
+        input="\n".join(["8", "2", "q", "q"]) + "\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -3061,7 +3097,7 @@ def test_antigravity_sign_in_skips_sdk_install_prompt(isolated_config, monkeypat
     result = CliRunner().invoke(
         cli,
         ["setup", "--no-internal-beta"],
-        input="\n".join(["7", "2", "q", "q"]) + "\n",
+        input="\n".join(["8", "2", "q", "q"]) + "\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -3079,9 +3115,9 @@ def test_antigravity_remove_api_key_drops_block_and_secret(
     with open(config_path, "w") as f:
         yaml.safe_dump({"antigravity": {"api_key_ref": "keychain:antigravity"}}, f)
 
-    # L1 7=Antigravity → antigravity menu (key set:
+    # L1 8=Antigravity → antigravity menu (key set:
     # 1=Replace 2=Remove 3=Back) → 2=Remove → q back → q quit.
-    stdin = "\n".join(["7", "2", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "2", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3106,9 +3142,9 @@ def test_antigravity_remove_does_not_delete_foreign_keychain_secret(
     with open(config_path, "w") as f:
         yaml.safe_dump({"antigravity": {"api_key_ref": "keychain:shared-gemini"}}, f)
 
-    # L1 7=Antigravity → antigravity menu 2=Remove →
+    # L1 8=Antigravity → antigravity menu 2=Remove →
     # q back → q quit.
-    stdin = "\n".join(["7", "2", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "2", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3126,9 +3162,9 @@ def test_antigravity_set_api_key_non_aiza_declined_is_not_stored(
     The soft prefix check warns and asks to store anyway; declining must leave
     both the secret store and the config untouched.
     """
-    # L1 7=Antigravity → 1=Set API key →
+    # L1 8=Antigravity → 1=Set API key →
     # paste non-AIza key → "n" decline warning → q back → q quit.
-    stdin = "\n".join(["7", "1", "sk-not-a-gemini-key", "n", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "1", "sk-not-a-gemini-key", "n", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3223,17 +3259,17 @@ def test_copilot_overview_install_command_is_selection_only(
     "choice,sdk_probe,unexpected_header",
     [
         (
-            "3\n2",
+            "4\n2",
             "omnigent.onboarding.cursor_auth.cursor_sdk_installed",
             "Cursor — no API key yet",
         ),
         (
-            "7",
+            "8",
             "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed",
             "Antigravity — no Gemini API key yet",
         ),
         (
-            "10",
+            "13",
             "omnigent.onboarding.copilot_auth.copilot_sdk_installed",
             "Copilot — no GitHub token yet",
         ),
@@ -3265,9 +3301,9 @@ def test_antigravity_drillin_offers_install_when_sdk_missing(
     The user picks "show the command" (choice 3), which prints the command and falls
     through to the key menu, then backs out.
     """
-    # L1 7=Antigravity → install offer 3=show command →
+    # L1 8=Antigravity → install offer 3=show command →
     # key menu q=back → L1 q.
-    stdin = "\n".join(["7", "3", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "3", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
     out = result.output
@@ -3284,9 +3320,9 @@ def test_antigravity_key_settable_when_sdk_missing(
     gate key management on it. The user declines ("set the key anyway" = choice 2),
     then sets the key, which must persist as it does with the SDK present.
     """
-    # L1 7=Antigravity → install offer 2=set key anyway →
+    # L1 8=Antigravity → install offer 2=set key anyway →
     # key menu 1=Set → paste AIza key → key menu q=back → L1 q=quit.
-    stdin = "\n".join(["7", "2", "1", "AIza_key_no_sdk", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "2", "1", "AIza_key_no_sdk", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3315,9 +3351,9 @@ def test_antigravity_install_now_invokes_runner_without_index(
     monkeypatch.setattr("omnigent.onboarding.extra_install.shutil.which", lambda name: None)
     monkeypatch.setattr("omnigent.onboarding.antigravity_auth.subprocess.run", _run)
 
-    # L1 7=Antigravity → install offer 1=install now →
+    # L1 8=Antigravity → install offer 1=install now →
     # key menu q=back → L1 q.
-    stdin = "\n".join(["7", "1", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "1", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3371,8 +3407,8 @@ def test_configure_harnesses_add_other_key_no_remaining_providers_aborts_cleanly
     monkeypatch.setattr("omnigent.onboarding.configure_models.other_key_providers", list)
 
     other = _other_key_add_menu_index(PI_SURFACE)
-    # L1 6=Pi → L2 1=+Add → add menu <other>=Other provider — API key → L2 q=back → L1 q=exit.
-    stdin = "\n".join(["6", "1", str(other), "q", "q"]) + "\n"
+    # L1 7=Pi → L2 1=+Add → add menu <other>=Other provider — API key → L2 q=back → L1 q=exit.
+    stdin = "\n".join(["7", "1", str(other), "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     # Pre-fix this exited non-zero with a ValueError; the guard makes it graceful.
