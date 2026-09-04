@@ -9,9 +9,11 @@ import { useProjects } from "@/hooks/useConversations";
  */
 export function ProjectRowIcon({ icon }: { icon?: string | null }) {
   return icon ? (
+    // Emoji advance-widths vary per glyph; a fixed centered box keeps the
+    // trailing label's left edge aligned with the folder-fallback rows.
     <span
       aria-hidden="true"
-      className="shrink-0 text-[14px] leading-none"
+      className="inline-flex size-3.5 shrink-0 items-center justify-center text-[14px] leading-none"
       data-testid="project-icon"
     >
       {icon}

@@ -516,12 +516,13 @@ export function AppShell() {
     (isChildSession ? parentSession?.title : activeSession?.title) ||
     (breadcrumbConv ? conversationDisplayLabel(breadcrumbConv) : null) ||
     (isChildSession ? UNTITLED_CONVERSATION_LABEL : null);
+  const headerProjectSummary =
+    breadcrumbConv?.project_id != null
+      ? projectSummaries?.find((p) => p.id === breadcrumbConv.project_id)
+      : undefined;
   const headerProjectName =
-    (breadcrumbConv?.project_id != null
-      ? projectSummaries?.find((p) => p.id === breadcrumbConv.project_id)?.name
-      : undefined) ??
-    breadcrumbConv?.labels?.[PROJECT_LABEL_KEY] ??
-    null;
+    headerProjectSummary?.name ?? breadcrumbConv?.labels?.[PROJECT_LABEL_KEY] ?? null;
+  const headerProjectIcon = headerProjectSummary?.icon ?? null;
   const headerTitleLinkTo =
     isChildSession && activeSession?.parentSessionId
       ? `/c/${activeSession.parentSessionId}`
@@ -1955,6 +1956,7 @@ export function AppShell() {
                   actionConversation={actionConversation}
                   conversationTitle={headerConversationTitle}
                   projectName={headerProjectName}
+                  projectIcon={headerProjectIcon}
                   titleLinkTo={headerTitleLinkTo}
                   boundAgent={boundAgent}
                   wrapperLabel={wrapperLabel}
