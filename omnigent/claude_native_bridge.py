@@ -3174,10 +3174,8 @@ def inject_user_message(
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
-        invocation fails, if the paste draft was never confirmed in the
-        input box after ``_PASTE_COMMIT_TIMEOUT_S`` (the TUI was still
-        consuming the paste — message not submitted), or if the draft
-        never leaves the input box after repeated submit Enters.
+        invocation fails, or if the draft never leaves the input box
+        after repeated submit Enters (message not delivered).
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # A surface left occupying the composer swallows everything typed
@@ -3239,21 +3237,24 @@ def inject_user_message(
     # into a paste; an Enter that arrives while it is still consuming
     # the paste becomes a newline inside the draft instead of a submit,
     # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic.
-    # The draft-visibility poll is best-effort, not a gate: large or
-    # multi-line pastes render as a collapsed ``[Pasted text]`` placeholder
-    # whose glyph row may not match the needle within the window, so a
-    # timeout here does not mean the paste failed. Fall through to submit
-    # regardless — the submit-verify loop below re-sends Enter while the
-    # draft is still visible and surfaces a genuine non-delivery.
+    # load / large payloads); polling is deterministic. Best-effort:
+    # when the draft never becomes identifiable (e.g. whitespace-only
+    # first line, custom statusline containing the glyph), fall through
+    # after the timeout and submit blind, matching the old behavior.
     needle = _submit_needle(content)
+    draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
         if _draft_in_input_box(_capture_pane(info["socket_path"], info["tmux_target"]), needle):
+            draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+    if not draft_seen:
+        # The draft was never observed, so its absence proves nothing —
+        # verification would trivially "pass". Submit blind as before.
+        return
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
