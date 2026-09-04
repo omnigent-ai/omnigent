@@ -227,6 +227,8 @@ OMNIGENT_ENDPOINTS: list[tuple[str, str, bool]] = [
     ("GET", "/v1/runners/{runner_id}/status", True),
     # Internal (hidden from the public schema).
     ("POST", "/v1/sessions/{session_id}/events", False),
+    # Session attachment uploads (public schema).
+    ("POST", "/v1/sessions/{session_id}/resources/files", True),
     ("POST", "/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve", False),
     # Device-grant login (oauth.py, accounts mode): authorize starts the grant;
     # /oauth/token both polls for the device-code token AND refreshes;
