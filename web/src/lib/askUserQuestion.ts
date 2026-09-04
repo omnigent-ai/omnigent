@@ -29,11 +29,18 @@
  * renaming. ``description`` and ``label`` are required in Claude's
  * wire format; ``preview`` is an optional longer/alternative
  * snippet some Claude builds attach for richer rendering.
+ *
+ * ``recommended`` is an Omnigent-only extension — it does not exist in
+ * Claude Code's own AskUserQuestion contract. Set by the cross-harness
+ * ``sys_ask_user_question`` builtin tool (see
+ * ``omnigent/tools/builtins/ask_user_question.py``) to mark the
+ * suggested default; the form pre-selects it and shows a badge.
  */
 export interface ClaudeQuestionOption {
   label: string;
   description?: string;
   preview?: string;
+  recommended?: boolean;
 }
 
 /**
@@ -142,6 +149,9 @@ export function parseAskUserQuestionPreview(preview: string): AskUserQuestionPay
       };
       if (typeof optionPreview === "string" && optionPreview) {
         option.preview = optionPreview;
+      }
+      if (optRec.recommended === true) {
+        option.recommended = true;
       }
       options.push(option);
     }

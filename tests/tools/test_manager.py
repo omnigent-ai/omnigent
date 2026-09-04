@@ -1374,3 +1374,45 @@ def test_read_skill_file_registered_for_root_level_resources(tmp_path: Path) -> 
     )
 
     assert any_skill_has_resources([skill]) is True
+
+
+# ── sys_ask_user_question: spec-gated registration ───────────────
+
+
+def test_sys_ask_user_question_not_registered_without_opt_in() -> None:
+    """A bare spec (no ``tools.builtins`` entry) does not register the tool.
+
+    Unlike the always-on ``browser_*`` family, ``sys_ask_user_question`` is
+    spec-gated / user-enablable — an agent must opt in via
+    ``tools.builtins``.
+    """
+    mgr = ToolManager(_make_spec())
+    assert mgr.get_tool("sys_ask_user_question") is None
+
+
+def test_sys_ask_user_question_registered_and_schema_exposed_when_declared() -> None:
+    """Declaring the builtin registers it and surfaces its schema.
+
+    This is the generic pickup path every SDK-track executor (claude-sdk,
+    codex, pi, openai-agents-sdk) reads tool definitions from
+    (``ToolManager(spec).get_tool_schemas()``) — no harness-specific
+    wiring needed once the tool is registered here.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="sys_ask_user_question")]),
+    )
+    mgr = ToolManager(spec)
+    tool = mgr.get_tool("sys_ask_user_question")
+    assert tool is not None
+
+    schemas = mgr.get_tool_schemas()
+    matching = [s for s in schemas if s["function"]["name"] == "sys_ask_user_question"]
+    assert len(matching) == 1
+    params = matching[0]["function"]["parameters"]
+    questions_schema = params["properties"]["questions"]
+    assert questions_schema["minItems"] == 1
+    assert questions_schema["maxItems"] == 4
+    option_schema = questions_schema["items"]["properties"]["options"]["items"]
+    assert "recommended" in option_schema["properties"]
+    assert option_schema["properties"]["recommended"]["type"] == "boolean"

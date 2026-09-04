@@ -435,6 +435,24 @@ _BROWSER_TIMEOUT_ERROR = (
     '{"error": "browser action timed out — is the session open in the Omnigent desktop app?"}'
 )
 
+# Cross-harness builtin: pause the turn and ask the human 1-4 structured
+# questions. Execution lives HERE (not in Tool.invoke) for the same reason as
+# ``_BROWSER_TOOLS`` — the elicitation protocol needs the runner's
+# ``server_client`` to POST a blocking request to the server, and
+# ``ToolContext`` carries none. See omnigent/tools/builtins/ask_user_question.py
+# for the schema-only class and omnigent/server/routes/_ask_user_question.py
+# for the request/response shaping that reuses the platform's existing
+# elicitation engine end to end.
+_ASK_USER_QUESTION_TOOLS = frozenset({"sys_ask_user_question"})
+
+# Runner-side outer HTTP read timeout for the ask_user_question POST. Held at
+# one day — matching ``omnigent.spec.types.DEFAULT_ASK_TIMEOUT`` and the same
+# ``_ASK_GATE_DELIVERY_TIMEOUT`` rationale in omnigent/runner/app.py — so the
+# POST WAITS for the server's real verdict instead of severing the parked
+# elicitation at a short read timeout. Fast connect (30s) so an unreachable
+# server still fails out promptly.
+_ASK_USER_QUESTION_TIMEOUT = httpx.Timeout(86400.0, connect=30.0)
+
 # Builtin tools the claude-native / codex-native relay advertises to the
 # real CLI, beyond the always-relayed ``sys_os_*`` family. Native harnesses
 # ignore the harness ``tools`` list, so the relay is their ONLY tool
@@ -478,6 +496,11 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # what discovers host-scope skills (``.agents/skills`` and friends), and a
     # native session's only tool surface is this relay.
     | _SKILL_TOOLS
+    # sys_ask_user_question must ride the native relay too: native harnesses
+    # ignore ``request.tools`` entirely, so without this union member the
+    # tool is invisible to claude-native, codex-native, opencode-native,
+    # cursor-native, hermes-native, and antigravity-native sessions.
+    | _ASK_USER_QUESTION_TOOLS
 )
 
 
@@ -3850,6 +3873,55 @@ async def _execute_browser_tool(
     return resp.text
 
 
+async def _execute_ask_user_question_tool(
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+) -> str:
+    """
+    Runner-local handler for ``sys_ask_user_question``.
+
+    Does the blocking round-trip that reuses the platform's existing
+    elicitation engine end to end: POST ``/v1/sessions/{conversation_id}/
+    ask_user_question`` with the tool call's raw ``{"questions": [...]}``
+    arguments and return the server's reconstructed JSON response verbatim
+    as the tool output. The server validates the questions, publishes a
+    ``response.elicitation_request`` event (the same one every other
+    harness ASK gate publishes), and parks until a human answers or the
+    request times out — so this POST stays open for as long as that takes,
+    up to one day (:data:`_ASK_USER_QUESTION_TIMEOUT`).
+
+    Mirrors the ``server_client.post`` pattern in :func:`_execute_browser_tool`,
+    with a read budget sized for a human response instead of a live renderer.
+
+    :param args: Parsed tool arguments from the LLM, e.g.
+        ``{"questions": [{"question": "...", "header": "...",
+        "options": [...], "multiSelect": False}]}``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: Current session id, e.g. ``"conv_abc123"``.
+    :returns: The server's reconstructed answer JSON, or an error JSON.
+    """
+    if server_client is None:
+        return json.dumps({"error": "sys_ask_user_question requires server access"})
+    if conversation_id is None:
+        return json.dumps({"error": "sys_ask_user_question requires a session id"})
+
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{conversation_id}/ask_user_question",
+            json=args,
+            timeout=_ASK_USER_QUESTION_TIMEOUT,
+        )
+    except httpx.HTTPError as exc:
+        return json.dumps({"error": f"sys_ask_user_question failed: {type(exc).__name__}: {exc}"})
+    if resp.status_code >= 400:
+        return json.dumps(
+            {"error": f"sys_ask_user_question returned {resp.status_code}: {resp.text[:500]}"}
+        )
+    return resp.text
+
+
 async def _execute_policy_tool(
     tool_name: str,
     arguments: str,
@@ -5961,6 +6033,12 @@ async def execute_tool(
         elif tool_name in _BROWSER_TOOLS:
             output = await _execute_browser_tool(
                 tool_name,
+                args,
+                server_client=server_client,
+                conversation_id=conversation_id,
+            )
+        elif tool_name in _ASK_USER_QUESTION_TOOLS:
+            output = await _execute_ask_user_question_tool(
                 args,
                 server_client=server_client,
                 conversation_id=conversation_id,

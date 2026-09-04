@@ -82,16 +82,47 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
+/**
+ * The label of the option marked ``recommended``, or ``null`` when none is.
+ *
+ * ``recommended`` is an Omnigent-only extension (see
+ * ``@/lib/askUserQuestion``'s ``ClaudeQuestionOption`` doc) — at most one
+ * option per question should carry it. Used to pre-select a sensible
+ * default so the human can just hit Submit when the suggestion is fine.
+ */
+function recommendedLabel(question: ClaudeQuestion): string | null {
+  return question.options.find((opt) => opt.recommended === true)?.label ?? null;
+}
+
+/** Small pill marking an option as the ``sys_ask_user_question`` caller's suggested default. */
+function RecommendedBadge() {
+  return (
+    <span
+      className="text-success text-sm font-medium rounded bg-muted px-1.5 py-0.5"
+      data-testid="ask-user-question-recommended-badge"
+    >
+      Recommended
+    </span>
+  );
+}
+
 export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQuestionFormProps) {
   // Currently-visible question (carousel index).
   const [currentIndex, setCurrentIndex] = useState(0);
 
   // Per-question option selection. Single-select stores a string;
-  // multi-select stores a deduped array.
+  // multi-select stores a deduped array. Pre-seeded with the
+  // ``recommended`` option (if any) so the human can accept the
+  // suggested default with just a Submit click.
   const [selections, setSelections] = useState<Record<string, string | string[]>>(() => {
     const initial: Record<string, string | string[]> = {};
     for (const q of questions) {
-      initial[questionKey(q)] = q.multiSelect ? [] : "";
+      const recommended = recommendedLabel(q);
+      initial[questionKey(q)] = q.multiSelect
+        ? recommended
+          ? [recommended]
+          : []
+        : (recommended ?? "");
     }
     return initial;
   });
@@ -259,7 +290,10 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
                     className="mt-1"
                   />
                   <span className="flex flex-col">
-                    <span>{opt.label}</span>
+                    <span className="flex items-center gap-1.5">
+                      {opt.label}
+                      {opt.recommended && <RecommendedBadge />}
+                    </span>
                     {opt.description && (
                       <span className="text-muted-foreground text-sm">{opt.description}</span>
                     )}
@@ -284,7 +318,10 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
                   className="mt-1"
                 />
                 <span className="flex flex-col">
-                  <span>{opt.label}</span>
+                  <span className="flex items-center gap-1.5">
+                    {opt.label}
+                    {opt.recommended && <RecommendedBadge />}
+                  </span>
                   {opt.description && (
                     <span className="text-muted-foreground text-sm">{opt.description}</span>
                   )}

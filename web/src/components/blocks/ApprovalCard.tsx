@@ -11,11 +11,17 @@
 //     actions — see `ExitPlanModeReview`.
 //
 //   - **AskUserQuestion form** — when the elicitation carries a
-//     structured `askUserQuestion` payload (the PermissionRequest
-//     endpoint stamps this when the gated tool is Claude's built-in
-//     AskUserQuestion). Renders a multi-question form with radio
-//     inputs for single-select, checkboxes for multi-select. Submit
-//     posts the gathered answers as `content.answers`.
+//     structured `askUserQuestion` payload. Two producers stamp this:
+//     the PermissionRequest endpoint (when the gated tool is Claude's
+//     built-in AskUserQuestion) and the cross-harness
+//     `sys_ask_user_question` builtin tool (any harness — see
+//     `omnigent/server/routes/_ask_user_question.py`), which adds one
+//     field Claude's own tool doesn't have: `recommended` on an
+//     option, marking the suggested default. `AskUserQuestionForm`
+//     pre-selects that option and shows a "Recommended" badge. Renders
+//     a multi-question form with radio inputs for single-select,
+//     checkboxes for multi-select. Submit posts the gathered answers
+//     as the flat `content` map (MCP `ElicitResult.content` shape).
 //
 //   - **Option buttons** — when `requestedSchema` is
 //     `{properties: {answer: {enum: [...]}}}`. Currently no

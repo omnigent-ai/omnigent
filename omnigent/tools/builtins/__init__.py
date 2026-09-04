@@ -30,6 +30,7 @@ from omnigent.tools.builtins.agents import (
     SysAgentGetTool,
     SysAgentListTool,
 )
+from omnigent.tools.builtins.ask_user_question import SysAskUserQuestionTool
 from omnigent.tools.builtins.async_inbox import (
     SysCallAsyncTool,
     SysCancelAsyncTool,
@@ -84,6 +85,7 @@ __all__ = [
     "SysAgentDownloadTool",
     "SysAgentGetTool",
     "SysAgentListTool",
+    "SysAskUserQuestionTool",
     "SysCallAsyncTool",
     "SysCancelAsyncTool",
     "SysListModelsTool",
@@ -184,6 +186,17 @@ def _create_export_agent(config: dict[str, str]) -> Tool:
     return ExportAgentTool()
 
 
+def _create_ask_user_question(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for SysAskUserQuestionTool.
+
+    :param config: Tool config (unused — the tool takes no spec-level
+        config; every field it needs comes from the per-call arguments).
+    :returns: A SysAskUserQuestionTool instance.
+    """
+    return SysAskUserQuestionTool()
+
+
 def _hindsight_available() -> bool:
     """
     Return ``True`` if the optional ``hindsight-client`` SDK is installed.
@@ -257,6 +270,13 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,
     "export_agent": _create_export_agent,
+    # Schema-only — execution is runner-dispatched (see
+    # ``_ASK_USER_QUESTION_TOOLS`` in omnigent/runner/tool_dispatch.py),
+    # like ``browser_*``, because it needs the runner's ``server_client``
+    # to publish/park a session elicitation. Registered with a factory
+    # (not ``None``) so it stays spec-gated / user-enablable via
+    # ``tools.builtins`` rather than auto-registered for every agent.
+    "sys_ask_user_question": _create_ask_user_question,
     # Framework-owned: need runtime context. ``web_fetch`` is
     # constructed by ToolManager before reaching this registry.
     # ``list_comments`` and ``update_comment`` are auto-registered by

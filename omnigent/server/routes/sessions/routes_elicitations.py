@@ -27,6 +27,11 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     AuthProvider,
 )
+from omnigent.server.routes._ask_user_question import (
+    build_ask_user_question_params,
+    reconstruct_ask_user_question_output,
+    validate_ask_user_question_questions,
+)
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -43,11 +48,13 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_pending_policy_ask_writes,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _publish_and_wait_for_harness_elicitation,
     _resolve_elicitation,
 )
 from omnigent.server.schemas import (
     ElicitationResult,
 )
+from omnigent.spec.types import DEFAULT_ASK_TIMEOUT
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
@@ -129,6 +136,61 @@ def register_elicitations_routes(
             session_id, conv, conversation_store, agent_store, _resolve_data
         )
         return {"queued": False}
+
+    @router.post(
+        "/sessions/{session_id}/ask_user_question",
+        # Internal builtin-tool dispatch flow — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def ask_user_question(
+        request: Request,
+        session_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Run one ``sys_ask_user_question`` builtin-tool call end to end.
+
+        Runner-invoked (see the ``_ASK_USER_QUESTION_TOOLS`` branch of
+        ``execute_tool()`` in ``omnigent/runner/tool_dispatch.py``), not
+        reachable by the LLM directly. Validates the tool call's
+        ``questions`` argument, publishes a
+        ``response.elicitation_request`` through the SAME elicitation
+        engine every other harness ASK gate uses (
+        :func:`_publish_and_wait_for_harness_elicitation` — no bespoke
+        plumbing), and blocks until a human answers, declines, or the
+        request times out (one day, matching the platform's
+        :data:`~omnigent.spec.types.DEFAULT_ASK_TIMEOUT`). The verdict is
+        reconstructed into the tool's rich, Claude-Code-shaped return
+        value by :func:`~omnigent.server.routes._ask_user_question.reconstruct_ask_user_question_output`.
+
+        :param request: The inbound request, used for identity extraction
+            and upstream-disconnect detection inside the parking helper.
+        :param session_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :param body: ``{"questions": [...]}`` — the tool call's raw
+            arguments, per Claude Code's ``AskUserQuestionInput`` contract
+            plus the platform's ``recommended`` option extension.
+        :returns: ``{"questions": [...], "answers": {...}}`` (optionally
+            with ``response``) on a normal accept, or ``{"questions": [...],
+            "answers": {}, "error": "..."}`` on decline / cancel / timeout.
+        :raises OmnigentError: 400 if ``questions`` doesn't satisfy the
+            1-4 questions / 2-4 options contract; 404 if no session exists.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        questions = validate_ask_user_question_questions(body.get("questions"))
+        params = build_ask_user_question_params(questions)
+        result = await _publish_and_wait_for_harness_elicitation(
+            request,
+            session_id=session_id,
+            params=params,
+            timeout_s=float(DEFAULT_ASK_TIMEOUT),
+            conversation_store=conversation_store,
+        )
+        return reconstruct_ask_user_question_output(questions, result)
 
     @router.get(
         "/sessions/{session_id}/elicitations/{elicitation_id}",

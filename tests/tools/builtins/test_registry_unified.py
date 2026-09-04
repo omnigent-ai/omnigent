@@ -122,6 +122,13 @@ def test_builtin_names_size_matches_registry() -> None:
                 "download_file",
                 "search_conversations",
                 "export_agent",
+                # Cross-harness question tool: schema-only Tool class
+                # (like browser_*), but INSTANTIABLE (factory present) —
+                # spec-gated / user-enablable via `tools.builtins`, not
+                # auto-registered for every agent. Execution is
+                # runner-dispatched via the _ASK_USER_QUESTION_TOOLS
+                # branch in runner/tool_dispatch.py.
+                "sys_ask_user_question",
                 # Hindsight long-term memory tools (optional `hindsight`
                 # extra; factories probe for hindsight-client).
                 "hindsight_retain",
