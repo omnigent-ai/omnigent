@@ -390,6 +390,7 @@ export const InlineComposerEditor = forwardRef<
         "aria-multiline": "true",
         "aria-label": ariaLabel,
         ...(testId ? { "data-testid": testId } : {}),
+        placeholder,
         "data-placeholder": placeholder,
         class: `block ${editorClassName} overflow-y-auto whitespace-pre-wrap break-words px-4 pt-3 pb-2 outline-none [scrollbar-width:none] [&::-webkit-scrollbar]:hidden`,
       },

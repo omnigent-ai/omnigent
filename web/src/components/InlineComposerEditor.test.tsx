@@ -12,6 +12,19 @@ function image(name: string): File {
 describe("InlineComposerEditor", () => {
   afterEach(cleanup);
 
+  it("exposes the placeholder on the editable element", () => {
+    const { getByPlaceholderText } = render(
+      <InlineComposerEditor
+        initialParts={[]}
+        onChange={() => {}}
+        ariaLabel="Message"
+        placeholder="Send a message…"
+      />,
+    );
+
+    expect(getByPlaceholderText("Send a message…")).toHaveAttribute("contenteditable", "true");
+  });
+
   it("inserts picked files at the visible caret", () => {
     const ref = createRef<InlineComposerEditorHandle>();
     let latest: ComposerDraftPart[] = [];
