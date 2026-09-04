@@ -452,7 +452,7 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _SDKState:
             state.got.append(name)
             return _SandboxRef(id=f"id-for-{name}", name=name)
 
-        def resume(self, name: str, *, workspace: str) -> None:
+        def start(self, name: str, *, workspace: str) -> None:
             state.resumed.append((name, workspace))
 
         def exec(
@@ -593,7 +593,7 @@ def test_client_execute_pins_sandbox_home(sdk: _SDKState) -> None:
 
 
 def test_client_resume_waits_ready_and_recaches_id(sdk: _SDKState) -> None:
-    """resume_sandbox drives the SDK resume, waits ready, refreshes the id.
+    """resume_sandbox drives the SDK start primitive, waits ready, refreshes the id.
 
     The resumed instance may carry a fresh opaque id, so subsequent execs
     must use the id reported by the post-resume readiness wait — without an
@@ -615,8 +615,8 @@ def test_client_resume_waits_ready_and_recaches_id(sdk: _SDKState) -> None:
 def test_client_resume_requires_sdk_support(
     sdk: _SDKState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An SDK predating sandbox resume surfaces an actionable upgrade hint."""
-    monkeypatch.delattr(sys.modules["openshell"].SandboxClient, "resume")
+    """An SDK predating ``SandboxClient.start`` surfaces an actionable upgrade hint."""
+    monkeypatch.delattr(sys.modules["openshell"].SandboxClient, "start")
     client = _OpenShellClient()
 
     with pytest.raises(click.ClickException, match="no sandbox resume primitive"):

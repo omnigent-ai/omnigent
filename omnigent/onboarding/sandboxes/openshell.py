@@ -283,22 +283,23 @@ class _OpenShellClient:
         """Resume a stopped sandbox in place and wait until it is ready again.
 
         The gateway delegates the actual restart to its compute driver; the
-        sandbox keeps its name and persistent volume. Gateways whose SDK
-        predates the sandbox resume primitive get an actionable error — the
-        server's wake path surfaces it without tearing the sandbox down.
+        sandbox keeps its name and persistent volume. The SDK names this
+        primitive ``SandboxClient.start`` (available from openshell 0.0.105);
+        an SDK predating it gets an actionable error — the server's wake path
+        surfaces it without tearing the sandbox down.
         """
-        resume = getattr(self._client, "resume", None)
-        if resume is None:
+        start = getattr(self._client, "start", None)
+        if start is None:
             raise click.ClickException(
                 f"Could not resume OpenShell sandbox '{name}': the installed "
-                "openshell SDK exposes no sandbox resume primitive. Upgrade the "
-                "openshell package (`uv pip install --upgrade 'omnigent[openshell]'`) "
-                "to a version whose gateway supports suspend/resume."
+                "openshell SDK exposes no sandbox resume primitive "
+                "(SandboxClient.start; requires openshell>=0.0.105). Upgrade the "
+                "openshell package (`uv pip install --upgrade 'omnigent[openshell]'`)."
             )
         ws = self._workspace
         self._guard(
             f"Could not resume OpenShell sandbox '{name}'",
-            lambda: resume(name, workspace=ws),
+            lambda: start(name, workspace=ws),
         )
         ready = self._guard(
             f"OpenShell sandbox '{name}' did not become ready after resume",
