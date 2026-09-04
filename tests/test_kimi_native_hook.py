@@ -163,16 +163,24 @@ def _capture_injection(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    ("verdict", "expected_key"),
-    [("allow", APPROVE_KEY), ("deny", DENY_KEY)],
+    ("verdict", "expected_keys"),
+    [
+        # Accept types the "approve once" digit; cancel (web dismiss, no
+        # server Escape) types the "reject" digit to close the menu.
+        ("accept", [APPROVE_KEY]),
+        ("cancel", [DENY_KEY]),
+        # An explicit web decline injects NOTHING: the server-forwarded Escape
+        # already answered kimi's menu, so a second keystroke would race it.
+        ("decline", []),
+    ],
 )
 def test_permission_request_injects_keystroke_for_verdict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     verdict: str,
-    expected_key: str,
+    expected_keys: list[str],
 ) -> None:
-    """A web Approve/Deny verdict is typed into kimi's prompt as the option digit."""
+    """Accept/cancel type an option digit; an explicit decline types nothing."""
     bridge_dir = _governed_bridge(tmp_path)
     _feed_stdin(
         monkeypatch,
@@ -205,7 +213,7 @@ def test_permission_request_injects_keystroke_for_verdict(
     assert body["elicitation_id"].startswith("elicit_kimi_")
     # The gated command reaches the card as the preview.
     assert "ls -la /tmp" in body["content_preview"]
-    assert keys == [expected_key]
+    assert keys == expected_keys
 
 
 def test_permission_request_omits_preview_without_tool_input(
@@ -219,7 +227,7 @@ def test_permission_request_omits_preview_without_tool_input(
     monkeypatch.setattr(
         kimi_native_hook,
         "_request_web_approval",
-        lambda url, headers, body: posted.append({"body": body}) or "allow",
+        lambda url, headers, body: posted.append({"body": body}) or "accept",
     )
     _capture_injection(monkeypatch)
 
@@ -367,9 +375,11 @@ def test_permission_request_ungoverned_no_request(
 @pytest.mark.parametrize(
     ("response", "expected"),
     [
-        ({"action": "accept"}, "allow"),
-        ({"action": "decline"}, "deny"),
-        ({"action": "cancel"}, "deny"),
+        # The action is returned verbatim so the caller can treat decline
+        # (server-Escaped) differently from cancel.
+        ({"action": "accept"}, "accept"),
+        ({"action": "decline"}, "decline"),
+        ({"action": "cancel"}, "cancel"),
         ({}, None),
         ({"action": "huh"}, None),
         ({"action": None}, None),
