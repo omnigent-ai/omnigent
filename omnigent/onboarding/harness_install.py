@@ -769,6 +769,10 @@ def harness_setup_hint(harness: str | None) -> str:
         elif spec.auth_hint:
             login = f", then {spec.auth_hint}"
         if install_key is not None:
+            resolution_errors: list[str] = []
+            _resolve_harness_cli_binary(install_key, spec, resolution_errors=resolution_errors)
+            if resolution_errors:
+                return resolution_errors[0]
             detected, required = harness_cli_version(install_key)
             if (
                 detected is not None
@@ -947,19 +951,27 @@ def _harness_cli_version_value_satisfies(spec: HarnessInstallSpec, version: str)
     return True
 
 
-def _resolve_harness_cli_binary(key: str, spec: HarnessInstallSpec) -> str | None:
+def _resolve_harness_cli_binary(
+    key: str,
+    spec: HarnessInstallSpec,
+    *,
+    resolution_errors: list[str] | None = None,
+) -> str | None:
     """Resolve the executable whose version gate applies for *key*."""
     path_binary = resolve_cli_binary(spec.binary)
     if key != KIMI_NATIVE_KEY or path_binary is None:
         return path_binary
 
+    # Native readiness must gate the exact executable launch will use, not PATH.
     from click import ClickException
 
     from omnigent.harnesses.kimi_native.main import resolve_kimi_executable
 
     try:
         return resolve_kimi_executable()
-    except ClickException:
+    except ClickException as exc:
+        if resolution_errors is not None:
+            resolution_errors.append(str(exc))
         return None
 
 
