@@ -3326,6 +3326,13 @@ def _build_host_daemon_env(
 
     env.pop(DISPATCH_TRACEPARENT_ENV_VAR, None)
     env.pop(DISPATCH_TRACESTATE_ENV_VAR, None)
+    # The background host runs with redirected stdout/stderr on Windows.
+    # Python otherwise uses the ANSI code page (commonly cp1252), and a
+    # normal Unicode status message such as "✓ Connected" tears down its
+    # WebSocket tunnel. The daemon must be UTF-8 regardless of the shell that
+    # launched the CLI; the flag is harmless on POSIX.
+    if os.name == "nt":
+        env.setdefault("PYTHONUTF8", "1")
     return env
 
 
