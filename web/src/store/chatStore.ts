@@ -294,10 +294,12 @@ export function hydrateLocalConversation(
   skill: { name: string; args: string } | null,
   navigate: (to: string, opts?: { replace?: boolean }) => void,
 ): void {
-  // Registry entry (with its bubble) + send chain, both id-addressed. Rekey the
-  // sidebar row BEFORE the caller's refetch so a lagging index can't drop it.
+  // Registry entry (carrying the optimistic bubble) + the sidebar row, both
+  // id-addressed. Rekey the row BEFORE the caller's refetch so a lagging index
+  // can't drop it. No send-chain migration: the composer is read-only for a temp
+  // id, so no send is ever keyed under it — the hydrating `send` below enters
+  // the chain under the real id directly.
   conversationRegistry.rekey(tempConvId, realId);
-  rekeySendChain(tempConvId, realId);
   rekeyConvRow(tempConvId, realId, text);
 
   const stillViewing = useChatStore.getState().conversationId === tempConvId;
@@ -1146,30 +1148,6 @@ const sendChains = new Map<string | symbol, SendChain>();
 // session is created inside the chained work, so they can't key by id. A
 // non-string key can never collide with a conversation id.
 const NEW_SESSION_SEND_CHAIN_KEY = Symbol("new-session");
-
-/**
- * Move any send chain from `oldId` to `newId`, preserving its queued followers.
- *
- * The navigate-first flow POSTs the first message only after rekeying to the
- * real id, so a chain under the temp id is usually absent — but a composer send
- * fired against the temp id before hydrate would key one, and it must follow the
- * conversation to its real id. No-op when no chain exists under `oldId`.
- */
-function rekeySendChain(oldId: string, newId: string): void {
-  const chain = sendChains.get(oldId);
-  if (chain === undefined) return;
-  const existing = sendChains.get(newId);
-  if (existing !== undefined && existing !== chain) {
-    // Splice ours behind an existing chain rather than dropping its queue.
-    // Capture the current tail into a local first: reading `chain.tail` inside
-    // the `.then` after reassigning it to that same promise is a self-cycle
-    // (`TypeError: Chaining cycle detected`).
-    const own = chain.tail;
-    chain.tail = existing.tail.then(() => own);
-  }
-  sendChains.delete(oldId);
-  sendChains.set(newId, chain);
-}
 
 /** Prefix of a client-only conversation id, shown while `createSession` runs. */
 const TEMP_CONV_ID_PREFIX = "temp:";
