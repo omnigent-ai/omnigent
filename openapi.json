@@ -10470,6 +10470,18 @@
               "title": "Pinned",
               "type": "boolean"
             }
+          },
+          {
+            "description": "Ownership filter for the sidebar's My/Shared split. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible to the caller but owned by someone else. `\"all\"` (default) returns all accessible sessions, matching the legacy behaviour.",
+            "in": "query",
+            "name": "visibility",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "pattern": "^(all|mine|shared)$",
+              "title": "Visibility",
+              "type": "string"
+            }
           }
         ],
         "responses": {
