@@ -7,8 +7,10 @@ if the section does not exist.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
+import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -217,10 +219,35 @@ def reset_host_id(path: Path = CONFIG_PATH) -> tuple[str | None, str]:
     host_section.setdefault("name", socket.gethostname())
     cfg["host"] = host_section
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
+    # Atomic write: reset-id is a recovery command run when things are already
+    # broken, so a crash mid-write must not truncate the whole config. Write a
+    # sibling temp file and rename it over the target (rename is atomic on the
+    # same filesystem).
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
     return (old_host_id if isinstance(old_host_id, str) else None), new_host_id
+
+
+def host_identity_env_override_active() -> bool:
+    """Whether an ``OMNIGENT_HOST_ID`` / ``OMNIGENT_HOST_NAME`` override is set.
+
+    When either is set, :func:`load_or_create_host_identity` returns the
+    env-supplied identity *without reading config.yaml*, so a
+    :func:`reset_host_id` write to the file would be ignored by the next
+    ``omnigent host`` — a silent no-op. Callers use this to refuse the reset
+    with a clear message instead of reporting false success.
+
+    :returns: ``True`` when at least one of the identity env vars is set.
+    """
+    return bool(os.environ.get(HOST_ID_ENV_VAR) or os.environ.get(HOST_NAME_ENV_VAR))
 
 
 def load_host_identity_if_present(

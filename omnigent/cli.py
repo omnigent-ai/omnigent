@@ -9996,7 +9996,25 @@ def host_reset_id(yes: bool) -> None:
 
     :param yes: When ``True``, skip the confirmation prompt.
     """
-    from omnigent.host.identity import CONFIG_PATH, reset_host_id
+    from omnigent.host.identity import (
+        CONFIG_PATH,
+        HOST_ID_ENV_VAR,
+        HOST_NAME_ENV_VAR,
+        host_identity_env_override_active,
+        reset_host_id,
+    )
+
+    # An OMNIGENT_HOST_ID / OMNIGENT_HOST_NAME override makes the host read its
+    # identity from the env, ignoring config.yaml — so writing a fresh id to
+    # the file would be a silent no-op. Refuse rather than report false success.
+    if host_identity_env_override_active():
+        raise click.ClickException(
+            f"This machine's host identity is pinned by the {HOST_ID_ENV_VAR} / "
+            f"{HOST_NAME_ENV_VAR} environment variable(s), so resetting the id in "
+            "the config file would have no effect. This is normally a "
+            "server-managed sandbox host, whose identity the server owns. Unset "
+            f"{HOST_ID_ENV_VAR} and {HOST_NAME_ENV_VAR} to reset the persisted id."
+        )
 
     running = [record for record in _list_daemon_records() if _pid_alive(record.pid)]
     if running:

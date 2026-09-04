@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 from omnigent.host.identity import (
+    host_identity_env_override_active,
     load_host_identity_if_present,
     load_or_create_host_identity,
     reset_host_id,
@@ -354,3 +355,55 @@ def test_reset_host_id_next_load_returns_the_new_identity(
     assert after.host_id == new_id
     assert after.host_id != before.host_id
     assert after.name == before.name
+
+
+def test_reset_host_id_write_is_atomic_and_preserves_config_on_dump_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure mid-write leaves the original config intact, not truncated.
+
+    reset-id is a recovery command run when things are already broken, so a
+    crash while serializing the new config must not destroy the existing one.
+    The atomic temp-file-plus-rename write guarantees the target is only
+    replaced once the new content is fully written.
+    """
+    config_path = tmp_path / "config.yaml"
+    original = yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}})
+    config_path.write_text(original)
+
+    # Blow up during serialization, after the target still holds the original.
+    import omnigent.host.identity as identity_mod
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(identity_mod.yaml, "safe_dump", _boom)
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        reset_host_id(config_path)
+
+    # The original config survives untouched, and no temp file is left behind.
+    assert config_path.read_text() == original
+    leftovers = [p for p in tmp_path.iterdir() if p.name != "config.yaml"]
+    assert leftovers == [], f"atomic write left temp files behind: {leftovers}"
+
+
+def test_host_identity_env_override_active_reflects_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The override predicate is true when either identity env var is set.
+
+    ``reset_host_id`` writes the config file, but the load path returns the
+    env identity without reading it — so the CLI must detect the override and
+    refuse rather than report a reset that the next load would ignore.
+    """
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    assert host_identity_env_override_active() is False
+
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "b" * 32)
+    assert host_identity_env_override_active() is True
+
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-host")
+    assert host_identity_env_override_active() is True
