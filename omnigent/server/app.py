@@ -38,7 +38,11 @@ from omnigent.debug_logging import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.extensions import ExtensionPluginState
-from omnigent.extensions.assets import ResolvedBundle, build_asset_index
+from omnigent.extensions.assets import (
+    ResolvedBundle,
+    build_asset_index,
+    parse_dev_bundle_overrides,
+)
 from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -178,7 +182,15 @@ def _resolve_extension_assets(
 ) -> tuple[dict[str, ResolvedBundle], dict[str, str]]:
     """Resolve bundle snapshots without allowing asset failures to stop the server."""
     try:
-        return build_asset_index(state)
+        overrides = None
+        raw_overrides = os.environ.get("OMNIGENT_EXTENSION_DEV_BUNDLES", "").strip()
+        if raw_overrides:
+            overrides = parse_dev_bundle_overrides(raw_overrides)
+            _logger.warning(
+                "using development extension bundle overrides for: %s",
+                ", ".join(sorted(overrides)),
+            )
+        return build_asset_index(state, overrides=overrides)
     except Exception as exc:  # noqa: BLE001
         _logger.warning("could not build extension asset index (%s)", exc, exc_info=True)
         return {}, {"registry": str(exc)}

@@ -138,7 +138,7 @@ export function githubNotFoundReason(message: string | undefined): GithubUnavail
     : "no_os_env";
 }
 
-async function fetchGithubInfo(conversationId: string): Promise<GithubInfo> {
+export async function fetchGithubInfo(conversationId: string): Promise<GithubInfo> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github`,
   );

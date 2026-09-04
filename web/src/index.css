@@ -1897,3 +1897,14 @@ aside[aria-label="Workspace"][data-maximized] {
   height: var(--emoji-picker-height, 420px) !important;
   min-height: 0 !important;
 }
+
+/* Extension pages sit below the shell header overlay. When AppShell drops that
+ * header (sidebar open on an extension route), the page takes the full height.
+ * Unlayered on purpose so it beats the responsive inset utilities. */
+main[data-shell-header="hidden"] .extension-view-host {
+  padding-top: 0;
+}
+
+main[data-shell-header="hidden"] .extension-view-status {
+  top: 0;
+}

@@ -4,6 +4,9 @@ packages:
   - '.github/ci-deps'
   - 'editors/vscode'
   - 'deploy/cloudflare'
+  - 'sdks/web-extension'
+  - 'examples/extensions/hello-page/web'
+  - 'extensions/canvas/web'
 
 settings:
   # 7-day dependency cooldown, mirroring the Python-side exclude-newer = "P7D" in uv.toml.

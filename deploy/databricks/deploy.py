@@ -307,8 +307,6 @@ def _sweep_local_src_wheels(keep: set[str]) -> None:
     for entry in src.iterdir():
         if not entry.is_file() or entry.suffix != ".whl":
             continue
-        if not any(entry.name.startswith(p) for p in _WHEEL_PREFIXES):
-            continue
         if entry.name in keep:
             continue
         _log(f"removing stale local wheel {entry.relative_to(_repo_root())}")
@@ -396,10 +394,22 @@ def _wheel_source_path(wheel: Path) -> str:
     )
 
 
+def _wheel_name_version(wheel: Path) -> tuple[str, str]:
+    """
+    Return the normalized distribution name and version from a wheel filename.
+
+    :param wheel: Wheel path, e.g. ``dist/omnigent_canvas-0.1.0-py3-none-any.whl``.
+    :returns: ``("omnigent-canvas", "0.1.0")``.
+    """
+    name, version = wheel.name.split("-")[:2]
+    return name.lower().replace("_", "-"), version
+
+
 def _uv_source_lines(
     main_wheel: Path,
     small_wheels: list[Path],
     oversize_wheels: list[Path],
+    extension_wheels: list[Path] = (),
 ) -> list[str]:
     """Build ``[tool.uv.sources]`` lines for the three deploy wheels.
 
@@ -421,6 +431,21 @@ def _uv_source_lines(
         wheel = next(wheel for name, wheel in wheels.items() if name.startswith(wheel_prefix))
         source = _wheel_source_path(wheel)
         source_lines.append(f"{package_name} = {{ path = {_toml_string(source)} }}")
+    core_names = {"omnigent", "omnigent-client", "omnigent-ui-sdk"}
+    seen: set[str] = set()
+    for wheel in extension_wheels:
+        package_name, _ = _wheel_name_version(wheel)
+        if package_name in core_names:
+            raise SystemExit(
+                f"--extension-wheel {wheel.name} would shadow the core package {package_name}"
+            )
+        if package_name in seen:
+            raise SystemExit(
+                f"--extension-wheel {wheel.name} repeats the extension {package_name}"
+            )
+        seen.add(package_name)
+        source = _wheel_source_path(wheel)
+        source_lines.append(f"{package_name} = {{ path = {_toml_string(source)} }}")
     return source_lines
 
 
@@ -429,6 +454,7 @@ def build_uv_pyproject(
     small_wheels: list[Path],
     oversize_wheels: list[Path],
     deploy_version: str,
+    extension_wheels: list[Path] = (),
 ) -> str:
     """Compose the app-level ``pyproject.toml`` for Databricks Apps.
 
@@ -438,14 +464,20 @@ def build_uv_pyproject(
     :param oversize_wheels: Wheels too large for the app source directory.
     :param deploy_version: Version stamped into the wheels, e.g.
         ``"0.1.0.post123"``.
+    :param extension_wheels: Omnigent extension wheels (``omnigent.extensions``
+        entry points) installed alongside the server, e.g.
+        ``src/omnigent_canvas-0.1.0-py3-none-any.whl``.
     :returns: Complete TOML text for ``src/pyproject.toml``.
     """
-    source_lines = _uv_source_lines(main_wheel, small_wheels, oversize_wheels)
+    source_lines = _uv_source_lines(main_wheel, small_wheels, oversize_wheels, extension_wheels)
     dependencies = [
         f'"omnigent[databricks,tracing]=={deploy_version}"',
         f'"omnigent-client=={deploy_version}"',
         f'"omnigent-ui-sdk=={deploy_version}"',
     ]
+    for wheel in extension_wheels:
+        package_name, version = _wheel_name_version(wheel)
+        dependencies.append(f'"{package_name}=={version}"')
     return (
         "[project]\n"
         'name = "omnigent-databricks-app"\n'
@@ -487,6 +519,7 @@ def write_uv_dependency_files(
     small_wheels: list[Path],
     oversize_wheels: list[Path],
     deploy_version: str,
+    extension_wheels: list[Path] = (),
 ) -> None:
     """Write the uv dependency files Databricks Apps should install.
 
@@ -497,6 +530,7 @@ def write_uv_dependency_files(
     :param oversize_wheels: Wheels too large for ``src``.
     :param deploy_version: Version stamped into the wheels, e.g.
         ``"0.1.0.post123"``.
+    :param extension_wheels: Extension wheels already copied into ``src``.
     """
     requirements = src / "requirements.txt"
     if requirements.exists():
@@ -508,6 +542,7 @@ def write_uv_dependency_files(
         small_wheels,
         oversize_wheels,
         deploy_version,
+        extension_wheels,
     )
     (src / "pyproject.toml").write_text(pyproject)
     _log("src/pyproject.toml:\n" + pyproject)
@@ -718,6 +753,18 @@ def _parse_args() -> argparse.Namespace:
         "--skip-web-ui",
         action="store_true",
         help="Build without the SPA (API-only deploy).",
+    )
+    parser.add_argument(
+        "--extension-wheel",
+        action="append",
+        default=[],
+        type=Path,
+        metavar="WHEEL",
+        help=(
+            "Prebuilt Omnigent extension wheel to install alongside the server "
+            "(repeatable), e.g. dist-ext/omnigent_canvas-0.1.0-py3-none-any.whl. "
+            "The server discovers it through its omnigent.extensions entry point."
+        ),
     )
     parser.add_argument(
         "--app-url",
@@ -1027,8 +1074,12 @@ def main() -> int:
     # wheels locally, then copy the new small wheels in.
     src = _src_dir()
     src.mkdir(parents=True, exist_ok=True)
-    _sweep_local_src_wheels(keep={w.name for w in classified.small})
-    for wheel in classified.small:
+    extension_wheels = [wheel.resolve() for wheel in args.extension_wheel]
+    for wheel in extension_wheels:
+        if not wheel.is_file():
+            raise SystemExit(f"--extension-wheel {wheel} does not exist")
+    _sweep_local_src_wheels(keep={w.name for w in [*classified.small, *extension_wheels]})
+    for wheel in [*classified.small, *extension_wheels]:
         dest = src / wheel.name
         _log(f"copy {wheel.name} → {dest.relative_to(_repo_root())}")
         shutil.copy2(wheel, dest)
@@ -1045,6 +1096,7 @@ def main() -> int:
         classified.small,
         classified.oversize,
         deploy_version,
+        [src / wheel.name for wheel in extension_wheels],
     )
 
     # 3) Guard every uploaded source file before touching the workspace.

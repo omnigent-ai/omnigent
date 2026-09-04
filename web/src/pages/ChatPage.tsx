@@ -1,7 +1,9 @@
 import {
   type FormEvent,
   type KeyboardEvent,
+  memo,
   useCallback,
+  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -362,6 +364,10 @@ function truncateTitle(raw: string, max = 60): string {
  */
 export function ChatPage() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
+  // Defer only the transcript key so the <Conversation> subtree remounts at
+  // transition priority. switchTo, routing, and the composer all stay on the
+  // immediate urlConvId — sends always target the conversation the URL shows.
+  const deferredConvId = useDeferredValue(urlConvId);
   const navigate = useNavigate();
   const appName = useAppName();
   // Optional first message handed off by the landing composer through the
@@ -832,14 +838,6 @@ export function ChatPage() {
       ? hostProbeOptions
       : sessionModelOptions;
 
-  // Loading + error gates for `/c/:id` hydration.
-  if (urlConvId) {
-    if (loadingConversation) return <HydratingPlaceholder />;
-    if (conversationLoadError) {
-      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
-    }
-  }
-
   // The session is unreachable and a message can't wake it: the host is
   // offline (host-bound) or it isn't host-bound and the runner is down.
   // `runner_asleep` is deliberately NOT here — there the host relaunches
@@ -852,75 +850,97 @@ export function ChatPage() {
   const isUnreachable =
     !sandboxLaunching && (liveness.kind === "host_offline" || liveness.kind === "local_stranded");
 
-  function onSend(text: string, files?: File[]) {
-    if (!agentId) return;
-    // An unbound coding clone (fork-source label) needs a directory before
-    // it can run: open the picker and stash this message to replay after
-    // the bind. Pin the prompt to THIS session so it replays here, never
-    // into a session the user may switch to first; carry any attachments
-    // so the replay sends the same payload.
-    if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
-      setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [] });
-      setResumeDirDialogOpen(true);
-      return;
-    }
-    // Unreachable → no executor to dispatch this turn to, and no host to
-    // wake. Surface the reconnect dialog instead of POSTing into
-    // a void.
-    if (urlConvId && isUnreachable) {
-      setReconnectDialogOpen(true);
-      return;
-    }
-    // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
-    // FIFO immediately when genuinely idle, so nothing stalls. With the
-    // always-steer preference on, a mid-turn follow-up skips the queue and is
-    // POSTed now instead.
-    const chat = useChatStore.getState();
-    if (
-      shouldQueueSend(
-        chat.conversationId,
-        chat.status,
-        chat.sessionStatus,
-        chat.queuedMessages,
-        readAlwaysSteer(),
-      )
-    ) {
-      chat.enqueueMessage(text, files);
-      return;
-    }
-    void useChatStore.getState().send(text, agentId, files, {
-      onConversationCreated: (newId) => {
-        // Eager URL update: the moment the server tells us this
-        // conversation's id, promote `/` → `/c/:newId`. Replace (not
-        // push) so the back button takes the user wherever they came
-        // from rather than to a stale `/`.
-        navigate(`/c/${newId}`, { replace: true });
-      },
-    });
-  }
+  const onSend = useCallback(
+    (text: string, files?: File[]) => {
+      if (!agentId) return;
+      // An unbound coding clone (fork-source label) needs a directory before
+      // it can run: open the picker and stash this message to replay after
+      // the bind. Pin the prompt to THIS session so it replays here, never
+      // into a session the user may switch to first; carry any attachments
+      // so the replay sends the same payload.
+      if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
+        setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [] });
+        setResumeDirDialogOpen(true);
+        return;
+      }
+      // Unreachable → no executor to dispatch this turn to, and no host to
+      // wake. Surface the reconnect dialog instead of POSTing into
+      // a void.
+      if (urlConvId && isUnreachable) {
+        setReconnectDialogOpen(true);
+        return;
+      }
+      // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
+      // FIFO immediately when genuinely idle, so nothing stalls. With the
+      // always-steer preference on, a mid-turn follow-up skips the queue and is
+      // POSTed now instead.
+      const chat = useChatStore.getState();
+      if (
+        shouldQueueSend(
+          chat.conversationId,
+          chat.status,
+          chat.sessionStatus,
+          chat.queuedMessages,
+          readAlwaysSteer(),
+        )
+      ) {
+        chat.enqueueMessage(text, files);
+        return;
+      }
+      void useChatStore.getState().send(text, agentId, files, {
+        onConversationCreated: (newId) => {
+          // Eager URL update: the moment the server tells us this
+          // conversation's id, promote `/` → `/c/:newId`. Replace (not
+          // push) so the back button takes the user wherever they came
+          // from rather than to a stale `/`.
+          navigate(`/c/${newId}`, { replace: true });
+        },
+      });
+    },
+    [
+      agentId,
+      urlConvId,
+      runnerOnline,
+      isUnboundFork,
+      canResumeOnLocalHost,
+      isUnreachable,
+      navigate,
+    ],
+  );
 
-  function onSendSlashCommand(name: string, args: string) {
-    if (!agentId) return;
-    // Slash commands aren't replayed (an edge), but still route an unbound
-    // coding clone to the directory picker so it isn't a dead end.
-    if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
-      setResumeDirDialogOpen(true);
-      return;
-    }
-    if (urlConvId && isUnreachable) {
-      setReconnectDialogOpen(true);
-      return;
-    }
-    void useChatStore.getState().sendSlashCommand(name, args, agentId, {
-      onConversationCreated: (newId) => {
-        navigate(`/c/${newId}`, { replace: true });
-      },
-    });
-  }
+  const onSendSlashCommand = useCallback(
+    (name: string, args: string) => {
+      if (!agentId) return;
+      // Slash commands aren't replayed (an edge), but still route an unbound
+      // coding clone to the directory picker so it isn't a dead end.
+      if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
+        setResumeDirDialogOpen(true);
+        return;
+      }
+      if (urlConvId && isUnreachable) {
+        setReconnectDialogOpen(true);
+        return;
+      }
+      void useChatStore.getState().sendSlashCommand(name, args, agentId, {
+        onConversationCreated: (newId) => {
+          navigate(`/c/${newId}`, { replace: true });
+        },
+      });
+    },
+    [
+      agentId,
+      urlConvId,
+      runnerOnline,
+      isUnboundFork,
+      canResumeOnLocalHost,
+      isUnreachable,
+      navigate,
+    ],
+  );
 
-  function onStop() {
+  const onStop = useCallback(() => {
     useChatStore.getState().stop();
-  }
+  }, []);
 
   // Sub-agent (child) sessions aren't returned by the sidebar list, so
   // ``activeConv`` is null for them — the snapshot (fetched above as
@@ -934,19 +954,26 @@ export function ChatPage() {
     conversationsData !== undefined,
   );
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
-  // Once present, the live session snapshot is authoritative.
-  const capabilitySource = {
-    labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
-    harness: activeSession?.harness ?? null,
-  };
+  // Once present, the live session snapshot is authoritative. Memoized so the
+  // derived props it feeds (modelPickerKind, effortLevels, wrapperLabel) keep a
+  // stable identity across the switch's re-render burst.
+  const capabilitySource = useMemo(
+    () => ({
+      labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+      harness: activeSession?.harness ?? null,
+    }),
+    [activeSession, activeConv],
+  );
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
   // Effort ladders key on the model the session is actually on — the
   // reported `llmModel` — falling back to the sticky preference only
-  // before the first report lands.
-  const effortLevels = effortLevelsForConv(
-    capabilitySource,
-    codexModelOptions,
-    llmModel ?? selectedModel,
+  // before the first report lands. Memoized because codex-native resolves
+  // via codexEffortLevelsForModel, which returns a fresh array each call;
+  // a new identity here would defeat the memo() on MainAgentSurface/Composer
+  // on every unrelated store tick (mirrors the codexModelOptions rationale).
+  const effortLevels = useMemo(
+    () => effortLevelsForConv(capabilitySource, codexModelOptions, llmModel ?? selectedModel),
+    [capabilitySource, codexModelOptions, llmModel, selectedModel],
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
@@ -957,17 +984,40 @@ export function ChatPage() {
   // Prefer the full agent object (with mcp_servers) from the session
   // endpoint when viewing a conversation. Fall back to the sessions-
   // derived list for the `/` (no session) picker view.
-  const visibleAgents = boundAgentId
-    ? boundAgentBySession
-      ? [boundAgentBySession]
-      : boundAgentName
-        ? [{ id: boundAgentId, name: boundAgentName } as Agent]
-        : agents?.filter((a) => a.id === boundAgentId)
-    : agents;
+  const visibleAgents = useMemo(
+    () =>
+      boundAgentId
+        ? boundAgentBySession
+          ? [boundAgentBySession]
+          : boundAgentName
+            ? [{ id: boundAgentId, name: boundAgentName } as Agent]
+            : agents?.filter((a) => a.id === boundAgentId)
+        : agents,
+    [boundAgentId, boundAgentBySession, boundAgentName, agents],
+  );
+
+  const onShowReconnectHelp = useCallback(() => {
+    // Route the banner to the SAME dialog typing a message would: an
+    // unbound coding clone or a host-less session the caller can resume
+    // in-app opens the directory picker (bind + launch), everything else
+    // gets the reconnect dialog.
+    if (isUnboundFork || canResumeOnLocalHost) setResumeDirDialogOpen(true);
+    else setReconnectDialogOpen(true);
+  }, [isUnboundFork, canResumeOnLocalHost]);
+
+  // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
+  // early return can't change the hook order between renders.
+  if (urlConvId) {
+    if (loadingConversation) return <HydratingPlaceholder />;
+    if (conversationLoadError) {
+      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
+    }
+  }
 
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
+      conversationKey={deferredConvId}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -978,14 +1028,7 @@ export function ChatPage() {
       onSend={onSend}
       onSendSlashCommand={onSendSlashCommand}
       onStop={onStop}
-      onShowReconnectHelp={() => {
-        // Route the banner to the SAME dialog typing a message would: an
-        // unbound coding clone or a host-less session the caller can resume
-        // in-app opens the directory picker (bind + launch), everything else
-        // gets the reconnect dialog.
-        if (isUnboundFork || canResumeOnLocalHost) setResumeDirDialogOpen(true);
-        else setReconnectDialogOpen(true);
-      }}
+      onShowReconnectHelp={onShowReconnectHelp}
       agents={visibleAgents}
       selectedAgentId={agentId}
       hasMoreHistory={hasMoreHistory}
@@ -1199,6 +1242,9 @@ interface MainAgentSurfaceProps {
    * session in terminal-first mode.
    */
   conversationId: string | null;
+  /** Deferred conversation id passed as the transcript key so <Conversation>
+   *  remounts at transition priority instead of blocking the interaction frame. */
+  conversationKey: string | null | undefined;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. Gates the
    *  composer's Stop/Interrupt button — the parent's OWN turn only. */
@@ -1365,8 +1411,9 @@ export function updateWarmTerminalSurfaces(
  * `MainTerminalView`. The switcher itself stays visible (in the header,
  * see ViewModeToggle) so the user can flip back to Chat.
  */
-function MainAgentSurface({
+const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
+  conversationKey,
   status,
   isWorking,
   showsWorking,
@@ -1522,6 +1569,12 @@ function MainAgentSurface({
   // with the full server-side slash_command path.
   const isTerminalFirst = terminalFirst?.isTerminalFirst === true;
   const isNativeWrapper = terminalFirst?.isNativeWrapper === true;
+  // Stable so they don't defeat Composer's memo on the switch re-render burst.
+  const removeReplyQuote = useCallback(
+    (i: number) => setReplyQuotes((prev) => prev.filter((_, idx) => idx !== i)),
+    [],
+  );
+  const clearReplyQuotes = useCallback(() => setReplyQuotes([]), []);
   const handleSendSlashCommand = useMemo(
     () =>
       onSendSlashCommand && !isNativeWrapper
@@ -1660,6 +1713,7 @@ function MainAgentSurface({
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
           <Transcript
+            conversationKey={conversationKey}
             setConversationEl={setConversationEl}
             containerEl={containerEl}
             scroller={scroller}
@@ -1697,8 +1751,8 @@ function MainAgentSurface({
             permissionLevel={permissionLevel}
             readOnlyReason={readOnlyReason}
             replyQuotes={replyQuotes}
-            onRemoveQuote={(i) => setReplyQuotes((prev) => prev.filter((_, idx) => idx !== i))}
-            onClearAllQuotes={() => setReplyQuotes([])}
+            onRemoveQuote={removeReplyQuote}
+            onClearAllQuotes={clearReplyQuotes}
             effortLevels={effortLevels}
             showEffort={showEffort}
             showModels={showModels}
@@ -1732,7 +1786,7 @@ function MainAgentSurface({
       )}
     </>
   );
-}
+});
 
 function HydratingPlaceholder() {
   return (
@@ -2445,7 +2499,7 @@ export function BackgroundTaskPill() {
  * suggestions menu, and the send/stop controls. Exported for direct
  * unit testing of the slash-command keyboard behavior.
  */
-export function Composer({
+function ComposerImpl({
   status,
   isWorking,
   disabled,
@@ -3810,6 +3864,8 @@ export function Composer({
     </form>
   );
 }
+
+export const Composer = memo(ComposerImpl);
 
 /**
  * Whether the main chat's display-only "Working…" indicator should light up.

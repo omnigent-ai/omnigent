@@ -16,6 +16,8 @@ import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
+import type { ExtensionCatalogItem } from "@/extensions/types";
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
@@ -224,16 +226,20 @@ function renderSidebar(
   initialEntry = "/",
   onOpenSearch?: () => void,
   info?: ServerInfo,
+  extensions: ExtensionCatalogItem[] = [],
+  onClose = vi.fn(),
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const sidebar = <Sidebar open={open} onClose={vi.fn()} onOpenSearch={onOpenSearch} />;
+  const sidebar = <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />;
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={[initialEntry]}>
-          {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
-        </MemoryRouter>
-      </TooltipProvider>
+      <ExtensionCatalogProvider extensions={extensions}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[initialEntry]}>
+            {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
+          </MemoryRouter>
+        </TooltipProvider>
+      </ExtensionCatalogProvider>
     </QueryClientProvider>,
   );
 }
@@ -294,6 +300,42 @@ function seedPins(ids: string[]) {
   pinnedIdsRef.current = ids;
 }
 afterEach(cleanup);
+
+const TEST_EXTENSION: ExtensionCatalogItem = {
+  object: "extension",
+  id: "acme.review",
+  display_name: "Review",
+  distribution: "acme-review",
+  version: "1.0.0",
+  extension_api: 1,
+  status: "enabled",
+  permissions: [],
+  pages: [
+    {
+      id: "acme.review.inbox-page",
+      title: "Extension Inbox",
+      route: "inbox",
+      view: "inbox",
+    },
+  ],
+  primary_navigation: [
+    {
+      id: "acme.review.primary-nav",
+      label: "Extension Inbox",
+      page: "acme.review.inbox-page",
+      icon: "puzzle",
+      order: 500,
+      when: null,
+    },
+  ],
+  browser: {
+    declared: true,
+    has_styles: false,
+    digest: "digest",
+    script_url: "/script",
+    style_url: null,
+  },
+};
 
 describe("Sidebar session list", () => {
   it("uses the interface text token for the empty session-list state", () => {
@@ -813,6 +855,37 @@ describe("Sidebar session list", () => {
       "dark:hover:bg-[var(--sidebar-active)]",
       "dark:hover:text-[var(--sidebar-active-foreground)]",
     );
+  });
+
+  it("renders and activates an extension nav row without activating core rows", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/extensions/acme.review/inbox", undefined, undefined, [TEST_EXTENSION]);
+
+    const extension = screen.getByTestId("extension-nav-acme.review.primary-nav");
+    expect(extension).toHaveAttribute("href", "/extensions/acme.review/inbox");
+    expect(extension).toHaveAttribute("aria-current", "page");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveAttribute("aria-current");
+    expect(screen.getByTestId("inbox-button")).not.toHaveAttribute("aria-current");
+  });
+
+  it("closes the mobile sidebar when an extension nav row is selected", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    const onClose = vi.fn();
+    renderSidebar(true, "/", undefined, undefined, [TEST_EXTENSION], onClose);
+
+    fireEvent.click(screen.getByTestId("extension-nav-acme.review.primary-nav"));
+
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("leaves the primary nav unchanged for an empty extension catalog", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    expect(screen.queryByTestId(/^extension-nav-/)).toBeNull();
+    expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
+    expect(screen.getByTestId("scheduled-tasks-nav")).toBeInTheDocument();
+    expect(screen.getByTestId("inbox-button")).toBeInTheDocument();
   });
 
   it("does NOT close the sidebar when the footer Settings is tapped", () => {
