@@ -97,7 +97,7 @@ def test_released_swipe_archives_without_navigating_and_stationary_tap_navigates
             x, y = center(link)
             touch(cdp, "touchStart", x, y)
             for offset in (16, 32, 50, 74, 90):
-                touch(cdp, "touchMove", x - offset, y)
+                touch(cdp, "touchMove", x + offset, y)
                 page.wait_for_timeout(25)
             expect(row).to_have_class(re.compile(r"\bmx-1\b"))
             assert _unexpected_events(page) == []
