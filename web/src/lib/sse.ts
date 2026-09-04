@@ -51,6 +51,7 @@ import type {
   SessionTitleEvent,
   SessionCollaborationModeEvent,
   SessionPermissionModeEvent,
+  SessionCodexApprovalModeEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
@@ -685,6 +686,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       permissionMode,
     } satisfies SessionPermissionModeEvent;
+  }
+  if (eventType === "session.codex_approval_mode") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const approvalMode = data.approval_mode;
+    if (typeof approvalMode !== "string" || !approvalMode) return null;
+    return {
+      type: "session_codex_approval_mode",
+      conversationId,
+      approvalMode,
+    } satisfies SessionCodexApprovalModeEvent;
   }
   if (eventType === "session.agent_changed") {
     const conversationId = data.conversation_id;

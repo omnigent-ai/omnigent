@@ -17,6 +17,7 @@
 
 import { type ReactNode, useCallback, useEffect, useRef } from "react";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { isSessionDeleting, markRecentlyCreated } from "@/hooks/useConversations";
@@ -58,6 +59,7 @@ function applyItemsToCache(
   queryClient: QueryClient,
   items: SessionListWireItem[],
   activeId: string | undefined,
+  viewerId?: string | null,
 ): { missingIds: string[]; needsRefetch: boolean } {
   // Frames are full rows with explicit nulls; convert null → undefined so a
   // cleared field overlays the cache in the same shape GET /v1/sessions
@@ -88,6 +90,7 @@ function applyItemsToCache(
       missingHere,
       filters,
       isSessionDeleting,
+      viewerId,
     );
     for (const row of inserted) {
       if (row.project_id == null && !row.labels?.[PROJECT_LABEL_KEY]) foundAnywhere.add(row.id);
@@ -339,6 +342,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             queryClient,
             frame.items,
             activeIdRef.current,
+            getCurrentUserId(),
           );
           // A watched id absent from every page is a new session whose sort
           // position we can't place locally. Membership-affecting deltas

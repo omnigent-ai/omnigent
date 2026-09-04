@@ -3086,16 +3086,37 @@ def client_for_transport(
 def normalize_codex_permission_launch_args(
     terminal_launch_args: Sequence[str] | None,
 ) -> list[str]:
-    """Complete legacy Full Access args with their approval policy."""
+    """Complete permission launch args into their effective stance.
+
+    Two normalizations:
+
+    - Legacy Full Access args (a ``default_permissions=":danger-full-access"``
+      profile with no approval policy) gain ``approval_policy="never"``.
+    - The bare default stance — no approval policy, sandbox, permission
+      profile, reviewer, or bypass flag — gains
+      ``approvals_reviewer="auto_review"``. Codex's built-in default routes
+      escalated approvals (e.g. an out-of-workspace write) to the human,
+      which parks web turns on an approval card even though the default
+      permission mode is presented as automatic. ``auto_review`` keeps the
+      workspace-write sandbox and approval boundaries but lets Codex's
+      automatic reviewer settle eligible requests instead of prompting.
+      Any explicit approval/sandbox/reviewer/profile choice wins untouched.
+    """
     args = list(terminal_launch_args or ())
     full_access = False
+    has_permission_profile = False
+    has_reviewer = False
+    has_sandbox = False
     has_approval_policy = "--dangerously-bypass-approvals-and-sandbox" in args
+    explicit_bypass = has_approval_policy
     index = 0
     while index < len(args):
         arg = args[index]
         assignment: str | None = None
         if arg in {"--ask-for-approval", "-a"} or arg.startswith(("--ask-for-approval=", "-a=")):
             has_approval_policy = True
+        elif arg in {"--sandbox", "-s"} or arg.startswith(("--sandbox=", "-s=")):
+            has_sandbox = True
         elif arg in {"--config", "-c"} and index + 1 < len(args):
             index += 1
             assignment = args[index]
@@ -3103,13 +3124,28 @@ def normalize_codex_permission_launch_args(
             assignment = arg.split("=", 1)[1]
         if assignment is not None:
             key, _, raw_value = assignment.partition("=")
-            if key.strip() == "approval_policy":
+            key = key.strip()
+            if key == "approval_policy":
                 has_approval_policy = True
-            elif key.strip() == "default_permissions":
+            elif key == "sandbox_mode":
+                has_sandbox = True
+            elif key == "approvals_reviewer":
+                has_reviewer = True
+            elif key == "default_permissions":
+                has_permission_profile = True
                 full_access = _codex_config_string(raw_value) == ":danger-full-access"
         index += 1
     if full_access and not has_approval_policy:
         args.extend(["-c", 'approval_policy="never"'])
+        has_approval_policy = True
+    if not (
+        explicit_bypass
+        or has_approval_policy
+        or has_sandbox
+        or has_reviewer
+        or has_permission_profile
+    ):
+        args.extend(["-c", 'approvals_reviewer="auto_review"'])
     return args
 
 

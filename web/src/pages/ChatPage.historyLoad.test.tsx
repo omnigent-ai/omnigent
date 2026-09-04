@@ -1117,6 +1117,26 @@ describe("JumpToTopButton", () => {
     expect(pill().className).toContain("pointer-events-none");
   });
 
+  it("does not mistake bottom re-anchoring for an upward scroll", () => {
+    const metrics = {
+      scrollTop: 600,
+      scrollHeight: 1000,
+      clientHeight: 400,
+    };
+    const { container, scroll, scroller } = makeScroller(metrics);
+
+    render(<JumpToTopButton containerEl={container} scroller={scroller} hasMoreHistory={true} />);
+
+    // Removing transient content can reduce both scrollHeight and scrollTop
+    // while the viewport remains pinned to the bottom.
+    act(() => {
+      metrics.scrollHeight = 800;
+      metrics.scrollTop = 400;
+      fireEvent.scroll(scroll);
+    });
+    expect(pill().className).toContain("pointer-events-none");
+  });
+
   it("releases the bottom-lock, pages in all history, then scrolls to the top", async () => {
     const { container, scroller, scroll } = makeScroller({
       scrollTop: 500,

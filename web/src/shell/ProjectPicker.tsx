@@ -2,22 +2,36 @@ import { useState } from "react";
 import { CheckIcon, FolderIcon, PlusIcon, SearchIcon } from "lucide-react";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { useProjects } from "@/hooks/useConversations";
+import { cn } from "@/lib/utils";
 
 /**
  * Leading visual for a project row: the project's emoji icon when set,
  * otherwise a folder glyph. Decorative only — row names carry the semantics.
+ *
+ * Defaults to the `size-3.5` (14px) footprint the dropdown and sidebar rows
+ * use; callers pass `className` to resize both branches together (the header
+ * breadcrumb overrides to `size-4`/`text-[16px]`). The emoji matches the
+ * folder's box and centers, so a resized icon column stays aligned.
  */
-export function ProjectRowIcon({ icon }: { icon?: string | null }) {
+export function ProjectRowIcon({ icon, className }: { icon?: string | null; className?: string }) {
   return icon ? (
+    // Emoji advance-widths vary per glyph; a fixed centered box keeps the
+    // trailing label's left edge aligned with the folder-fallback rows.
     <span
       aria-hidden="true"
-      className="shrink-0 text-[14px] leading-none"
+      className={cn(
+        "inline-flex size-3.5 shrink-0 items-center justify-center text-[14px] leading-none",
+        className,
+      )}
       data-testid="project-icon"
     >
       {icon}
     </span>
   ) : (
-    <FolderIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+    <FolderIcon
+      aria-hidden="true"
+      className={cn("size-3.5 shrink-0 text-muted-foreground", className)}
+    />
   );
 }
 

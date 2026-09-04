@@ -318,6 +318,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
           cost_control_mode_override?: "on" | "off" | null;
           subagent_routing_override?: "on" | "off" | null;
           collaboration_mode?: string;
+          approval_mode?: string;
         })
       : {};
     const labels = { ...(sessionLabels.get(sessionId) ?? {}) };
@@ -339,6 +340,10 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
     }
     if ("collaboration_mode" in body && typeof body.collaboration_mode === "string") {
       labels["omnigent.codex_native.collaboration_mode"] = body.collaboration_mode;
+      sessionLabels.set(sessionId, labels);
+    }
+    if ("approval_mode" in body && typeof body.approval_mode === "string") {
+      labels["omnigent.codex_native.approval_mode"] = body.approval_mode;
       sessionLabels.set(sessionId, labels);
     }
     return mockResponse({
@@ -4997,6 +5002,31 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("session.codex_approval_mode", () => {
+    it("moves the picker to an approval mode switched inside the TUI", () => {
+      // A /permissions change in the Codex TUI emits no event of its own; the
+      // forwarder observes thread/settings/updated and the server republishes
+      // it here, which is the only way the web picker learns about it.
+      useChatStore.setState({ conversationId: "conv_abc", codexApprovalMode: "" });
+      handleSessionEvent({
+        type: "session_codex_approval_mode",
+        conversationId: "conv_abc",
+        approvalMode: "approve-for-me",
+      });
+      expect(useChatStore.getState().codexApprovalMode).toBe("approve-for-me");
+    });
+
+    it("ignores an approval-mode event from a different session", () => {
+      useChatStore.setState({ conversationId: "conv_open", codexApprovalMode: "ask-for-approval" });
+      handleSessionEvent({
+        type: "session_codex_approval_mode",
+        conversationId: "conv_other",
+        approvalMode: "full-access",
+      });
+      expect(useChatStore.getState().codexApprovalMode).toBe("ask-for-approval");
+    });
+  });
+
   describe("session.input.consumed", () => {
     it("promotes the oldest pending user message into blocks (FIFO, plain append)", () => {
       const existingAssistant: AnyBlock = {
@@ -7572,6 +7602,89 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     expect(useChatStore.getState().codexPlanMode).toBe(false);
     expect(sessionLabels.get("conv_plan_failure")).not.toHaveProperty(
       "omnigent.codex_native.collaboration_mode",
+    );
+  });
+
+  it("hydrates Codex approval mode from the label on switch", async () => {
+    seedSession("conv_approval_hydrate", []);
+    withSnapshot("conv_approval_hydrate", {
+      labels: {
+        "omnigent.wrapper": "codex-native-ui",
+        "omnigent.codex_native.approval_mode": "approve-for-me",
+      },
+    });
+
+    await useChatStore.getState().switchTo("conv_approval_hydrate");
+
+    expect(useChatStore.getState().codexApprovalMode).toBe("approve-for-me");
+  });
+
+  it("leaves Codex approval mode empty when the label is absent", async () => {
+    // Label-only reader: no label means unset (the picker shows a
+    // placeholder), never a guessed default.
+    seedSession("conv_approval_unset", []);
+    withSnapshot("conv_approval_unset", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+
+    await useChatStore.getState().switchTo("conv_approval_unset");
+
+    expect(useChatStore.getState().codexApprovalMode).toBe("");
+  });
+
+  it("leaves Codex approval mode empty on a non-Codex session", async () => {
+    seedSession("conv_approval_non_codex", []);
+    withSnapshot("conv_approval_non_codex", {
+      labels: { "omnigent.codex_native.approval_mode": "approve-for-me" },
+    });
+
+    await useChatStore.getState().switchTo("conv_approval_non_codex");
+
+    expect(useChatStore.getState().codexApprovalMode).toBe("");
+  });
+
+  it("PATCHes Codex approval mode and settles from the returned label", async () => {
+    seedSession("conv_approval_toggle", []);
+    withSnapshot("conv_approval_toggle", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+    await useChatStore.getState().switchTo("conv_approval_toggle");
+    fetchMock.mockClear();
+
+    await useChatStore.getState().setCodexApprovalMode("approve-for-me");
+
+    expect(patchCallsFor("conv_approval_toggle")).toEqual([{ approval_mode: "approve-for-me" }]);
+    expect(useChatStore.getState().codexApprovalMode).toBe("approve-for-me");
+  });
+
+  it("rolls back Codex approval mode when the PATCH is rejected", async () => {
+    seedSession("conv_approval_failure", []);
+    withSnapshot("conv_approval_failure", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+    await useChatStore.getState().switchTo("conv_approval_failure");
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0]!;
+      if (path === "/v1/sessions/conv_approval_failure" && init?.method === "PATCH") {
+        return mockResponse(
+          {
+            error: {
+              code: "runner_unavailable",
+              message: "Could not switch to approve-for-me approval mode: no live Codex runner.",
+            },
+          },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+    fetchMock.mockClear();
+
+    await expect(useChatStore.getState().setCodexApprovalMode("approve-for-me")).rejects.toThrow(
+      "Could not switch to approve-for-me approval mode",
+    );
+
+    expect(patchCallsFor("conv_approval_failure")).toEqual([{ approval_mode: "approve-for-me" }]);
+    // Rolls back to the pre-switch value; with no label yet, that's the unset
+    // empty string — never the optimistic value.
+    expect(useChatStore.getState().codexApprovalMode).toBe("");
+    expect(sessionLabels.get("conv_approval_failure")).not.toHaveProperty(
+      "omnigent.codex_native.approval_mode",
     );
   });
 

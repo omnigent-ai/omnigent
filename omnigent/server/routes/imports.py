@@ -24,7 +24,7 @@ from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
-from omnigent.server.routes._host_launch import resolve_host_owner
+from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._session_create_validation import resolve_project_session_create
 from omnigent.server.schemas import SessionCreateRequest
 from omnigent.session_import import (
@@ -429,13 +429,13 @@ def create_imports_router(
             )
         user_id = require_user(request, auth_provider)
         # Owns-host check + live connection, mirroring the runner-launch path.
-        resolve_host_owner(user_id=user_id, host_id=body.host_id, host_store=host_store)
+        host = resolve_host_owner(user_id=user_id, host_id=body.host_id, host_store=host_store)
         host_conn = host_registry.get(body.host_id)
         if host_conn is None:
-            raise OmnigentError(
-                f"host '{body.host_id}' is not connected",
-                code=ErrorCode.CONFLICT,
-            )
+            # A live host absent from THIS replica is a wrong-replica landing, not
+            # an offline host: WRONG_REPLICA (400) so the client re-addresses
+            # keyless, CONFLICT (409) only when the row is genuinely stale.
+            raise host_absent_error(host)
         return user_id, host_conn
 
     async def _import_local_core(

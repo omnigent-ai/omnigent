@@ -28,6 +28,10 @@ from omnigent.codex_native_bridge import (
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.spec import load
 
+# The default-stance auto-review override normalize_codex_permission_launch_args
+# adds when no explicit approval/sandbox/reviewer/profile choice is present.
+_AUTO_REVIEW_ARGS = ["-c", 'approvals_reviewer="auto_review"']
+
 
 @pytest.fixture(autouse=True)
 def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1166,21 +1170,27 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             None,
             "unix:///tmp/app-server.sock",
-            ["--remote", "unix:///tmp/app-server.sock"],
+            [*_AUTO_REVIEW_ARGS, "--remote", "unix:///tmp/app-server.sock"],
         ),
         # Resume an existing thread over a Unix socket (local reattach).
         (
             (),
             "thread_local",
             "unix:///tmp/app-server.sock",
-            ["resume", "--remote", "unix:///tmp/app-server.sock", "thread_local"],
+            [
+                *_AUTO_REVIEW_ARGS,
+                "resume",
+                "--remote",
+                "unix:///tmp/app-server.sock",
+                "thread_local",
+            ],
         ),
         # Fresh thread over a loopback ws endpoint.
         (
             (),
             None,
             "ws://127.0.0.1:9876",
-            ["--remote", "ws://127.0.0.1:9876"],
+            [*_AUTO_REVIEW_ARGS, "--remote", "ws://127.0.0.1:9876"],
         ),
         # Resume an existing thread over a loopback ws endpoint: the
         # host-spawned runner path. The app-server listens on ws:// there
@@ -1191,7 +1201,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             "thread_host",
             "ws://127.0.0.1:9876",
-            ["resume", "--remote", "ws://127.0.0.1:9876", "thread_host"],
+            [*_AUTO_REVIEW_ARGS, "resume", "--remote", "ws://127.0.0.1:9876", "thread_host"],
         ),
         # Leading codex args are preserved ahead of the attach flags.
         (
@@ -1201,6 +1211,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             [
                 "--model",
                 "gpt-5.4-mini",
+                *_AUTO_REVIEW_ARGS,
                 "resume",
                 "--remote",
                 "ws://127.0.0.1:9876",
@@ -1247,6 +1258,7 @@ def test_build_codex_remote_args_passes_transport_verbatim(
                 'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
+                *_AUTO_REVIEW_ARGS,
                 "--remote",
                 "ws://127.0.0.1:9876",
             ],
@@ -1260,6 +1272,7 @@ def test_build_codex_remote_args_passes_transport_verbatim(
                 'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
+                *_AUTO_REVIEW_ARGS,
                 "resume",
                 "--remote",
                 "ws://127.0.0.1:9876",
@@ -9189,6 +9202,7 @@ def test_attach_with_forwarder_falls_back_when_tmux_socket_is_not_local(
         """
         attach_url = kwargs["attach_url"]
         assert isinstance(attach_url, str)
+        assert kwargs["session_name"] == "Codex"
         active_session_id_reader = kwargs["active_session_id_reader"]
         assert callable(active_session_id_reader)
         assert active_session_id_reader() == "conv_rotated"

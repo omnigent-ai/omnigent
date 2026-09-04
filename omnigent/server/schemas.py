@@ -2199,6 +2199,16 @@ class UpdateSessionRequest(BaseModel):
         fields here the switch is applied by the live TUI, so a failure
         to reach the mode is surfaced as an error rather than persisted.
         Omitted leaves unchanged.
+    :param approval_mode: Codex-native approval mode to switch a running
+        session to, one of ``"ask-for-approval"``, ``"approve-for-me"``,
+        ``"full-access"``, ``"read-only"`` — Codex's own ``/permissions``
+        presets (the set is codex-version-dependent, so an older build may not
+        offer every one). Only valid for sessions stamped with the codex-native
+        wrapper label. The runner applies it by driving Codex's ``/permissions``
+        popup and confirms the switch echoed before returning, so a failure to
+        reach the mode surfaces as an error. The confirmed mode is stored on the
+        read-back label only (Codex owns the durable approval state), so it is
+        not written to ``terminal_launch_args``. Omitted leaves unchanged.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session.
@@ -2257,6 +2267,7 @@ class UpdateSessionRequest(BaseModel):
     model_override: str | None = None
     collaboration_mode: str | None = None
     permission_mode: str | None = None
+    approval_mode: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     external_session_id: str | None = None
@@ -3105,6 +3116,32 @@ class SessionPermissionModeEvent(_SSEEventBase):
     type: Literal["session.permission_mode"]
     conversation_id: str
     permission_mode: str
+
+
+class SessionCodexApprovalModeEvent(_SSEEventBase):
+    """
+    Active approval/sandbox-mode update from a codex-native session.
+
+    Emitted after the web UI switches the mode, and after the Codex forwarder
+    observes a ``thread/settings/updated`` notification — an approval change the
+    user made inside Codex's ``/permissions`` popup, which Omnigent has no other
+    way to see. Lets the composer's approval picker track the thread without a
+    reload.
+
+    :param type: Always ``"session.codex_approval_mode"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param approval_mode: The active mode, one of ``"ask-for-approval"``,
+        ``"approve-for-me"``, ``"full-access"``, ``"read-only"``.
+
+    Category: **transient** (SSE-only). The server also writes
+    ``omnigent.codex_native.approval_mode`` on the conversation labels (and
+    ``terminal_launch_args``), so reconnecting clients restore the same state
+    from the session snapshot.
+    """
+
+    type: Literal["session.codex_approval_mode"]
+    conversation_id: str
+    approval_mode: str
 
 
 class SessionAgentChangedEvent(_SSEEventBase):
@@ -4512,6 +4549,7 @@ ServerStreamEvent = Annotated[
     | SessionReasoningEffortEvent
     | SessionCollaborationModeEvent
     | SessionPermissionModeEvent
+    | SessionCodexApprovalModeEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent

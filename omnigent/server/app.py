@@ -3075,6 +3075,24 @@ def create_app(
             prefix="/v1",
             tags=["hosts"],
         )
+        # Host-facing credential vending: a sandbox fetches its owner's
+        # per-provider credential over the launch-token-authenticated channel
+        # instead of having it injected. One generic route serves every provider
+        # that registered a credential_resolver (app.state set by the
+        # connection-provider wiring above); it 404s for a provider not
+        # configured on this server, so mounting it unconditionally is safe.
+        #
+        # Registered AFTER create_hosts_router on purpose: its ``{provider}`` path
+        # param would otherwise shadow that router's literal
+        # ``/hosts/{host_id}/credentials/detected`` (Starlette matches in
+        # registration order with no literal-over-parameter priority).
+        from omnigent.server.routes.host_credentials import create_host_credentials_router
+
+        app.include_router(
+            create_host_credentials_router(host_store),
+            prefix="/v1",
+            tags=["hosts"],
+        )
 
     # Per-user connection routes (/v1/connections/{provider}/*): connect /
     # callback / status / disconnect. One registry entry per provider; each is
