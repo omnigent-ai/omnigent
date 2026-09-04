@@ -176,7 +176,12 @@ def test_permission_request_injects_keystroke_for_verdict(
     bridge_dir = _governed_bridge(tmp_path)
     _feed_stdin(
         monkeypatch,
-        {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_call_id": "tc_1"},
+        {
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "tool_call_id": "tc_1",
+            "tool_input": {"command": "ls -la /tmp"},
+        },
     )
     posted: list[dict[str, object]] = []
     monkeypatch.setattr(
@@ -196,7 +201,64 @@ def test_permission_request_injects_keystroke_for_verdict(
     assert body["policy_name"] == "kimi_native_permission"
     assert body["message"] == "Kimi wants to call **Bash**"
     assert body["operation_type"] == "Bash"
+    # Re-attach id was renamed from ``_omnigent_elicitation_id``.
+    assert body["elicitation_id"].startswith("elicit_kimi_")
+    # The gated command reaches the card as the preview.
+    assert "ls -la /tmp" in body["content_preview"]
     assert keys == [expected_key]
+
+
+def test_permission_request_omits_preview_without_tool_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No usable tool_input → the card body carries no content_preview field."""
+    bridge_dir = _governed_bridge(tmp_path)
+    _feed_stdin(monkeypatch, {"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+    posted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        kimi_native_hook,
+        "_request_web_approval",
+        lambda url, headers, body: posted.append({"body": body}) or "allow",
+    )
+    _capture_injection(monkeypatch)
+
+    assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+    assert "content_preview" not in posted[0]["body"]
+
+
+@pytest.mark.parametrize(
+    ("tool_input", "expected"),
+    [
+        # A shell command is the most useful single line.
+        ({"command": "ls -la /tmp"}, "ls -la /tmp"),
+        ({"command": "  echo hi  "}, "echo hi"),
+        # No command → the JSON-encoded input.
+        ({"path": "/etc/hosts", "mode": "r"}, '"path": "/etc/hosts"'),
+        ({}, "{}"),
+        # Blank command falls through to the JSON encoding.
+        ({"command": "   "}, '"command"'),
+        # No usable input → omitted (None), never the bare tool name.
+        (None, None),
+        ("not a dict", None),
+    ],
+)
+def test_content_preview_renders_or_omits(tool_input: object, expected: str | None) -> None:
+    result = kimi_native_hook._content_preview(tool_input)
+    if expected is None:
+        assert result is None
+    else:
+        assert result is not None and expected in result
+
+
+def test_content_preview_truncates_to_limit() -> None:
+    long_command = "a" * (kimi_native_hook._PREVIEW_MAX + 500)
+    result = kimi_native_hook._content_preview({"command": long_command})
+    assert result is not None and len(result) == kimi_native_hook._PREVIEW_MAX
+
+
+def test_content_preview_omits_non_serializable_tool_input() -> None:
+    assert kimi_native_hook._content_preview({"blob": object()}) is None
 
 
 def test_permission_request_no_verdict_injects_nothing(

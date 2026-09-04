@@ -85,11 +85,32 @@ _PERMISSION_RETRY_WINDOW_S = (
 )
 _PERMISSION_REQUEST_TIMEOUT_S = _PERMISSION_RETRY_WINDOW_S
 _HARNESS = "kimi-native"
+# Cap on the preview string POSTed to the card (server truncates too).
+_PREVIEW_MAX = 1024
 
 
 def _url_component(value: str) -> str:
     """Percent-encode one URL path component (slashes escaped)."""
     return urllib.parse.quote(value, safe="")
+
+
+def _content_preview(tool_input: object) -> str | None:
+    """Render a compact card preview from the gated tool's input.
+
+    Mirrors qwen's ``_preview_for``: a shell tool's ``command`` is the most
+    useful single line, otherwise the JSON-encoded input, truncated to
+    ``_PREVIEW_MAX``. Returns ``None`` when there is no usable input so the
+    field is omitted rather than echoing the bare tool name.
+    """
+    if not isinstance(tool_input, dict):
+        return None
+    command = tool_input.get("command")
+    if isinstance(command, str) and command.strip():
+        return command.strip()[:_PREVIEW_MAX]
+    try:
+        return json.dumps(tool_input, ensure_ascii=False)[:_PREVIEW_MAX]
+    except (TypeError, ValueError):
+        return None
 
 
 def _headers_from_config(config: dict[str, object]) -> dict[str, str]:
@@ -252,6 +273,9 @@ def _main_permission_request(argv: list[str]) -> int:
         "message": f"Kimi wants to call **{tool_name}**",
         "operation_type": tool_name,
     }
+    preview = _content_preview(payload.get("tool_input"))
+    if preview is not None:
+        body["content_preview"] = preview
 
     url = (
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
