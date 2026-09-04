@@ -1,6 +1,6 @@
-// Persisted, per-device preference for what a horizontal swipe on a session
-// row does on touch devices. Two independent directions — swipe-left and
-// swipe-right — each map to an action. Modeled after the other `*Preferences`
+// Persisted, per-device preference for what a horizontal finger swipe on a
+// session row does. Two independent travel directions each map to an action.
+// Modeled after the other `*Preferences`
 // helpers: a localStorage-backed value, SSR-safe reads, and writes that swallow
 // quota/access errors so a corrupt entry can't break app boot.
 //
@@ -10,9 +10,8 @@
 // reload. writeSwipeActions notifies same-tab subscribers; a `storage` listener
 // covers other tabs.
 //
-// Defaults mirror a phone mail app: swipe-left archives (the common tidy-away
-// gesture), swipe-right is inert. Both directions may map to the SAME action —
-// nothing prevents e.g. archiving on either side.
+// Defaults mirror phone mail apps: swiping right reveals Archive on the left;
+// swiping left reveals Delete on the right. Both directions stay configurable.
 
 import { useSyncExternalStore } from "react";
 
@@ -31,10 +30,10 @@ export interface SwipeActionPreferences {
   right: SwipeAction;
 }
 
-/** Default: swipe-left archives, swipe-right does nothing. */
+/** Default: swipe-left deletes; swipe-right archives. */
 export const DEFAULT_SWIPE_ACTIONS: SwipeActionPreferences = {
-  left: "archive",
-  right: "none",
+  left: "delete",
+  right: "archive",
 };
 
 /** Return whether a string is one of the selectable swipe actions. */
@@ -49,8 +48,8 @@ export function isSwipeAction(value: unknown): value is SwipeAction {
  */
 export function normalizeSwipeActions(value: unknown): SwipeActionPreferences {
   const obj = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
-  // A direction set to something unrecognized goes inert rather than inheriting
-  // the default, which would silently arm archive on a swipe meant to be safe.
+  // An unrecognized stored direction stays inert rather than silently arming
+  // a default action, especially the destructive delete gesture.
   function actionFor(direction: SwipeDirection): SwipeAction {
     const action = obj[direction];
     if (isSwipeAction(action)) return action;
@@ -61,8 +60,8 @@ export function normalizeSwipeActions(value: unknown): SwipeActionPreferences {
 
 /**
  * Read the persisted swipe actions. Returns the defaults when nothing is
- * stored, on a server render (no `window`), or when the stored value is
- * missing/malformed — never throws, so a corrupt entry can't break app boot.
+ * stored, on a server render, or when the stored JSON cannot be parsed.
+ * Never throws, so a corrupt entry can't break app boot.
  */
 export function readSwipeActions(): SwipeActionPreferences {
   if (typeof window === "undefined") return normalizeSwipeActions(null);

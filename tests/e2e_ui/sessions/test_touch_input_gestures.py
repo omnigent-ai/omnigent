@@ -68,56 +68,20 @@ def test_sidebar_resize_handle_supports_touch_drag(
         context.close()
 
 
-def test_session_row_swipe_shows_affordance(
+def test_session_row_left_swipe_opens_default_delete_confirmation(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A horizontal swipe on a session row tracks the finger or commits its action."""
+    """A leftward session-row swipe uses the default confirmed delete action."""
     base_url, session_id = seeded_session
     context = new_touch_context(browser, viewport=_PHONE_VIEWPORT, is_mobile=True)
     try:
         page = context.new_page()
 
-        archive_requests: list[str] = []
-
-        def _on_request(request) -> None:
-            if request.method == "PATCH" and f"/v1/sessions/{session_id}" in request.url:
-                body = request.post_data or ""
-                if "archived" in body:
-                    archive_requests.append(body)
-
-        page.on("request", _on_request)
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
 
         row_link = page.locator(f'a[href="/c/{session_id}"]')
         expect(row_link).to_be_visible()
-
-        # Baseline the row's transforms and margins, then sample them every
-        # frame so any gesture-driven movement during the swipe is caught. The
-        # swipe surface tracks the finger via margin (not transform), so a
-        # transform-only probe would never see the row move.
-        page.evaluate(
-            """(sessionId) => {
-                const link = document.querySelector(`a[href="/c/${sessionId}"]`);
-                const row = link.closest('li') ?? link;
-                const surface = row.querySelector('[data-testid="conversation-swipe-surface"]');
-                const targets = [row, link, surface].filter(Boolean);
-                const probe = (el) => {
-                    const s = getComputedStyle(el);
-                    return `${s.transform}|${s.marginLeft}|${s.marginRight}`;
-                };
-                const baseline = targets.map(probe);
-                window.__swipeProbe = { moved: false, raf: 0 };
-                const sample = () => {
-                    targets.forEach((el, i) => {
-                        if (probe(el) !== baseline[i]) window.__swipeProbe.moved = true;
-                    });
-                    window.__swipeProbe.raf = requestAnimationFrame(sample);
-                };
-                sample();
-            }""",
-            session_id,
-        )
 
         box = row_link.bounding_box()
         assert box is not None
@@ -133,16 +97,7 @@ def test_session_row_swipe_shows_affordance(
             hold_before_move_s=0.05,
         )
 
-        page.wait_for_timeout(400)
-        moved = page.evaluate(
-            "() => { cancelAnimationFrame(window.__swipeProbe.raf);"
-            " return window.__swipeProbe.moved; }"
-        )
-        assert moved or archive_requests, (
-            "horizontal swipe on the session row produced no swipe response: the row "
-            "never tracked the finger and no swipe action (archived PATCH) fired — "
-            "session rows have no swipe affordance"
-        )
+        expect(page.get_by_text("Delete conversation?", exact=True)).to_be_visible()
     finally:
         context.close()
 
