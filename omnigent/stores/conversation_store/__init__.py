@@ -662,6 +662,8 @@ class ConversationStore(ABC):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        updated_at_min: int | None = None,
+        updated_at_max: int | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -772,6 +774,12 @@ class ConversationStore(ABC):
             Powers the ``(agent, title)`` child-session lookup in
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
+        :param updated_at_min: When set, only return conversations whose
+            ``updated_at`` is >= this Unix epoch timestamp. ``None`` disables
+            the lower bound. Powers the usage page date-range filtering.
+        :param updated_at_max: When set, only return conversations whose
+            ``updated_at`` is <= this Unix epoch timestamp. ``None`` disables
+            the upper bound. Powers the usage page date-range filtering.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -1210,6 +1218,57 @@ class ConversationStore(ABC):
             ``"2026-06-05"``.
         :param ask_approved_usd: The crossed checkpoint value (USD) the
             user approved continuing past, e.g. ``0.05``.
+        """
+        ...
+
+    @abstractmethod
+    def mark_usage_summary_stale(self, user_id: str) -> None:
+        """
+        Mark the user's usage summary as needing rebuild.
+
+        Sets ``needs_rebuild=True`` in the ``user_usage_summary`` table
+        for this user. Called after :meth:`increment_session_usage` to
+        invalidate the cached breakdown. On the next ``GET /v1/usage``
+        request, the summary will be rebuilt from all sessions.
+
+        :param user_id: The user whose summary should be marked stale.
+        """
+        ...
+
+    @abstractmethod
+    def get_usage_summary(
+        self,
+        user_id: str,
+    ) -> tuple[dict[str, float], dict[str, float]] | None:
+        """
+        Get cached usage breakdown for a user if not stale.
+
+        :param user_id: The user to read.
+        :returns: ``(harness_breakdown, model_breakdown)`` if cache is
+            fresh (``needs_rebuild=False``), or ``None`` if stale or
+            doesn't exist.
+        """
+        ...
+
+    @abstractmethod
+    def set_usage_summary(
+        self,
+        user_id: str,
+        harness_breakdown: dict[str, float],
+        model_breakdown: dict[str, float],
+        total_sessions: int,
+    ) -> None:
+        """
+        Update the user's cached usage summary.
+
+        UPSERTs the ``user_usage_summary`` row with new breakdown data
+        and sets ``needs_rebuild=False``. Called after rebuilding
+        breakdowns from all sessions.
+
+        :param user_id: The user whose summary to update.
+        :param harness_breakdown: Harness name → total cost USD mapping.
+        :param model_breakdown: Model ID → total cost USD mapping.
+        :param total_sessions: Count of sessions contributing to summary.
         """
         ...
 

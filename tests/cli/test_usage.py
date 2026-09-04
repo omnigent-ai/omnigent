@@ -86,11 +86,14 @@ def test_usage_command_help() -> None:
 
 
 class _FakeResponse:
+    def __init__(self, data: dict[str, Any]) -> None:
+        self._data = data
+
     def raise_for_status(self) -> None:
         return None
 
     def json(self) -> dict[str, Any]:
-        return _REPORT
+        return self._data
 
 
 class _FakeClient:
@@ -103,9 +106,13 @@ class _FakeClient:
     def __exit__(self, *args: object) -> bool:
         return False
 
-    def get(self, path: str) -> _FakeResponse:
+    def get(self, path: str, params: dict[str, Any] | None = None) -> _FakeResponse:
         assert path == "/v1/usage"
-        return _FakeResponse()
+        # Return report with pagination fields (has_more=False for single page)
+        report = dict(_REPORT)
+        report["sessions_has_more"] = False
+        report["sessions_last_id"] = None
+        return _FakeResponse(report)
 
 
 @pytest.fixture()
@@ -131,3 +138,160 @@ def test_usage_command_json() -> None:
     payload = json.loads(result.output)
     assert payload["cost_today"] == 1.5
     assert payload["sessions"][0]["models"] == {"claude-opus-4-8": 1.5}
+
+
+class _PaginatedClient:
+    """Mock client that returns multiple pages of sessions."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.call_count = 0
+
+    def __enter__(self) -> _PaginatedClient:
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+    def get(self, path: str, params: dict[str, Any] | None = None) -> _FakeResponse:
+        assert path == "/v1/usage"
+        self.call_count += 1
+        params = params or {}
+
+        if self.call_count == 1:
+            # First page
+            return _FakeResponse(
+                {
+                    "cost_today": 1.5,
+                    "cost_last_7d": 3.0,
+                    "cost_last_30d": 9.0,
+                    "total_cost_usd": 9.0,
+                    "sessions": [
+                        {"id": "conv_page1_a", "cost_usd": 1.0, "models": {}},
+                        {"id": "conv_page1_b", "cost_usd": 0.5, "models": {}},
+                    ],
+                    "sessions_has_more": True,
+                    "sessions_last_id": "conv_page1_b",
+                }
+            )
+        if params.get("after") == "conv_page1_b":
+            # Second page
+            return _FakeResponse(
+                {
+                    "cost_today": 1.5,
+                    "cost_last_7d": 3.0,
+                    "cost_last_30d": 9.0,
+                    "total_cost_usd": 9.0,
+                    "sessions": [
+                        {"id": "conv_page2_a", "cost_usd": 0.75, "models": {}},
+                    ],
+                    "sessions_has_more": False,
+                    "sessions_last_id": "conv_page2_a",
+                }
+            )
+        raise AssertionError(f"Unexpected pagination state: {params}")
+
+
+@pytest.fixture()
+def _stub_paginated_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli._resolve_attach_server", lambda *a, **k: "http://x")
+    monkeypatch.setattr("omnigent.chat._remote_headers", lambda **k: {})
+    monkeypatch.setattr(httpx, "Client", _PaginatedClient)
+
+
+@pytest.mark.usefixtures("_stub_paginated_fetch")
+def test_usage_command_fetches_all_pages() -> None:
+    """CLI should loop through all pages and accumulate all sessions."""
+    result = CliRunner().invoke(cli, ["usage", "--json", "--server", "http://x"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    # Should have all 3 sessions from both pages
+    assert len(payload["sessions"]) == 3
+    assert payload["sessions"][0]["id"] == "conv_page1_a"
+    assert payload["sessions"][1]["id"] == "conv_page1_b"
+    assert payload["sessions"][2]["id"] == "conv_page2_a"
+
+
+@pytest.mark.usefixtures("_stub_paginated_fetch")
+def test_usage_command_display_limit_still_works() -> None:
+    """--limit should still cap the rendered table, even with multiple pages."""
+    result = CliRunner().invoke(cli, ["usage", "--limit", "2", "--server", "http://x"])
+    assert result.exit_code == 0, result.output
+    # Should show "(last 2)" even though 3 sessions were fetched
+    assert "(last 2)" in result.output
+    assert "conv_page1_a" in result.output
+    assert "conv_page1_b" in result.output
+    # Third session should not be shown (limited to 2)
+    assert "conv_page2_a" not in result.output
+
+
+class _DuplicatingClient:
+    """Mock client that returns duplicate sessions across pages (due to concurrent updates)."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.call_count = 0
+
+    def __enter__(self) -> _DuplicatingClient:
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+    def get(self, path: str, params: dict[str, Any] | None = None) -> _FakeResponse:
+        assert path == "/v1/usage"
+        self.call_count += 1
+        params = params or {}
+
+        if self.call_count == 1:
+            # First page
+            return _FakeResponse(
+                {
+                    "cost_today": 1.5,
+                    "cost_last_7d": 3.0,
+                    "cost_last_30d": 9.0,
+                    "total_cost_usd": 9.0,
+                    "sessions": [
+                        {"id": "conv_a", "cost_usd": 1.0, "models": {}},
+                        {"id": "conv_b", "cost_usd": 0.5, "models": {}},
+                    ],
+                    "sessions_has_more": True,
+                    "sessions_last_id": "conv_b",
+                }
+            )
+        if params.get("after") == "conv_b":
+            # Second page - conv_b appears again due to updated_at changing
+            return _FakeResponse(
+                {
+                    "cost_today": 1.5,
+                    "cost_last_7d": 3.0,
+                    "cost_last_30d": 9.0,
+                    "total_cost_usd": 9.0,
+                    "sessions": [
+                        {"id": "conv_b", "cost_usd": 0.5, "models": {}},  # Duplicate!
+                        {"id": "conv_c", "cost_usd": 0.75, "models": {}},
+                    ],
+                    "sessions_has_more": False,
+                    "sessions_last_id": "conv_c",
+                }
+            )
+        raise AssertionError(f"Unexpected pagination state: {params}")
+
+
+@pytest.fixture()
+def _stub_duplicating_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli._resolve_attach_server", lambda *a, **k: "http://x")
+    monkeypatch.setattr("omnigent.chat._remote_headers", lambda **k: {})
+    monkeypatch.setattr(httpx, "Client", _DuplicatingClient)
+
+
+@pytest.mark.usefixtures("_stub_duplicating_fetch")
+def test_usage_command_deduplicates_sessions() -> None:
+    """CLI should de-duplicate sessions that appear in multiple pages."""
+    result = CliRunner().invoke(cli, ["usage", "--json", "--server", "http://x"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    # Should have only 3 unique sessions (conv_a, conv_b, conv_c), not 4
+    assert len(payload["sessions"]) == 3
+    session_ids = {s["id"] for s in payload["sessions"]}
+    assert session_ids == {"conv_a", "conv_b", "conv_c"}

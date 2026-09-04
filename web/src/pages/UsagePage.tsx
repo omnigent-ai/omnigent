@@ -7,7 +7,7 @@ import { UsageBreakdownCharts } from "@/components/usage/UsageBreakdownCharts";
 import { UsageSessionTable } from "@/components/usage/UsageSessionTable";
 import { useUsageReport } from "@/hooks/useUsageReport";
 import { formatSessionCostUsd } from "@/lib/formatCost";
-import type { DailyCost, SessionUsage } from "@/lib/usageApi";
+import type { DailyCost } from "@/lib/usageApi";
 import { cn } from "@/lib/utils";
 
 type RangeKey = "7d" | "30d" | "90d" | "all" | "custom";
@@ -61,21 +61,7 @@ function filterDailyCosts(
   });
 }
 
-function filterSessions(
-  sessions: SessionUsage[],
-  since: string | null,
-  until: string | null,
-): SessionUsage[] {
-  if (!since && !until) return sessions;
-  const sinceEpoch = since ? new Date(since + "T00:00:00Z").getTime() / 1000 : 0;
-  const untilEpoch = until ? new Date(until + "T23:59:59Z").getTime() / 1000 : Infinity;
-  return sessions.filter((s) => s.updatedAt >= sinceEpoch && s.updatedAt <= untilEpoch);
-}
-
 export function UsagePage() {
-  const { data, isLoading, isError, refetch } = useUsageReport();
-  const { trackClick } = useOmnigentAnalytics();
-
   const [rangeKey, setRangeKey] = useState<RangeKey>("30d");
   const [customStart, setCustomStart] = useState(() => daysAgoIso(30));
   const [customEnd, setCustomEnd] = useState(todayIso);
@@ -83,21 +69,48 @@ export function UsagePage() {
   const today = todayIso();
   const { since, until } = rangeToWindow(rangeKey, customStart, customEnd);
 
+  // Pass date range to hook - it will reset the query when the range changes
+  const { data, isLoading, isError, refetch, fetchNextPage, hasNextPage, isFetchingNextPage } =
+    useUsageReport(since, until);
+  const { trackClick } = useOmnigentAnalytics();
+
+  // Flatten pages and extract first page summary data
+  const firstPage = data?.pages[0];
+
+  // De-duplicate sessions by ID (cursor pagination on mutable updated_at can repeat rows)
+  const allSessions = useMemo(() => {
+    const flat = data?.pages.flatMap((page) => page.sessions) ?? [];
+    const seen = new Set<string>();
+    return flat.filter((session) => {
+      if (seen.has(session.id)) return false;
+      seen.add(session.id);
+      return true;
+    });
+  }, [data]);
+
   const filteredCosts = useMemo(
-    () => (data ? filterDailyCosts(data.dailyCosts, since, until) : []),
-    [data, since, until],
+    () => (firstPage ? filterDailyCosts(firstPage.dailyCosts, since, until) : []),
+    [firstPage, since, until],
   );
 
-  const filteredSessions = useMemo(
-    () => (data ? filterSessions(data.sessions, since, until) : []),
-    [data, since, until],
-  );
+  // Extract breakdowns from first page (server computes across ALL sessions, not just loaded pages)
+  const { harnessBreakdown, modelBreakdown } = useMemo(() => {
+    return {
+      harnessBreakdown: firstPage?.harnessBreakdown ?? {},
+      modelBreakdown: firstPage?.modelBreakdown ?? {},
+    };
+  }, [firstPage]);
 
+  // Total cost from daily rollup (authoritative), with fallback to session sum
   const totalCost = useMemo(() => {
-    const fromDaily = filteredCosts.reduce((sum, d) => sum + d.costUsd, 0);
-    if (fromDaily > 0) return fromDaily;
-    return filteredSessions.reduce((sum, s) => sum + s.costUsd, 0);
-  }, [filteredCosts, filteredSessions]);
+    const rolledUp = filteredCosts.reduce((sum, d) => sum + d.costUsd, 0);
+    // Fallback to session sum when daily rollup is empty (can happen when rollup
+    // is unpopulated or range excludes days with spend but includes sessions)
+    if (rolledUp === 0 && allSessions.length > 0) {
+      return allSessions.reduce((sum, s) => sum + s.costUsd, 0);
+    }
+    return rolledUp;
+  }, [filteredCosts, allSessions]);
 
   return (
     <PageScroll>
@@ -179,7 +192,7 @@ export function UsagePage() {
           </div>
         )}
 
-        {data && (
+        {firstPage && (
           <div className="flex flex-col gap-8">
             <div className="rounded-lg border border-border bg-card p-4">
               <p className="text-xs text-muted-foreground">Total cost</p>
@@ -187,7 +200,8 @@ export function UsagePage() {
                 {formatSessionCostUsd(totalCost)}
               </p>
               <p className="mt-0.5 text-xs text-muted-foreground">
-                {filteredSessions.length} session{filteredSessions.length !== 1 && "s"}
+                {allSessions.length} session{allSessions.length !== 1 && "s"}
+                {hasNextPage && " loaded"}
               </p>
             </div>
 
@@ -196,11 +210,38 @@ export function UsagePage() {
               <CostTimelineChart dailyCosts={filteredCosts} />
             </section>
 
-            <UsageBreakdownCharts sessions={filteredSessions} />
+            <div>
+              <UsageBreakdownCharts
+                harnessBreakdown={harnessBreakdown}
+                modelBreakdown={modelBreakdown}
+              />
+            </div>
 
             <section>
               <h2 className="mb-3 text-sm font-medium text-muted-foreground">Sessions</h2>
-              <UsageSessionTable sessions={filteredSessions} />
+              <UsageSessionTable sessions={allSessions} />
+              {hasNextPage && (
+                <div className="mt-4 flex justify-center">
+                  <button
+                    type="button"
+                    className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+                    onClick={() => {
+                      trackClick("usage.load_more", "button");
+                      void fetchNextPage();
+                    }}
+                    disabled={isFetchingNextPage}
+                  >
+                    {isFetchingNextPage ? (
+                      <span className="flex items-center gap-2">
+                        <Loader2Icon className="h-4 w-4 animate-spin" />
+                        Loading...
+                      </span>
+                    ) : (
+                      "Load More"
+                    )}
+                  </button>
+                </div>
+              )}
             </section>
           </div>
         )}

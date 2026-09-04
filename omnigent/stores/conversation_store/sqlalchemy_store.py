@@ -38,6 +38,7 @@ from omnigent.db.db_models import (
     SqlProject,
     SqlSessionPermission,
     SqlUserDailyCost,
+    SqlUserUsageSummary,
     current_workspace_id,
     uuid_to_bytes,
 )
@@ -1706,6 +1707,125 @@ class SqlAlchemyConversationStore(ConversationStore):
                 existing.ask_approved_usd = ask_approved_usd
                 existing.updated_at = now
 
+    def mark_usage_summary_stale(self, user_id: str) -> None:
+        """Mark the user's usage summary as needing rebuild."""
+        with self._session("mark_usage_summary_stale") as session:
+            # UPSERT: insert if not exists, otherwise set needs_rebuild=True
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            if dialect in ("sqlite", "postgresql"):
+                stmt: Any
+                if dialect == "sqlite":
+                    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+                    stmt = sqlite_insert(SqlUserUsageSummary)
+                else:
+                    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                    stmt = pg_insert(SqlUserUsageSummary)
+                stmt = stmt.values(
+                    user_id=user_id,
+                    harness_breakdown="{}",  # MySQL forbids TEXT defaults
+                    model_breakdown="{}",
+                    total_sessions=0,
+                    needs_rebuild=True,
+                    last_updated_at=0,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["workspace_id", "user_id"],
+                    set_={"needs_rebuild": True},
+                )
+                session.execute(stmt)
+            else:
+                # Generic dialect fallback
+                existing = session.get(SqlUserUsageSummary, (current_workspace_id(), user_id))
+                if existing is None:
+                    session.add(
+                        SqlUserUsageSummary(
+                            user_id=user_id,
+                            harness_breakdown="{}",  # MySQL forbids TEXT defaults
+                            model_breakdown="{}",
+                            total_sessions=0,
+                            needs_rebuild=True,
+                            last_updated_at=0,
+                        )
+                    )
+                else:
+                    existing.needs_rebuild = True
+
+    def get_usage_summary(
+        self,
+        user_id: str,
+    ) -> tuple[dict[str, float], dict[str, float]] | None:
+        """Get cached usage breakdown if not stale."""
+        with self._session("get_usage_summary") as session:
+            row = session.get(SqlUserUsageSummary, (current_workspace_id(), user_id))
+            if row is None or row.needs_rebuild:
+                return None
+            harness = json.loads(row.harness_breakdown) if row.harness_breakdown else {}
+            model = json.loads(row.model_breakdown) if row.model_breakdown else {}
+            return (harness, model)
+
+    def set_usage_summary(
+        self,
+        user_id: str,
+        harness_breakdown: dict[str, float],
+        model_breakdown: dict[str, float],
+        total_sessions: int,
+    ) -> None:
+        """Update the user's cached usage summary."""
+        now = now_epoch()
+        with self._session("set_usage_summary") as session:
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            if dialect in ("sqlite", "postgresql"):
+                stmt: Any
+                if dialect == "sqlite":
+                    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+                    stmt = sqlite_insert(SqlUserUsageSummary)
+                else:
+                    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                    stmt = pg_insert(SqlUserUsageSummary)
+                stmt = stmt.values(
+                    user_id=user_id,
+                    harness_breakdown=json.dumps(harness_breakdown),
+                    model_breakdown=json.dumps(model_breakdown),
+                    total_sessions=total_sessions,
+                    needs_rebuild=False,
+                    last_updated_at=now,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["workspace_id", "user_id"],
+                    set_={
+                        "harness_breakdown": stmt.excluded.harness_breakdown,
+                        "model_breakdown": stmt.excluded.model_breakdown,
+                        "total_sessions": stmt.excluded.total_sessions,
+                        "needs_rebuild": False,
+                        "last_updated_at": stmt.excluded.last_updated_at,
+                    },
+                )
+                session.execute(stmt)
+            else:
+                # Generic dialect fallback
+                existing = session.get(SqlUserUsageSummary, (current_workspace_id(), user_id))
+                if existing is None:
+                    session.add(
+                        SqlUserUsageSummary(
+                            user_id=user_id,
+                            harness_breakdown=json.dumps(harness_breakdown),
+                            model_breakdown=json.dumps(model_breakdown),
+                            total_sessions=total_sessions,
+                            needs_rebuild=False,
+                            last_updated_at=now,
+                        )
+                    )
+                else:
+                    existing.harness_breakdown = json.dumps(harness_breakdown)
+                    existing.model_breakdown = json.dumps(model_breakdown)
+                    existing.total_sessions = total_sessions
+                    existing.needs_rebuild = False
+                    existing.last_updated_at = now
+
     def get_session_owner(self, conversation_id: str) -> str | None:
         """
         Return the user id that owns a session (its creator).
@@ -2318,6 +2438,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        updated_at_min: int | None = None,
+        updated_at_max: int | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -2642,6 +2764,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     )
                 )
+            if updated_at_min is not None:
+                stmt = stmt.where(SqlConversation.updated_at >= updated_at_min)
+            if updated_at_max is not None:
+                stmt = stmt.where(SqlConversation.updated_at <= updated_at_max)
             if after:
                 stmt = self._apply_cursor(
                     stmt,

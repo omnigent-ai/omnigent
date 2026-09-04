@@ -8384,6 +8384,24 @@
             "title": "Daily Costs",
             "type": "array"
           },
+          "harness_breakdown": {
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
+            "description": "**All-time** cost aggregated by harness across all user sessions (pre-computed, not date-filtered), for the breakdown chart. Keys are harness names (e.g. `\"claude-sdk\"`); values are total USD cost. Sessions without a resolved harness are omitted. Shows the user's overall cost distribution regardless of `since`/`until` filters.",
+            "title": "Harness Breakdown",
+            "type": "object"
+          },
+          "model_breakdown": {
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
+            "description": "**All-time** cost aggregated by model across all user sessions (pre-computed, not date-filtered), for the breakdown chart. Keys are model IDs (e.g. `\"claude-opus-4-8\"`); values are total USD cost. Shows the user's overall cost distribution regardless of `since`/`until` filters.",
+            "title": "Model Breakdown",
+            "type": "object"
+          },
           "object": {
             "const": "usage_report",
             "default": "usage_report",
@@ -8391,12 +8409,30 @@
             "type": "string"
           },
           "sessions": {
-            "description": "Per-session detail, newest activity first.",
+            "description": "Per-session detail, newest activity first. **Pagination caveat:** sessions are sorted by `updated_at` (mutable), so if a session's `updated_at` changes between page fetches (e.g., a new turn updates an older session), it may skip forward past the cursor and be omitted from later pages. This is inherent to paginating on a mutable sort key; ID-based de-duplication on the client mitigates duplicates but cannot recover skipped rows.",
             "items": {
               "$ref": "#/components/schemas/SessionUsage"
             },
             "title": "Sessions",
             "type": "array"
+          },
+          "sessions_has_more": {
+            "default": false,
+            "description": "Whether more sessions exist beyond this page.",
+            "title": "Sessions Has More",
+            "type": "boolean"
+          },
+          "sessions_last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "ID of the last session in the page, for cursor pagination. `None` if the page is empty.",
+            "title": "Sessions Last Id"
           },
           "total_cost_usd": {
             "default": 0.0,
@@ -14440,6 +14476,70 @@
       "get": {
         "description": "Aggregate the calling user's LLM spend across their sessions.\n\nrequire_user, not get_user_id: the aggregation scopes to the caller,\nso a request slipping through as `None` in multi-user mode would\nread another scope. Fail closed with 401 instead (`user_id` is\n`None` only when auth is disabled \u2014 the single-user / local case).",
         "operationId": "get_usage_v1_usage_get",
+        "parameters": [
+          {
+            "description": "Maximum number of sessions to return per page (default 50, max 200).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination \u2014 the last session ID from the previous page.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "description": "Filter sessions with updated_at >= this date (ISO 8601 format: YYYY-MM-DD). `None` disables the lower bound.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "description": "Filter sessions with updated_at <= this date (ISO 8601 format: YYYY-MM-DD). `None` disables the upper bound.",
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Until"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -14450,6 +14550,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Get Usage",

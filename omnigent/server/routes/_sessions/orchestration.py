@@ -1357,6 +1357,11 @@ def _accumulate_session_usage(
     new_current = conversation_store.increment_session_usage(session_id, delta)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
+    # Mark usage summary as stale so breakdowns are rebuilt on next request
+    if conv:
+        owner = conversation_store.get_session_owner(conv.id)
+        if owner:
+            conversation_store.mark_usage_summary_stale(owner)
     return _priced_cost_for_display(new_current)
 
 
@@ -1589,6 +1594,11 @@ def _persist_native_cumulative_usage(
     # Non-negative by the monotonic clamp above; ``max(0.0, ...)`` keeps the
     # daily rollup from ever being clawed back even if that invariant changes.
     _record_daily_cost(conv, max(0.0, new_cost - old_cost), conversation_store)
+    # Mark usage summary as stale so breakdowns are rebuilt on next request
+    if conv:
+        owner = conversation_store.get_session_owner(conv.id)
+        if owner:
+            conversation_store.mark_usage_summary_stale(owner)
     return _priced_cost_for_display(current)
 
 
