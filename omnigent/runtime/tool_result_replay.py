@@ -497,6 +497,71 @@ def _blocks_from_newline_joined(output: str) -> RehydratedContent:
     return RehydratedContent(blocks, dropped_oversized_image=dropped)
 
 
+def _image_block_media_type(block: JsonObject) -> str | None:
+    """Return an image block's declared media type, from either shape.
+
+    :param block: An ``{"type": "image", ...}`` block.
+    :returns: The media type, e.g. ``"image/png"``, or ``None``.
+    """
+    source = block.get("source")
+    if isinstance(source, dict):
+        media_type = source.get("media_type")
+        if isinstance(media_type, str) and media_type:
+            return media_type
+    mime = block.get("mimeType")
+    return mime if isinstance(mime, str) and mime else None
+
+
+def _image_block_has_valid_payload(block: JsonObject) -> bool:
+    """Whether an image block still carries a base64 image payload.
+
+    Validates against the declared media type, so a compaction marker or any
+    other non-base64 string fails. Unlike :func:`_image_block_from_object`, a
+    source-shaped block is not passed through on failure — the payload must
+    actually decode to the declared image type.
+
+    :param block: An ``{"type": "image", ...}`` block, either the Anthropic
+        ``source`` shape or the bare ``data``/``mimeType`` MCP shape.
+    :returns: True when the payload is a usable image of its declared type.
+    """
+    source = block.get("source")
+    data = source.get("data") if isinstance(source, dict) else block.get("data")
+    media_type = _image_block_media_type(block)
+    if not isinstance(data, str) or not data or media_type is None:
+        return False
+    return _is_supported_image_payload(data, media_type)
+
+
+def sanitize_replayed_image_blocks(content: object) -> object:
+    """Downgrade image blocks whose base64 payload is no longer usable.
+
+    A compaction snapshot replaces each image block's base64 with a short marker
+    (``[image/png content omitted from the compaction snapshot]``). Replayed
+    verbatim into a ``--resume`` transcript that marker reaches the provider as
+    ``source.data`` and the whole request is rejected (``invalid base64 image
+    data: Invalid symbol 91, offset 0`` — the leading ``[``). Any image block
+    whose payload no longer validates is turned into the omitted-image text
+    placeholder; a still-valid one is canonicalized so a wrapped or unpadded
+    spelling cannot fail the resume either. Recurses so image blocks nested
+    inside a ``tool_result``'s ``content`` are reached too.
+
+    :param content: Arbitrarily nested message content (blocks, lists, scalars).
+    :returns: A copy with unusable image blocks replaced by text placeholders.
+    """
+    if isinstance(content, list):
+        return [sanitize_replayed_image_blocks(item) for item in content]
+    if isinstance(content, dict):
+        if content.get("type") == "image":
+            if _image_block_has_valid_payload(content):
+                return _image_block_from_object(content) or content
+            return {
+                "type": "text",
+                "text": image_omitted_placeholder(_image_block_media_type(content)),
+            }
+        return {key: sanitize_replayed_image_blocks(value) for key, value in content.items()}
+    return content
+
+
 def image_payloads_in_blocks(blocks: list[JsonObject]) -> list[str]:
     """
     Return the base64 payloads carried by a block list's image blocks.

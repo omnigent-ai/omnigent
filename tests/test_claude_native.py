@@ -8525,6 +8525,60 @@ def test_claude_transcript_records_handles_native_compaction_messages() -> None:
     assert "discarded before compaction" not in json.dumps(records)
 
 
+def test_claude_transcript_records_downgrades_compaction_stripped_image() -> None:
+    """A compaction-stripped image block never resumes as an invalid image.
+
+    Compaction replaces an image block's base64 with the marker
+    ``[image/png content omitted from the compaction snapshot]``. Replayed
+    verbatim that marker reaches the provider as ``source.data`` and fails the
+    resume with ``invalid base64 image data: Invalid symbol 91, offset 0`` (the
+    leading ``[``). The rebuild must downgrade it to a text placeholder.
+    """
+    marker = "[image/png content omitted from the compaction snapshot]"
+    items: list[dict[str, Any]] = [
+        {
+            "id": "cmp",
+            "type": "compaction",
+            "token_count": 42,
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": marker,
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        },
+    ]
+
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_img",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+
+    tool_result = records[1]["message"]["content"][0]
+    inner = tool_result["content"][0]
+    assert inner["type"] == "text", f"stripped image replayed as invalid image: {inner}"
+    assert marker not in json.dumps(records)
+
+
 def test_websocket_connect_passes_ssl_context_for_wss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

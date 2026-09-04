@@ -27,6 +27,7 @@ from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
     image_payloads_in_blocks,
+    sanitize_replayed_image_blocks,
     strip_unparseable_image_output,
     tool_result_content_blocks,
 )
@@ -5351,7 +5352,11 @@ def _claude_native_message_content(
         if block is None or not isinstance(block.get("type"), str):
             return None
         blocks.append(block)
-    return blocks
+    # A compaction snapshot strips image base64 to a marker; replayed verbatim
+    # that marker reaches the provider as source.data and fails the resume, so
+    # downgrade any unusable image block to its omitted-image placeholder.
+    sanitized = sanitize_replayed_image_blocks(blocks)
+    return cast(list[_JsonObject], sanitized)
 
 
 def _synthetic_claude_transcript_uuid(

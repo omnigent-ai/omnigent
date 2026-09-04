@@ -286,3 +286,44 @@ def test_unusable_payloads_stay_omitted() -> None:
             b"\x89PNG\r\n\x1a\n"
         )
     )
+
+
+def test_sanitize_replayed_image_blocks_downgrades_the_compaction_marker() -> None:
+    """A compaction-stripped image nested in a tool_result becomes text."""
+    marker = "[image/png content omitted from the compaction snapshot]"
+    content = [
+        {
+            "type": "tool_result",
+            "tool_use_id": "toolu_img",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": marker},
+                }
+            ],
+        }
+    ]
+
+    sanitized = trc.sanitize_replayed_image_blocks(content)
+
+    inner = sanitized[0]["content"][0]
+    assert inner["type"] == "text"
+    assert "image/png" in inner["text"]
+    assert marker not in json.dumps(sanitized)
+
+
+def test_sanitize_replayed_image_blocks_preserves_valid_images() -> None:
+    """A still-valid image survives sanitization, canonicalized in place."""
+    content = [
+        {"type": "text", "text": "keep me"},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": _TINY_PNG_BASE64},
+        },
+    ]
+
+    sanitized = trc.sanitize_replayed_image_blocks(content)
+
+    assert sanitized[0] == {"type": "text", "text": "keep me"}
+    assert sanitized[1]["type"] == "image"
+    assert sanitized[1]["source"]["media_type"] == "image/png"
