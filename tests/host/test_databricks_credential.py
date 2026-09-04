@@ -28,6 +28,9 @@ class _Resp:
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # These tests model a managed sandbox host, where IS_SANDBOX=1 is baked into
+    # the image; see test_noop_off_sandbox for the local-host (unset) no-op.
+    monkeypatch.setenv("IS_SANDBOX", "1")
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "host-tok")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
@@ -137,6 +140,23 @@ def test_noop_without_host_token(monkeypatch: pytest.MonkeyPatch) -> None:
     called = _patch_get(monkeypatch, _Resp(200, {"connected": True, "token": "t"}))
     assert dc.configure_host_databricks("https://omni.example", "h") is False
     assert called == {}  # broker never hit
+
+
+def test_noop_off_sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Local-host safety: a connected owner running ``omnigent host`` on a laptop
+    (no IS_SANDBOX) must not get their real ~/.databrickscfg written. This is an
+    auto-applied sandbox integration — it no-ops entirely off a managed sandbox,
+    even with a valid host token and a connected broker, and never hits the broker."""
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    called = _patch_get(
+        monkeypatch,
+        _Resp(200, {"connected": True, "token": "t", "workspace_host": "https://ws.example"}),
+    )
+    assert dc.configure_host_databricks("https://omni.example", "h") is False
+    assert called == {}  # broker never hit — pure no-op
+    assert not (tmp_path / ".databrickscfg").exists()  # no local footprint
+    assert not (tmp_path / dc._SIDECAR_NAME).exists()
+    assert "DATABRICKS_CONFIG_PROFILE" not in os.environ
 
 
 def test_noop_on_broker_error(monkeypatch: pytest.MonkeyPatch) -> None:

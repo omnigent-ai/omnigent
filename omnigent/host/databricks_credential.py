@@ -213,9 +213,19 @@ def configure_host_databricks(server_url: str, host_id: str) -> bool:
     inherits it via the env allowlist) resolves the gateway workspace as them.
     The bearer itself is fetched on demand from the broker, never persisted.
 
+    Sandbox-only: this is an auto-applied *sandbox integration*, so it no-ops
+    unless ``IS_SANDBOX=1``. ``omnigent host`` also runs on a developer's laptop,
+    where writing a brokered ``[omnigent]`` profile into their real
+    ``~/.databrickscfg`` is an unwanted local-machine footprint. ``IS_SANDBOX``
+    is baked into the managed-sandbox host image (and set on the k8s Pod) and is
+    never present on a laptop, so it scopes the write to managed sandboxes on top
+    of the owner-connected gate.
+
     :returns: ``True`` when the per-user profile was written; ``False`` otherwise
         (no-op — ambient config, if any, is left untouched).
     """
+    if os.environ.get("IS_SANDBOX") != "1":
+        return False
     token = (os.environ.get(HOST_TOKEN_ENV_VAR) or "").strip()
     if not token:
         return False
