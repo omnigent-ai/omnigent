@@ -21,9 +21,8 @@ Enumeration is deterministic per provider kind:
   ``"openai-compatible"``).
 - ``subscription`` → live CLI discovery for Cursor; curated static aliases for
   CLIs without a listing API (source ``"static"``, ``verified: false``).
-- ``cli-config`` → native Claude/Codex shared probe catalogs (source ``"cli"``)
-  when available, otherwise an empty static listing. Credentials are
-  resolved by the CLI at launch.
+- ``cli-config`` → Codex static pre-launch shape, or live Kimi CLI discovery
+  (source ``"cli"``); credentials are resolved by each CLI's config at launch.
 - anything unresolvable → source ``"none"`` with an explanatory note,
   which doubles as a dead-worker preflight signal.
 """
@@ -154,6 +153,7 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     "kimi-code": "kimi",
     # Native Kimi TUI harness shares the multi-provider kimi resolution path.
     "kimi-native": "kimi",
+    "native-kimi": "kimi",
     # Generic ACP (and its acp:<slug> ids, canonicalized before lookup) is
     # family-agnostic like kimi; the curated picker reads every family's
     # models: map from the resolved entry (see acp_curated_models).
@@ -636,14 +636,18 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
             kind=NONE_KIND,
             detail=f"harness {harness or 'unknown'!r} has no model-provider resolution",
         )
+    agent_spec = cast("AgentSpec", spec)
     if harness_type == "kimi":
+        if agent_spec.executor.auth is not None:
+            from omnigent.runtime.workflow import _build_kimi_spawn_env
+
+            _build_kimi_spawn_env(agent_spec)
         return ResolvedModelProvider(
             kind=CLI_CONFIG_KIND,
             cli="kimi",
             detail="Kimi CLI config",
         )
 
-    agent_spec = cast("AgentSpec", spec)
     entry = (
         _acp_provider_entry(agent_spec)
         if harness_type == "acp"
@@ -1389,6 +1393,9 @@ def _listing_for_provider(
             provider.kind == CLI_CONFIG_KIND and provider.cli == "kimi"
         ):
             # A failed self-managed CLI probe says nothing about dispatchability.
+            credential_source = (
+                "own provider config" if provider.cli == "kimi" else "own stored login"
+            )
             return ModelListing(
                 source="static",
                 verified=False,
@@ -1396,7 +1403,7 @@ def _listing_for_provider(
                 note=(
                     f"model listing failed for {provider.detail or provider.kind} "
                     f"({_redacted_failure_reason(exc)}); the CLI launches with its "
-                    "own provider config, so dispatches to this worker can still run"
+                    f"{credential_source}, so dispatches to this worker can still run"
                 ),
             )
         return ModelListing(
@@ -1467,6 +1474,7 @@ def _fetch_kimi_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
     raw_models = payload.get("models") if isinstance(payload, dict) else None
     if not isinstance(raw_models, dict):
         raise ValueError("Kimi CLI model listing did not contain a models object")
+    # Kimi keys this object by the full model id accepted by ``--model``.
     model_ids = tuple(
         model_id for model_id in raw_models if isinstance(model_id, str) and model_id
     )
