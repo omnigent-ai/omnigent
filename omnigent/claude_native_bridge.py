@@ -135,6 +135,16 @@ _MAX_CONCURRENT_MCP_REQUESTS = 64
 # ``tmux.json`` after the Claude terminal launches; the harness
 # tails it and shells out to tmux.
 _TMUX_READY_TIMEOUT_S = 30.0
+# Hard cap on waiting for a slow-booting terminal whose process is still
+# alive. A flat readiness budget drops the first prompt on hosts where
+# connecting/booting Claude Code legitimately takes longer than
+# ``_TMUX_READY_TIMEOUT_S`` (e.g. a slow remote-sandbox host connect): the
+# terminal would have become ready moments later, but the gate gave up, the
+# pane was reaped, and the message was silently lost. While ``#{pane_dead}``
+# affirms the pane's process is alive, the readiness gate keeps waiting up
+# to this cap; a dead (or unobservable) pane still fails at the base budget
+# so genuine boot crashes surface as fast as before.
+_TMUX_READY_SLOW_BOOT_TIMEOUT_S = 180.0
 # Per-command tmux budget. 10s matches every other native bridge: a tmux
 # server starved by parallel worker boots on a large worktree can stall
 # past 5s while still healthy, and a shorter budget kills the delivery.
@@ -3173,6 +3183,10 @@ def inject_user_message(
     :param content: User text from the Omnigent web UI. Must be non-empty.
     :param timeout_s: Seconds to wait for each readiness gate
         (``tmux.json`` advertised, then prompt rendered), e.g. ``30.0``.
+        The prompt-rendered gate extends past this budget while the
+        terminal's process is verifiably alive but still booting (see
+        :func:`_wait_for_claude_prompt_ready`), so a slow host connect
+        delivers the message late instead of dropping it.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
@@ -3894,6 +3908,49 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     return proc.stdout if proc.returncode == 0 else ""
 
 
+def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool:
+    """
+    Report whether the Claude pane's process is still running.
+
+    The Claude terminal is launched with ``keep_alive_after_exit``, so a
+    dead pane persists (capturable for diagnostics) — pane existence is
+    not liveness. ``#{pane_dead}`` is the deterministic signal: ``0``
+    means the pane's process is running (e.g. a slow boot still in
+    progress), ``1`` means it exited.
+
+    Never raises, and errs toward "not alive": an unreachable tmux
+    server, an unknown target, or a torn probe reads as dead, so callers
+    extend a wait only on an affirmative liveness signal.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: ``True`` only when tmux reports the pane's process alive.
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                socket_path,
+                "display-message",
+                "-p",
+                "-t",
+                tmux_target,
+                "#{pane_dead}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "0"
+
+
 def claude_pane_ready(bridge_dir: Path) -> bool:
     """
     Report whether the Claude pane is showing a usable input box right now.
@@ -4250,17 +4307,25 @@ def _wait_for_claude_prompt_ready(
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :param timeout_s: Seconds to wait for the prompt, e.g. ``30.0``.
+    :param timeout_s: Seconds to wait for the prompt while the terminal
+        cannot be confirmed alive, e.g. ``30.0``. While ``#{pane_dead}``
+        affirms the pane's process is running — a slow boot in progress,
+        e.g. a slow host connect — the wait extends past this budget, up
+        to :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`, so the first message
+        of a session is delivered late rather than silently dropped.
     :returns: None.
-    :raises ClaudePromptTimeout: If the prompt never renders within
-        *timeout_s* (Claude failed to boot). The message carries a poll
+    :raises ClaudePromptTimeout: If the prompt never renders in time
+        (Claude failed to boot, or a slow boot outlasted even the hard
+        cap). The message carries the seconds actually waited, a poll
         count, how many of those polls saw an empty capture, and the tail
         of the last non-empty capture the loop actually observed (see
         :func:`_format_terminal_failure_tail`) so the true failure mode —
         a startup crash, a torn/empty capture under a mid-turn repaint, or
         a box that never appeared — is diagnosable from the error alone.
     """
-    deadline = time.monotonic() + timeout_s
+    started = time.monotonic()
+    deadline = started + timeout_s
+    hard_deadline = started + max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S)
     polls = 0
     empty_polls = 0
     # Keep the last non-empty capture the loop actually saw, not a fresh
@@ -4281,16 +4346,24 @@ def _wait_for_claude_prompt_ready(
             empty_polls += 1
         if _claude_prompt_rendered(pane):
             return
-        if time.monotonic() >= deadline:
-            break
+        now = time.monotonic()
+        if now >= deadline:
+            # Past the base budget, a slow boot is only distinguishable
+            # from a dead one by the pane's process: keep waiting while
+            # tmux affirms it is alive (the boot is still in progress),
+            # bounded by the hard cap. A dead or unobservable pane stops
+            # here, exactly as fast as the base budget always did.
+            if now >= hard_deadline or not _claude_pane_alive(socket_path, tmux_target):
+                break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     # Timed out. The poll/empty-capture counts separate the failure modes:
     # mostly-empty captures point at a torn read under a busy repaint (the
     # session is alive but capture-pane came back blank); non-empty captures
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
+    waited_s = time.monotonic() - started
     raise ClaudePromptTimeout(
-        f"Claude Code terminal did not become ready within {timeout_s}s "
+        f"Claude Code terminal did not become ready within {waited_s:.1f}s "
         f"(input prompt never rendered in {polls} polls, "
         f"{empty_polls} empty captures). The message was not delivered."
         + _format_terminal_failure_tail(last_nonempty)
