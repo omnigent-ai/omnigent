@@ -542,24 +542,61 @@ def sanitize_replayed_image_blocks(content: object) -> object:
     data: Invalid symbol 91, offset 0`` — the leading ``[``). Any image block
     whose payload no longer validates is turned into the omitted-image text
     placeholder; a still-valid one is canonicalized so a wrapped or unpadded
-    spelling cannot fail the resume either. Recurses so image blocks nested
-    inside a ``tool_result``'s ``content`` are reached too.
+    spelling cannot fail the resume either.
 
-    :param content: Arbitrarily nested message content (blocks, lists, scalars).
+    Traversal is deliberately narrow — a message content list and, within it, a
+    ``tool_result``'s ``content`` list. It does not descend into a
+    ``tool_use.input`` or other arbitrary structured value, so a nested payload
+    that merely *looks* like ``{"type": "image", ...}`` (e.g. an image tool's
+    arguments) is never rewritten.
+
+    :param content: A message ``content`` value — a block list, or a string that
+        is returned untouched.
     :returns: A copy with unusable image blocks replaced by text placeholders.
     """
     if isinstance(content, list):
-        return [sanitize_replayed_image_blocks(item) for item in content]
-    if isinstance(content, dict):
-        if content.get("type") == "image":
-            if _image_block_has_valid_payload(content):
-                return _image_block_from_object(content) or content
-            return {
-                "type": "text",
-                "text": image_omitted_placeholder(_image_block_media_type(content)),
-            }
-        return {key: sanitize_replayed_image_blocks(value) for key, value in content.items()}
+        return [_sanitize_replayed_block(item) for item in content]
     return content
+
+
+def _sanitize_replayed_block(block: object) -> object:
+    """Sanitize one content block, recursing only into ``tool_result.content``.
+
+    :param block: One entry from a message ``content`` list.
+    :returns: The block, downgraded when it is an unusable image block, with a
+        ``tool_result``'s nested content sanitized in turn.
+    """
+    parsed = _json_object(block)
+    if parsed is None:
+        return block
+    block_type = parsed.get("type")
+    if block_type == "image":
+        return _sanitize_image_block(parsed)
+    if block_type == "tool_result":
+        inner = parsed.get("content")
+        if isinstance(inner, list):
+            return {**parsed, "content": [_sanitize_replayed_block(item) for item in inner]}
+    return block
+
+
+def _sanitize_image_block(block: JsonObject) -> JsonObject:
+    """Canonicalize a usable image block, else downgrade it to a placeholder.
+
+    A non-base64 ``source`` type (e.g. ``url``) carries no base64 to validate,
+    so it is preserved rather than dropped.
+
+    :param block: A block whose ``type`` is ``"image"``.
+    :returns: The canonical image block, the original block for a non-base64
+        source, or an omitted-image text block.
+    """
+    source = block.get("source")
+    if isinstance(source, dict):
+        source_type = source.get("type")
+        if isinstance(source_type, str) and source_type != "base64":
+            return block
+    if _image_block_has_valid_payload(block):
+        return _image_block_from_object(block) or block
+    return {"type": "text", "text": image_omitted_placeholder(_image_block_media_type(block))}
 
 
 def image_payloads_in_blocks(blocks: list[JsonObject]) -> list[str]:
