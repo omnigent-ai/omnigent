@@ -16,6 +16,16 @@ describe("ProjectRowIcon", () => {
     expect(icon.className).toContain("justify-center");
   });
 
+  it("applies a caller's className to both the emoji and folder branches", () => {
+    // The header breadcrumb resizes the icon to size-4 (16px); the class must
+    // reach both the emoji span and the folder svg so neither shrinks.
+    const { rerender, container } = render(<ProjectRowIcon icon="🚀" className="size-4" />);
+    expect(screen.getByTestId("project-icon").className).toContain("size-4");
+
+    rerender(<ProjectRowIcon icon={null} className="size-4" />);
+    expect(container.querySelector("svg")?.getAttribute("class")).toContain("size-4");
+  });
+
   it("falls back to a folder glyph when no icon is set", () => {
     const { container } = render(<ProjectRowIcon icon={null} />);
     expect(screen.queryByTestId("project-icon")).toBeNull();

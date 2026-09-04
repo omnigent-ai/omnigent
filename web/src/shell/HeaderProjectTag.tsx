@@ -63,7 +63,7 @@ export function HeaderProjectTag({
                   )}
                 >
                   {projectName ? (
-                    <ProjectRowIcon icon={projectIcon} />
+                    <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
                   ) : (
                     <FolderPlusIcon className="size-4" />
                   )}

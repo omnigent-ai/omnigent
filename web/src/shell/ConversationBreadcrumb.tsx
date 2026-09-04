@@ -114,14 +114,14 @@ export function ConversationBreadcrumb({
                   )}
                   aria-label={`Project: ${projectName}`}
                 >
-                  <ProjectRowIcon icon={projectIcon} />
+                  <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
                 </span>
               </TooltipTrigger>
               <TooltipContent side="bottom" align="start">
                 <div>
                   <span className="font-semibold text-ui">{conversationTitle}</span>
                   <div className="flex gap-1 text-muted-foreground">
-                    <ProjectRowIcon icon={projectIcon} />
+                    <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
                     {projectName}
                   </div>
                 </div>
