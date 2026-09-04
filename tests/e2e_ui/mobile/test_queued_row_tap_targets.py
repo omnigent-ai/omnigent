@@ -89,6 +89,8 @@ def test_queued_row_controls_meet_mobile_tap_target(
         # msg2 -> typed while busy -> held in the client-side queue and shown
         # in the docked strip above the composer.
         composer.fill(_MSG2)
+        # A pre-warmed hidden terminal surface must not intercept the composer.
+        send.click(trial=True)
         send.click()
         strip = page.get_by_test_id("composer-queued-strip")
         expect(strip).to_be_visible(timeout=15_000)

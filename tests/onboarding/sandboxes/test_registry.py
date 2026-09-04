@@ -126,6 +126,13 @@ def test_instantiate_loads_blaxel_without_optional_sdk() -> None:
     assert launcher.provider == "blaxel"
 
 
+def test_instantiate_loads_microsandbox_without_optional_sdk() -> None:
+    """The lazy microsandbox module imports before the optional SDK is installed."""
+    reset_plugin_state_for_tests()
+    launcher = instantiate("microsandbox")
+    assert launcher.provider == "microsandbox"
+
+
 def test_instantiate_unknown_raises() -> None:
     """Instantiating an unknown provider raises SandboxRegistryError."""
     reset_plugin_state_for_tests()

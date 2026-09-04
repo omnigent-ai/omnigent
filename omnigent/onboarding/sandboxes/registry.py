@@ -154,6 +154,13 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 launcher_class="omnigent.onboarding.sandboxes.boxlite:BoxliteSandboxLauncher",
                 managed_token_ttl_s=7 * 24 * 3600,
             ),
+            "microsandbox": SandboxProviderMetadata(
+                name="microsandbox",
+                launcher_class=(
+                    "omnigent.onboarding.sandboxes.microsandbox:MicrosandboxSandboxLauncher"
+                ),
+                managed_token_ttl_s=7 * 24 * 3600,
+            ),
             "cwsandbox": SandboxProviderMetadata(
                 name="cwsandbox",
                 launcher_class="omnigent.onboarding.sandboxes.cwsandbox:CWSandboxLauncher",

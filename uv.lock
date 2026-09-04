@@ -2692,6 +2692,18 @@ wheels = [
 ]
 
 [[package]]
+name = "microsandbox"
+version = "0.6.9"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/83/f4/a21b50ff460f387e37a544506b879f4a800d0edfc806d238a26d78f6e754/microsandbox-0.6.9-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:618d9cd3f309f59db5afe7b4301d708f5b8ecfd90abcf2e2f53ae47b56cf126c", size = 36896851, upload-time = "2026-08-15T03:40:57.567Z" },
+    { url = "https://files.pythonhosted.org/packages/73/04/2699ac852424cb4b6c672a6fe0592debe79320722b0887508fc05da8dd67/microsandbox-0.6.9-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:dc61c7496753a2e3b0a4722d0cffbbac1ff754de1b0fd963a2321aca4fcd3c31", size = 38972096, upload-time = "2026-08-15T03:41:03.221Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/a9/29b81847140a7b195473511a1b0785dd6d775a8d56afd6bccb96fa43373a/microsandbox-0.6.9-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:b5193071cc8c79655459e0be79408b1287f3b3dc6e9a9207b352f28b23e56329", size = 35942162, upload-time = "2026-08-15T03:41:08.232Z" },
+    { url = "https://files.pythonhosted.org/packages/66/cd/c762be576fa7ee2821494e9e7cbcec6cbc830f4f65523b60c21c141224c3/microsandbox-0.6.9-cp310-abi3-win_amd64.whl", hash = "sha256:90839de0f2e0a5962ad7e49c41a225579d3c99ec24e33ba72717c23e4d2e5089", size = 33419398, upload-time = "2026-08-15T03:41:13.279Z" },
+    { url = "https://files.pythonhosted.org/packages/56/8e/fc4252ee4ac6e0cc21884e4016c171050572763d2d629e39cd9d8022d446/microsandbox-0.6.9-cp310-abi3-win_arm64.whl", hash = "sha256:d9edc1bea7e185013be37ff97d3ff9f1ef7cdb64e87357591cd25b9337fc6b3e", size = 36788238, upload-time = "2026-08-15T03:41:18.985Z" },
+]
+
+[[package]]
 name = "mlflow"
 version = "3.13.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3254,6 +3266,9 @@ kubernetes = [
 loadtest = [
     { name = "locust" },
 ]
+microsandbox = [
+    { name = "microsandbox" },
+]
 modal = [
     { name = "modal" },
 ]
@@ -3375,6 +3390,7 @@ requires-dist = [
     { name = "kubernetes", marker = "extra == 'kubernetes'", specifier = ">=36,<37" },
     { name = "locust", marker = "extra == 'loadtest'", specifier = ">=2.30,<3" },
     { name = "mcp", specifier = ">=1.0,<2" },
+    { name = "microsandbox", marker = "extra == 'microsandbox'", specifier = ">=0.6.9,<0.7" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.0,<2" },
     { name = "nimble-python", marker = "extra == 'nimble'", specifier = ">=1.2.0,<2" },
     { name = "numpy", marker = "extra == 'dictation'", specifier = ">=1.24,<3" },
@@ -3426,7 +3442,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "databricks", "loadtest"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "databricks", "loadtest"]
 
 [package.metadata.requires-dev]
 dev = [
