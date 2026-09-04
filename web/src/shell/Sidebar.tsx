@@ -15,6 +15,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
@@ -2328,15 +2329,22 @@ function ConversationList({
             )}
           </div>
         </RowEditHoldContext.Provider>
-        {/* The dragged row's preview follows the pointer (rendered in a portal),
-          a compact card showing the session's title. */}
-        <DragOverlay dropAnimation={null}>
-          {activeDrag ? (
-            <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip">
-              {activeDrag.label}
-            </div>
-          ) : null}
-        </DragOverlay>
+        {/* The dragged row's preview follows the pointer: a compact card
+          showing the session's title. Portaled to <body>: the sidebar aside
+          always carries a transform (translate-x), which makes it the
+          containing block for fixed-position descendants — rendered inline,
+          the overlay's viewport coordinates would resolve against the aside,
+          displacing the card by the floating peek card's offset. */}
+        {createPortal(
+          <DragOverlay dropAnimation={null}>
+            {activeDrag ? (
+              <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip">
+                {activeDrag.label}
+              </div>
+            ) : null}
+          </DragOverlay>,
+          document.body,
+        )}
       </DndContext>
     </SidebarRowDataProvider>
   );
