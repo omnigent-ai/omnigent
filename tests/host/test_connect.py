@@ -800,6 +800,11 @@ async def _cancel(task: asyncio.Task[None]) -> None:
         await task
 
 
+async def _noop_prewarm() -> None:
+    """Stand in for the model-options prewarm, which shells out to real CLIs."""
+    return
+
+
 def test_unavailable_harness_quick_probe_is_ttl_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     """The quick probe resolves each unavailable harness once per TTL.
 
@@ -1320,6 +1325,197 @@ async def test_capability_probe_failure_does_not_block_registration(
     assert hello.configured_harnesses is None
     assert hello.gateway_inference == {"codex": False}
     assert "Permission denied: '/usr/local/bin/codex'" in capsys.readouterr().err
+
+
+class _OpenTunnel:
+    """Fake tunnel that stays open until the test closes it.
+
+    ``_FakeTunnel`` drops on first ``recv``, which tears down the post-hello
+    background tasks immediately. This one keeps serving so a test can observe
+    frames the host pushes while connected.
+    """
+
+    def __init__(self) -> None:
+        """Initialize the frame log and the first-send / close signals."""
+        self.sent: list[str] = []
+        self.first_send = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def send(self, data: str) -> None:
+        """Record an outbound frame and signal the first send.
+
+        :param data: Encoded frame text.
+        """
+        self.sent.append(data)
+        self.first_send.set()
+
+    async def recv(self) -> str:
+        """Block until the test closes the tunnel, then disconnect."""
+        await self.closed.wait()
+        raise ConnectionError("test disconnect")
+
+
+async def test_hello_is_sent_before_the_capability_probe_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registration must not wait on capability discovery.
+
+    The startup probe shells out to four harness CLIs in series, which
+    measured 0.8-1.3s of a ~1.5s cold host start. It now runs alongside the
+    handshake, so hello registers the host with readiness unknown and the
+    probe's answer arrives as a readiness frame.
+
+    A 10ms heartbeat counts event-loop ticks: hello must land on the tick the
+    tunnel opened, long before the (deliberately much slower) probe returns.
+    """
+    host = _make_host_process()
+    monkeypatch.setattr(host, "_prewarm_model_options", _noop_prewarm)
+    release = asyncio.Event()
+    ticks = {"n": 0}
+
+    async def _heartbeat() -> None:
+        while True:
+            await asyncio.sleep(0.01)
+            ticks["n"] += 1
+
+    async def _blocked_configured(*, startup: bool) -> dict[str, bool]:
+        del startup
+        await release.wait()
+        return {"pi": True}
+
+    async def _blocked_gateway(*, startup: bool) -> dict[str, bool]:
+        del startup
+        await release.wait()
+        return {"codex": True}
+
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _blocked_configured)
+    monkeypatch.setattr(host, "_probe_gateway_inference", _blocked_gateway)
+
+    beat = asyncio.create_task(_heartbeat())
+    init = asyncio.create_task(host._initialize_and_publish_capabilities())
+    tunnel = _OpenTunnel()
+    serve = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=2.0)
+        hello_tick = ticks["n"]
+
+        hello = decode_host_frame(tunnel.sent[0])
+        assert isinstance(hello, HostHelloFrame)
+        # Registered as "unknown" — never as "nothing is configured".
+        assert hello.configured_harnesses is None
+        assert hello.gateway_inference is None
+        assert not host._capabilities_initialized
+
+        # The probe is still blocked several heartbeats after registration.
+        while ticks["n"] < hello_tick + 5:
+            await asyncio.sleep(0.01)
+        assert len(tunnel.sent) == 1
+
+        # Its answer reaches the server as soon as it lands, without waiting
+        # out HARNESS_READINESS_REFRESH_INTERVAL_S (left at its real 5s here).
+        release.set()
+        await asyncio.wait_for(init, timeout=2.0)
+        assert len(tunnel.sent) == 2
+        readiness = decode_host_frame(tunnel.sent[1])
+        assert isinstance(readiness, HostHarnessReadinessFrame)
+        assert readiness.configured_harnesses == {"pi": True}
+        assert readiness.gateway_inference == {"codex": True}
+    finally:
+        tunnel.closed.set()
+        with contextlib.suppress(ConnectionError):
+            await serve
+        await _cancel(beat)
+    _cleanup_host(host)
+
+
+async def test_capability_probe_landing_before_hello_needs_no_readiness_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot ready in time rides hello instead of a follow-up frame."""
+    host = _make_host_process()
+    monkeypatch.setattr(host, "_prewarm_model_options", _noop_prewarm)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", lambda: {"pi": True})
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
+
+    await host._initialize_and_publish_capabilities()
+    tunnel = _OpenTunnel()
+    serve = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=2.0)
+        hello = decode_host_frame(tunnel.sent[0])
+        assert isinstance(hello, HostHelloFrame)
+        assert hello.configured_harnesses == {"pi": True}
+        # Nothing to correct, so no duplicate readiness frame.
+        await asyncio.sleep(0.05)
+        assert len(tunnel.sent) == 1
+    finally:
+        tunnel.closed.set()
+        with contextlib.suppress(ConnectionError):
+            await serve
+    _cleanup_host(host)
+
+
+async def test_settled_unknown_readiness_is_probed_without_a_refresh_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A startup probe that failed is retried on the loop's first tick.
+
+    ``HARNESS_READINESS_REFRESH_INTERVAL_S`` is left at its real 5s: a loop
+    that slept before its first probe would blow the 2s timeout below.
+    """
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", lambda: {"pi": True})
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
+    host = _make_host_process()
+    host._configured_harnesses = None
+    host._gateway_inference = None
+    host._capabilities_initialized = True
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._harness_readiness_loop(ws))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
+
+    assert len(ws.sent) == 1
+    refresh = decode_host_frame(ws.sent[0])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"pi": True}
+    _cleanup_host(host)
+
+
+async def test_refresh_loop_does_not_duplicate_an_in_flight_startup_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown readiness with the startup probe still running waits for it.
+
+    Probing again would double the four serial CLI execs for an answer already
+    on its way, so the loop only treats "unknown" as urgent once the startup
+    probe has settled.
+    """
+    calls = {"n": 0}
+
+    def _counted() -> dict[str, bool]:
+        calls["n"] += 1
+        return {"pi": True}
+
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _counted)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
+    host = _make_host_process()
+    host._configured_harnesses = None
+    host._gateway_inference = None
+    host._capabilities_initialized = False
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._harness_readiness_loop(ws))  # type: ignore[arg-type]
+    try:
+        await asyncio.sleep(0.2)
+    finally:
+        await _cancel(task)
+
+    assert calls["n"] == 0
+    assert ws.sent == []
+    _cleanup_host(host)
 
 
 async def test_hello_advertises_installed_version() -> None:

@@ -997,6 +997,10 @@ class HostProcess:
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
         self._gateway_inference: dict[str, bool] | None = None
         self._capabilities_initialized = False
+        # Tracks the startup capability probe so the readiness loop can tell
+        # "still probing" from "probed and found nothing", and skip refreshing
+        # alongside a probe already in flight.
+        self._capability_init_task: asyncio.Task[None] | None = None
         # Consecutive login-page redirects; reset by a successful upgrade.
         self._login_redirect_streak = 0
         # Reset by a successful upgrade or non-auth error; bounds fresh-host refresh retries.
@@ -3051,7 +3055,15 @@ class HostProcess:
             return None
 
     async def _initialize_capabilities(self) -> None:
-        """Build the initial capability snapshot once, before any handshake."""
+        """Build the initial capability snapshot once, off the connect path.
+
+        Probing shells out to four CLIs in series and imports the harness
+        modules, which measured 0.8-1.3s of a ~1.5s cold host start. The
+        metadata is advisory (``None`` means "unknown" on the wire, and the
+        launch-time check on this host is authoritative), so registration must
+        not wait on it: :meth:`run` starts this as a background task and
+        :meth:`_publish_capabilities` pushes the answer when it lands.
+        """
         if self._capabilities_initialized:
             return
         try:
@@ -3076,6 +3088,39 @@ class HostProcess:
         self._configured_harnesses = configured
         self._gateway_inference = gateway
         self._capabilities_initialized = True
+
+    async def _initialize_and_publish_capabilities(self) -> None:
+        """Probe capabilities in the background, then tell the live tunnel.
+
+        A hello sent before the probe finished reported readiness as unknown,
+        so the result is pushed as a readiness frame instead of waiting out
+        :data:`HARNESS_READINESS_REFRESH_INTERVAL_S`.
+        """
+        await self._initialize_capabilities()
+        await self._publish_capabilities()
+
+    async def _publish_capabilities(self) -> None:
+        """Push the current capability snapshot on the live tunnel, if any.
+
+        No-op when nothing is connected: the hello of the next connection
+        carries the snapshot. Best-effort — a send that loses a race with a
+        disconnect must not take the host down.
+        """
+        ws = self._ws
+        configured = self._configured_harnesses
+        if ws is None or configured is None:
+            return
+        try:
+            await ws.send(
+                encode_host_frame(
+                    HostHarnessReadinessFrame(
+                        configured_harnesses=configured,
+                        gateway_inference=self._gateway_inference,
+                    )
+                )
+            )
+        except Exception:  # noqa: BLE001 — advisory metadata, never fatal
+            _logger.debug("Could not publish host capabilities", exc_info=True)
 
     async def _lifecycle_monitor_loop(self) -> None:
         """Self-terminate once this daemon no longer owns its registry record.
@@ -3144,10 +3189,14 @@ class HostProcess:
             authorization / outdated server, or a loopback server that
             kept refusing connections (the local server is gone).
         """
-        # Capability probes may shell out or inspect local config, so perform
-        # them once during daemon initialization. They are advisory: a broken
-        # harness is reported as unknown and must not prevent registration.
-        await self._initialize_capabilities()
+        # Capability probes shell out to harness CLIs and import their
+        # modules, which dominated cold host start. They are advisory — a
+        # broken or unfinished probe is reported as unknown and must not delay
+        # registration — so they run alongside the connect instead of ahead of
+        # it, and push a readiness frame when they land.
+        self._capability_init_task = asyncio.create_task(
+            self._initialize_and_publish_capabilities(), name="host-capability-init"
+        )
 
         # Reap orphaned harness/tool grandchildren that reparent here when a
         # runner dies (this host is PID 1 in a container, or a subreaper
@@ -3381,6 +3430,11 @@ class HostProcess:
             # takeover paths that own it (this daemon may have been superseded).
             if self._lifecycle_lock is not None:
                 self._lifecycle_lock.release()
+            if self._capability_init_task is not None:
+                self._capability_init_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._capability_init_task
+                self._capability_init_task = None
             if self._zygote_prestart_task is not None:
                 self._zygote_prestart_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -3678,6 +3732,10 @@ class HostProcess:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
         await ws.send(encoded_hello)
         self._ws = ws
+        if self._configured_harnesses != hello.configured_harnesses:
+            # The background probe landed while hello was on the wire, so the
+            # server holds the "unknown" this frame reported. Correct it now.
+            await self._publish_capabilities()
         # Reports raised while disconnected must wait until registration; the
         # server cannot route them before this connection owns the host.
         for runner_id, error in list(self._unreported_exits.items()):
@@ -3734,14 +3792,29 @@ class HostProcess:
         ws: websockets.asyncio.client.ClientConnection,
     ) -> None:
         """Refresh advisory capabilities without endangering the tunnel."""
-        configured = self._configured_harnesses
-        gateway = self._gateway_inference
         loop = asyncio.get_running_loop()
-        next_quick = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
+        # A probe that already settled as unknown is re-probed on the first
+        # tick rather than a full interval later, so the server is not left
+        # guessing. A probe still in flight is left to publish its own result.
+        settled_unknown = self._configured_harnesses is None and self._capabilities_initialized
+        next_quick = loop.time() + (
+            0.0 if settled_unknown else HARNESS_READINESS_REFRESH_INTERVAL_S
+        )
         next_full = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
         while True:
             await asyncio.sleep(max(0.0, min(next_quick, next_full) - loop.time()))
             now = loop.time()
+            # Registration no longer waits for the startup probe, so a tick can
+            # land while it is still running; refreshing here would run a
+            # second probe beside it. It publishes its own result when it lands.
+            init_task = self._capability_init_task
+            if init_task is not None and not init_task.done():
+                next_quick = now + HARNESS_READINESS_REFRESH_INTERVAL_S
+                continue
+            # Re-read each tick: the snapshot tracks what the server was last
+            # told, which the background probe may have pushed since.
+            configured = self._configured_harnesses
+            gateway = self._gateway_inference
             refresh_full = configured is None or now >= next_full
             if now >= next_quick:
                 next_quick = now + HARNESS_READINESS_REFRESH_INTERVAL_S
@@ -3771,10 +3844,8 @@ class HostProcess:
                         )
                     )
                 )
-                configured = new_configured
-                gateway = new_gateway
-                self._configured_harnesses = configured
-                self._gateway_inference = gateway
+                self._configured_harnesses = new_configured
+                self._gateway_inference = new_gateway
 
     def _raise_connection_error(self, frame: HostConnectionErrorFrame) -> None:
         """Raise the lifecycle exception requested by a server error frame."""
