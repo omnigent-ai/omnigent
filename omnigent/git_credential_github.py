@@ -45,11 +45,13 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 
 import httpx
+import yaml
 
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR as _HOST_TOKEN_ENV_VAR
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
@@ -189,29 +191,61 @@ def _gh_config_dir() -> Path:
 
 
 def _write_gh_hosts(login: str, token: str) -> bool:
-    """Write ``<gh config>/hosts.yml`` so the gh CLI authenticates as the owner.
+    """Materialize the owner's ``github.com`` auth into gh's ``hosts.yml``.
 
     The gh CLI does not consult git's ``credential.helper`` for its own API
     calls (``gh api`` / ``gh pr`` / ``gh issue``); it reads ``oauth_token`` from
-    ``hosts.yml`` (or ``GH_TOKEN``). This is a small, fixed document, so it is
-    written directly rather than shelling out to ``gh auth login`` (no gh binary
-    or network dependency at setup time). Values are quoted defensively.
+    ``hosts.yml`` (or ``GH_TOKEN``).
+
+    Writes **only the** ``github.com`` **key, merging** into any existing
+    document so a user's other hosts survive (``hosts.yml`` is a multi-host map —
+    a GitHub Enterprise entry, a second account). This matters because the host's
+    ``GH_CONFIG_DIR`` is not always a throwaway sandbox one: a local ``omnigent
+    host`` resolves it to the real ``~/.config/gh``, where truncating would
+    destroy the developer's config on every refresh. Mirrors the Databricks
+    config writer in :mod:`omnigent.onboarding.setup`, which mutates one section
+    of ``~/.databrickscfg`` and writes the rest back rather than truncating.
+
+    Written via a fresh ``0600`` temp file + :func:`os.replace`, so the token is
+    never briefly world-readable and a concurrent ``gh`` read never sees a
+    partial file; :func:`yaml.safe_dump` quotes values correctly whatever they
+    contain.
 
     NB deliberately no ``gh auth setup-git``: that would register gh as a git
     credential helper and compete with the per-user broker, which must stay
     authoritative for github.com so git ops fetch the token fresh per op.
+
+    :returns: ``True`` when written; ``False`` on any filesystem error.
     """
     hosts_path = _gh_config_dir() / "hosts.yml"
-    body = (
-        f'github.com:\n    oauth_token: "{token}"\n    user: "{login}"\n    git_protocol: https\n'
-    )
+    # Merge into the existing document so other hosts / accounts are preserved. A
+    # missing, unreadable, or non-mapping file is treated as empty (never a
+    # failure) — the worst case is starting a fresh map.
+    hosts: dict = {}
+    with contextlib.suppress(OSError, yaml.YAMLError):
+        loaded = yaml.safe_load(hosts_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            hosts = loaded
+    entry = hosts.get("github.com")
+    if not isinstance(entry, dict):
+        entry = {}
+    entry.update({"oauth_token": token, "user": login, "git_protocol": "https"})
+    hosts["github.com"] = entry
+
+    tmp: str | None = None
     try:
         hosts_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(hosts_path, "w", encoding="utf-8") as handle:
-            handle.write(body)
-        with contextlib.suppress(OSError):
-            os.chmod(hosts_path, 0o600)
-    except OSError:
+        # mkstemp creates the file 0600 (owner-only, umask-independent), so the
+        # credential never has a world-readable window; os.replace swaps it in
+        # atomically, so a concurrent gh read never sees a partial file.
+        fd, tmp = tempfile.mkstemp(dir=hosts_path.parent, prefix=".hosts.", suffix=".yml")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(hosts, handle, default_flow_style=False, sort_keys=True)
+        os.replace(tmp, hosts_path)
+    except (OSError, yaml.YAMLError):
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
         return False
     return True
 
@@ -220,12 +254,12 @@ def configure_host_gh(server_url: str, host_id: str) -> bool:
     """Authenticate the sandbox's gh CLI as the session owner.
 
     Companion to :func:`configure_host_git` (which wires git's per-op broker):
-    the gh CLI has no per-op credential hook, so — like
-    :func:`omnigent.host.databricks_credential.configure_host_databricks`
-    writing ``~/.databrickscfg`` — the owner's brokered GitHub token is
-    materialized into ``hosts.yml`` at host startup. The token is a short-lived,
-    server-refreshed user token; it is re-fetched on each host launch, so a
-    long-lived session should relaunch to refresh it.
+    the gh CLI has no per-op credential hook, so — like the Databricks config
+    writer in :mod:`omnigent.onboarding.setup` materializes ``~/.databrickscfg``
+    — the owner's brokered GitHub token is materialized into ``hosts.yml`` at
+    host startup. The token is a short-lived, server-refreshed user token; it is
+    re-fetched on each host launch, so a long-lived session should relaunch to
+    refresh it.
 
     Best-effort: a no-op when the host token is absent, the broker is
     unreachable, or the owner hasn't linked GitHub (any ambient gh auth is left

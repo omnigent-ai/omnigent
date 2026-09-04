@@ -4042,9 +4042,11 @@ def run_host_process(
     # materialize the owner's brokered token into gh's hosts.yml (best-effort),
     # then keep it fresh: git re-fetches per op via the broker, but gh reads a
     # static hosts.yml, so a background thread re-writes it before the GitHub
-    # token expires (~8h) so a long-lived session's gh doesn't 401.
-    configure_host_gh(server_url, identity.host_id)
-    start_host_gh_refresh(server_url, identity.host_id)
+    # token expires (~8h) so a long-lived session's gh doesn't 401. Only when the
+    # owner has GitHub connected (configure_host_gh wrote the file) — a
+    # shared-token / not-connected host writes nothing and spins no refresher.
+    if configure_host_gh(server_url, identity.host_id):
+        start_host_gh_refresh(server_url, identity.host_id)
 
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)

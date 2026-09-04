@@ -6,6 +6,7 @@ import io
 import sys
 
 import pytest
+import yaml
 
 import omnigent.git_credential_github as h
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR
@@ -206,11 +207,38 @@ def test_configure_host_gh_writes_hosts_yml(monkeypatch: pytest.MonkeyPatch, tmp
         lambda *a, **k: {"connected": True, "token": "gho_user", "login": "octo"},
     )
     assert h.configure_host_gh("http://srv", "host1") is True
-    hosts = (tmp_path / "gh" / "hosts.yml").read_text()
-    assert "github.com:" in hosts
-    assert 'oauth_token: "gho_user"' in hosts
-    assert 'user: "octo"' in hosts
-    assert "git_protocol: https" in hosts
+    hosts_path = tmp_path / "gh" / "hosts.yml"
+    written = yaml.safe_load(hosts_path.read_text())
+    assert written["github.com"] == {
+        "oauth_token": "gho_user",
+        "user": "octo",
+        "git_protocol": "https",
+    }
+    # The credential file is owner-only (0600) — never a world-readable window.
+    assert (hosts_path.stat().st_mode & 0o777) == 0o600
+
+
+def test_configure_host_gh_preserves_other_hosts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    # Merge, don't truncate: an existing GitHub Enterprise entry (or a second
+    # account) must survive — hosts.yml is a multi-host map, and the host's
+    # GH_CONFIG_DIR can resolve to the developer's real ~/.config/gh.
+    gh_dir = tmp_path / "gh"
+    gh_dir.mkdir()
+    (gh_dir / "hosts.yml").write_text(
+        "github.mycompany.com:\n    oauth_token: enterprise-tok\n    user: alice\n"
+    )
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(gh_dir))
+    monkeypatch.setattr(
+        h, "_fetch", lambda *a, **k: {"connected": True, "token": "gho_user", "login": "octo"}
+    )
+    assert h.configure_host_gh("http://srv", "host1") is True
+    written = yaml.safe_load((gh_dir / "hosts.yml").read_text())
+    # The enterprise host survives; github.com is added.
+    assert written["github.mycompany.com"]["oauth_token"] == "enterprise-tok"
+    assert written["github.com"]["oauth_token"] == "gho_user"
 
 
 def test_configure_host_gh_noop_when_not_connected(
