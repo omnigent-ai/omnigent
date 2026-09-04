@@ -10597,6 +10597,18 @@
               "title": "Pinned",
               "type": "boolean"
             }
+          },
+          {
+            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions. `\"all\"` (default) returns all accessible non-archived sessions, matching the legacy behaviour.",
+            "in": "query",
+            "name": "visibility",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "pattern": "^(all|mine|shared|archived)$",
+              "title": "Visibility",
+              "type": "string"
+            }
           }
         ],
         "responses": {

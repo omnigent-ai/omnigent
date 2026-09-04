@@ -792,7 +792,7 @@ jobs:
       )
     uses: ./.github/workflows/issue-prioritization-v2.yml
     with:
-      issue_number: ${{ github.event.issue.number || inputs.issue_number }}
+      issue_number: ${{ fromJSON(format('{0}', github.event.issue.number || inputs.issue_number)) }}
       intake: ${{ github.event_name == 'workflow_dispatch' || github.event.action == 'opened' }}
       apply: ${{ github.event_name != 'workflow_dispatch' || inputs.apply_labels }}
       manual_dispatch: ${{ github.event_name == 'workflow_dispatch' }}

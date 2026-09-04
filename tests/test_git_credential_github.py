@@ -64,7 +64,7 @@ def test_configure_host_git_resets_then_adds_broker_helper(
     reset_idx = next(
         i
         for i, c in enumerate(calls)
-        if c[:4] == ["git", "config", "--global", key] and c[-1] == ""
+        if c[:5] == ["git", "config", "--global", "--replace-all", key] and c[-1] == ""
     )
     add_idx = next(
         i
@@ -84,6 +84,42 @@ def test_configure_host_git_noop_without_token(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(h.subprocess, "run", lambda *a, **k: calls.append(a))
     h.configure_host_git("http://srv", "host1")
     assert calls == []  # no token → nothing configured
+
+
+def test_configure_host_git_clears_stale_broker_when_not_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Scoping: a confirmed not-connected owner (shared-$GIT_TOKEN / local model)
+    # must NOT install the broker. It must also CLEAR any stale broker a prior
+    # (inconclusive) clone probe installed — otherwise the reset it left strands
+    # in-session git behind a declining broker. So the one and only write is the
+    # unset that restores the ambient/shared helper; no --add, no identity.
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": False})
+    h.configure_host_git("http://srv", "host1")
+    key = "credential.https://github.com.helper"
+    assert calls == [["git", "config", "--global", "--unset-all", key]]
+    flat = [" ".join(c) for c in calls]
+    assert not any("--add" in c for c in flat)
+    assert not any("user.email" in c for c in flat)
+
+
+def test_resolve_github_token_returns_token_when_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        h,
+        "_fetch",
+        lambda *a, **k: {"connected": True, "token": "ghu_x", "username": "x-access-token"},
+    )
+    assert h.resolve_github_token("http://srv", "host1", "tok") == "ghu_x"
+
+
+def test_resolve_github_token_none_when_not_connected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": False})
+    assert h.resolve_github_token("http://srv", "host1", "tok") is None
 
 
 def test_credential_url_targets_the_generic_provider_path() -> None:
@@ -113,3 +149,63 @@ def test_fetch_sends_launch_token_as_header_not_url(monkeypatch: pytest.MonkeyPa
     assert seen["url"] == "http://s/v1/hosts/hid/credentials/github"
     assert seen["headers"][h.MANAGED_HOST_TOKEN_HEADER] == "launch-tok"
     assert "launch-tok" not in seen["url"]
+
+
+def test_configure_clone_credentials_wires_broker_when_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": True, "owner": "a@b.com"})
+    assert h.configure_clone_credentials("http://srv", "host1") is True
+    key = "credential.https://github.com.helper"
+    reset_idx = next(
+        i
+        for i, c in enumerate(calls)
+        if c[:5] == ["git", "config", "--global", "--replace-all", key] and c[-1] == ""
+    )
+    add_idx = next(
+        i
+        for i, c in enumerate(calls)
+        if c[:5] == ["git", "config", "--global", "--add", key] and "host1" in c[-1]
+    )
+    assert reset_idx < add_idx
+
+
+def test_configure_clone_credentials_noop_when_not_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Not connected → leave the ambient (image GIT_TOKEN) helper intact; no git config.
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": False})
+    assert h.configure_clone_credentials("http://srv", "host1") is False
+    assert calls == []
+
+
+def test_configure_clone_credentials_noop_without_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    calls: list[object] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda *a, **k: calls.append(a))
+    assert h.configure_clone_credentials("http://srv", "host1") is False
+    assert calls == []
+
+
+def test_configure_clone_credentials_fails_closed_when_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A transient probe failure (``_fetch`` -> None) is indistinguishable from
+    # "not linked", so fail closed: install the broker anyway rather than let the
+    # clone silently fall back to the shared $GIT_TOKEN identity for what may be a
+    # linked owner. Only a *successful* ``connected: false`` keeps the fallback.
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: None)
+    assert h.configure_clone_credentials("http://srv", "host1") is True
+    key = "credential.https://github.com.helper"
+    assert any(
+        c[:5] == ["git", "config", "--global", "--add", key] and "host1" in c[-1] for c in calls
+    )

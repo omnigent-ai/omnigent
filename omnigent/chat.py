@@ -1771,6 +1771,25 @@ async def _prepare_chat_session_via_daemon(
     return _DaemonChatSession(session_id=session_id, runner_id=runner_id)
 
 
+def _stop_headless_session(*, base_url: str, session_id: str) -> None:
+    """Stop a finished one-shot session's daemon-owned runner, best-effort.
+
+    A ``-p`` run is complete when it returns and nothing reattaches to it, but
+    the daemon only tears a runner down on an explicit stop; otherwise it lives
+    until the runner's own idle self-exit, holding its harness subtree open.
+
+    :param base_url: Omnigent server base URL.
+    :param session_id: The finished session's id, e.g. ``"conv_abc123"``.
+    """
+    from omnigent.cli import _stop_session_on_server
+
+    # Teardown must never turn a completed run into a failed one.
+    try:
+        _stop_session_on_server(base_url=base_url, session_id=session_id)
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
+
+
 def _chat_via_daemon(
     agent_path: str,
     base_url: str,
@@ -1903,24 +1922,30 @@ def _chat_via_daemon(
             # client refreshes its own auth per request. ``progress`` is handed
             # off so ``_chat_with_server`` clears the spinner the instant before
             # the REPL paints (or before it redirects to a native wrapper).
-            _chat_with_server(
-                base_url,
-                tool_handler,
-                initial_message=initial_message,
-                resume_conversation_id=prepared.session_id,
-                fork_session_id=None,
-                agent_name=agent_name,
-                runner_id=prepared.runner_id,
-                runner_recover=None,
-                log=log,
-                agent_yaml=spec_path,
-                session_bundle=bundle_bytes,
-                debug_events=debug_events,
-                resume_parts=resume_parts,
-                skills=all_skills or None,
-                auto_open_conversation=auto_open_conversation,
-                progress=progress,
-            )
+            try:
+                _chat_with_server(
+                    base_url,
+                    tool_handler,
+                    initial_message=initial_message,
+                    resume_conversation_id=prepared.session_id,
+                    fork_session_id=None,
+                    agent_name=agent_name,
+                    runner_id=prepared.runner_id,
+                    runner_recover=None,
+                    log=log,
+                    agent_yaml=spec_path,
+                    session_bundle=bundle_bytes,
+                    debug_events=debug_events,
+                    resume_parts=resume_parts,
+                    skills=all_skills or None,
+                    auto_open_conversation=auto_open_conversation,
+                    progress=progress,
+                )
+            finally:
+                # One-shot only: an interactive REPL session stays online for
+                # the next turn, so it must not be torn down here.
+                if initial_message is not None:
+                    _stop_headless_session(base_url=base_url, session_id=prepared.session_id)
     finally:
         _cleanup_materialized_override_bundle(spec_path)
 

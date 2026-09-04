@@ -9,6 +9,7 @@ import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { cn } from "@/lib/utils";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import {
   type Bubble,
   type BubbleCache,
@@ -70,6 +71,8 @@ export interface TranscriptProps {
   sandboxLaunching: boolean;
   /** Terminal-first spin-up bits for the cold-launch empty state. */
   terminalFirst: { isTerminalFirst: boolean; terminalStartingUp?: boolean } | null | undefined;
+  /** Pub/sub ref for the LatestTurnSpacer's synchronous re-measure handle. */
+  spacerMeasureRef: React.RefObject<(() => void) | null>;
 }
 
 /**
@@ -93,6 +96,7 @@ function TranscriptImpl({
   agentsError,
   sandboxLaunching,
   terminalFirst,
+  spacerMeasureRef,
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
@@ -197,7 +201,7 @@ function TranscriptImpl({
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) user-turn navigation.
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent) => {
-      if (!(e.metaKey || e.ctrlKey) || !e.altKey) return;
+      if (!hasCommandModifier(e) || !e.altKey) return;
       if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
       if (e.defaultPrevented) return;
       e.preventDefault();
@@ -299,6 +303,7 @@ function TranscriptImpl({
             <LatestTurnSpacer
               scrollElement={scroller?.el ?? null}
               topGapPx={hasTasks ? 16 : undefined}
+              measureRef={spacerMeasureRef}
             />
           </ConversationContent>
           <ConversationScrollButton />

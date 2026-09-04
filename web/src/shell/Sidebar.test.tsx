@@ -581,13 +581,15 @@ describe("Sidebar session list", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
-    // The sidebar requests the session list with `includeArchived`
-    // hard-wired to true, so the "Archived sessions" filter has something to
-    // show. A regression to false would leave that filter perpetually empty.
-    expect(useConvMock.mock.calls.length).toBeGreaterThanOrEqual(1);
-    for (const call of useConvMock.mock.calls) {
-      expect(call).toEqual(["", true, { reconcileWhileConnected: true }]);
-    }
+    // The sidebar makes two useConversations calls: one all-sessions query
+    // (includeArchived: true, reconcileWhileConnected: true — for inbox counts
+    // and WS reconciliation) and one tab-scoped filtered query (includeArchived:
+    // false, for display). Assert the all-sessions call is present and correct.
+    const calls = useConvMock.mock.calls;
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    const allSessionsCall = calls.find((call) => call[0] === "" && call[1] === true);
+    expect(allSessionsCall).toBeDefined();
+    expect(allSessionsCall?.[2]).toMatchObject({ reconcileWhileConnected: true });
   });
 
   it("opens the command palette when the Search button is clicked", () => {
@@ -1360,6 +1362,12 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
   });
 
   it("auto-fetches the next page when the sentinel scrolls into view (infinite scroll)", () => {
+    // Start on the "all" tab so the background all-sessions paginator doesn't
+    // fire on mount (it only runs on "mine"/"shared" tabs). The default tab is
+    // "mine" (DEFAULT_SESSION_FILTER), so force "all" via localStorage before
+    // rendering. This isolates the test to sentinel-triggered pagination only.
+    localStorage.setItem("omnigent:session-filter", "all");
+
     // Capture the IntersectionObserver callback so the test can simulate the
     // sentinel entering the scroll viewport.
     let observerCallback: IntersectionObserverCallback | undefined;
@@ -1409,6 +1417,62 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
     expect(fetchNextPage).toHaveBeenCalledTimes(1);
 
     vi.unstubAllGlobals();
+  });
+});
+
+// The sidebar uses two queries: an all-sessions query for inbox/WS and a
+// tab-scoped query for display on the "mine" and "shared" tabs. The tab-scoped
+// query passes `visibility` to the server so the server paginates only the
+// relevant sessions (proper fix for OMNI-6002).
+describe("Sidebar visibility filter (server-side mine/shared split)", () => {
+  it('calls useConversations with visibility="mine" when on the mine tab', () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+
+    // Sidebar always renders on the "mine" tab by default. Check that one of the
+    // useConversations calls passes visibility="mine" (the tab-scoped query).
+    const calls = useConvMock.mock.calls;
+    const mineCall = calls.find((args) => args[4] === "mine");
+    expect(mineCall).toBeDefined();
+    // The tab-scoped query uses includeArchived=false and enabled=true.
+    expect(mineCall![1]).toBe(false);
+    expect((mineCall![2] as { enabled?: boolean }).enabled).toBe(true);
+  });
+
+  it('calls useConversations with visibility="shared" when on the shared tab', () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+    selectSessionFilter("shared");
+
+    const calls = useConvMock.mock.calls;
+    const sharedCall = calls.find((args) => args[4] === "shared");
+    expect(sharedCall).toBeDefined();
+    expect(sharedCall![1]).toBe(false);
+    expect((sharedCall![2] as { enabled?: boolean }).enabled).toBe(true);
+  });
+
+  it("disables the tab-scoped query when on the all tab", () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+    selectSessionFilter("all");
+
+    const calls = useConvMock.mock.calls;
+    // No call should pass visibility="mine" or "shared" — the tab-scoped query
+    // is disabled (enabled=false) when the active tab is "all".
+    const disabledTabCalls = calls.filter(
+      (args) => (args[2] as { enabled?: boolean })?.enabled === false,
+    );
+    expect(disabledTabCalls.length).toBeGreaterThan(0);
+  });
+
+  it("renders sessions from the tab-scoped query on the mine tab", () => {
+    // When on the "mine" tab the display query is the filtered one. Both calls
+    // return the same mock data here, so the visible session row reflects the
+    // tab-scoped result.
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
   });
 });
 
