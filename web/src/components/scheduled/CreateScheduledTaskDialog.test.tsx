@@ -770,7 +770,9 @@ describe("CreateScheduledTaskDialog active range", () => {
 
   it("submits the range bounds on create when the toggle is switched on", async () => {
     renderDialog();
-    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Business hours" } });
+    fireEvent.change(screen.getByTestId("task-name-input"), {
+      target: { value: "Business hours" },
+    });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Check queue" } });
     fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
     fireEvent.click(screen.getByRole("option", { name: "Hourly" }));

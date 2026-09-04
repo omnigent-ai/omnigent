@@ -146,7 +146,9 @@ describe("validateSchedule — active range", () => {
       validateSchedule(model({ preset: "hourly", activeRange: { start: "9:00", end: "17:00" } })),
     ).toMatch(/valid start and end/i);
     expect(
-      validateSchedule(model({ preset: "hourly", activeRange: { start: "09:00", end: "not-a-time" } })),
+      validateSchedule(
+        model({ preset: "hourly", activeRange: { start: "09:00", end: "not-a-time" } }),
+      ),
     ).toMatch(/valid start and end/i);
     expect(
       validateSchedule(model({ preset: "hourly", activeRange: { start: "24:00", end: "17:00" } })),

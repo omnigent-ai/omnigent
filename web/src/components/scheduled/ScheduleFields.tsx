@@ -193,14 +193,17 @@ export function ScheduleFields({
   }
 
   function handlePresetChange(preset: SchedulePreset) {
-    const staysHourly = preset === "hourly" || (preset === "custom" && model.customFreq === "hourly");
+    const staysHourly =
+      preset === "hourly" || (preset === "custom" && model.customFreq === "hourly");
     onChange({ ...model, preset, activeRange: staysHourly ? model.activeRange : null });
   }
 
   function handleActiveRangeToggle(enabled: boolean) {
     onChange({
       ...model,
-      activeRange: enabled ? { start: formatTimeOfDay24(9, 0), end: formatTimeOfDay24(17, 0) } : null,
+      activeRange: enabled
+        ? { start: formatTimeOfDay24(9, 0), end: formatTimeOfDay24(17, 0) }
+        : null,
     });
   }
 
