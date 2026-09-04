@@ -1361,6 +1361,12 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
   });
 
   it("auto-fetches the next page when the sentinel scrolls into view (infinite scroll)", () => {
+    // Start on the "all" tab so the background all-sessions paginator doesn't
+    // fire on mount (it only runs on "mine"/"shared" tabs). The default tab is
+    // "mine" (DEFAULT_SESSION_FILTER), so force "all" via localStorage before
+    // rendering. This isolates the test to sentinel-triggered pagination only.
+    localStorage.setItem("omnigent:session-filter", "all");
+
     // Capture the IntersectionObserver callback so the test can simulate the
     // sentinel entering the scroll viewport.
     let observerCallback: IntersectionObserverCallback | undefined;

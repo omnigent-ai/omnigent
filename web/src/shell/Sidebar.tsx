@@ -606,6 +606,21 @@ export function Sidebar({
   // "mine" and "shared" use the fast tab-scoped query.
   const displayQuery = tabVisibility ? filteredConversationsQuery : conversationsQuery;
 
+  // When showing a filtered tab (mine/shared), the ConversationList renders
+  // `displayQuery` and never drives `conversationsQuery.fetchNextPage()`.
+  // Background-paginate `conversationsQuery` so its cache stays complete for the
+  // inbox badge and WS watch-set — without it, only the first page of all-sessions
+  // is ever loaded and approvals/comments on later pages would be invisible.
+  const {
+    hasNextPage: allHasNextPage,
+    isFetchingNextPage: allIsFetchingNextPage,
+    fetchNextPage: allFetchNextPage,
+  } = conversationsQuery;
+  useEffect(() => {
+    if (!tabVisibility) return; // ConversationList drives pagination on "all"/"archived"
+    if (allHasNextPage && !allIsFetchingNextPage) allFetchNextPage();
+  }, [tabVisibility, allHasNextPage, allIsFetchingNextPage, allFetchNextPage]);
+
   // The scrollable list container — used as the IntersectionObserver root for
   // infinite scroll (auto-loading the next page as the sentinel nears view).
   const scrollContainerRef = useRef<HTMLElement>(null);

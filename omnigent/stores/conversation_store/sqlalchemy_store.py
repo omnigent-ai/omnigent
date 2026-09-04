@@ -2415,9 +2415,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 accessible_set: set[str] | None = None
                 owned_set: set[str] | None = None
                 if accessible_by is not None or shared_only:
-                    # shared_only needs the accessible set even when the caller
-                    # didn't explicitly pass accessible_by; use accessible_by
-                    # when provided, else fall back to the shared_only anchor.
+                    if shared_only and accessible_by is None:
+                        raise ValueError("shared_only=True requires accessible_by to be set")
                     acl_user = accessible_by
                     accessible_set = set(
                         meta_sess.execute(

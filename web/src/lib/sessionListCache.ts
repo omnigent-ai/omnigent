@@ -125,34 +125,37 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
 /**
  * Decode the filter dimensions from a conversations query key.
  *
- * The base key is `["conversations", searchQuery, includeArchived]`. The
- * project-filtered variant appends a fourth element:
- * `["conversations", searchQuery, includeArchived, project]` (the Archived
- * settings picker is the only producer today). Both lengths are accepted so
- * the rename overlay and push-delta merge — which iterate *every* cached
- * `["conversations", ...]` query — never throw on the project variant. Query
- * membership decisions depend on these dimensions, so malformed keys fail
- * loudly instead of being guessed.
+ * The base key is `["conversations", searchQuery, includeArchived]`. Variants:
+ * - 4 elements: `[..., project]` — the Archived settings picker's project filter.
+ * - 5 elements: `[..., project|null, visibility]` — the sidebar's mine/shared
+ *   tab-scoped query (project is `null` here since it's always unset for those
+ *   tabs). All lengths are accepted so the rename overlay and push-delta merge
+ *   — which iterate *every* cached `["conversations", ...]` query — never throw
+ *   on unknown variants. Query membership decisions depend on these dimensions,
+ *   so malformed keys fail loudly instead of being guessed.
  *
  * @param key - TanStack Query key for a conversations query.
  * @returns Parsed list filters.
  * @throws Error if the key is not a conversations list key.
  */
 export function filtersFromConversationQueryKey(key: readonly unknown[]): ConversationListFilters {
-  if ((key.length !== 3 && key.length !== 4) || key[0] !== "conversations") {
+  if (key.length < 3 || key.length > 5 || key[0] !== "conversations") {
     throw new Error("Invalid conversations query key");
   }
   const [, searchQuery, includeArchived, project] = key;
   if (typeof searchQuery !== "string" || typeof includeArchived !== "boolean") {
     throw new Error("Invalid conversations query key");
   }
-  if (project !== undefined && typeof project !== "string") {
+  // project is undefined (3-element), a string (4-element project-scoped), or
+  // null (5-element visibility-scoped where project is always unset).
+  if (project !== undefined && project !== null && typeof project !== "string") {
     throw new Error("Invalid conversations query key");
   }
   return {
     searchQuery,
     includeArchived,
-    project,
+    // Treat null (visibility-scoped key) the same as undefined (no project filter).
+    project: project ?? undefined,
   };
 }
 
