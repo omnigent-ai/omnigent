@@ -206,6 +206,10 @@ def test_kimi_install_spec_is_login_only_no_npm() -> None:
     assert spec.login_args == ("login",)
     assert spec.logout_args is None
     assert spec.status_args is None
+    native_spec = hi.harness_install_spec(hi.KIMI_NATIVE_KEY)
+    assert native_spec is not None
+    assert native_spec.binary == spec.binary
+    assert native_spec.install_hint == spec.install_hint
 
 
 def test_kimi_required_cli_returns_install_spec() -> None:
@@ -644,6 +648,8 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
         ("native-cursor", "cursor-agent"),
         ("kiro-native", "kiro-cli"),
         ("native-kiro", "kiro-cli"),
+        ("kimi-native", "kimi"),
+        ("native-kimi", "kimi"),
     ],
 )
 def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
@@ -1778,7 +1784,8 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
     [
         (hi.OPENCODE_KEY, "2.0.18", "2.1.0"),
         (hi.CURSOR_KEY, "2026.06.02", None),
-        (hi.KIMI_KEY, "0.41.0", None),
+        (hi.KIMI_KEY, "0.7.0", None),
+        (hi.KIMI_NATIVE_KEY, "0.41.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
         (OPENAI_FAMILY, "0.137.0", None),
         (hi.PI_KEY, "0.84.2", None),
@@ -1834,6 +1841,7 @@ def test_harness_cli_installed_checks_version_for_versioned_specs(
     [
         hi.CURSOR_KEY,
         hi.KIMI_KEY,
+        hi.KIMI_NATIVE_KEY,
         ANTHROPIC_FAMILY,
         OPENAI_FAMILY,
         hi.PI_KEY,
@@ -1884,23 +1892,17 @@ def test_the_codex_launch_floor_accepts_the_ci_pinned_cli(
     assert hi.harness_cli_installed(OPENAI_FAMILY) is True
 
 
-def test_the_kimi_floor_accepts_the_supported_cli(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("version", ["0.7.0", "0.40.9"])
+def test_the_headless_kimi_floor_accepts_its_supported_range(
+    monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:
-    """A current ``kimi-code`` build must read as installed, not too-low.
-
-    The floor tracks Moonshot's ``kimi-code`` CLI (a 0.x series, the binary
-    this spec's installer puts on PATH), not the separately numbered
-    ``kimi-cli`` project. Pinning it to a 1.x version made every shipping
-    ``kimi`` fail the range, so ``harness_is_configured`` stayed false and the
-    host refused every kimi-native launch.
-    """
+    """Headless Kimi retains the general 0.7.0 compatibility floor."""
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
             return subprocess.CompletedProcess(
-                args=argv, returncode=0, stdout="0.41.0\n", stderr=""
+                args=argv, returncode=0, stdout=f"{version}\n", stderr=""
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
@@ -1926,7 +1928,7 @@ def test_the_kimi_floor_requires_the_workspace_trust_format_version(
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
-    assert hi.harness_cli_installed(hi.KIMI_KEY) is expected
+    assert hi.harness_cli_installed(hi.KIMI_NATIVE_KEY) is expected
 
 
 def test_the_kimi_floor_stays_in_the_kimi_code_version_series() -> None:
@@ -1944,10 +1946,15 @@ def test_the_kimi_floor_stays_in_the_kimi_code_version_series() -> None:
     When ``kimi-code`` itself ships 1.0, this assertion is the deliberate stop:
     raise the bound here alongside the floor rather than dropping the guard.
     """
-    spec = hi.harness_install_spec(hi.KIMI_KEY)
-    assert spec is not None
-    assert spec.min_version is not None
-    assert Version(spec.min_version) < Version("1.0.0")
+    specs = (
+        hi.harness_install_spec(hi.KIMI_KEY),
+        hi.harness_install_spec(hi.KIMI_NATIVE_KEY),
+    )
+    assert all(spec is not None for spec in specs)
+    for spec in specs:
+        assert spec is not None
+        assert spec.min_version is not None
+        assert Version(spec.min_version) < Version("1.0.0")
 
 
 def test_the_hermes_floor_accepts_the_shipping_version_line(
@@ -2011,7 +2018,8 @@ def test_parse_harness_cli_version_normalizes_date_versions(raw: str, expected: 
     "key,outdated,satisfying",
     [
         (hi.CURSOR_KEY, "2026.05.24", "2026.06.22"),
-        (hi.KIMI_KEY, "0.40.9", "0.41.0"),
+        (hi.KIMI_KEY, "0.6.0", "0.7.0"),
+        (hi.KIMI_NATIVE_KEY, "0.40.9", "0.41.0"),
         (hi.HERMES_KEY, "0.16.9", "0.19.1"),
     ],
 )

@@ -16,8 +16,9 @@ Three user-observable failure modes are guarded here:
    ``omnigent/runtime/workflow.py`` still points users at ``~/.kimi/``.
 
 Failure modes 1–2 were fixed by "fix(onboarding): correct the kimi and hermes
-CLI version floors"; Kimi's floor is now 0.41.0 because the native bridge uses
-that release's trust format. The tests here guard both constraints. Failure mode 3 is
+CLI version floors". Headless Kimi retains the 0.7.0 floor, while native Kimi
+requires 0.41.0 for its workspace-trust format. The tests guard both constraints.
+Failure mode 3 is
 guarded by ``test_kimi_auth_rejection_names_the_real_kimi_code_config_path``,
 which fails while any user-visible guidance names the legacy path.
 
@@ -115,8 +116,8 @@ def _base_env(home: Path, bin_dir: Path) -> dict[str, str]:
     return env
 
 
-def test_kimi_version_floor_targets_kimi_code_0x_series() -> None:
-    """Guard: the kimi floor stays in Kimi Code's 0.x series.
+def test_kimi_version_floors_split_headless_and_native() -> None:
+    """Guard the general Kimi floor separately from the native trust floor.
 
     The bug was the floor being re-derived from the wrong upstream project
     (``kimi-cli``, a 1.x series). Kimi Code ships 0.x releases, so any floor
@@ -125,15 +126,18 @@ def test_kimi_version_floor_targets_kimi_code_0x_series() -> None:
     """
     from omnigent.onboarding import harness_install as hi
 
-    spec = hi.harness_install_spec(hi.KIMI_KEY)
-    assert spec is not None, "kimi install spec missing"
-    assert spec.min_version is not None, "kimi spec no longer declares a floor"
-    assert Version(spec.min_version) < Version("1.0.0"), (
-        f"kimi min_version {spec.min_version!r} is outside Kimi Code's 0.x "
+    headless_spec = hi.harness_install_spec(hi.KIMI_KEY)
+    native_spec = hi.harness_install_spec(hi.KIMI_NATIVE_KEY)
+    assert headless_spec is not None, "headless kimi install spec missing"
+    assert native_spec is not None, "native kimi install spec missing"
+    assert headless_spec.min_version is not None
+    assert Version(headless_spec.min_version) < Version("1.0.0"), (
+        f"kimi min_version {headless_spec.min_version!r} is outside Kimi Code's 0.x "
         "series — this re-imports the separate kimi-cli project's numbering "
         "and rejects every shipping Kimi Code build"
     )
-    assert spec.min_version == _SUPPORTED_KIMI_VERSION
+    assert headless_spec.min_version == "0.7.0"
+    assert native_spec.min_version == _SUPPORTED_KIMI_VERSION
 
 
 def test_setup_kimi_row_does_not_read_needs_upgrade(tmp_path: Path) -> None:

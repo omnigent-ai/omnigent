@@ -179,7 +179,7 @@ def render_kimi_hooks_toml(*, bridge_dir: Path, python_executable: str | None = 
 
 def _workspace_trust_record(workspace: Path) -> tuple[str, str]:
     """Return Kimi 0.41's canonical root and workspace-trust filename."""
-    # Native terminals are disabled on Windows, so trust roots here are POSIX-only.
+    # Native launch fails at tmux/PTY on Windows, so this seeded record is never read there.
     root = os.path.abspath(os.fspath(workspace)).replace("\\", "/")
     canonical_root = root.rstrip("/") or root
     basename = canonical_root.rsplit("/", maxsplit=1)[-1]
