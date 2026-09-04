@@ -13,12 +13,12 @@ from typing import Any, Literal, cast, get_args
 
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.host.frames import HostImportLocalFrame, encode_host_frame
+from omnigent.host.frames import HostImportLocalByIdFrame, HostImportLocalFrame, encode_host_frame
 from omnigent.native_coding_agents import native_coding_agent_for_harness
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
@@ -98,11 +98,13 @@ class ImportSessionResponse(BaseModel):
 
 
 class LocalImportRequest(BaseModel):
-    """Request to import the caller's recent local harness sessions from a host.
+    """Request to import local harness sessions from a host.
 
     Unlike ``/imports`` (the CLI posts already-normalized items), the server
     asks the chosen host to read + normalize its own transcripts over the
-    tunnel — the transcripts live on the caller's machine, not the server.
+    tunnel — the transcripts live on the caller's machine, not the server. A
+    supplied ``session_id`` loads that exact session without enumerating local
+    history.
     """
 
     host_id: str
@@ -110,6 +112,25 @@ class LocalImportRequest(BaseModel):
     # the host in one batch (each imported session keeps its own source).
     source: ImportSource | Literal["all"]
     limit: int = Field(default=10, ge=1, le=100)
+    session_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @field_validator("session_id")
+    @classmethod
+    def strip_session_id(cls, value: str | None) -> str | None:
+        """Reject an exact session id that is only whitespace."""
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("session_id must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def exact_import_needs_harness(self) -> LocalImportRequest:
+        """An id is only meaningful within one harness namespace."""
+        if self.session_id is not None and self.source == "all":
+            raise ValueError("an exact session import requires a specific harness")
+        return self
 
 
 class ImportedSessionRef(BaseModel):
@@ -190,11 +211,12 @@ async def _stream_local_sessions_from_host(
     host_conn: HostConnection,
     source: str,
     limit: int,
+    session_id: str | None = None,
     stats: dict[str, int] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """Yield the host's recent local sessions one at a time as they stream in.
+    """Yield requested local sessions one at a time as they stream in.
 
-    Sends a ``host.import_local`` frame and drains the per-request queue the
+    Sends a recent or exact import frame and drains the per-request queue the
     tunnel fills: each ``host.import_local_session`` frame yields one session
     dict (``{total, external_session_id, workspace, items, title, source}``); the
     terminal ``host.import_local_done`` ends the stream. The caller persists each
@@ -204,9 +226,16 @@ async def _stream_local_sessions_from_host(
         the host reports a read failure.
     """
     request_id = secrets.token_hex(8)
-    frame = encode_host_frame(
-        HostImportLocalFrame(request_id=request_id, source=source, limit=limit)
+    request_frame = (
+        HostImportLocalByIdFrame(
+            request_id=request_id,
+            source=source,
+            session_id=session_id,
+        )
+        if session_id is not None
+        else HostImportLocalFrame(request_id=request_id, source=source, limit=limit)
     )
+    frame = encode_host_frame(request_frame)
     queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
     host_conn.pending_import_local[request_id] = queue
     try:
@@ -444,7 +473,7 @@ def create_imports_router(
         host_conn: HostConnection,
         counts: dict[str, int],
     ) -> AsyncIterator[ImportedSessionRef]:
-        """Import the host's recent sessions, one at a time.
+        """Import the host's requested sessions, one at a time.
 
         Yields one ref per newly imported session and tracks the running tally in
         ``counts`` (``imported`` / ``already_imported`` / ``failed``). Persists
@@ -467,6 +496,7 @@ def create_imports_router(
             host_conn=host_conn,
             source=body.source,
             limit=body.limit,
+            session_id=body.session_id,
             stats=stats,
         ):
             external_session_id = session.get("external_session_id")
@@ -530,12 +560,12 @@ def create_imports_router(
         body: LocalImportRequest,
         request: Request,
     ) -> LocalImportResponse:
-        """Import the caller's recent local transcripts from a chosen host.
+        """Import local transcripts from a chosen host.
 
         The transcripts live on the caller's machine, so the read happens on
         the connected host over its tunnel — the server can't see them. The
-        host enumerates + normalizes the most recent sessions; the server
-        imports those not already imported.
+        host loads an exact id or enumerates recent sessions, then normalizes
+        them; the server imports those not already imported.
 
         Buffered form: returns the whole batch's tally in one JSON body. For a
         live per-session list use ``POST /v1/imports/local/stream``. Not atomic:
@@ -566,7 +596,7 @@ def create_imports_router(
         body: LocalImportRequest,
         request: Request,
     ) -> StreamingResponse:
-        """Stream the caller's recent local transcripts from a chosen host.
+        """Stream local transcripts from a chosen host.
 
         Same import as the buffered ``POST /v1/imports/local``, but responds with
         NDJSON: one ``{"event": "session", ...}`` line per newly imported session

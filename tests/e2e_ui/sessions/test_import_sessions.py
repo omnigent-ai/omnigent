@@ -93,6 +93,44 @@ def test_settings_import_panel_imports_and_links_sessions(
     assert captured["post"] == {"host_id": _HOST_ID, "source": "all", "limit": 25}
 
 
+def test_settings_import_panel_imports_one_session_by_id(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Settings can import an exact harness session without showing a session list."""
+    captured: dict[str, object] = {}
+
+    def _handle_import(route: Route) -> None:
+        captured["post"] = route.request.post_data_json
+        _fulfill_ndjson(
+            route,
+            [
+                {"event": "session", "session_id": "conv_exact", "title": "Exact import"},
+                {"event": "done", "imported": 1, "already_imported": 0, "failed": 0},
+            ],
+        )
+
+    page.route("**/v1/hosts", lambda r: _fulfill_json(r, _HOSTS_BODY))
+    page.route("**/v1/imports/local/stream", _handle_import)
+    page.goto(f"{live_server}/settings/import")
+
+    expect(page.get_by_test_id("import-sessions-panel")).to_be_visible(timeout=30_000)
+    page.get_by_test_id("import-mode-select").click()
+    page.get_by_role("option", name="Session by ID").click()
+    page.get_by_test_id("import-source-select").click()
+    page.get_by_role("option", name="Codex").click()
+    page.get_by_test_id("import-session-id").fill("session-exact")
+    page.get_by_test_id("import-submit").click()
+
+    expect(page.get_by_test_id("import-result")).to_contain_text("Imported 1", timeout=30_000)
+    assert captured["post"] == {
+        "host_id": _HOST_ID,
+        "source": "codex",
+        "limit": 25,
+        "session_id": "session-exact",
+    }
+
+
 def test_empty_landing_import_button_opens_settings(
     page: Page,
     live_server: str,

@@ -37,6 +37,7 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportLocalByIdFrame,
     HostImportLocalFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
@@ -5421,6 +5422,63 @@ async def test_handle_import_local_all_streams_a_frame_per_session(
         (f.session.external_session_id, f.session.source, f.session.title) for f in session_frames
     } == {("c1", "claude", "claude title"), ("x1", "codex", "codex title")}
     assert all(f.total == 2 for f in session_frames)
+    assert len(done_frames) == 1 and done_frames[0].status == "ok"
+
+
+async def test_handle_import_local_exact_id_does_not_list_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact harness/id request loads that transcript without enumeration."""
+    from omnigent.host.frames import HostImportLocalDoneFrame, HostImportLocalSessionFrame
+
+    host = _make_host_process()
+
+    def _unexpected_list(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("exact import must not enumerate local sessions")
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        assert (source, session_id) == ("codex", "session-exact")
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title="Exact session",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _unexpected_list
+    )
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_local_session_ids", _unexpected_list
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalByIdFrame(
+            request_id="req_exact",
+            source="codex",
+            session_id="session-exact",
+        ),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+    assert [f.session.external_session_id for f in session_frames] == ["session-exact"]
+    assert session_frames[0].total == 1
     assert len(done_frames) == 1 and done_frames[0].status == "ok"
 
 

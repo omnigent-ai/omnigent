@@ -2852,7 +2852,7 @@
         "type": "object"
       },
       "LocalImportRequest": {
-        "description": "Request to import the caller's recent local harness sessions from a host.\n\nUnlike `/imports` (the CLI posts already-normalized items), the server\nasks the chosen host to read + normalize its own transcripts over the\ntunnel \u2014 the transcripts live on the caller's machine, not the server.",
+        "description": "Request to import local harness sessions from a host.\n\nUnlike `/imports` (the CLI posts already-normalized items), the server\nasks the chosen host to read + normalize its own transcripts over the\ntunnel \u2014 the transcripts live on the caller's machine, not the server. A\nsupplied `session_id` loads that exact session without enumerating local\nhistory.",
         "properties": {
           "host_id": {
             "title": "Host Id",
@@ -2865,6 +2865,19 @@
             "minimum": 1.0,
             "title": "Limit",
             "type": "integer"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
           },
           "source": {
             "anyOf": [
@@ -9714,7 +9727,7 @@
     },
     "/v1/imports/local": {
       "post": {
-        "description": "Import the caller's recent local transcripts from a chosen host.\n\nThe transcripts live on the caller's machine, so the read happens on\nthe connected host over its tunnel \u2014 the server can't see them. The\nhost enumerates + normalizes the most recent sessions; the server\nimports those not already imported.\n\nBuffered form: returns the whole batch's tally in one JSON body. For a\nlive per-session list use `POST /v1/imports/local/stream`. Not atomic:\neach session is persisted as its frame arrives, so if the host drops\nmid-stream this raises after the sessions read so far are already\ncommitted; a retry is idempotent (they come back as already-imported).",
+        "description": "Import local transcripts from a chosen host.\n\nThe transcripts live on the caller's machine, so the read happens on\nthe connected host over its tunnel \u2014 the server can't see them. The\nhost loads an exact id or enumerates recent sessions, then normalizes\nthem; the server imports those not already imported.\n\nBuffered form: returns the whole batch's tally in one JSON body. For a\nlive per-session list use `POST /v1/imports/local/stream`. Not atomic:\neach session is persisted as its frame arrives, so if the host drops\nmid-stream this raises after the sessions read so far are already\ncommitted; a retry is idempotent (they come back as already-imported).",
         "operationId": "import_local_sessions_v1_imports_local_post",
         "requestBody": {
           "content": {
@@ -9756,7 +9769,7 @@
     },
     "/v1/imports/local/stream": {
       "post": {
-        "description": "Stream the caller's recent local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch; a terminal `{\"event\": \"done\", ...}`\ncarries the tally. A mid-stream host failure emits `{\"event\": \"error\", ...}` before `done` \u2014 the sessions read so far are already committed\nand a retry is idempotent. Request validation still fails ahead of the\nstream with the usual HTTP error.",
+        "description": "Stream local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch; a terminal `{\"event\": \"done\", ...}`\ncarries the tally. A mid-stream host failure emits `{\"event\": \"error\", ...}` before `done` \u2014 the sessions read so far are already committed\nand a retry is idempotent. Request validation still fails ahead of the\nstream with the usual HTTP error.",
         "operationId": "import_local_sessions_stream_v1_imports_local_stream_post",
         "requestBody": {
           "content": {
