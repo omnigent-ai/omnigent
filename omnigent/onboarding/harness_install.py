@@ -792,9 +792,13 @@ def harness_setup_hint(harness: str | None) -> str:
             login = f", then run `{spec.binary} {' '.join(spec.login_args)}`"
         elif spec.auth_hint:
             login = f", then {spec.auth_hint}"
-        if install_key is not None and not harness_cli_installed(install_key):
+        if install_key is not None:
             detected, required = harness_cli_version(install_key)
-            if detected is not None and required is not None:
+            if (
+                detected is not None
+                and required is not None
+                and not _harness_cli_version_value_satisfies(spec, detected)
+            ):
                 return (
                     f"upgrade the {spec.binary} CLI on that machine "
                     f"(installed {detected}; required {required}) with "
@@ -941,6 +945,11 @@ def _harness_cli_version_satisfies(
     if spec == _HARNESS_INSTALL[OPENCODE_KEY] and opencode_version_check_skipped():
         _warn_opencode_version_check_skipped(version, _version_range_str(spec))
         return True
+    return _harness_cli_version_value_satisfies(spec, version)
+
+
+def _harness_cli_version_value_satisfies(spec: HarnessInstallSpec, version: str) -> bool:
+    """Check a parsed CLI version string against *spec*'s declared range."""
     try:
         parsed = Version(version)
     except InvalidVersion:
@@ -978,6 +987,22 @@ def _warn_opencode_version_check_skipped(version: str, supported: str | None) ->
         version,
         supported,
     )
+
+
+def _resolve_harness_cli_binary(key: str, spec: HarnessInstallSpec) -> str | None:
+    """Resolve the executable whose version gate applies for *key*."""
+    path_binary = resolve_cli_binary(spec.binary)
+    if key != KIMI_NATIVE_KEY or path_binary is None:
+        return path_binary
+
+    from click import ClickException
+
+    from omnigent.harnesses.kimi_native.main import resolve_kimi_executable
+
+    try:
+        return resolve_kimi_executable()
+    except ClickException:
+        return None
 
 
 def harness_install_spec(key: str) -> HarnessInstallSpec | None:
@@ -1019,7 +1044,7 @@ def harness_cli_version_satisfies(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = harness_cli_binary(key)
+    binary = _resolve_harness_cli_binary(key, spec)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary)
@@ -1055,7 +1080,7 @@ def harness_cli_installed(
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = harness_cli_binary(key)
+    binary = _resolve_harness_cli_binary(key, spec)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary, timeout, raise_on_timeout=raise_on_timeout)
@@ -1078,7 +1103,7 @@ def harness_cli_version(key: str) -> tuple[str | None, str | None]:
     spec = harness_install_spec(key)
     if spec is None:
         return None, None
-    binary = harness_cli_binary(key)
+    binary = _resolve_harness_cli_binary(key, spec)
     if binary is None:
         return None, None
     version = _harness_cli_version_string(spec, binary)
