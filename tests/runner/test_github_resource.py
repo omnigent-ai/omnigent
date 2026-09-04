@@ -207,6 +207,42 @@ def test_github_info_pr_no_upstream_uses_pr_view(
     assert not any(c[:2] == ("pr", "list") for c in calls)
 
 
+def test_github_info_pushed_ref_matches_branch_uses_pr_view_not_list(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A branch pushed under its own name resolves via bare ``gh pr view``, not list.
+
+    Regression: on a base branch like ``master`` the pushed ref equals the local
+    name, so a bare ``gh pr view`` (which correctly finds no PR) must be used.
+    ``gh pr list --head`` matches the ref name alone and would return a
+    stranger's unrelated PR whose head merely shares the name — a false positive.
+    """
+    _set_pushed_ref(repo, "feature")  # pushed ref == local branch name
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(argv: Sequence[str], *, cwd: str) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        head = tuple(argv[:2])
+        if head == ("auth", "status"):
+            return (0, "", "")
+        if head == ("repo", "view"):
+            return (0, json.dumps({"nameWithOwner": "o/r"}), "")
+        if head == ("pr", "view"):
+            return (1, "", "no pull requests found for branch")
+        if head == ("pr", "list"):
+            # A stranger's PR sharing the ref name — must never be consulted here.
+            return (0, json.dumps([{"number": 999, "headRefName": "feature"}]), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    info = github_info(str(repo))
+    assert info["pr"] is None
+    assert info["base_ref"] is None
+    assert not any(c[:2] == ("pr", "list") for c in calls)
+
+
 def test_github_changed_files_via_pr_list_head(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

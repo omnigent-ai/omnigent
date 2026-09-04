@@ -17,11 +17,14 @@ Design notes:
 - Only the on-demand per-file expand-context reader (:func:`github_file_diff`)
   still uses ``git show`` for full before/after content — a unified-diff blob
   can't drive the viewer's context expansion.
-- The branch→PR lookup resolves in one ``gh`` call: when the branch has an
-  upstream, ``gh pr list --head <pushed-ref>`` matches on the head ref name
-  alone, so it finds the PR whether the head is in the base repo or a fork —
-  unlike a bare ``gh pr view``, whose head-repo-owner guess misses fork heads.
-  A bare ``gh pr view`` is used only when there's no upstream to name the head.
+- The branch→PR lookup resolves in one ``gh`` call, picked by whether the pushed
+  ref (``branch.<name>.merge``) was renamed from the local branch — the mark of
+  a fork / triangular push (Databricks prefixes it with ``<user>/``). Renamed →
+  ``gh pr list --head <pushed-ref>``, which matches the head ref name alone and
+  so finds a fork head a bare ``gh pr view`` misses. Not renamed → a bare ``gh pr
+  view``, which is correct and more precise for same-repo branches and returns
+  nothing for a base branch like ``master`` (``gh pr list --head master`` would
+  wrongly match a stranger's PR whose head merely shares the name).
 - ``available: false`` payloads let the tab render a message ("gh not installed",
   "not a git repo") instead of surfacing an error.
 """
@@ -177,17 +180,14 @@ def _current_branch(root: str) -> str | None:
     return out.strip() or None
 
 
-def _pushed_head_ref(root: str) -> str | None:
-    """Return the current branch's pushed head ref name, or ``None``.
+def _pushed_head_ref(root: str, branch: str) -> str | None:
+    """Return ``branch``'s pushed head ref name, or ``None``.
 
     Reads the configured upstream (``branch.<name>.merge``), whose value is the
     ref that was actually pushed — which may carry a ``<user>/`` prefix under a
     fork / triangular push flow and so differ from the local branch name.
-    ``None`` when detached or with no upstream configured.
+    ``None`` with no upstream configured.
     """
-    branch = _current_branch(root)
-    if branch is None:
-        return None
     rc, out, _ = _git(["config", f"branch.{branch}.merge"], cwd=root)
     if rc != 0 or not out.strip():
         return None
@@ -197,19 +197,37 @@ def _pushed_head_ref(root: str) -> str | None:
 def _pr_view_json(root: str, fields: str) -> dict[str, Any] | None:
     """Return the branch's PR as a ``gh``-JSON object for ``fields``, or ``None``.
 
-    Resolves the PR in a single ``gh`` call. When the branch has an upstream,
-    ``gh pr list --head <pushed-ref>`` matches on the head ref name alone, so it
-    finds the PR whether the head is in the base repo or a fork — unlike a bare
-    ``gh pr view``, whose head-repo-owner guess misses fork heads. ``--state
-    all`` keeps merged/closed PRs visible, as a bare ``gh pr view`` would.
-    ``gh pr list --json`` accepts the same fields and its rows share the shape of
-    a ``gh pr view`` object, so the first row parses identically. Only with no
-    upstream to name the head does it fall back to a bare ``gh pr view``.
+    Resolves the PR in a single ``gh`` call, choosing the query from a cheap git
+    signal: whether the pushed ref (``branch.<name>.merge``) was *renamed* from
+    the local branch name. A fork / triangular push renames it (Databricks pushes
+    carry a ``<user>/`` prefix), and only then does a bare ``gh pr view`` miss the
+    PR — its head-repo-owner guess looks in the wrong place. There we resolve by
+    the pushed ref with ``gh pr list --head`` (``--json`` takes the same fields,
+    and a row shares the shape of a ``gh pr view`` object, so it parses
+    identically; ``--state all`` keeps merged/closed PRs visible).
+
+    Otherwise a bare ``gh pr view`` is correct and *more precise*: it resolves
+    same-repo and standard-fork PRs, and returns nothing for a base branch like
+    ``master``. Using ``gh pr list --head`` there would be wrong — it matches on
+    the head ref name alone, so on ``master`` it returns a stranger's unrelated
+    PR whose head merely happens to be named ``master``.
     """
-    head_ref = _pushed_head_ref(root)
-    if head_ref is not None:
+    branch = _current_branch(root)
+    pushed_ref = _pushed_head_ref(root, branch) if branch is not None else None
+    if pushed_ref is not None and pushed_ref != branch:
         rc, out, _ = _gh(
-            ["pr", "list", "--head", head_ref, "--state", "all", "--limit", "1", "--json", fields],
+            [
+                "pr",
+                "list",
+                "--head",
+                pushed_ref,
+                "--state",
+                "all",
+                "--limit",
+                "1",
+                "--json",
+                fields,
+            ],
             cwd=root,
         )
         if rc != 0:
