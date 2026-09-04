@@ -8349,7 +8349,9 @@ async def _create_session_from_existing_agent(
     # the validated body args (e.g. ``["--permission-mode",
     # "bypassPermissions"]`` from the web permission-mode selector). The
     # flat-list shape plus this bounds check is the security boundary;
-    # mirrors the multipart create + PATCH paths.
+    # mirrors the multipart create + PATCH paths. When the body carries no
+    # args, the agent's own trusted spec seeds them below — explicit
+    # opt-ins only, never the headless worker default bypass.
     sub_spec: AgentSpec | None = None
     if body.sub_agent_name:
         sub_spec = _resolve_subagent_spec(
@@ -8375,24 +8377,46 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    # Spec-seeded defaults: a self-resolved agent's stored spec supplies the
+    # spec-level reasoning effort and, when the body carried no launch args,
+    # its explicit native-bypass opt-ins; one tolerant load serves both.
+    own_spec: AgentSpec | None = None
+    needs_launch_args_from_spec = not body.sub_agent_name and validated_launch_args is None
+    needs_effort_from_spec = reasoning_effort is None and sub_spec is None
+    if (
+        (needs_launch_args_from_spec or needs_effort_from_spec)
+        and agent_cache is not None
+        and agent.bundle_location is not None
+    ):
+        try:
+            own_loaded = await asyncio.to_thread(
+                agent_cache.load,
+                agent.id,
+                agent.bundle_location,
+                expand_env=agent.session_id is None,
+            )
+            own_spec = own_loaded.spec if own_loaded is not None else None
+        except (OSError, ValueError, RuntimeError, KeyError, AttributeError, ImportError):
+            _logger.warning(
+                "create: spec load for spec-seeded defaults failed "
+                "(agent=%s); session starts with no spec-level effort or launch args",
+                agent.id,
+                exc_info=True,
+            )
+
+    if needs_launch_args_from_spec and own_spec is not None:
+        try:
+            validated_launch_args = _derive_terminal_launch_args_from_spec(
+                own_spec, headless_defaults=False
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid terminal_launch_args in agent spec: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+
     if reasoning_effort is None:
-        effort_spec: AgentSpec | None = sub_spec
-        if effort_spec is None and agent_cache is not None and agent.bundle_location is not None:
-            try:
-                effort_loaded = await asyncio.to_thread(
-                    agent_cache.load,
-                    agent.id,
-                    agent.bundle_location,
-                    expand_env=agent.session_id is None,
-                )
-                effort_spec = effort_loaded.spec if effort_loaded is not None else None
-            except (OSError, ValueError, RuntimeError, KeyError, AttributeError, ImportError):
-                _logger.warning(
-                    "create: spec load for reasoning_effort default failed "
-                    "(agent=%s); session starts with no spec-level effort",
-                    agent.id,
-                    exc_info=True,
-                )
+        effort_spec: AgentSpec | None = sub_spec if sub_spec is not None else own_spec
         spec_effort = effort_spec.executor.reasoning_effort if effort_spec is not None else None
         if spec_effort is not None:
             _, reasoning_effort = validate_session_model_metadata(
@@ -8806,6 +8830,21 @@ def _create_session_from_bundle(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
         metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
+    elif metadata.terminal_launch_args is None:
+        # Top-level bundle create (the ``omnigent run <dir>`` shape): honor the
+        # spec's explicit bypass opt-ins (e.g. codex-native ``yolo: true``);
+        # an interactive session never inherits the headless default bypass.
+        try:
+            terminal_launch_args = _derive_terminal_launch_args_from_spec(
+                spec, headless_defaults=False
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid terminal_launch_args in bundled spec: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if terminal_launch_args is not None:
+            metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
 
     agent_id = generate_agent_id()
     agent_bundle_location = bundle_location(agent_id, bundle_bytes)
