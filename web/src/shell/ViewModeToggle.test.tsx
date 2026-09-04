@@ -147,4 +147,16 @@ describe("ViewModeToggle", () => {
     fireEvent.click(chatSegment());
     expect(setView).toHaveBeenCalledWith("chat");
   });
+
+  it("sizes each segment for touch on mobile", () => {
+    // icon-xs alone is a 24px hit box; on a phone each segment must meet the
+    // 44px tap-target floor like the header's other controls, and the track
+    // sheds its padding so the floating pill stays 44px tall.
+    renderToggle(makeCtx());
+    for (const segment of [chatSegment(), terminalSegment()]) {
+      expect(segment).toHaveClass("max-md:size-11", "max-md:rounded-full");
+      expect(segment.querySelector("svg")).toHaveClass("max-md:size-5");
+    }
+    expect(screen.getByTestId("view-mode-toggle")).toHaveClass("max-md:p-0");
+  });
 });
