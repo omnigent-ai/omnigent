@@ -392,6 +392,61 @@ def test_verdict_from_response(response: object, expected: str | None) -> None:
     assert kimi_native_hook._verdict_from_response(response) == expected
 
 
+def _mock_http_action(monkeypatch: pytest.MonkeyPatch, action: str) -> None:
+    """Patch httpx so the REAL verdict parse runs over ``{"action": action}``."""
+
+    class _Client:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del url, json
+            return httpx.Response(
+                200,
+                json={"action": action},
+                request=httpx.Request("POST", "http://server"),
+            )
+
+    monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_keys"),
+    [
+        # accept types "approve once"; cancel (no server interrupt) types
+        # "reject"; an explicit decline injects nothing (server Escape rejects).
+        ("accept", [APPROVE_KEY]),
+        ("cancel", [DENY_KEY]),
+        ("decline", []),
+    ],
+)
+def test_permission_request_keystroke_matches_real_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    expected_keys: list[str],
+) -> None:
+    """End-to-end: the real ElicitationResult parse drives the keystroke.
+
+    Only the pty inject and the HTTP transport are stubbed — ``_request_web_approval``
+    and ``_verdict_from_response`` run for real, so inverting or collapsing the
+    decline/cancel discrimination fails this.
+    """
+    bridge_dir = _governed_bridge(tmp_path)
+    _feed_stdin(monkeypatch, {"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+    _mock_http_action(monkeypatch, action)
+    keys = _capture_injection(monkeypatch)
+
+    assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+    assert keys == expected_keys
+
+
 def test_unknown_subcommand_returns_2(capsys: pytest.CaptureFixture[str]) -> None:
     assert kimi_native_hook.main(["bogus", "--bridge-dir", "/tmp/x"]) == 2
 
