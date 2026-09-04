@@ -339,10 +339,8 @@ def test_upgrade_pre_passes_prerelease_flag_to_installer(
 def test_update_is_hidden_and_shares_upgrade_options() -> None:
     """``update`` is a hidden shim over ``upgrade``, not a second command.
 
-    It is its own Click object now (it has to be, to warn), so the guard is
-    that it is built from ``upgrade``'s own parameter objects: the option
-    surface is identical by construction and cannot drift when ``upgrade``
-    grows a flag. ``hidden`` is what keeps it out of the ``--help`` listing.
+    It has to be its own Click object to warn, so the guard is that it reuses
+    ``upgrade``'s parameter objects — the option surface cannot drift.
     """
     update_cmd = cli.commands["update"]
     upgrade_cmd = cli.commands["upgrade"]
@@ -380,10 +378,8 @@ def test_update_deprecation_notice_honors_the_wrapper_command(
 ) -> None:
     """Under a wrapper the notice says ``isaac omni upgrade``, not ``omni``.
 
-    Most users reach this CLI wrapped (``isaac omni update``), and the wrapper
-    guard rejects naked ``omnigent`` calls — so a hint spelling the naked
-    binary would name a command that cannot run. Same contract as every other
-    followup hint in ``omnigent.cli``.
+    The wrapper guard rejects naked ``omnigent`` calls, so a hint spelling the
+    naked binary would name a command that cannot run.
     """
     monkeypatch.setenv(WRAPPER_COMMAND_ENV, "isaac omni")
     monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.1.0")
@@ -403,8 +399,7 @@ def test_update_check_matches_upgrade_check(
 ) -> None:
     """``update --check`` behaves identically to ``upgrade --check``.
 
-    Identical stdout and exit status (1 when a release is available) — the
-    deprecation only adds a stderr line, it does not change the flow.
+    The deprecation adds a stderr line; it does not change the flow.
     """
     monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
 

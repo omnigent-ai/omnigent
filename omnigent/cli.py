@@ -1715,8 +1715,7 @@ _ACCENT_RGB = (244, 59, 166)
 # Command names that are pure aliases of another command (the same Click
 # object registered under a second name, e.g. ``antigravity`` -> ``agy``).
 # Kept runnable/registered but omitted from the ``--help`` listing so the
-# alias isn't shown as a duplicate line. Deprecated spellings do NOT belong
-# here — they carry ``hidden=True`` themselves, which already excludes them.
+# alias isn't shown as a duplicate line.
 _ALIAS_COMMANDS: frozenset[str] = frozenset({"antigravity"})
 
 
@@ -5542,12 +5541,7 @@ def upgrade(
 def _update_deprecated(ctx: click.Context, **kwargs: object) -> None:
     """Warn that ``update`` is deprecated, then run the ``upgrade`` flow.
 
-    The callback behind the hidden ``update`` command registered below. Runs
-    ``upgrade`` through ``ctx.invoke`` rather than re-implementing anything, so
-    the deprecated spelling cannot drift from the canonical one in behavior or
-    exit status (``--check`` still exits 1 when a release is available).
-
-    :param ctx: The click context, used to invoke ``upgrade``'s callback.
+    :param ctx: The click context, used to invoke ``upgrade``.
     :param kwargs: ``upgrade``'s own parsed options, forwarded verbatim.
     :returns: None.
     """
@@ -5558,29 +5552,19 @@ def _update_deprecated(ctx: click.Context, **kwargs: object) -> None:
     ctx.invoke(upgrade, **kwargs)
 
 
-# ``upgrade`` is the one canonical spelling: it is what ``--help`` lists and
-# what every hint in this file and in ``omnigent.update_check`` points at.
-# ``update`` was a silent second name for the same Command object; it is now
-# deprecated — hidden from ``--help`` and warning on stderr so users migrate.
-#
-# Deprecated rather than deleted, deliberately. ``update`` is a common mistype
-# of ``upgrade``, and this is the wrapped CLI reached as ``isaac omni update``,
-# so a hard removal turns it into a bare "No such command 'update'" — and this
-# repo already has the scar: ``server start`` was removed outright in v0.7.0
-# (#3105) and had to be restored (#3578) when older clients hard-failed on it.
-#
-# Built from ``upgrade``'s own parameter objects so the option surface
-# (``--check`` / ``--force`` / ``--pre`` / ``--nightly`` / ``--extra`` /
-# ``--target-version`` / ``--dry-run``) stays identical by construction; there
-# is nothing to keep in sync when ``upgrade`` grows a flag.
+# ``update`` was a silent second name for the same Command object; ``upgrade``
+# is the canonical spelling, so ``update`` is now hidden and warns. Deprecated
+# rather than deleted because ``server start`` was deleted outright in v0.7.0
+# (#3105) and had to be restored (#3578) when older clients hard-failed on it —
+# and the desktop About window shipped this same ``omni update`` hint. Reusing
+# ``upgrade.params`` keeps the option surface identical by construction.
 cli.add_command(
     click.Command(
         "update",
         params=list(upgrade.params),
         callback=_update_deprecated,
         hidden=True,
-        # Static, unlike the runtime warning: a module-level f-string would
-        # freeze the wrapper spelling at import time.
+        # Static: a module-level f-string would freeze the wrapper spelling.
         help="Deprecated spelling of `upgrade`. Use `upgrade` instead.",
     )
 )
