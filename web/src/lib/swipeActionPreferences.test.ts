@@ -10,6 +10,7 @@ import {
 } from "./swipeActionPreferences";
 
 const STORAGE_KEY = "omnigent:swipe-actions";
+const EXPECTED_DEFAULTS = { left: "delete", right: "archive" } as const;
 
 afterEach(() => {
   cleanup();
@@ -18,7 +19,8 @@ afterEach(() => {
 
 describe("swipeActionPreferences — read/write", () => {
   it("returns the defaults when nothing is stored", () => {
-    expect(readSwipeActions()).toEqual(DEFAULT_SWIPE_ACTIONS);
+    expect(DEFAULT_SWIPE_ACTIONS).toEqual(EXPECTED_DEFAULTS);
+    expect(readSwipeActions()).toEqual(EXPECTED_DEFAULTS);
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
   });
 
@@ -65,8 +67,9 @@ describe("normalizeSwipeActions", () => {
   it("fills absent directions from the defaults", () => {
     expect(normalizeSwipeActions({ left: "delete" })).toEqual({
       left: "delete",
-      right: DEFAULT_SWIPE_ACTIONS.right,
+      right: "archive",
     });
+    expect(normalizeSwipeActions({})).toEqual(EXPECTED_DEFAULTS);
   });
 
   it("makes a present but unrecognized action inert", () => {
@@ -77,10 +80,10 @@ describe("normalizeSwipeActions", () => {
   });
 
   it("maps null, arrays, and primitives to the defaults", () => {
-    expect(normalizeSwipeActions(null)).toEqual(DEFAULT_SWIPE_ACTIONS);
-    expect(normalizeSwipeActions("nope")).toEqual(DEFAULT_SWIPE_ACTIONS);
-    expect(normalizeSwipeActions(123)).toEqual(DEFAULT_SWIPE_ACTIONS);
-    expect(normalizeSwipeActions([])).toEqual(DEFAULT_SWIPE_ACTIONS);
+    expect(normalizeSwipeActions(null)).toEqual(EXPECTED_DEFAULTS);
+    expect(normalizeSwipeActions("nope")).toEqual(EXPECTED_DEFAULTS);
+    expect(normalizeSwipeActions(123)).toEqual(EXPECTED_DEFAULTS);
+    expect(normalizeSwipeActions([])).toEqual(EXPECTED_DEFAULTS);
   });
 });
 
@@ -95,7 +98,7 @@ describe("readSwipeActions — corrupt storage", () => {
     });
 
     try {
-      expect(readSwipeActions()).toEqual(DEFAULT_SWIPE_ACTIONS);
+      expect(readSwipeActions()).toEqual(EXPECTED_DEFAULTS);
     } finally {
       Object.defineProperty(window, "localStorage", descriptor);
     }
@@ -103,12 +106,18 @@ describe("readSwipeActions — corrupt storage", () => {
 
   it("falls back to the defaults on unparseable JSON", () => {
     localStorage.setItem(STORAGE_KEY, "{not json");
-    expect(readSwipeActions()).toEqual(DEFAULT_SWIPE_ACTIONS);
+    expect(readSwipeActions()).toEqual(EXPECTED_DEFAULTS);
   });
 
-  it("normalizes a partially-valid stored object", () => {
+  it("defaults absent stored directions but keeps corrupt present directions inert", () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({}));
+    expect(readSwipeActions()).toEqual(EXPECTED_DEFAULTS);
+
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ left: "delete" }));
+    expect(readSwipeActions()).toEqual(EXPECTED_DEFAULTS);
+
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ left: "delete", right: "bogus" }));
-    expect(readSwipeActions()).toEqual({ left: "delete", right: DEFAULT_SWIPE_ACTIONS.right });
+    expect(readSwipeActions()).toEqual({ left: "delete", right: "none" });
   });
 
   it("makes an unrecognized stored action inert", () => {
@@ -126,7 +135,7 @@ describe("useSwipeActions — live updates", () => {
 
   it("re-renders on a same-tab write (Settings change updates mounted rows)", () => {
     const { result } = renderHook(() => useSwipeActions());
-    expect(result.current).toEqual(DEFAULT_SWIPE_ACTIONS);
+    expect(result.current).toEqual(EXPECTED_DEFAULTS);
 
     act(() => {
       writeSwipeActions({ left: "delete", right: "delete" });
