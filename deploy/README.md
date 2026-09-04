@@ -93,6 +93,9 @@ deploy/
 ├── openshell/         ← NVIDIA OpenShell sandbox-provider guide (self-hosted
 │   └── README.md         gRPC gateway, on-prem/air-gapped); NOT a server target.
 │
+├── tenki/             ← Tenki sandbox-provider guide (boots from a prepared
+│   └── README.md         registry image); NOT a server deploy target.
+│
 ├── databricks/        ← Databricks Apps (Lakebase + UC Volumes)
 │   ├── databricks.yml     bundle declarative config
 │   ├── deploy.py          build + `bundle deploy`/`run` orchestrator
@@ -265,10 +268,10 @@ omnigent run path/to/agent.yaml --server https://your-host
 
 Don't want a laptop to be the host? Run the host in a cloud sandbox instead.
 
-**From the CLI (Modal, Daytona, Blaxel, Islo, or E2B).** Install the provider extra when needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, `'omnigent[blaxel]'`, or `'omnigent[e2b]'`; Islo uses the built-in HTTP client). Authenticate with `modal token new`, `DAYTONA_API_KEY`, Blaxel's `BL_WORKSPACE` and `BL_API_KEY`, `ISLO_API_KEY`, or `E2B_API_KEY`. Then run:
+**From the CLI (Modal, Daytona, Blaxel, Islo, E2B, or Tenki).** Install the provider extra when needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, `'omnigent[blaxel]'`, `'omnigent[e2b]'`, or `'omnigent[tenki]'`; Islo uses the built-in HTTP client). Authenticate with `modal token new`, `DAYTONA_API_KEY`, Blaxel's `BL_WORKSPACE` and `BL_API_KEY`, `ISLO_API_KEY`, `E2B_API_KEY`, or `TENKI_API_KEY`. Then run:
 
 ```bash
-omnigent sandbox create --provider modal     # or --provider daytona / blaxel / islo / e2b
+omnigent sandbox create --provider modal     # or --provider daytona / blaxel / islo / e2b / tenki
 omnigent sandbox connect --provider modal --sandbox-id <id> --server https://your-host
 ```
 
@@ -279,9 +282,11 @@ omnigent sandbox connect --provider modal --sandbox-id <id> --server https://you
 > [`daytona/README.md`](daytona/README.md) for the relay workaround. E2B
 > shares Modal's 24-hour cap **and** boots from a pre-built E2B *template*
 > rather than a registry image — build it once first; see
-> [`e2b/README.md`](e2b/README.md).
+> [`e2b/README.md`](e2b/README.md). Tenki also boots from a prepared registry
+> image (with the host baked in) rather than a stock one — build and publish it
+> once first; see [`tenki/README.md`](tenki/README.md).
 
-**Server-managed (Modal, Daytona, Blaxel, Islo, or E2B).** With *managed hosts*, creating a
+**Server-managed (Modal, Daytona, Blaxel, Islo, E2B, or Tenki).** With *managed hosts*, creating a
 session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
@@ -297,7 +302,7 @@ sandbox:
 
 Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
 `MODAL_TOKEN_SECRET`, or a mounted `~/.modal.toml`), not the config file.
-Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`. Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY` from the server environment.
+Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`. Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY`. Tenki reads `TENKI_API_KEY` and optional `TENKI_API_ENDPOINT` from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
 
@@ -370,7 +375,7 @@ a Modal secret (GitLab: add `GIT_USERNAME=oauth2`). The host image's git
 credential helper picks it up for the clone and for the agent's later
 fetch/push.
 
-See the [`modal`](modal/README.md), [`daytona`](daytona/README.md), [`blaxel`](blaxel/README.md), and [`islo`](islo/README.md) guides for provider setup and troubleshooting.
+See the [`modal`](modal/README.md), [`daytona`](daytona/README.md), [`blaxel`](blaxel/README.md), [`islo`](islo/README.md), and [`tenki`](tenki/README.md) guides for provider setup and troubleshooting (the Tenki guide covers the one-time host-template build).
 
 ## Auth
 

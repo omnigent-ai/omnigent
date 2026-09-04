@@ -199,6 +199,11 @@ openshell = ["openshell>=0.0.88,<1"]
 # package and imports the official client lazily, so only users of the
 # provider need this extra.
 kubernetes = ["kubernetes>=36,<37"]
+# Tenki sandbox launcher (`omnigent sandbox --provider tenki` and
+# server-managed `sandbox.provider: tenki`). The launcher module ships in
+# the base package and imports the SDK lazily, so only users of the
+# provider need this extra. Pre-1.0 SDK: pin minor.
+tenki = ["tenki>=0.5.4,<0.6"]
 # Vault Transit backend for the credential store's SecretCipher — the
 # non-AWS alternative to the built-in KMS cipher (selected by
 # OMNIGENT_CREDENTIAL_VAULT_KEY). hvac is imported lazily, like boto3, so

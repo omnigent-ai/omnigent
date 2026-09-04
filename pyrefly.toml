@@ -49,6 +49,10 @@ ignore-missing-imports = [
     "omnigent.onboarding.internal_beta",
     "openshell",
     "openshell.*",
+    "tenki",
+    "tenki.*",
+    "tenki_sandbox",
+    "tenki_sandbox.*",
 ]
 
 ignore-errors-in-generated-code = true

@@ -42,6 +42,7 @@ from omnigent.server.managed_hosts import (
     KUBERNETES_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
+    TENKI_MANAGED_TOKEN_TTL_S,
     ManagedLaunch,
     ManagedLaunchTracker,
     ManagedSandboxConfig,
@@ -72,6 +73,7 @@ from tests.server.helpers import (
     install_fake_kubernetes_launcher,
     install_fake_modal_launcher,
     install_fake_openshell_launcher,
+    install_fake_tenki_launcher,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -854,6 +856,70 @@ def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
         )
 
 
+def test_parse_valid_tenki_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The documented tenki YAML shape parses into a config whose factory
+    constructs Tenki launchers carrying the image reference, env names,
+    API override, and sandbox sizing, with the fixed 7-day token TTL.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "tenki",
+            "server_url": "https://srv.example.com/",
+            "tenki": {
+                "image": "myworkspace/omnigent-host:latest",
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "base_url": "https://api.tenki.cloud/",
+                "workspace": "ws-123",
+                "vcpus": 4,
+                "memory_mb": 8192,
+                "disk_gb": 40,
+            },
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == TENKI_MANAGED_TOKEN_TTL_S
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "tenki"
+    fake = FakeSandboxLauncher()
+    install_fake_tenki_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image == "myworkspace/omnigent-host:latest"
+    assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.base_url == "https://api.tenki.cloud/"
+    assert fake.workspace == "ws-123"
+    assert fake.vcpus == 4
+    assert fake.memory_mb == 8192
+    assert fake.disk_gb == 40
+
+
+def test_parse_tenki_without_section_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `provider: tenki` + `server_url` is a complete config: optional
+    fields reach the launcher as None so its env-var fallbacks apply
+    (the launcher fails fast at provision time if no image resolves).
+    """
+    cfg = parse_sandbox_config({"provider": "tenki", "server_url": "https://s.example.com"})
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_tenki_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image is None
+    assert fake.env is None
+    assert fake.base_url is None
+    assert fake.workspace is None
+    assert fake.vcpus is None
+    assert fake.memory_mb is None
+    assert fake.disk_gb is None
+
+
 @pytest.mark.parametrize(
     ("kubernetes_block", "expected_fragment"),
     [
@@ -1552,6 +1618,61 @@ def test_parse_kubernetes_secret_mounts_allows_same_secret_at_two_paths() -> Non
                 "host_config": {"providers": {"litellm": {"kind": "bogus"}}},
             },
             "sandbox.host_config.providers",
+        ),
+        # tenki section present but malformed.
+        ({"provider": "tenki", "server_url": "https://s", "tenki": "x"}, "sandbox.tenki"),
+        (
+            {"provider": "tenki", "server_url": "https://s", "tenki": {"image": "  "}},
+            "sandbox.tenki.image",
+        ),
+        (
+            {"provider": "tenki", "server_url": "https://s", "tenki": {"env": "OPENAI"}},
+            "sandbox.tenki.env",
+        ),
+        (
+            {"provider": "tenki", "server_url": "https://s", "tenki": {"base_url": "  "}},
+            "sandbox.tenki.base_url",
+        ),
+        (
+            {"provider": "tenki", "server_url": "https://s", "tenki": {"vcpus": 0}},
+            "sandbox.tenki.vcpus",
+        ),
+        (
+            {"provider": "tenki", "server_url": "https://s", "tenki": {"memory_mb": "large"}},
+            "sandbox.tenki.memory_mb",
+        ),
+        # tenki resource bounds (vCPU 1..16, memory 128..65536 aligned to 2, disk 5..100).
+        (
+            {"provider": "tenki", "server_url": "https://s", "tenki": {"vcpus": 17}},
+            "sandbox.tenki.vcpus",
+        ),
+        (
+            {"provider": "tenki", "server_url": "https://s", "tenki": {"vcpus": True}},
+            "sandbox.tenki.vcpus",
+        ),
+        (
+            {"provider": "tenki", "server_url": "https://s", "tenki": {"memory_mb": 1}},
+            "sandbox.tenki.memory_mb",
+        ),
+        (
+            {"provider": "tenki", "server_url": "https://s", "tenki": {"memory_mb": 65538}},
+            "sandbox.tenki.memory_mb",
+        ),
+        (
+            {"provider": "tenki", "server_url": "https://s", "tenki": {"memory_mb": 4097}},
+            "aligned to 2 MiB",
+        ),
+        (
+            {"provider": "tenki", "server_url": "https://s", "tenki": {"memory_mb": 4096.5}},
+            "sandbox.tenki.memory_mb",
+        ),
+        (
+            {"provider": "tenki", "server_url": "https://s", "tenki": {"disk_gb": 1}},
+            "sandbox.tenki.disk_gb",
+        ),
+        (
+            {"provider": "tenki", "server_url": "https://s", "tenki": {"disk_gb": 101}},
+            "sandbox.tenki.disk_gb",
         ),
         # yaml.safe_load turns an unquoted date into datetime.date, which the
         # per-launch json.dumps cannot take — must fail startup, not launches.
@@ -2864,6 +2985,65 @@ def test_parse_modal_secrets_malformed_fails_loud(secrets: object) -> None:
                 "modal": {"secrets": secrets},
             }
         )
+
+
+async def test_launch_tenki_from_parsed_config_registers_host(
+    monkeypatch: pytest.MonkeyPatch, db_uri: str
+) -> None:
+    """
+    The whole YAML path for tenki as one flow: parse_sandbox_config
+    selects the tenki branch and its fixed 7-day TTL, the factory
+    constructs the launcher with the parsed image, and launch_managed_host
+    prepares, provisions, runs the inherited EXEC start_host, and registers
+    the host as provider ``tenki`` — none of which the parse-only or the
+    generic injected-launch tests exercise together.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        """Simulate the sandbox host connecting over the tunnel."""
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    install_fake_tenki_launcher(monkeypatch, fake)
+
+    config = parse_sandbox_config(
+        {
+            "provider": "tenki",
+            "server_url": "https://srv.example.com/",
+            "tenki": {"image": "myworkspace/omnigent-host:latest"},
+        }
+    )
+    assert config is not None
+    assert config.default.token_ttl_s == TENKI_MANAGED_TOKEN_TTL_S
+
+    result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+
+    assert fake.prepared is True
+    # The factory constructed the real launcher with the parsed image.
+    assert fake.image == "myworkspace/omnigent-host:latest"
+    # Inherited EXEC start_host: workspace created + host dialed the server URL.
+    assert result.workspace == "/root/workspace"
+    assert any("mkdir -p /root/workspace" in cmd for cmd in fake.commands)
+    start = fake.host_starts[0]
+    assert "--server https://srv.example.com" in start.command
+    # The hosts row records the tenki binding (provider comes from the launcher)
+    # and reaches online.
+    host = host_store.get_host(result.host_id)
+    assert host is not None
+    assert host.status == "online"
+    assert host.sandbox_provider == "tenki"
+    assert host.sandbox_id == "sb-fake-1"
+    # The 7-day launch token resolves (unexpired) to this host.
+    resolved = host_store.resolve_launch_token(start.host_id, start.token)
+    assert resolved is not None
+    assert resolved.host_id == result.host_id
+    # Success path tears nothing down.
+    assert fake.terminated == []
 
 
 # ── multi-provider sandbox config ──────────────────────────────────────

@@ -693,6 +693,33 @@ def connect_sandbox_host(
 # ── High-level orchestrator ────────────────────────────
 
 
+def _terminate_failed_bootstrap(launcher: SandboxLauncher, sandbox_id: str) -> None:
+    """
+    Best-effort terminate of a sandbox the failing bootstrap created.
+
+    A sandbox provisioned by a run that then fails (wheel build, ship,
+    install, auth) is half-set-up and, with the keep-alive already
+    applied, would otherwise keep billing until its lifetime lapses.
+    Only bootstrap-created sandboxes are terminated — attached
+    pre-existing ones are the user's to keep — and a termination error
+    is reported without masking the original failure.
+
+    :param launcher: The provider's launcher.
+    :param sandbox_id: The sandbox this run provisioned.
+    """
+    click.echo(f"▸ Bootstrap failed — terminating sandbox '{sandbox_id}' created by this run")
+    try:
+        launcher.terminate(sandbox_id)
+    except Exception as exc:
+        click.echo(
+            f"  → warning: could not terminate '{sandbox_id}' ({exc}); "
+            "terminate it manually with the provider's tooling.",
+            err=True,
+        )
+    else:
+        click.echo(f"  → terminated {sandbox_id}")
+
+
 def bootstrap_sandbox_host(
     launcher: SandboxLauncher,
     *,
@@ -709,6 +736,11 @@ def bootstrap_sandbox_host(
     Six steps: provider preflight → provision or attach sandbox →
     keep-alive → build wheels → ship wheels → ``omnigent login``
     inside the sandbox.
+
+    A failure (or Ctrl-C) after provisioning terminates the
+    just-created sandbox, best-effort, so an unfinished bootstrap
+    doesn't leak a running, keep-alive-extended session. Sandboxes
+    passed in via *sandbox_id* are never terminated.
 
     :param launcher: The provider's launcher.
     :param sandbox_id: Existing sandbox id to attach to, or ``None`` to
@@ -736,24 +768,32 @@ def bootstrap_sandbox_host(
     if not skip_auth and not launcher.capabilities.local_port_forward:
         raise launcher.forward_capability_error()
     launcher.prepare()
+    provisioned = sandbox_id is None
     if sandbox_id is None:
         sandbox_id = launcher.provision(sandbox_name)
     else:
         launcher.attach(sandbox_id)
     click.echo(f"  → sandbox_id={sandbox_id}")
-    launcher.keep_alive(sandbox_id)
-    wheels_tgz = Path(DEFAULT_WHEELS_TGZ)
-    build_wheels(
-        repo_root,
-        tgz_path=wheels_tgz,
-        pypi_proxy=launcher.wheel_build_index_url,
-    )
-    ship_wheels(launcher, sandbox_id, wheels_tgz=wheels_tgz)
-    login_app_oauth_in_sandbox(
-        launcher,
-        sandbox_id,
-        server_url=server_url,
-        workspace=workspace,
-        skip=skip_auth,
-    )
+    # BaseException: a Ctrl-C mid-bootstrap abandons the sandbox just as
+    # thoroughly as an error does — clean up our own creation either way.
+    try:
+        launcher.keep_alive(sandbox_id)
+        wheels_tgz = Path(DEFAULT_WHEELS_TGZ)
+        build_wheels(
+            repo_root,
+            tgz_path=wheels_tgz,
+            pypi_proxy=launcher.wheel_build_index_url,
+        )
+        ship_wheels(launcher, sandbox_id, wheels_tgz=wheels_tgz)
+        login_app_oauth_in_sandbox(
+            launcher,
+            sandbox_id,
+            server_url=server_url,
+            workspace=workspace,
+            skip=skip_auth,
+        )
+    except BaseException:
+        if provisioned:
+            _terminate_failed_bootstrap(launcher, sandbox_id)
+        raise
     return sandbox_id

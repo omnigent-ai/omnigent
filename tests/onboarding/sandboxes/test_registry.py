@@ -97,6 +97,20 @@ def test_available_providers_returns_builtins() -> None:
     assert "kubernetes" in names
 
 
+def test_tenki_is_a_registered_builtin() -> None:
+    """Tenki is discoverable through the registry, not just importable.
+
+    Provider discovery (the CLI's ``--provider`` choices, managed-host
+    resolution) reads the registry — a launcher module that exists but is
+    never contributed here is unreachable, so this pins the wiring.
+    """
+    reset_plugin_state_for_tests()
+    assert "tenki" in available_providers()
+    meta = get_provider_metadata("tenki")
+    assert meta is not None
+    assert meta.launcher_class == "omnigent.onboarding.sandboxes.tenki:TenkiSandboxLauncher"
+
+
 def test_get_provider_metadata_known_provider() -> None:
     """Metadata for a registered provider is available."""
     reset_plugin_state_for_tests()

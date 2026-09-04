@@ -191,6 +191,10 @@ class _FakeLauncher(SandboxLauncher):
         """Marker command proving the launcher hook supplied the pip line."""
         return f"FAKE-INSTALL {remote_tgz_path}"
 
+    def terminate(self, sandbox_id: str) -> None:
+        """Record the termination."""
+        self.log.append(f"terminate:{sandbox_id}")
+
 
 class _NoForwardLauncher(_FakeLauncher):
     """
@@ -923,3 +927,92 @@ def test_bootstrap_attaches_to_existing_sandbox(
     # would create a fresh sandbox on every re-ship of an existing one.
     assert not any(entry.startswith("provision") for entry in launcher.log), launcher.log
     assert "attach:existing-sb" in launcher.log
+
+
+def test_bootstrap_failure_terminates_provisioned_sandbox(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A failure after provisioning must terminate the sandbox this run
+    created — otherwise the failed bootstrap leaks a running,
+    keep-alive-extended session that bills until it lapses.
+    """
+    launcher = _FakeLauncher()
+    monkeypatch.setattr(bootstrap_mod, "build_wheels", lambda repo_root, **kwargs: None)
+
+    def _ship_fails(launcher_arg: Any, sid: str, **kwargs: Any) -> None:
+        raise click.ClickException("upload rejected")
+
+    monkeypatch.setattr(bootstrap_mod, "ship_wheels", _ship_fails)
+
+    with pytest.raises(click.ClickException, match="upload rejected"):
+        bootstrap_sandbox_host(launcher, sandbox_id=None, **_bootstrap_kwargs(tmp_path))
+    assert "terminate:sb-new" in launcher.log
+
+
+def test_bootstrap_interrupt_terminates_provisioned_sandbox(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Ctrl-C mid-bootstrap abandons the sandbox just like an error does —
+    the just-created session must not survive the abort.
+    """
+    launcher = _FakeLauncher()
+
+    def _build_interrupted(repo_root: Path, **kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(bootstrap_mod, "build_wheels", _build_interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        bootstrap_sandbox_host(launcher, sandbox_id=None, **_bootstrap_kwargs(tmp_path))
+    assert "terminate:sb-new" in launcher.log
+
+
+def test_bootstrap_failure_keeps_attached_sandbox(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A pre-existing sandbox passed in by the user is never ours to clean
+    up — a failing re-ship must leave it running.
+    """
+    launcher = _FakeLauncher()
+    monkeypatch.setattr(bootstrap_mod, "build_wheels", lambda repo_root, **kwargs: None)
+
+    def _ship_fails(launcher_arg: Any, sid: str, **kwargs: Any) -> None:
+        raise click.ClickException("upload rejected")
+
+    monkeypatch.setattr(bootstrap_mod, "ship_wheels", _ship_fails)
+
+    with pytest.raises(click.ClickException, match="upload rejected"):
+        bootstrap_sandbox_host(
+            launcher,
+            sandbox_id="existing-sb",
+            **{**_bootstrap_kwargs(tmp_path), "skip_auth": True},
+        )
+    assert not any(entry.startswith("terminate") for entry in launcher.log), launcher.log
+
+
+def test_bootstrap_cleanup_failure_does_not_mask_original_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    When the cleanup terminate itself fails, the user must still see the
+    bootstrap error that actually broke the run, with a warning about
+    the sandbox left behind.
+    """
+
+    class _TerminateFailsLauncher(_FakeLauncher):
+        def terminate(self, sandbox_id: str) -> None:
+            raise click.ClickException("provider outage")
+
+    launcher = _TerminateFailsLauncher()
+    monkeypatch.setattr(bootstrap_mod, "build_wheels", lambda repo_root, **kwargs: None)
+
+    def _ship_fails(launcher_arg: Any, sid: str, **kwargs: Any) -> None:
+        raise click.ClickException("upload rejected")
+
+    monkeypatch.setattr(bootstrap_mod, "ship_wheels", _ship_fails)
+
+    with pytest.raises(click.ClickException, match="upload rejected"):
+        bootstrap_sandbox_host(launcher, sandbox_id=None, **_bootstrap_kwargs(tmp_path))
