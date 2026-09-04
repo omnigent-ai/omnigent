@@ -368,7 +368,6 @@ def test_update_warns_then_runs_upgrade(
     assert result.exit_code == 0, result.output
     assert "`update` is deprecated" in result.stderr
     assert "upgrade" in result.stderr
-    # The upgrade flow itself still ran to completion.
     assert "up to date" in result.stdout
     assert "0.1.0" in result.stdout
 
@@ -397,10 +396,7 @@ def test_update_deprecation_notice_honors_the_wrapper_command(
 def test_update_check_matches_upgrade_check(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
-    """``update --check`` behaves identically to ``upgrade --check``.
-
-    The deprecation adds a stderr line; it does not change the flow.
-    """
+    """``update --check`` behaves identically to ``upgrade --check``."""
     monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
 
     def _must_not_run(*_a: object, **_k: object) -> int:
@@ -415,7 +411,7 @@ def test_update_check_matches_upgrade_check(
     assert update_result.exit_code == upgrade_result.exit_code == 1
     assert update_result.stdout == upgrade_result.stdout
     assert "v0.1.0 → v0.2.0" in update_result.stdout
-    # The warning is the only difference, and only on the deprecated spelling.
+    # The warning is the only difference between the two.
     assert "`update` is deprecated" in update_result.stderr
     assert "deprecated" not in upgrade_result.stderr
 

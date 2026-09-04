@@ -2079,9 +2079,9 @@ def _should_skip_update_check(argv: list[str]) -> bool:
 
     Skipped for help / version requests, internal TUI subcommands
     (``pane-split`` / ``pane-picker``, invoked by the terminal UI rather
-    than the user), and ``upgrade`` itself along with its deprecated
-    ``update`` spelling — pointing the user at ``omni upgrade`` while they
-    are running it is noise.
+    than the user), and ``upgrade`` (and its deprecated ``update`` spelling)
+    itself (pointing the user at ``omni upgrade`` while they are running it
+    is noise).
 
     :param argv: CLI arguments without the program name, e.g.
         ``["run", "agent.yaml"]``.
@@ -5552,12 +5552,9 @@ def _update_deprecated(ctx: click.Context, **kwargs: object) -> None:
     ctx.invoke(upgrade, **kwargs)
 
 
-# ``update`` was a silent second name for the same Command object; ``upgrade``
-# is the canonical spelling, so ``update`` is now hidden and warns. Deprecated
-# rather than deleted because ``server start`` was deleted outright in v0.7.0
-# (#3105) and had to be restored (#3578) when older clients hard-failed on it —
-# and the desktop About window shipped this same ``omni update`` hint. Reusing
-# ``upgrade.params`` keeps the option surface identical by construction.
+# Deprecated rather than deleted: the desktop About window shipped this same
+# ``omni update`` hint, and ``server start`` was deleted outright in v0.7.0
+# (#3105) then restored (#3578) when older clients hard-failed on it.
 cli.add_command(
     click.Command(
         "update",

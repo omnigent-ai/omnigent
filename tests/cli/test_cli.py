@@ -1101,7 +1101,6 @@ def test_help_hides_deprecated_update_spelling_but_keeps_it_runnable() -> None:
 
     assert result.exit_code == 0, result.output
     assert "upgrade" in result.output
-    # Suppressed from the listing, but still a real command — deprecated, not gone.
     assert "\n  update " not in result.output
     assert cli.commands["update"].hidden is True
 
