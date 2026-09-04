@@ -52,11 +52,57 @@ import { SessionCardNode, type SessionCardData } from "./SessionCardNode";
 const nodeTypes = { session: SessionCardNode };
 const proOptions = { hideAttribution: true };
 const FIT_VIEW = { padding: 0.2, maxZoom: 1 };
+const MIN_ZOOM = 0.2;
+const MAX_ZOOM = 2.5;
+const LARGE_CANVAS_SESSION_COUNT = 40;
+const READABLE_VIEWPORT = { x: 24, y: 24, zoom: 0.9 };
 const RESIZE_REFIT_DELAY_MS = 100;
-export const SESSION_POLL_INTERVAL_MS = 5_000;
+export const SESSION_POLL_INTERVAL_MS = 30_000;
 export const PULL_REQUEST_REFRESH_MS = 300_000;
+export const PULL_REQUEST_CONCURRENCY = 4;
 const PROJECT_NAME_MAX_LENGTH = 100;
 type SessionNode = Node<SessionCardData, "session">;
+
+interface PullRequestTask {
+  key: string;
+  run: () => Promise<void>;
+}
+
+class PullRequestQueue {
+  private readonly active = new Set<string>();
+  private readonly pending = new Map<string, () => Promise<void>>();
+
+  constructor(private readonly concurrency: number) {}
+
+  replace(tasks: PullRequestTask[]): void {
+    this.pending.clear();
+    for (const task of tasks) {
+      if (!this.active.has(task.key)) this.pending.set(task.key, task.run);
+    }
+    this.drain();
+  }
+
+  clear(): void {
+    this.pending.clear();
+  }
+
+  private drain(): void {
+    while (this.active.size < this.concurrency && this.pending.size > 0) {
+      const entry = this.pending.entries().next().value as
+        [string, () => Promise<void>] | undefined;
+      if (!entry) return;
+      const [key, run] = entry;
+      this.pending.delete(key);
+      this.active.add(key);
+      void run()
+        .catch(() => undefined)
+        .finally(() => {
+          this.active.delete(key);
+          this.drain();
+        });
+    }
+  }
+}
 
 function sessionCountLabel(count: number): string {
   return count === 1 ? "1 session" : `${count} sessions`;
@@ -71,6 +117,12 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
     Record<string, ExtensionPullRequest | null>
   >({});
   const pullRequestCheckedAtRef = useRef<Record<string, number>>({});
+  const pullRequestQueueRef = useRef<PullRequestQueue | null>(null);
+  if (pullRequestQueueRef.current === null) {
+    pullRequestQueueRef.current = new PullRequestQueue(
+      PULL_REQUEST_CONCURRENCY,
+    );
+  }
   const [activeCanvas, setActiveCanvas] = useState(MAIN_CANVAS_ID);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -89,6 +141,7 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
   const activeCanvasRef = useRef(MAIN_CANVAS_ID);
   const openingRef = useRef(false);
   const initializedRef = useRef(false);
+  const refreshInFlightRef = useRef<Promise<void> | null>(null);
   const viewportTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aliveRef = useRef(true);
 
@@ -106,13 +159,18 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
   useEffect(() => {
     return () => {
       aliveRef.current = false;
+      pullRequestQueueRef.current?.clear();
     };
   }, []);
 
-  const fitToView = useCallback(
-    (duration = 0) => {
+  const applyDefaultViewport = useCallback(
+    (sessionCount: number, duration = 0) => {
       viewportDirtyRef.current = false;
-      void flow.fitView({ ...FIT_VIEW, duration });
+      if (sessionCount > LARGE_CANVAS_SESSION_COUNT) {
+        void flow.setViewport(READABLE_VIEWPORT, { duration });
+      } else {
+        void flow.fitView({ ...FIT_VIEW, duration });
+      }
     },
     [flow],
   );
@@ -125,32 +183,26 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
     };
   }, []);
 
-  // A saved viewport only makes sense for the container it was saved in (and
-  // within the zoom cap); anything else fits the cards to the current view.
+  // Preserve a user's saved view across ordinary window resizes. React Flow
+  // safely applies the same transform to the new container dimensions.
   const applyViewport = useCallback(
-    (saved: CanvasViewport | null) => {
+    (saved: CanvasViewport | null, sessionCount: number) => {
       requestAnimationFrame(() => {
         if (!aliveRef.current) return;
-        const size = containerSize();
         const usable =
-          saved !== null &&
-          saved.zoom <= FIT_VIEW.maxZoom &&
-          saved.width !== undefined &&
-          saved.height !== undefined &&
-          Math.abs(saved.width - size.width) <= 2 &&
-          Math.abs(saved.height - size.height) <= 2;
+          saved !== null && saved.zoom >= MIN_ZOOM && saved.zoom <= MAX_ZOOM;
         if (usable) {
-          viewportDirtyRef.current = false;
+          viewportDirtyRef.current = true;
           void flow.setViewport(
             { x: saved.x, y: saved.y, zoom: saved.zoom },
             { duration: 0 },
           );
         } else {
-          fitToView();
+          applyDefaultViewport(sessionCount);
         }
       });
     },
-    [containerSize, fitToView, flow],
+    [applyDefaultViewport, flow],
   );
 
   const openSession = useCallback(
@@ -203,32 +255,38 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
     [openExternal, openSession, pullRequests],
   );
 
-  // Ask the host (it shells out to gh on the session's host) for each card's
-  // PR when the card appears and at most every few minutes after that.
+  // Only enrich branch-bearing cards on the active canvas. A bounded queue
+  // prevents large workspaces from exhausting the host's request budget.
   useEffect(() => {
-    if (!context.capabilities.includes("sessions.pullRequest")) return;
+    const queue = pullRequestQueueRef.current;
+    if (!context.capabilities.includes("sessions.pullRequest")) {
+      queue?.clear();
+      return;
+    }
     const now = Date.now();
-    const due = sessions.filter(
+    const due = visibleSessions.filter(
       (session) =>
+        Boolean(session.gitBranch?.trim()) &&
         now - (pullRequestCheckedAtRef.current[session.id] ?? 0) >=
-        PULL_REQUEST_REFRESH_MS,
+          PULL_REQUEST_REFRESH_MS,
     );
-    for (const session of due)
-      pullRequestCheckedAtRef.current[session.id] = now;
-    for (const session of due) {
-      void context.sessions
-        .pullRequest(session.id)
-        .then((pullRequest) => {
+    queue?.replace(
+      due.map((session) => ({
+        key: session.id,
+        run: async () => {
+          pullRequestCheckedAtRef.current[session.id] = Date.now();
+          const pullRequest = await context.sessions.pullRequest(session.id);
           if (!aliveRef.current) return;
           setPullRequests((current) =>
             current[session.id] === pullRequest
               ? current
               : { ...current, [session.id]: pullRequest },
           );
-        })
-        .catch(() => undefined);
-    }
-  }, [context, sessions]);
+        },
+      })),
+    );
+    return () => queue?.clear();
+  }, [context, visibleSessions]);
 
   // Cards follow the active canvas; drags update the node state directly and
   // land in positionsRef on drop, so rebuilding here never loses a move.
@@ -275,11 +333,12 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
               writePositionBucket(context.storage.user, persisted, bucket),
             ),
           );
+          if (aliveRef.current && dirtyBuckets.size > 0) {
+            setStorageWarning(null);
+          }
         } catch {
           if (aliveRef.current) {
-            setStorageWarning(
-              "Canvas layout could not be saved in this browser.",
-            );
+            setStorageWarning("Canvas layout could not be saved.");
           }
         }
       }
@@ -293,30 +352,43 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
   );
 
   const refresh = useCallback(
-    async (initial = false) => {
+    (initial = false): Promise<void> => {
+      if (refreshInFlightRef.current) return refreshInFlightRef.current;
       if (initial) setLoading(true);
-      try {
-        const [items, projectList] = await loadData();
-        if (!aliveRef.current) return;
-        await applyData(items, projectList, !initial);
-        if (!aliveRef.current) return;
-        setError(null);
-        if (initial) fitToView();
-      } catch (reason) {
-        if (aliveRef.current) {
-          setError(
-            reason instanceof Error
-              ? reason.message
-              : "Could not load sessions",
-          );
+      const request = (async () => {
+        try {
+          const [items, projectList] = await loadData();
+          if (!aliveRef.current) return;
+          await applyData(items, projectList, !initial);
+          if (!aliveRef.current) return;
+          setError(null);
+          if (initial) {
+            const ids = new Set(projectList.map((project) => project.id));
+            applyDefaultViewport(
+              sessionsOnCanvas(items, activeCanvasRef.current, ids).length,
+            );
+          }
+        } catch (reason) {
+          if (aliveRef.current) {
+            setError(
+              reason instanceof Error
+                ? reason.message
+                : "Could not load sessions",
+            );
+          }
+        } finally {
+          if (aliveRef.current) setLoading(false);
         }
-      } finally {
-        if (aliveRef.current) {
-          setLoading(false);
+      })();
+      refreshInFlightRef.current = request;
+      void request.finally(() => {
+        if (refreshInFlightRef.current === request) {
+          refreshInFlightRef.current = null;
         }
-      }
+      });
+      return request;
     },
-    [applyData, fitToView, loadData],
+    [applyData, applyDefaultViewport, loadData],
   );
 
   useEffect(() => {
@@ -337,7 +409,11 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
         if (cancelled || !aliveRef.current) return;
         initializedRef.current = true;
         setLoading(false);
-        applyViewport(layout.viewport);
+        const ids = new Set(projectList.map((project) => project.id));
+        applyViewport(
+          layout.viewport,
+          sessionsOnCanvas(items, MAIN_CANVAS_ID, ids).length,
+        );
       },
       (reason: unknown) => {
         if (cancelled) return;
@@ -363,9 +439,12 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
         canvasId,
       ).catch(() => null);
       if (!aliveRef.current || activeCanvasRef.current !== canvasId) return;
-      applyViewport(viewport);
+      applyViewport(
+        viewport,
+        sessionsOnCanvas(sessions, canvasId, projectIds).length,
+      );
     },
-    [applyViewport, context.storage.user],
+    [applyViewport, context.storage.user, projectIds, sessions],
   );
 
   // Follow the window: while the view is an auto-fit, keep it fitted as the
@@ -382,7 +461,9 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
       }
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
-        if (initializedRef.current && !viewportDirtyRef.current) fitToView();
+        if (initializedRef.current && !viewportDirtyRef.current) {
+          applyDefaultViewport(visibleSessions.length);
+        }
       }, RESIZE_REFIT_DELAY_MS);
     });
     observer.observe(container);
@@ -390,7 +471,7 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
       if (timer) clearTimeout(timer);
       observer.disconnect();
     };
-  }, [fitToView, loading]);
+  }, [applyDefaultViewport, loading, visibleSessions.length]);
 
   // The tab strip only advertises a scrollbar when it actually overflows.
   useEffect(() => {
@@ -408,13 +489,22 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
   // No live feed yet: poll like the sidebar does so status, titles, and new
   // sessions keep up while the canvas is open, and catch up on window focus.
   useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const refreshIfReady = () => {
       if (initializedRef.current && !document.hidden) void refresh();
     };
-    const timer = setInterval(refreshIfReady, SESSION_POLL_INTERVAL_MS);
+    const schedule = () => {
+      timer = setTimeout(async () => {
+        if (initializedRef.current && !document.hidden) await refresh();
+        if (!cancelled) schedule();
+      }, SESSION_POLL_INTERVAL_MS);
+    };
+    schedule();
     window.addEventListener("focus", refreshIfReady);
     return () => {
-      clearInterval(timer);
+      cancelled = true;
+      if (timer) clearTimeout(timer);
       window.removeEventListener("focus", refreshIfReady);
     };
   }, [refresh]);
@@ -449,21 +539,23 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
           { ...flow.getViewport(), ...containerSize() },
           activeCanvasRef.current,
         ),
-      ]).catch(() => {
-        if (aliveRef.current) {
-          setStorageWarning(
-            "Canvas layout could not be saved in this browser.",
-          );
-        }
-      });
+      ])
+        .then(() => {
+          if (aliveRef.current) setStorageWarning(null);
+        })
+        .catch(() => {
+          if (aliveRef.current) {
+            setStorageWarning("Canvas layout could not be saved.");
+          }
+        });
     },
     [containerSize, context.storage.user, flow],
   );
 
   const onMoveEnd = useCallback(
     (event: MouseEvent | TouchEvent | null, viewport: CanvasViewport) => {
-      if (!initializedRef.current) return;
-      if (event !== null) viewportDirtyRef.current = true;
+      if (!initializedRef.current || event === null) return;
+      viewportDirtyRef.current = true;
       if (viewportTimerRef.current) clearTimeout(viewportTimerRef.current);
       const canvasId = activeCanvasRef.current;
       viewportTimerRef.current = setTimeout(() => {
@@ -471,13 +563,15 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
           context.storage.user,
           { ...viewport, ...containerSize() },
           canvasId,
-        ).catch(() => {
-          if (aliveRef.current) {
-            setStorageWarning(
-              "Canvas viewport could not be saved in this browser.",
-            );
-          }
-        });
+        )
+          .then(() => {
+            if (aliveRef.current) setStorageWarning(null);
+          })
+          .catch(() => {
+            if (aliveRef.current) {
+              setStorageWarning("Canvas viewport could not be saved.");
+            }
+          });
       }, 250);
     },
     [containerSize, context.storage.user],
@@ -501,16 +595,19 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
         persistedPositionsRef.current,
         ids,
       );
+      if (aliveRef.current) setStorageWarning(null);
     } catch {
       if (aliveRef.current) {
         setStorageWarning("Stored canvas layout could not be reset.");
       }
     }
-    if (aliveRef.current) requestAnimationFrame(() => fitToView());
+    if (aliveRef.current) {
+      requestAnimationFrame(() => applyDefaultViewport(visibleSessions.length));
+    }
   }, [
     activeCanvas,
     context.storage.user,
-    fitToView,
+    applyDefaultViewport,
     nodesFor,
     visibleSessions,
   ]);
@@ -711,8 +808,8 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
           panOnScroll
           nodeDragThreshold={3}
           onlyRenderVisibleElements
-          minZoom={0.2}
-          maxZoom={2.5}
+          minZoom={MIN_ZOOM}
+          maxZoom={MAX_ZOOM}
           proOptions={proOptions}
         >
           {visibleSessions.length > 0 && <Background />}

@@ -1,6 +1,6 @@
 import "fake-indexeddb/auto";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionCatalogItem } from "../types";
@@ -216,6 +216,48 @@ describe("useExtensionHostServices", () => {
       "noopener,noreferrer",
     );
     open.mockRestore();
+  });
+
+  it("does not make session pages wait behind pull-request enrichment", async () => {
+    let resolvePullRequest!: (response: Response) => void;
+    const pullRequestResponse = new Promise<Response>((resolve) => {
+      resolvePullRequest = resolve;
+    });
+    authenticatedFetchMock.mockImplementation((url: string) => {
+      if (url.includes("/resources/github")) return pullRequestResponse;
+      return Promise.resolve(
+        new Response(JSON.stringify({ data: [], has_more: false, last_id: null }), { status: 200 }),
+      );
+    });
+    const { result } = renderHook(() => useExtensionHostServices(extension), {
+      wrapper,
+    });
+
+    const pullRequest = result.current.methods["sessions.pullRequest"]?.(
+      { sessionId: "conv_slow" },
+      signal(),
+    );
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledOnce());
+    const page = result.current.methods["sessions.listPage"]?.({}, signal());
+    await waitFor(() =>
+      expect(authenticatedFetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/^\/v1\/sessions\?/),
+        expect.anything(),
+      ),
+    );
+
+    resolvePullRequest(
+      new Response(
+        JSON.stringify({
+          object: "session.github.info",
+          available: false,
+          pr: null,
+        }),
+        { status: 200 },
+      ),
+    );
+    await expect(page).resolves.toMatchObject({ sessions: [] });
+    await expect(pullRequest).resolves.toBeNull();
   });
 
   it("lists projects and creates one while refreshing the sidebar's project list", async () => {

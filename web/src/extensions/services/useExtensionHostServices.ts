@@ -73,7 +73,8 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
   const queryClient = useQueryClient();
   const theme = resolvedTheme === "dark" ? "dark" : "light";
   const writeLimiter = useMemo(() => new ExtensionStorageWriteLimiter(), []);
-  const sessionReadLimiter = useMemo(() => new SessionReadLimiter(), []);
+  const sessionListLimiter = useMemo(() => new SessionReadLimiter(), []);
+  const pullRequestLimiter = useMemo(() => new SessionReadLimiter(), []);
   // External URLs the host has handed to this extension; the only ones it may open.
   const externalUrlsRef = useRef(new Set<string>());
 
@@ -161,9 +162,9 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
           return null;
         }),
       "sessions.listPage": (params: unknown, signal: AbortSignal) =>
-        sessionReadLimiter.run(signal, () => listSessionPage(params, signal)),
+        sessionListLimiter.run(signal, () => listSessionPage(params, signal)),
       "sessions.pullRequest": (params: unknown, signal: AbortSignal) =>
-        sessionReadLimiter.run(signal, async (): Promise<ExtensionPullRequest | null> => {
+        pullRequestLimiter.run(signal, async (): Promise<ExtensionPullRequest | null> => {
           const sessionId = objectParams(params).sessionId;
           if (typeof sessionId !== "string" || !sessionId || sessionId.length > 256) {
             throw new ExtensionHostServiceError("InvalidParams", "sessionId is invalid");
@@ -193,7 +194,15 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
       },
     };
     return grantedHostMethods(extension, implementations);
-  }, [extension, navigate, queryClient, sessionReadLimiter, theme, writeLimiter]);
+  }, [
+    extension,
+    navigate,
+    pullRequestLimiter,
+    queryClient,
+    sessionListLimiter,
+    theme,
+    writeLimiter,
+  ]);
   const events = useMemo(() => ({ "theme.changed": { theme } }), [theme]);
   return { methods, events };
 }

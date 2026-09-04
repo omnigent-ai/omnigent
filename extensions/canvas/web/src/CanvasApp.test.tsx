@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -64,7 +70,11 @@ vi.mock("@xyflow/react", () => ({
   applyNodeChanges: (_changes: unknown, nodes: unknown) => nodes,
 }));
 
-import { CanvasApp, SESSION_POLL_INTERVAL_MS } from "./CanvasApp";
+import {
+  CanvasApp,
+  PULL_REQUEST_CONCURRENCY,
+  SESSION_POLL_INTERVAL_MS,
+} from "./CanvasApp";
 import {
   LAYOUT_META_KEY,
   positionBucket,
@@ -98,6 +108,14 @@ const sessions: ExtensionSessionSummary[] = [
     updatedAt: 1,
   },
 ];
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 function contextWith(
   items: ExtensionSessionSummary[] = sessions,
@@ -309,12 +327,13 @@ describe("CanvasApp", () => {
     expect(screen.queryByTestId("flow-node-conv_1")).not.toBeInTheDocument();
     await waitFor(() => expect(fitView).toHaveBeenCalled());
 
-    (
-      flowProps.current?.onMoveEnd as (
-        event: null,
-        viewport: { x: number; y: number; zoom: number },
-      ) => void
-    )(null, { x: 5, y: 6, zoom: 1.5 });
+    const moveEnd = flowProps.current?.onMoveEnd as (
+      event: MouseEvent | null,
+      viewport: { x: number; y: number; zoom: number },
+    ) => void;
+    moveEnd(null, { x: 1, y: 2, zoom: 0.5 });
+    expect(values.has(viewportKey("proj_a"))).toBe(false);
+    moveEnd(new MouseEvent("mouseup"), { x: 5, y: 6, zoom: 1.5 });
     await waitFor(() =>
       expect(values.get(viewportKey("proj_a"))).toEqual({
         x: 5,
@@ -368,38 +387,21 @@ describe("CanvasApp", () => {
     expect(context.projects.list).not.toHaveBeenCalled();
   });
 
-  it("restores a saved viewport only when it was made for this container size", async () => {
-    const stale = contextWith();
-    stale.values.set(LAYOUT_META_KEY, { version: 1 });
-    stale.values.set(viewportKey("main"), {
+  it("restores a saved viewport across container sizes and the full zoom range", async () => {
+    const saved = contextWith();
+    saved.values.set(LAYOUT_META_KEY, { version: 1 });
+    saved.values.set(viewportKey("main"), {
       x: 5,
       y: 6,
-      zoom: 0.8,
+      zoom: 2.5,
       width: 1400,
       height: 800,
     });
-    const rendered = render(<CanvasApp context={stale.context} />);
-    await screen.findByText("2 sessions");
-    await waitFor(() => expect(fitView).toHaveBeenCalled());
-    expect(setViewport).not.toHaveBeenCalled();
-    rendered.unmount();
-    fitView.mockClear();
-
-    // jsdom containers measure 0x0, so a viewport saved for 0x0 matches.
-    const matching = contextWith();
-    matching.values.set(LAYOUT_META_KEY, { version: 1 });
-    matching.values.set(viewportKey("main"), {
-      x: 5,
-      y: 6,
-      zoom: 0.8,
-      width: 0,
-      height: 0,
-    });
-    render(<CanvasApp context={matching.context} />);
+    render(<CanvasApp context={saved.context} />);
     await screen.findByText("2 sessions");
     await waitFor(() =>
       expect(setViewport).toHaveBeenCalledWith(
-        { x: 5, y: 6, zoom: 0.8 },
+        { x: 5, y: 6, zoom: 2.5 },
         { duration: 0 },
       ),
     );
@@ -473,6 +475,113 @@ describe("CanvasApp", () => {
     }
   });
 
+  it("waits for a slow refresh before scheduling or accepting another", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const slowRefresh = deferred<ExtensionSessionSummary[]>();
+      const { context } = contextWith();
+      vi.mocked(context.sessions.listAll)
+        .mockResolvedValueOnce(sessions)
+        .mockImplementationOnce(() => slowRefresh.promise)
+        .mockResolvedValue(sessions);
+      render(<CanvasApp context={context} />);
+      await screen.findByText("2 sessions");
+
+      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
+      expect(context.sessions.listAll).toHaveBeenCalledTimes(2);
+
+      fireEvent(window, new Event("focus"));
+      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS * 2);
+      expect(context.sessions.listAll).toHaveBeenCalledTimes(2);
+
+      await act(async () => slowRefresh.resolve(sessions));
+      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
+      expect(context.sessions.listAll).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("opens a large canvas at a readable viewport instead of fitting every card", async () => {
+    const manySessions = Array.from({ length: 529 }, (_, index) => ({
+      ...sessions[1],
+      id: `conv_${index}`,
+      title: `Session ${index}`,
+      updatedAt: 529 - index,
+    }));
+    const { context } = contextWith(manySessions);
+    render(<CanvasApp context={context} />);
+
+    expect(await screen.findByText("529 sessions")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(setViewport).toHaveBeenCalledWith(
+        { x: 24, y: 24, zoom: 0.9 },
+        { duration: 0 },
+      ),
+    );
+    expect(fitView).not.toHaveBeenCalled();
+  });
+
+  it("bounds pull-request lookups to branch cards on the active canvas", async () => {
+    const branchSessions = Array.from({ length: 9 }, (_, index) => ({
+      ...sessions[1],
+      id: `branch_${index}`,
+      title: `Branch ${index}`,
+      gitBranch: `feat/${index}`,
+      updatedAt: 20 - index,
+    }));
+    const projectBranch = {
+      ...branchSessions[0],
+      id: "project_branch",
+      projectId: "proj_a",
+    };
+    const { context } = contextWith(
+      [...sessions, ...branchSessions, projectBranch],
+      [{ id: "proj_a", name: "Alpha", icon: null }],
+    );
+    let active = 0;
+    let maximumActive = 0;
+    let pending: Array<(value: null) => void> = [];
+    vi.mocked(context.sessions.pullRequest).mockImplementation(() => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      return new Promise<null>((resolve) => pending.push(resolve)).finally(
+        () => {
+          active -= 1;
+        },
+      );
+    });
+    render(<CanvasApp context={context} />);
+    await screen.findByText("11 sessions");
+
+    await waitFor(() =>
+      expect(context.sessions.pullRequest).toHaveBeenCalledTimes(
+        PULL_REQUEST_CONCURRENCY,
+      ),
+    );
+    expect(maximumActive).toBe(PULL_REQUEST_CONCURRENCY);
+    expect(context.sessions.pullRequest).not.toHaveBeenCalledWith("conv_1");
+    expect(context.sessions.pullRequest).not.toHaveBeenCalledWith(
+      "project_branch",
+    );
+
+    while (vi.mocked(context.sessions.pullRequest).mock.calls.length < 9) {
+      const batch = pending;
+      pending = [];
+      await act(async () => batch.forEach((resolve) => resolve(null)));
+      await waitFor(() => expect(pending.length).toBeGreaterThan(0));
+    }
+    await act(async () => pending.forEach((resolve) => resolve(null)));
+    expect(maximumActive).toBe(PULL_REQUEST_CONCURRENCY);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+    await waitFor(() =>
+      expect(context.sessions.pullRequest).toHaveBeenCalledWith(
+        "project_branch",
+      ),
+    );
+  });
+
   it("looks up each session's pull request once and hands it to the card", async () => {
     const { context } = contextWith([
       ...sessions,
@@ -489,7 +598,7 @@ describe("CanvasApp", () => {
     await waitFor(() =>
       expect(context.sessions.pullRequest).toHaveBeenCalledWith("conv_branch"),
     );
-    expect(context.sessions.pullRequest).toHaveBeenCalledTimes(3);
+    expect(context.sessions.pullRequest).toHaveBeenCalledTimes(1);
     await waitFor(() => {
       const nodes = flowProps.current?.nodes as Array<{
         id: string;
