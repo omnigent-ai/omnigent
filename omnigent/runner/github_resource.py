@@ -458,13 +458,19 @@ def github_file_diff(root: str, base: str, path: str) -> dict[str, Any]:
 def github_pr_diff(root: str) -> dict[str, Any]:
     """Return the whole PR as one unified diff patch, straight from GitHub.
 
-    ``gh pr diff`` yields the PR's "Files changed" patch (server-computed against
-    the base's merge-base), which the web view parses client-side into per-file
-    diffs. Empty when the branch has no PR.
+    ``gh pr diff <number>`` yields the PR's "Files changed" patch (server-computed
+    against the base's merge-base), which the web view parses client-side into
+    per-file diffs. The PR is resolved by number first (via :func:`_pr_number`,
+    which handles fork / triangular heads a bare ``gh pr diff`` can't); empty when
+    the branch has no PR.
 
     :param root: Absolute workspace path.
     :returns: A ``session.github.pr_diff`` object with the ``patch`` text
         (empty when there's no PR / no changes).
     """
-    rc, out, _ = _gh(["pr", "diff"], cwd=root)
+    empty: dict[str, Any] = {"object": "session.github.pr_diff", "patch": ""}
+    number = _pr_number(root)
+    if number is None:
+        return empty
+    rc, out, _ = _gh(["pr", "diff", str(number)], cwd=root)
     return {"object": "session.github.pr_diff", "patch": out if rc == 0 else ""}

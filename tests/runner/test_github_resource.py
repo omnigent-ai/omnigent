@@ -290,16 +290,49 @@ def test_github_changed_files_no_pr(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_github_pr_diff_returns_gh_patch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The whole-PR patch is ``gh pr diff`` verbatim (GitHub-computed)."""
+    """The whole-PR patch is ``gh pr diff <number>`` verbatim (GitHub-computed)."""
     patch = "diff --git a/fileA.py b/fileA.py\n@@ -1 +1 @@\n-A base\n+A changed\n"
-    _stub_gh(monkeypatch, {("pr", "diff"): (0, patch, "")})
+    _stub_gh(
+        monkeypatch,
+        {
+            ("pr", "view"): (0, json.dumps({"number": 7}), ""),
+            ("pr", "diff"): (0, patch, ""),
+        },
+    )
     assert github_pr_diff("/root") == {"object": "session.github.pr_diff", "patch": patch}
 
 
 def test_github_pr_diff_no_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     """With no PR for the branch, the patch is empty rather than an error."""
-    _stub_gh(monkeypatch, {("pr", "diff"): (1, "", "no pull requests found")})
+    _stub_gh(monkeypatch, {("pr", "view"): (1, "", "no pull requests found")})
     assert github_pr_diff("/root") == {"object": "session.github.pr_diff", "patch": ""}
+
+
+def test_github_pr_diff_via_pr_list_head(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole-PR diff resolves the PR number via ``gh pr list --head``, then diffs it.
+
+    Mirrors the fork / triangular case: a bare ``gh pr diff`` can't resolve the
+    head, so the number is resolved by the pushed ref (``branch.<n>.merge``) and
+    passed to ``gh pr diff <number>``.
+    """
+    _set_pushed_ref(repo, "alice/feature")
+    patch = "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(argv: Sequence[str], *, cwd: str) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        head = tuple(argv[:2])
+        if head == ("pr", "list"):
+            return (0, json.dumps([{"number": 9}]), "")
+        if head == ("pr", "diff"):
+            return (0, patch, "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    result = github_pr_diff(str(repo))
+    assert result == {"object": "session.github.pr_diff", "patch": patch}
+    # The diff was fetched by the resolved number, never a bare 'gh pr diff'.
+    assert [c for c in calls if c[:2] == ("pr", "diff")] == [("pr", "diff", "9")]
 
 
 def test_summarize_checks_mixed() -> None:
