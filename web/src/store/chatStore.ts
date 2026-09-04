@@ -5632,6 +5632,33 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // runner moved to the new one — so its optimistic bubble would otherwise
       // spin forever. Drop it; resuming starts a fresh turn.
       applyToNamedConversation(event.conversationId, { pendingUserMessages: [] });
+      // The same rotation orphans the app-global composer carry-over that still
+      // holds attachment `File` handles bound to the superseded conversation: a
+      // retained failed-send draft and any queued (not-yet-POSTed) messages.
+      // Left in place, those files ride into the fresh conversation's first turn
+      // — a stale image/screenshot re-attached after `/clear` (the model then
+      // "sees" an attachment the user never sent this turn). Flush them here,
+      // mirroring the REPL's `_pending_bang_blocks.clear()` on `/clear`/`/new`
+      // and the `pendingUserMessages` drop just above.
+      useChatStore.setState((s) => {
+        const next: Partial<ChatState> = {};
+        if (s.failedSendDraft?.conversationId === event.conversationId) {
+          next.failedSendDraft = null;
+        }
+        const keptQueued = s.queuedMessages.filter(
+          (m) => m.conversationId !== event.conversationId,
+        );
+        if (keptQueued.length !== s.queuedMessages.length) {
+          next.queuedMessages = keptQueued;
+        }
+        // Composer @-mention chips are staged for the on-screen composer, which
+        // is being redirected to the new conversation — drop any staged for the
+        // superseded one so they can't leak into the fresh turn.
+        if (s.pendingComposerAttachments.length > 0) {
+          next.pendingComposerAttachments = [];
+        }
+        return next;
+      });
       return;
     case "session_resource_created":
       if (event.resource.type === "terminal") {

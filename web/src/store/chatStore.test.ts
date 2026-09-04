@@ -3646,6 +3646,36 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(state.pendingUserMessages).toEqual([]);
     });
 
+    it("flushes stale attachment carry-over so it can't ride into the fresh conversation", () => {
+      const staleFile = new File(["x"], "screenshot.png", { type: "image/png" });
+      useChatStore.setState({
+        conversationId: "conv_old",
+        redirectToConversationId: null,
+        failedSendDraft: { conversationId: "conv_old", text: "look at this", files: [staleFile] },
+        queuedMessages: [
+          { queueId: "q_1", text: "queued", conversationId: "conv_old", files: [staleFile] },
+          { queueId: "q_2", text: "other", conversationId: "conv_keep", files: [] },
+        ],
+        pendingComposerAttachments: [{ path: "src/a.ts", isDir: false }],
+      });
+      handleSessionEvent({
+        type: "session_superseded",
+        conversationId: "conv_old",
+        targetConversationId: "conv_new",
+        reason: "clear",
+      });
+      const state = useChatStore.getState();
+      // Both the failed-send draft and the queued message for the superseded
+      // conversation held a File handle; leaving them would re-attach the image
+      // to the new conversation's first turn. They must be dropped here, while
+      // carry-over bound to OTHER conversations survives untouched.
+      expect(state.failedSendDraft).toBeNull();
+      expect(state.queuedMessages).toEqual([
+        { queueId: "q_2", text: "other", conversationId: "conv_keep", files: [] },
+      ]);
+      expect(state.pendingComposerAttachments).toEqual([]);
+    });
+
     it("ignores a superseded frame from a switched-away conversation", () => {
       useChatStore.setState({ conversationId: "conv_current", redirectToConversationId: null });
       handleSessionEvent({
