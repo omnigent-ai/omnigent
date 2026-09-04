@@ -10004,16 +10004,18 @@ def host_reset_id(yes: bool) -> None:
         reset_host_id,
     )
 
-    # An OMNIGENT_HOST_ID / OMNIGENT_HOST_NAME override makes the host read its
-    # identity from the env, ignoring config.yaml — so writing a fresh id to
-    # the file would be a silent no-op. Refuse rather than report false success.
+    # With OMNIGENT_HOST_ID / OMNIGENT_HOST_NAME set, the host takes its
+    # identity from the environment, not config.yaml (both set → env identity
+    # used; only one set → startup errors). Either way resetting the id in the
+    # file will not change the machine's identity, so refuse and point at the
+    # env vars rather than let a config write mislead the user.
     if host_identity_env_override_active():
         raise click.ClickException(
-            f"This machine's host identity is pinned by the {HOST_ID_ENV_VAR} / "
-            f"{HOST_NAME_ENV_VAR} environment variable(s), so resetting the id in "
-            "the config file would have no effect. This is normally a "
-            "server-managed sandbox host, whose identity the server owns. Unset "
-            f"{HOST_ID_ENV_VAR} and {HOST_NAME_ENV_VAR} to reset the persisted id."
+            f"This machine's host identity is controlled by the {HOST_ID_ENV_VAR} / "
+            f"{HOST_NAME_ENV_VAR} environment variable(s), so resetting the id in the "
+            "config file will not change it. This is normally a server-managed "
+            f"sandbox host, whose identity the server owns. Unset {HOST_ID_ENV_VAR} "
+            f"and {HOST_NAME_ENV_VAR} first if you need to reset the persisted id."
         )
 
     running = [record for record in _list_daemon_records() if _pid_alive(record.pid)]

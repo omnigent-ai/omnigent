@@ -237,17 +237,24 @@ def reset_host_id(path: Path = CONFIG_PATH) -> tuple[str | None, str]:
 
 
 def host_identity_env_override_active() -> bool:
-    """Whether an ``OMNIGENT_HOST_ID`` / ``OMNIGENT_HOST_NAME`` override is set.
+    """Whether either identity env var (``OMNIGENT_HOST_ID`` / ``_NAME``) is set.
 
-    When either is set, :func:`load_or_create_host_identity` returns the
-    env-supplied identity *without reading config.yaml*, so a
-    :func:`reset_host_id` write to the file would be ignored by the next
-    ``omnigent host`` — a silent no-op. Callers use this to refuse the reset
-    with a clear message instead of reporting false success.
+    These pin the host identity from the environment:
+    :func:`load_or_create_host_identity` returns the env identity *without
+    reading config.yaml* when both are set, and raises when exactly one is
+    set (they must be set together). Either way a :func:`reset_host_id`
+    write to the file does not fix the machine's identity, so callers refuse
+    the reset and tell the user to unset the env vars.
+
+    Uses ``is not None`` (not truthiness) to match the loader, which treats a
+    present-but-empty var as set.
 
     :returns: ``True`` when at least one of the identity env vars is set.
     """
-    return bool(os.environ.get(HOST_ID_ENV_VAR) or os.environ.get(HOST_NAME_ENV_VAR))
+    return (
+        os.environ.get(HOST_ID_ENV_VAR) is not None
+        or os.environ.get(HOST_NAME_ENV_VAR) is not None
+    )
 
 
 def load_host_identity_if_present(
