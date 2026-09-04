@@ -2291,12 +2291,20 @@ export function NewChatLandingScreen() {
   // user-registered agents). Harness-backed vs composed, NOT the builtins/customs
   // split: Polly & Debby are built-ins but are composed agents, so they stay
   // under "Agents". ACP agents aren't native, so they fold into "More".
+  const isIdentityNativeAgent = (agent: AvailableAgent) =>
+    agent.builtin === false && isNativeCodingAgent(agent);
   const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a) || isAcpHarnessAgent(a)),
+    () =>
+      agentList.filter(
+        (a) => (isNativeCodingAgent(a) && !isIdentityNativeAgent(a)) || isAcpHarnessAgent(a),
+      ),
     [agentList],
   );
   const agentEntries = useMemo(
-    () => agentList.filter((a) => !isNativeCodingAgent(a) && !isAcpHarnessAgent(a)),
+    () =>
+      agentList.filter(
+        (a) => (!isNativeCodingAgent(a) || isIdentityNativeAgent(a)) && !isAcpHarnessAgent(a),
+      ),
     [agentList],
   );
 
@@ -4081,6 +4089,11 @@ export function NewChatLandingScreen() {
     // An explicit pick — even of the value the config seeded — is the user's
     // own choice: send it with the create rather than default-filling.
     agentFromConfigRef.current = false;
+    if (agent.workspace_hint) {
+      workspaceFromConfigRef.current = false;
+      setWorkspace(agent.workspace_hint);
+      setBranchName("");
+    }
     setPickedAgentId(agent.id);
     writeLastAgentId(agent.id);
   };

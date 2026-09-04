@@ -182,6 +182,32 @@ async def test_list_builtin_agents_exposes_harness_from_spec(
     assert entry["harness"] == harness
 
 
+async def test_list_builtin_agents_exposes_absolute_workspace_hint(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agents_client: httpx.AsyncClient,
+) -> None:
+    """A durable native template can seed its constrained host workspace."""
+    bundle = build_agent_bundle(
+        name="Chief of Staff",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+        os_env={"type": "caller_process", "cwd": "/srv/lunaos/state/agents/cos"},
+    )
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="57914bd6ac8bd25239a14ef060e99e70",
+        name="Chief of Staff",
+        bundle=bundle,
+    )
+
+    resp = await agents_client.get("/v1/agents")
+
+    assert resp.status_code == 200, resp.text
+    entry = next(a for a in resp.json()["data"] if a["name"] == "Chief of Staff")
+    assert entry["workspace_hint"] == "/srv/lunaos/state/agents/cos"
+
+
 async def test_list_builtin_agents_exposes_declared_terminals_from_spec(
     agent_store: SqlAlchemyAgentStore,
     artifact_store: LocalArtifactStore,
