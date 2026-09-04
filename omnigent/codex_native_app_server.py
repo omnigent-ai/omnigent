@@ -44,6 +44,8 @@ from omnigent.codex_native_process_registry import (
 )
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
+    _CODEX_HOME_COPY_FILES,
+    _CODEX_HOME_SYMLINK_FILES,
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
     _codex_cli_version,
@@ -912,10 +914,14 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     key = hashlib.sha256("\n".join(config_overrides).encode("utf-8")).hexdigest()[:12]
     home = Path.home() / ".omnigent" / "cache" / "codex-model-probe" / key
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # The bridge skips files that already exist, and config.toml is copied
-    # (not symlinked), so drop the copy to re-read an edited source config.
-    with contextlib.suppress(OSError):
-        (home / "config.toml").unlink(missing_ok=True)
+    # The bridge skips entries that already exist and this home outlives one
+    # probe, so clear what it materializes. A kept config.toml copy would pin
+    # the first probe's tables; a kept credential symlink would keep naming a
+    # source home that has since moved, or dangle if it was removed (a
+    # dangling link reads as present here, so it never self-heals).
+    for name in (*_CODEX_HOME_SYMLINK_FILES, *_CODEX_HOME_COPY_FILES):
+        with contextlib.suppress(OSError):
+            (home / name).unlink(missing_ok=True)
     _populate_codex_home_config(home, _codex_home_config_source_from_env(), minimal_config=True)
     return home
 
