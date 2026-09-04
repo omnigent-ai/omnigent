@@ -864,18 +864,79 @@ def test_kimi_readiness_keys_off_binary_and_credential(
     assert harness_is_configured("kimi-code") is True
 
 
-def test_kimi_native_outdated_diagnosis_preserves_headless_support(
+def test_kimi_native_custom_supported_binary_ignores_older_path_binary(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    """Kimi 0.40.9 remains headless-ready but native reports an actionable upgrade."""
+    """Native readiness checks the configured executable rather than PATH Kimi."""
     import omnigent.onboarding.kimi_auth as _ka
 
-    version = "0.40.9"
-    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+    path_kimi = tmp_path / "path-kimi"
+    custom_kimi = tmp_path / "custom-kimi"
+    for binary in (path_kimi, custom_kimi):
+        binary.write_text("#!/bin/sh\n", encoding="utf-8")
+        binary.chmod(0o755)
+    monkeypatch.setenv("OMNIGENT_KIMI_PATH", str(custom_kimi))
+    monkeypatch.setattr(
+        hi.shutil,
+        "which",
+        lambda name: (
+            str(path_kimi)
+            if name == "kimi"
+            else str(custom_kimi)
+            if name == str(custom_kimi)
+            else None
+        ),
+    )
     monkeypatch.setattr(_ka, "kimi_auth_configured", lambda: True)
+    probes: list[str] = []
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
+            probes.append(argv[0])
+            version = "0.41.0" if argv[0] == str(custom_kimi) else "0.40.9"
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{version}\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+
+    assert harness_is_configured("kimi-native") is True
+    assert probes == [str(custom_kimi)]
+
+
+def test_kimi_native_custom_outdated_binary_drives_diagnosis_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The configured native binary drives readiness and its launch-failure hint."""
+    import omnigent.onboarding.kimi_auth as _ka
+
+    path_kimi = tmp_path / "path-kimi"
+    custom_kimi = tmp_path / "custom-kimi"
+    for binary in (path_kimi, custom_kimi):
+        binary.write_text("#!/bin/sh\n", encoding="utf-8")
+        binary.chmod(0o755)
+    monkeypatch.setenv("OMNIGENT_KIMI_PATH", str(custom_kimi))
+    monkeypatch.setattr(
+        hi.shutil,
+        "which",
+        lambda name: (
+            str(path_kimi)
+            if name == "kimi"
+            else str(custom_kimi)
+            if name == str(custom_kimi)
+            else None
+        ),
+    )
+    monkeypatch.setattr(_ka, "kimi_auth_configured", lambda: True)
+    probes: list[str] = []
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            probes.append(argv[0])
+            version = "0.40.9" if argv[0] == str(custom_kimi) else "0.41.0"
             return subprocess.CompletedProcess(
                 args=argv, returncode=0, stdout=f"{version}\n", stderr=""
             )
@@ -886,13 +947,15 @@ def test_kimi_native_outdated_diagnosis_preserves_headless_support(
     assert harness_is_configured("kimi") is True
     result = configured_harness_map()
     assert result["kimi-native"] == HARNESS_VERSION_TOO_LOW
+
+    probes.clear()
+    hi._VERSION_PROBE_CACHE.clear()
+    monkeypatch.setattr(hi, "_binary_signature", lambda binary: None)
     hint = hi.harness_setup_hint("kimi-native")
     assert "installed 0.40.9" in hint
     assert "required >=0.41.0" in hint
     assert "code.kimi.com/kimi-code/install.sh" in hint
-
-    version = "0.41.0"
-    assert harness_is_configured("kimi-native") is True
+    assert probes.count(str(custom_kimi)) == 1
 
 
 def test_cursor_readiness_keys_off_api_key(
