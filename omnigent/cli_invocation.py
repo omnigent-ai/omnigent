@@ -17,6 +17,15 @@ from collections.abc import Mapping
 
 DEFAULT_CLI_NAME = "omnigent"
 WRAPPER_COMMAND_ENV = "OMNIGENT_WRAPPER_COMMAND"
+REQUIRE_WRAPPER_ENV = "OMNIGENT_REQUIRE_WRAPPER"
+WRAPPER_BYPASS_ENV = "OMNIGENT_WRAPPER_BYPASS"
+
+
+def wrapper_required(env: Mapping[str, str]) -> bool:
+    """Whether the operator's wrapper gate currently refuses a naked invocation."""
+    from omnigent.process_logging import env_truthy
+
+    return env_truthy(env.get(REQUIRE_WRAPPER_ENV)) and not env_truthy(env.get(WRAPPER_BYPASS_ENV))
 
 
 def cli_invocation(*, name: str = DEFAULT_CLI_NAME, env: Mapping[str, str] | None = None) -> str:

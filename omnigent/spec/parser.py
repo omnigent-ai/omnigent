@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
@@ -185,6 +185,31 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         raise FileNotFoundError(f"config.yaml not found in {root}")
 
     raw = yaml.load(config_path.read_text(), Loader=_ConfigYamlLoader)
+    spec = parse_config(raw, expand_env=expand_env)
+    raw_instructions = raw.get("instructions")
+    if raw_instructions is None:
+        raw_instructions = raw.get("prompt")
+    spec.instructions = _resolve_instructions(root, raw_instructions)
+    spec.skills = _discover_skills(root / "skills")
+    spec.mcp_servers = (
+        _discover_mcp_servers(root / "tools" / "mcp", expand_env=expand_env) + spec.mcp_servers
+    )
+    spec.local_tools = _discover_local_tools(root / "tools")
+    spec.sub_agents = _discover_sub_agents(root / "agents", expand_env=expand_env)
+    return spec
+
+
+def parse_config(
+    raw: dict[str, Any],  # type: ignore[explicit-any]  # heterogeneous decoded YAML
+    *,
+    expand_env: bool = True,
+) -> AgentSpec:
+    """Parse config fields without discovering assets or resolving instructions.
+
+    Callers handling untrusted data must validate its shape first and disable
+    environment expansion. OS-environment configuration has separate credential
+    resolution rules; offline callers must exclude that block.
+    """
     if not isinstance(raw, dict):
         raise OmnigentError(
             f"config.yaml must be a YAML mapping, got {type(raw).__name__}",
@@ -279,18 +304,8 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # anonymous read.
     agent_session_sharing = _parse_share_policy(raw.get("agent_session_sharing"))
 
-    # Honor ``prompt:`` as the legacy alias for ``instructions:`` (per
-    # ``_OMNIGENT_SYSTEM_PROMPT_KEYS``); ``instructions:`` wins if both set.
-    raw_instructions = raw.get("instructions")
-    if raw_instructions is None:
-        raw_instructions = raw.get("prompt")
-    instructions = _resolve_instructions(root, raw_instructions)
-    skills = _discover_skills(root / "skills")
     skills_filter = _parse_skills_filter(raw.get("skills"))
-    mcp_servers = _discover_mcp_servers(root / "tools" / "mcp", expand_env=expand_env)
-    mcp_servers = mcp_servers + _parse_inline_mcp_servers(raw_tools, expand_env=expand_env)
-    local_tools = _discover_local_tools(root / "tools")
-    sub_agents = _discover_sub_agents(root / "agents", expand_env=expand_env)
+    mcp_servers = _parse_inline_mcp_servers(raw_tools, expand_env=expand_env)
 
     return AgentSpec(
         spec_version=spec_version,
@@ -303,12 +318,8 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         compaction=compaction,
         guardrails=guardrails,
         params=params,
-        instructions=instructions,
-        skills=skills,
         skills_filter=skills_filter,
         mcp_servers=mcp_servers,
-        local_tools=local_tools,
-        sub_agents=sub_agents,
         async_enabled=async_enabled,
         os_env=os_env,
         terminals=terminals,
@@ -2469,6 +2480,11 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
             f"SKILL.md could not be read: {skill_md}: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    return parse_skill_text(text, skill_md)
+
+
+def parse_skill_text(text: str, skill_md: Path) -> SkillSpec:
+    """Parse already-read skill text; the path records provenance only."""
     match = _FRONTMATTER_RE.match(text)
     if not match:
         raise OmnigentError(

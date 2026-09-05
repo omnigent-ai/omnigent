@@ -868,6 +868,11 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
 _state: HarnessPluginState | None = None
 
 
+def builtin_harness_spellings() -> frozenset[str]:
+    """Return shipped harness names and aliases without loading plugins."""
+    return _BUILTIN_CONTRIBUTION.valid_harnesses | frozenset(_BUILTIN_CONTRIBUTION.aliases)
+
+
 def _entry_points() -> tuple[importlib.metadata.EntryPoint, ...]:
     discovered = importlib.metadata.entry_points()
     if hasattr(discovered, "select"):

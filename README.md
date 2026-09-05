@@ -596,6 +596,13 @@ The same file can declare sub-agents and reviewers. For a fuller example, see
 Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/examples/polly/), and the
 [Agent YAML spec](https://github.com/omnigent-ai/omnigent/blob/main/docs/AGENT_YAML_SPEC.md) for the full schema.
 
+For **Agent Image Spec v1** bundles (`config.yaml` with `spec_version: 1`),
+`omnigent validate path/to/bundle --offline --json` checks supported static
+content without executing code or contacting services. See
+[offline validation](docs/OFFLINE_VALIDATION.md) for its supported subset,
+skipped runtime checks and exit codes. The standalone YAML format shown above
+is not yet supported by offline validation.
+
 ---
 
 ## Telemetry

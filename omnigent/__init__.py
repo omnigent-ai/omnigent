@@ -1,5 +1,9 @@
 """Omnigent: A declarative agent authoring and runtime framework."""
 
+from omnigent.entrypoint import isolate_offline_imports as _isolate_offline_imports
+
+_isolate_offline_imports(package_init=True)
+
 # Some libraries we transitively depend on call ``hashlib.md5()``
 # without ``usedforsecurity=False`` for non-security content hashes.
 # On FIPS-enabled OpenSSL builds the bare md5 constructor raises
@@ -10,7 +14,7 @@
 # the fix before any dependency import touches it. The flag is the
 # standard Python 3.9+ opt-out for non-security md5 calls and is a
 # harmless no-op on non-FIPS hosts.
-import hashlib as _fips_safe_hashlib
+import hashlib as _fips_safe_hashlib  # noqa: E402
 
 _fips_safe_orig_md5 = _fips_safe_hashlib.md5
 
