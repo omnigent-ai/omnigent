@@ -57,12 +57,14 @@ from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.routes._session_create_validation import (
+    resolve_project_session_create,
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
-from omnigent.server.schemas import SessionEventInput
+from omnigent.server.schemas import ProjectSessionCreateRequest, SessionEventInput
+from omnigent.stores.project_store import ProjectStore
 
 _logger = logging.getLogger(__name__)
 
@@ -122,6 +124,7 @@ class FireDeps:
     host_store: Any | None
     host_registry: Any | None
     policy_store: Any | None = None
+    project_store: ProjectStore | None = None
     agent_cache: Any | None = None
     runner_router: Any | None = None
     tunnel_registry: Any | None = None
@@ -394,10 +397,6 @@ async def _run_fire_for_task(
         # enforced even for a defaulted workspace, exactly as ``POST /v1/sessions``
         # does — an agent that pins an absolute cwd outside HOME records a failed
         # run instead of silently launching outside its declared boundary.
-        # Scheduled tasks have no project field, so there is nothing for the
-        # project-aware create resolver to do here. If tasks ever grow one,
-        # the create below must route through resolve_project_session_create
-        # so ownership/default-fill semantics match POST /v1/sessions.
         validate_workspace = preflight is not None and effective.workspace is not None
         validation_error = await _validate_fire_session_inputs(
             deps, effective, validate_workspace=validate_workspace
@@ -416,6 +415,7 @@ async def _run_fire_for_task(
             )
             return
 
+        effective = replace(effective, project_id=await _resolve_fire_project(deps, task))
         try:
             conv = await _create_session(deps, effective)
         except Exception:
@@ -594,6 +594,123 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
 _PERMISSION_MODE_HARNESS = "claude-native"
 
 
+async def _resolve_owned_fire_project(
+    project_store: ProjectStore,
+    task: ScheduledTask,
+) -> str | None:
+    """Resolve Projects across the two supported single-user owner forms."""
+    owners = (task.user_id,) if task.user_id is not None else (None, RESERVED_USER_LOCAL)
+    body = ProjectSessionCreateRequest(
+        agent_id=task.agent_id,
+        project_id=task.project_id,
+        host_id=task.host_id,
+        workspace=task.workspace,
+        git=None,
+    )
+    for owner in owners:
+        try:
+            resolution = await resolve_project_session_create(
+                body=body,
+                user_id=owner,
+                project_store=project_store,
+                warn_on_mismatch=False,
+            )
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.NOT_FOUND:
+                continue
+            raise
+        if resolution.project_id is not None:
+            return resolution.project_id
+    return None
+
+
+async def _resolve_fire_project(
+    deps: FireDeps,
+    task: ScheduledTask,
+) -> str | None:
+    """Resolve one fire's Project and repair only a proven-missing pointer."""
+    if task.project_id is None:
+        return None
+    project_store = deps.project_store
+    if project_store is None:
+        _logger.warning(
+            "scheduled fire: task %s project %s could not be verified; "
+            "run is unfiled; assignment preserved",
+            task.id,
+            task.project_id,
+        )
+        return None
+    try:
+        resolved = await _resolve_owned_fire_project(project_store, task)
+    except Exception:  # noqa: BLE001 -- lookup failures are unverifiable, not absent
+        _logger.warning(
+            "scheduled fire: task %s project %s could not be verified; "
+            "run is unfiled; assignment preserved",
+            task.id,
+            task.project_id,
+            exc_info=True,
+        )
+        return None
+    if resolved is not None:
+        return resolved
+
+    try:
+        exists = await asyncio.to_thread(project_store.exists, task.project_id)
+    except Exception:  # noqa: BLE001 -- existence failures are unverifiable
+        _logger.warning(
+            "scheduled fire: task %s project %s existence could not be verified; "
+            "run is unfiled; assignment preserved",
+            task.id,
+            task.project_id,
+            exc_info=True,
+        )
+        return None
+    if exists:
+        _logger.warning(
+            "scheduled fire: task %s project %s is not owned by the current identity; "
+            "run is unfiled; assignment preserved",
+            task.id,
+            task.project_id,
+        )
+        return None
+
+    _logger.warning(
+        "scheduled fire: task %s project %s no longer exists; run is unfiled",
+        task.id,
+        task.project_id,
+    )
+    await _self_heal_task_project(deps, task)
+    return None
+
+
+async def _self_heal_task_project(deps: FireDeps, task: ScheduledTask) -> None:
+    """Best-effort clear of the exact stale Project pointer."""
+    if task.project_id is None:
+        return
+    try:
+        repaired = await asyncio.to_thread(
+            deps.scheduled_task_store.compare_and_set_project,
+            task.id,
+            expected_project_id=task.project_id,
+            project_id=None,
+        )
+    except Exception:  # noqa: BLE001 -- repair failures must not block a fire
+        _logger.warning(
+            "scheduled fire: task %s project %s self-heal failed; run continues",
+            task.id,
+            task.project_id,
+            exc_info=True,
+        )
+        return
+    if not repaired:
+        _logger.debug(
+            "scheduled fire: task %s project %s self-heal skipped; "
+            "assignment changed or task deleted",
+            task.id,
+            task.project_id,
+        )
+
+
 async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> list[str] | None:
     """Derive the native-terminal ``--permission-mode`` args for a task.
 
@@ -725,6 +842,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         title=task.name,
         host_id=task.host_id,
         workspace=task.workspace,
+        project_id=task.project_id,
         terminal_launch_args=await _permission_mode_launch_args(deps, task),
     )
     reasoning_effort = task.reasoning_effort

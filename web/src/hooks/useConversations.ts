@@ -2051,6 +2051,7 @@ export function useDeleteProject() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["scheduled-tasks"] });
       // Deleting a project archives its members, growing the archived set.
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },

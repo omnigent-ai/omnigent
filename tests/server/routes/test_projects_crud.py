@@ -16,14 +16,21 @@ Two auth setups are exercised:
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
 import pytest_asyncio
+import sqlalchemy as sa
 from fastapi import FastAPI
 
+from omnigent.db.db_models import SqlScheduledTask
+from omnigent.db.enum_codecs import (
+    encode_scheduled_task_execution_target,
+    encode_scheduled_task_state,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
@@ -37,6 +44,7 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
@@ -61,6 +69,7 @@ def project_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
             cache_dir=tmp_path / "cache",
         ),
         project_store=SqlAlchemyProjectStore(db_uri),
+        scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
     )
 
 
@@ -204,6 +213,91 @@ async def test_delete_project(project_client: httpx.AsyncClient) -> None:
     assert second_delete.status_code == 404
 
 
+async def test_delete_project_logically_unfiles_automations_without_nulling_deleting_or_pausing(
+    project_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    project = (await project_client.post("/v1/projects", json={"name": "Tasks"})).json()
+    task_store = SqlAlchemyScheduledTaskStore(db_uri)
+    task = task_store.create(
+        uuid.uuid4().hex,
+        "nightly",
+        "prompt",
+        "FREQ=DAILY",
+        None,
+        uuid.uuid4().hex,
+        "UTC",
+        project_id=project["id"],
+    )
+
+    response = await project_client.delete(f"/v1/projects/{project['id']}")
+    unfiled = (await project_client.get("/v1/scheduled-tasks?unfiled=true")).json()
+    stored = task_store.get(task.id)
+
+    assert response.status_code == 200
+    assert [row["id"] for row in unfiled["scheduled_tasks"]] == [task.id]
+    assert stored is not None
+    assert stored.project_id == project["id"]
+    assert stored.state == "active"
+
+
+async def test_delete_project_logically_unfiles_first_class_sessions_without_nulling_or_deleting(
+    project_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    project = (await project_client.post("/v1/projects", json={"name": "Sessions"})).json()
+    agent_id = uuid.uuid4().hex
+    SqlAlchemyAgentStore(db_uri).create(agent_id, "agent", f"{agent_id}/bundle")
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation(agent_id=agent_id, project_id=project["id"])
+
+    response = await project_client.delete(f"/v1/projects/{project['id']}")
+    unfiled = (await project_client.get("/v1/sessions?project=")).json()
+    stored = store.get_conversation(conversation.id)
+
+    assert response.status_code == 200
+    assert conversation.id in {row["id"] for row in unfiled["data"]}
+    assert stored is not None
+    assert stored.project_id == project["id"]
+
+
+async def test_delete_project_with_10001_references_returns_200(
+    project_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    project = (await project_client.post("/v1/projects", json={"name": "Large"})).json()
+    task_store = SqlAlchemyScheduledTaskStore(db_uri)
+    rows = [
+        {
+            "id": uuid.UUID(int=index + 1).hex,
+            "name": "task",
+            "prompt": "p",
+            "rrule": "FREQ=DAILY",
+            "user_id": None,
+            "agent_id": "1" * 32,
+            "timezone": "UTC",
+            "state": encode_scheduled_task_state("paused"),
+            "execution_target": encode_scheduled_task_execution_target("connected_host"),
+            "project_id": project["id"],
+            "created_at": index,
+        }
+        for index in range(10_001)
+    ]
+    with task_store._engine.begin() as connection:
+        connection.execute(sa.insert(SqlScheduledTask), rows)
+
+    response = await project_client.delete(f"/v1/projects/{project['id']}")
+
+    assert response.status_code == 200
+    with task_store._engine.connect() as connection:
+        remaining = connection.execute(
+            sa.select(sa.func.count())
+            .select_from(SqlScheduledTask)
+            .where(SqlScheduledTask.project_id == project["id"])
+        ).scalar_one()
+    assert remaining == 10_001
+
+
 async def test_session_projects_unions_first_class_and_labels(
     project_client: httpx.AsyncClient,
     db_uri: str,
@@ -271,6 +365,7 @@ def multi_user_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
             cache_dir=tmp_path / "cache",
         ),
         project_store=SqlAlchemyProjectStore(db_uri),
+        scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
         permission_store=SqlAlchemyPermissionStore(db_uri),
     )
@@ -362,4 +457,44 @@ async def test_cannot_delete_another_users_project(
     assert resp.status_code == 404
     assert (
         await multi_user_client.get(f"/v1/projects/{created['id']}", headers=_as_user(BOB))
+    ).status_code == 200
+
+
+async def test_delete_other_users_project_does_not_clear_their_or_callers_tasks(
+    multi_user_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    bob_project = (
+        await multi_user_client.post("/v1/projects", json={"name": "Bob"}, headers=_as_user(BOB))
+    ).json()
+    task_store = SqlAlchemyScheduledTaskStore(db_uri)
+    alice_task = task_store.create(
+        uuid.uuid4().hex,
+        "alice",
+        "p",
+        "FREQ=DAILY",
+        ALICE,
+        uuid.uuid4().hex,
+        "UTC",
+    )
+    bob_task = task_store.create(
+        uuid.uuid4().hex,
+        "bob",
+        "p",
+        "FREQ=DAILY",
+        BOB,
+        uuid.uuid4().hex,
+        "UTC",
+        project_id=bob_project["id"],
+    )
+
+    response = await multi_user_client.delete(
+        f"/v1/projects/{bob_project['id']}", headers=_as_user(ALICE)
+    )
+
+    assert response.status_code == 404
+    assert task_store.get(alice_task.id).project_id is None
+    assert task_store.get(bob_task.id).project_id == bob_project["id"]
+    assert (
+        await multi_user_client.get(f"/v1/projects/{bob_project['id']}", headers=_as_user(BOB))
     ).status_code == 200

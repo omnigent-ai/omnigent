@@ -10,6 +10,7 @@ import * as api from "@/lib/scheduledTasksApi";
 import {
   SCHEDULED_TASKS_KEY,
   scheduledTaskRunsKey,
+  scheduledTasksKey,
   useCreateScheduledTask,
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
@@ -40,6 +41,7 @@ const TASK: api.ScheduledTask = {
   permissionMode: null,
   workspace: null,
   hostId: null,
+  projectId: null,
   state: "active",
   lastRunAt: null,
   lastRunStatus: null,
@@ -74,6 +76,25 @@ describe("useScheduledTasks", () => {
     const { result } = renderHook(() => useScheduledTasks(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data).toEqual([TASK]);
+    expect(api.listScheduledTasks).toHaveBeenCalledWith({ kind: "all" });
+  });
+
+  it("uses distinct all, unfiled, and Project keys", () => {
+    expect(scheduledTasksKey({ kind: "all" })).toEqual(["scheduled-tasks", "all"]);
+    expect(scheduledTasksKey({ kind: "unfiled" })).toEqual(["scheduled-tasks", "unfiled"]);
+    expect(scheduledTasksKey({ kind: "project", projectId: "p_1" })).toEqual([
+      "scheduled-tasks",
+      "project",
+      "p_1",
+    ]);
+  });
+
+  it("passes the explicit Project filter to the API", async () => {
+    const { wrapper } = makeWrapper();
+    const filter = { kind: "project", projectId: "p_1" } as const;
+    const { result } = renderHook(() => useScheduledTasks(filter), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(api.listScheduledTasks).toHaveBeenCalledWith(filter);
   });
 });
 

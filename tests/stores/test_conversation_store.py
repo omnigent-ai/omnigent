@@ -19,7 +19,7 @@ from omnigent.entities import (
     NewConversationItem,
     ReasoningData,
 )
-from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
@@ -29,6 +29,8 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 # ── CRUD ──────────────────────────────────────────────
 
@@ -5615,6 +5617,96 @@ def test_set_conversation_project_files_and_unfiles(
     unfiled = conversation_store.set_conversation_project(conv.id, None)
     assert unfiled is True
     assert conversation_store.get_conversation(conv.id).project_id is None
+
+
+def test_create_conversation_sets_project_id_in_initial_metadata_without_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Regression guard for pre-existing first-class Project creation."""
+    project_id = "a" * 32
+    conv = conversation_store.create_conversation(project_id=project_id)
+    assert conv.project_id == project_id
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.project_id == project_id
+    assert "omni_project" not in fetched.labels
+
+
+def test_project_name_filter_finds_pointer_only_session(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Regression guard for pre-existing Project-name pointer filtering."""
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    project = SqlAlchemyProjectStore(db_uri).create("a" * 32, "Pointer only", None)
+    conv = conversation_store.create_conversation(project_id=project.id)
+    page = conversation_store.list_conversations(project=project.name, owned_by=None)
+    assert [item.id for item in page.data] == [conv.id]
+    assert page.data[0].labels.get("omni_project") is None
+
+
+@pytest.mark.parametrize(
+    "store_fixture",
+    ["conversation_store", "split_db_conversation_store"],
+)
+def test_unfiled_filter_includes_directly_inserted_dangling_first_class_pointer(
+    request: pytest.FixtureRequest,
+    store_fixture: str,
+) -> None:
+    store: SqlAlchemyConversationStore = request.getfixturevalue(store_fixture)
+    dangling_id = "d" * 32
+    conv = store.create_conversation(project_id=dangling_id)
+
+    unfiled = store.list_conversations(project="", owned_by=None)
+    assert conv.id in {item.id for item in unfiled.data}
+    assert store.get_conversation(conv.id).project_id == dangling_id
+
+
+@pytest.mark.parametrize(
+    "store_fixture",
+    ["conversation_store", "split_db_conversation_store"],
+)
+def test_unfiled_filter_keeps_pointer_reused_by_foreign_owner(
+    request: pytest.FixtureRequest,
+    store_fixture: str,
+) -> None:
+    store: SqlAlchemyConversationStore = request.getfixturevalue(store_fixture)
+    project_id = "e" * 32
+    projects = SqlAlchemyProjectStore(store.storage_location)
+    projects.create(project_id, "Alice deleted", "alice@example.com")
+    conv = store.create_conversation(project_id=project_id)
+    permissions = SqlAlchemyPermissionStore(store.storage_location)
+    permissions.ensure_user("alice@example.com")
+    permissions.grant("alice@example.com", conv.id, LEVEL_OWNER)
+    assert projects.delete(project_id, user_id="alice@example.com") is True
+    projects.create(project_id, "Bob reused", "bob@example.com")
+
+    unfiled = store.list_conversations(
+        project="", accessible_by="alice@example.com", owned_by=None
+    )
+    assert conv.id in {item.id for item in unfiled.data}
+    assert store.get_conversation(conv.id).project_id == project_id
+
+
+@pytest.mark.parametrize(
+    "store_fixture",
+    ["conversation_store", "split_db_conversation_store"],
+)
+def test_dangling_pointer_with_legacy_project_label_remains_label_filed(
+    request: pytest.FixtureRequest,
+    store_fixture: str,
+) -> None:
+    store: SqlAlchemyConversationStore = request.getfixturevalue(store_fixture)
+    conv = store.create_conversation(project_id="d" * 32)
+    store.set_labels(conv.id, {"omni_project": "Legacy"})
+
+    assert conv.id not in {
+        item.id for item in store.list_conversations(project="", owned_by=None).data
+    }
+    assert conv.id in {
+        item.id for item in store.list_conversations(project="Legacy", owned_by=None).data
+    }
 
 
 def test_set_conversation_project_unknown_session_returns_false(

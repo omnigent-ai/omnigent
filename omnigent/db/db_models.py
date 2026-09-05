@@ -1543,6 +1543,8 @@ class SqlScheduledTask(OmnigentBase):
     # sandbox is provisioned/adopted under a deterministic id at fire time, so
     # there is nothing to pin here).
     host_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    # Organizational membership only. No DB foreign key (Rule R032).
+    project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
@@ -1565,6 +1567,14 @@ class SqlScheduledTask(OmnigentBase):
             "ix_scheduled_tasks_user_scope",
             "workspace_id",
             "user_id",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_scheduled_tasks_project_id",
+            "workspace_id",
+            "user_id",
+            "project_id",
             "created_at",
             "id",
         ),

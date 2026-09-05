@@ -438,6 +438,8 @@ class ConversationStore(ABC):
             the column NULL; a list (including ``[]``) is persisted
             so the runner applies it when it auto-launches the
             terminal.
+        :param project_id: First-class Project membership. ``None`` means
+            unfiled.
         :param conversation_id: Optional caller-supplied identifier.
             ``None`` generates a new random id. Reserved for flows that
             require database-enforced idempotency.

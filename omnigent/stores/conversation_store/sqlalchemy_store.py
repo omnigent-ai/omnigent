@@ -949,6 +949,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             the column NULL; a list (including ``[]``) is JSON-encoded
             so the runner applies it when it auto-launches the
             terminal.
+        :param project_id: First-class Project membership. ``None`` means
+            unfiled.
         :param conversation_id: Optional caller-supplied identifier.
             ``None`` generates a new random id.
         :returns: The newly created :class:`Conversation`.
@@ -1030,11 +1032,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 host_id=host_id,
                 sub_agent_name=sub_agent_name,
                 workspace=workspace,
+                project_id=project_id,
                 git_branch=git_branch,
                 terminal_launch_args=(
                     json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
                 ),
-                project_id=project_id,
             )
             with self._session("insert_conversation_metadata") as meta_sess:
                 meta_sess.add(meta)
@@ -2389,7 +2391,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
-        from omnigent.server.auth import LEVEL_OWNER
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 
         sort_col = self._resolve_sort_column(sort_by)
         is_desc = order == "desc"
@@ -2563,30 +2565,96 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationLabel.key == PROJECT_LABEL_KEY,
                 )
                 if project == "":
-                    # Unfiled: no first-class membership AND no label.
-                    first_class_stmt = select(SqlConversationMetadata.id).where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.project_id.is_not(None),
+                    owner_permission = aliased(SqlSessionPermission)
+                    has_owner = (
+                        select(owner_permission.conversation_id)
+                        .where(
+                            owner_permission.workspace_id == SqlConversationMetadata.workspace_id,
+                            owner_permission.conversation_id == SqlConversationMetadata.id,
+                            owner_permission.level >= LEVEL_OWNER,
+                        )
+                        .exists()
+                    )
+                    has_matching_owner = (
+                        select(owner_permission.conversation_id)
+                        .where(
+                            owner_permission.workspace_id == SqlConversationMetadata.workspace_id,
+                            owner_permission.conversation_id == SqlConversationMetadata.id,
+                            owner_permission.level >= LEVEL_OWNER,
+                            or_(
+                                owner_permission.user_id == SqlProject.user_id,
+                                and_(
+                                    owner_permission.user_id == RESERVED_USER_LOCAL,
+                                    SqlProject.user_id.is_(None),
+                                ),
+                            ),
+                        )
+                        .exists()
+                    )
+                    project_owner_matches = or_(
+                        has_matching_owner,
+                        and_(
+                            ~has_owner,
+                            or_(
+                                SqlProject.user_id.is_(None),
+                                SqlProject.user_id == RESERVED_USER_LOCAL,
+                            ),
+                        ),
                     )
                     if self._conv_engine is self._engine:
-                        # Single-DB: metadata is colocated with conversations, so
-                        # push the exclusion down as a NOT IN subquery — no need to
-                        # pull every filed id into Python.
-                        first_class_filed: Any = first_class_stmt
+                        stmt = stmt.outerjoin(
+                            SqlConversationMetadata,
+                            and_(
+                                SqlConversationMetadata.workspace_id
+                                == SqlConversation.workspace_id,
+                                SqlConversationMetadata.id == SqlConversation.id,
+                            ),
+                        ).outerjoin(
+                            SqlProject,
+                            and_(
+                                SqlProject.workspace_id == SqlConversationMetadata.workspace_id,
+                                SqlProject.id == SqlConversationMetadata.project_id,
+                                project_owner_matches,
+                            ),
+                        )
+                        stmt = stmt.where(
+                            or_(
+                                SqlConversationMetadata.id.is_(None),
+                                SqlConversationMetadata.project_id.is_(None),
+                                SqlProject.id.is_(None),
+                            ),
+                            SqlConversation.id.not_in(label_filed),
+                        )
                     else:
-                        # Split-DB: metadata lives elsewhere, so prefetch the ids.
-                        # Bound to qualifying_ids (when permission-scoped) so the
-                        # NOT IN list stays capped to the caller's own sessions.
+                        # Only pointers resolving to a same-workspace Project are filed.
+                        first_class_stmt = (
+                            select(SqlConversationMetadata.id)
+                            .join(
+                                SqlProject,
+                                and_(
+                                    SqlProject.workspace_id
+                                    == SqlConversationMetadata.workspace_id,
+                                    SqlProject.id == SqlConversationMetadata.project_id,
+                                    project_owner_matches,
+                                ),
+                            )
+                            .where(
+                                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                                SqlProject.workspace_id == current_workspace_id(),
+                            )
+                        )
                         if qualifying_ids is not None:
                             first_class_stmt = first_class_stmt.where(
                                 SqlConversationMetadata.id.in_(qualifying_ids)
                             )
                         with self._session("list_conversations") as meta_sess:
-                            first_class_filed = list(meta_sess.execute(first_class_stmt).scalars())
-                    stmt = stmt.where(
-                        SqlConversation.id.not_in(first_class_filed),
-                        SqlConversation.id.not_in(label_filed),
-                    )
+                            resolved_filed_ids = list(
+                                meta_sess.execute(first_class_stmt).scalars()
+                            )
+                        stmt = stmt.where(
+                            SqlConversation.id.not_in(resolved_filed_ids),
+                            SqlConversation.id.not_in(label_filed),
+                        )
                 else:
                     # Resolve the owner's project of this name → its member ids
                     # (one join). No such project yields an empty match, so the

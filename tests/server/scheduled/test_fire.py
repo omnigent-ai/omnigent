@@ -18,8 +18,9 @@ unit-tested without a live host/runner.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import pytest
@@ -41,6 +42,13 @@ class _FakeConversation:
     host_id: str | None = None
     git_branch: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
+    project_id: str | None = None
+
+
+@dataclass
+class _FakeProject:
+    id: str
+    config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -95,13 +103,22 @@ class FakeAgentCache:
 class FakeScheduledTaskStore:
     """Records update/create_run calls and serves get() from a dict."""
 
-    def __init__(self, rows: dict[str, ScheduledTask] | None = None) -> None:
+    def __init__(
+        self,
+        rows: dict[str, ScheduledTask] | None = None,
+        *,
+        compare_and_set_result: bool | None = None,
+        fail_compare_and_set: bool = False,
+    ) -> None:
         self._rows = rows or {}
         self.updates: list[dict[str, Any]] = []
         self.runs: list[dict[str, Any]] = []
         self.get_workspace_ids: list[int] = []
         self.update_workspace_ids: list[int] = []
         self.run_workspace_ids: list[int] = []
+        self.compare_and_set_calls: list[dict[str, Any]] = []
+        self.compare_and_set_result = compare_and_set_result
+        self.fail_compare_and_set = fail_compare_and_set
 
     def get(self, scheduled_task_id: str) -> ScheduledTask | None:
         self.get_workspace_ids.append(current_workspace_id())
@@ -127,6 +144,30 @@ class FakeScheduledTaskStore:
         )
         return None
 
+    def compare_and_set_project(
+        self,
+        scheduled_task_id: str,
+        *,
+        expected_project_id: str,
+        project_id: str | None,
+    ) -> bool:
+        self.compare_and_set_calls.append(
+            {
+                "id": scheduled_task_id,
+                "expected_project_id": expected_project_id,
+                "project_id": project_id,
+            }
+        )
+        if self.fail_compare_and_set:
+            raise RuntimeError("compare-and-set failed")
+        if self.compare_and_set_result is not None:
+            return self.compare_and_set_result
+        row = self._rows.get(scheduled_task_id)
+        if row is None or row.project_id != expected_project_id:
+            return False
+        self._rows[scheduled_task_id] = replace(row, project_id=project_id)
+        return True
+
 
 class SequencedScheduledTaskStore(FakeScheduledTaskStore):
     """Returns scripted rows for consecutive get() calls."""
@@ -143,13 +184,21 @@ class SequencedScheduledTaskStore(FakeScheduledTaskStore):
 
 
 class FakeConversationStore:
-    def __init__(self, *, fail_create: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_create: bool = False,
+        events: list[str] | None = None,
+    ) -> None:
         self.created: list[dict[str, Any]] = []
         self.updated: list[dict[str, Any]] = []
+        self.project_updates: list[tuple[str, str | None]] = []
         self.create_workspace_ids: list[int] = []
+        self.conversations: dict[str, _FakeConversation] = {}
         self._seq = 0
         self.fail_create = fail_create
         self.label_writes: dict[str, dict[str, str]] = {}
+        self.events = events
 
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
         self.create_workspace_ids.append(current_workspace_id())
@@ -162,9 +211,27 @@ class FakeConversationStore:
             workspace=kwargs.get("workspace"),
             host_id=kwargs.get("host_id"),
             git_branch=kwargs.get("git_branch"),
+            project_id=kwargs.get("project_id"),
         )
         self.created.append(kwargs)
+        self.conversations[conv.id] = conv
+        if self.events is not None:
+            self.events.append("create")
         return conv
+
+    def set_conversation_project(
+        self,
+        conversation_id: str,
+        project_id: str | None,
+    ) -> bool:
+        conv = self.conversations.get(conversation_id)
+        if conv is None:
+            return False
+        self.project_updates.append((conversation_id, project_id))
+        self.conversations[conversation_id] = replace(conv, project_id=project_id)
+        if self.events is not None:
+            self.events.append("unfile")
+        return True
 
     def update_conversation(self, conversation_id: str, **kwargs: Any) -> _FakeConversation:
         self.updated.append({"id": conversation_id, **kwargs})
@@ -178,11 +245,17 @@ class FakeConversationStore:
 
 
 class FakePermissionStore:
-    def __init__(self, *, fail_grant: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_grant: bool = False,
+        events: list[str] | None = None,
+    ) -> None:
         self.ensured: list[str] = []
         self.grants: list[tuple[str, str, int]] = []
         self.grant_workspace_ids: list[int] = []
         self.fail_grant = fail_grant
+        self.events = events
 
     def ensure_user(self, user_id: str, *, is_admin: bool = False) -> None:
         self.ensured.append(user_id)
@@ -191,8 +264,46 @@ class FakePermissionStore:
         self.grant_workspace_ids.append(current_workspace_id())
         if self.fail_grant:
             raise RuntimeError("grant failed")
+        if self.events is not None:
+            self.events.append("grant")
         self.grants.append((user_id, conversation_id, level))
         return None
+
+
+class FakeProjectStore:
+    """Returns scripted ownership lookups and records workspace scope."""
+
+    def __init__(
+        self,
+        results: list[_FakeProject | None | Exception],
+        *,
+        exists_result: bool | Exception = False,
+        events: list[str] | None = None,
+    ) -> None:
+        self.results = list(results)
+        self.exists_result = exists_result
+        self.get_workspace_ids: list[int] = []
+        self.exists_workspace_ids: list[int] = []
+        self.calls: list[tuple[str, str | None]] = []
+        self.exists_calls: list[str] = []
+        self.events = events
+
+    def get(self, project_id: str, *, user_id: str | None) -> _FakeProject | None:
+        self.get_workspace_ids.append(current_workspace_id())
+        self.calls.append((project_id, user_id))
+        if self.events is not None:
+            self.events.append("project")
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def exists(self, project_id: str) -> bool:
+        self.exists_workspace_ids.append(current_workspace_id())
+        self.exists_calls.append(project_id)
+        if isinstance(self.exists_result, Exception):
+            raise self.exists_result
+        return self.exists_result
 
 
 @dataclass
@@ -264,6 +375,7 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         conversation_store=overrides.get("conversation_store", FakeConversationStore()),
         permission_store=overrides.get("permission_store", FakePermissionStore()),
         policy_store=overrides.get("policy_store"),
+        project_store=overrides.get("project_store"),
         host_store=overrides.get("host_store", FakeHostStore()),
         host_registry=overrides.get("host_registry", FakeHostRegistry()),
         agent_cache=overrides.get("agent_cache"),
@@ -409,6 +521,507 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+@pytest.mark.asyncio
+async def test_fire_sets_project_once_in_initial_insert_without_followup_write() -> None:
+    project_id = "a" * 32
+    events: list[str] = []
+    project_store = FakeProjectStore([_FakeProject(project_id)], events=events)
+    conv_store = FakeConversationStore(events=events)
+    permission_store = FakePermissionStore(events=events)
+    store = FakeScheduledTaskStore(rows={"task_1": _task(project_id=project_id)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            project_store=project_store,
+            conversation_store=conv_store,
+            permission_store=permission_store,
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["project_id"] == project_id
+    assert "labels" not in conv_store.created[0]
+    assert project_store.calls == [(project_id, None)]
+    assert conv_store.project_updates == []
+    assert events == ["project", "create", "grant"]
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_fire_project_config_does_not_override_launch_fields() -> None:
+    project_id = "a" * 32
+    project_store = FakeProjectStore(
+        [
+            _FakeProject(
+                project_id,
+                config={
+                    "agent_id": "project_agent",
+                    "workspace": "/project/workspace",
+                    "git": {"branch": "obsolete-project-branch"},
+                },
+            )
+        ]
+    )
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(project_id=project_id)})
+    launched: list[ScheduledTask] = []
+
+    async def _launch(conv: Any, effective: ScheduledTask) -> None:
+        launched.append(effective)
+
+    on_fire = build_on_fire(
+        _deps(store, project_store=project_store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    created = conv_store.created[0]
+    assert created["project_id"] == project_id
+    assert created["agent_id"] == "ag_1"
+    assert created["host_id"] == "host_1"
+    assert created["workspace"] == "/repo"
+    assert conv_store.conversations["conv_1"].git_branch is None
+    assert launched[0].agent_id == "ag_1"
+    assert launched[0].host_id == "host_1"
+    assert launched[0].workspace == "/repo"
+    assert launched[0].base_branch is None
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_fire_resolves_local_project_for_null_owner_task() -> None:
+    project_id = "a" * 32
+    project_store = FakeProjectStore([None, _FakeProject(project_id)])
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(project_id=project_id)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, project_store=project_store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["project_id"] == project_id
+    assert project_store.calls == [
+        (project_id, None),
+        (project_id, RESERVED_USER_LOCAL),
+    ]
+    assert project_store.exists_calls == []
+    assert conv_store.project_updates == []
+    assert store.compare_and_set_calls == []
+
+
+@pytest.mark.asyncio
+async def test_fire_missing_project_runs_unfiled_and_conditionally_self_heals_task(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    project_id = "a" * 32
+    task = _task(project_id=project_id)
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    conv_store = FakeConversationStore()
+    project_store = FakeProjectStore([None, None])
+
+    async def _launch(conv: Any, effective: Any) -> None:
+        return None
+
+    with caplog.at_level(logging.WARNING, logger=fire_mod.__name__):
+        on_fire = build_on_fire(
+            _deps(
+                store,
+                project_store=project_store,
+                conversation_store=conv_store,
+            ),
+            launch_dispatch=_launch,
+        )
+        await on_fire(0, "task_1")
+        await _drain()
+
+    assert conv_store.created[0]["project_id"] is None
+    assert store._rows["task_1"].project_id is None
+    assert store.compare_and_set_calls == [
+        {"id": "task_1", "expected_project_id": project_id, "project_id": None}
+    ]
+    assert project_store.exists_calls == [project_id]
+    assert store.runs[0]["status"] == "running"
+    assert f"project {project_id} no longer exists; run is unfiled" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fire_stamps_labels_while_self_healing_missing_project() -> None:
+    from omnigent.native_coding_agents import PI_NATIVE_AGENT_NAME
+
+    project_id = "a" * 32
+    task = _task(project_id=project_id)
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    conv_store = FakeConversationStore()
+    deps = _deps(
+        store,
+        project_store=FakeProjectStore([None, None]),
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", name=PI_NATIVE_AGENT_NAME)}),
+    )
+
+    async def _launch(conv: Any, effective: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.label_writes["conv_1"] == {
+        "omnigent.ui": "terminal",
+        "omnigent.wrapper": PI_NATIVE_AGENT_NAME,
+    }
+    assert store._rows["task_1"].project_id is None
+    assert store.compare_and_set_calls == [
+        {"id": "task_1", "expected_project_id": project_id, "project_id": None}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fire_self_heal_zero_rows_runs_normally_and_preserves_concurrent_assignment(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stale_project_id = "a" * 32
+    concurrent_project_id = "b" * 32
+    snapshot = _task(project_id=stale_project_id)
+    store = SequencedScheduledTaskStore([snapshot, snapshot])
+    store._rows["task_1"] = replace(snapshot, project_id=concurrent_project_id)
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    with caplog.at_level(logging.DEBUG, logger=fire_mod.__name__):
+        on_fire = build_on_fire(
+            _deps(store, project_store=FakeProjectStore([None, None])),
+            launch_dispatch=_launch,
+        )
+        await on_fire(0, "task_1")
+        await _drain()
+
+    assert store._rows["task_1"].project_id == concurrent_project_id
+    assert store.runs[0]["status"] == "running"
+    assert "self-heal skipped; assignment changed or task deleted" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fire_self_heal_exception_logs_warning_and_run_continues(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    project_id = "a" * 32
+    task = _task(project_id=project_id)
+    store = FakeScheduledTaskStore(
+        rows={"task_1": task},
+        fail_compare_and_set=True,
+    )
+
+    async def _launch(conv: Any, effective: Any) -> None:
+        return None
+
+    with caplog.at_level(logging.WARNING, logger=fire_mod.__name__):
+        on_fire = build_on_fire(
+            _deps(store, project_store=FakeProjectStore([None, None])),
+            launch_dispatch=_launch,
+        )
+        await on_fire(0, "task_1")
+        await _drain()
+
+    assert store._rows["task_1"].project_id == project_id
+    assert store.runs[0]["status"] == "running"
+    assert "self-heal failed; run continues" in caplog.text
+    assert "compare-and-set failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fire_without_project_store_runs_unfiled_and_preserves_task_assignment(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    project_id = "a" * 32
+    task = _task(project_id=project_id)
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    conv_store = FakeConversationStore()
+
+    async def _launch(conv: Any, effective: Any) -> None:
+        return None
+
+    with caplog.at_level(logging.WARNING, logger=fire_mod.__name__):
+        on_fire = build_on_fire(
+            _deps(store, project_store=None, conversation_store=conv_store),
+            launch_dispatch=_launch,
+        )
+        await on_fire(0, "task_1")
+        await _drain()
+
+    assert conv_store.created[0]["project_id"] is None
+    assert store._rows["task_1"].project_id == project_id
+    assert store.compare_and_set_calls == []
+    assert store.runs[0]["status"] == "running"
+    assert "could not be verified; run is unfiled; assignment preserved" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fire_project_lookup_error_runs_unfiled_and_preserves_task_assignment(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    project_id = "a" * 32
+    task = _task(project_id=project_id)
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    conv_store = FakeConversationStore()
+
+    async def _launch(conv: Any, effective: Any) -> None:
+        return None
+
+    with caplog.at_level(logging.WARNING, logger=fire_mod.__name__):
+        on_fire = build_on_fire(
+            _deps(
+                store,
+                project_store=FakeProjectStore([RuntimeError("lookup unavailable")]),
+                conversation_store=conv_store,
+            ),
+            launch_dispatch=_launch,
+        )
+        await on_fire(0, "task_1")
+        await _drain()
+
+    assert conv_store.created[0]["project_id"] is None
+    assert store._rows["task_1"].project_id == project_id
+    assert store.compare_and_set_calls == []
+    assert store.runs[0]["status"] == "running"
+    assert "assignment preserved" in caplog.text
+    assert "lookup unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fire_does_not_confirm_or_rewrite_project_after_initial_insert() -> None:
+    project_id = "a" * 32
+    task = _task(project_id=project_id)
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    conv_store = FakeConversationStore()
+    project_store = FakeProjectStore([_FakeProject(project_id)])
+
+    async def _launch(conv: Any, effective: Any) -> None:
+        assert conv.project_id == project_id
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            project_store=project_store,
+            conversation_store=conv_store,
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["project_id"] == project_id
+    assert conv_store.project_updates == []
+    assert conv_store.conversations["conv_1"].project_id == project_id
+    assert project_store.calls == [(project_id, None)]
+    assert store._rows["task_1"].project_id == project_id
+    assert store.compare_and_set_calls == []
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_fire_project_owned_by_another_identity_runs_unfiled_and_preserves_assignment(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    project_id = "a" * 32
+    task = _task(project_id=project_id, user_id="stale@example.com")
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    conv_store = FakeConversationStore()
+    project_store = FakeProjectStore([None], exists_result=True)
+
+    async def _launch(conv: Any, effective: Any) -> None:
+        assert conv.project_id is None
+
+    with caplog.at_level(logging.WARNING, logger=fire_mod.__name__):
+        on_fire = build_on_fire(
+            _deps(
+                store,
+                project_store=project_store,
+                conversation_store=conv_store,
+            ),
+            launch_dispatch=_launch,
+        )
+        await on_fire(0, "task_1")
+        await _drain()
+
+    assert project_store.calls == [(project_id, "stale@example.com")]
+    assert project_store.exists_calls == [project_id]
+    assert store._rows["task_1"].project_id == project_id
+    assert store.compare_and_set_calls == []
+    assert store.runs[0]["status"] == "running"
+    assert "not owned by the current identity" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fire_with_null_project_emits_no_project_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = FakeScheduledTaskStore(rows={"task_1": _task(project_id=None)})
+
+    async def _launch(conv: Any, effective: Any) -> None:
+        return None
+
+    with caplog.at_level(logging.WARNING, logger=fire_mod.__name__):
+        on_fire = build_on_fire(_deps(store), launch_dispatch=_launch)
+        await on_fire(0, "task_1")
+        await _drain()
+
+    assert not [record for record in caplog.records if " project " in record.getMessage()]
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_patch_after_fire_snapshot_changes_only_next_run() -> None:
+    first_project_id = "a" * 32
+    next_project_id = "b" * 32
+    first_snapshot = _task(project_id=first_project_id)
+    store = FakeScheduledTaskStore(rows={"task_1": first_snapshot})
+    conv_store = FakeConversationStore()
+    project_store = FakeProjectStore(
+        [
+            _FakeProject(first_project_id),
+            _FakeProject(next_project_id),
+        ]
+    )
+
+    async def _launch(conv: Any, effective: Any) -> None:
+        if len(conv_store.created) == 1:
+            store._rows["task_1"] = replace(first_snapshot, project_id=next_project_id)
+
+    on_fire = build_on_fire(
+        _deps(store, project_store=project_store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert [created["project_id"] for created in conv_store.created] == [
+        first_project_id,
+        next_project_id,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delete_after_initial_insert_reads_unfiled_and_next_fire_self_heals(
+    db_uri: str,
+) -> None:
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    project_store = SqlAlchemyProjectStore(db_uri)
+    task_store = SqlAlchemyScheduledTaskStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    project_id = "a" * 32
+    project_store.create(project_id, "Deleted during fire", None)
+    task = task_store.create(
+        "1" * 32,
+        "task",
+        "p",
+        "FREQ=DAILY",
+        None,
+        "3" * 32,
+        "UTC",
+        workspace="/repo",
+        host_id="4" * 32,
+        project_id=project_id,
+    )
+
+    async def _delete_after_insert(conv: Any, effective: Any) -> None:
+        assert conv.project_id == project_id
+        assert project_store.delete(project_id, user_id=None) is True
+
+    first_fire = build_on_fire(
+        _deps(
+            task_store,  # type: ignore[arg-type]
+            agent_store=FakeAgentStore({"3" * 32: _FakeAgent("3" * 32)}),
+            project_store=project_store,
+            conversation_store=conversation_store,
+        ),
+        launch_dispatch=_delete_after_insert,
+    )
+    await first_fire(0, task.id)
+    await _drain()
+    first_after = task_store.get(task.id)
+    assert first_after is not None
+    assert first_after.project_id == project_id
+    first_conversation = conversation_store.get_conversation(first_after.last_run_conversation_id)
+    assert first_conversation is not None
+    assert first_conversation.project_id == project_id
+    assert first_conversation.id in {
+        conversation.id for conversation in conversation_store.list_conversations(project="").data
+    }
+
+    async def _launch_unfiled(conv: Any, effective: Any) -> None:
+        assert conv.project_id is None
+
+    second_fire = build_on_fire(
+        _deps(
+            task_store,  # type: ignore[arg-type]
+            agent_store=FakeAgentStore({"3" * 32: _FakeAgent("3" * 32)}),
+            project_store=project_store,
+            conversation_store=conversation_store,
+        ),
+        launch_dispatch=_launch_unfiled,
+    )
+    await second_fire(0, task.id)
+    await _drain()
+    second_after = task_store.get(task.id)
+    assert second_after is not None
+    assert second_after.project_id is None
+    second_conversation = conversation_store.get_conversation(
+        second_after.last_run_conversation_id
+    )
+    assert second_conversation is not None
+    assert second_conversation.project_id is None
+
+    unfiled_ids = {
+        conversation.id for conversation in conversation_store.list_conversations(project="").data
+    }
+    assert first_conversation.id in unfiled_ids
+    assert second_conversation.id in unfiled_ids
+
+
+@pytest.mark.asyncio
+async def test_fire_project_lookup_stays_inside_scheduler_workspace_scope() -> None:
+    project_id = "a" * 32
+    task = _task(project_id=project_id, workspace_id=42)
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    project_store = FakeProjectStore([_FakeProject(project_id)])
+
+    async def _launch(conv: Any, effective: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, project_store=project_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(42, "task_1")
+    await _drain()
+
+    assert project_store.get_workspace_ids == [42]
 
 
 def _claude_agent_deps(

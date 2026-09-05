@@ -87,8 +87,8 @@ class SqlAlchemyProjectStore(ProjectStore):
     SQLAlchemy-backed implementation of :class:`ProjectStore`.
 
     Persists projects in a relational database via the SQLAlchemy ORM. Every
-    query is scoped by ``workspace_id`` (tenant partition) and ``user_id``
-    (projects are owner-private).
+    query is scoped by ``workspace_id``; user-facing operations also scope by
+    ``user_id`` because Projects are owner-private.
     """
 
     def __init__(self, storage_location: str) -> None:
@@ -177,6 +177,11 @@ class SqlAlchemyProjectStore(ProjectStore):
             if row is None or row.user_id != user_id:
                 return None
             return _to_entity(row)
+
+    def exists(self, project_id: str) -> bool:
+        """Return whether a Project id exists, regardless of owner."""
+        with self._session("check_project_exists") as session:
+            return session.get(SqlProject, (current_workspace_id(), project_id)) is not None
 
     def list(self, *, user_id: str | None) -> list[Project]:
         """List the owner's projects ordered by ``created_at ASC, id ASC``."""

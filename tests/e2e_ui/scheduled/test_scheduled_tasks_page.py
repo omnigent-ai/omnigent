@@ -18,9 +18,15 @@ never exercised.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import time
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 
@@ -397,6 +403,86 @@ def test_scheduled_task_row_run_controls(
     assert _has_failed_run(), "Run now did not record a failed run within the timeout"
 
 
+def test_automation_project_picker_filter_and_unfile(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Assign, filter, unfile, reassign, and survive Project deletion."""
+    project_a = httpx.post(
+        f"{live_server}/v1/projects",
+        json={"name": "Automation Project A"},
+        timeout=10.0,
+    )
+    project_a.raise_for_status()
+    project_a_id = project_a.json()["id"]
+    project_b = httpx.post(
+        f"{live_server}/v1/projects",
+        json={"name": "Automation Project B"},
+        timeout=10.0,
+    )
+    project_b.raise_for_status()
+
+    page.goto(f"{live_server}/tasks")
+    _open_create_dialog(page)
+    page.get_by_test_id("task-name-input").fill("Project automation")
+    page.get_by_test_id("task-prompt-input").fill("Summarize Project activity.")
+    _pick_select_option(page, "task-project-trigger", "Automation Project A")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    row = _row_by_name(page, "Project automation")
+    expect(row).to_be_visible(timeout=30_000)
+    expect(row.get_by_test_id("task-project-chip")).to_have_text("Automation Project A")
+
+    _pick_select_option(page, "tasks-project-filter", "Automation Project A")
+    expect(row).to_be_visible(timeout=30_000)
+    _pick_select_option(page, "tasks-project-filter", "Automation Project B")
+    expect(page.get_by_text("No automations in Automation Project B")).to_be_visible()
+    _pick_select_option(page, "tasks-project-filter", "Unfiled")
+    expect(row).to_be_hidden(timeout=30_000)
+    _pick_select_option(page, "tasks-project-filter", "All projects")
+
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+    _pick_select_option(page, "task-project-trigger", "No project")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(row.get_by_test_id("task-project-chip")).to_be_hidden(timeout=30_000)
+    _pick_select_option(page, "tasks-project-filter", "Unfiled")
+    expect(row).to_be_visible(timeout=30_000)
+
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+    _pick_select_option(page, "task-project-trigger", "Automation Project A")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(row).to_be_hidden(timeout=30_000)
+    _pick_select_option(page, "tasks-project-filter", "All projects")
+    expect(row.get_by_test_id("task-project-chip")).to_have_text("Automation Project A")
+
+    sidebar = page.get_by_role("complementary", name="Conversations")
+    project_heading = sidebar.get_by_text("Automation Project A", exact=True)
+    project_heading.click()
+    expect(sidebar.get_by_text("Project automation", exact=True)).to_have_count(0)
+
+    sidebar.get_by_role("button", name="Project actions for Automation Project A").click()
+    page.get_by_test_id("delete-project").click()
+    page.get_by_role("button", name="Delete project", exact=True).click()
+    expect(project_heading).to_be_hidden(timeout=30_000)
+
+    page.reload()
+    row = _row_by_name(page, "Project automation")
+    expect(row).to_be_visible(timeout=30_000)
+    expect(row).to_have_attribute("data-state", "active")
+    expect(row.get_by_test_id("task-project-chip")).to_be_hidden()
+    _pick_select_option(page, "tasks-project-filter", "Unfiled")
+    expect(row).to_be_visible(timeout=30_000)
+
+    tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
+    stored = next(task for task in tasks if task["name"] == "Project automation")
+    assert stored["project_id"] == project_a_id
+    assert stored["state"] == "active"
+
+
 # ── Model + reasoning-effort selectors (PR #3331) ──────────────────────────
 #
 # The create/edit dialog renders a Model|Effort row (ModelEffortFields) that is
@@ -740,3 +826,291 @@ def test_scheduled_task_edit_prefills_permission_mode(
     expect(dialog).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("task-permission-control")).to_be_visible()
     expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Bypass permissions")
+
+
+@pytest.mark.nightly
+def test_automation_project_emoji_rendering(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Project emojis show in the chip, filter options, and trigger.
+
+    Seeds one Project WITH a chosen emoji (``config.icon``) and one without,
+    creates an automation filed into the emoji Project through the dialog
+    (proving the aria-hidden emoji keeps option accessible names plain), and
+    walks the filter: the emoji renders in the row chip, the filter option,
+    and the filter trigger; the emoji-less Project's option shows the folder
+    fallback; and the filter still narrows correctly, including Unfiled.
+    """
+    emoji_project = httpx.post(
+        f"{live_server}/v1/projects",
+        json={"name": "Emoji Project", "config": {"icon": "📊"}},
+        timeout=10.0,
+    )
+    emoji_project.raise_for_status()
+    plain_project = httpx.post(
+        f"{live_server}/v1/projects",
+        json={"name": "Plain Project"},
+        timeout=10.0,
+    )
+    plain_project.raise_for_status()
+
+    # An unfiled automation seeded over REST anchors the Unfiled filter leg.
+    agent_id = _builtin_agent_id(live_server, "hello_world")
+    _create_task(live_server, agent_id, "Unfiled automation", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
+
+    page.goto(f"{live_server}/tasks")
+    _open_create_dialog(page)
+    page.get_by_test_id("task-name-input").fill("Emoji automation")
+    page.get_by_test_id("task-prompt-input").fill("Summarize dashboards.")
+    # The emoji is aria-hidden, so the shared name-only option pick still works.
+    _pick_select_option(page, "task-project-trigger", "Emoji Project")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    row = _row_by_name(page, "Emoji automation")
+    expect(row).to_be_visible(timeout=30_000)
+    chip = row.get_by_test_id("task-project-chip")
+    expect(chip).to_contain_text("📊")
+    expect(chip).to_contain_text("Emoji Project")
+
+    # Filter options: emoji for the emoji Project, folder fallback otherwise.
+    page.get_by_test_id("tasks-project-filter").click()
+    emoji_option = page.get_by_role("option", name="Emoji Project", exact=True)
+    expect(emoji_option).to_contain_text("📊")
+    plain_option = page.get_by_role("option", name="Plain Project", exact=True)
+    expect(plain_option.get_by_test_id("project-label-fallback")).to_be_visible()
+    emoji_option.click()
+
+    # The trigger mirrors the selected option — emoji included — and narrows.
+    expect(page.get_by_test_id("tasks-project-filter")).to_contain_text("📊")
+    expect(row).to_be_visible(timeout=30_000)
+    expect(_row_by_name(page, "Unfiled automation")).to_be_hidden()
+
+    _pick_select_option(page, "tasks-project-filter", "Plain Project")
+    expect(page.get_by_text("No automations in Plain Project")).to_be_visible()
+    _pick_select_option(page, "tasks-project-filter", "Unfiled")
+    expect(_row_by_name(page, "Unfiled automation")).to_be_visible(timeout=30_000)
+    expect(row).to_be_hidden()
+    _pick_select_option(page, "tasks-project-filter", "All projects")
+    expect(row).to_be_visible(timeout=30_000)
+    expect(_row_by_name(page, "Unfiled automation")).to_be_visible()
+
+
+def _online_host_ids(base_url: str) -> list[str]:
+    """Host ids currently ONLINE on the spawned server (``status == 'online'``)."""
+    resp = httpx.get(f"{base_url}/v1/hosts", timeout=5.0)
+    resp.raise_for_status()
+    return [h["host_id"] for h in resp.json()["hosts"] if h.get("status") == "online"]
+
+
+@pytest.fixture
+def connected_host(live_server: str) -> Iterator[str]:
+    """Bring a real connected host online against the spawned server.
+
+    A scheduled fire launches on the owner's online CONNECTED host — the
+    ``omnigent host`` tunnel — not the e2e runner. With none, the fire records a
+    ``no_online_host`` failure and creates no session, so there is nothing to
+    file. Spawning ``omnigent host`` against the local server registers one, so a
+    manual Run now resolves it, creates the session, and stamps it with the
+    task's project. Yields the online host id; the daemon is torn down after.
+    """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("OMNIGENT_RUNNER")
+        and k
+        not in {
+            "OMNIGENT_HOST_ID",
+            "OMNIGENT_HOST_TOKEN",
+            "OMNIGENT_HOST_NAME",
+            "RUNNER_SERVER_URL",
+            "OMNIGENT_REMOTE_AUTH_TOKEN",
+        }
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "omnigent.cli", "host", live_server, "--non-interactive"],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        deadline = time.monotonic() + 60.0
+        host_ids: list[str] = []
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"omnigent host exited early (code {proc.returncode})")
+            host_ids = _online_host_ids(live_server)
+            if host_ids:
+                break
+            time.sleep(1.0)
+        assert host_ids, "connected host never came online for the scheduled fire"
+        yield host_ids[0]
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+@pytest.mark.nightly
+def test_automation_project_emoji_rendering_demo_paced(
+    page: Page,
+    live_server: str,
+    connected_host: str,
+) -> None:
+    """The emoji-rendering journey, held on each surface long enough to watch.
+
+    Same coverage as ``test_automation_project_emoji_rendering``, with a dwell
+    after each visual state so a screen recording of the run is reviewable.
+    Dwell length comes from ``OMNIGENT_E2E_DEMO_PACE_MS`` (default 0, so plain
+    runs stay as fast as the sibling test).
+    """
+    pace_ms = int(os.environ.get("OMNIGENT_E2E_DEMO_PACE_MS", "0"))
+
+    def dwell() -> None:
+        if pace_ms:
+            page.wait_for_timeout(pace_ms)
+
+    emoji_project = httpx.post(
+        f"{live_server}/v1/projects",
+        json={"name": "Growth Metrics", "config": {"icon": "📊"}},
+        timeout=10.0,
+    )
+    emoji_project.raise_for_status()
+    emoji_project_id = emoji_project.json()["id"]
+    plain_project = httpx.post(
+        f"{live_server}/v1/projects",
+        json={"name": "Ops Runbook"},
+        timeout=10.0,
+    )
+    plain_project.raise_for_status()
+    plain_project_id = plain_project.json()["id"]
+
+    agent_id = _builtin_agent_id(live_server, "hello_world")
+    _create_task(live_server, agent_id, "Morning triage", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
+    # A row filed into the emoji-less Project anchors the folder-fallback pill.
+    resp = httpx.post(
+        f"{live_server}/v1/scheduled-tasks",
+        json={
+            "name": "Runbook sweep",
+            "prompt": "Do the thing.",
+            "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+            "agent_id": agent_id,
+            "timezone": "UTC",
+            "project_id": plain_project_id,
+        },
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+
+    page.goto(f"{live_server}/tasks")
+    dwell()
+
+    # Scenario 1: create an automation through the dialog, filing it into the
+    # emoji Project from the task-project-trigger select.
+    _open_create_dialog(page)
+    page.get_by_test_id("task-name-input").fill("Weekly metrics digest")
+    page.get_by_test_id("task-prompt-input").fill("Summarize the growth dashboards.")
+    dwell()
+    page.get_by_test_id("task-project-trigger").click()
+    emoji_option = page.get_by_role("option", name="Growth Metrics", exact=True)
+    expect(emoji_option).to_contain_text("📊")
+    expect(
+        page.get_by_role("option", name="Ops Runbook", exact=True).get_by_test_id(
+            "project-label-fallback"
+        )
+    ).to_be_visible()
+    dwell()
+    emoji_option.click()
+    expect(page.get_by_test_id("task-project-trigger")).to_contain_text("📊")
+    dwell()
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    # Scenario 2: row pills — emoji on the filed row, folder fallback on the
+    # emoji-less Project's row — then the filter listbox showing both.
+    emoji_row = _row_by_name(page, "Weekly metrics digest")
+    expect(emoji_row).to_be_visible(timeout=30_000)
+    emoji_chip = emoji_row.get_by_test_id("task-project-chip")
+    expect(emoji_chip).to_contain_text("📊")
+    expect(emoji_chip).to_contain_text("Growth Metrics")
+    plain_row = _row_by_name(page, "Runbook sweep")
+    plain_chip = plain_row.get_by_test_id("task-project-chip")
+    expect(plain_chip).to_contain_text("Ops Runbook")
+    expect(plain_chip.get_by_test_id("project-label-fallback")).to_be_visible()
+    dwell()
+    page.get_by_test_id("tasks-project-filter").click()
+    filter_emoji_option = page.get_by_role("option", name="Growth Metrics", exact=True)
+    expect(filter_emoji_option).to_contain_text("📊")
+    expect(
+        page.get_by_role("option", name="Ops Runbook", exact=True).get_by_test_id(
+            "project-label-fallback"
+        )
+    ).to_be_visible()
+    dwell()
+
+    # Scenario 3: narrow to each Project, then Unfiled, then back to All.
+    filter_emoji_option.click()
+    expect(page.get_by_test_id("tasks-project-filter")).to_contain_text("📊")
+    expect(emoji_row).to_be_visible(timeout=30_000)
+    expect(plain_row).to_be_hidden()
+    expect(_row_by_name(page, "Morning triage")).to_be_hidden()
+    dwell()
+    _pick_select_option(page, "tasks-project-filter", "Ops Runbook")
+    expect(plain_row).to_be_visible(timeout=30_000)
+    expect(emoji_row).to_be_hidden()
+    dwell()
+    _pick_select_option(page, "tasks-project-filter", "Unfiled")
+    expect(_row_by_name(page, "Morning triage")).to_be_visible(timeout=30_000)
+    expect(emoji_row).to_be_hidden()
+    expect(plain_row).to_be_hidden()
+    dwell()
+    _pick_select_option(page, "tasks-project-filter", "All projects")
+    expect(emoji_row).to_be_visible(timeout=30_000)
+    expect(plain_row).to_be_visible()
+    expect(_row_by_name(page, "Morning triage")).to_be_visible()
+    dwell()
+
+    # Scenario 4: fire the emoji Project's automation and prove the spawned
+    # session lands in that Project — the backend half of the feature, which has
+    # no other on-screen evidence. Run now launches on the connected host, so the
+    # fire creates a real session stamped with the task's project_id.
+    emoji_row.hover()
+    emoji_row.get_by_test_id("task-row-menu").click()
+    expect(page.get_by_test_id("task-run-now")).to_be_visible()
+    dwell()
+    page.get_by_test_id("task-run-now").click()
+
+    # The fire is async (POST returns 202). Wait for the run to create a session,
+    # then confirm over REST it is filed under the emoji Project (the sessions
+    # filter matches by project NAME, exactly as the sidebar folder query does).
+    def _fired_session() -> dict | None:
+        listed = httpx.get(
+            f"{live_server}/v1/sessions",
+            params={"project": "Growth Metrics"},
+            timeout=5.0,
+        ).json()
+        rows = listed.get("data", [])
+        return rows[0] if rows else None
+
+    waited = 0
+    while _fired_session() is None and waited < 150:
+        page.wait_for_timeout(200)
+        waited += 1
+    session = _fired_session()
+    assert session is not None, "Run now did not create a session for the emoji Project"
+    assert session["project_id"] == emoji_project_id, (
+        f"fired session filed under {session['project_id']!r}, "
+        f"not the emoji Project {emoji_project_id!r}"
+    )
+
+    # And it shows in the sidebar, nested under the emoji Project's folder.
+    sidebar = page.get_by_role("complementary", name="Conversations")
+    sidebar.get_by_test_id("project-list-actions").click()
+    page.get_by_test_id("expand-all-projects").click()
+    expect(sidebar.get_by_text("Weekly metrics digest")).to_be_visible(timeout=30_000)
+    # Hold on the destination — the fired session nested under the emoji Project —
+    # long enough for a reviewer to read it.
+    dwell()
+    dwell()
