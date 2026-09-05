@@ -1030,6 +1030,11 @@ _AGY_IDLE_MARKER = "? for shortcuts"
 # a mid-turn steer; submission itself is verified by draft disappearance, NOT by
 # this marker (footer text can change across agy builds or be truncated).
 _AGY_ACTIVE_MARKER = "esc to cancel"
+# Pause between Escape re-sends while a marker-less panel (e.g. the /usage
+# overlay) occupies the pane during prompt readiness (see
+# :func:`_wait_for_agy_prompt_ready`). Matches claude-native's occupied-input
+# dismiss cadence.
+_PANEL_DISMISS_RETRY_INTERVAL_S = 0.75
 # agy collapses a paste carrying many line breaks into a single placeholder row
 # (``[Pasted text #1 +17 lines]``) instead of echoing the text into the composer.
 # The threshold is line-count based — ~13+ line breaks; total length does not
@@ -1420,16 +1425,48 @@ def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s:
     the submit step is the real guard, and a changed footer string in a future
     agy build must not hard-block delivery.
 
+    **Occupying-panel reclaim.** A full-screen panel left on the pane — the
+    ``/usage`` overlay and its slash-command siblings — renders NEITHER footer
+    marker (agy dropped the statusline hints from overlay panels) and swallows
+    every keystroke, so a paste delivered into it is lost and the turn dies.
+    Each such panel documents Escape as its way out ("press esc or q to
+    close"), so while the pane verifiably shows a marker-less screen — a
+    non-empty capture with no footer, re-confirmed on a later poll so a
+    repaint artifact never draws one — a bare Escape is sent, re-sent while
+    the panel remains (spaced by :data:`_PANEL_DISMISS_RETRY_INTERVAL_S`), to
+    hand the composer back before the paste. Escape is never spent while a
+    footer marker is visible: on the idle composer it could clear a draft,
+    and mid-turn it would cancel the running turn. An empty (torn) capture is
+    "unknown" and earns no Escape. Mirrors claude-native's
+    ``_restore_occupied_input``.
+
     :param socket_path: tmux server socket path.
     :param tmux_target: tmux pane target.
     :param timeout_s: Maximum seconds to wait for a footer to render.
     :returns: None.
     """
     deadline = time.monotonic() + timeout_s
+    markerless_streak = 0
+    last_escape: float | None = None
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
         if _AGY_IDLE_MARKER in pane or _AGY_ACTIVE_MARKER in pane:
             return
+        if pane.strip():
+            markerless_streak += 1
+        else:
+            markerless_streak = 0
+        now = time.monotonic()
+        if markerless_streak >= 2 and (
+            last_escape is None or now - last_escape >= _PANEL_DISMISS_RETRY_INTERVAL_S
+        ):
+            _logger.info("antigravity-native: dismissing the panel occupying the agy input box")
+            # Best-effort: a send-keys race with a dying pane must not turn the
+            # non-raising readiness gate into a hard failure — the delivery
+            # step right after this reports the real cause loudly.
+            with contextlib.suppress(RuntimeError):
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+            last_escape = now
         time.sleep(_TMUX_POLL_INTERVAL_S)
 
 
@@ -1648,7 +1685,10 @@ def inject_user_message_via_tui(
     its id only after processing a turn), which the forwarder then discovers.
 
     Steps: wait for the advertised tmux target and the agy input box (idle OR a
-    running turn — agy accepts a mid-turn paste), then deliver via
+    running turn — agy accepts a mid-turn paste; a marker-less panel occupying
+    the pane, e.g. a ``/usage`` overlay left open from the Terminal view, is
+    dismissed with a verified Escape — see :func:`_wait_for_agy_prompt_ready`),
+    then deliver via
     :func:`_paste_and_submit` (clear the draft, stream the content through a named
     tmux buffer, wait for the draft to render, submit and verify it left the live
     composer).
