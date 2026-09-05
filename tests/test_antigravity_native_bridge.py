@@ -1813,6 +1813,94 @@ def test_seed_isolated_agy_home_tolerates_absent_plugins(
     assert (iso_config / ".migrated").is_file()
 
 
+def test_seed_isolated_agy_home_seeds_user_global_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user's global config/hooks.json is seeded into --gemini_dir.
+
+    agy loads its global lifecycle hooks from ``<gemini_dir>/config/hooks.json``,
+    so without the seed a dispatched session silently drops the user's
+    hook-based policy gates (e.g. a PreToolUse deny of ``git commit
+    --no-verify``) that fire in every interactive agy.
+    """
+    fake_home = tmp_path / "real-home"
+    real_config = fake_home / ".gemini" / "config"
+    real_config.mkdir(parents=True)
+    hooks_payload = json.dumps(
+        {"no-verify-gate": {"PreToolUse": [{"matcher": "run_command", "hooks": []}]}}
+    )
+    (real_config / "hooks.json").write_text(hooks_payload, encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_hooks = agy_gemini_dir(bridge_dir) / "config" / "hooks.json"
+    assert json.loads(iso_hooks.read_text(encoding="utf-8")) == json.loads(hooks_payload)
+    # The real file is copied, never moved or modified.
+    assert (real_config / "hooks.json").read_text(encoding="utf-8") == hooks_payload
+
+
+def test_seed_isolated_agy_home_reseed_refreshes_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-seeding picks up the freshest real-home hooks, so policy edits win."""
+    fake_home = tmp_path / "real-home"
+    real_hooks = fake_home / ".gemini" / "config" / "hooks.json"
+    real_hooks.parent.mkdir(parents=True)
+    real_hooks.write_text('{"old-gate": {}}', encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+    real_hooks.write_text('{"new-gate": {}}', encoding="utf-8")
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_hooks = agy_gemini_dir(bridge_dir) / "config" / "hooks.json"
+    assert json.loads(iso_hooks.read_text(encoding="utf-8")) == {"new-gate": {}}
+
+
+def test_seed_isolated_agy_home_hooks_are_copied_not_linked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hooks are copied, not linked: agy can write hooks.json, and an edit made
+    inside a dispatched session must never mutate the user's real ~/.gemini."""
+    fake_home = tmp_path / "real-home"
+    real_hooks = fake_home / ".gemini" / "config" / "hooks.json"
+    real_hooks.parent.mkdir(parents=True)
+    real_hooks.write_text('{"gate": {}}', encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_hooks = agy_gemini_dir(bridge_dir) / "config" / "hooks.json"
+    assert not iso_hooks.is_symlink()
+    iso_hooks.write_text('{"session-edit": {}}', encoding="utf-8")
+    assert real_hooks.read_text(encoding="utf-8") == '{"gate": {}}'
+
+
+def test_seed_isolated_agy_home_tolerates_absent_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user with no global hooks seeds cleanly — no file, no failed launch."""
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_config = agy_gemini_dir(bridge_dir) / "config"
+    assert not (iso_config / "hooks.json").exists()
+    # The rest of the seed still landed.
+    assert (iso_config / ".migrated").is_file()
+
+
 def test_seed_isolated_agy_home_exposes_user_skill_dirs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
