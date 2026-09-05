@@ -346,7 +346,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _IM.NATIVE_TUI,
         _EL.JSONRPC,
         _RS.WARM_REATTACH,
-        _EF.OPENAI,
+        _EF.CODEX_NATIVE,
         _MF.GPT,
         _AU.OMNIGENT_CREDENTIAL,
         subagents=True,

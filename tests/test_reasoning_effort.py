@@ -237,11 +237,23 @@ def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
     returns ``None`` (callers cannot classify it, so a filter must pass the
     value through rather than drop what a plugin harness might accept).
     """
-    from omnigent.reasoning_effort import GEMINI_EFFORTS, efforts_for_harness
+    from omnigent.reasoning_effort import (
+        CODEX_NATIVE_EFFORTS,
+        GEMINI_EFFORTS,
+        OPENAI_EFFORTS,
+        efforts_for_harness,
+    )
 
     assert efforts_for_harness("claude-sdk") == ANTHROPIC_EFFORTS
     assert efforts_for_harness("claude-native") == ANTHROPIC_EFFORTS
     assert efforts_for_harness("antigravity-native") == GEMINI_EFFORTS
+    # codex-native drives the real CLI (per-model ladder up to ultra), not the
+    # Responses wire — so it gets the full native vocabulary, while the `codex`
+    # SDK harness stays on the capped wire ladder.
+    assert efforts_for_harness("codex-native") == CODEX_NATIVE_EFFORTS
+    assert "max" in efforts_for_harness("codex-native")
+    assert efforts_for_harness("codex") == OPENAI_EFFORTS
+    assert "max" not in efforts_for_harness("codex")
     # pi declares its own family, so it resolves to a real vocabulary.
     assert efforts_for_harness("pi") == PI_EFFORTS
     assert efforts_for_harness("pi-native") == PI_EFFORTS
