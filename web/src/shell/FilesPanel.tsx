@@ -10,7 +10,7 @@ import {
   SlidersHorizontalIcon,
   XIcon,
 } from "lucide-react";
-import { useDeferredValue, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
 import { isOwnerLevel } from "@/lib/permissionsApi";
@@ -340,13 +340,6 @@ export function FilesPanel({
   }
 
   const allFilesQuery = useWorkspaceAllFiles(conversationId, { enabled: !flatView }, locationParam);
-  // Defer only the tree's file rows, not the panel's identity. On a conversation
-  // switch the heavy FolderTree render then happens in a non-blocking follow-up
-  // pass (React discards it if you switch again first), while conversationId,
-  // locationParam, and onFileSelect stay immediate — so a click during the lag
-  // resolves against the current conversation, never opens the previous one's
-  // file under the new session.
-  const deferredTreeFiles = useDeferredValue(allFilesQuery.data?.data);
   // A refused location must say so on the bar. Rendering an empty tree instead
   // would read as "this directory is empty", which is a different fact.
   const unreachable =
@@ -582,7 +575,7 @@ export function FilesPanel({
           />
         ) : (
           <FolderTree
-            files={deferredTreeFiles}
+            files={allFilesQuery.data?.data}
             isLoading={allFilesQuery.isLoading}
             isError={allFilesQuery.isError}
             error={allFilesQuery.error}

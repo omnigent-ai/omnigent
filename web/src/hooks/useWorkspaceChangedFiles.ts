@@ -423,13 +423,14 @@ export function useWorkspaceAllFiles(
     // the session's `failed` status downstream, not by retries.
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
-    // Keep the tree warm across conversation switches: within staleTime a
-    // return paints the cached tree with no loading flash, and placeholderData
-    // holds the last tree on screen during any background refetch instead of
-    // blanking to a spinner. Freshness on turn-completion is still handled by
-    // useTrailingInvalidate above.
+    // Keep the tree warm on revisits: within staleTime a return to a
+    // previously-loaded conversation/location paints its cached tree with no
+    // loading flash. Freshness on turn-completion is still handled by
+    // useTrailingInvalidate above. No cross-key placeholderData — carrying the
+    // previous conversation's tree under a new conversation's key fed stale
+    // files into the folder tree's default-expansion cache; virtualization
+    // already keeps the per-switch render cheap, so the warm-carry isn't needed.
     staleTime: 30_000,
-    placeholderData: (prev) => prev,
   });
 }
 
