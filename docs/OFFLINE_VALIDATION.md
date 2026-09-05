@@ -5,9 +5,12 @@ starting agents, importing bundle-local Python or policy handlers, resolving
 credentials, expanding environment variables, contacting services, or changing
 the input. It also bypasses normal CLI state migration, diagnostic logs, update
 checks, and community-plugin loading. Operator-required CLI wrappers still apply.
-For this command, the working directory and supplied bundle roots are removed
-from dependency lookup before package initialization, so a bundle-local
-`yaml.py` or `hashlib.py` cannot replace an installed dependency.
+For this command, the working directory, supplied bundle roots and their
+descendant import paths are removed from dependency lookup before package
+initialization, so a bundle-local `yaml.py` or `hashlib.py` cannot replace an
+installed dependency. Only the running interpreter's identified standard-library
+and dependency installation paths are exempt, including an active project-local
+virtualenv; merely naming a directory `site-packages` does not make it trusted.
 
 This is an independently useful **static preflight**, not proof that an agent
 can run. It does not validate deployment readiness or execute workflows.
@@ -44,7 +47,8 @@ the current directory; offline mode is always enabled, so `--offline` is
 optional. Without `--json`, output is human-readable and still lists skipped
 checks. Runtime root flags such as `--profiling`, `--debug`, and
 `--log-to-stderr` are not supported for `validate`; they are rejected instead
-of activating their startup effects. `validate --help` exits `0`.
+of activating their startup effects, including before a root `--` separator.
+`omnigent -- validate ...` is supported. `validate --help` exits `0`.
 
 ## Supported scope
 

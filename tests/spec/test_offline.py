@@ -64,6 +64,38 @@ def test_bundle_and_explicit_config_have_the_same_report(tmp_path: Path) -> None
     }
 
 
+@pytest.mark.parametrize("tools", ["", "tools: {}\n", "tools: {agents: [worker]}\n"])
+def test_offline_output_does_not_depend_on_container_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tools: str
+) -> None:
+    path = write_config(tmp_path, BASE + tools)
+    write_config(
+        tmp_path / "agents" / "worker",
+        "spec_version: 1\nname: worker\nexecutor: {type: agents_sdk}\n",
+    )
+    monkeypatch.delenv("OMNIGENT_CONTAINER_RUNTIME", raising=False)
+    expected = validate_path(str(path)).to_dict()
+    assert expected["status"] == "valid"
+    for value in ("docker", "podman", "", "invalid-host-runtime"):
+        monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", value)
+        assert validate_path(str(path)).to_dict() == expected
+        assert os.environ["OMNIGENT_CONTAINER_RUNTIME"] == value
+
+
+def test_offline_validation_does_not_read_container_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_config(tmp_path)
+    original_get = os.environ.get
+
+    def guarded_get(key: str, default: object = None) -> object:
+        assert key != "OMNIGENT_CONTAINER_RUNTIME", "Offline parsing read the runtime environment"
+        return original_get(key, default)
+
+    monkeypatch.setattr(os.environ, "get", guarded_get)
+    assert validate_path(str(path)).exit_code == 0
+
+
 @pytest.mark.parametrize("extension", [".yaml", ".yml"])
 def test_explicit_v1_yaml_filename(tmp_path: Path, extension: str) -> None:
     path = tmp_path / f"agent{extension}"

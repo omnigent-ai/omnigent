@@ -338,7 +338,7 @@ class _Reader:
                 "INPUT_LIMIT", "agents", "Agent nesting exceeds the offline limit."
             )
         raw = scope.config(_load_yaml(self.read(path)))
-        spec = parse_config(raw, expand_env=False)
+        spec = parse_config(raw, expand_env=False, default_container_runtime="docker")
         root = path.parent
         spec.instructions = self.instructions(root, raw)
         spec.skills = self.skills(root / "skills")

@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _GUARDED_ENTRYPOINT = r"""
 import importlib.abc
 import runpy
@@ -21,7 +23,8 @@ def audit(event, args):
 
 class BlockRuntime(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.startswith(("offline_bundle_trap", "omnigent.inner.loader",
+        if fullname == "omnigent.cli" or fullname.startswith((
+                                "offline_bundle_trap", "omnigent.inner.loader",
                                 "omnigent.runtime", "omnigent.policies",
                                 "omnigent.tools.builtins", "omnigent.cli_config",
                                 "omnigent.spec._omnigent_compat")):
@@ -34,7 +37,137 @@ runpy.run_module("omnigent", run_name="__main__")
 """
 
 
-def test_offline_bundle_cli_happy_path(tmp_path: Path) -> None:
+@pytest.fixture
+def offline_bundle(tmp_path: Path) -> Path:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "config.yaml").write_text(
+        "spec_version: 1\nexecutor: {type: agents_sdk}\n", encoding="utf-8"
+    )
+    return bundle
+
+
+@pytest.fixture
+def offline_cli_env(tmp_path: Path) -> dict[str, str]:
+    process_env = {
+        name: os.environ[name]
+        for name in (
+            "PATH",
+            "SYSTEMROOT",
+            "WINDIR",
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "TEMP",
+            "TMP",
+            "LANG",
+            "LC_ALL",
+        )
+        if name in os.environ
+    }
+    return {
+        **process_env,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        "PYTHONDONTWRITEBYTECODE": "",
+        "OMNIGENT_WRAPPER_BYPASS": "1",
+        "OMNIGENT_DATA_DIR": str(tmp_path / "must-not-be-created"),
+        "OMNIGENT_CONTAINER_RUNTIME": "invalid-host-runtime",
+    }
+
+
+@pytest.mark.parametrize("input_form", ["directory", "file"])
+def test_offline_cli_rejects_descendant_dependency_shadowing(
+    tmp_path: Path, offline_bundle: Path, offline_cli_env: dict[str, str], input_form: str
+) -> None:
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    import_roots = [
+        offline_bundle / "tools" / "python",
+        offline_bundle / "fake-venv" / "lib" / "site-packages",
+    ]
+    for root in import_roots:
+        root.mkdir(parents=True)
+        for name in ("yaml", "click", "hashlib", "sysconfig"):
+            (root / f"{name}.py").write_text(
+                "raise AssertionError('Imported bundle descendant as a dependency')\n",
+                encoding="utf-8",
+            )
+    before = {
+        p.relative_to(offline_bundle): p.read_bytes()
+        for p in offline_bundle.rglob("*")
+        if p.is_file()
+    }
+    offline_cli_env["PYTHONPATH"] = os.pathsep.join(
+        [offline_cli_env["PYTHONPATH"], *(str(root) for root in import_roots)]
+    )
+    source = offline_bundle if input_form == "directory" else offline_bundle / "config.yaml"
+    result = subprocess.run(
+        [sys.executable, "-m", "omnigent", "validate", str(source), "--offline", "--json"],
+        cwd=caller,
+        env=offline_cli_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert json.loads(result.stdout)["status"] == "valid"
+    assert not (tmp_path / "must-not-be-created").exists()
+    assert before == {
+        p.relative_to(offline_bundle): p.read_bytes()
+        for p in offline_bundle.rglob("*")
+        if p.is_file()
+    }
+
+
+@pytest.mark.parametrize(
+    ("prefix", "expected_exit"),
+    [
+        (["--"], 0),
+        (["--profiling", "--"], 2),
+        (["--debug", "--"], 2),
+        (["--log-to-stderr", "--"], 2),
+        (["--debug", "--profiling", "--log-to-stderr", "--"], 2),
+    ],
+)
+def test_offline_cli_root_separator_cannot_enter_runtime(
+    tmp_path: Path,
+    offline_bundle: Path,
+    offline_cli_env: dict[str, str],
+    prefix: list[str],
+    expected_exit: int,
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _GUARDED_ENTRYPOINT,
+            *prefix,
+            "validate",
+            str(offline_bundle),
+            "--offline",
+            "--json",
+        ],
+        cwd=offline_bundle,
+        env=offline_cli_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == expected_exit, result.stdout + result.stderr
+    assert result.stderr == ""
+    payload = json.loads(result.stdout)
+    assert payload["exit_code"] == expected_exit
+    assert payload["status"] == ("valid" if expected_exit == 0 else "invalid_invocation")
+    if expected_exit:
+        assert payload["diagnostics"][0]["code"] == "INVALID_INVOCATION"
+        assert str(offline_bundle) not in result.stdout
+    assert not (tmp_path / "must-not-be-created").exists()
+    assert list(offline_bundle.iterdir()) == [offline_bundle / "config.yaml"]
+
+
+def test_offline_bundle_cli_happy_path(tmp_path: Path, offline_cli_env: dict[str, str]) -> None:
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     (bundle / "config.yaml").write_text(
@@ -91,14 +224,9 @@ guardrails:
     python_tools.mkdir()
     (python_tools / "untrusted.py").write_text(code, encoding="utf-8")
     before = {p.relative_to(bundle): p.read_bytes() for p in bundle.rglob("*") if p.is_file()}
-    repo = Path(__file__).resolve().parents[2]
     secret = "offline-e2e-secret-not-a-real-credential"
     env = {
-        **os.environ,
-        "PYTHONPATH": str(repo),
-        "PYTHONDONTWRITEBYTECODE": "",
-        "OMNIGENT_WRAPPER_BYPASS": "1",
-        "OMNIGENT_DATA_DIR": str(tmp_path / "must-not-be-created"),
+        **offline_cli_env,
         "OFFLINE_E2E_SECRET": secret,
     }
     outputs = []

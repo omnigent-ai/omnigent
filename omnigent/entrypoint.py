@@ -10,8 +10,9 @@ def offline_arguments(argv: list[str]) -> list[str] | None:
     index = 0
     while index < len(argv) and argv[index] in {"--debug", "--log-to-stderr", "--profiling"}:
         index += 1
-    if index < len(argv) and argv[index] == "validate":
-        return [*argv[:index], *argv[index + 1 :]]
+    command_index = index + 1 if index < len(argv) and argv[index] == "--" else index
+    if command_index < len(argv) and argv[command_index] == "validate":
+        return [*argv[:index], *argv[command_index + 1 :]]
     return None
 
 
@@ -48,14 +49,53 @@ def isolate_offline_imports(*, package_init: bool = False) -> None:
         roots.add(path)
         if path.endswith((".yaml", ".yml")):
             roots.add(os.path.dirname(path))
-    trusted_paths = []
-    for entry in sys.path:
-        path = os.path.normcase(os.path.abspath(entry))
-        # A project's .venv is a trusted interpreter dependency path, not the
-        # project import root; retain nested installation paths.
-        if path not in roots:
-            trusted_paths.append(entry)
-    sys.path[:] = trusted_paths
+
+    def normalized(path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
+
+    # Bootstrap metadata discovery from the running interpreter's stdlib, never
+    # a bundle's sysconfig.py. Do not trust a path merely named "site-packages".
+    stdlib = getattr(sys, "_stdlib_dir", None) or os.path.dirname(os.__file__)
+    trusted = {
+        normalized(stdlib),
+        normalized(os.path.join(stdlib, "lib-dynload")),
+        normalized(
+            os.path.join(
+                os.path.dirname(stdlib),
+                f"python{sys.version_info.major}{sys.version_info.minor}.zip",
+            )
+        ),
+    }
+    if os.name == "nt":
+        trusted.add(normalized(os.path.join(sys.base_exec_prefix, "DLLs")))
+    original_paths = [(entry, normalized(entry)) for entry in sys.path]
+
+    def filtered_paths() -> list[str]:
+        return [
+            entry
+            for entry, path in original_paths
+            if path in trusted
+            or not any(
+                path == root or path.startswith(root.rstrip(os.sep) + os.sep) for root in roots
+            )
+        ]
+
+    sys.path[:] = filtered_paths()
+    import sysconfig
+
+    trusted.update(
+        normalized(sysconfig.get_path(name))
+        for name in ("stdlib", "platstdlib", "purelib", "platlib")
+    )
+    extension_path = sysconfig.get_config_var("DESTSHARED")
+    if isinstance(extension_path, str):
+        trusted.add(normalized(extension_path))
+    site = sys.modules.get("site")
+    if site is not None:
+        trusted.update(normalized(path) for path in site.getsitepackages())
+        if site.ENABLE_USER_SITE and site.USER_SITE:
+            trusted.add(normalized(site.USER_SITE))
+    sys.path[:] = filtered_paths()
 
 
 def main() -> None:

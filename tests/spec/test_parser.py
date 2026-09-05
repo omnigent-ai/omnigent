@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 import yaml
 
 from omnigent.errors import OmnigentError
-from omnigent.spec.parser import _parse_skill, discover_host_skills, parse
+from omnigent.spec.parser import _parse_skill, discover_host_skills, parse, parse_config
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
@@ -1571,6 +1572,42 @@ def test_parse_tools_sandbox_null_runtime_rejected(tmp_path: Path) -> None:
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
     with pytest.raises(ValueError, match="container_runtime"):
         parse(tmp_path)
+
+
+@pytest.mark.parametrize("tools", [None, {}, {"sandbox": {"container_image": "python:3.12-slim"}}])
+def test_parse_config_container_runtime_default_is_explicit(
+    monkeypatch: pytest.MonkeyPatch, tools: dict[str, object] | None
+) -> None:
+    raw = {"spec_version": 1, "tools": tools}
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "podman")
+    assert parse_config(raw, expand_env=False).tools.sandbox.container_runtime == "podman"
+    assert (
+        parse_config(
+            raw, expand_env=False, default_container_runtime="docker"
+        ).tools.sandbox.container_runtime
+        == "docker"
+    )
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "invalid-host-runtime")
+    with pytest.raises(ValueError, match="container_runtime"):
+        parse_config(raw, expand_env=False)
+    assert (
+        parse_config(
+            raw, expand_env=False, default_container_runtime="docker"
+        ).tools.sandbox.container_runtime
+        == "docker"
+    )
+    assert os.environ["OMNIGENT_CONTAINER_RUNTIME"] == "invalid-host-runtime"
+
+
+def test_parse_config_yaml_runtime_beats_explicit_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "invalid-host-runtime")
+    raw = {"spec_version": 1, "tools": {"sandbox": {"container_runtime": "podman"}}}
+    assert (
+        parse_config(
+            raw, expand_env=False, default_container_runtime="docker"
+        ).tools.sandbox.container_runtime
+        == "podman"
+    )
 
 
 def test_parse_inline_mcp_skips_non_mcp_type_entries(tmp_path: Path) -> None:

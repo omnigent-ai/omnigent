@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import sysconfig
 import types
 from pathlib import Path
 
@@ -77,7 +78,16 @@ def test_help() -> None:
 
 
 @pytest.mark.parametrize(
-    "argv", [["version"], ["run", "agent.yaml"], ["--help"], ["host"], ["--version", "validate"]]
+    "argv",
+    [
+        ["version"],
+        ["run", "agent.yaml"],
+        ["--help"],
+        ["host"],
+        ["--version", "validate"],
+        ["--", "version"],
+        ["--profiling", "--", "version"],
+    ],
 )
 def test_other_entrypoint_commands_are_delegated_unchanged(
     argv: list[str], monkeypatch: pytest.MonkeyPatch
@@ -91,9 +101,19 @@ def test_other_entrypoint_commands_are_delegated_unchanged(
     assert called == [["omnigent", *argv]]
 
 
-def test_root_runtime_flags_do_not_trigger_startup() -> None:
-    args = offline_arguments(["--profiling", "validate", "--json"])
-    assert args == ["--profiling", "--json"]
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        ["--profiling"],
+        ["--profiling", "--"],
+        ["--debug", "--"],
+        ["--log-to-stderr", "--"],
+        ["--debug", "--log-to-stderr", "--profiling", "--"],
+    ],
+)
+def test_root_runtime_flags_do_not_trigger_startup(prefix: list[str]) -> None:
+    args = offline_arguments([*prefix, "validate", "--json"])
+    assert args == [flag for flag in prefix if flag != "--"] + ["--json"]
     result = CliRunner().invoke(validate_command, args)
     assert result.exit_code == 2
     assert json.loads(result.stdout)["status"] == "invalid_invocation"
@@ -121,7 +141,23 @@ def test_import_isolation_preserves_project_virtualenv(
     monkeypatch.setattr(sys, "argv", ["omnigent", "validate", "--json"])
     monkeypatch.setattr(sys, "dont_write_bytecode", False)
     site_packages = str(tmp_path / ".venv" / "lib" / "site-packages")
-    monkeypatch.setattr(sys, "path", ["", str(tmp_path), site_packages])
+    child = str(tmp_path / "tools" / "python")
+    fake_site_packages = str(tmp_path / "fake-venv" / "lib" / "site-packages")
+    original_get_path = sysconfig.get_path
+    monkeypatch.setattr(
+        sysconfig,
+        "get_path",
+        lambda name: site_packages if name in {"purelib", "platlib"} else original_get_path(name),
+    )
+    monkeypatch.setattr(sys, "path", ["", str(tmp_path), child, fake_site_packages, site_packages])
     isolate_offline_imports(package_init=True)
     assert sys.path == [site_packages]
     assert sys.dont_write_bytecode
+
+
+def test_root_separator_is_removed_but_command_separator_is_preserved() -> None:
+    assert offline_arguments(["--", "validate", "bundle", "--json"]) == ["bundle", "--json"]
+    assert offline_arguments(["--", "validate", "--", "--literal.yaml"]) == [
+        "--",
+        "--literal.yaml",
+    ]

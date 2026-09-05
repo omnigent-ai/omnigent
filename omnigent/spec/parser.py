@@ -203,12 +203,15 @@ def parse_config(
     raw: dict[str, Any],  # type: ignore[explicit-any]  # heterogeneous decoded YAML
     *,
     expand_env: bool = True,
+    default_container_runtime: Literal["docker", "podman"] | None = None,
 ) -> AgentSpec:
     """Parse config fields without discovering assets or resolving instructions.
 
     Callers handling untrusted data must validate its shape first and disable
     environment expansion. OS-environment configuration has separate credential
     resolution rules; offline callers must exclude that block.
+    ``default_container_runtime`` supplies an explicit sandbox fallback without
+    consulting the host environment; ``None`` preserves runtime defaults.
     """
     if not isinstance(raw, dict):
         raise OmnigentError(
@@ -228,7 +231,9 @@ def parse_config(
     raw_tools = raw.get("tools")
     llm = _parse_llm(raw_llm, expand_env=expand_env)
     interaction = _parse_interaction(raw.get("interaction"))
-    tools_config = _parse_tools_config(raw_tools, expand_env=expand_env)
+    tools_config = _parse_tools_config(
+        raw_tools, expand_env=expand_env, default_container_runtime=default_container_runtime
+    )
     executor = _parse_executor(raw_executor, expand_env=expand_env)
     # ── Consolidate llm: → executor ────────────────────────────────
     # ``executor.model`` and ``executor.connection`` are the primary
@@ -443,6 +448,7 @@ def _parse_tools_config(
     raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
+    default_container_runtime: Literal["docker", "podman"] | None = None,
 ) -> ToolsConfig:
     """
     Parse the ``tools:`` block from config.yaml into a
@@ -456,11 +462,17 @@ def _parse_tools_config(
         when *raw* is ``None``.
     """
     if raw is None:
-        return ToolsConfig()
+        return ToolsConfig(
+            sandbox=_parse_sandbox_config(
+                None, default_container_runtime=default_container_runtime
+            )
+        )
     timeout = _parse_int_field(raw["timeout"], "tools.timeout") if "timeout" in raw else 60
     retry = _parse_retry(raw.get("retry"))
     builtins = _parse_builtin_tools(raw.get("builtins", []), expand_env=expand_env)
-    sandbox = _parse_sandbox_config(raw.get("sandbox"))
+    sandbox = _parse_sandbox_config(
+        raw.get("sandbox"), default_container_runtime=default_container_runtime
+    )
     raw_agents = raw.get("agents", [])
     if not isinstance(raw_agents, list):
         raise OmnigentError(
@@ -478,6 +490,8 @@ def _parse_tools_config(
 
 def _parse_sandbox_config(
     raw: object,
+    *,
+    default_container_runtime: Literal["docker", "podman"] | None = None,
 ) -> SandboxConfig:
     """
     Parse the ``tools.sandbox`` block from config.yaml.
@@ -493,16 +507,18 @@ def _parse_sandbox_config(
 
     :param raw: The raw ``sandbox`` value from the ``tools``
         block. ``None`` means not specified (use defaults).
+    :param default_container_runtime: Explicit fallback for data-only callers;
+        ``None`` retains the environment-based runtime default.
     :returns: A :class:`SandboxConfig`.
     """
     if raw is None or not isinstance(raw, dict):
-        return SandboxConfig()
+        return SandboxConfig(container_runtime=default_container_runtime)
     raw_image = raw.get("container_image") or raw.get("docker_image")
     image = str(raw_image) if raw_image is not None else None
     raw_runtime = raw.get("container_runtime")
     runtime: Literal["docker", "podman"] | None
     if "container_runtime" not in raw:
-        runtime = None
+        runtime = default_container_runtime
     elif raw_runtime == "docker":
         runtime = "docker"
     elif raw_runtime == "podman":
