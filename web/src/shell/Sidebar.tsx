@@ -52,6 +52,7 @@ import {
   SquareCheckIcon,
   SquarePenIcon,
   Trash2Icon,
+  UsersIcon,
   WalletIcon,
   XIcon,
 } from "lucide-react";
@@ -3947,6 +3948,11 @@ function ConversationRowImpl({
           {label}
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
+        {!isOwner && (
+          <span role="img" aria-label="Shared session" title="Shared with you" className="shrink-0">
+            <UsersIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
+          </span>
+        )}
       </div>
     </Link>
   );
