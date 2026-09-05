@@ -2192,6 +2192,9 @@ def _databricks_launch_materialization(
             "with a host visible to the runner process."
         )
     host = host.rstrip("/")
+    # Resolve against what the workspace actually serves (live UC listing →
+    # ucode state → bundled catalog), never the bundled catalog alone — its
+    # legacy ``databricks-`` spellings can 501 on today's gateway.
     resolved_model = _resolve_databricks_codex_model(host, profile, model)
     return _DatabricksLaunchMaterialization(
         config_overrides=_databricks_codex_config_overrides(
@@ -2206,28 +2209,32 @@ def _databricks_launch_materialization(
 
 # DATABRICKS-PATCH(codex-live-model-discovery)
 def _resolve_databricks_codex_model(host: str, profile: str, requested: str | None) -> str:
-    """Use an explicit Codex model ID or select a Databricks default.
+    """Resolve the codex launch model against what the workspace serves.
 
-    Explicit IDs are opaque and never rewritten or revalidated here. Callers
-    must resolve aliases before building the launch.
+    Codex used to take its model from the bundled MLflow catalog — a
+    third-party listing whose Databricks ids carry the legacy
+    ``databricks-`` spelling the gateway now answers with ``501
+    NOT_IMPLEMENTED ... Use Unity Catalog model services (v3)`` — so a launch
+    could pin a model the workspace will not serve. Resolve from the workspace
+    instead, as claude-native already does: the live Unity Catalog listing,
+    then ucode's cached copy of it, then the bundled catalog as the documented
+    last resort.
 
-    Only an unset model needs discovery: prefer the live workspace listing,
-    then ucode's cached copy on failure, then the bundled catalog as a last
-    resort. The bundled catalog alone may name models the workspace cannot
-    serve.
+    An explicit model is matched against the servable ids, so a legacy
+    ``model_override`` persisted before this change still launches; one the
+    workspace does not serve passes through untouched, because the gateway's
+    error beats a silent substitution.
 
     :param host: Workspace origin, e.g. ``"https://example.com"``.
     :param profile: Databricks CLI profile backing the launch.
-    :param requested: Explicit provider model ID; ``None`` or an empty string
-        selects the preferred available default.
+    :param requested: Explicit model id, or ``None`` to take the newest
+        servable one.
     :returns: The model id to pin on the codex launch.
     """
-    if requested:
-        # Explicit IDs need no rediscovery: SDK initialization can block on DNS/auth.
-        # Codex still authenticates through the profile-pinned auth.command.
-        return requested
-
-    from omnigent.databricks_model_discovery import discover_databricks_codex_models
+    from omnigent.databricks_model_discovery import (
+        discover_databricks_codex_models,
+        select_servable_model,
+    )
 
     servable: tuple[str, ...] = ()
     try:
@@ -2260,6 +2267,8 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
                 "native-codex: could not read ucode state for %r", profile, exc_info=True
             )
 
+    if requested:
+        return select_servable_model(requested, servable) or requested
     if servable:
         return servable[0]
     return model_catalog.resolve_catalog_model("databricks", family="openai").model_id

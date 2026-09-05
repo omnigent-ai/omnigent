@@ -4175,6 +4175,8 @@ async def _auto_create_codex_terminal(
         )
         or None
     )
+    # SDK initialization can block on DNS/auth before model discovery times out.
+    # Keep it off the runner loop so heartbeats and other sessions can progress.
     app_server = await asyncio.to_thread(
         build_codex_native_server,
         socket_path=socket_path,
