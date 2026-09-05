@@ -254,6 +254,43 @@ def test_hello_frame_empty_runners() -> None:
     assert decoded.runners == []
 
 
+def test_hello_frame_capabilities_round_trip() -> None:
+    """
+    Verify the hello frame's capability advertisement survives encode → decode.
+
+    The server rejects harness-setup frames a daemon doesn't advertise, so a
+    dropped or garbled list would turn a supported credential write into a
+    spurious "host is too old" rejection.
+    """
+    original = HostHelloFrame(
+        version="0.13.0",
+        frame_protocol_version=1,
+        name="laptop",
+        capabilities=["host.store_secret", "host.detect_credentials"],
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.capabilities == ["host.store_secret", "host.detect_credentials"]
+
+
+def test_hello_frame_without_capabilities_decodes_to_none() -> None:
+    """
+    A hello that predates capability advertisement decodes to ``None``.
+
+    ``None`` means "unknown — judge by version"; collapsing it to an empty
+    list would read as "supports nothing" and block every proxied frame for
+    hosts on 0.7.x–0.12.x, which do support them.
+    """
+    original = HostHelloFrame(
+        version="0.6.0",
+        frame_protocol_version=1,
+        name="laptop",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.capabilities is None
+
+
 def test_launch_runner_frame_round_trip() -> None:
     """
     Verify HostLaunchRunnerFrame survives encode → decode.

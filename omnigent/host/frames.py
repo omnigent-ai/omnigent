@@ -109,6 +109,12 @@ class HostHelloFrame:
         ``omnigent.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host, or a startup probe
         that failed) — never treat it as "nothing is gateway-backed".
+    :param capabilities: Wire ``kind`` values of the request frames this
+        daemon can serve, e.g. ``["host.store_secret", ...]``. Lets the
+        server reject a frame the daemon has no handler for instead of
+        forwarding it into a silent-drop timeout. ``None`` means the host
+        predates capability advertisement — judge those by ``version``,
+        never as "supports nothing".
     """
 
     version: str
@@ -119,6 +125,7 @@ class HostHelloFrame:
     gateway_inference: dict[str, bool] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+    capabilities: list[str] | None = None
 
 
 @dataclass
@@ -1049,6 +1056,9 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "gateway_inference": frame.gateway_inference,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
+                "capabilities": (
+                    list(frame.capabilities) if frame.capabilities is not None else None
+                ),
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1558,6 +1568,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
+        capabilities=_optional_nullable_str_list(msg, "capabilities"),
     )
 
 
@@ -2179,6 +2190,25 @@ def _optional_str_list(msg: _JsonObject, key: str) -> list[str]:
     :raises ValueError: If the field is not a string list.
     """
     val = msg.get(key, [])
+    if not isinstance(val, list) or not all(isinstance(item, str) for item in val):
+        raise ValueError(f"frame field must be a list of strings: {key!r}")
+    return list(val)
+
+
+def _optional_nullable_str_list(msg: _JsonObject, key: str) -> list[str] | None:
+    """Return an optional list of strings, ``None`` when absent or null.
+
+    Unlike :func:`_optional_str_list`, absence is meaningful (the sender
+    predates the field), so it is not collapsed to an empty list.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, e.g. ``"capabilities"``.
+    :returns: A list of strings, or ``None`` when absent/null.
+    :raises ValueError: If the field is present but not a string list.
+    """
+    val = msg.get(key)
+    if val is None:
+        return None
     if not isinstance(val, list) or not all(isinstance(item, str) for item in val):
         raise ValueError(f"frame field must be a list of strings: {key!r}")
     return list(val)

@@ -1345,6 +1345,40 @@ async def test_hello_advertises_installed_version() -> None:
     assert hello.version != "0.1.0"
 
 
+async def test_hello_advertises_frame_capabilities() -> None:
+    """The ``host.hello`` frame advertises the request frames this daemon serves.
+
+    The server gates harness-setup proxies (credential write, credential
+    detection, installs, model options) on this list; a hello without them
+    would make every such request bounce with "update the host" even though
+    this daemon handles them. Every advertised kind must also be a real wire
+    kind — a typo would silently un-advertise a handler.
+    """
+    from omnigent.host.frames import HostFrameKind
+
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.capabilities is not None
+    advertised = set(hello.capabilities)
+    # The harness-setup frames the server's routes gate on.
+    assert {
+        "host.store_secret",
+        "host.detect_credentials",
+        "host.install_harness",
+        "host.model_options",
+    } <= advertised
+    # Every entry is a real request kind (no *_result frames, no typos).
+    valid_kinds = {kind.value for kind in HostFrameKind}
+    assert advertised <= valid_kinds
+    assert not {kind for kind in advertised if kind.endswith("_result")}
+
+
 async def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     """
     Verify that _handle_stop terminates a tracked runner and
