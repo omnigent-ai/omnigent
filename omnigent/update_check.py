@@ -1818,7 +1818,66 @@ def _probe_installed_distribution() -> tuple[str | None, str | None]:
     return version, commit
 
 
-def _upgrade_failure_message(code: int, extras: Collection[str] = ()) -> str:
+def _index_reinstall_command(info: _InstalledWheelInfo, extras: Collection[str]) -> str:
+    """Build the reinstall-from-index command for this install's installer.
+
+    Deliberately not a re-run of the recorded spec (``uv tool upgrade`` /
+    ``pipx reinstall`` would re-pull the recorded git URL): the point is to
+    move the install onto the configured package index.
+
+    :param info: Metadata from ``_read_installed_wheel_info``.
+    :param extras: Extras to preserve on the new spec.
+    :returns: A runnable shell command, or ``""`` when the installer has no
+        known install-from-index form.
+    """
+    installer = info.detected_installer or info.installer
+    spec = _package_spec(extras=extras)
+    if extras:
+        # Brackets are shell glob characters; keep the line copy-pasteable.
+        spec = f"'{spec}'"
+    if installer == "uv":
+        return f"uv tool install --force{_uv_python_pin()} {spec}"
+    if installer == "pipx":
+        return f"pipx install --force {spec}"
+    if installer == "pip":
+        return f"{_pip_invocation()} install --force-reinstall {spec}"
+    return ""
+
+
+def _index_fallback_hint(info: _InstalledWheelInfo, extras: Collection[str]) -> str:
+    """The package-index alternative shown when a git re-pull fails.
+
+    A git-shaped install upgrades by re-pulling its recorded git URL, so on a
+    network where that host is blocked (GitHub from a Databricks workspace,
+    say) the upgrade can never succeed no matter how often it is retried. The
+    configured package index usually still works there (Databricks routes it
+    through a PyPI mirror), so name that way out explicitly.
+
+    :param info: Installed-distribution metadata with ``info.vcs_url`` set.
+    :param extras: Extras this install had, preserved on the suggestion.
+    :returns: The hint paragraph appended to the failure message.
+    """
+    lead = (
+        f"This install upgrades by re-pulling its git source ({info.vcs_url}). "
+        "If this machine cannot reach that host (GitHub is commonly blocked on "
+        "Databricks-managed networks), install the latest release from your "
+        "configured package index (PyPI mirror) instead"
+    )
+    command = _index_reinstall_command(info, extras)
+    if not command:
+        return f"{lead}, using your installer's install-from-index command."
+    return (
+        f"{lead}:\n\n"
+        f"    {command}\n\n"
+        "This moves the install off the git source and onto index releases."
+    )
+
+
+def _upgrade_failure_message(
+    code: int,
+    extras: Collection[str] = (),
+    info: _InstalledWheelInfo | None = None,
+) -> str:
     """Describe a failed upgrade, after checking whether the install survived.
 
     uv and pipx replace the tool environment before the replacement is built,
@@ -1830,13 +1889,20 @@ def _upgrade_failure_message(code: int, extras: Collection[str] = ()) -> str:
     :param code: The installer's exit status.
     :param extras: Extras this install had, so the recovery line reinstalls
         the same shape.
+    :param info: Installed-distribution metadata when the caller has it. A
+        git-shaped install (``info.vcs_url`` set) gets the package-index
+        fallback appended: re-pulling a blocked git host can never succeed,
+        so the failure must name the install path that still works.
     :returns: The message body for the raised ``ClickException``.
     """
     version, _ = _probe_installed_distribution()
     if version is not None:
-        return f"Upgrade command exited with status {code}; your previous install is intact."
+        message = f"Upgrade command exited with status {code}; your previous install is intact."
+        if info is not None and info.vcs_url:
+            message += f"\n\n{_index_fallback_hint(info, extras)}"
+        return message
     extra_flags = "".join(f" --extra {extra}" for extra in sorted(extras))
-    return (
+    message = (
         f"Upgrade command exited with status {code}, and omnigent is no longer "
         "installed: the installer replaced the old environment before the new "
         "build failed. Your agents, history and credentials are untouched; "
@@ -1846,6 +1912,9 @@ def _upgrade_failure_message(code: int, extras: Collection[str] = ()) -> str:
         "If the web UI build was what failed, install Node 22 LTS and pnpm "
         "first, or set OMNIGENT_SKIP_WEB_UI=true to install without it."
     )
+    if info is not None and info.vcs_url:
+        message += f"\n\n{_index_fallback_hint(info, extras)}"
+    return message
 
 
 def _split_vcs_url(vcs_url: str) -> tuple[str, str | None]:

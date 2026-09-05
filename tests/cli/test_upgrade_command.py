@@ -881,6 +881,114 @@ def test_upgrade_failure_message_confirms_a_surviving_install(
     assert message == "Upgrade command exited with status 1; your previous install is intact."
 
 
+def test_upgrade_failure_message_git_install_offers_package_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed git re-pull must name the package-index install path.
+
+    On a network where the git host is unreachable (GitHub from a Databricks
+    workspace), retrying the recorded git URL can never succeed; the mirror
+    served through the configured package index is the only way forward, so
+    the failure message must spell it out — extras preserved.
+    """
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: ("0.8.2", None)
+    )
+    info = _git_install_info()
+
+    message = _upgrade_failure_message(2, {"databricks"}, info=info)
+
+    assert "your previous install is intact" in message
+    assert "package index" in message
+    assert "PyPI mirror" in message
+    # A runnable install-from-index command, not another re-pull of the git URL.
+    assert f"uv tool install --force{_UV_PY} 'omnigent[databricks]'" in message
+
+
+def test_upgrade_failure_message_registry_install_stays_terse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registry install's failure has no blocked-git angle — no index hint."""
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: ("0.8.2", None)
+    )
+
+    message = _upgrade_failure_message(2, info=_uv_registry_info())
+
+    assert message == "Upgrade command exited with status 2; your previous install is intact."
+
+
+def test_upgrade_failure_message_destroyed_git_install_still_offers_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wiped git install on a blocked network needs the index path too.
+
+    install.sh pulls from GitHub, so on a GitHub-blocked machine the recovery
+    line alone leaves the user stuck; the index alternative must ride along.
+    """
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: (None, None)
+    )
+
+    message = _upgrade_failure_message(2, {"databricks"}, info=_git_install_info())
+
+    assert "no longer installed" in message
+    assert "install.sh | sh -s -- --extra databricks" in message
+    assert "package index" in message
+    assert f"uv tool install --force{_UV_PY} 'omnigent[databricks]'" in message
+
+
+def test_index_reinstall_command_covers_each_installer() -> None:
+    """The index fallback maps each installer to its install-from-index form."""
+    from omnigent.update_check import _index_reinstall_command
+
+    def info_for(installer: str | None) -> _InstalledWheelInfo:
+        return _InstalledWheelInfo(
+            install_time_epoch=0.0,
+            installer=installer,
+            vcs_url="git+https://github.com/omnigent-ai/omnigent.git",
+            commit_sha=None,
+            is_editable=False,
+            package_version="0.8.2",
+            detected_installer=installer,
+        )
+
+    assert (
+        _index_reinstall_command(info_for("uv"), ()) == f"uv tool install --force{_UV_PY} omnigent"
+    )
+    assert _index_reinstall_command(info_for("pipx"), ()) == "pipx install --force omnigent"
+    assert "install --force-reinstall omnigent" in _index_reinstall_command(info_for("pip"), ())
+    # Unknown installer: no runnable command; the hint degrades to prose.
+    assert _index_reinstall_command(info_for(None), ()) == ""
+
+
+def test_upgrade_git_repull_failure_output_names_package_index(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """End to end: `omni upgrade` on a git install whose re-pull fails.
+
+    The reported journey — a git-shaped install on a machine that cannot
+    reach github.com. The installer exits non-zero and the CLI's failure
+    output must offer the package-index (PyPI mirror) install path rather
+    than only restating the exit status.
+    """
+    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", _git_install_info)
+    # Remote HEAD indeterminate — exactly what a blocked network looks like.
+    monkeypatch.setattr("omnigent.update_check._remote_git_head", lambda _url: None)
+    # The re-pull fails (git fetch cannot reach the host).
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a, **_k: 2)
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: ("0.1.0", "a" * 40)
+    )
+
+    result = CliRunner().invoke(cli, ["upgrade"])
+
+    assert result.exit_code != 0
+    assert "exited with status 2" in result.output
+    assert "package index" in result.output
+    assert "PyPI mirror" in result.output
+
+
 def test_upgrade_nightly_failure_surfaces_recovery_when_install_is_gone(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:

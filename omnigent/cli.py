@@ -5157,7 +5157,7 @@ def _upgrade_vcs_install(
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
         raise click.ClickException(
-            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
+            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides), info=info)
         )
 
     # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
@@ -5305,7 +5305,7 @@ def _upgrade_to_nightly(
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
         raise click.ClickException(
-            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
+            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides), info=info)
         )
 
     # Same trust-the-disk verification as the release path: re-read the
@@ -5576,7 +5576,7 @@ def upgrade(
     code = _run_upgrade_command(suggestion.command, console)
     if code != 0:
         raise click.ClickException(
-            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
+            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides), info=info)
         )
 
     # Trust the installed version, not the installer's exit code. The running
