@@ -311,12 +311,13 @@ declares the passthrough.
 
 #### 🐙 Polly and 🟠🔵 Debby
 
-Two example agents ship with the repo, and they make good first sessions:
+Several example agents ship with the repo, and they make good first sessions:
 
 ```bash
 omnigent run examples/polly/
 omnigent run examples/debby/
 omnigent run examples/deep-research/
+omnigent run examples/pipeshub/
 
 # ...or on a different harness (sub-agents keep their own):
 omnigent run examples/polly/ --harness <harness>
@@ -339,6 +340,13 @@ cross-checked report. It plans sub-queries, searches the live web and reads
 full pages through an MCP search server, and verifies each claim across
 independent sources. It's also the simplest example to copy from: one agent
 plus one `tools/mcp/*.yaml` server, no sub-agents.
+
+**🔌 PipesHub** answers from your own organization's knowledge instead of the
+open web — Slack, Drive, Confluence, and whatever else your company has
+connected — through the PipesHub MCP server. It searches before it answers and
+cites what it found, so you can check the source. Same shape as Deep Research:
+one agent, one `tools/mcp/*.yaml` server. (Needs a PipesHub deployment and a
+personal access token.)
 
 **Prefer the browser?** One command starts the local server and registers this
 machine as a host:

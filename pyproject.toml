@@ -440,7 +440,7 @@ include = ["omnigent*"]
 [tool.setuptools.package-data]
 "omnigent.db" = ["alembic.ini"]
 "omnigent.db.migrations" = ["script.py.mako"]
-"omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*"]
+"omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*", "pipeshub/**/*"]
 "omnigent.resources.pi_native" = ["*.js"]
 "omnigent.resources.scripts" = ["*.sh"]
 # include UI assets in build, plus the static API-only landing page served
