@@ -1101,6 +1101,97 @@ describe("LatestTurnSpacer", () => {
     act(() => holder.cb?.());
     expect(spacer.style.height).toBe("154px");
   });
+
+  it("retries capture across frames until the windowed anchor row mounts", () => {
+    // WHY: the anchor row can be absent for the first frame(s) on a cold load of
+    // a windowed transcript (the scroll element is published before the
+    // virtualizer fills its window). Capture must retry rather than depend on a
+    // resize that need not fire — the wrapper height is estimate-fixed.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    // Drive requestAnimationFrame callbacks manually.
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      frames.push(cb);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+    // Committed anchor exists in the store, but its row hasn't mounted yet.
+    useChatStore.setState({ blocks: [userBlock("initial-user")] });
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
+    // Mount + manual measure both find no anchor node → a retry is scheduled and
+    // no height is set yet.
+    act(() => holder.cb?.());
+    expect(spacer.style.height || "0px").toBe("0px");
+    expect(frames.length).toBeGreaterThan(0);
+
+    // The row mounts; the next scheduled frame fires and capture succeeds.
+    const anchor = document.createElement("div");
+    anchor.dataset.role = "user";
+    anchor.dataset.userMessageId = "initial-user";
+    vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(0));
+    scrollRoot.append(anchor);
+    act(() => frames.shift()?.(0));
+    expect(spacer.style.height).toBe("104px"); // 600 − 400 − 96
+  });
+
+  it("settles a never-anchoring turn to display:none after the retry budget", () => {
+    // WHY: a tool-only trailing turn (committed non-user block, no user anchor
+    // and no assistant-text section) must not retry forever — capture settles to
+    // no-anchor (display:none) once the budget is spent, matching the pre-
+    // windowing behaviour.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      frames.push(cb);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+    // A committed block that is NOT a user message and never renders an anchor.
+    useChatStore.setState({
+      blocks: [{ type: "reasoning", ctx: { itemId: "r1" }, text: "…" }] as never,
+    });
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
+
+    // Drain the retry budget; the anchor never mounts. Bounded, so it stops.
+    act(() => holder.cb?.());
+    let guard = 0;
+    while (frames.length > 0 && guard < 50) {
+      guard += 1;
+      act(() => frames.shift()?.(0));
+    }
+    expect(guard).toBeLessThan(50); // did not retry forever
+    expect(spacer.style.display).toBe("none");
+  });
 });
 
 describe("JumpToTopButton", () => {

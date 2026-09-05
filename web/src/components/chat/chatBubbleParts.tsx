@@ -1153,6 +1153,9 @@ const PINNED_ANCHOR_TOP_GAP_PX = 96;
  */
 const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
 
+/** Frames to wait for the windowed anchor row to mount before settling capture. */
+const ANCHOR_CAPTURE_MAX_RETRIES = 10;
+
 /**
  * Trailing spacer that pins the initially loaded turn's anchor to the top of
  * the viewport. The anchor is captured once when the hydrated chat surface
@@ -1198,6 +1201,14 @@ export function LatestTurnSpacer({
     }
     initialCommittedUserIdsRef.current = ids;
   }
+  // Bounded rAF retries for capturing the anchor when committed blocks exist but
+  // their rows haven't mounted yet (windowed transcript, published a frame
+  // before the virtualizer fills its window). A resize we could observe isn't
+  // guaranteed — the wrapper height is fixed to the estimate — so we drive the
+  // retry ourselves rather than wait for one. When the budget runs out (e.g. a
+  // tool-only trailing turn that never has an anchor) capture settles to `null`.
+  const captureFrameRef = useRef(0);
+  const captureAttemptsRef = useRef(0);
 
   const measure = useCallback(() => {
     const scrollEl = scrollElement ?? ctx.scrollRef?.current;
@@ -1239,7 +1250,21 @@ export function LatestTurnSpacer({
         const hasCommittedAnchor =
           initialCommittedUserIdsRef.current!.size > 0 ||
           useChatStore.getState().blocks.some((b) => b.type !== "user_message");
-        if (hasCommittedAnchor) return; // rows not mounted yet — retry on the next tick
+        // Rows not mounted yet: retry on the next frame, up to a small budget,
+        // so a resize that never comes can't leave the spacer uncaptured — and
+        // an anchorless turn (tool-only trailing bubble) still settles instead
+        // of retrying forever. The `requestAnimationFrame` guard keeps this a
+        // no-op in environments without it rather than throwing.
+        if (
+          hasCommittedAnchor &&
+          captureAttemptsRef.current < ANCHOR_CAPTURE_MAX_RETRIES &&
+          typeof requestAnimationFrame === "function"
+        ) {
+          captureAttemptsRef.current += 1;
+          cancelAnimationFrame(captureFrameRef.current);
+          captureFrameRef.current = requestAnimationFrame(() => measure());
+          return;
+        }
       }
       initialAnchorRef.current =
         initialUserId !== null
@@ -1303,6 +1328,9 @@ export function LatestTurnSpacer({
     if (contentEl) observer.observe(contentEl); // streaming / reflow growth
     return () => observer.disconnect();
   }, [ctx.scrollRef, measure, scrollElement]);
+
+  // Cancel any pending capture-retry frame when the surface unmounts.
+  useEffect(() => () => cancelAnimationFrame(captureFrameRef.current), []);
 
   return <div ref={spacerRef} aria-hidden style={{ flexShrink: 0 }} />;
 }
