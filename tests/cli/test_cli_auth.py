@@ -665,6 +665,117 @@ def test_refresh_stored_token_skips_when_already_fresh(token_dir, monkeypatch) -
     assert refresh_stored_token("http://localhost:6767") == "already-fresh"
 
 
+def test_refresh_stored_token_force_renews_rejected_fresh_token(token_dir, monkeypatch) -> None:
+    """A server rejection can force renewal despite the stored expiry."""
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="revoked",
+        user_id="a@x",
+        expires_at=time.time() + 3600,
+        refresh_token="refresh-1",
+    )
+    posted: list[str] = []
+
+    def _fake_post(url, *, data=None, timeout=None):
+        del data, timeout
+        posted.append(url)
+        return httpx.Response(
+            200,
+            json={"access_token": "fresh", "expires_in": 3600},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    assert refresh_stored_token("http://localhost:6767", force=True) == "fresh"
+    assert posted == ["http://localhost:6767/oauth/token"]
+
+
+def test_refresh_stored_token_force_reuses_concurrently_replaced_token(
+    token_dir, monkeypatch
+) -> None:
+    """Forced refresh does not rotate a token another process already replaced."""
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="replacement",
+        user_id="a@x",
+        expires_at=time.time() + 3600,
+        refresh_token="refresh-1",
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("replacement token must avoid another refresh")
+
+    monkeypatch.setattr(httpx, "post", _boom)
+
+    assert (
+        refresh_stored_token(
+            "http://localhost:6767",
+            force=True,
+            rejected_token="rejected",
+        )
+        == "replacement"
+    )
+
+
+def test_refresh_stored_token_force_derives_rejected_token_before_lock(
+    token_dir, monkeypatch
+) -> None:
+    """A forced refresh without an explicit bearer still deduplicates."""
+    import httpx
+
+    import omnigent.cli_auth as cli_auth
+
+    entries = iter(
+        (
+            {"token": "rejected", "refresh_token": "refresh-1"},
+            {
+                "token": "replacement",
+                "expires_at": time.time() + 3600,
+                "refresh_token": "refresh-2",
+            },
+        )
+    )
+    monkeypatch.setattr(cli_auth, "_load_entry", lambda _url: next(entries))
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("replacement token must avoid another refresh")
+
+    monkeypatch.setattr(httpx, "post", _boom)
+
+    assert cli_auth.refresh_stored_token("http://localhost:6767", force=True) == "replacement"
+
+
+def test_refresh_stored_token_tolerates_invalid_proxy_url(token_dir, monkeypatch) -> None:
+    """Malformed proxy settings degrade like other refresh transport errors."""
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+
+    def _invalid_proxy(*_args, **_kwargs):
+        raise httpx.InvalidURL("bad proxy")
+
+    monkeypatch.setattr(httpx, "post", _invalid_proxy)
+
+    assert refresh_stored_token("http://localhost:6767") is None
+
+
 def test_refresh_no_material_does_not_touch_lock_file(token_dir, monkeypatch) -> None:
     """With no refresh material, the refresh must not create a lock file.
 

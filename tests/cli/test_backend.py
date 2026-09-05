@@ -384,6 +384,81 @@ def test_ensure_host_daemon_local_daemon_serves_requested_url_is_noop(
     assert "args" not in captured  # reused, not respawned
 
 
+def test_ensure_host_daemon_concrete_local_url_heals_offline_tunnel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A discovered local URL still enters local-mode tunnel healing."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+        config_sig=cli.server_config_signature(),
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8123")
+    monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
+    monkeypatch.setattr(cli, "_daemon_tunnel_recovers", lambda record, **_kw: False)
+    torn_down: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_host_unit",
+        lambda record, *, reason, keep_local_server=False: torn_down.append(
+            (reason, keep_local_server)
+        ),
+    )
+
+    _ensure_host_daemon("http://127.0.0.1:8123")
+
+    assert len(torn_down) == 1 and "offline" in torn_down[0][0]
+    assert torn_down[0][1] is True
+    args = captured["args"]
+    assert isinstance(args, list)
+    assert "--local" in args
+    assert "--server" not in args
+
+
+def test_terminate_host_unit_preserves_server_for_tunnel_heal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel-only restart leaves the local AP server at its current URL."""
+    record = cli._HostDaemonRecord(
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path="/tmp/host.log",
+        started_at=1_000_000,
+    )
+    terminated: list[tuple[int, bool]] = []
+    stopped_servers: list[bool] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda daemon, *, force: terminated.append((daemon.pid, force)),
+    )
+    monkeypatch.setattr(
+        cli,
+        "stop_local_omnigent_server",
+        lambda: stopped_servers.append(True),
+    )
+
+    cli._terminate_host_unit(
+        record,
+        reason="host tunnel is offline",
+        keep_local_server=True,
+    )
+
+    assert terminated == [(4242, True)]
+    assert stopped_servers == []
+
+
 def test_ensure_host_daemon_reuses_healthy_background_daemon(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -410,9 +485,13 @@ def test_ensure_host_daemon_reuses_healthy_background_daemon(
     # Old enough to be eligible for the tunnel-health check, and online.
     monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
     monkeypatch.setattr(cli, "_daemon_host_online", lambda record, **_kw: True)
-    torn_down: list[str] = []
+    torn_down: list[tuple[str, bool]] = []
     monkeypatch.setattr(
-        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+        cli,
+        "_terminate_host_unit",
+        lambda record, *, reason, keep_local_server=False: torn_down.append(
+            (reason, keep_local_server)
+        ),
     )
 
     _ensure_host_daemon(None)
@@ -446,14 +525,18 @@ def test_ensure_host_daemon_respawns_on_host_identity_change(
     )
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cli, "_load_existing_host_id", lambda: "host_new")
-    torn_down: list[str] = []
+    torn_down: list[tuple[str, bool]] = []
     monkeypatch.setattr(
-        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+        cli,
+        "_terminate_host_unit",
+        lambda record, *, reason, keep_local_server=False: torn_down.append(
+            (reason, keep_local_server)
+        ),
     )
 
     _ensure_host_daemon(None)
 
-    assert len(torn_down) == 1 and "identity" in torn_down[0]
+    assert len(torn_down) == 1 and "identity" in torn_down[0][0]
     assert "args" in captured
 
 
@@ -518,14 +601,19 @@ def test_ensure_host_daemon_heals_offline_tunnel(
     # Old enough to be past the min-age grace; tunnel does not recover.
     monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
     monkeypatch.setattr(cli, "_daemon_tunnel_recovers", lambda record, **_kw: False)
-    torn_down: list[str] = []
+    torn_down: list[tuple[str, bool]] = []
     monkeypatch.setattr(
-        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+        cli,
+        "_terminate_host_unit",
+        lambda record, *, reason, keep_local_server=False: torn_down.append(
+            (reason, keep_local_server)
+        ),
     )
 
     _ensure_host_daemon(None)
 
-    assert len(torn_down) == 1 and "offline" in torn_down[0]
+    assert len(torn_down) == 1 and "offline" in torn_down[0][0]
+    assert torn_down[0][1] is True
     assert "args" in captured  # fresh daemon spawned
 
 

@@ -17,8 +17,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
@@ -561,6 +562,7 @@ def run_attach(
     debug_events: bool = False,
     auto_open_conversation: bool = False,
     resume_parts: list[str] | None = None,
+    suppress_slice_key_for_host: str | None = None,
 ) -> None:
     """
     Attach the REPL to a LIVE conversation, dispatching to its existing runner.
@@ -584,6 +586,8 @@ def run_attach(
         URL once attached.
     :param resume_parts: Argument-list prefix for the on-exit resume hint, e.g.
         ``["cli", "attach", "conv_abc123", "--server", "http://..."]``.
+    :param suppress_slice_key_for_host: Host whose proven-stale replica-routing
+        key must be omitted. ``None`` preserves normal host-pinned routing.
     :raises click.ClickException: If the session has no online runner (its host
         is offline) — ``attach`` never starts one.
     """
@@ -591,7 +595,11 @@ def run_attach(
     # Pre-flight (read-only): a co-drive client can only run turns if the
     # session's host runner is online; attach never launches one. The same
     # snapshot gives the agent name + harness for an honest banner.
-    info = _attach_session_info(base_url=base_url, conversation_id=conversation_id)
+    info = _attach_session_info(
+        base_url=base_url,
+        conversation_id=conversation_id,
+        suppress_slice_key_for_host=suppress_slice_key_for_host,
+    )
     if not info.runner_online:
         from omnigent.server_url import display_server_url
 
@@ -619,6 +627,7 @@ def run_attach(
         debug_events=debug_events,
         resume_parts=resume_parts,
         auto_open_conversation=auto_open_conversation,
+        suppress_slice_key_for_host=suppress_slice_key_for_host,
     )
 
 
@@ -656,6 +665,12 @@ def _is_url(target: str) -> bool:
 # translated into the routing header inside ``cli_auth.databricks_request_headers``;
 # OSS only ever threads a host_id.)
 _session_hosts: dict[str, str] = {}
+_STORED_TOKEN_REFRESH_FAILURE_COOLDOWN_S = 30.0
+_AUTH_REPLAY_MAX_BODY_BYTES = 8 * 1024 * 1024
+_stored_token_refresh_state_lock = threading.Lock()
+_stored_token_refresh_locks: dict[str, threading.Lock] = {}
+_stored_token_refresh_retry_after: dict[str, float] = {}
+_stored_token_forced_retry_after: dict[tuple[str, str], float] = {}
 
 
 def set_session_host(session_id: str, host_id: str | None) -> None:
@@ -682,6 +697,125 @@ def get_session_host(session_id: str) -> str | None:
     return _session_hosts.get(session_id)
 
 
+def _clear_stored_token_refresh_failure(server_url: str) -> None:
+    """Clear failed-refresh cooldowns after a usable token appears."""
+    normalized = server_url.rstrip("/")
+    with _stored_token_refresh_state_lock:
+        _stored_token_refresh_retry_after.pop(normalized, None)
+        stale = [key for key in _stored_token_forced_retry_after if key[0] == normalized]
+        for key in stale:
+            _stored_token_forced_retry_after.pop(key, None)
+
+
+def _stored_token_refresh_lock(server_url: str) -> threading.Lock:
+    """Return the per-server lock that deduplicates token renewal."""
+    normalized = server_url.rstrip("/")
+    with _stored_token_refresh_state_lock:
+        return _stored_token_refresh_locks.setdefault(normalized, threading.Lock())
+
+
+def _stored_token_was_rejected(server_url: str, token: str) -> bool:
+    """Return whether a failed forced refresh still tracks this token."""
+    normalized = server_url.rstrip("/")
+    with _stored_token_refresh_state_lock:
+        return (normalized, token) in _stored_token_forced_retry_after
+
+
+def _refreshable_stored_token(
+    server_url: str,
+    *,
+    force_refresh: bool = False,
+    rejected_token: str | None = None,
+) -> str | None:
+    """Return a stored login token, renewing it without refresh storms."""
+    from omnigent.cli_auth import (
+        REFRESH_MIN_REMAINING_SECONDS,
+        load_token,
+        refresh_stored_token,
+    )
+
+    normalized = server_url.rstrip("/")
+    if not force_refresh:
+        token = load_token(
+            server_url,
+            min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS,
+        )
+        if token is not None:
+            if not _stored_token_was_rejected(server_url, token):
+                _clear_stored_token_refresh_failure(server_url)
+            return token
+
+    with _stored_token_refresh_lock(server_url):
+        current = load_token(
+            server_url,
+            min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS,
+        )
+        if current is not None and (
+            not force_refresh or (rejected_token is not None and current != rejected_token)
+        ):
+            if not _stored_token_was_rejected(server_url, current):
+                _clear_stored_token_refresh_failure(server_url)
+            return current
+
+        now = time.monotonic()
+        with _stored_token_refresh_state_lock:
+            if force_refresh and rejected_token is not None:
+                retry_after = _stored_token_forced_retry_after.get(
+                    (normalized, rejected_token), 0.0
+                )
+            else:
+                retry_after = _stored_token_refresh_retry_after.get(normalized, 0.0)
+        if now < retry_after:
+            return load_token(server_url)
+
+        refreshed = (
+            refresh_stored_token(
+                server_url,
+                force=True,
+                rejected_token=rejected_token,
+            )
+            if force_refresh
+            else refresh_stored_token(server_url)
+        )
+        if refreshed is not None and (
+            not force_refresh or rejected_token is None or refreshed != rejected_token
+        ):
+            _clear_stored_token_refresh_failure(server_url)
+            return refreshed
+
+        retry_at = time.monotonic() + _STORED_TOKEN_REFRESH_FAILURE_COOLDOWN_S
+        with _stored_token_refresh_state_lock:
+            _stored_token_refresh_retry_after[normalized] = retry_at
+            if force_refresh and rejected_token is not None:
+                _stored_token_forced_retry_after[(normalized, rejected_token)] = retry_at
+        # A near-expiry token remains preferable when renewal is unavailable.
+        return refreshed or load_token(server_url)
+
+
+def _remote_auth_rejected(response: httpx.Response) -> bool:
+    """Return whether a response requires replacing its bearer."""
+    if response.status_code in (401, 403):
+        return True
+    if not response.is_redirect:
+        return False
+    location = response.headers.get("location", "")
+    return "/oidc/" in location or "/.auth/" in location
+
+
+def _remote_wrong_replica(response: httpx.Response) -> bool:
+    """Return whether a buffered error response reports stale routing."""
+    if response.status_code != 400:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    return isinstance(error, dict) and error.get("code") == "wrong_replica"
+
+
 def _remote_headers(
     server_url: str | None = None,
     *,
@@ -693,7 +827,7 @@ def _remote_headers(
     Resolution order:
       1. explicit ``OMNIGENT_REMOTE_AUTH_TOKEN`` env var
       2. stored OIDC token from ``~/.omnigent/auth_tokens.json``
-         (populated by ``omnigent login``)
+         (populated and refreshable by ``omnigent login``)
       3. stored Databricks Apps pointer record for ``server_url``
          (populated by ``omnigent login <apps-url>``) — mints a
          fresh workspace OAuth token via the SDK
@@ -721,10 +855,10 @@ def _remote_headers(
         # 1. Explicit env-var token.
         headers["Authorization"] = f"Bearer {token}"
     elif server_url:
-        from omnigent.cli_auth import load_token
-
-        # 2. Stored OIDC session token from `omnigent login`.
-        oidc_token = load_token(server_url)
+        # 2. Stored OIDC session token from `omnigent login`. Renew before it
+        # can lapse during a WebSocket handshake; if renewal is unavailable,
+        # retain a still-valid near-expiry token instead of dropping auth.
+        oidc_token = _refreshable_stored_token(server_url)
         if oidc_token:
             headers["Authorization"] = f"Bearer {oidc_token}"
         else:
@@ -815,6 +949,7 @@ class _DatabricksTokenAuth(httpx.Auth):
         server_url: str | None = None,
         *,
         session_id: str | None = None,
+        suppress_slice_key_for_host: str | None = None,
     ) -> None:
         """
         :param server_url: Remote server URL for looking up stored
@@ -822,9 +957,13 @@ class _DatabricksTokenAuth(httpx.Auth):
         :param session_id: The single session this client drives; its
             requests are pinned to that session's host replica. ``None``
             for a hostless / local client.
+        :param suppress_slice_key_for_host: Host whose proven-stale routing
+            key must be omitted while other host keys remain eligible.
         """
         self._server_url = server_url
         self._session_id = session_id
+        self._suppress_slice_key_for_host = suppress_slice_key_for_host
+        self._routing_lock = threading.Lock()
         raw = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
         self._static_token = raw.strip() if raw else None
         # Lazily-resolved, then reused, SDK auth (one Config → one token
@@ -833,6 +972,7 @@ class _DatabricksTokenAuth(httpx.Auth):
         # long-lived transcript-forwarder client that posts reply items.
         self._sdk_auth: _DatabricksBearerAuth | None = None
         self._sdk_auth_resolved = False
+        self._sdk_auth_lock = threading.Lock()
 
     def pin_session(self, session_id: str | None) -> None:
         """Repoint this auth at a different session's host.
@@ -868,24 +1008,132 @@ class _DatabricksTokenAuth(httpx.Auth):
             _resolve_databricks_auth,
         )
 
-        if not self._sdk_auth_resolved:
-            workspace_host = (
-                load_databricks_workspace_host(self._server_url) if self._server_url else None
-            )
+        with self._sdk_auth_lock:
+            if not self._sdk_auth_resolved:
+                workspace_host = (
+                    load_databricks_workspace_host(self._server_url) if self._server_url else None
+                )
+                try:
+                    if workspace_host is not None:
+                        self._sdk_auth, _host = _resolve_databricks_auth(host=workspace_host)
+                    else:
+                        self._sdk_auth, _host = _resolve_databricks_auth()
+                except (DatabricksAuthError, ImportError, ValueError):
+                    self._sdk_auth = None
+                self._sdk_auth_resolved = True
+            if self._sdk_auth is None:
+                return None
             try:
-                if workspace_host is not None:
-                    self._sdk_auth, _host = _resolve_databricks_auth(host=workspace_host)
-                else:
-                    self._sdk_auth, _host = _resolve_databricks_auth()
-            except (DatabricksAuthError, ImportError, ValueError):
-                self._sdk_auth = None
-            self._sdk_auth_resolved = True
-        if self._sdk_auth is None:
-            return None
+                return self._sdk_auth.current_token()
+            except DatabricksAuthError:
+                return None
+
+    def _apply_routing_headers(
+        self,
+        request: httpx.Request,
+    ) -> tuple[str | None, bool, bool]:
+        """Apply host routing and report the request's keyed/keyless mode."""
+        if self._server_url is None:
+            return None, False, False
+        from omnigent.cli_auth import (
+            OMNIGENT_SLICE_KEY_HEADER,
+            databricks_request_headers,
+        )
+
+        session_host = get_session_host(self._session_id) if self._session_id else None
+        request.headers.update(databricks_request_headers(self._server_url, host_id=session_host))
+        with self._routing_lock:
+            suppressed = (
+                self._suppress_slice_key_for_host is not None
+                and request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+                == self._suppress_slice_key_for_host
+            )
+            if suppressed:
+                request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
+        keyed = (
+            session_host is not None
+            and request.headers.get(OMNIGENT_SLICE_KEY_HEADER) == session_host
+        )
+        return session_host, keyed, suppressed
+
+    def _retry_opposite_routing(
+        self,
+        request: httpx.Request,
+        host_id: str,
+        *,
+        keyed: bool,
+    ) -> str | None:
+        """Apply the opposite route to one request and return its preference."""
+        from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+
+        if keyed:
+            request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
+            return host_id
+        request.headers[OMNIGENT_SLICE_KEY_HEADER] = host_id
+        return None
+
+    def _commit_routing(self, suppression: str | None) -> None:
+        """Commit a routing preference after its request reaches a replica."""
+        with self._routing_lock:
+            self._suppress_slice_key_for_host = suppression
+
+    @staticmethod
+    def _buffer_sync_replay_body(request: httpx.Request) -> bool:
+        """Buffer a known-small sync body and report whether retry is safe."""
         try:
-            return self._sdk_auth.current_token()
-        except DatabricksAuthError:
-            return None
+            _ = request.content
+        except httpx.RequestNotRead:
+            pass
+        else:
+            return True
+        try:
+            content_length = int(request.headers["Content-Length"])
+        except (KeyError, ValueError):
+            return False
+        if not 0 <= content_length <= _AUTH_REPLAY_MAX_BODY_BYTES:
+            return False
+        request.read()
+        return True
+
+    @staticmethod
+    async def _buffer_async_replay_body(request: httpx.Request) -> bool:
+        """Buffer a known-small async body and report whether retry is safe."""
+        try:
+            _ = request.content
+        except httpx.RequestNotRead:
+            pass
+        else:
+            return True
+        try:
+            content_length = int(request.headers["Content-Length"])
+        except (KeyError, ValueError):
+            return False
+        if not 0 <= content_length <= _AUTH_REPLAY_MAX_BODY_BYTES:
+            return False
+        await request.aread()
+        return True
+
+    @staticmethod
+    def _sync_wrong_replica(response: httpx.Response) -> bool:
+        """Read a sync 400 response only when routing recovery may need it."""
+        if response.status_code != 400:
+            return False
+        try:
+            response.read()
+        except (httpx.HTTPError, RuntimeError):
+            return False
+        return _remote_wrong_replica(response)
+
+    @staticmethod
+    async def _async_wrong_replica(response: httpx.Response) -> bool:
+        """Read an async 400 response only when routing recovery may need it."""
+        if response.status_code != 400:
+            return False
+        try:
+            await response.aread()
+        except (httpx.HTTPError, RuntimeError):
+            return False
+        return _remote_wrong_replica(response)
 
     def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
         """
@@ -900,36 +1148,131 @@ class _DatabricksTokenAuth(httpx.Auth):
         :param request: The outgoing httpx request.
         :yields: The request with auth header set.
         """
-        # Workspace routing (empty when none recorded); independent of the
-        # credential branch below. On a host-sharded deployment, also pin the
-        # turn/resource/stream traffic for this client's session to the replica
-        # holding its runner tunnel — the slice key is the session's host_id,
-        # from the session→host map. An unsharded server has no sharding layer,
-        # so no key.
-        if self._server_url:
-            from omnigent.cli_auth import databricks_request_headers
-
-            session_host = get_session_host(self._session_id) if self._session_id else None
-            request.headers.update(
-                databricks_request_headers(self._server_url, host_id=session_host)
-            )
+        replayable = self._buffer_sync_replay_body(request)
+        session_host, keyed, suppressed = self._apply_routing_headers(request)
+        oidc_token: str | None = None
         if self._static_token:
             request.headers["Authorization"] = f"Bearer {self._static_token}"
         else:
             # Check stored OIDC token from `omnigent login`, then fall back to
             # the reused Databricks SDK auth.
-            oidc_token = None
             if self._server_url:
-                from omnigent.cli_auth import load_token
-
-                oidc_token = load_token(self._server_url)
+                oidc_token = _refreshable_stored_token(self._server_url)
             if oidc_token:
                 request.headers["Authorization"] = f"Bearer {oidc_token}"
             else:
                 token = self._sdk_token()
                 if token:
                     request.headers["Authorization"] = f"Bearer {token}"
-        yield request
+        auth_replayed = False
+        routing_replayed = False
+        retry_suppression: str | None = None
+        while True:
+            response = yield request
+            if (
+                not auth_replayed
+                and not self._static_token
+                and self._server_url is not None
+                and oidc_token is not None
+                and _remote_auth_rejected(response)
+            ):
+                refreshed = _refreshable_stored_token(
+                    self._server_url,
+                    force_refresh=True,
+                    rejected_token=oidc_token,
+                )
+                if refreshed is not None and refreshed != oidc_token:
+                    request.headers["Authorization"] = f"Bearer {refreshed}"
+                    oidc_token = refreshed
+                    auth_replayed = True
+                    if replayable:
+                        continue
+
+            wrong_replica = self._sync_wrong_replica(response)
+            if wrong_replica and session_host is not None:
+                if not routing_replayed and (keyed or suppressed):
+                    retry_suppression = self._retry_opposite_routing(
+                        request,
+                        session_host,
+                        keyed=keyed,
+                    )
+                    if not replayable:
+                        self._commit_routing(retry_suppression)
+                        return
+                    routing_replayed = True
+                    continue
+                return
+            if routing_replayed:
+                self._commit_routing(retry_suppression)
+            return
+
+    async def async_auth_flow(
+        self,
+        request: httpx.Request,
+    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        """Async auth flow that keeps blocking credential renewal off-loop."""
+        replayable = await self._buffer_async_replay_body(request)
+        session_host, keyed, suppressed = await asyncio.to_thread(
+            self._apply_routing_headers,
+            request,
+        )
+        oidc_token: str | None = None
+        if self._static_token:
+            request.headers["Authorization"] = f"Bearer {self._static_token}"
+        else:
+            if self._server_url:
+                oidc_token = await asyncio.to_thread(
+                    _refreshable_stored_token,
+                    self._server_url,
+                )
+            token = oidc_token
+            if token is None:
+                token = await asyncio.to_thread(self._sdk_token)
+            if token:
+                request.headers["Authorization"] = f"Bearer {token}"
+
+        auth_replayed = False
+        routing_replayed = False
+        retry_suppression: str | None = None
+        while True:
+            response = yield request
+            if (
+                not auth_replayed
+                and not self._static_token
+                and self._server_url is not None
+                and oidc_token is not None
+                and _remote_auth_rejected(response)
+            ):
+                refreshed = await asyncio.to_thread(
+                    _refreshable_stored_token,
+                    self._server_url,
+                    force_refresh=True,
+                    rejected_token=oidc_token,
+                )
+                if refreshed is not None and refreshed != oidc_token:
+                    request.headers["Authorization"] = f"Bearer {refreshed}"
+                    oidc_token = refreshed
+                    auth_replayed = True
+                    if replayable:
+                        continue
+
+            wrong_replica = await self._async_wrong_replica(response)
+            if wrong_replica and session_host is not None:
+                if not routing_replayed and (keyed or suppressed):
+                    retry_suppression = self._retry_opposite_routing(
+                        request,
+                        session_host,
+                        keyed=keyed,
+                    )
+                    if not replayable:
+                        self._commit_routing(retry_suppression)
+                        return
+                    routing_replayed = True
+                    continue
+                return
+            if routing_replayed:
+                self._commit_routing(retry_suppression)
+            return
 
 
 def _server_headers(
@@ -958,6 +1301,7 @@ def _server_auth(
     server_url: str | None = None,
     *,
     session_id: str | None,
+    suppress_slice_key_for_host: str | None = None,
 ) -> httpx.Auth | None:
     """
     Build an httpx Auth for a remote Omnigent server client.
@@ -978,21 +1322,35 @@ def _server_auth(
         traffic co-locates, or ``None`` before a session exists / for a
         host-less client (the slice key then falls back to the runner-env
         or CLI-own-host id inside ``databricks_request_headers``).
+    :param suppress_slice_key_for_host: Host whose proven-stale routing key
+        must be omitted. ``None`` preserves normal routing.
     :returns: Auth instance, or ``None``.
     """
     raw = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
     if raw and raw.strip():
-        return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
+        return _DatabricksTokenAuth(
+            server_url=server_url,
+            session_id=session_id,
+            suppress_slice_key_for_host=suppress_slice_key_for_host,
+        )
     # Check stored `omnigent login` records: a session JWT or a
     # Databricks Apps pointer record.
     if server_url:
-        from omnigent.cli_auth import load_databricks_workspace_host, load_token
+        from omnigent.cli_auth import load_databricks_workspace_host
 
-        if load_token(server_url) or load_databricks_workspace_host(server_url):
-            return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
+        if _refreshable_stored_token(server_url) or load_databricks_workspace_host(server_url):
+            return _DatabricksTokenAuth(
+                server_url=server_url,
+                session_id=session_id,
+                suppress_slice_key_for_host=suppress_slice_key_for_host,
+            )
     creds = _read_databrickscfg(None)
     if creds is not None and creds.token:
-        return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
+        return _DatabricksTokenAuth(
+            server_url=server_url,
+            session_id=session_id,
+            suppress_slice_key_for_host=suppress_slice_key_for_host,
+        )
     return None
 
 
@@ -1020,6 +1378,7 @@ def _chat_with_server(
     progress: RunnerStartupProgress | None = None,
     attach_only: bool = False,
     attach_harness: str | None = None,
+    suppress_slice_key_for_host: str | None = None,
 ) -> None:
     """
     Connect to a server URL and run a one-shot query or REPL.
@@ -1083,6 +1442,8 @@ def _chat_with_server(
         (``progress.finish()``) the instant before this function produces
         terminal output — a native-wrapper redirect notice, the one-shot
         reply, or the REPL's first paint.
+    :param suppress_slice_key_for_host: Host whose proven-stale routing key
+        must be omitted by an attached REPL.
     """
     base_url = server_url.rstrip("/")
 
@@ -1092,18 +1453,18 @@ def _chat_with_server(
     # setup, so the user never sees a cleared spinner over an empty gap here.
     # The label lags the exact step on purpose — better than a vaguer one.
 
-    # Wrapper-aware resume redirect: if the conversation we're about to
-    # resume was originally created by a terminal-native wrapper, the AP
-    # REPL is the WRONG surface to attach to. Detect via the
-    # ``omnigent.wrapper`` label on the conversation and re-dispatch
-    # into the native wrapper carrying ``--server`` through. Without
-    # this, the REPL renders an empty chat on top of a
-    # session whose state lives in a tmux terminal it can't see.
-    if resume_conversation_id is not None and _redirect_native_resume_if_needed(
-        base_url=base_url,
-        conversation_id=resume_conversation_id,
-        auto_open_conversation=auto_open_conversation,
-        progress=progress,
+    # Normal resume returns terminal-native sessions to their native wrapper.
+    # ``attach`` is deliberately different: its post-only REPL preserves
+    # collaborator attribution and never requests writable terminal control.
+    if (
+        not attach_only
+        and resume_conversation_id is not None
+        and _redirect_native_resume_if_needed(
+            base_url=base_url,
+            conversation_id=resume_conversation_id,
+            auto_open_conversation=auto_open_conversation,
+            progress=progress,
+        )
     ):
         return
 
@@ -1151,6 +1512,7 @@ def _chat_with_server(
         auto_open_conversation=auto_open_conversation,
         attach_only=attach_only,
         attach_harness=attach_harness,
+        suppress_slice_key_for_host=suppress_slice_key_for_host,
     )
 
 
@@ -1355,6 +1717,7 @@ def _attach_session_info(
     *,
     base_url: str,
     conversation_id: str,
+    suppress_slice_key_for_host: str | None = None,
 ) -> _AttachSessionInfo:
     """
     Read the facts ``attach`` needs from one ``GET /v1/sessions/{id}``.
@@ -1373,13 +1736,21 @@ def _attach_session_info(
 
     :param base_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param suppress_slice_key_for_host: Host whose proven-stale routing key
+        must be omitted from this host-agnostic snapshot request.
     :returns: The session facts; ``runner_online=False`` on any failure.
     """
     empty = _AttachSessionInfo(runner_online=False, agent_name=None, harness=None)
+    headers = _remote_headers(server_url=base_url, host_id=None)
+    if suppress_slice_key_for_host is not None:
+        from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+
+        if headers.get(OMNIGENT_SLICE_KEY_HEADER) == suppress_slice_key_for_host:
+            headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
     try:
         resp = _server_get(
             f"{base_url}/v1/sessions/{conversation_id}",
-            headers=_remote_headers(server_url=base_url, host_id=None),
+            headers=headers,
             timeout=10.0,
         )
     except (httpx.HTTPError, httpx.InvalidURL) as exc:
@@ -3968,6 +4339,7 @@ def _run_repl(
     auto_open_conversation: bool = False,
     attach_only: bool = False,
     attach_harness: str | None = None,
+    suppress_slice_key_for_host: str | None = None,
 ) -> None:
     """
     Open the REPL connected to the server.
@@ -4032,6 +4404,8 @@ def _run_repl(
         ``None`` (default) means no skill commands are registered.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL when the session id becomes known.
+    :param suppress_slice_key_for_host: Host whose proven-stale routing key
+        must be omitted from this REPL client's requests.
     """
     from omnigent.repl import run_repl
     from omnigent.repl._session_log import DEFAULT_LOG_DIR
@@ -4104,7 +4478,11 @@ def _run_repl(
 
         # Named so a --fork below can repoint it: the auth pins the slice key
         # to whichever session it names, and a fork lands under a new id.
-        server_auth = _server_auth(server_url=base_url, session_id=resume_conversation_id)
+        server_auth = _server_auth(
+            server_url=base_url,
+            session_id=resume_conversation_id,
+            suppress_slice_key_for_host=suppress_slice_key_for_host,
+        )
         async with OmnigentClient(
             base_url=base_url,
             headers=_server_headers(runner_id=runner_id),

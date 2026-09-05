@@ -369,7 +369,13 @@ def _token_file_lock() -> Iterator[None]:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
-def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | None:
+def refresh_stored_token(
+    server_url: str,
+    *,
+    timeout: float = 10.0,
+    force: bool = False,
+    rejected_token: str | None = None,
+) -> str | None:
     """Renew the stored access token from its login-issued refresh grant.
 
     POSTs ``grant_type=refresh_token`` to the server's ``/oauth/token``,
@@ -385,6 +391,11 @@ def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | Non
 
     :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
     :param timeout: HTTP timeout in seconds.
+    :param force: Renew even when the stored expiry still appears healthy.
+        Used after the server rejects a revoked or otherwise stale bearer.
+    :param rejected_token: Bearer that triggered a forced refresh. If another
+        process already replaced it while this caller waited, reuse that token.
+        A forced refresh derives it from the pre-lock entry when omitted.
     :returns: A valid access token, or ``None``.
     """
     normalized = _normalize_server_url(server_url)
@@ -395,9 +406,18 @@ def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | Non
     pre = _load_entry(server_url)
     if pre is None or not isinstance(pre.get("refresh_token"), str) or not pre["refresh_token"]:
         return None
+    if force and rejected_token is None:
+        pre_lock_token = pre.get("token")
+        rejected_token = pre_lock_token if isinstance(pre_lock_token, str) else None
     try:
         with _token_file_lock():
-            return _refresh_locked(server_url, normalized, timeout)
+            return _refresh_locked(
+                server_url,
+                normalized,
+                timeout,
+                force=force,
+                rejected_token=rejected_token,
+            )
     except OSError as exc:
         # Cannot lock/persist (read-only or full state dir) — a refresh we
         # could not store is worse than none, so decline and let the caller
@@ -406,7 +426,14 @@ def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | Non
         return None
 
 
-def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | None:
+def _refresh_locked(
+    server_url: str,
+    normalized: str,
+    timeout: float,
+    *,
+    force: bool,
+    rejected_token: str | None,
+) -> str | None:
     """Perform the refresh exchange; caller holds the token-file lock."""
     entry = _load_entry(server_url)
     if entry is None:
@@ -416,12 +443,11 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
     # "someone already renewed" from "this is the same near-expiry token".
     expires_at = entry.get("expires_at", 0)
     token = entry.get("token")
-    if (
-        isinstance(token, str)
-        and isinstance(expires_at, (int, float))
-        and expires_at - time.time() > REFRESH_MIN_REMAINING_SECONDS
-    ):
-        return token
+    if isinstance(token, str) and isinstance(expires_at, (int, float)):
+        already_replaced = force and rejected_token is not None and token != rejected_token
+        still_fresh = expires_at - time.time() > REFRESH_MIN_REMAINING_SECONDS
+        if already_replaced or (not force and still_fresh):
+            return token
     refresh_token = entry.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
         return None
@@ -434,7 +460,7 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
             data={"grant_type": "refresh_token", "refresh_token": refresh_token},
             timeout=timeout,
         )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
         _logger.warning("Token refresh against %s failed: %s", normalized, exc)
         return None
     if resp.status_code != 200:

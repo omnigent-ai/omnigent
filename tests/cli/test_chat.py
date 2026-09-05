@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import click
 import httpx
@@ -2603,6 +2604,61 @@ def test_remote_headers_prefers_explicit_remote_token_env(monkeypatch: pytest.Mo
     }
 
 
+def test_remote_headers_refreshes_near_expiry_stored_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ad-hoc headers renew a stored login before a long-lived handshake."""
+    from omnigent.cli_auth import REFRESH_MIN_REMAINING_SECONDS
+
+    calls: list[float] = []
+
+    def load_token(_url: str, *, min_remaining_seconds: float = 0.0) -> str | None:
+        calls.append(min_remaining_seconds)
+        return None
+
+    refresh_calls: list[str] = []
+
+    def refresh_token(url: str) -> str:
+        refresh_calls.append(url)
+        return "fresh-token"
+
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", load_token)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", refresh_token)
+
+    headers = _remote_headers(server_url="https://srv.example.com", host_id=None)
+
+    assert headers == {"Authorization": "Bearer fresh-token"}
+    assert calls == [REFRESH_MIN_REMAINING_SECONDS] * 2
+    assert refresh_calls == ["https://srv.example.com"]
+
+
+def test_remote_headers_keeps_still_valid_token_when_refresh_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed proactive renewal does not discard a near-expiry login."""
+    from omnigent.cli_auth import REFRESH_MIN_REMAINING_SECONDS
+
+    calls: list[float] = []
+
+    def load_token(_url: str, *, min_remaining_seconds: float = 0.0) -> str | None:
+        calls.append(min_remaining_seconds)
+        return "near-expiry-token" if min_remaining_seconds == 0.0 else None
+
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", load_token)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
+
+    headers = _remote_headers(server_url="https://srv.example.com", host_id=None)
+
+    assert headers == {"Authorization": "Bearer near-expiry-token"}
+    assert calls == [
+        REFRESH_MIN_REMAINING_SECONDS,
+        REFRESH_MIN_REMAINING_SECONDS,
+        0.0,
+    ]
+
+
 def test_remote_headers_falls_back_to_ambient_databricks_creds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2615,7 +2671,8 @@ def test_remote_headers_falls_back_to_ambient_databricks_creds(
     profile is threaded anymore) and put its token in the bearer header.
     """
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kwargs: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
     monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: None)
     read_calls: list[object] = []
 
@@ -2644,7 +2701,8 @@ def test_remote_headers_adds_org_id_header(monkeypatch: pytest.MonkeyPatch) -> N
     whichever bearer the resolution chain produced.
     """
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kwargs: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
     monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: "rec-tok")
     monkeypatch.setattr(
         "omnigent.cli_auth.load_databricks_org_id", lambda _url: "2850744067564480"
@@ -2669,7 +2727,8 @@ def test_remote_headers_omits_org_when_no_record(monkeypatch: pytest.MonkeyPatch
     was recorded.
     """
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kwargs: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
     monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: "rec-tok")
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
 
@@ -2693,7 +2752,8 @@ def test_remote_headers_keys_by_host_id_on_workspace_mount(
     sends none.
     """
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kwargs: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
     monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: "rec-tok")
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
 
@@ -3011,7 +3071,8 @@ def _stub_run_repl_deps(
     monkeypatch.setattr("omnigent.repl._repl.run_repl", _fake_run_repl)
     monkeypatch.setattr("omnigent.chat.OmnigentClient", _FakeClientCtx)
     monkeypatch.setattr(
-        "omnigent.chat._server_auth", lambda server_url=None, *, session_id=None: None
+        "omnigent.chat._server_auth",
+        lambda server_url=None, *, session_id=None, suppress_slice_key_for_host=None: None,
     )
     monkeypatch.setattr(
         "omnigent.repl._tmux_pane.register_pane",
@@ -3035,6 +3096,47 @@ def test_run_repl_passes_resume_parts_to_run_repl(
     )
 
     assert captured["resume_parts"] == parts
+
+
+def test_chat_with_server_threads_stale_host_suppression_to_repl_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The attach dispatcher carries recovery-only routing into client auth."""
+    _stub_run_repl_deps(monkeypatch, conversation_id="conv_1")
+    captured: dict[str, object] = {}
+
+    def _capture_auth(
+        server_url: str | None = None,
+        *,
+        session_id: str | None,
+        suppress_slice_key_for_host: str | None = None,
+    ) -> None:
+        captured.update(
+            server_url=server_url,
+            session_id=session_id,
+            suppress_slice_key_for_host=suppress_slice_key_for_host,
+        )
+
+    monkeypatch.setattr(chat_module, "_server_auth", _capture_auth)
+    monkeypatch.setattr(
+        chat_module,
+        "_redirect_native_resume_if_needed",
+        lambda **_kwargs: False,
+    )
+
+    chat_module._chat_with_server(
+        "https://acme.databricks.com/api/2.0/omnigent",
+        None,
+        agent_name="hello",
+        resume_conversation_id="conv_1",
+        suppress_slice_key_for_host="host_stale",
+    )
+
+    assert captured == {
+        "server_url": "https://acme.databricks.com/api/2.0/omnigent",
+        "session_id": "conv_1",
+        "suppress_slice_key_for_host": "host_stale",
+    }
 
 
 def test_run_repl_passes_ephemeral_to_run_repl(
@@ -3208,7 +3310,10 @@ def test_databricks_token_auth_resolves_sdk_once(
 
     monkeypatch.setattr(dbx, "_resolve_databricks_auth", _fake_resolve)
     monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)  # skip static path
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)  # skip OIDC path
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_token", lambda _url, **_kwargs: None
+    )  # skip OIDC path
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
     # No Databricks Apps pointer record stored for this server → the auth
     # falls through to ambient SDK resolution rather than host-keyed lookup.
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
@@ -3231,6 +3336,318 @@ def test_databricks_token_auth_resolves_sdk_once(
     assert cfg.authenticate_calls == 4
 
 
+def test_databricks_token_auth_serializes_concurrent_sdk_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent first requests share one lazily resolved SDK auth."""
+    import contextlib
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import omnigent.inner.databricks_executor as dbx
+
+    class _Config:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer tok-xyz"}
+
+    rendezvous = threading.Barrier(2)
+    resolve_calls = 0
+
+    def resolve(
+        profile: str | None = None,
+        *,
+        host: str | None = None,
+    ) -> tuple[object, str]:
+        nonlocal resolve_calls
+        assert profile is None and host is None
+        resolve_calls += 1
+        with contextlib.suppress(threading.BrokenBarrierError):
+            rendezvous.wait(timeout=0.1)
+        return dbx._DatabricksBearerAuth(_Config(), profile_name=None), "https://example.com"
+
+    monkeypatch.setattr(dbx, "_resolve_databricks_auth", resolve)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
+    auth = chat_module._DatabricksTokenAuth(server_url="https://example.com")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        tokens = list(pool.map(lambda _index: auth._sdk_token(), range(2)))
+
+    assert tokens == ["tok-xyz", "tok-xyz"]
+    assert resolve_calls == 1
+
+
+def test_databricks_token_auth_refreshes_oidc_during_long_lived_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One auth instance renews a stored login after its first token lapses."""
+    from omnigent.cli_auth import REFRESH_MIN_REMAINING_SECONDS
+
+    expired = False
+    load_calls: list[float] = []
+
+    def load_token(_url: str, *, min_remaining_seconds: float = 0.0) -> str | None:
+        load_calls.append(min_remaining_seconds)
+        return None if expired else "initial-token"
+
+    refresh_calls: list[str] = []
+
+    def refresh_token(url: str) -> str:
+        refresh_calls.append(url)
+        return "renewed-token"
+
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", load_token)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", refresh_token)
+    auth = chat_module._DatabricksTokenAuth(server_url="https://srv.example.com")
+
+    assert _first_auth_header(auth, "https://srv.example.com/v1/x") == ("Bearer initial-token")
+    expired = True
+    assert _first_auth_header(auth, "https://srv.example.com/v1/x") == ("Bearer renewed-token")
+
+    assert load_calls == [REFRESH_MIN_REMAINING_SECONDS] * 3
+    assert refresh_calls == ["https://srv.example.com"]
+
+
+def test_databricks_token_auth_cools_down_failed_oidc_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refresh outage does not block every request in a long-lived REPL."""
+    refresh_calls: list[str] = []
+
+    def load_token(_url: str, *, min_remaining_seconds: float = 0.0) -> str | None:
+        return "near-expiry-token" if min_remaining_seconds == 0.0 else None
+
+    def refresh_token(url: str) -> None:
+        refresh_calls.append(url)
+
+    server_url = "https://refresh-cooldown.example.com"
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", load_token)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", refresh_token)
+    auth = chat_module._DatabricksTokenAuth(server_url=server_url)
+
+    assert _first_auth_header(auth, f"{server_url}/v1/one") == ("Bearer near-expiry-token")
+    assert _first_auth_header(auth, f"{server_url}/v1/two") == ("Bearer near-expiry-token")
+
+    assert refresh_calls == [server_url]
+
+
+def test_databricks_token_auth_force_refreshes_rejected_oidc_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A revoked-but-unexpired stored bearer is replaced and replayed once."""
+    refresh_calls: list[tuple[str, bool]] = []
+
+    def load_token(_url: str, *, min_remaining_seconds: float = 0.0) -> str:
+        del min_remaining_seconds
+        return "revoked-token"
+
+    def refresh_token(
+        url: str,
+        *,
+        force: bool = False,
+        rejected_token: str | None = None,
+    ) -> str:
+        assert rejected_token == "revoked-token"
+        refresh_calls.append((url, force))
+        return "renewed-token"
+
+    server_url = "https://revoked-token.example.com"
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", load_token)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", refresh_token)
+    auth = chat_module._DatabricksTokenAuth(server_url=server_url)
+    flow = auth.auth_flow(httpx.Request("GET", f"{server_url}/v1/x"))
+
+    first_request = next(flow)
+    assert first_request.headers["Authorization"] == "Bearer revoked-token"
+    second_request = flow.send(httpx.Response(401, request=first_request))
+    assert second_request.headers["Authorization"] == "Bearer renewed-token"
+    flow.close()
+
+    assert refresh_calls == [(server_url, True)]
+
+
+def test_databricks_token_auth_replays_streamed_body_after_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sync auth retry preserves a generator-backed request body."""
+    bodies: list[bytes] = []
+
+    class _ConsumingTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            bodies.append(b"".join(request.stream))
+            return httpx.Response(401 if len(bodies) == 1 else 200)
+
+    def resolve_token(
+        _url: str,
+        *,
+        force_refresh: bool = False,
+        rejected_token: str | None = None,
+    ) -> str:
+        assert rejected_token in (None, "revoked-token")
+        return "renewed-token" if force_refresh else "revoked-token"
+
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(chat_module, "_refreshable_stored_token", resolve_token)
+    auth = chat_module._DatabricksTokenAuth(server_url="https://stream-retry.example.com")
+
+    with httpx.Client(transport=_ConsumingTransport(), auth=auth) as client:
+        response = client.post(
+            "https://stream-retry.example.com/v1/events",
+            content=iter((b"first-", b"second")),
+            headers={"Content-Length": "12"},
+        )
+
+    assert response.status_code == 200
+    assert bodies == [b"first-second", b"first-second"]
+
+
+@pytest.mark.asyncio
+async def test_databricks_token_auth_async_replays_streamed_body_after_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An async auth retry preserves an async-generator request body."""
+    bodies: list[bytes] = []
+
+    class _ConsumingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            bodies.append(b"".join([chunk async for chunk in request.stream]))
+            return httpx.Response(401 if len(bodies) == 1 else 200)
+
+    def resolve_token(
+        _url: str,
+        *,
+        force_refresh: bool = False,
+        rejected_token: str | None = None,
+    ) -> str:
+        assert rejected_token in (None, "revoked-token")
+        return "renewed-token" if force_refresh else "revoked-token"
+
+    async def body() -> AsyncGenerator[bytes, None]:
+        yield b"first-"
+        yield b"second"
+
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(chat_module, "_refreshable_stored_token", resolve_token)
+    auth = chat_module._DatabricksTokenAuth(server_url="https://async-stream-retry.example.com")
+
+    async with httpx.AsyncClient(transport=_ConsumingTransport(), auth=auth) as client:
+        response = await client.post(
+            "https://async-stream-retry.example.com/v1/events",
+            content=body(),
+            headers={"Content-Length": "12"},
+        )
+
+    assert response.status_code == 200
+    assert bodies == [b"first-second", b"first-second"]
+
+
+def test_databricks_token_auth_does_not_buffer_or_replay_large_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected large upload stays streamed and is not resent implicitly."""
+    bodies: list[bytes] = []
+    refreshes: list[str] = []
+
+    class _ConsumingTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            bodies.append(b"".join(request.stream))
+            return httpx.Response(401)
+
+    def resolve_token(
+        url: str,
+        *,
+        force_refresh: bool = False,
+        rejected_token: str | None = None,
+    ) -> str:
+        if force_refresh:
+            assert rejected_token == "revoked-token"
+            refreshes.append(url)
+            return "renewed-token"
+        return "revoked-token"
+
+    server_url = "https://large-stream.example.com"
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(chat_module, "_refreshable_stored_token", resolve_token)
+    auth = chat_module._DatabricksTokenAuth(server_url=server_url)
+
+    with httpx.Client(transport=_ConsumingTransport(), auth=auth) as client:
+        response = client.post(
+            f"{server_url}/v1/files",
+            content=iter((b"streamed",)),
+            headers={
+                "Content-Length": str(chat_module._AUTH_REPLAY_MAX_BODY_BYTES + 1),
+            },
+        )
+
+    assert response.status_code == 401
+    assert bodies == [b"streamed"]
+    assert refreshes == [server_url]
+
+
+def test_databricks_token_auth_cools_down_failed_forced_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated rejection of one token does not retry a failed renewal per request."""
+    refresh_calls: list[str] = []
+
+    def load_token(_url: str, *, min_remaining_seconds: float = 0.0) -> str:
+        del min_remaining_seconds
+        return "revoked-token"
+
+    def refresh_token(
+        url: str,
+        *,
+        force: bool = False,
+        rejected_token: str | None = None,
+    ) -> None:
+        assert force is True
+        assert rejected_token == "revoked-token"
+        refresh_calls.append(url)
+
+    server_url = "https://revoked-token-cooldown.example.com"
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", load_token)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", refresh_token)
+    auth = chat_module._DatabricksTokenAuth(server_url=server_url)
+
+    for path in ("one", "two"):
+        flow = auth.auth_flow(httpx.Request("GET", f"{server_url}/v1/{path}"))
+        request = next(flow)
+        with pytest.raises(StopIteration):
+            flow.send(httpx.Response(401, request=request))
+
+    assert refresh_calls == [server_url]
+
+
+@pytest.mark.asyncio
+async def test_databricks_token_auth_resolves_stored_token_off_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Async clients run blocking stored-token resolution in a worker thread."""
+    import threading
+
+    main_thread = threading.get_ident()
+    resolver_threads: list[int] = []
+
+    def resolve_token(_url: str) -> str:
+        resolver_threads.append(threading.get_ident())
+        return "oidc-token"
+
+    server_url = "https://async-auth.example.com"
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(chat_module, "_refreshable_stored_token", resolve_token)
+    auth = chat_module._DatabricksTokenAuth(server_url=server_url)
+    flow = auth.async_auth_flow(httpx.Request("GET", f"{server_url}/v1/x"))
+
+    request = await anext(flow)
+    assert request.headers["Authorization"] == "Bearer oidc-token"
+    await flow.aclose()
+
+    assert resolver_threads and resolver_threads[0] != main_thread
+
+
 def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every SDK-client request carries the workspace-routing header.
 
@@ -3242,7 +3659,8 @@ def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) 
     :returns: None.
     """
     monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kwargs: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
     monkeypatch.setattr(
         "omnigent.cli_auth.databricks_request_headers",
         lambda _url, *, host_id=None: {"X-Databricks-Org-Id": "2850744067564480"},
@@ -3656,6 +4074,61 @@ def test_run_attach_connects_post_only_without_binding_runner(
     # server agent-picker + its "Agent: …" echo) and the host's harness.
     assert captured["agent_name"] == "nessie"
     assert captured["attach_harness"] == "codex"
+
+
+def test_run_attach_suppresses_stale_slice_key_in_preflight_and_repl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery attach stays keyless from its snapshot through REPL startup."""
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+
+    base_url = "https://acme.databricks.com/api/2.0/omnigent"
+    monkeypatch.setattr(chat_module, "_session_hosts", {})
+    monkeypatch.setattr(
+        chat_module,
+        "_remote_headers",
+        lambda *, server_url, host_id: {
+            "Authorization": "Bearer test-token",
+            OMNIGENT_SLICE_KEY_HEADER: "host_stale",
+        },
+    )
+    preflight_headers: dict[str, str] = {}
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {
+                "host_id": "host_stale",
+                "runner_id": "runner_1",
+                "runner_online": True,
+                "agent_name": "nessie",
+                "harness": "codex",
+            }
+
+    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> _Resp:
+        assert url == f"{base_url}/v1/sessions/conv_1"
+        assert timeout == 10.0
+        preflight_headers.update(headers)
+        return _Resp()
+
+    repl_kwargs: dict[str, object] = {}
+    monkeypatch.setattr(chat_module, "_server_get", _fake_get)
+    monkeypatch.setattr(
+        chat_module,
+        "_chat_with_server",
+        lambda *_args, **kwargs: repl_kwargs.update(kwargs),
+    )
+
+    chat_module.run_attach(
+        base_url=base_url,
+        conversation_id="conv_1",
+        suppress_slice_key_for_host="host_stale",
+    )
+
+    assert preflight_headers == {"Authorization": "Bearer test-token"}
+    assert repl_kwargs["suppress_slice_key_for_host"] == "host_stale"
 
 
 def test_run_attach_uses_session_snapshot_runner_online(
@@ -4549,3 +5022,26 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     )
 
     assert redirected["session_id"] == "conv_abc123"
+
+
+def test_attach_only_native_session_uses_attributed_repl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attach stays in transcript mode instead of requesting raw TUI control."""
+    redirect = Mock(return_value=True)
+    run_repl = Mock()
+    monkeypatch.setattr(chat_module, "_redirect_native_resume_if_needed", redirect)
+    monkeypatch.setattr(chat_module, "_run_repl", run_repl)
+
+    chat_module._chat_with_server(
+        "https://example.com",
+        None,
+        resume_conversation_id="conv_shared_native",
+        agent_name="codex",
+        attach_only=True,
+        attach_harness="codex-native",
+    )
+
+    redirect.assert_not_called()
+    assert run_repl.call_args.kwargs["attach_only"] is True
+    assert run_repl.call_args.kwargs["attach_harness"] == "codex-native"
