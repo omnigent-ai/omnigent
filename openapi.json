@@ -2472,10 +2472,46 @@
             "title": "Call Id",
             "type": "string"
           },
+          "is_async": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the native tool result represents background work that is still running.",
+            "title": "Is Async"
+          },
+          "is_error": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the native harness marked the tool result as an error. Missing on conversation items written by older versions.",
+            "title": "Is Error"
+          },
           "output": {
             "description": "The tool's string result.",
             "title": "Output",
             "type": "string"
+          },
+          "tool_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional status carried by a native harness's structured tool-result metadata, e.g. `\"running\"` or `\"completed\"`. Named separately from the conversation item's own `status` so flattening the API shape cannot overwrite it.",
+            "title": "Tool Status"
           }
         },
         "required": [

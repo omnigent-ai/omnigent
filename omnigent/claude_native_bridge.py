@@ -465,6 +465,21 @@ class ClaudeTranscriptItem:
 
 
 @dataclass(frozen=True)
+class ClaudeTaskNotification:
+    """Structured completion notification written into Claude's transcript.
+
+    Claude records background Task/Agent completion as a synthetic ``user``
+    message. Only fields needed for correlation and safe delivery are kept;
+    paths and the raw control-message envelope are deliberately excluded.
+    """
+
+    task_id: str
+    tool_use_id: str | None = None
+    status: str | None = None
+    result: str | None = None
+
+
+@dataclass(frozen=True)
 class TranscriptReadResult:
     """
     Result of reading Claude transcript JSONL records.
@@ -498,6 +513,7 @@ class TranscriptReadResult:
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    task_notifications: tuple[ClaudeTaskNotification, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2403,6 +2419,7 @@ def read_transcript_items_since_with_position(
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    task_notifications: list[ClaudeTaskNotification] = []
     for record in read_result.records:
         if record.text is None:
             continue
@@ -2412,6 +2429,7 @@ def read_transcript_items_since_with_position(
             continue
         if not isinstance(entry, dict):
             continue
+        task_notifications.extend(_task_notifications_from_entry(entry))
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -2443,6 +2461,7 @@ def read_transcript_items_since_with_position(
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
+        task_notifications=tuple(task_notifications),
     )
 
 
@@ -2496,6 +2515,7 @@ def read_transcript_items_from_offset(
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    task_notifications: list[ClaudeTaskNotification] = []
     for record in read_result.records:
         if record.text is None:
             continue
@@ -2505,6 +2525,7 @@ def read_transcript_items_from_offset(
             continue
         if not isinstance(entry, dict):
             continue
+        task_notifications.extend(_task_notifications_from_entry(entry))
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -2537,6 +2558,7 @@ def read_transcript_items_from_offset(
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
+        task_notifications=tuple(task_notifications),
     )
 
 
@@ -2819,7 +2841,9 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
                     transcript_path = (
                         payload.get("transcript_path") if isinstance(payload, dict) else None
                     )
-                    if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
+                    if isinstance(transcript_path, str) and "subagents" in (
+                        part.casefold() for part in transcript_path.replace("\\", "/").split("/")
+                    ):
                         continue
                     return True
     except FileNotFoundError:
@@ -6176,6 +6200,68 @@ def _is_task_notification_text(text: str) -> bool:
     )
 
 
+def _task_notification_field(text: str, field: str) -> str | None:
+    """Return one bounded XML-like task-notification field."""
+    match = re.search(
+        rf"<{re.escape(field)}>(.*?)</{re.escape(field)}>",
+        text,
+        re.DOTALL,
+    )
+    if match is None:
+        return None
+    value = match.group(1).strip()
+    return value or None
+
+
+def _task_notification_from_text(text: str) -> ClaudeTaskNotification | None:
+    """Parse safe correlation/result fields from a Claude task notification."""
+    if not _is_task_notification_text(text):
+        return None
+    task_id = _task_notification_field(text, "task-id")
+    if task_id is None:
+        return None
+    return ClaudeTaskNotification(
+        task_id=task_id,
+        tool_use_id=_task_notification_field(text, "tool-use-id"),
+        status=_task_notification_field(text, "status"),
+        result=_task_notification_field(text, "result"),
+    )
+
+
+def _task_notifications_from_entry(entry: _JsonObject) -> list[ClaudeTaskNotification]:
+    """Extract task notifications without retaining their private path fields."""
+    message = entry.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return []
+    content = message.get("content")
+    texts: list[str] = []
+    if isinstance(content, str):
+        texts.append(content)
+    elif isinstance(content, list):
+        texts.extend(
+            text
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance((text := block.get("text")), str)
+        )
+    return [parsed for text in texts if (parsed := _task_notification_from_text(text))]
+
+
+def _task_notification_item_data(notification: ClaudeTaskNotification) -> _JsonObject:
+    """Build the persisted tool-result shape for a correlated notification."""
+    assert notification.tool_use_id is not None
+    data: _JsonObject = {
+        "call_id": notification.tool_use_id,
+        "output": notification.result or "",
+        "is_async": True,
+    }
+    if notification.status is not None:
+        data["tool_status"] = notification.status
+        data["is_error"] = notification.status == "failed"
+    return data
+
+
 def _local_command_transcript_items_from_entry(
     entry: _JsonObject,
     *,
@@ -6425,6 +6511,17 @@ def _user_transcript_items_from_entry(
         if any(stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS):
             return current_response_id, []
         if _is_task_notification_text(content):
+            notification = _task_notification_from_text(content)
+            if notification is not None and notification.tool_use_id is not None:
+                items.append(
+                    ClaudeTranscriptItem(
+                        source_id=_source_id(source_key, 0, "function_call_output"),
+                        item_type="function_call_output",
+                        data=_task_notification_item_data(notification),
+                        response_id=current_response_id or fallback_response_id,
+                    )
+                )
+                return current_response_id, items
             items.append(
                 ClaudeTranscriptItem(
                     source_id=_source_id(source_key, 0, "message"),
@@ -6478,6 +6575,18 @@ def _user_transcript_items_from_entry(
             ):
                 continue
             if _is_task_notification_text(text):
+                notification = _task_notification_from_text(text)
+                if notification is not None and notification.tool_use_id is not None:
+                    items.append(
+                        ClaudeTranscriptItem(
+                            source_id=_source_id(source_key, item_index, "function_call_output"),
+                            item_type="function_call_output",
+                            data=_task_notification_item_data(notification),
+                            response_id=current_response_id or fallback_response_id,
+                        )
+                    )
+                    item_index += 1
+                    continue
                 items.append(
                     ClaudeTranscriptItem(
                         source_id=_source_id(source_key, item_index, "message"),
@@ -6511,6 +6620,7 @@ def _user_transcript_items_from_entry(
                 data={
                     "call_id": call_id,
                     "output": _tool_result_output(entry, block),
+                    **_tool_result_metadata(entry, block),
                 },
                 response_id=response_id,
             )
@@ -6782,6 +6892,30 @@ def _tool_result_output(entry: _JsonObject, block: _JsonObject) -> str:
     if tool_use_result is not None:
         return json.dumps(_strip_inline_image_data(tool_use_result), separators=(",", ":"))
     return ""
+
+
+def _tool_result_metadata(entry: _JsonObject, block: _JsonObject) -> _JsonObject:
+    """Keep only lifecycle metadata needed to interpret a native tool result."""
+    data: _JsonObject = {}
+    tool_use_result = entry.get("toolUseResult")
+    if isinstance(tool_use_result, dict):
+        status = tool_use_result.get("status")
+        if isinstance(status, str) and status:
+            data["tool_status"] = status
+        raw_async = tool_use_result.get("isAsync")
+        if not isinstance(raw_async, bool):
+            raw_async = tool_use_result.get("is_async")
+        if isinstance(raw_async, bool):
+            data["is_async"] = raw_async
+        raw_error = tool_use_result.get("is_error")
+        if not isinstance(raw_error, bool):
+            raw_error = tool_use_result.get("isError")
+        if isinstance(raw_error, bool):
+            data["is_error"] = raw_error
+    block_error = block.get("is_error")
+    if isinstance(block_error, bool):
+        data["is_error"] = block_error
+    return data
 
 
 def _transcript_source_key(

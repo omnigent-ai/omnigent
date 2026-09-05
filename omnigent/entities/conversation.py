@@ -364,10 +364,21 @@ class FunctionCallOutputData(BaseModel):
     :param call_id: The call_id this output corresponds to,
         e.g. ``"call_abc123"``.
     :param output: The tool's string result.
+    :param tool_status: Optional status carried by a native harness's
+        structured tool-result metadata, e.g. ``"running"`` or
+        ``"completed"``. Named separately from the conversation item's own
+        ``status`` so flattening the API shape cannot overwrite it.
+    :param is_async: Whether the native tool result represents background
+        work that is still running.
+    :param is_error: Whether the native harness marked the tool result as an
+        error. Missing on conversation items written by older versions.
     """
 
     call_id: str
     output: str
+    tool_status: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    is_async: bool | None = Field(default=None, exclude_if=lambda value: value is None)
+    is_error: bool | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ErrorData(BaseModel):

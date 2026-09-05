@@ -2360,26 +2360,34 @@ async def _enrich_terminal_status_with_subagent_output(
 
     :param data: The ``external_session_status`` ``data`` to enrich, e.g.
         ``{"status": "idle"}``.
-    :param status: Status edge; only the terminal ``"idle"`` / ``"failed"``
-        edges are enriched.
+    :param status: Status edge. Legacy ``"idle"`` plus structured
+        ``"completed"`` / ``"failed"`` / ``"stopped"`` / ``"killed"``
+        terminal edges are enriched.
     :param session_id: Sub-agent session id, e.g. ``"conv_child123"``.
     :param conversation_store: Store read for the child's assistant text.
     :returns: ``data`` with ``"output"`` added when a terminal edge has a
         persisted assistant message; otherwise unchanged.
     """
-    if status not in ("idle", "failed"):
+    if status not in ("idle", "completed", "failed", "stopped", "killed"):
         return data
     existing = data.get("output")
-    if status == "failed" and isinstance(existing, str) and existing.strip():
+    if isinstance(existing, str) and existing.strip():
         return data
     output = await asyncio.to_thread(
         _latest_assistant_text_from_store,
         conversation_store,
         session_id,
     )
-    if output is None:
-        return data
-    return {**data, "output": output}
+    if output is not None:
+        return {**data, "output": output}
+    safe_fallbacks = {
+        "completed": "Sub-agent completed without a reliable final result.",
+        "failed": "Error: native sub-agent failed without a reliable error detail.",
+        "stopped": "Sub-agent stopped before producing a reliable final result.",
+        "killed": "Sub-agent was killed before producing a reliable final result.",
+    }
+    fallback = safe_fallbacks.get(status)
+    return {**data, "output": fallback} if fallback is not None else data
 
 
 async def _heal_subagent_runner_binding_via_parent(

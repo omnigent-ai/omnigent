@@ -188,10 +188,11 @@ async def post_external_session_status(
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
-    :param status: Session status value, e.g. ``"idle"`` or ``"failed"``.
-    :param output: Optional text attached to ``data``. On a ``"failed"`` edge
-        the server surfaces it as ``last_task_error`` so the UI shows a detail
-        instead of a bare "failed". Ignored when falsy.
+    :param status: Session status value, e.g. ``"running"``, ``"completed"``,
+        ``"failed"``, ``"stopped"``, or ``"killed"``.
+    :param output: Optional text attached to ``data``. For structured terminal
+        edges this is the correlated child result; on failure the server also
+        surfaces it as ``last_task_error``. Ignored when falsy.
     :param background_task_count: Background tasks (shells) still running at the
         edge, forwarded so the UI can show "N background tasks still running".
         ``None`` omits the field (server leaves its sticky tally untouched) — the

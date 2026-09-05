@@ -889,7 +889,11 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
     assert json.loads(tool_call.data["arguments"]) == {"file_path": "TODO.md"}
     assert tool_call.data["call_id"] == "toolu_read_1"
     assert items[2].response_id == tool_call.response_id
-    assert items[2].data == {"call_id": "toolu_read_1", "output": "TODO contents"}
+    assert items[2].data == {
+        "call_id": "toolu_read_1",
+        "output": "TODO contents",
+        "is_error": False,
+    }
     assert items[3].response_id == tool_call.response_id
     assert items[3].data == {
         "role": "assistant",
@@ -1014,6 +1018,107 @@ def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Pat
         "role": "user",
         "is_meta": True,
         "content": [{"type": "input_text", "text": task_notification}],
+    }
+
+
+def test_read_transcript_items_from_offset_parses_correlated_task_notification(
+    tmp_path: Path,
+) -> None:
+    """A correlated Claude task notification is a durable terminal tool result."""
+    task_notification = (
+        "<task-notification>\n"
+        "<task-id>a815d</task-id>\n"
+        "<tool-use-id>toolu_worker_1</tool-use-id>\n"
+        "<output-file>/private/tmp/worker.out</output-file>\n"
+        "<status>completed</status>\n"
+        '<summary>Agent "Explore spec" finished</summary>\n'
+        "<result>Final verified report.</result>\n"
+        "</task-notification>"
+    )
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "task-notification-correlated",
+                "message": {"role": "user", "content": task_notification},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+    )
+
+    assert len(result.task_notifications) == 1
+    notification = result.task_notifications[0]
+    assert notification.task_id == "a815d"
+    assert notification.tool_use_id == "toolu_worker_1"
+    assert notification.status == "completed"
+    assert notification.result == "Final verified report."
+    assert [item.item_type for item in result.items] == ["function_call_output"]
+    assert result.items[0].data == {
+        "call_id": "toolu_worker_1",
+        "output": "Final verified report.",
+        "is_async": True,
+        "tool_status": "completed",
+        "is_error": False,
+    }
+    assert "/private/tmp/worker.out" not in json.dumps(result.items[0].data)
+
+
+def test_read_transcript_items_since_preserves_async_tool_result_metadata(
+    tmp_path: Path,
+) -> None:
+    """Native async lifecycle fields survive the transcript boundary."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "tool-result-async",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_async_1",
+                            "content": "Async task started",
+                            "is_error": False,
+                        }
+                    ],
+                },
+                "toolUseResult": {
+                    "status": "running",
+                    "isAsync": True,
+                    "isError": True,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["function_call_output"]
+    assert items[0].data == {
+        "call_id": "toolu_async_1",
+        "output": "Async task started",
+        "tool_status": "running",
+        "is_async": True,
+        # The block-level value is the actual tool result and overrides the
+        # looser entry-level metadata.
+        "is_error": False,
     }
 
 
@@ -1217,20 +1322,21 @@ def test_read_transcript_items_from_offset_skips_existing_prefix(
         + "\n"
         for index in range(100)
     )
-    transcript_path.write_text(
-        prefix
-        + json.dumps(
-            {
-                "type": "assistant",
-                "uuid": "assistant-new",
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "new output"}],
-                },
-            }
-        )
-        + "\n",
-        encoding="utf-8",
+    transcript_path.write_bytes(
+        (
+            prefix
+            + json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": "assistant-new",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "new output"}],
+                    },
+                }
+            )
+            + "\n"
+        ).encode("utf-8")
     )
     prefix_offset = len(prefix.encode("utf-8"))
     _fail_if_path_reads_before_offset(monkeypatch, transcript_path, prefix_offset)
@@ -1540,19 +1646,20 @@ def test_read_transcript_line_cursor_migration_preserves_legacy_source_ids(
         )
         + "\n"
     )
-    transcript_path.write_text(
-        first_record
-        + json.dumps(
-            {
-                "type": "assistant",
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "new output"}],
-                },
-            }
-        )
-        + "\n",
-        encoding="utf-8",
+    transcript_path.write_bytes(
+        (
+            first_record
+            + json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "new output"}],
+                    },
+                }
+            )
+            + "\n"
+        ).encode("utf-8")
     )
 
     migrated = claude_native_bridge.read_transcript_items_since_with_position(
@@ -1838,9 +1945,8 @@ def test_read_hook_events_from_offset_skips_existing_prefix(
     prefix = "".join(
         json.dumps({"payload": {"hook_event_name": "SessionStart"}}) + "\n" for _index in range(50)
     )
-    hooks_path.write_text(
-        prefix + json.dumps({"payload": {"hook_event_name": "Stop"}}) + "\n",
-        encoding="utf-8",
+    hooks_path.write_bytes(
+        (prefix + json.dumps({"payload": {"hook_event_name": "Stop"}}) + "\n").encode("utf-8")
     )
     prefix_offset = len(prefix.encode("utf-8"))
     _fail_if_path_reads_before_offset(monkeypatch, hooks_path, prefix_offset)

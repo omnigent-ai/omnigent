@@ -1091,6 +1091,50 @@ def test_subagent_terminal_delivery_retry_uses_latest_undelivered_report() -> No
     assert delivered["output"] == "DONE_AFTER_RETRY"
 
 
+@pytest.mark.parametrize("terminal_status", ["stopped", "killed"])
+@pytest.mark.asyncio
+async def test_subagent_terminal_delivery_preserves_structured_terminal_status(
+    terminal_status: str,
+) -> None:
+    """Runner inbox delivery retains stopped/killed instead of flattening them."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import _cleanup_drained_subagent_work
+
+    parent_id = f"parent-{terminal_status}"
+    child_id = f"child-{terminal_status}"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref[parent_id] = session_inbox
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="terminal status",
+    )
+
+    delivered: dict[str, Any]
+    try:
+        ack = runner_app.mark_subagent_work_terminal(
+            child_id,
+            status=terminal_status,
+            output=f"worker {terminal_status}",
+        )
+        delivered = session_inbox.get_nowait()
+        await _cleanup_drained_subagent_work(
+            delivered,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+        )
+        work_after_drain = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert ack.delivered is True
+    assert delivered["status"] == terminal_status
+    assert delivered["output"] == f"worker {terminal_status}"
+    assert work_after_drain is None
+    assert runner_app._session_status_to_task_status(terminal_status) == terminal_status
+
+
 def test_stop_after_completed_does_not_downgrade_status() -> None:
     """
     A stop_session arriving after sub-agent completion must not downgrade status.

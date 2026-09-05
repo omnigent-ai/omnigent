@@ -101,7 +101,7 @@ _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 
 
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
-    {"idle", "running", "waiting", "failed"}
+    {"idle", "running", "waiting", "completed", "failed", "stopped", "killed"}
 )
 
 
@@ -170,6 +170,9 @@ _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY = "omnigent.claude_native.tool_use_id"
 
 
 _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY = "omnigent.claude_native.description"
+
+
+_SUBAGENT_TERMINAL_STATUS_LABEL_KEY = "omnigent.subagent.terminal_status"
 
 
 _EXTERNAL_CODEX_SUBAGENT_START_TYPE: str = "external_codex_subagent_start"
@@ -987,6 +990,7 @@ __all__ = [
     "_STOP_RUNNER_RESULT_TIMEOUT_S",
     "_STOP_SESSION_TYPE",
     "_SUBAGENT_FORWARD_RECONNECT_WAIT_S",
+    "_SUBAGENT_TERMINAL_STATUS_LABEL_KEY",
     "_TERMINAL_RESPONSE_EVENT_TYPES",
     "_TURN_ACTOR_LABEL",
     "_UI_ADDED_AGENT_TITLE_PREFIX",

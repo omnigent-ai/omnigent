@@ -1480,14 +1480,14 @@ async def test_external_subagent_start_idempotency_pages_beyond_first_100(
 
 @pytest.mark.parametrize(
     "missing_key",
-    ["subagent_id", "agent_type", "description", "tool_use_id"],
+    ["subagent_id", "agent_type", "description"],
 )
 async def test_external_subagent_start_rejects_missing_required_keys(
     client: httpx.AsyncClient,
     missing_key: str,
 ) -> None:
     """
-    A POST missing any of the four required ``data`` keys returns
+    A POST missing any required identity/display ``data`` key returns
     400 — payload validation is at the route boundary so the handler
     body always sees a complete record.
     """
@@ -3729,6 +3729,39 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
     assert published[5][1]["item"]["type"] == "terminal_command"
 
 
+async def test_post_external_function_call_output_preserves_lifecycle_metadata(
+    client: httpx.AsyncClient,
+) -> None:
+    """Async native tool lifecycle metadata survives persist and snapshot."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    item_data = {
+        "call_id": "toolu_async_roundtrip",
+        "output": "Async task started",
+        "tool_status": "running",
+        "is_async": True,
+        "is_error": False,
+    }
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call_output",
+                "response_id": "resp_async_roundtrip",
+                "source_id": "src_async_roundtrip",
+                "item_data": item_data,
+            },
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["items"][0]["type"] == "function_call_output"
+    assert snapshot["items"][0]["data"] == item_data
+
+
 async def test_post_external_function_call_output_caps_oversized_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -4336,10 +4369,21 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
             f"/v1/sessions/{child['id']}/events",
             json={"type": "external_session_status", "data": {"status": "idle"}},
         )
+        terminal_snapshot = await client.get(f"/v1/sessions/{child['id']}")
+        waiting_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "waiting"}},
+        )
+        active_snapshot = await client.get(f"/v1/sessions/{child['id']}")
     finally:
         await fake_runner.aclose()
 
     assert status_resp.status_code == 202, status_resp.text
+    assert terminal_snapshot.status_code == 200, terminal_snapshot.text
+    assert terminal_snapshot.json()["labels"]["omnigent.subagent.terminal_status"] == "completed"
+    assert waiting_resp.status_code == 202, waiting_resp.text
+    assert active_snapshot.status_code == 200, active_snapshot.text
+    assert active_snapshot.json()["labels"]["omnigent.subagent.terminal_status"] == ""
     assert forwarded == [
         {
             "path": f"/v1/sessions/{child['id']}/events",
@@ -4350,8 +4394,151 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
                 "tools": None,
                 "created_by": None,
             },
+        },
+        {
+            "path": f"/v1/sessions/{child['id']}/events",
+            "body": {
+                "type": "external_session_status",
+                "data": {"status": "waiting"},
+                "model_override": None,
+                "tools": None,
+                "created_by": None,
+            },
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_output"),
+    [
+        ("completed", "Sub-agent completed without a reliable final result."),
+        ("stopped", "Sub-agent stopped before producing a reliable final result."),
+        ("killed", "Sub-agent was killed before producing a reliable final result."),
+    ],
+)
+async def test_post_external_structured_terminal_ignores_stale_assistant_opener(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: str,
+    expected_output: str,
+) -> None:
+    """A newer tool boundary prevents an opener from becoming the result."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[dict[str, Any]] = []
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append({"path": request.url.path, "body": json.loads(request.content)})
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient:
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    try:
+        agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+        parent = await _create_session(client, agent["id"])
+        child_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent["id"],
+                "sub_agent_name": "worker",
+                "title": "worker:native",
+            },
+        )
+        assert child_resp.status_code == 201, child_resp.text
+        child = child_resp.json()
+
+        transcript_items = [
+            {
+                "item_type": "message",
+                "response_id": "resp_native_incomplete",
+                "source_id": "src_native_opener",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": "I will inspect the files."}],
+                },
+            },
+            {
+                "item_type": "function_call",
+                "response_id": "resp_native_incomplete",
+                "source_id": "src_native_call",
+                "item_data": {
+                    "agent": "claude-native-ui",
+                    "name": "Read",
+                    "arguments": '{"file_path":"spec.md"}',
+                    "call_id": "toolu_incomplete",
+                },
+            },
+            {
+                "item_type": "function_call_output",
+                "response_id": "resp_native_incomplete",
+                "source_id": "src_native_output",
+                "item_data": {
+                    "call_id": "toolu_incomplete",
+                    "output": "Async task still running",
+                    "tool_status": "running",
+                    "is_async": True,
+                    "is_error": False,
+                },
+            },
+        ]
+        for item in transcript_items:
+            item_resp = await client.post(
+                f"/v1/sessions/{child['id']}/events",
+                json={"type": "external_conversation_item", "data": item},
+            )
+            assert item_resp.status_code == 202, item_resp.text
+
+        forwarded.clear()
+        status_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": terminal_status},
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_resp.status_code == 202, status_resp.text
+    child_snapshot = await client.get(f"/v1/sessions/{child['id']}")
+    assert child_snapshot.status_code == 200, child_snapshot.text
+    assert child_snapshot.json()["labels"]["omnigent.subagent.terminal_status"] == terminal_status
+    assert forwarded == [
+        {
+            "path": f"/v1/sessions/{child['id']}/events",
+            "body": {
+                "type": "external_session_status",
+                "data": {"status": terminal_status, "output": expected_output},
+                "model_override": None,
+                "tools": None,
+                "created_by": None,
+            },
         }
     ]
+    assert not any(event.get("status") == terminal_status for _session_id, event in published)
+    assert any(
+        event.get("type") == "session.status" and event.get("status") == "idle"
+        for _session_id, event in published
+    )
+    assert "I will inspect the files." not in forwarded[0]["body"]["data"]["output"]
 
 
 async def test_post_external_session_status_failed_forwards_persisted_assistant_output(
@@ -10768,3 +10955,28 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+async def test_external_subagent_start_accepts_legacy_payload_without_tool_use_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """Older forwarders can register a child before correlation metadata existed."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": "legacy-agent-id",
+                "agent_type": "Explore",
+                "description": "Legacy forwarder",
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert isinstance(resp.json().get("child_session_id"), str)
