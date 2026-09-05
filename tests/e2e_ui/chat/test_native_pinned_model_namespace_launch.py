@@ -75,8 +75,13 @@ _PROBE_TIMEOUT_S = 300.0
 # (warmed by the probe above) plus the tmux/CLI boot on the fixed path.
 _OUTCOME_TIMEOUT_S = 240.0
 
-# The launch gate's rejection marker (runner/native/orchestration.py).
-_GATE_MARKER = "not in this host's current model list"
+# The launch gate's silent-fallback warnings (runner/native/orchestration.py):
+# a pin the gate cannot place on the catalog launches on the provider default
+# and logs one of these instead of honoring the pick.
+_FALLBACK_MARKERS = {
+    "claude": "claude-native: model pick",
+    "codex": "codex-native: model pick",
+}
 
 _ERROR_PILL = '[data-testid="error-pill"]'
 
@@ -414,15 +419,14 @@ def _session_terminal_exists(base_url: str, session_id: str) -> bool:
     return any(isinstance(row, dict) and row.get("type") == "terminal" for row in rows)
 
 
-def _session_gate_error(base_url: str, session_id: str) -> str | None:
-    """The session's persisted launch-gate failure detail, if any.
+def _session_launch_error(base_url: str, session_id: str) -> str | None:
+    """The session's persisted launch-failure detail, if any.
 
-    The gate abort publishes ``session.status: failed`` whose error the
+    A launch abort publishes ``session.status: failed`` whose error the
     server persists as reload-visible labels projected into the snapshot's
     ``last_task_error`` — the durable, user-facing failure record.
 
-    :returns: The failure message when it is the launch-gate rejection,
-        else ``None``.
+    :returns: The failure message when the launch recorded one, else ``None``.
     """
     snapshot = _client.get(f"{base_url}/v1/sessions/{session_id}", timeout=5.0)
     if snapshot.status_code != 200:
@@ -430,7 +434,7 @@ def _session_gate_error(base_url: str, session_id: str) -> str | None:
     error = snapshot.json().get("last_task_error")
     if isinstance(error, dict):
         message = str(error.get("message") or "")
-        if _GATE_MARKER in message:
+        if message:
             return message
     return None
 
@@ -442,17 +446,21 @@ def test_gateway_namespace_pin_does_not_abort_native_launch(
     native_launch_rig: _NativeRig,
     harness: str,
 ) -> None:
-    """A pin naming a served model in gateway spelling must still launch.
+    """A pin naming a served model in gateway spelling launches on that model.
 
     Journey (the reported one): create a native codex/claude session, pin a
     model this host's launchable catalog serves — spelled in the gateway /
     catalog namespace, as a deployed agent spec or an orchestrator pick
     spells it — open the session, and let the runner launch the terminal.
 
-    While the bug is live the pre-launch gate rejects the pin with ``the
-    requested model ... is not in this host's current model list`` before
-    the CLI starts, the session goes ``failed``, and this test fails with
-    that message. After a fix the terminal comes up.
+    The original bug hard-failed this launch at the pre-launch model gate
+    (session ``failed``, no terminal). The recovery contract that landed on
+    main softened an unplaceable pin to a provider-default launch, so
+    terminal registration alone no longer distinguishes a folded pin from a
+    silently dropped one; the test therefore also asserts the gate did not
+    log its not-served fallback for the pin. Opportunistic smoke: it skips
+    without the real CLI on PATH — the autocreate unit tests assert the
+    exact ``--model`` and pick survival deterministically.
     """
     if shutil.which(harness) is None:
         pytest.skip(f"{harness} CLI is required for the native pinned-model launch e2e")
@@ -491,13 +499,13 @@ def test_gateway_namespace_pin_does_not_abort_native_launch(
         )
         bind.raise_for_status()
 
-        # Outcome: the terminal registers (launch proceeded), or the gate
-        # rejection lands in the session's durable failure record.
+        # Outcome: the terminal registers (launch proceeded), or the launch
+        # failure lands in the session's durable failure record.
         gate_error: str | None = None
         launched = False
         deadline = time.monotonic() + _OUTCOME_TIMEOUT_S
         while time.monotonic() < deadline:
-            gate_error = _session_gate_error(rig.base_url, session_id)
+            gate_error = _session_launch_error(rig.base_url, session_id)
             if gate_error is not None:
                 break
             if _session_terminal_exists(rig.base_url, session_id):
@@ -513,16 +521,27 @@ def test_gateway_namespace_pin_does_not_abort_native_launch(
             with contextlib.suppress(AssertionError):
                 expect(page.locator(_ERROR_PILL).first).to_be_visible(timeout=30_000)
             pytest.fail(
-                f"native {harness} terminal launch aborted at the model gate for a "
-                f"pin that denotes a served model: pin={pin!r} (served by the host's "
-                f"launchable catalog as {served!r}; rows={catalog_ids}). Gate error: "
-                f"{gate_error}"
+                f"native {harness} terminal launch failed for a pin that denotes a "
+                f"served model: pin={pin!r} (served by the host's launchable catalog "
+                f"as {served!r}; rows={catalog_ids}). Launch error: {gate_error}"
             )
 
         assert launched, (
             f"native {harness} terminal neither launched nor hit the model gate "
             f"within {_OUTCOME_TIMEOUT_S:.0f}s (pin={pin!r}, catalog={catalog_ids}).\n"
             f"Runner log tail:\n{rig.runner_log.read_text()[-3000:]}"
+        )
+
+        # The fallback warning precedes the terminal launch, so by the time
+        # the terminal has registered its absence proves the gate honored
+        # the pin (folded onto the catalog's spelling) rather than silently
+        # launching the provider default and resetting the pick.
+        runner_log = rig.runner_log.read_text()
+        assert _FALLBACK_MARKERS[harness] not in runner_log, (
+            f"native {harness} terminal launched, but on the provider default: "
+            f"the gate could not place the pin {pin!r} on the catalog (served as "
+            f"{served!r}) and fell back instead of folding it.\n"
+            f"Runner log tail:\n{runner_log[-3000:]}"
         )
     finally:
         with contextlib.suppress(httpx.HTTPError):
