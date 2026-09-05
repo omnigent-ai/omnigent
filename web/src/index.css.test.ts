@@ -174,6 +174,18 @@ describe("index.css app-shell viewport lock", () => {
   });
 });
 
+describe("index.css monospace font rule", () => {
+  const rule = cssBlocks
+    .map(([block]) => block)
+    .find((block) => selectorOf(block) === ".font-mono");
+
+  it("disables punctuation ligatures and contextual alternates", () => {
+    expect(rule, "the global font-mono override is gone from index.css").toBeDefined();
+    expect(rule).toMatch(/font-variant-ligatures\s*:\s*none/);
+    expect(rule).toMatch(/font-feature-settings\s*:\s*"liga"\s+0\s*,\s*"calt"\s+0/);
+  });
+});
+
 const allWidthNativeLayoutRules = [
   ["iOS keyboard viewport", "[data-ios-native].app-shell", "--omnigent-viewport-height"],
   ["native chat header", ".chat-header", "--omnigent-safe-top"],

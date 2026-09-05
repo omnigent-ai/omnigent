@@ -116,6 +116,13 @@
   --shadow-dialog: 0 16px 48px rgb(var(--ui-shadow-neutral-rgb) / 0.2);
 }
 
+.font-mono {
+  font-variant-ligatures: none;
+  font-feature-settings:
+    "liga" 0,
+    "calt" 0;
+}
+
 /* The two body text steps. Keep these non-inline: `@theme inline` bakes the
  * literal value into each utility, which would make the runtime typography
  * mapping below a no-op. Line heights are unitless so both tiers keep their

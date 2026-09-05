@@ -61,7 +61,7 @@ export function CliCommandBlock({
     // line, which doesn't fire if surrounding tokens push it to wrap.
     <div className="flex w-full items-center gap-2 rounded-md border border-border bg-muted px-3 py-2 font-mono text-sm">
       <code
-        className="min-w-0 flex-1 break-all whitespace-pre-wrap [font-variant-ligatures:none] [font-feature-settings:'liga'_0,'calt'_0]"
+        className="min-w-0 flex-1 break-all whitespace-pre-wrap"
         data-testid={`${testIdPrefix}-command`}
       >
         {command}
@@ -91,9 +91,7 @@ export function InlineCliCode({ command }: { command: string }) {
 
   return (
     <span className="inline-flex items-baseline gap-1 rounded bg-muted px-1 align-baseline font-mono">
-      <code className="select-text break-all [font-variant-ligatures:none] [font-feature-settings:'liga'_0,'calt'_0]">
-        {command}
-      </code>
+      <code className="select-text break-all">{command}</code>
       <button
         type="button"
         aria-label={copied ? "Copied" : "Copy command"}
