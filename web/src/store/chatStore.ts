@@ -57,6 +57,7 @@ import { userInputElicitationKey } from "@/lib/askUserQuestion";
 import { LIVE_ITEM_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { hasUnresolvedTrailingToolCall } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   ApiError,
@@ -5491,15 +5492,44 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Captured BEFORE the patch below adopts event.responseId, so a
       // running/waiting status carrying an unseen id marks a new turn.
       const prevResponseId = useChatStore.getState().activeResponse?.responseId;
+      // Set when the patch callback classifies this edge as a false idle and
+      // drops it, so the id-keyed side effects below skip too — otherwise the
+      // sidebar dot would flip to idle while the chat stays working.
+      let ignoredFalseIdle = false;
       // The status patch is conversation-scoped; the cache/query side effects
       // further down are deliberately NOT (they are keyed by explicit id, so a
       // sub-agent's status still refreshes its parent's rail).
       applyToNamedConversation(event.conversationId, (s) => {
+        // A bare PTY-quiescence `idle` landing while the live turn still has
+        // an unresolved trailing tool call is a FALSE idle: a long,
+        // output-less tool keeps the pane unchanged past the idle watcher's
+        // threshold while the agent is still working (a harness with no
+        // status file has nothing else to say so). Adopting it would read as
+        // a turn end — the "Working…" shimmer dies and the in-flight tool
+        // collapses to "no output" — so drop the edge. It self-heals: the
+        // tool's eventual output mutates the pane, the watcher re-emits
+        // `running`, and the true turn-end idle is adopted because by then
+        // the call has a result (or trailing narration displaced it). An
+        // id-bearing terminal edge (status file / Stop hook) and a parked
+        // edge carrying a blocked-on reason stay authoritative, and a
+        // plain-text turn's bare idle still clears Working (no unresolved
+        // trailing call).
+        if (
+          event.status === "idle" &&
+          event.responseId === undefined &&
+          event.blockedOn == null &&
+          (s.sessionStatus === "running" || s.activeResponse?.state === "streaming") &&
+          hasUnresolvedTrailingToolCall(s.blocks)
+        ) {
+          ignoredFalseIdle = true;
+          return {};
+        }
         // `sessionStatus` tracks the server's session-level status 1:1 — a
         // server `idle` means the session is idle, full stop, and the
         // "Working…" indicator (which reads only `sessionStatus`) turns off.
         // There is exactly one idle heuristic and it lives server-side (the
-        // runner's PTY-activity watcher); the client must not second-guess it.
+        // runner's PTY-activity watcher); the client second-guesses it only
+        // for the single false-idle shape dropped above (a bare idle mid-tool).
         // The bubble lifecycle below (`status`/`activeResponse`) still defers
         // to response_end, but that is separate from the session-level status.
         const patch: Partial<ChatState> = {
@@ -5662,6 +5692,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         }
         return patch;
       });
+      // A dropped false idle must vanish entirely: no sidebar-cache status
+      // flip and no turn-end invalidations for an edge the store ignored.
+      if (ignoredFalseIdle) return;
       // Refetch the snapshot at turn START too: the runner persists
       // turn-scoped labels (e.g. the cost advisor's `cost_control.plan`
       // verdict) before the harness runs, so the verdict can render

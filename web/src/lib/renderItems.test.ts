@@ -22,6 +22,7 @@ import {
   buildBubbles,
   bubblesEqual,
   createBubbleCache,
+  hasUnresolvedTrailingToolCall,
   lastRenderableAssistantIndex,
   liveCandidateAssistantIndex,
 } from "./renderItems";
@@ -3543,5 +3544,67 @@ describe("buildBubbles — lastActivityAtS", () => {
     );
     const asst = bubbles[0] as Extract<Bubble, { kind: "assistant" }>;
     expect(asst.lastActivityAtS).toBeUndefined();
+  });
+});
+
+describe("hasUnresolvedTrailingToolCall", () => {
+  const group = (callIds: string[], output: string | null = null) => ({
+    type: "tool_group" as const,
+    ctx: ctx({ itemId: "fc_1", responseId: "resp_1" }),
+    executions: callIds.map((id) => ({ ...mkExec("shell", id), output })),
+    iteration: 0,
+  });
+  const result = (callId: string) => ({
+    type: "tool_result" as const,
+    ctx: ctx({ itemId: "fco_1", responseId: "resp_1" }),
+    name: "shell",
+    callId,
+    agentName: "test",
+    output: "done",
+  });
+  const text = () => ({
+    type: "text_done" as const,
+    ctx: ctx({ itemId: "m1", responseId: "resp_1" }),
+    fullText: "narration",
+    hasCodeBlocks: false,
+  });
+
+  it("empty transcript → false", () => {
+    expect(hasUnresolvedTrailingToolCall([])).toBe(false);
+  });
+
+  it("plain-text turn (no tool) → false", () => {
+    expect(hasUnresolvedTrailingToolCall([text()])).toBe(false);
+  });
+
+  it("trailing result-less tool call → true", () => {
+    expect(hasUnresolvedTrailingToolCall([text(), group(["c1"])])).toBe(true);
+  });
+
+  it("trailing call resolved by a tool_result → false", () => {
+    expect(hasUnresolvedTrailingToolCall([group(["c1"]), result("c1")])).toBe(false);
+  });
+
+  it("trailing call resolved by an inline execution output → false", () => {
+    expect(hasUnresolvedTrailingToolCall([group(["c1"], "ok")])).toBe(false);
+  });
+
+  it("narration after the tool call displaces the trailing phase → false", () => {
+    expect(hasUnresolvedTrailingToolCall([group(["c1"]), text()])).toBe(false);
+  });
+
+  it("native_tool blocks are skipped, not trailing-phase breakers → true", () => {
+    const native = {
+      type: "native_tool" as const,
+      ctx: ctx({ itemId: "nt_1", responseId: "resp_1" }),
+      toolType: "web_search_call",
+      label: "search",
+      data: {},
+    };
+    expect(hasUnresolvedTrailingToolCall([group(["c1"]), native])).toBe(true);
+  });
+
+  it("one resolved and one in-flight call in the trailing phase → true", () => {
+    expect(hasUnresolvedTrailingToolCall([group(["c1", "c2"]), result("c1")])).toBe(true);
   });
 });
