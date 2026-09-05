@@ -2789,13 +2789,21 @@ def register_core_routes(
         # Push the forked session to this user's other open tabs.
         _announce_session_added(user_id, new_conv.id)
 
+        # Bound the response like the GET-session snapshot: newest item page,
+        # chronological. Clients navigate by the fork's id and hydrate the
+        # transcript via the paged items endpoint, so returning the whole
+        # copied history only made the user-blocked response scale with
+        # source size.
         fork_items = await asyncio.to_thread(
-            conversation_store.list_items, new_conv.id, limit=10000
+            conversation_store.list_items,
+            new_conv.id,
+            limit=100,
+            order="desc",
         )
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
         return _build_session_response(
             new_conv,
-            fork_items.data,
+            list(reversed(fork_items.data)),
             "idle",
             permission_level=level,
             last_task_error=None,

@@ -262,12 +262,18 @@ class _ConversationStore:
         :param type: Item type filter.
         :returns: A PagedList of items.
         """
-        items = self._items.get(conversation_id, [])
+        items = list(self._items.get(conversation_id, []))
+        # Honor order + limit like the real store, so route tests can pin
+        # which page of the copied history a response carries.
+        if order == "desc":
+            items.reverse()
+        has_more = len(items) > limit
+        items = items[:limit]
         return PagedList(
             data=items,
             first_id=items[0].id if items else None,
             last_id=items[-1].id if items else None,
-            has_more=False,
+            has_more=has_more,
         )
 
 
@@ -605,6 +611,48 @@ async def test_fork_session_up_to_response_id_passes_through_and_truncates() -> 
     # appearing means the store ignored the cutoff.
     assert [item["response_id"] for item in body["items"]] == ["resp_001", "resp_001"], (
         f"Fork should contain only resp_001 items, got {body['items']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_response_is_bounded_to_newest_item_page() -> None:
+    """The 201 body must not carry the whole copied transcript.
+
+    The fork dialog blocks on this response and uses only the clone's id,
+    so a body that ships every copied item makes the user's wait scale
+    with history size (tens of MB for a long session). Like the
+    GET-session snapshot, the route returns the newest item page in
+    chronological order.
+    """
+    conv = _make_conversation()
+    items = [
+        _make_item(f"{index:032x}", f"turn {index}", response_id=f"resp_{index:03d}")
+        for index in range(150)
+    ]
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={"e9f8f58523cec9a57d3bdf93be543e8c": items},
+    )
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+
+    assert resp.status_code == 201, f"Expected 201 Created, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert len(body["items"]) == 100, (
+        f"fork response must carry at most one item page (100), got "
+        f"{len(body['items'])} of 150 copied items — a full-transcript body "
+        f"makes the user-blocked fork response scale with source size"
+    )
+    texts = [
+        part["text"]
+        for item in body["items"]
+        for part in item.get("data", {}).get("content", [])
+        if part.get("type") == "input_text"
+    ]
+    assert texts[0] == "turn 50" and texts[-1] == "turn 149", (
+        f"fork response should carry the NEWEST page in chronological order, "
+        f"got first={texts[0]!r} last={texts[-1]!r}"
     )
 
 

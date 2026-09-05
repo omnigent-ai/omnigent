@@ -3800,6 +3800,153 @@ def test_fork_remaps_compaction_boundary_to_copied_item(
     assert fork_compaction.data.last_item_id == fork_items[0].id
 
 
+def _count_encode_hooks(
+    store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, int]:
+    """Replace *store*'s payload-transform hooks with counting identities.
+
+    Models a deployment-shaped store where every hook call (per-item or
+    batch) is one round-trip, so a test can pin how many round-trips an
+    operation pays.
+
+    :param store: The store instance to instrument.
+    :param monkeypatch: Pytest monkeypatch for test-scoped patching.
+    :returns: Mutable counters keyed ``"item"``/``"batch"``/``"decode_batch"``.
+    """
+    calls = {"item": 0, "batch": 0, "decode_batch": 0}
+
+    def per_item_encode(data_json: str) -> str:
+        calls["item"] += 1
+        return data_json
+
+    def batch_encode(data_jsons: list[str]) -> list[str]:
+        calls["batch"] += 1
+        return list(data_jsons)
+
+    def batch_decode(stored: list[str]) -> list[str]:
+        calls["decode_batch"] += 1
+        return list(stored)
+
+    monkeypatch.setattr(store, "_encode_item_data", per_item_encode)
+    monkeypatch.setattr(store, "_encode_item_data_batch", batch_encode)
+    monkeypatch.setattr(store, "_decode_item_data_batch", batch_decode)
+    return calls
+
+
+def test_fork_reuses_encoded_payloads_without_per_item_encode(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forking must not pay one encode round-trip per copied item.
+
+    On a store whose payload encode is a per-call RPC (the documented
+    batch-hook deployment), a per-item fan-out multiplies the user's
+    blocked fork request by the item count. Non-compaction payloads never
+    change on copy, so the fork must reuse the stored encoding verbatim:
+    zero encode calls of either kind for a compaction-free source.
+    """
+    source = conversation_store.create_conversation()
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{index:03d}",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"turn {index}"}],
+                ),
+            )
+            for index in range(5)
+        ],
+    )
+    calls = _count_encode_hooks(conversation_store, monkeypatch)
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert calls["item"] == 0, (
+        f"fork paid {calls['item']} per-item encode round-trips; copied "
+        f"payloads must reuse the source's stored encoding"
+    )
+    assert calls["batch"] == 0, (
+        f"fork paid {calls['batch']} batch encode calls for a source with "
+        f"no compaction items; nothing needed re-encoding"
+    )
+    assert calls["decode_batch"] == 0, (
+        f"fork paid {calls['decode_batch']} batch decode calls for a source "
+        f"with no compaction items; nothing needed decoding"
+    )
+    fork_items = conversation_store.list_items(fork.id).data
+    source_items = conversation_store.list_items(source.id).data
+    assert [item.data for item in fork_items] == [item.data for item in source_items]
+
+
+def test_fork_reencodes_only_compaction_payloads_in_one_batch(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only compaction payloads (whose cursor is remapped) pay a re-encode,
+    and they pay it as ONE batch decode + ONE batch encode — never one call
+    per copied item."""
+    source = conversation_store.create_conversation()
+    [boundary] = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "old"}]),
+            )
+        ],
+    )
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="compact_001",
+                data=CompactionData(
+                    summary="The user said old.",
+                    last_item_id=boundary.id,
+                    token_count=6,
+                ),
+            )
+        ]
+        + [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{index:03d}",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"turn {index}"}],
+                ),
+            )
+            for index in range(2, 6)
+        ],
+    )
+    calls = _count_encode_hooks(conversation_store, monkeypatch)
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert calls["item"] == 0, (
+        f"fork paid {calls['item']} per-item encode round-trips; compaction "
+        f"re-encoding must go through the batch hook"
+    )
+    assert calls["batch"] == 1, (
+        f"fork paid {calls['batch']} batch encode calls; the remapped "
+        f"compaction payloads must be re-encoded in one batch"
+    )
+    assert calls["decode_batch"] == 1, (
+        f"fork paid {calls['decode_batch']} batch decode calls; only the "
+        f"compaction payloads need decoding, in one batch"
+    )
+    fork_items = conversation_store.list_items(fork.id).data
+    fork_compaction = next(item for item in fork_items if item.type == "compaction")
+    assert isinstance(fork_compaction.data, CompactionData)
+    assert fork_compaction.data.last_item_id == fork_items[0].id
+
+
 def test_fork_of_sub_agent_is_top_level(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,

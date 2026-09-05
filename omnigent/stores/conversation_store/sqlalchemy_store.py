@@ -3912,25 +3912,43 @@ class SqlAlchemyConversationStore(ConversationStore):
                 src_item.id: generate_item_id(decode_item_type(src_item.type))
                 for src_item in source_items
             }
-            decoded_item_data = self._decode_item_data_batch(
-                [src_item.data for src_item in source_items]
-            )
-
-            fts_rows: list[tuple[str, str, str]] = []
-            for pos, (src_item, decoded_data) in enumerate(
-                zip(source_items, decoded_item_data, strict=True)
-            ):
-                # src_item.type/status are int codes copied verbatim to the new
-                # row. Compaction data is the sole payload containing an item ID.
-                new_item_id = copied_item_ids[src_item.id]
-                copied_data = decoded_data
-                if decode_item_type(src_item.type) == "compaction":
+            # Copied rows reuse the source's already-encoded payload bytes (the
+            # encode transform depends only on item data); only compaction
+            # payloads change, remapped via one batch decode + one batch encode
+            # so a store whose encode is a per-call RPC never pays one
+            # round-trip per copied item inside this transaction.
+            compaction_positions = [
+                pos
+                for pos, src_item in enumerate(source_items)
+                if decode_item_type(src_item.type) == "compaction"
+            ]
+            remapped_compaction_data: dict[int, str] = {}
+            if compaction_positions:
+                decoded_compactions = self._decode_item_data_batch(
+                    [source_items[pos].data for pos in compaction_positions]
+                )
+                remapped: list[str] = []
+                for decoded_data in decoded_compactions:
                     compaction_data = json.loads(decoded_data)
                     boundary_id = compaction_data.get("last_item_id")
                     mapped_boundary_id = copied_item_ids.get(boundary_id)
                     if mapped_boundary_id is not None:
                         compaction_data["last_item_id"] = mapped_boundary_id
-                        copied_data = json.dumps(compaction_data)
+                    remapped.append(json.dumps(compaction_data))
+                remapped_compaction_data = dict(
+                    zip(
+                        compaction_positions,
+                        self._encode_item_data_batch(remapped),
+                        strict=True,
+                    )
+                )
+
+            fts_rows: list[tuple[str, str, str]] = []
+            for pos, src_item in enumerate(source_items):
+                # src_item.type/status/data are copied verbatim to the new row;
+                # compaction data alone is rewritten (the sole payload that
+                # contains an item ID).
+                new_item_id = copied_item_ids[src_item.id]
                 new_item = SqlConversationItem(
                     id=new_item_id,
                     conversation_id=new_conv.id,
@@ -3939,7 +3957,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     status=src_item.status,
                     position=pos,
                     type=src_item.type,
-                    data=self._encode_item_data(copied_data),
+                    data=remapped_compaction_data.get(pos, src_item.data),
                     search_text=src_item.search_text,
                     created_by=src_item.created_by,
                 )
