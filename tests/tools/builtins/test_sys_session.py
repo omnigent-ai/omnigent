@@ -984,6 +984,39 @@ def test_session_list_skips_label_closed_child_with_original_title(
     assert payload["sub_agents"] == []
 
 
+def test_session_list_reports_child_live_status(
+    session_fixture: _Fixture,
+) -> None:
+    """
+    ``sys_session_list`` rows carry the child's durable live status.
+
+    Without it, a parent inspecting its sub-agents cannot tell a child
+    whose turn ended (or died with an interrupted runner) from one still
+    working — the row read as an eternal opaque handle. A child that
+    never reported a status surfaces ``status: None`` rather than a guess.
+    """
+    raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
+    payload = json.loads(raw)
+    assert payload["sub_agents"] == [
+        {
+            "agent": "researcher",
+            "title": "auth",
+            "conversation_id": session_fixture.child_conv_id,
+            "status": None,
+        }
+    ]
+
+    session_fixture.conv_store.set_session_live_status(session_fixture.child_conv_id, "idle")
+    raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
+    payload = json.loads(raw)
+    assert payload["sub_agents"][0]["status"] == "idle"
+
+    session_fixture.conv_store.set_session_live_status(session_fixture.child_conv_id, "failed")
+    raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
+    payload = json.loads(raw)
+    assert payload["sub_agents"][0]["status"] == "failed"
+
+
 def test_session_list_schema_exposes_bounded_pagination() -> None:
     """The harness can discover the same pagination inputs the runner accepts."""
 
