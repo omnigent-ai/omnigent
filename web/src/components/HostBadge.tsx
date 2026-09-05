@@ -148,7 +148,10 @@ export function HostBadge({
   // The dot is decorative (aria-hidden), so the status would otherwise be
   // conveyed by color alone. Restate it in sr-only text — read together with
   // the visible label, a screen reader announces "<host>, <status>". `title`
-  // carries the same text for mouse hover.
+  // carries the same text for mouse hover. When the host dropped, the
+  // reconnect wording is the action the disabled composer's "reconnect
+  // below" placeholder points at, so it must be legible — sr-only/hover-only
+  // leaves sighted users with nothing visible to click.
   const content = (
     <>
       <span
@@ -156,7 +159,14 @@ export function HostBadge({
         className={cn("size-2 shrink-0 rounded-full", STATUS_DOT_CLASS[badge.status])}
       />
       <span className="truncate">{badge.label}</span>
-      <span className="sr-only">, {statusWord}</span>
+      {reconnectable ? (
+        <>
+          <span className="sr-only">{", "}</span>
+          <span className="shrink-0 whitespace-nowrap text-destructive">{statusWord}</span>
+        </>
+      ) : (
+        <span className="sr-only">, {statusWord}</span>
+      )}
     </>
   );
   const title = `Host ${badge.label}, ${statusWord}`;
