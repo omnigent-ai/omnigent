@@ -994,6 +994,57 @@ describe("LatestTurnSpacer", () => {
     expect(spacer.style.display).toBe("none");
     expect(spacer.style.height || "0px").toBe("0px");
   });
+
+  it("holds its height while the anchor is windowed out, then re-resolves the remounted node", () => {
+    // WHY: the transcript is virtualized, so the anchor's DOM node is destroyed
+    // when it scrolls out of the window and a *fresh* node with the same id
+    // mounts when it returns. The spacer must resolve the anchor by id, not by a
+    // captured node reference — a held reference would stay detached forever and
+    // freeze the reservation.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const makeAnchor = (top: number) => {
+      const el = document.createElement("div");
+      el.dataset.role = "user";
+      el.dataset.userMessageId = "initial-user";
+      vi.spyOn(el, "getBoundingClientRect").mockReturnValue(rect(top));
+      return el;
+    };
+    const first = makeAnchor(0);
+    scrollRoot.append(first);
+    useChatStore.setState({ blocks: [userBlock("initial-user")] });
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("104px"); // 600 − 400 − 96
+
+    // Windowed out: the row unmounts. The captured height must hold.
+    first.remove();
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("104px");
+
+    // Windowed back in as a *new* node with the same id, at a different offset
+    // (anchor at 50 → 600 − (400 − 50) − 96 = 154). A stale node reference would
+    // still read the removed node; id re-resolution picks up the fresh node.
+    const remounted = makeAnchor(50);
+    scrollRoot.append(remounted);
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("154px");
+  });
 });
 
 describe("JumpToTopButton", () => {

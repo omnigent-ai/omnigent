@@ -1,4 +1,5 @@
-import { memo, useEffect, useMemo, useRef } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Conversation,
   ConversationContent,
@@ -268,14 +269,12 @@ function TranscriptImpl({
               <>
                 {/* Older pages prepend here while their request is in flight. */}
                 {loadingMoreHistory && <HistoryLoadingIndicator />}
-                {streamBubbles.map((bubble, bubbleIndex) => (
-                  <BubbleView
-                    key={bubbleKey(bubble)}
-                    bubble={bubble}
-                    isLastAssistant={bubbleIndex === lastAssistantIndex}
-                    showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
-                  />
-                ))}
+                <VirtualBubbleList
+                  bubbles={streamBubbles}
+                  scrollEl={scroller?.el ?? null}
+                  lastAssistantIndex={lastAssistantIndex}
+                  showsWorking={showsWorking}
+                />
                 {/* Pending elicitation cards, floated to the bottom of the chat
                 so an outstanding question stays in view. Newest renders last,
                 nearest the composer. Above the Working… indicator. */}
@@ -339,6 +338,127 @@ function TranscriptImpl({
         )}
       </div>
     </>
+  );
+}
+
+/**
+ * Windows the bubble list off the StickToBottom scroll container so only the
+ * on-screen slice mounts — switching into a long conversation no longer pays to
+ * mount every bubble's markdown/tool subtree at once.
+ *
+ * The window is one flex child of the content div, sized to the full measured
+ * height (`getTotalSize`) with each row absolutely positioned. Keeping the
+ * wrapper at full height preserves `scrollHeight`, so StickToBottom's
+ * at-bottom math, the TranscriptScrollbar, and the LatestTurnSpacer all keep
+ * measuring the whole transcript even though most rows are unmounted. Rows are
+ * keyed by `bubbleKey` so measured heights follow a bubble across a streaming
+ * rebuild or a history prepend.
+ */
+function VirtualBubbleList({
+  bubbles,
+  scrollEl,
+  lastAssistantIndex,
+  showsWorking,
+}: {
+  bubbles: Bubble[];
+  scrollEl: HTMLElement | null;
+  lastAssistantIndex: number;
+  showsWorking: boolean;
+}) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  // The list isn't the scroll container's first child — indicators, padding,
+  // and the task tracker sit above it — so its top offset feeds the virtualizer
+  // as scrollMargin. Without it every row's computed `start` is shifted and the
+  // wrong window mounts. It goes stale whenever content ABOVE the list changes
+  // height without changing `bubbles.length` (the history-loading indicator
+  // toggling, the `pt-4 ↔ pt-20` task padding), so it is remeasured by watching
+  // the content element — which reflows on any such change — not just the
+  // scroll container (whose box size those changes leave untouched).
+  const [scrollMargin, setScrollMargin] = useState(0);
+  useLayoutEffect(() => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper || !scrollEl) return;
+    const measure = () => {
+      const offset =
+        wrapper.getBoundingClientRect().top -
+        scrollEl.getBoundingClientRect().top +
+        scrollEl.scrollTop;
+      setScrollMargin((prev) => (Math.abs(prev - offset) >= 1 ? offset : prev));
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(scrollEl); // viewport height changes
+    if (wrapper.parentElement) observer.observe(wrapper.parentElement); // content reflow above
+    return () => observer.disconnect();
+  }, [scrollEl, bubbles.length]);
+
+  const virtualizer = useVirtualizer({
+    count: bubbles.length,
+    getScrollElement: () => scrollEl,
+    // Corrected per row by measureElement; a middling bubble keeps the initial
+    // total close enough that the first paint doesn't jump.
+    estimateSize: () => 280,
+    getItemKey: (index) => bubbleKey(bubbles[index]!),
+    // Replaces the content column's `gap-4` between bubbles, which absolute
+    // positioning would otherwise drop.
+    gap: 16,
+    overscan: 6,
+    scrollMargin,
+  });
+
+  const totalSize = virtualizer.getTotalSize();
+
+  // Older-history prepend compensation. Absolute rows are out of normal flow,
+  // so the browser's native scroll anchoring — which `HistoryAutoLoader` leans
+  // on to hold the read position across a prepend — can't act on them: the
+  // window would jump down by the height the prepended rows add. When a page is
+  // prepended (the first row's key changes while the reader isn't at the very
+  // top), bump scrollTop by the growth in total height so the read position
+  // stays put. react-virtual then corrects the estimate→actual delta itself as
+  // the freshly-mounted top rows measure (its first-measure above-fold
+  // adjustment), so this only has to cover the initial estimated shift.
+  const prevFirstKeyRef = useRef<string | undefined>(undefined);
+  const prevTotalSizeRef = useRef(totalSize);
+  useLayoutEffect(() => {
+    const firstKey = bubbles.length > 0 ? bubbleKey(bubbles[0]!) : undefined;
+    const prevFirstKey = prevFirstKeyRef.current;
+    const prevTotal = prevTotalSizeRef.current;
+    prevFirstKeyRef.current = firstKey;
+    prevTotalSizeRef.current = totalSize;
+    // A prepend keeps the old first row somewhere in the new list, just no
+    // longer first. A conversation switch replaces the whole list, so the old
+    // first key is gone — that case is handled by the mount-time scroll-to-
+    // bottom, and must not be compensated here.
+    if (!scrollEl || prevFirstKey === undefined || firstKey === prevFirstKey) return;
+    const stillPresent = bubbles.some((b) => bubbleKey(b) === prevFirstKey);
+    if (!stillPresent) return;
+    const grew = totalSize - prevTotal;
+    if (grew > 0 && scrollEl.scrollTop > 1) scrollEl.scrollTop += grew;
+  }, [bubbles, totalSize, scrollEl]);
+
+  return (
+    <div ref={wrapperRef} className="relative w-full" style={{ height: `${totalSize}px` }}>
+      {virtualizer.getVirtualItems().map((item) => {
+        const bubble = bubbles[item.index];
+        if (!bubble) return null;
+        return (
+          <div
+            key={item.key}
+            data-index={item.index}
+            ref={virtualizer.measureElement}
+            className="absolute top-0 left-0 w-full"
+            style={{ transform: `translateY(${item.start - scrollMargin}px)` }}
+          >
+            <BubbleView
+              bubble={bubble}
+              isLastAssistant={item.index === lastAssistantIndex}
+              showsWorking={showsWorking && item.index === lastAssistantIndex}
+            />
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
