@@ -5,7 +5,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from omnigent_slack.models import SessionRecord, ThreadKey, UserConfig
+from omnigent_slack.models import PendingMessage, SessionRecord, ThreadKey, UserConfig
 
 
 class SQLiteStore:
@@ -51,6 +51,21 @@ class SQLiteStore:
                     workspace TEXT,
                     host_id TEXT,
                     host_name TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (team_id, user_id)
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_messages (
+                    team_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    thread_ts TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    in_channel INTEGER NOT NULL,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     PRIMARY KEY (team_id, user_id)
@@ -177,13 +192,79 @@ class SQLiteStore:
             )
             await db.commit()
 
+    async def upsert_pending_message(
+        self, user_id: str, key: ThreadKey, text: str, *, in_channel: bool
+    ) -> None:
+        """Keep the message a user sent before they had any setup.
+
+        One row per ``(team_id, user_id)``: a second message written while
+        setup is still open REPLACES the first, so finishing setup answers what
+        the user asked most recently rather than replaying a backlog.
+        """
+        now = int(time.time())
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                """
+                INSERT INTO pending_messages (
+                    team_id, user_id, channel_id, thread_ts, text,
+                    in_channel, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(team_id, user_id) DO UPDATE SET
+                    channel_id = excluded.channel_id,
+                    thread_ts = excluded.thread_ts,
+                    text = excluded.text,
+                    in_channel = excluded.in_channel,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    key.team_id,
+                    user_id,
+                    key.channel_id,
+                    key.thread_ts,
+                    text,
+                    int(in_channel),
+                    now,
+                    now,
+                ),
+            )
+            await db.commit()
+
+    async def take_pending_message(self, team_id: str, user_id: str) -> PendingMessage | None:
+        """Claim the user's stashed message, removing it in the same statement.
+
+        Read-and-delete is one statement (SQLite 3.35+ ``RETURNING``) so a
+        replayed setup submission can't run the same message twice — only the
+        caller that removes the row gets it. ``None`` means nothing was stashed,
+        which is the normal case for someone who ran ``/omnigent`` directly.
+        """
+        async with aiosqlite.connect(self._path) as db:
+            cursor = await db.execute(
+                """
+                DELETE FROM pending_messages
+                WHERE team_id = ? AND user_id = ?
+                RETURNING channel_id, thread_ts, text, in_channel
+                """,
+                (team_id, user_id),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            await db.commit()
+        if row is None:
+            return None
+        return PendingMessage(
+            key=ThreadKey(team_id=team_id, channel_id=str(row[0]), thread_ts=str(row[1])),
+            text=str(row[2]),
+            in_channel=bool(row[3]),
+        )
+
     async def clear_user_data(self, team_id: str, user_id: str) -> None:
-        """Delete a user's saved config and every session thread they own.
+        """Delete a user's saved config, session threads, and stashed message.
 
         Backs ``/omnigent logout``: after this the user is fully reset —
-        their agent/host/workspace choice is gone and their channel/DM
-        threads no longer map to any Omnigent session, so a later message
-        starts fresh (once they reconfigure).
+        their agent/host/workspace choice is gone, their channel/DM threads no
+        longer map to any Omnigent session, and no pre-setup message is left to
+        replay, so a later message starts fresh (once they reconfigure).
         """
         async with aiosqlite.connect(self._path) as db:
             await db.execute(
@@ -192,6 +273,10 @@ class SQLiteStore:
             )
             await db.execute(
                 "DELETE FROM thread_sessions WHERE team_id = ? AND owner_user_id = ?",
+                (team_id, user_id),
+            )
+            await db.execute(
+                "DELETE FROM pending_messages WHERE team_id = ? AND user_id = ?",
                 (team_id, user_id),
             )
             await db.commit()

@@ -138,6 +138,11 @@ async def run() -> None:
         setup=setup,
         server_url=settings.server_url,
     )
+    # A first message from an unconfigured user is stashed and prompted into
+    # setup; this replays it the moment setup saves, so the user gets an answer
+    # instead of having to send it again. Wired after both exist — the service
+    # already depends on the flow, so the flow only learns the callback.
+    setup.set_completion_hook(service.resume_pending_message)
 
     app = AsyncApp(token=settings.slack_bot_token)
     setup.register(app)

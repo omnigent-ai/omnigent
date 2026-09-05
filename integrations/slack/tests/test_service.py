@@ -1551,6 +1551,162 @@ async def test_unconfigured_user_is_prompted_and_no_turn_runs(tmp_path: Path) ->
     assert setup.prompted[0]["in_channel"] is True
 
 
+async def test_unconfigured_mention_is_stashed_for_replay(tmp_path: Path) -> None:
+    # The message that triggers setup is kept, so finishing setup can answer it.
+    # Without this the user's first message silently vanishes and they have to
+    # notice nothing happened and send it again.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, setup = _service(store, omnigent)
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> what changed?"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await service.shutdown()
+
+    assert len(setup.prompted) == 1
+    pending = await store.take_pending_message("T1", "U1")
+    assert pending is not None
+    assert pending.text == "what changed?"
+    # The thread it arrived in, so the replay can answer there.
+    assert pending.key == ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
+    assert pending.in_channel is True
+
+
+async def test_setup_completion_resumes_the_pending_message(tmp_path: Path) -> None:
+    # The whole point: once setup saves, the stashed message runs as a normal
+    # turn — under the config just saved, in the thread it came from.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> what changed?"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    # Setup saves a config, then fires the completion hook that app.py wires
+    # to this method.
+    await _configure_user(store, "T1", "U1", agent_id="ag_9")
+    await service.resume_pending_message("T1", "U1", slack)
+    stream = await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    # Ran once, with the agent setup just saved.
+    assert omnigent.turns == [("conv_1", "what changed?")]
+    assert omnigent.created[0][0] == "ag_9"
+    # The answer lands in the ORIGINAL channel thread, not in the DM where the
+    # user finished setup.
+    assert stream.start_kwargs["channel"] == "C1"
+    assert stream.start_kwargs["thread_ts"] == "100.1"
+    # The session belongs to the sender, and the stash is consumed — a repeated
+    # setup submission must not run the same message twice.
+    record = await store.get_session(ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1"))
+    assert record is not None and record.owner_user_id == "U1"
+    assert await store.take_pending_message("T1", "U1") is None
+
+
+async def test_second_mention_before_setup_replaces_the_pending_message(tmp_path: Path) -> None:
+    # Someone who asks a second thing mid-setup wants THAT answered — not both,
+    # and not the one they moved on from.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+
+    for ts, event_id, text in (("100.1", "Ev1", "first"), ("200.2", "Ev2", "second")):
+        await service.handle_app_mention(
+            body={"team_id": "T1", "event_id": event_id},
+            event={"channel": "C1", "ts": ts, "user": "U1", "text": f"<@B1> {text}"},
+            client=slack,
+            context={"bot_user_id": "B1"},
+        )
+
+    await _configure_user(store, "T1", "U1")
+    await service.resume_pending_message("T1", "U1", slack)
+    stream = await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    assert omnigent.turns == [("conv_1", "second")]
+    assert stream.start_kwargs["thread_ts"] == "200.2"
+
+
+async def test_resume_without_a_pending_message_runs_no_turn(tmp_path: Path) -> None:
+    # Running /omnigent without ever messaging the bot leaves nothing stashed.
+    # The hook must stay silent rather than manufacture a turn nobody asked for.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.resume_pending_message("T1", "U1", slack)
+    await service.shutdown()
+
+    assert omnigent.created == []
+    assert omnigent.turns == []
+    assert slack.streams == []
+    assert slack.posts == []
+
+
+async def test_resumed_message_is_dropped_while_that_thread_streams(tmp_path: Path) -> None:
+    # The user re-sends their question out of habit just as setup saves. That
+    # turn already holds the thread, so the resumed copy must be dropped — two
+    # streams on one thread render every event twice.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    release = asyncio.Event()
+
+    class BlockingClient(FakeOmnigentClient):
+        async def run_turn(
+            self,
+            session_id: str,
+            text: str,
+            *,
+            workspace: str | None = None,
+            host_id: str | None = None,
+        ) -> AsyncIterator[dict[str, Any]]:
+            self.turns.append((session_id, text))
+            await release.wait()  # hold the re-sent turn streaming locally
+            yield {"type": "session.status", "status": "idle"}
+
+    omnigent = BlockingClient()
+    service, _pool, _setup = _service(store, omnigent)
+    event = {"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> ship it?"}
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event=event,
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _configure_user(store, "T1", "U1")
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev2"},
+        event=event,
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    for _ in range(100):  # wait until the re-sent turn is actually streaming
+        if omnigent.turns:
+            break
+        await asyncio.sleep(0.02)
+
+    await service.resume_pending_message("T1", "U1", slack)
+
+    # One turn, and the stash is gone — the re-sent copy is answering it.
+    assert omnigent.turns == [("conv_1", "ship it?")]
+    assert await store.take_pending_message("T1", "U1") is None
+    release.set()
+    await service.shutdown()
+
+
 async def test_channel_followup_from_other_user_is_ignored(tmp_path: Path) -> None:
     # A thread's session belongs to its creator; a different user's @mention in
     # that thread is not added to the session, but that user gets a private

@@ -26,7 +26,15 @@ from omnigent_slack.auth_manager import AuthManager
 from omnigent_slack.models import UserConfig
 from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.service import SlackOmnigentService
-from omnigent_slack.setup import SetupFlow
+from omnigent_slack.setup import (
+    AGENT_ACTION,
+    AGENT_BLOCK,
+    HOST_ACTION,
+    HOST_BLOCK,
+    WORKSPACE_ACTION,
+    WORKSPACE_BLOCK,
+    SetupFlow,
+)
 from omnigent_slack.store import SQLiteStore
 from omnigent_slack.tokens import EncryptedTokenStore
 
@@ -494,6 +502,88 @@ async def test_no_delta_turn_recovers_committed_answer(tmp_path: Path) -> None:
     assert f"/v1/sessions/{server.session_id}/items" in server.paths("GET")
     # Slack side: the recovered committed answer was delivered.
     assert "Recovered answer." in client.streamed_text
+
+
+# ── Scenario 10: message before setup → answered when setup saves ─────────────
+
+
+@respx.mock
+async def test_message_sent_before_setup_is_answered_once_setup_saves(tmp_path: Path) -> None:
+    """An unconfigured user's first message is kept and replayed as a full turn
+    the moment they finish setup — answered in the thread it came from, not the
+    DM where they completed setup."""
+    server = FakeOmnigentServer(_SERVER)
+    server.install(respx.mock)
+
+    store = await _store(tmp_path)
+    pool = OmnigentClientPool()
+    setup = SetupFlow(store=store, pool=pool, server_url=_SERVER)
+    service = SlackOmnigentService(store=store, pool=pool, setup=setup, server_url=_SERVER)
+    # The wiring app.py performs once both objects exist.
+    setup.set_completion_hook(service.resume_pending_message)
+    client = RecordingSlackClient()
+
+    try:
+        await service.handle_app_mention(
+            body={"team_id": "T1", "event_id": "Ev1"},
+            event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> review this"},
+            client=client,
+            context={"bot_user_id": "B1"},
+        )
+        # Nothing ran yet: the user was DM'd the setup button instead.
+        assert server.find("POST", "/v1/sessions") is None
+        assert client.dm_opens, "expected the setup prompt DM"
+
+        await setup._handle_select_submit(
+            _noop_ack,
+            {"team": {"id": "T1"}, "user": {"id": "U1"}},
+            _submitted_picker(),
+            client,
+        )
+        await _wait_for_stream_stop(client, service)
+    finally:
+        await service.shutdown()
+        await pool.aclose_all()
+
+    # Server side: the stashed message drove the whole turn contract, under the
+    # agent/host/workspace the submission just saved.
+    server.assert_request("POST", "/v1/sessions", json_contains={"agent_id": "ag_1"})
+    launch = server.assert_request("POST", "/v1/hosts/h1/runners")
+    assert launch[3] == {"session_id": "conv_1", "workspace": "/home/bot/work"}
+    submit = server.assert_request("POST", f"/v1/sessions/{server.session_id}/events")
+    assert submit[3]["data"]["content"] == [{"type": "input_text", "text": "review this"}]
+
+    # Slack side: the answer streamed into the ORIGINAL channel thread.
+    assert "Here is the answer." in client.streamed_text
+    assert client.stream.start_kwargs["channel"] == "C1"
+    assert client.stream.start_kwargs["thread_ts"] == "100.1"
+
+
+def _submitted_picker() -> dict[str, object]:
+    """The completed agent/host/workspace picker, as Slack submits it."""
+    return {
+        "state": {
+            "values": {
+                AGENT_BLOCK: {
+                    AGENT_ACTION: {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "debby"},
+                            "value": "ag_1",
+                        }
+                    }
+                },
+                HOST_BLOCK: {
+                    HOST_ACTION: {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Host One"},
+                            "value": "h1",
+                        }
+                    }
+                },
+                WORKSPACE_BLOCK: {WORKSPACE_ACTION: {"value": "/home/bot/work"}},
+            }
+        },
+    }
 
 
 # ── minimal setup/ack doubles for the service path ────────────────────────────

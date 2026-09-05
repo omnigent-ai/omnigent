@@ -79,6 +79,21 @@ class SessionRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingMessage:
+    """A message its sender wrote before they had any setup, kept to replay.
+
+    Held per ``(team_id, user_id)`` — only the newest one, since someone who
+    asks a second thing mid-setup wants that answered, not both. ``key`` is the
+    thread the message arrived in, so the replayed answer lands there rather
+    than wherever setup was finished.
+    """
+
+    key: ThreadKey
+    text: str
+    in_channel: bool
+
+
+@dataclass(frozen=True, slots=True)
 class SlackTurn:
     key: ThreadKey
     text: str

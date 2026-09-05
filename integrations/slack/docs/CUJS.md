@@ -46,6 +46,12 @@ device-grant / OIDC-ticket login; `databricks` drives a custom U2M OAuth app
   (`SetupFlow.prompt_unconfigured`). Enrollment happens **inside the modal**: the
   bot posts a sign-in link, polls for the delegated token to land, then advances
   to the agent / host / workspace picker — no re-running the command.
+- **That first message is answered, not lost.** The message that triggered setup
+  is stashed per user (`store.upsert_pending_message`) and replayed as a turn the
+  moment setup saves — in the thread it came from, not where setup finished
+  (`SetupFlow` completion hook → `service.resume_pending_message`). A newer
+  message sent while setup is still open replaces the stashed one. Running
+  `/omnigent` with nothing stashed starts no turn.
 - **`/omnigent` retriggers setup.** Reopens the setup modal any time to
   (re-)enroll or change the chosen agent / host / workspace
   (`_handle_config_command`). The server is operator-fixed, so there is no URL to

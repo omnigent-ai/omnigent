@@ -709,6 +709,109 @@ async def test_select_submit_requires_a_host(tmp_path: Path) -> None:
     assert await store.get_user_config("T1", "U1") is None
 
 
+def _picker_submission() -> dict[str, Any]:
+    """A completed agent/host/workspace picker, as Slack submits it."""
+    return {
+        "state": {
+            "values": {
+                AGENT_BLOCK: {
+                    "agent_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Helper"},
+                            "value": "ag_1",
+                        }
+                    }
+                },
+                HOST_BLOCK: {
+                    "host_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Host One"},
+                            "value": "h1",
+                        }
+                    }
+                },
+                WORKSPACE_BLOCK: {"workspace_input": {"value": "/home/me/project"}},
+            }
+        },
+    }
+
+
+async def test_select_submit_runs_the_completion_hook(tmp_path: Path) -> None:
+    # app.py wires this hook to resume the message the user sent before setup.
+    # It carries the live Slack client (setup holds none) and runs only once the
+    # config is persisted, so the resumed turn can read it.
+    store = await _store(tmp_path)
+    pool = OmnigentClientPool()
+    flow = _flow(store, pool)
+    ack = FakeAck()
+    client = FakeSetupClient()
+    calls: list[tuple[str, str, Any, Any]] = []
+
+    async def _hook(team_id: str, user_id: str, hook_client: Any) -> None:
+        saved = await store.get_user_config(team_id, user_id)
+        calls.append((team_id, user_id, hook_client, saved))
+
+    flow.set_completion_hook(_hook)
+
+    try:
+        await flow._handle_select_submit(
+            ack, {"team": {"id": "T1"}, "user": {"id": "U1"}}, _picker_submission(), client
+        )
+    finally:
+        await pool.aclose_all()
+
+    assert len(calls) == 1
+    team_id, user_id, hook_client, config = calls[0]
+    assert (team_id, user_id) == ("T1", "U1")
+    assert hook_client is client
+    assert config is not None and config.agent_id == "ag_1"
+
+
+async def test_select_submit_survives_a_failing_completion_hook(tmp_path: Path) -> None:
+    # The config is already saved when the hook runs, so a hook failure must not
+    # cost the user their confirmation DM or make the submission look broken.
+    store = await _store(tmp_path)
+    pool = OmnigentClientPool()
+    flow = _flow(store, pool)
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    async def _hook(team_id: str, user_id: str, hook_client: Any) -> None:
+        raise RuntimeError("resume failed")
+
+    flow.set_completion_hook(_hook)
+
+    try:
+        await flow._handle_select_submit(
+            ack, {"team": {"id": "T1"}, "user": {"id": "U1"}}, _picker_submission(), client
+        )
+    finally:
+        await pool.aclose_all()
+
+    assert ack.calls == [{}]  # saved, not an inline error
+    assert await store.get_user_config("T1", "U1") is not None
+    assert client.posts and "set up" in client.posts[0]["text"].lower()
+
+
+async def test_select_submit_without_a_hook_still_saves(tmp_path: Path) -> None:
+    # No hook is wired in unit tests or a future embedding of the flow.
+    store = await _store(tmp_path)
+    pool = OmnigentClientPool()
+    flow = _flow(store, pool)
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    try:
+        await flow._handle_select_submit(
+            ack, {"team": {"id": "T1"}, "user": {"id": "U1"}}, _picker_submission(), client
+        )
+    finally:
+        await pool.aclose_all()
+
+    assert ack.calls == [{}]
+    assert await store.get_user_config("T1", "U1") is not None
+
+
 def test_no_host_modal_shows_guidance() -> None:
     view = no_host_modal(_SERVER)
     assert view["callback_id"] == CALLBACK_SETUP_INFO

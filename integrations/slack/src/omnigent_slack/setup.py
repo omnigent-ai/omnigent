@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +50,10 @@ _MAX_SELECT_OPTIONS = 100
 # Pause after views.open before the first views_update, so the client has
 # rendered the modal and won't drop the update (see _open_connecting_modal).
 _MODAL_SETTLE_SECONDS = 0.6
+
+# Called with ``(team_id, user_id, slack_client)`` once a user's setup is saved.
+# The Slack client comes from the live submission — setup holds none of its own.
+SetupCompletedHook = Callable[[str, str, Any], Awaitable[None]]
 
 
 class _ViewUpdateAck:
@@ -108,7 +112,20 @@ class SetupFlow:
         # ``None`` here means the historical device-grant / OIDC-ticket login
         # is used.
         self._enrollment_url = enrollment_url
+        # Run once a config is saved; see set_completion_hook.
+        self._on_completed: SetupCompletedHook | None = None
         self._logger = logging.getLogger(__name__)
+
+    def set_completion_hook(self, hook: SetupCompletedHook) -> None:
+        """Wire the "setup saved" callback after construction.
+
+        The service depends on this flow (it prompts unconfigured users through
+        it), so the flow can hold no reference to the service's type. ``app.py``
+        builds both, then attaches the service's resume entry point here — which
+        keeps the dependency one-directional and this class independently
+        testable.
+        """
+        self._on_completed = hook
 
     def register(self, app: AsyncApp) -> None:
         app.command(COMMAND_NAME)(self._handle_config_command)
@@ -707,6 +724,7 @@ class SetupFlow:
             config.agent_id,
             host_id,
         )
+        await self._run_completion_hook(team_id, user_id, client)
 
         host_line = f" on host *{host_name}*" if host_name else ""
         await self._dm_user(
@@ -719,6 +737,23 @@ class SetupFlow:
             ),
             purpose="setup confirmation",
         )
+
+    async def _run_completion_hook(self, team_id: str, user_id: str, client: Any) -> None:
+        """Run the "setup saved" hook, if one is wired. Never raises.
+
+        The config is already persisted by the time this runs, so a failing hook
+        (today: resuming the message the user sent before setup) must not cost
+        them the confirmation DM or leave the submission looking broken. Logged
+        with a traceback instead.
+        """
+        if self._on_completed is None:
+            return
+        try:
+            await self._on_completed(team_id, user_id, client)
+        except Exception:
+            self._logger.exception(
+                "Setup completion hook failed team=%s user=%s", team_id, user_id
+            )
 
 
 def default_workspace() -> str:

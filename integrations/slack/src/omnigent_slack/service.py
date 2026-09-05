@@ -13,7 +13,7 @@ from omnigent_slack.approvals import (
 )
 from omnigent_slack.auth_manager import pack_user_key
 from omnigent_slack.elicitation import ElicitationController, ElicitationTurnState
-from omnigent_slack.models import SlackTurn, ThreadKey, event_is_dm
+from omnigent_slack.models import SlackTurn, ThreadKey, UserConfig, event_is_dm
 from omnigent_slack.notifications import (
     SlackNotifier,
     format_output_file,
@@ -469,9 +469,15 @@ class SlackOmnigentService:
             config = await self._store.get_user_config(key.team_id, requester)
             if config is None:
                 self._logger.info(
-                    "Unconfigured user thread=%s user=%s; prompting setup",
+                    "Unconfigured user thread=%s user=%s; stashing message and prompting setup",
                     key.display(),
                     requester,
+                )
+                # Stash BEFORE prompting: the user can only finish setup once the
+                # prompt is delivered, and a prompt that fails half-way must not
+                # leave a completable setup with nothing to answer.
+                await self._store.upsert_pending_message(
+                    requester, key, text, in_channel=in_channel
                 )
                 await self._setup.prompt_unconfigured(
                     client,
@@ -482,19 +488,8 @@ class SlackOmnigentService:
                 )
                 return
 
-            self._spawn_turn(
-                SlackTurn(
-                    key=key,
-                    text=text,
-                    user_id=requester,
-                    create_if_missing=True,
-                    title=await _session_title(client, key, event),
-                    slack_client=client,
-                    agent_id=config.agent_id,
-                    owner_user_id=requester,
-                    workspace=config.workspace,
-                    host_id=config.host_id,
-                )
+            await self._spawn_first_turn(
+                key=key, text=text, user_id=requester, config=config, client=client
             )
             spawned = True
         finally:
@@ -502,6 +497,90 @@ class SlackOmnigentService:
             # turn's ``_run_turn_tracked`` finally owns the release from here on.
             if not spawned:
                 self._active_threads.discard(key)
+
+    async def resume_pending_message(
+        self, team_id: str, user_id: str, client: SlackClientProtocol
+    ) -> None:
+        """Run the message this user sent before setup, now that setup is saved.
+
+        Wired as :class:`SetupFlow`'s completion hook in ``app.py``. Without it a
+        first-time user's opening message is dropped: they are prompted into
+        setup and have to re-send it. The reply lands in the thread the message
+        came from, NOT wherever setup was finished. A user who ran ``/omnigent``
+        with nothing stashed is a no-op — never manufacture a turn.
+        """
+        pending = await self._store.take_pending_message(team_id, user_id)
+        if pending is None:
+            return
+        config = await self._store.get_user_config(team_id, user_id)
+        if config is None:
+            # Setup saved a config and it is already gone (a logout raced this
+            # hook). There is nothing to run the turn as; the message is dropped
+            # with the rest of that user's state.
+            self._logger.info(
+                "No config to resume pending message with team=%s user=%s", team_id, user_id
+            )
+            return
+
+        key = pending.key
+        # Same LOCAL concurrency guard as a routed message, reserved
+        # synchronously: a mention landing as setup completes must not open a
+        # second stream on this thread.
+        if key in self._active_threads:
+            self._logger.info(
+                "Thread already streaming thread=%s; dropping resumed message", key.display()
+            )
+            return
+        self._active_threads.add(key)
+        spawned = False
+        try:
+            self._logger.info(
+                "Resuming pending message thread=%s user=%s chars=%s in_channel=%s",
+                key.display(),
+                user_id,
+                len(pending.text),
+                pending.in_channel,
+            )
+            await self._spawn_first_turn(
+                key=key, text=pending.text, user_id=user_id, config=config, client=client
+            )
+            spawned = True
+        finally:
+            # The spawned turn's ``_run_turn_tracked`` finally owns the release
+            # from here on; anything that failed short of spawning releases now.
+            if not spawned:
+                self._active_threads.discard(key)
+
+    async def _spawn_first_turn(
+        self,
+        *,
+        key: ThreadKey,
+        text: str,
+        user_id: str,
+        config: UserConfig,
+        client: SlackClientProtocol,
+    ) -> None:
+        """Spawn the turn that creates a thread's session from a user's config.
+
+        Both ways onto a new thread share it — a configured user's message, and
+        the message replayed once setup completes — so the config-to-session
+        mapping (agent, workspace, host) can't drift between them.
+        The caller already holds the thread's ``_active_threads`` reservation.
+        """
+        self._spawn_turn(
+            SlackTurn(
+                key=key,
+                text=text,
+                user_id=user_id,
+                create_if_missing=True,
+                title=await _session_title(client, key),
+                slack_client=client,
+                agent_id=config.agent_id,
+                owner_user_id=user_id,
+                workspace=config.workspace,
+                host_id=config.host_id,
+            )
+        )
 
     def _spawn_turn(self, turn: SlackTurn) -> None:
         """Run a reserved turn as a background task, tracked for shutdown.
@@ -984,9 +1063,7 @@ def _event_id(body: dict[str, Any], event: dict[str, Any]) -> str | None:
     return str(event_id) if event_id else None
 
 
-async def _session_title(
-    client: SlackClientProtocol, key: ThreadKey, event: dict[str, Any]
-) -> str:
+async def _session_title(client: SlackClientProtocol, key: ThreadKey) -> str:
     """Build the Omnigent session title: ``Slack: <thread permalink>``.
 
     A real Slack thread permalink (via ``chat.getPermalink``) is a clickable URL
@@ -994,7 +1071,7 @@ async def _session_title(
     thread. Falls back to a plain channel/ts descriptor if the lookup fails (e.g.
     a missing scope) — the title is cosmetic and must never block session start.
     """
-    ts = event.get("thread_ts") or event.get("ts")
+    ts = key.thread_ts
     try:
         response = await client.chat_getPermalink(channel=key.channel_id, message_ts=ts)
         permalink = response.get("permalink")
