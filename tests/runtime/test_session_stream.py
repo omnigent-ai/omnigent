@@ -43,8 +43,10 @@ def _clean_session_stream_registry() -> None:
     of every later test by retaining the leak's slot.
     """
     session_stream._subscribers.clear()
+    session_stream._browser_renderer_counts.clear()
     yield
     session_stream._subscribers.clear()
+    session_stream._browser_renderer_counts.clear()
 
 
 async def _collect(conv_id: str, expected: int) -> list[dict[str, Any]]:
@@ -275,6 +277,79 @@ async def test_has_subscribers_tracks_live_subscription() -> None:
     session_stream.publish("conv_probe", {"type": "a"})
     await asyncio.wait_for(task, timeout=2.0)
     assert session_stream.has_subscribers("conv_probe") is False
+
+
+@pytest.mark.asyncio
+async def test_has_browser_renderer_ignores_plain_subscribers() -> None:
+    """
+    A generic subscriber never counts as a browser renderer.
+
+    Production breakage that causes this test to fail: renderer
+    capability falls back to mere presence, so a headless ``omnigent
+    run`` session — whose CLI keeps its own stream open all turn — gets
+    ``browser_*`` tools advertised and every call ends in
+    "no browser renderer is connected".
+    """
+    gen = session_stream.subscribe("conv_plain", ready_event={"type": "test.ready"})
+    assert await asyncio.wait_for(gen.__anext__(), timeout=1.0) == {"type": "test.ready"}
+    try:
+        assert session_stream.has_subscribers("conv_plain") is True
+        assert session_stream.has_browser_renderer("conv_plain") is False
+    finally:
+        await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_has_browser_renderer_tracks_renderer_subscription() -> None:
+    """
+    A renderer-capable subscriber flips the capability on, and its exit
+    flips it off and prunes the registry key.
+    """
+    assert session_stream.has_browser_renderer("conv_rdr") is False
+    gen = session_stream.subscribe(
+        "conv_rdr", ready_event={"type": "test.ready"}, browser_renderer=True
+    )
+    assert await asyncio.wait_for(gen.__anext__(), timeout=1.0) == {"type": "test.ready"}
+    assert session_stream.has_browser_renderer("conv_rdr") is True
+    await gen.aclose()
+    assert session_stream.has_browser_renderer("conv_rdr") is False
+    assert "conv_rdr" not in session_stream._browser_renderer_counts, (
+        f"renderer count leak: {session_stream._browser_renderer_counts!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_has_browser_renderer_survives_mixed_subscriber_exits() -> None:
+    """
+    Capability follows the renderer slots, not the subscriber count.
+
+    With one renderer and one plain subscriber live, the renderer's exit
+    turns the capability off even though the plain subscriber remains;
+    with two renderers, one exit keeps it on.
+    """
+    conv = "conv_mixed"
+    plain = session_stream.subscribe(conv, ready_event={"type": "test.ready"})
+    renderer_a = session_stream.subscribe(
+        conv, ready_event={"type": "test.ready"}, browser_renderer=True
+    )
+    renderer_b = session_stream.subscribe(
+        conv, ready_event={"type": "test.ready"}, browser_renderer=True
+    )
+    for gen in (plain, renderer_a, renderer_b):
+        assert await asyncio.wait_for(gen.__anext__(), timeout=1.0) == {"type": "test.ready"}
+    try:
+        assert session_stream.has_browser_renderer(conv) is True
+        await renderer_a.aclose()
+        assert session_stream.has_browser_renderer(conv) is True, (
+            "one of two renderers exiting must not clear the capability"
+        )
+        await renderer_b.aclose()
+        assert session_stream.has_browser_renderer(conv) is False, (
+            "a surviving plain subscriber must not keep the capability on"
+        )
+        assert session_stream.has_subscribers(conv) is True
+    finally:
+        await plain.aclose()
 
 
 @pytest.mark.asyncio

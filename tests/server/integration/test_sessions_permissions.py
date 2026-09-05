@@ -3124,6 +3124,66 @@ async def test_stream_disconnect_broadcasts_leave_after_grace(
         await collector.stop()
 
 
+async def test_stream_browser_renderer_param_registers_capability(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """The ``browser_renderer`` query param registers the stream as a
+    renderer-capable subscriber for its lifetime; a plain stream never
+    does. The desktop app's SPA is the only client that sets it — the
+    ``browser_*`` advertisement hint and the browser action bridge both
+    ride on this registration, so a plain viewer (or a headless CLI's
+    stream pump) counting as a renderer re-creates the always-failing
+    browser_navigate calls this seam exists to prevent."""
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+
+    async def _wait_for(predicate: Any, deadline_s: float = 2.0) -> bool:
+        """Poll *predicate* until true or the deadline lapses."""
+        loop = asyncio.get_running_loop()
+        end = loop.time() + deadline_s
+        while loop.time() < end:
+            if predicate():
+                return True
+            await asyncio.sleep(0.01)
+        return bool(predicate())
+
+    # Plain stream: subscribed, but never renderer-capable.
+    plain = asyncio.create_task(
+        auth_client.get(
+            f"/v1/sessions/{session_id}/stream",
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+    )
+    try:
+        assert await _wait_for(lambda: session_stream.has_subscribers(session_id)), (
+            "plain stream never registered a subscriber slot"
+        )
+        assert session_stream.has_browser_renderer(session_id) is False, (
+            "a plain stream must not register the browser-renderer capability"
+        )
+    finally:
+        plain.cancel()
+        await asyncio.gather(plain, return_exceptions=True)
+
+    # Renderer-declared stream: capability on while connected, off after.
+    renderer = asyncio.create_task(
+        auth_client.get(
+            f"/v1/sessions/{session_id}/stream?browser_renderer=true",
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+    )
+    try:
+        assert await _wait_for(lambda: session_stream.has_browser_renderer(session_id)), (
+            "browser_renderer=true stream never registered the capability"
+        )
+    finally:
+        renderer.cancel()
+        await asyncio.gather(renderer, return_exceptions=True)
+    assert session_stream.has_browser_renderer(session_id) is False, (
+        "capability must clear when the renderer stream disconnects"
+    )
+
+
 async def test_stream_local_single_user_not_tracked(
     local_auth_client: httpx.AsyncClient,
 ) -> None:

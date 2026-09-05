@@ -15,8 +15,10 @@ the tool was misrouted to the server-side path — the base class raises
 
 Descriptions for the five browser tools that drive the Omnigent
 desktop app's embedded browser. Request-driven harnesses omit them when
-the turn starts without a stream subscriber; native harnesses have a
-session-scoped relay surface, but unclaimed calls still fail promptly.
+the turn starts without a browser-capable renderer subscribed (generic
+stream consumers such as a headless CLI's own pump don't count); native
+harnesses have a session-scoped relay surface, but unclaimed calls
+still fail promptly.
 """
 
 from __future__ import annotations

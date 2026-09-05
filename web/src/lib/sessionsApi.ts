@@ -1188,6 +1188,14 @@ export async function postEvent(
  * flag — the stream URL is the entire presence uplink, so an idle
  * flip mid-view arrives as a reconnect carrying the new value.
  *
+ * `opts.browserRenderer` declares the renderer capability: pass `true`
+ * only when this client can claim and execute embedded-browser actions
+ * (the desktop shell's WebContentsView bridge is present — see
+ * `useBrowserAgentRelay`). The server advertises `browser_*` tools to
+ * the agent and parks browser actions only while a renderer-capable
+ * subscriber is connected; plain viewers must leave it unset so their
+ * presence never advertises tools they cannot serve.
+ *
  * The fetch itself throws only on network failure; HTTP errors
  * surface as `res.ok === false`. Callers must check `res.ok` before
  * consuming the body.
@@ -1195,9 +1203,13 @@ export async function postEvent(
 export function openSessionStream(
   sessionId: string,
   signal: AbortSignal,
-  opts?: { idle?: boolean },
+  opts?: { idle?: boolean; browserRenderer?: boolean },
 ): Promise<Response> {
-  const query = opts?.idle ? "?idle=true" : "";
+  const params = new URLSearchParams();
+  if (opts?.idle) params.set("idle", "true");
+  if (opts?.browserRenderer) params.set("browser_renderer", "true");
+  const search = params.toString();
+  const query = search ? `?${search}` : "";
   return authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/stream${query}`, {
     headers: { Accept: "text/event-stream" },
     signal,

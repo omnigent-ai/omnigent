@@ -1802,6 +1802,118 @@ async def test_skill_slash_command_non_json_resolve_surfaces_controlled_error(
     assert "malformed skill resolution" in resp.json()["error"]["message"]
 
 
+async def test_message_forward_hint_requires_renderer_capable_subscriber(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``browser_renderer_available`` reflects renderer capability, not presence.
+
+    A headless ``omnigent run`` keeps the CLI's own stream pump subscribed
+    for the whole turn. That plain subscriber must not stamp the turn as
+    renderer-backed — the runner would advertise ``browser_*`` tools whose
+    every call ends in "no browser renderer is connected". Only a
+    subscriber that registered the capability (the desktop app's SPA)
+    flips the hint on.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Capture forwarded runner events.
+
+        :param request: Request sent to the fake runner.
+        :returns: Accepted response.
+        """
+        forwarded.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient:
+        """
+        Resolve every session to the fake runner client.
+
+        :param session_id: Session id being routed.
+        :param runner_router: Real app runner router, unused here.
+        :returns: The fake runner client.
+        """
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+
+    async def _forwarded_hint_with_subscriber(*, browser_renderer: bool) -> bool:
+        """
+        Post one user message while a live subscriber is attached.
+
+        :param browser_renderer: Capability flag the subscriber registers
+            with — ``False`` models the CLI's own stream pump on a
+            headless run, ``True`` the desktop app's renderer.
+        :returns: The ``browser_renderer_available`` hint on the body
+            forwarded to the runner.
+        """
+        agent = await create_test_agent(
+            client, name=f"hint-agent-{'renderer' if browser_renderer else 'plain'}"
+        )
+        session = await _create_session(client, agent["id"])
+        subscribed = asyncio.Event()
+
+        async def _on_subscribed() -> tuple[dict[str, Any], ...]:
+            subscribed.set()
+            return ()
+
+        async def _pump() -> None:
+            async for _ in session_stream.subscribe(
+                session["id"],
+                on_subscribed=_on_subscribed,
+                browser_renderer=browser_renderer,
+            ):
+                pass
+
+        forwarded.clear()
+        pump = asyncio.create_task(_pump())
+        await subscribed.wait()
+        try:
+            resp = await client.post(
+                f"/v1/sessions/{session['id']}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello"}],
+                    },
+                },
+            )
+            assert resp.status_code == 202, resp.text
+        finally:
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+        assert forwarded, "message was not forwarded to the runner"
+        hint = forwarded[-1]["browser_renderer_available"]
+        assert isinstance(hint, bool)
+        return hint
+
+    try:
+        assert await _forwarded_hint_with_subscriber(browser_renderer=False) is False, (
+            "a plain stream subscriber must not stamp the turn renderer-backed"
+        )
+        assert await _forwarded_hint_with_subscriber(browser_renderer=True) is True, (
+            "a renderer-capable subscriber must stamp the turn renderer-backed"
+        )
+    finally:
+        await fake_runner.aclose()
+
+
 async def test_external_meta_user_message_persists_without_live_input_event(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

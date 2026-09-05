@@ -78,6 +78,7 @@ import type {
   SessionViewer,
   StreamEvent,
 } from "@/lib/events";
+import { supportsBrowser } from "@/lib/nativeBridge";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
@@ -4147,7 +4148,14 @@ export async function startStreamPump(
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
         try {
-          streamRes = await openSessionStream(id, attempt.signal, { idle });
+          // Declare the browser-renderer capability only when the desktop
+          // shell's WebContentsView bridge can actually execute agent
+          // browser actions — the server gates `browser_*` tool
+          // advertisement and browser-action parking on it.
+          streamRes = await openSessionStream(id, attempt.signal, {
+            idle,
+            browserRenderer: supportsBrowser(),
+          });
         } catch (err) {
           if (err instanceof Error && err.name === "AbortError") {
             if (controller.signal.aborted || isConversationDisposed(id)) break;
