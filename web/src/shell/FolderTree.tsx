@@ -239,6 +239,7 @@ function flattenTree(
       const isLazyDir = node.lazy === true;
       const lazy = isLazyDir && open ? dirData.get(node.path) : undefined;
       const lazyLoading = !!lazy?.isLoading && lazy?.data === undefined;
+      const lazyError = !!lazy?.isError && lazy?.data === undefined;
       rows.push({ kind: "node", key: node.path, depth, node, open, lazyLoading });
       if (!open) continue;
 
@@ -248,17 +249,26 @@ function flattenTree(
           : []
         : node.children;
       const children = visible(rawChildren);
+      // Placeholder keys are prefixed by kind (not the raw path) so they can't
+      // collide with a real file/dir path.
       if (lazyLoading) {
         rows.push({
           kind: "placeholder",
-          key: `${node.path}::loading`,
+          key: `loading ${node.path}`,
           depth: depth + 1,
           text: "Loading…",
+        });
+      } else if (lazyError) {
+        rows.push({
+          kind: "placeholder",
+          key: `error ${node.path}`,
+          depth: depth + 1,
+          text: "Failed to load this folder.",
         });
       } else if (children.length === 0 && rawChildren.length > 0) {
         rows.push({
           kind: "placeholder",
-          key: `${node.path}::hidden`,
+          key: `hidden ${node.path}`,
           depth: depth + 1,
           text: "All files are hidden — click the eye icon to reveal them.",
         });
