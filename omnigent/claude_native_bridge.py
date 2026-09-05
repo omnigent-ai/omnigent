@@ -1432,6 +1432,7 @@ def build_hook_settings(
     launch_permission_mode: str | None = None,
     launch_bypass_permissions: bool = False,
     launch_effort: str | None = None,
+    model_overrides: Mapping[str, str] | None = None,
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
 ) -> _JsonObject:
@@ -1467,6 +1468,12 @@ def build_hook_settings(
         dialog never blocks a host-spawned terminal.
     :param launch_effort: Effective launch effort from ``--effort``.
         Mirrored into ``effortLevel`` for restart/re-exec parity.
+    :param model_overrides: Canonical-to-served model id rewrites, e.g.
+        ``{"claude-opus-4-8": "databricks-claude-opus-4-8"}``. Written as
+        Claude Code's ``modelOverrides`` setting so a model the CLI names
+        by its canonical vendor id (the refusal-fallback's route table)
+        is rewritten to the spelling the endpoint serves. ``None``/empty
+        writes nothing.
     :param subagent_router_dir: Directory where the runner advertises its
         ``route-subagent`` endpoint (``subagent_router.json``). When set,
         a ``PreToolUse`` hook routes native subagent spawns; ``None``
@@ -1730,6 +1737,13 @@ def build_hook_settings(
         settings["effortLevel"] = launch_effort
     if api_key_helper:
         settings["apiKeyHelper"] = api_key_helper
+    if model_overrides:
+        # Claude Code names some models itself: its refusal-fallback
+        # re-issues a safeguard-flagged turn on a canonical vendor id from
+        # a route table internal to the CLI. ``modelOverrides`` rewrites
+        # that id to the endpoint's served spelling on the way out, so the
+        # re-issued turn stays routable instead of dying model_not_found.
+        settings["modelOverrides"] = dict(model_overrides)
     # Override Claude Code's statusLine so we receive its stdin (the
     # only place ``context_window`` surfaces). A /bin/sh shim captures
     # the raw payload atomically (no interpreter spawn on Claude's
@@ -1819,6 +1833,7 @@ def augment_claude_args(
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     api_key_helper: str | None = None,
+    model_overrides: Mapping[str, str] | None = None,
     bundle_dir: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
@@ -1848,6 +1863,9 @@ def augment_claude_args(
     :param api_key_helper: Optional Claude Code ``apiKeyHelper``
         command from ucode state, e.g. ``"databricks auth token
         --host https://example.databricks.com ..."``.
+    :param model_overrides: Canonical-to-served model id rewrites,
+        threaded to :func:`build_hook_settings` as Claude Code's
+        ``modelOverrides`` setting. ``None``/empty writes nothing.
     :param bundle_dir: Materialized agent-bundle root, when the
         session's agent ships a ``skills/`` directory. Triggers
         ``--plugin-dir <bundle>`` so Claude Code discovers bundled
@@ -1883,6 +1901,7 @@ def augment_claude_args(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=api_key_helper,
+        model_overrides=model_overrides,
         launch_model=_arg_value(claude_args, "--model"),
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
         launch_bypass_permissions=_args_request_bypass_permissions(claude_args),

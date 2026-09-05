@@ -2816,6 +2816,39 @@ def test_augment_claude_args_materializes_api_key_helper(
     assert settings_path.stat().st_mode & 0o777 == 0o600
 
 
+def test_augment_claude_args_writes_model_overrides_into_settings(
+    tmp_path: Path,
+) -> None:
+    """Canonical-to-served model rewrites land in the ``--settings`` sidecar.
+
+    Claude Code names some models itself: its refusal-fallback re-issues a
+    safeguard-flagged turn on a canonical vendor id from a route table
+    internal to the CLI. A gateway serving Claude under its own spellings
+    rejects that id with ``model_not_found``, killing the flagged turn.
+    ``modelOverrides`` is the CLI's rewrite knob, and the sidecar is the only
+    settings channel the native launch paths have — so the map must reach it.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        model_overrides={"claude-opus-4-8": "gw-claude-opus-4-8"},
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings["modelOverrides"] == {"claude-opus-4-8": "gw-claude-opus-4-8"}
+
+
+@pytest.mark.parametrize("absent", [None, {}], ids=["none", "empty"])
+def test_augment_claude_args_omits_unset_model_overrides(
+    tmp_path: Path,
+    absent: dict[str, str] | None,
+) -> None:
+    """No rewrites (canonical endpoint, unknown catalog) writes no setting."""
+    args = augment_claude_args((), bridge_dir=tmp_path, model_overrides=absent)
+
+    assert "modelOverrides" not in _load_invocation_settings(args)
+
+
 def test_augment_claude_args_mirrors_launch_overrides_into_settings(
     tmp_path: Path,
 ) -> None:

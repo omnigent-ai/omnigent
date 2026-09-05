@@ -8009,6 +8009,161 @@ def test_provider_config_for_native_claude_keeps_betas_under_use_gateway(
     assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in cfg.env
 
 
+def _gateway_provider_entry() -> Any:
+    """A gateway entry whose ``models:`` pins name only the newest Opus."""
+    from omnigent.onboarding.provider_config import load_providers
+
+    return load_providers(
+        {
+            "providers": {
+                "gw": {
+                    "kind": "gateway",
+                    "anthropic": {
+                        "base_url": "https://gw.example/anthropic",
+                        "auth_command": "my-cli print-token",
+                        "models": {
+                            "default": "gw-claude-fable-5",
+                            "opus": "gw-claude-opus-5",
+                        },
+                    },
+                }
+            }
+        }
+    )["gw"]
+
+
+def test_provider_config_widens_routable_models_from_endpoint_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``refresh_models`` merges the endpoint's served Claude ids behind the pins.
+
+    The declared ``models:`` pins name only the ids the user chose (the newest
+    generation per family), but Claude Code's refusal route table targets a
+    specific older generation. Only the endpoint's own listing knows that
+    spelling, so the launch config must carry it — it feeds the canonical
+    rewrites and routed-arm resolution. Non-Claude ids never ride along.
+    """
+    from omnigent import model_catalog
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
+    seen: list[model_catalog.ResolvedModelProvider] = []
+
+    def _fake_listing(provider: model_catalog.ResolvedModelProvider) -> model_catalog.ModelListing:
+        seen.append(provider)
+        return model_catalog.ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=(
+                model_catalog.ModelEntry(id="gw-claude-opus-5", family="claude"),
+                model_catalog.ModelEntry(id="gw-claude-opus-4-8", family="claude"),
+                model_catalog.ModelEntry(id="gw-gpt-6", family="openai"),
+            ),
+            note="",
+        )
+
+    monkeypatch.setattr(model_catalog, "listing_for_provider", _fake_listing)
+
+    cfg = claude_native._provider_config_for_native_claude(
+        _gateway_provider_entry(), refresh_models=True
+    )
+
+    assert cfg is not None
+    # Declared pins stay first (they are what the entry can route for sure);
+    # the listing adds the served generation the pins do not name.
+    assert cfg.routable_models == (
+        "gw-claude-opus-5",
+        "gw-claude-fable-5",
+        "gw-claude-opus-4-8",
+    )
+    [provider] = seen
+    assert provider.base_url == "https://gw.example/anthropic"
+    assert provider.auth_command == "my-cli print-token"
+
+
+def test_provider_config_keeps_declared_pins_when_listing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unlistable endpoint degrades to the declared pins — today's shape."""
+    from omnigent import model_catalog
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
+
+    def _boom(provider: model_catalog.ResolvedModelProvider) -> model_catalog.ModelListing:
+        raise RuntimeError("endpoint down")
+
+    monkeypatch.setattr(model_catalog, "listing_for_provider", _boom)
+
+    cfg = claude_native._provider_config_for_native_claude(
+        _gateway_provider_entry(), refresh_models=True
+    )
+
+    assert cfg is not None
+    assert cfg.routable_models == ("gw-claude-opus-5", "gw-claude-fable-5")
+
+
+def test_provider_config_skips_listing_for_canonical_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An endpoint that accepts canonical ids pays no listing call.
+
+    The Anthropic API resolves canonical ids and family aliases natively, so
+    there is nothing to rewrite and no served set to learn.
+    """
+    from omnigent import model_catalog
+    from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
+
+    def _never(provider: model_catalog.ResolvedModelProvider) -> model_catalog.ModelListing:
+        raise AssertionError("canonical endpoints must not be listed")
+
+    monkeypatch.setattr(model_catalog, "listing_for_provider", _never)
+
+    entry = load_providers(
+        {
+            "providers": {
+                "anthropic": {
+                    "kind": "key",
+                    "anthropic": {
+                        "base_url": "https://api.anthropic.com",
+                        "api_key": "sk-ant-test",
+                        "models": {"default": "claude-sonnet-4-6"},
+                    },
+                }
+            }
+        }
+    )["anthropic"]
+
+    cfg = claude_native._provider_config_for_native_claude(entry, refresh_models=True)
+
+    assert cfg is not None
+    assert cfg.routable_models == ("claude-sonnet-4-6",)
+
+
+def test_claude_native_model_overrides_maps_canonical_ids_to_served() -> None:
+    """The launch config's served set becomes canonical→served rewrites."""
+    cfg = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"},
+        routable_models=("gw-claude-opus-5", "gw-claude-opus-4-8"),
+    )
+
+    assert claude_native.claude_native_model_overrides(cfg) == {
+        "claude-opus-5": "gw-claude-opus-5",
+        "claude-opus-4-8": "gw-claude-opus-4-8",
+    }
+
+
+def test_claude_native_model_overrides_empty_when_nothing_to_rewrite() -> None:
+    """Canonical endpoints and Claude's own login produce no rewrites."""
+    canonical = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+        routable_models=("claude-opus-4-8",),
+    )
+
+    assert claude_native.claude_native_model_overrides(canonical) == {}
+    assert claude_native.claude_native_model_overrides(None) == {}
+
+
 def test_bedrock_config_for_native_claude_static_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """A ``bedrock`` provider sets the Bedrock env trio and no apiKeyHelper.
 

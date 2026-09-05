@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.styles import Style
 
-    from omnigent.onboarding.provider_config import ProviderEntry
+    from omnigent.onboarding.provider_config import FamilyConfig, ProviderEntry
     from omnigent.spec.types import AgentSpec
 
 import click
@@ -435,6 +435,32 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
         return True
     host = (urlparse(base_url).hostname or "").lower()
     return host == "anthropic.com" or host.endswith(".anthropic.com")
+
+
+def claude_native_model_overrides(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> dict[str, str]:
+    """Canonical-to-served id rewrites for the models Claude Code names itself.
+
+    The alias pins in ``claude_config.env`` only cover the family aliases;
+    Claude Code also names canonical vendor ids directly — its
+    refusal-fallback re-issues a safeguard-flagged turn on an id from a route
+    table internal to the CLI. An endpoint that serves Claude under its own
+    spellings rejects that id with ``model_not_found`` and the flagged turn
+    dies, so both launch paths hand the CLI a ``modelOverrides`` map derived
+    from what the endpoint serves.
+
+    :param claude_config: The resolved launch config, or ``None`` (Claude's
+        own login).
+    :returns: Canonical id → served id, e.g. ``{"claude-opus-4-8":
+        "databricks-claude-opus-4-8"}``. Empty when the endpoint accepts
+        canonical ids (nothing to rewrite) or its served set is unknown.
+    """
+    from omnigent.claude_model_vocabulary import served_canonical_overrides
+
+    if claude_config is None or _serves_canonical_anthropic_ids(claude_config):
+        return {}
+    return served_canonical_overrides(claude_config.routable_models)
 
 
 def _claude_family(token: str) -> str | None:
@@ -2837,7 +2863,11 @@ def _profile_pinned_auth_command(
     return databricks_bearer_token_command(workspace_url, profile, fallback_command=auth_command)
 
 
-def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcodeConfig | None:
+def _provider_config_for_native_claude(
+    entry: ProviderEntry,
+    *,
+    refresh_models: bool = False,
+) -> ClaudeNativeUcodeConfig | None:
     """Build native Claude Code launch config from a generic provider.
 
     The OSS counterpart to :func:`_ucode_config_for_profile`: it takes a
@@ -2850,6 +2880,10 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
 
     :param entry: A resolved provider entry. Only ``key`` / ``gateway`` /
         ``local`` kinds serving the ``anthropic`` family produce a config.
+    :param refresh_models: Ask the endpoint what it serves and widen
+        ``routable_models`` beyond the declared pins (one cached network
+        call, skipped for endpoints that accept canonical ids). ``False``
+        stays network-free and carries the declared pins only.
     :returns: The launch config, or ``None`` when the provider does not
         serve the anthropic surface or carries no usable credential (the
         caller then falls back to the CLI's own login).
@@ -2903,7 +2937,7 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         default_env_var = ALIAS_MODEL_ENV_VARS.get(base_alias)
         if default_env_var:
             pin_env.setdefault(default_env_var, family.default_model)
-    return ClaudeNativeUcodeConfig(
+    config = ClaudeNativeUcodeConfig(
         env={
             _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
             **pin_env,
@@ -2917,7 +2951,8 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         },
         api_key_helper=api_key_helper,
         model=family.default_model,
-        # The declared models are exactly what this entry can route.
+        # The declared models are what this entry can route for sure; the
+        # endpoint's own listing widens this below when it can be fetched.
         routable_models=tuple(
             dict.fromkeys(
                 [
@@ -2927,6 +2962,63 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
             )
         ),
     )
+    # The declared pins are only the ids the user chose to name; the endpoint
+    # usually serves more (e.g. the older Opus generation the CLI's refusal
+    # route table targets). Mirror the ucode path's live discovery: list what
+    # the endpoint serves so ``routable_models`` carries every served id — the
+    # source for the canonical rewrites and for routed-arm resolution. An
+    # endpoint that accepts canonical ids needs no rewrite, so it skips the
+    # call.
+    if refresh_models and not _serves_canonical_anthropic_ids(config):
+        served = _served_claude_ids_for_provider(entry.kind, entry.name, family)
+        if served:
+            config = replace(
+                config,
+                routable_models=tuple(dict.fromkeys([*config.routable_models, *served])),
+            )
+    return config
+
+
+def _served_claude_ids_for_provider(
+    kind: str,
+    name: str,
+    family: FamilyConfig,
+) -> tuple[str, ...]:
+    """The Claude ids a provider's endpoint reports serving, best-effort.
+
+    One cached listing call (the same enumeration the claude-sdk gateway
+    transport uses), degrading to an empty tuple — the declared pins — when
+    the endpoint cannot be listed.
+
+    :param kind: The provider entry kind, e.g. ``"gateway"``.
+    :param name: The provider entry name, for the provider descriptor detail.
+    :param family: The entry's resolved anthropic family (``base_url`` /
+        ``api_key`` / ``auth_command``).
+    :returns: The served Claude ids, e.g. ``("databricks-claude-opus-5",
+        "databricks-claude-opus-4-8")``, or ``()`` when unknown.
+    """
+    from omnigent import model_catalog
+    from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY
+
+    provider = model_catalog.ResolvedModelProvider(
+        kind=kind,
+        family=ANTHROPIC_FAMILY,
+        base_url=family.base_url,
+        api_key=family.api_key,
+        auth_command=family.auth_command,
+        detail=f"provider {name!r} (native claude launch)",
+    )
+    try:
+        listing = model_catalog.listing_for_provider(provider)
+    except Exception:  # noqa: BLE001 — best-effort; the declared pins are the safe default
+        _logger.warning(
+            "native-claude: could not list provider %r's served models; "
+            "routable_models carries the declared pins only",
+            name,
+            exc_info=True,
+        )
+        return ()
+    return tuple(entry.id for entry in listing.models if entry.family == "claude")
 
 
 def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcodeConfig | None:
@@ -3063,7 +3155,7 @@ def _native_claude_config_from_entry(
     )
 
     if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
-        return _provider_config_for_native_claude(entry)
+        return _provider_config_for_native_claude(entry, refresh_models=refresh_models)
     if entry.kind == BEDROCK_KIND:
         return _bedrock_config_for_native_claude(entry)
     if entry.kind == DATABRICKS_KIND:
@@ -5951,6 +6043,7 @@ def _claude_terminal_request(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
+        model_overrides=claude_native_model_overrides(claude_config),
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
     )

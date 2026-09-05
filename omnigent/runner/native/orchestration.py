@@ -6656,6 +6656,7 @@ async def _auto_create_claude_terminal(
         build_native_claude_terminal_env,
         claude_config_with_launch_model_pinned,
         claude_config_with_routed_arms_pinned,
+        claude_native_model_overrides,
         resolve_claude_native_model_selection,
         resolve_native_claude_config,
     )
@@ -7146,6 +7147,10 @@ async def _auto_create_claude_terminal(
         agent_name=agent_name,
         skills_filter=skills_filter,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
+        # Rewrite the canonical ids Claude Code names itself (the
+        # refusal-fallback's route table) to this endpoint's served
+        # spellings, so a safeguard-flagged turn's re-issue stays routable.
+        model_overrides=claude_native_model_overrides(claude_config),
         subagent_router_dir=subagent_router_dir,
         append_system_prompt="\n\n".join(
             x
