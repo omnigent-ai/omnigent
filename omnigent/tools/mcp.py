@@ -32,6 +32,7 @@ from anyio.streams.memory import (
     MemoryObjectReceiveStream,
     MemoryObjectSendStream,
 )
+import httpx
 from cachetools import TTLCache
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
@@ -1251,12 +1252,15 @@ def _collect_problematic_keywords(
 
 # Exception types that indicate a dead/broken connection
 # rather than a legitimate tool error. These are worth
-# retrying after a reconnect.
+# retrying after a reconnect. ``httpx.NetworkError`` (connection
+# reset/refused, read/write errors) mirrors the LLM retry path's
+# transient classification in ``omnigent/runtime/llm_retry.py``.
 _CONNECTION_ERROR_TYPES = (
     EOFError,
     BrokenPipeError,
     ConnectionError,
     OSError,
+    httpx.NetworkError,
 )
 
 
@@ -1295,6 +1299,41 @@ def _is_connection_error(exc: BaseException) -> bool:
             and exc.error.message.strip().lower() == _SESSION_TERMINATED_MESSAGE
         )
     return False
+
+
+# The MCP SDK surfaces a request whose response never arrives as an
+# ``McpError`` with ``code=httpx.codes.REQUEST_TIMEOUT`` (408). When
+# the transport died mid-call, the response can never arrive, so a
+# dead connection surfaces as this timeout while the underlying
+# network error is swallowed by the lifecycle task.
+_REQUEST_TIMEOUT_CODE = int(httpx.codes.REQUEST_TIMEOUT)
+
+
+def _is_dead_session_timeout(exc: BaseException, conn: McpServerConnection) -> bool:
+    """
+    Detect a request timeout caused by a dead transport.
+
+    A transient network failure mid-call (connection reset, brief
+    refusal window) kills the transport's lifecycle task; the
+    in-flight request then never receives a response and surfaces
+    as the SDK's request-timeout ``McpError`` instead of the
+    underlying network error. Distinguish that from a live-but-slow
+    server by the session state: the lifecycle task clears
+    ``_session`` when it dies, so a timeout with a dead session is
+    a connection failure worth a reconnect-retry, while a timeout
+    from a live session is a genuine tool timeout and must not be
+    retried.
+
+    :param exc: The exception raised by the tool invocation.
+    :param conn: The connection the invocation ran on.
+    :returns: ``True`` if the timeout is attributable to a dead
+        session.
+    """
+    if not isinstance(exc, McpError):
+        return False
+    if exc.error.code != _REQUEST_TIMEOUT_CODE:
+        return False
+    return conn._session is None
 
 
 def _backoff_delay(attempt: int, retry: RetryPolicy) -> float:
@@ -1352,14 +1391,24 @@ async def _call_tool_with_reconnect(
     """
     last_exc: Exception | None = None
     total_tries = retry.max_retries + 1
+    needs_reconnect = False
 
     for attempt in range(total_tries):
         try:
+            # Reconnect first when the previous attempt broke the
+            # session. Inside the try so a reconnect that fails on a
+            # still-recovering network is itself classified and
+            # retried on the next attempt instead of aborting the
+            # whole call.
+            if needs_reconnect:
+                await conn._reconnect()
+                needs_reconnect = False
             return await conn._invoke_tool(name, arguments, session_id=session_id)
         except Exception as exc:
-            if not _is_connection_error(exc):
+            if not (_is_connection_error(exc) or _is_dead_session_timeout(exc, conn)):
                 raise
             last_exc = exc
+            needs_reconnect = True
             # Last attempt — don't reconnect, just raise.
             if attempt + 1 >= total_tries:
                 break
@@ -1374,7 +1423,6 @@ async def _call_tool_with_reconnect(
                 delay,
             )
             await _sleep(delay)
-            await conn._reconnect()
 
     # All attempts exhausted — re-raise the last connection error.
     assert last_exc is not None
