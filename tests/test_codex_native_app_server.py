@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
+from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 try:
     import tomllib
@@ -19,6 +23,7 @@ except ImportError:  # pragma: no cover - Python < 3.11
 from omnigent.codex_native_app_server import (
     _FRAMEWORK_APPROVED_TOOLS,
     _POLICY_HOOK_TIMEOUT_SECONDS,
+    CodexAppServerClient,
     CodexNativeAppServer,
     _build_native_codex_app_server_argv,
     _codex_policy_hooks_settings,
@@ -38,6 +43,79 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
+
+
+@pytest.mark.parametrize(
+    "reader_error", [ConnectionClosedError(None, None), ConnectionClosedOK(None, None)]
+)
+async def test_client_close_cleans_up_after_reader_disconnect(reader_error: Exception) -> None:
+    client = CodexAppServerClient(ws_url="ws://127.0.0.1:12345")
+    websocket = AsyncMock(spec=ClientConnection)
+    client._ws = cast(ClientConnection, websocket)
+
+    async def fail_reader() -> None:
+        raise reader_error
+
+    reader = asyncio.create_task(fail_reader())
+    client._reader_task = reader
+    pending = asyncio.get_running_loop().create_future()
+    client._pending_requests[1] = pending
+    await asyncio.sleep(0)
+    assert reader.done()
+
+    await client.close()
+
+    assert pending.cancelled()
+    assert client._pending_requests == {}
+    assert client._reader_task is None
+    assert client._ws is None
+    websocket.close.assert_awaited_once()
+    await client.close()
+    websocket.close.assert_awaited_once()
+
+
+async def test_client_close_preserves_reader_bug_after_cleanup() -> None:
+    client = CodexAppServerClient(ws_url="ws://127.0.0.1:12345")
+    websocket = AsyncMock(spec=ClientConnection)
+    client._ws = cast(ClientConnection, websocket)
+
+    async def fail_reader() -> None:
+        raise ValueError("invalid event payload")
+
+    reader = asyncio.create_task(fail_reader())
+    client._reader_task = reader
+    pending = asyncio.get_running_loop().create_future()
+    client._pending_requests[1] = pending
+    await asyncio.sleep(0)
+
+    with pytest.raises(ValueError, match="invalid event payload"):
+        await client.close()
+
+    assert pending.cancelled()
+    assert client._pending_requests == {}
+    assert client._reader_task is None
+    assert client._ws is None
+    websocket.close.assert_awaited_once()
+
+
+async def test_client_close_clears_state_when_websocket_close_fails() -> None:
+    client = CodexAppServerClient(ws_url="ws://127.0.0.1:12345")
+    websocket = AsyncMock(spec=ClientConnection)
+    websocket.close.side_effect = ValueError("close failed")
+    client._ws = cast(ClientConnection, websocket)
+    reader = asyncio.create_task(asyncio.sleep(60))
+    client._reader_task = reader
+    pending = asyncio.get_running_loop().create_future()
+    client._pending_requests[1] = pending
+
+    with pytest.raises(ValueError, match="close failed"):
+        await client.close()
+
+    assert reader.cancelled()
+    assert pending.cancelled()
+    assert client._pending_requests == {}
+    assert client._reader_task is None
+    assert client._ws is None
 
 
 async def test_discover_codex_model_options_strips_secrets_and_stops_process(
