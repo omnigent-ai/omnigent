@@ -83,7 +83,12 @@ interface BrowserPaneBridge {
       canGoForward: boolean;
     }) => void,
   ) => () => void;
-  browserHasView?: (conversationId: string) => Promise<{ exists: boolean }>;
+  browserHasView?: (conversationId: string) => Promise<{
+    exists: boolean;
+    url?: string;
+    canGoBack?: boolean;
+    canGoForward?: boolean;
+  }>;
 }
 
 function getBridge(): BrowserPaneBridge | null {
@@ -93,8 +98,9 @@ function getBridge(): BrowserPaneBridge | null {
 }
 
 export interface BrowserPaneProps {
-  /** Conversation whose WebContentsView this pane hosts. */
+  /** Native view key: the session ID or a session-scoped browser tab ID. */
   conversationId: string;
+  agentBrowser?: boolean;
   /** Extra classes for the measuring placeholder wrapper. */
   className?: string;
 }
@@ -103,7 +109,7 @@ export interface BrowserPaneProps {
  * Keeps the agent relay alive for a conversation and, once a native browser
  * view is attached, keeps that view positioned over a measuring placeholder.
  */
-export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
+export function BrowserPane({ conversationId, className, agentBrowser = true }: BrowserPaneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
   const browserSupported = supportsBrowser();
@@ -115,6 +121,7 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
   // edits the input (urlEditingRef gates the stomp); canGoBack/Forward drive
   // the arrow buttons.
   const [currentUrl, setCurrentUrl] = useState("");
+  const [navigationError, setNavigationError] = useState<string | null>(null);
   // Ref (not state): read synchronously in the url-changed listener; a
   // stale-closure state read would race.
   const urlEditingRef = useRef(false);
@@ -137,7 +144,12 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
 
     // (2) Re-show an already-created view when the pane remounts.
     void bridge.browserHasView?.(conversationId).then((r) => {
-      if (!cancelled && r?.exists) setViewActive(true);
+      if (!cancelled && r?.exists) {
+        setViewActive(true);
+        if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
+        setCanGoBack(!!r.canGoBack);
+        setCanGoForward(!!r.canGoForward);
+      }
     });
 
     // (1) A view was just created for this conversation (first navigate).
@@ -196,7 +208,13 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
     if (!raw) return;
     const navUrl = normalizeTypedUrl(raw);
     setCurrentUrl(navUrl);
-    void bridge.browserOpenOrNavigate(conversationId, navUrl, undefined, { force: true });
+    setNavigationError(null);
+    void bridge
+      .browserOpenOrNavigate(conversationId, navUrl, undefined, { force: true })
+      .then((result) => {
+        if (!result.ok) setNavigationError(result.error ?? "Unable to open this page.");
+      })
+      .catch(() => setNavigationError("Unable to open this page."));
   }, [conversationId, currentUrl]);
 
   const handleBack = useCallback(() => {
@@ -469,6 +487,11 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
           <SquareDashedMousePointerIcon className="size-4" />
         </button>
       </div>
+      {navigationError && (
+        <div role="alert" className="px-2 py-1 text-destructive text-xs">
+          {navigationError}
+        </div>
+      )}
       {viewActive ? (
         /* Measuring region — the native WebContentsView paints over this.
            flex-1 min-h-0 so it fills everything BELOW the toolbar; its rect
@@ -477,7 +500,8 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
         <div ref={containerRef} className="min-h-0 min-w-0 flex-1" />
       ) : (
         <div className="flex min-h-0 flex-1 items-center justify-center bg-card px-6 py-8 text-center text-muted-foreground text-ui">
-          Enter a URL above to get started — the agent will open pages here too.
+          Enter a URL above to get started
+          {agentBrowser ? " — the agent will open pages here too." : "."}
         </div>
       )}
     </div>

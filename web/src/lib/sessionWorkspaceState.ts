@@ -25,6 +25,8 @@ export interface SessionWorkspaceState {
   openTerminals?: string[];
   /** The active shell tab (null = a file/scope view is active). */
   selectedTerminalKey?: string | null;
+  openBrowsers?: string[];
+  selectedBrowserId?: string | null;
 }
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
@@ -80,6 +82,18 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   }
   if (record.selectedTerminalKey === null || typeof record.selectedTerminalKey === "string") {
     state.selectedTerminalKey = record.selectedTerminalKey;
+  }
+  if (Array.isArray(record.openBrowsers)) {
+    state.openBrowsers = [
+      ...new Set(
+        record.openBrowsers.filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        ),
+      ),
+    ];
+  }
+  if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
+    state.selectedBrowserId = record.selectedBrowserId;
   }
   return state;
 }

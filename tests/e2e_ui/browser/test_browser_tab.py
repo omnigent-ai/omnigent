@@ -130,3 +130,48 @@ def test_no_browser_tab_in_plain_browser(
     # absent (not merely hidden) in a non-Electron shell.
     expect(rail.get_by_role("tab", name=re.compile("Agents"))).to_be_visible()
     expect(rail.get_by_role("tab", name=re.compile("Browser"))).to_have_count(0)
+
+
+def test_multiple_browser_soft_tabs(page: Page, seeded_session: tuple[str, str]) -> None:
+    """User-created browser tabs select independent views and close individually."""
+    base_url, session_id = seeded_session
+    page.add_init_script(_ELECTRON_SHELL_INIT_SCRIPT)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+
+    for ordinal in (1, 2):
+        rail.get_by_role("button", name="Open new", exact=True).click()
+        page.get_by_role("menuitem", name="Browser", exact=True).click()
+        expect(rail.get_by_role("tab", name=f"Browser {ordinal}", exact=True)).to_have_attribute(
+            "aria-selected", "true"
+        )
+
+    second_view = rail.locator("[data-browser-pane-conversation]").get_attribute(
+        "data-browser-pane-conversation"
+    )
+    rail.get_by_role("tab", name="Browser 1", exact=True).click()
+    first_view = rail.locator("[data-browser-pane-conversation]").get_attribute(
+        "data-browser-pane-conversation"
+    )
+    assert first_view != second_view
+    assert first_view != session_id
+    rail.get_by_role("tab", name="Browser 2", exact=True).click()
+    expect(rail.locator("[data-browser-pane-conversation]")).to_have_attribute(
+        "data-browser-pane-conversation", second_view
+    )
+
+    page.reload()
+    expect(rail.get_by_role("tab", name="Browser 2", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    rail.get_by_role("button", name="Close Browser 2", exact=True).click()
+    expect(rail.get_by_role("tab", name="Browser 2", exact=True)).to_have_count(0)
+    expect(rail.get_by_role("tab", name="Browser 1", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    rail.get_by_role("button", name="Close Browser 1", exact=True).click()
+    expect(rail.get_by_role("tab", name="Browser", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )

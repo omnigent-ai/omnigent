@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserPane } from "./BrowserPane";
 
@@ -58,6 +58,46 @@ afterEach(() => {
 });
 
 describe("BrowserPane cold-start (no view yet)", () => {
+  it("does not claim that the agent navigates user-created tabs", () => {
+    render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+    expect(screen.getByText("Enter a URL above to get started.")).toBeInTheDocument();
+    expect(screen.queryByText(/the agent will open pages here too/)).toBeNull();
+  });
+
+  it("restores a tab's URL and navigation state from its existing native view", async () => {
+    const bridge = installBridge({
+      browserHasView: vi.fn().mockResolvedValue({
+        exists: true,
+        url: "https://example.com/tab-two",
+        canGoBack: true,
+        canGoForward: false,
+      }),
+    });
+    render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
+        "https://example.com/tab-two",
+      ),
+    );
+    expect(screen.getByRole("button", { name: "Go back" })).toBeEnabled();
+    expect(bridge.browserSetActive).toHaveBeenCalledWith("browser-tab:conv_a:two");
+    cleanup();
+    expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null);
+  });
+
+  it("reports native view-cap failures instead of silently leaving a blank tab", async () => {
+    installBridge({
+      browserOpenOrNavigate: vi
+        .fn()
+        .mockResolvedValue({ ok: false, error: "browser view cap reached — close one" }),
+    });
+    render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
+    const address = screen.getByRole("textbox", { name: "Address bar" });
+    fireEvent.change(address, { target: { value: "example.com" } });
+    fireEvent.keyDown(address, { key: "Enter" });
+    expect(await screen.findByRole("alert")).toHaveTextContent("browser view cap reached");
+  });
+
   it("renders the URL bar in the empty state so the first page is reachable", async () => {
     render(<BrowserPane conversationId="conv_a" />);
 
