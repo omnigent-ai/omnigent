@@ -820,6 +820,30 @@ function SidebarImpl({
   const dragging = dragProgress != null;
   const effectiveOpen = open || dragging || peek;
 
+  // While the peek card's entry animation is still fading it in, the card is
+  // (nearly) invisible yet already covers the toggle whose hover armed it —
+  // taking pointer events then would swallow a click aimed at that toggle,
+  // landing it on whatever sidebar content sits under the pointer instead.
+  // Stay click-through until the entry animation completes. A native listener
+  // (not React's onAnimationEnd) so the reduced-motion near-zero duration and
+  // every browser's event name are honored alike; children's animations
+  // bubble here too, so only the card's own end flips it interactive.
+  const asideRef = useRef<HTMLElement | null>(null);
+  const [peekInteractive, setPeekInteractive] = useState(false);
+  useEffect(() => {
+    if (!peek) {
+      setPeekInteractive(false);
+      return;
+    }
+    const el = asideRef.current;
+    if (!el) return;
+    const onAnimationEnd = (e: AnimationEvent) => {
+      if (e.target === el) setPeekInteractive(true);
+    };
+    el.addEventListener("animationend", onAnimationEnd);
+    return () => el.removeEventListener("animationend", onAnimationEnd);
+  }, [peek]);
+
   // While peeking, leaving the card closes it after a short grace period;
   // re-entering before that fires cancels the close so a wobble doesn't
   // dismiss it.
@@ -868,6 +892,7 @@ function SidebarImpl({
         />
       )}
       <aside
+        ref={asideRef}
         aria-label="Conversations"
         onPointerEnter={cancelPeekClose}
         onPointerLeave={() => {
@@ -931,6 +956,10 @@ function SidebarImpl({
           // overlay rather than a push.
           peek &&
             "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
+          // Click-through while fading in (see peekInteractive above): the
+          // click falls through to the header toggle underneath, which pins
+          // the sidebar open — what the user aimed for.
+          peek && !peekInteractive && "pointer-events-none",
         )}
         style={
           {
