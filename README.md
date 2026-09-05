@@ -11,7 +11,7 @@ Omnigent is an open-source **meta-harness** that gives you a common orchestratio
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/omnigent)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
-[omnigent.ai](https://omnigent.ai) · **[⬇️ Download the macOS desktop app](https://omnigent.ai/download/mac)**
+[omnigent.ai](https://omnigent.ai) · **[⬇️ Download the macOS desktop app](https://omnigent.ai/download/mac)** · **[📱 Get the iOS app](https://omnigent.ai/download/ios)**
 
 </div>
 
@@ -430,6 +430,15 @@ Run Omnigent on a server with a stable URL
 become reachable from anywhere, including your phone. The web UI is built for
 mobile, so you get the same chat, sub-agents, terminals, and files, in sync
 with your laptop.
+
+On iPhone and iPad there is also a **native app** (currently a
+[TestFlight beta](https://omnigent.ai/download/ios)) that connects to your
+server and loads that same UI, so you don't have to keep a browser tab around:
+sign in through the system browser, pick a recent server on launch, and get
+local notifications plus an app badge when a session wants your attention.
+Administrators can preset the servers the app offers over MDM — see
+[`web/ios/README.md`](https://github.com/omnigent-ai/omnigent/blob/main/web/ios/README.md)
+to build it yourself.
 
 One `docker compose up` runs the server on any host you have (a VPS, a home
 server); **Render** and **Railway** deploy with one click; **Fly.io**, **Hugging
