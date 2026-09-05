@@ -334,9 +334,9 @@ function PlainTextFallback({ text }: { text: string }) {
  * block rendering too, stripping `<pre>` and collapsing whitespace.
  *
  * When `breaks` is set, single newlines render as `<br>` (remark-breaks)
- * instead of collapsing to spaces per CommonMark. Used for user bubbles,
- * where people type multi-line messages without blank-line paragraph
- * separators and expect their line breaks preserved. NOTE: Streamdown's
+ * instead of collapsing to spaces per CommonMark. Used for chat bubbles,
+ * where user input and CLI output can contain meaningful line breaks without
+ * blank-line paragraph separators. NOTE: Streamdown's
  * `remarkPlugins` prop *replaces* its defaults rather than merging, so we
  * extend `defaultRemarkPlugins` (which carries remark-gfm) — passing
  * `[remarkBreaks]` alone would silently drop GFM tables / strikethrough.
