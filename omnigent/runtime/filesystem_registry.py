@@ -36,6 +36,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from omnigent.process_logging import log_once
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows has no flock.
@@ -989,25 +991,30 @@ class GitFilesystemRegistry(FilesystemRegistry):
             )
             raise GitStatusUnavailable(f"git status timed out after {elapsed:.1f}s") from exc
         except OSError as exc:
-            elapsed = time.monotonic() - started
-            _logger.warning(
-                "GitFilesystemRegistry.list_changed_files: %r in %s could not run after %.2fs: %s",
+            log_once(
+                _logger,
+                logging.WARNING,
+                "GitFilesystemRegistry.list_changed_files: %r in %s could not run: %s",
                 argv,
                 self._git_root,
-                elapsed,
                 exc,
             )
             raise GitStatusUnavailable(f"git status could not run: {exc}") from exc
 
-        elapsed = time.monotonic() - started
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            _logger.warning(
-                "GitFilesystemRegistry.list_changed_files: %r in %s exited %d after %.2fs: %s",
+            # The file panel polls this, so a workspace that is simply not a
+            # repo fails identically on every poll -- hundreds of lines for one
+            # unchanging condition. Elapsed time is left out of the message so
+            # it stays a stable dedup key; the timeout branch above keeps it,
+            # since there the duration is the finding.
+            log_once(
+                _logger,
+                logging.WARNING,
+                "GitFilesystemRegistry.list_changed_files: %r in %s exited %d: %s",
                 argv,
                 self._git_root,
                 result.returncode,
-                elapsed,
                 stderr,
             )
             raise GitStatusUnavailable(
@@ -1084,25 +1091,25 @@ class GitFilesystemRegistry(FilesystemRegistry):
             )
             raise GitStatusUnavailable(f"git status timed out after {elapsed:.1f}s") from exc
         except OSError as exc:
-            elapsed = time.monotonic() - started
-            _logger.warning(
-                "GitFilesystemRegistry.get_changed_file: %r in %s could not run after %.2fs: %s",
+            log_once(
+                _logger,
+                logging.WARNING,
+                "GitFilesystemRegistry.get_changed_file: %r in %s could not run: %s",
                 argv,
                 self._git_root,
-                elapsed,
                 exc,
             )
             raise GitStatusUnavailable(f"git status could not run: {exc}") from exc
 
-        elapsed = time.monotonic() - started
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            _logger.warning(
-                "GitFilesystemRegistry.get_changed_file: %r in %s exited %d after %.2fs: %s",
+            log_once(
+                _logger,
+                logging.WARNING,
+                "GitFilesystemRegistry.get_changed_file: %r in %s exited %d: %s",
                 argv,
                 self._git_root,
                 result.returncode,
-                elapsed,
                 stderr,
             )
             raise GitStatusUnavailable(

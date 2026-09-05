@@ -571,6 +571,40 @@ def test_git_list_changed_files_raises_on_nonzero_exit(tmp_path: Path, monkeypat
         reg.list_changed_files("any-conv", limit=100)
 
 
+def test_git_status_failure_warns_once_across_polls(
+    tmp_path: Path,
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A workspace that is not a repo must not warn once per poll.
+
+    The file panel polls ``list_changed_files``, so an unchanging condition —
+    a session opened outside any repo — logged hundreds of identical warnings
+    for one setup problem, drowning real failures in the logs. The failure must
+    still raise every time; only the logging is deduplicated.
+    """
+
+    def _not_a_repo(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args="git status",
+            returncode=128,
+            stdout=b"",
+            stderr=b"fatal: not a git repository (or any parent up to mount point /)",
+        )
+
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _not_a_repo)
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    with caplog.at_level(logging.WARNING, logger="omnigent.runtime.filesystem_registry"):
+        for _ in range(5):
+            with pytest.raises(GitStatusUnavailable, match="exited 128"):
+                reg.list_changed_files("any-conv", limit=100)
+
+    warnings = [r for r in caplog.records if "list_changed_files" in r.getMessage()]
+    assert len(warnings) == 1, f"expected one warning across five polls, got {len(warnings)}"
+    assert "not a git repository" in warnings[0].getMessage()
+
+
 def test_git_get_changed_file_raises_on_timeout(tmp_path: Path, monkeypatch) -> None:
     """A ``git status`` timeout in the single-file lookup must raise, not return ``None``.
 
