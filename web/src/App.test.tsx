@@ -1,10 +1,19 @@
 import { render, screen } from "@testing-library/react";
 import { Outlet, MemoryRouter } from "react-router-dom";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { CHUNK_RELOAD_AT_STORAGE_KEY } from "@/lib/lazyChunkRecovery";
 
-vi.mock("@/lib/analytics", () => ({ useOmnigentPageView: vi.fn() }));
+vi.mock("@/lib/analytics", () => ({
+  useOmnigentPageView: vi.fn(),
+  // Button reads trackClick from this hook; the boundary fallback renders one.
+  useOmnigentAnalytics: () => ({
+    trackClick: vi.fn(),
+    trackValueChange: vi.fn(),
+    trackInteraction: vi.fn(),
+  }),
+}));
 vi.mock("@/shell/AppShell", () => ({
   AppShell: () => (
     <div>
@@ -14,6 +23,11 @@ vi.mock("@/shell/AppShell", () => ({
   ),
 }));
 vi.mock("@/pages/ChatPage", () => ({ ChatPage: () => <div>chat page</div> }));
+// Simulates a redeploy that deleted this lazy route's hashed chunk: the
+// dynamic import itself rejects, exactly like a stale tab fetching the old URL.
+vi.mock("@/pages/InboxPage", () => {
+  throw new TypeError("Failed to fetch dynamically imported module: /assets/InboxPage-old.js");
+});
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
 vi.mock("@/pages/SettingsPage", async () => {
@@ -150,5 +164,24 @@ describe("Settings routes", () => {
     expect(await screen.findByTestId("settings-location")).toHaveTextContent(
       "/settings/appearance",
     );
+  });
+});
+
+describe("Lazy route chunk deleted by a redeploy", () => {
+  afterEach(() => {
+    sessionStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it("shows a reload affordance instead of a blank page once auto-reload is spent", async () => {
+    // The tab already spent its one automatic recovery reload moments ago, so
+    // the failure must surface as an explicit affordance — never a blank page.
+    sessionStorage.setItem(CHUNK_RELOAD_AT_STORAGE_KEY, String(Date.now()));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    renderRoute("/inbox");
+
+    expect(await screen.findByText("This page failed to load")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reload" })).toBeInTheDocument();
   });
 });
