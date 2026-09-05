@@ -53,6 +53,7 @@ from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
+from .codex_staging import CODEX_HOME_PREFIX, codex_home_staging_root
 from .databricks_executor import (
     _databricks_gateway_host,
 )
@@ -602,9 +603,11 @@ def _populate_codex_skills(
     target_dir: Path,
     skills_filter: str | list[str],
     sources: list[Path],
+    *,
+    copy_skills: bool = False,
 ) -> None:
     """
-    Populate *target_dir* with symlinks to skill directories.
+    Populate *target_dir* with symlinks to (or copies of) skill directories.
 
     Codex auto-discovers skills under ``$CODEX_HOME/skills/<name>/``.
     Our executor already overrides ``CODEX_HOME`` to a per-conversation
@@ -628,6 +631,11 @@ def _populate_codex_skills(
         source that contains a given skill name wins (so callers should
         list bundled skills before host skills if they want bundle
         overrides, or vice versa).
+    :param copy_skills: Copy each selected skill directory instead of
+        symlinking it. Used for sandbox-exposed staging, where the
+        ``skills/`` subtree must be self-contained — a symlink whose
+        target is outside the mounted subtree dangles inside the tool
+        namespace.
     """
     if skills_filter == "none":
         return
@@ -639,38 +647,42 @@ def _populate_codex_skills(
         link_path = target_dir / name
         if link_path.exists() or link_path.is_symlink():
             continue
-        try:
-            # Resolve to absolute so the symlink doesn't break when
-            # the source was a relative path (relative symlinks resolve
-            # against the link's parent, not the original cwd).
-            link_path.symlink_to(skill_dir.resolve())
-        except OSError as exc:
-            # Filesystems without symlink support (e.g. some Windows
-            # configs) — fall back to a copy. Don't crash the harness
-            # boot over a skill-discovery convenience.
-            logger.warning(
-                "could not symlink skill %r into %s (%s); copying instead",
-                name,
-                target_dir,
-                exc,
-            )
+        if not copy_skills:
             try:
-                shutil.copytree(skill_dir, link_path)
-            except OSError as copy_exc:
-                # Copy fallback can also fail (unreadable source, race) — skip
-                # this one skill rather than abort the whole session boot.
+                # Resolve to absolute so the symlink doesn't break when
+                # the source was a relative path (relative symlinks resolve
+                # against the link's parent, not the original cwd).
+                link_path.symlink_to(skill_dir.resolve())
+                continue
+            except OSError as exc:
+                # Filesystems without symlink support (e.g. some Windows
+                # configs) — fall back to a copy. Don't crash the harness
+                # boot over a skill-discovery convenience.
                 logger.warning(
-                    "could not copy skill %r into %s (%s); skipping",
+                    "could not symlink skill %r into %s (%s); copying instead",
                     name,
                     target_dir,
-                    copy_exc,
+                    exc,
                 )
+        try:
+            shutil.copytree(skill_dir, link_path)
+        except OSError as copy_exc:
+            # Copying can fail too (unreadable source, race) — skip this
+            # one skill rather than abort the whole session boot.
+            logger.warning(
+                "could not copy skill %r into %s (%s); skipping",
+                name,
+                target_dir,
+                copy_exc,
+            )
 
 
 def populate_codex_skills_from_bundle(
     codex_home: Path,
     bundle_dir: Path | None,
     skills_filter: str | list[str],
+    *,
+    copy_skills: bool = False,
 ) -> None:
     """
     Populate a CODEX_HOME's ``skills/`` from a bundle + host skills.
@@ -692,10 +704,17 @@ def populate_codex_skills_from_bundle(
         first (highest-priority) source when present.
     :param skills_filter: The spec's ``skills_filter``: ``"all"`` /
         ``"none"`` / a list of skill names.
+    :param copy_skills: Copy skill directories instead of symlinking them
+        (see :func:`_populate_codex_skills`). Per-conversation temp homes
+        pass ``True`` so the sandbox-exposed ``skills/`` subtree is
+        self-contained; the persistent codex-native home keeps symlinks so
+        skill content tracks the source.
     :returns: None.
     """
     skill_sources = codex_skill_sources(bundle_dir, Path.home())
-    _populate_codex_skills(codex_home / "skills", skills_filter, skill_sources)
+    _populate_codex_skills(
+        codex_home / "skills", skills_filter, skill_sources, copy_skills=copy_skills
+    )
 
 
 def _is_omnigent_private_codex_home(path: Path) -> bool:
@@ -720,7 +739,7 @@ def _is_omnigent_private_codex_home(path: Path) -> bool:
         and parts[-4] == ".omnigent"
     ):
         return True
-    return expanded.name.startswith("omnigent-codex-home-")
+    return expanded.name.startswith(CODEX_HOME_PREFIX)
 
 
 def _private_codex_home_config_source(path: Path) -> Path | None:
@@ -2296,19 +2315,21 @@ class _CodexAppServerSession:
         if self._started:
             return
         self._loop = asyncio.get_running_loop()
-        codex_home_root = Path(tempfile.gettempdir())
-        if self._cwd and self._cwd != "/":
-            try:
-                codex_home_root = Path(self._cwd) / ".codex-tmp"
-                codex_home_root.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                # The cwd may be on a read-only filesystem — e.g. macOS
-                # root ``/`` inherited from a runner whose working
-                # directory was never explicitly set.  Fall back to the
-                # system temp directory so the codex home is still writable.
-                codex_home_root = Path(tempfile.gettempdir())
+        try:
+            # Deliberately OUTSIDE the workspace: staging under cwd left an
+            # untracked dir in the user's checkout for the session's
+            # lifetime, and put the skill paths codex publishes under the
+            # sandbox's hidden-dotdir mask. The well-known root also lets
+            # sandbox backends re-expose each home's ``skills/`` subtree
+            # (and nothing else) inside tool namespaces.
+            codex_home_root = codex_home_staging_root()
+        except OSError:
+            # The staging root may be uncreatable (unwritable temp dir) —
+            # fall back to the plain system temp directory so the codex
+            # home is still writable.
+            codex_home_root = Path(tempfile.gettempdir())
         self._codex_home_dir = Path(
-            tempfile.mkdtemp(prefix="omnigent-codex-home-", dir=str(codex_home_root))
+            tempfile.mkdtemp(prefix=CODEX_HOME_PREFIX, dir=str(codex_home_root))
         )
         # Populate the per-conversation CODEX_HOME's ``skills/`` subdir
         # based on the spec's ``skills:`` field. Codex auto-discovers
@@ -2317,10 +2338,14 @@ class _CodexAppServerSession:
         # so even ``skills: all`` would expose nothing. The shared helper
         # is the same one the codex-native launch path uses, so both
         # expose an identical skill surface.
+        # ``copy_skills``: the sandbox re-exposes only the staged ``skills/``
+        # subtree, so its entries must be self-contained — a symlink into the
+        # bundle dir would dangle inside the mount namespace.
         populate_codex_skills_from_bundle(
             self._codex_home_dir,
             self._bundle_dir,
             self._skills_filter,
+            copy_skills=True,
         )
         # Bridge the user's authentication and provider config into the
         # temp CODEX_HOME. The codex CLI reads ``auth.json`` (OAuth tokens

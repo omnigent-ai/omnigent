@@ -28,6 +28,7 @@ from omnigent.runner.identity import (
 )
 
 from .async_utils import run_sync_on_thread
+from .codex_staging import staged_codex_skill_dirs
 from .credential_proxy import (
     CredentialProxyRuntime,
     CredentialRewriteRule,
@@ -45,6 +46,7 @@ from .sandbox import (
     reachable_roots,
     resolve_sandbox,
     set_temp_env,
+    with_additional_read_roots,
     with_additional_write_roots,
 )
 
@@ -462,6 +464,14 @@ class _HelperProcessClient:
         if sandbox.active:
             self._tmpdir = create_private_tmpdir()
             sandbox = with_additional_write_roots(sandbox, [self._tmpdir])
+            # Harness-staged skill manifests (see ``codex_staging``): grant
+            # read so the file tools' reach checks agree with the mount view
+            # the sandbox backends expose for those subtrees. Re-evaluated on
+            # every helper (re)start, so homes staged before this spawn are
+            # covered.
+            staged_skill_dirs = staged_codex_skill_dirs()
+            if staged_skill_dirs:
+                sandbox = with_additional_read_roots(sandbox, staged_skill_dirs)
             set_temp_env(env, self._tmpdir)
             if self.start_in_scratch:
                 helper_cwd = self._tmpdir
