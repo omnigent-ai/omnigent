@@ -3555,3 +3555,208 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
             await task
         # The background re-probe healed the store for the next launch.
         assert model_catalog_store.read_catalog("codex-native", fingerprint) == refreshed
+
+
+@pytest.mark.asyncio
+async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A persisted override in the gateway spelling still resolves the catalog.
+
+    The override is stored as the servable id ``databricks-gpt-5-6-sol`` while
+    the catalog lists codex's own slug ``gpt-5.6-sol``. The launch translates
+    between the two, so the pre-launch check must match by codex's vocabulary,
+    not string equality — a raw membership test refuses a model this host serves.
+    """
+    import omnigent.codex_native_app_server as codex_app_mod
+    from omnigent import model_catalog_store
+    from omnigent.runner import app as runner_app_mod
+    from tests.runner.conftest import REAL_CODEX_LAUNCH_CATALOG
+
+    session_id = "5b0c7e2a9d1f4c3b8e6a7d5f4c3b2a1e"
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60937f"
+    override = "databricks-gpt-5-6-sol"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    monkeypatch.setattr(
+        codex_app_mod,
+        "resolve_native_codex_launch",
+        lambda *, model, spec=None: codex_app_mod.NativeCodexLaunch(
+            config_overrides=[], model=model, profile=None
+        ),
+    )
+    monkeypatch.setattr(codex_app_mod, "codex_launch_catalog", REAL_CODEX_LAUNCH_CATALOG)
+
+    async def _fake_probe(*, codex_path: str | None = None) -> list[dict[str, object]]:
+        """Stand in for the real codex probe; unused on a store hit."""
+        del codex_path
+        return [{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}]
+
+    monkeypatch.setattr(codex_app_mod, "probe_codex_model_options", _fake_probe)
+    fingerprint = codex_app_mod.codex_catalog_fingerprint(
+        codex_app_mod.resolve_native_codex_launch(model=None)
+    )
+    # A fresh catalog carrying codex's own slug, not the gateway spelling.
+    model_catalog_store.write_catalog(
+        "codex-native",
+        fingerprint,
+        [{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}],
+    )
+
+    class _SnapshotServerClient:
+        """Server client returning a resume snapshot with the gateway override."""
+
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            """
+            Return the session snapshot / item history the helper reads.
+
+            :param url: Request path.
+            :param kwargs: Request keyword arguments.
+            :returns: HTTP 200 response.
+            """
+            del kwargs
+            if url == f"/v1/sessions/{session_id}/items":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "id": "b1649a5cbfec3f92bec12275c14f4b61",
+                                "response_id": "codex_turn_1",
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "remember this"}],
+                            }
+                        ],
+                        "has_more": False,
+                    },
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                json={"model_override": override, "external_session_id": thread_id},
+                request=httpx.Request("GET", url),
+            )
+
+    class _FakeCodexAppServer:
+        """Minimal app-server object used by ``codex_terminal_env``."""
+
+        codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = (0, 145, 0)
+
+        def __init__(self) -> None:
+            """Initialize the fake app-server state."""
+            self.env = {"OPENAI_API_KEY": "sk-test"}
+            self.codex_home = tmp_path / "unconfigured-codex-home"
+            self.listen_url: str | None = None
+            self.started = False
+            self.config_overrides: list[str] = []
+
+        async def start(self) -> None:
+            """Mark the fake app-server started."""
+            self.started = True
+
+        async def close(self) -> None:
+            """No-op close."""
+
+    app_server = _FakeCodexAppServer()
+    build_calls: list[dict[str, Any]] = []
+
+    def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
+        """
+        Capture app-server construction.
+
+        :param kwargs: Keyword arguments passed by the runner helper.
+        :returns: Fake app-server.
+        """
+        build_calls.append(kwargs)
+        app_server.codex_home = kwargs["codex_home"]
+        return app_server
+
+    class _UnexpectedDiscoveryClient:
+        """App-server client that must not connect on a known-thread resume."""
+
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            """
+            :param ws_url: App-server WebSocket URL.
+            :param client_name: JSON-RPC client name.
+            """
+            self.ws_url = ws_url
+            self.client_name = client_name
+
+        async def connect(self) -> None:
+            """Fail if the resume path tries to discover a fresh thread."""
+            raise AssertionError("resume path must not connect discovery client")
+
+        async def close(self) -> None:
+            """No-op close."""
+
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
+        """Accept preloading of the known Codex thread."""
+        del transport, loaded_thread_id, terminal_launch_args
+
+    async def _fake_forward_known_thread(**kwargs: Any) -> None:
+        """Accept the known-thread forwarder invocation."""
+        del kwargs
+
+    class _FakeResourceRegistry:
+        """Resource registry that accepts the terminal launch."""
+
+        async def launch_auxiliary_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Accept the terminal launch request."""
+            del terminal_name, session_key, spec, resource_role, parent_os_env
+            return SessionResourceView(
+                id="terminal_codex_main",
+                type="terminal",
+                session_id=session_id,
+                name="Codex",
+            )
+
+    monkeypatch.setattr(
+        codex_app_mod, "build_codex_native_server", _fake_build_codex_native_server
+    )
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
+    monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
+    monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
+
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="codex",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+    try:
+        await _auto_create_codex_terminal(
+            session_id,
+            _FakeResourceRegistry(),  # type: ignore[arg-type]
+            lambda _sid, _evt: None,
+            agent_spec=agent_spec,
+            server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0)
+    finally:
+        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    # The gateway-spelled override was accepted (not refused) and passed
+    # through to the launch, which translates it to codex's slug downstream.
+    assert build_calls, "a servable override was refused as unknown"
+    assert build_calls[0]["model"] == override

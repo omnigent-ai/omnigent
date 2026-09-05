@@ -23,6 +23,7 @@ import tomlkit
 import websockets
 from cachetools import TTLCache
 from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import ConnectionClosed
 
 from omnigent import model_catalog
 from omnigent.json_types import JsonObject as _JsonObject
@@ -603,18 +604,22 @@ class CodexAppServerClient:
 
         :returns: None.
         """
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._reader_task
-        for future in self._pending_requests.values():
-            if not future.done():
-                future.cancel()
-        self._pending_requests.clear()
-        if self._ws is not None:
-            await self._ws.close()
-        self._ws = None
-        self._reader_task = None
+        try:
+            if self._reader_task is not None:
+                self._reader_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, ConnectionClosed):
+                    await self._reader_task
+        finally:
+            for future in self._pending_requests.values():
+                if not future.done():
+                    future.cancel()
+            self._pending_requests.clear()
+            try:
+                if self._ws is not None:
+                    await self._ws.close()
+            finally:
+                self._ws = None
+                self._reader_task = None
 
     async def request(self, method: str, params: CodexParams) -> CodexMessage:
         """

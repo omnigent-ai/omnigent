@@ -1,7 +1,7 @@
 """Drop the unused conversation item content trigram index.
 
-Revision ID: gb1b2c3d4e5f
-Revises: ga1b2c3d4e5f
+Revision ID: gc1b2c3d4e5f
+Revises: gb1b2c3d4e5f
 Create Date: 2026-09-03 00:00:00.000000
 
 Conversation content search deliberately uses raw ``ILIKE`` inside a
@@ -17,8 +17,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "gb1b2c3d4e5f"
-down_revision: str | None = "ga1b2c3d4e5f"
+revision: str = "gc1b2c3d4e5f"
+down_revision: str | None = "gb1b2c3d4e5f"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

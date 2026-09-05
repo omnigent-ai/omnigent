@@ -47,10 +47,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
-from urllib import error, request
+from urllib import request
 
 from omnigent._platform import stable_user_id
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
@@ -58,6 +59,7 @@ from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import CONTEXT_RAW_FILE
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
+from omnigent.model_metadata import concrete_reported_model
 
 if TYPE_CHECKING:
     import httpx
@@ -3174,10 +3176,8 @@ def inject_user_message(
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
-        invocation fails, if the paste draft was never confirmed in the
-        input box after ``_PASTE_COMMIT_TIMEOUT_S`` (the TUI was still
-        consuming the paste — message not submitted), or if the draft
-        never leaves the input box after repeated submit Enters.
+        invocation fails, or if the draft never leaves the input box
+        after repeated submit Enters (message not delivered).
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # A surface left occupying the composer swallows everything typed
@@ -3239,13 +3239,10 @@ def inject_user_message(
     # into a paste; an Enter that arrives while it is still consuming
     # the paste becomes a newline inside the draft instead of a submit,
     # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic.
-    # When the draft never becomes visible (timeout expired) AND the
-    # content has an identifiable needle, raise rather than submit blind:
-    # a blind Enter races the still-consuming TUI and would silently drop
-    # the message (the caller gets no error but the turn never runs).
-    # When the needle is empty (whitespace-only content) the draft cannot
-    # be confirmed either way; fall through to best-effort blind submit.
+    # load / large payloads); polling is deterministic. Best-effort:
+    # when the draft never becomes identifiable (e.g. whitespace-only
+    # first line, custom statusline containing the glyph), fall through
+    # after the timeout and submit blind, matching the old behavior.
     needle = _submit_needle(content)
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
@@ -3254,21 +3251,12 @@ def inject_user_message(
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    if not draft_seen:
-        if not needle:
-            # Content has no identifiable first line (e.g. whitespace-only).
-            # The draft position cannot be confirmed, so fall through to a
-            # best-effort blind submit rather than hard-failing.
-            time.sleep(_PASTE_SETTLE_S)
-            _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
-            return
-        raise RuntimeError(
-            f"The pasted draft was never visible in Claude Code's input box after "
-            f"{_PASTE_COMMIT_TIMEOUT_S}s (needle={needle!r}). The TUI may still be "
-            "consuming the paste — the message was not submitted. Retry the send."
-        )
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+    if not draft_seen:
+        # The draft was never observed, so its absence proves nothing —
+        # verification would trivially "pass". Submit blind as before.
+        return
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
@@ -3823,8 +3811,8 @@ def post_tools_changed(
     :param timeout_s: Seconds to wait for the bridge HTTP control
         endpoint to publish itself, e.g. ``30.0``.
     :returns: None.
-    :raises RuntimeError: If the bridge server is not ready or
-        rejects the notification.
+    :raises RuntimeError: If the bridge server is not ready, cannot
+        be reached, or rejects the notification.
     """
     server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s)
     token = server.get("token")
@@ -3844,7 +3832,7 @@ def post_tools_changed(
         with request.urlopen(req, timeout=_TOOLS_CHANGED_POST_TIMEOUT_S) as resp:
             if resp.status >= 400:
                 raise RuntimeError(f"tools-changed POST failed with HTTP {resp.status}")
-    except error.URLError as exc:
+    except (OSError, HTTPException) as exc:
         raise RuntimeError(f"failed to notify Claude tool list change: {exc}") from exc
 
 
@@ -5551,10 +5539,7 @@ def _model_from_transcript_entry(entry: _JsonObject) -> str | None:
     message = entry.get("message")
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return None
-    model = message.get("model")
-    if isinstance(model, str) and model:
-        return model
-    return None
+    return concrete_reported_model(message.get("model"))
 
 
 def _custom_title_from_transcript_entry(entry: _JsonObject) -> str | None:

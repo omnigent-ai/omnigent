@@ -811,9 +811,19 @@ async def test_native_activity_refresh_prevents_idle_reaping(tmp_path: Path) -> 
 
 
 class _FakeReapProc:
-    """Minimal process stand-in recording whether the reaper killed it."""
+    """Minimal process stand-in recording whether the reaper killed it.
+
+    Implements the full ``_proc._ProcessLike`` protocol (``pid``/``returncode``/
+    ``terminate``/``kill``) because teardown is tree-aware. ``pid`` is ``None``
+    on purpose: it routes ``_proc.terminate_tree`` / ``kill_tree`` down their
+    no-pid branch, which signals this object directly and makes no OS calls at
+    all. A made-up integer pid would be actively dangerous here — the helpers
+    would resolve it against the real process table, and a pid that happened to
+    exist would get a live process group signalled by the test suite.
+    """
 
     def __init__(self) -> None:
+        self.pid: int | None = None
         self.returncode: int | None = None
         self.killed = False
         self._done = asyncio.Event()
@@ -822,6 +832,9 @@ class _FakeReapProc:
         self.killed = True
         self.returncode = -15
         self._done.set()
+
+    def terminate(self) -> None:
+        self.send_signal(signal.SIGTERM)
 
     def kill(self) -> None:
         self.killed = True

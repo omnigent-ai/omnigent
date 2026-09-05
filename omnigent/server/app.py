@@ -38,7 +38,11 @@ from omnigent.debug_logging import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.extensions import ExtensionPluginState
-from omnigent.extensions.assets import ResolvedBundle, build_asset_index
+from omnigent.extensions.assets import (
+    ResolvedBundle,
+    build_asset_index,
+    parse_dev_bundle_overrides,
+)
 from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -55,7 +59,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import session_live_state, shutdown_state
+from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -63,6 +67,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
+from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -178,7 +183,15 @@ def _resolve_extension_assets(
 ) -> tuple[dict[str, ResolvedBundle], dict[str, str]]:
     """Resolve bundle snapshots without allowing asset failures to stop the server."""
     try:
-        return build_asset_index(state)
+        overrides = None
+        raw_overrides = os.environ.get("OMNIGENT_EXTENSION_DEV_BUNDLES", "").strip()
+        if raw_overrides:
+            overrides = parse_dev_bundle_overrides(raw_overrides)
+            _logger.warning(
+                "using development extension bundle overrides for: %s",
+                ", ".join(sorted(overrides)),
+            )
+        return build_asset_index(state, overrides=overrides)
     except Exception as exc:  # noqa: BLE001
         _logger.warning("could not build extension asset index (%s)", exc, exc_info=True)
         return {}, {"registry": str(exc)}
@@ -1481,9 +1494,26 @@ def create_app(
             # endpoints (see routes/scheduled_tasks.py); there is no startup
             # sweep and no periodic reconcile.
 
+        managed_sandbox_reaper: ManagedSandboxReaper | None = None
+        if sandbox_config is not None and sandbox_config.reaper.enabled:
+            if host_store is None:
+                _logger.warning(
+                    "Managed sandbox reaper is enabled but no host store is configured; "
+                    "the reaper will not run"
+                )
+            else:
+                managed_sandbox_reaper = ManagedSandboxReaper(
+                    host_store=host_store,
+                    sandbox_config=sandbox_config,
+                )
+                app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
+                await managed_sandbox_reaper.start()
+
         try:
             yield
         finally:
+            if managed_sandbox_reaper is not None:
+                await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
             # lazy-on-read stale backstop — there is no run-reconciler task to
             # cancel. Only the per-job scheduler holds timers that need stopping.
@@ -1652,6 +1682,9 @@ def create_app(
     # run-completion hook (persist_scheduled_run_completion) fired from
     # _publish_status when a fired conversation's turn reaches terminal.
     session_live_state.configure(conversation_store, scheduled_task_store)
+    # Extend a managed sandbox while its runner tunnel is live (the managed-path
+    # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
+    managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
 
     @app.middleware("http")

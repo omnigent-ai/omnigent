@@ -667,14 +667,24 @@ async def test_launch_omits_keep_alive_options_by_default(
 
 
 @pytest.mark.asyncio
-async def test_launch_disables_tmux_mouse_mode(
+async def test_launch_enables_tmux_mouse_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Managed terminals leave scrolling and text selection to the client."""
+    """
+    Managed terminals enable tmux mouse mode so a native attach can scroll.
+
+    With ``mouse off`` a wheel gesture from a native ``tmux attach`` client is
+    passed through to the pane program, which for an inline CLI such as Codex
+    ignores it, leaving tmux's history unreachable. ``mouse on`` routes the
+    wheel through tmux's ``WheelUpPane`` binding instead.
+
+    :param tmp_path: Temporary directory for the fake tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
     cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=False)
-    assert contains_subsequence(cmd, ["set-option", "-g", "mouse", "off"])
-    assert not contains_subsequence(cmd, ["set-option", "-g", "mouse", "on"])
+    assert contains_subsequence(cmd, ["set-option", "-g", "mouse", "on"])
+    assert not contains_subsequence(cmd, ["set-option", "-g", "mouse", "off"])
 
 
 @pytest.mark.asyncio
@@ -685,11 +695,11 @@ async def test_launch_binds_page_up_scrollback_entry_point(
     """
     Managed terminals keep one route into tmux scrollback for attached users.
 
-    The lockdown removes every default copy-mode entry point (``mouse off``,
-    ``prefix None``, emptied prefix table) and native clients attach with
-    ``-f /dev/null``, so without a root-table Page Up binding the formatted
-    output above the viewport is unreachable. The binding must pass Page Up
-    through on the alternate screen so full-screen programs keep the key.
+    The lockdown removes the prefix-key copy-mode entry points (``prefix
+    None``, emptied prefix table) and native clients attach with
+    ``-f /dev/null``, so a keyboard route into the formatted output above the
+    viewport has to be bound explicitly. The binding must pass Page Up through
+    on the alternate screen so full-screen programs keep the key.
 
     :param tmp_path: Temporary directory for the fake tmux socket.
     :param monkeypatch: Pytest monkeypatch fixture.

@@ -1,0 +1,411 @@
+/* Colors, type scale, and control sizes mirror the Omnigent shell
+   (web/src/index.css + themePalettes.generated.css) so the page reads as
+   part of the app rather than an embedded widget. */
+:root {
+  color-scheme: light;
+  font-family:
+    ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji",
+    "Segoe UI Symbol", "Noto Color Emoji";
+  font-size: 13px;
+  line-height: 1.5;
+  color: #27272a;
+  background: #ffffff;
+  --canvas-card: #ffffff;
+  --canvas-border: #e4e4e7;
+  --canvas-muted: #71717a;
+  --canvas-hover: rgb(0 0 0 / 6%);
+  --canvas-dots: #d4d4d8;
+  --canvas-accent: #df3c85;
+  --canvas-idle: #71717a;
+  --canvas-unread: #df3c85;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  color: #f4f5f6;
+  background: #0e1013;
+  --canvas-card: #1f272d;
+  --canvas-border: #33383c;
+  --canvas-muted: #92a4b3;
+  --canvas-hover: rgb(255 255 255 / 8%);
+  --canvas-dots: #2b3238;
+  --canvas-idle: #92a4b3;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  display: inline-flex;
+  height: 32px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--canvas-border);
+  border-radius: 8px;
+  padding: 0 10px;
+  background: var(--canvas-card);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: var(--canvas-hover);
+}
+
+button:focus-visible,
+input:focus-visible,
+.session-card:focus-visible {
+  outline: 2px solid var(--canvas-accent);
+  outline-offset: 2px;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.canvas-shell {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
+  background: inherit;
+}
+
+.canvas-toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 24px 0;
+}
+
+.canvas-toolbar h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.canvas-toolbar span {
+  color: var(--canvas-muted);
+  font-size: 12px;
+}
+
+.canvas-banner {
+  margin: 0 24px 12px;
+  border: 1px solid var(--canvas-border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: var(--canvas-muted);
+}
+
+.canvas-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 24px;
+  overflow-x: auto;
+  /* Keep the thin scrollbar's space reserved (no layout jump) but paint it
+     only while the pointer is over the header strip. */
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+.canvas-tabs[data-scrollable="true"]:hover {
+  scrollbar-color: var(--canvas-border) transparent;
+}
+
+.canvas-tablist {
+  display: flex;
+  gap: 4px;
+}
+
+.canvas-tab {
+  max-width: 200px;
+  height: 28px;
+  flex: 0 0 auto;
+  border-color: transparent;
+  padding: 0 10px;
+  color: var(--canvas-muted);
+  background: transparent;
+}
+
+.canvas-tab-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.canvas-tab[aria-selected="true"] {
+  color: inherit;
+  background: color-mix(in srgb, var(--canvas-accent) 12%, var(--canvas-card));
+}
+
+.canvas-tab[aria-selected="true"]:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--canvas-accent) 18%, var(--canvas-card));
+}
+
+.canvas-tab-add {
+  padding: 0 9px;
+  font-size: 15px;
+}
+
+.canvas-new-project {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.canvas-new-project input {
+  width: 200px;
+  height: 28px;
+  border: 1px solid var(--canvas-border);
+  border-radius: 8px;
+  padding: 0 10px;
+  background: var(--canvas-card);
+}
+
+.canvas-new-project button {
+  height: 28px;
+}
+
+.canvas-flow {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  border-top: 1px solid var(--canvas-border);
+}
+
+.canvas-empty {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+}
+
+.canvas-empty > * {
+  pointer-events: auto;
+}
+
+/* Floating "new session" action, bottom-right like OpenUI's. */
+.canvas-fab {
+  position: absolute;
+  right: 24px;
+  bottom: 24px;
+  z-index: 6;
+  display: grid;
+  width: 52px;
+  height: 52px;
+  place-items: center;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  color: #fff;
+  background: var(--canvas-accent);
+  box-shadow: 0 6px 16px rgb(223 60 133 / 35%);
+}
+
+.canvas-fab:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--canvas-accent) 88%, #000);
+}
+
+.canvas-flow .react-flow__background {
+  fill: var(--canvas-dots);
+}
+
+/* React Flow's zoom controls follow the page theme instead of xyflow's light defaults. */
+.canvas-flow .react-flow {
+  --xy-controls-button-background-color: var(--canvas-card);
+  --xy-controls-button-background-color-hover: var(--canvas-hover);
+  --xy-controls-button-color: currentcolor;
+  --xy-controls-button-color-hover: currentcolor;
+  --xy-controls-button-border-color: var(--canvas-border);
+  --xy-controls-box-shadow: 0 1px 2px rgb(0 0 0 / 6%);
+}
+
+.session-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 280px;
+  min-height: 116px;
+  border: 1px solid var(--canvas-border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  background: var(--canvas-card);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 6%);
+  cursor: grab;
+  user-select: none;
+}
+
+.session-card:active {
+  cursor: grabbing;
+}
+
+.session-card-selected {
+  border-color: var(--canvas-accent);
+  box-shadow: 0 0 0 2px
+    color-mix(in srgb, var(--canvas-accent) 22%, transparent);
+}
+
+.session-card-title-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.session-card-title-row strong {
+  font-weight: 600;
+}
+
+.session-card-title-provisional {
+  color: var(--canvas-muted);
+  font-style: italic;
+  font-weight: 500;
+}
+
+.session-card-title-row strong,
+.session-workspace {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--canvas-idle);
+}
+
+.session-card[data-state="unread"] .session-status-dot {
+  background: var(--canvas-unread);
+}
+
+.session-spinner {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  color: var(--canvas-muted);
+  animation: session-spin 1s linear infinite;
+}
+
+@keyframes session-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.session-status-text,
+.session-meta {
+  color: var(--canvas-muted);
+  font-size: 12px;
+}
+
+.session-meta {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+}
+
+.session-meta-icon {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+}
+
+.session-meta-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-workspace,
+.session-branch {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* The PR row is a real link-like control inside the card. */
+.session-card .session-pull-request {
+  height: auto;
+  border: none;
+  padding: 0;
+  background: transparent;
+  color: var(--canvas-accent);
+  font-weight: 500;
+}
+
+.session-card .session-pull-request:hover:not(:disabled) {
+  background: transparent;
+  text-decoration: underline;
+}
+
+.canvas-state {
+  display: flex;
+  min-height: 100%;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px;
+  color: var(--canvas-muted);
+  text-align: center;
+}
+
+.canvas-state strong {
+  color: #27272a;
+  font-weight: 500;
+}
+
+:root[data-theme="dark"] .canvas-state strong {
+  color: #f4f5f6;
+}
+
+.canvas-state button {
+  margin-top: 8px;
+}
+
+@media (max-width: 767px) {
+  .canvas-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  button {
+    height: 40px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

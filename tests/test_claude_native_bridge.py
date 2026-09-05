@@ -14,10 +14,13 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator
+from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TextIO
+from unittest.mock import Mock
+from urllib.error import URLError
 
 import pytest
 
@@ -4607,6 +4610,48 @@ def test_inject_slash_command_raises_when_tmux_target_never_published(
         )
 
 
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        URLError("bridge unavailable"),
+        ConnectionResetError("connection reset"),
+        RemoteDisconnected("bridge disconnected"),
+        TimeoutError("notification timed out"),
+        BadStatusLine("invalid response"),
+    ],
+)
+def test_post_tools_changed_normalizes_transport_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transport_error: Exception
+) -> None:
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_server_info",
+        Mock(return_value={"url": "http://127.0.0.1:12345", "token": "test-token"}),
+    )
+    monkeypatch.setattr(claude_native_bridge.request, "urlopen", Mock(side_effect=transport_error))
+
+    with pytest.raises(RuntimeError, match="failed to notify Claude tool list change") as caught:
+        post_tools_changed(tmp_path)
+
+    assert caught.value.__cause__ is transport_error
+
+
+def test_post_tools_changed_preserves_programming_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_server_info",
+        Mock(return_value={"url": "http://127.0.0.1:12345", "token": "test-token"}),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge.request, "urlopen", Mock(side_effect=ValueError("bug"))
+    )
+
+    with pytest.raises(ValueError, match="bug"):
+        post_tools_changed(tmp_path)
+
+
 @pytest.mark.asyncio
 async def test_channel_server_relays_active_omnigent_tools(
     tmp_path: Path,
@@ -5769,6 +5814,37 @@ def test_read_transcript_items_from_offset_returns_latest_model(
     )
 
     assert result.latest_model == "claude-opus-4-7"
+
+
+@pytest.mark.parametrize("initial_model", [None, "gateway-claude-model"])
+def test_transcript_synthetic_error_preserves_model(
+    tmp_path: Path, initial_model: str | None
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    models = [initial_model, "<synthetic>"] if initial_model else ["<synthetic>"]
+    transcript_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": f"a{index}",
+                    "message": {
+                        "role": "assistant",
+                        "model": model,
+                        "content": [{"type": "text", "text": "API Error: 429"}],
+                    },
+                }
+            )
+            + "\n"
+            for index, model in enumerate(models)
+        ),
+        encoding="utf-8",
+    )
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    assert result.latest_model == initial_model
+    assert result.items  # Error messages remain visible; only model metadata is ignored.
 
 
 def test_read_transcript_items_surfaces_custom_title_without_an_item(
@@ -9062,156 +9138,6 @@ async def test_curl_evaluate_policy_command_round_trips(
     output = json.loads(result.stdout)
     assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
-
-
-# ---------------------------------------------------------------------------
-# OMNI-3699 regression: a continuation paste whose draft is never confirmed
-# by ``_draft_in_input_box`` must raise RuntimeError, not silently drop.
-#
-# Background: ``inject_user_message`` polls up to ``_PASTE_COMMIT_TIMEOUT_S``
-# for the paste to become visible as a draft in the input box.  When that
-# window expires before the TUI shows the ``[Pasted text]`` placeholder
-# (e.g. a large paste on a loaded machine), the old code sent a single blind
-# Enter and returned silently.  That Enter was absorbed into the still-
-# processing paste burst as a newline, so the message sat unsent, the harness
-# returned success, and the session latched at ``status: "running"``
-# indefinitely.
-#
-# The fix raises ``RuntimeError`` in that path so the caller cannot silently
-# lose the message.  The "draft unidentifiable" fall-through (empty-needle
-# whitespace-only content) is preserved as a best-effort path that emits a
-# warning rather than hard-failing.
-# ---------------------------------------------------------------------------
-
-
-def _post_turn_pane(draft: str = "") -> str:
-    """Return a pane that looks like a completed-turn composer with *draft* in the box.
-
-    Simulates what Claude Code shows after a turn finishes: scrollback with
-    a ``[Pasted text]`` entry from the previous paste plus a fresh empty
-    composer waiting for the next message.
-
-    :param draft: Text currently sitting in the input box row.
-    :returns: The pane text string.
-    """
-    return (
-        "❯ [Pasted text #1 +22 lines]\n"
-        "  ✓  Explored the codebase\n"
-        "  ✓  Read 12 files\n"
-        "The implementation looks correct.\n"
-        "──────────────────────────────────────────────────────────────\n"
-        f"❯ {draft}\n"
-        "──────────────────────────────────────────────────────────────\n"
-        "  ? for shortcuts\n"
-    )
-
-
-def test_inject_user_message_continuation_paste_draft_timeout_raises(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """inject_user_message raises when the paste-commit timeout expires and draft is unseen.
-
-    The pane after a completed turn has a ``❯ [Pasted text]`` line in scrollback
-    that looks like it could contain a paste placeholder, but the *live* input box
-    (the last ``❯`` row) is empty.  ``_draft_in_input_box`` correctly matches only
-    the last glyph line, so it never returns True, and the poll window expires
-    with ``draft_seen=False``.
-
-    Before the fix: the function sent a single blind Enter and returned without
-    error, silently dropping the message.
-
-    After the fix: the function raises ``RuntimeError`` describing that the draft
-    was never confirmed, preventing the caller from losing the message silently.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
-    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
-    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
-
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/example/tmux.sock"),
-        tmux_target="claude:0.0",
-    )
-
-    # Build a large multi-line prompt that exceeds the paste-placeholder threshold:
-    # > 1 937 chars, >= 14 newlines (the range where Claude Code's TUI renders the
-    # paste as ``[Pasted text #N +M lines]`` instead of verbatim text, and which
-    # all observed OMNI-3699 failures shared).
-    continuation_prompt = "\n".join(
-        [
-            "Please implement the following feature:",
-            "",
-            "The system needs to handle continuation messages sent to an existing",
-            "claude-native sub-agent session.  These are second or later calls to",
-            "sys_session_send for a session that has already completed at least one turn.",
-            "",
-        ]
-        + [
-            f"Step {i}: perform the necessary action for this item in the sequence."
-            for i in range(1, 30)
-        ]
-    )
-    assert len(continuation_prompt) > 1_500
-    assert continuation_prompt.count("\n") >= 14
-
-    # Simulate the pane state after a completed turn: the live input box is empty,
-    # but there is a ``❯ [Pasted text]`` entry in scrollback from the prior turn.
-    # ``_draft_in_input_box`` only inspects the *last* ``❯`` row, so the
-    # scrollback placeholder does not satisfy the poll, and ``draft_seen`` stays
-    # False until the timeout fires.
-    tui: dict[str, str] = {"pane": _post_turn_pane()}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-
-    # The fix: must raise RuntimeError when the draft was never confirmed.
-    # (Before the fix this returned silently — the regression the test guards.)
-    with pytest.raises(RuntimeError, match="draft"):
-        inject_user_message(bridge_dir, content=continuation_prompt)
-
-
-def test_inject_user_message_whitespace_only_content_submits_blind(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Whitespace-only content (empty needle) uses the blind-submit fallback, not the error path.
-
-    When ``_submit_needle`` returns an empty string (the content has no usable
-    first line), the draft cannot be identified in the pane, so the poll is skipped
-    and a single Enter is sent without verification — same as the legacy blind-submit
-    behavior.  This must not raise: the best-effort path is retained for content
-    whose draft position cannot be determined.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
-    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
-    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
-
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/example/tmux.sock"),
-        tmux_target="claude:0.0",
-    )
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=_composer_pane(), stderr="")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-
-    # Whitespace-only content has no identifiable needle — must not raise.
-    inject_user_message(bridge_dir, content="   \n  \n  ")
 
 
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────

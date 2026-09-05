@@ -3362,6 +3362,30 @@ def _parse_policy_base_fields(
     if is_function:
         # ``on:`` is ignored for function policies — the callable self-selects
         # which events to handle by returning ALLOW for events it doesn't act on.
+        # Silently discarding an authored output-phase binding misleads the
+        # bundle author into believing an output gate is bound when nothing
+        # ever restricts the callable to (or guarantees it sees) that phase —
+        # say so. Scoped to the output phases (``response`` /
+        # ``llm_response``): an unenforced output gate is a policy hole,
+        # while the common ``on: [tool_call]`` annotation is harmless
+        # documentation on a callable that self-filters anyway.
+        raw_on = data.get("on")
+        if isinstance(raw_on, str):
+            entries: list[object] = [raw_on]
+        elif isinstance(raw_on, list):
+            entries = raw_on
+        else:
+            entries = []
+        if any(entry in ("response", "llm_response") for entry in entries):
+            _log.warning(
+                "policy %r: `on: %r` is ignored for type: function policies — "
+                "the callable self-selects which event types it handles at "
+                "runtime. If this policy is meant to gate the assistant's "
+                "output, filter inside the callable instead (e.g. "
+                "make_fixed_action_callable's on_phases=['response']).",
+                name,
+                raw_on,
+            )
         on_value = None
     else:
         on_value = _parse_on(data.get("on", ["request", "response"]), policy_name=name)

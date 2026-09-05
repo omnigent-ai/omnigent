@@ -9,6 +9,7 @@ import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { cn } from "@/lib/utils";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import {
   type Bubble,
   type BubbleCache,
@@ -50,6 +51,12 @@ import {
 } from "@/components/chat/chatBubbleParts";
 
 export interface TranscriptProps {
+  /**
+   * Deferred conversation id — keys the `<Conversation>` subtree so it
+   * remounts at transition priority rather than blocking the interaction frame.
+   * Passed from ChatPage as `useDeferredValue(urlConvId)`.
+   */
+  conversationKey: string | null | undefined;
   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
    *  JumpToTopButton hover ancestor). Owned by the parent, forwarded here. */
   setConversationEl: (el: HTMLDivElement | null) => void;
@@ -70,6 +77,8 @@ export interface TranscriptProps {
   sandboxLaunching: boolean;
   /** Terminal-first spin-up bits for the cold-launch empty state. */
   terminalFirst: { isTerminalFirst: boolean; terminalStartingUp?: boolean } | null | undefined;
+  /** Pub/sub ref for the LatestTurnSpacer's synchronous re-measure handle. */
+  spacerMeasureRef: React.RefObject<(() => void) | null>;
 }
 
 /**
@@ -81,6 +90,7 @@ export interface TranscriptProps {
  * dialogs bail out via React's normal prop-equality check.
  */
 function TranscriptImpl({
+  conversationKey,
   setConversationEl,
   containerEl,
   scroller,
@@ -93,6 +103,7 @@ function TranscriptImpl({
   agentsError,
   sandboxLaunching,
   terminalFirst,
+  spacerMeasureRef,
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
@@ -134,11 +145,6 @@ function TranscriptImpl({
     subagentRoutingOverride,
     sessionStatus,
   ]);
-
-  // Keys the transcript so a warm switch (no hydration remount) still re-runs
-  // its mount-only scroll-to-bottom and anchor capture. Store id, not the URL
-  // prop, which leads the mirrored blocks by a commit.
-  const activeConversationId = useChatStore((s) => s.conversationId);
 
   // Single nav instance shared by hotkey + buttons. System-message bubbles are
   // excluded — the hotkey is for navigating real user turns, not markers.
@@ -197,7 +203,7 @@ function TranscriptImpl({
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) user-turn navigation.
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent) => {
-      if (!(e.metaKey || e.ctrlKey) || !e.altKey) return;
+      if (!hasCommandModifier(e) || !e.altKey) return;
       if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
       if (e.defaultPrevented) return;
       e.preventDefault();
@@ -223,7 +229,7 @@ function TranscriptImpl({
         className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
         <Conversation
-          key={activeConversationId ?? "landing"}
+          key={conversationKey ?? "landing"}
           className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}
         >
           <ConversationContent
@@ -299,6 +305,7 @@ function TranscriptImpl({
             <LatestTurnSpacer
               scrollElement={scroller?.el ?? null}
               topGapPx={hasTasks ? 16 : undefined}
+              measureRef={spacerMeasureRef}
             />
           </ConversationContent>
           <ConversationScrollButton />

@@ -1,7 +1,9 @@
 import {
   type FormEvent,
   type KeyboardEvent,
+  memo,
   useCallback,
+  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -362,6 +364,10 @@ function truncateTitle(raw: string, max = 60): string {
  */
 export function ChatPage() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
+  // Defer only the transcript key so the <Conversation> subtree remounts at
+  // transition priority. switchTo, routing, and the composer all stay on the
+  // immediate urlConvId — sends always target the conversation the URL shows.
+  const deferredConvId = useDeferredValue(urlConvId);
   const navigate = useNavigate();
   const appName = useAppName();
   // Optional first message handed off by the landing composer through the
@@ -832,14 +838,6 @@ export function ChatPage() {
       ? hostProbeOptions
       : sessionModelOptions;
 
-  // Loading + error gates for `/c/:id` hydration.
-  if (urlConvId) {
-    if (loadingConversation) return <HydratingPlaceholder />;
-    if (conversationLoadError) {
-      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
-    }
-  }
-
   // The session is unreachable and a message can't wake it: the host is
   // offline (host-bound) or it isn't host-bound and the runner is down.
   // `runner_asleep` is deliberately NOT here — there the host relaunches
@@ -852,75 +850,97 @@ export function ChatPage() {
   const isUnreachable =
     !sandboxLaunching && (liveness.kind === "host_offline" || liveness.kind === "local_stranded");
 
-  function onSend(text: string, files?: File[]) {
-    if (!agentId) return;
-    // An unbound coding clone (fork-source label) needs a directory before
-    // it can run: open the picker and stash this message to replay after
-    // the bind. Pin the prompt to THIS session so it replays here, never
-    // into a session the user may switch to first; carry any attachments
-    // so the replay sends the same payload.
-    if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
-      setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [] });
-      setResumeDirDialogOpen(true);
-      return;
-    }
-    // Unreachable → no executor to dispatch this turn to, and no host to
-    // wake. Surface the reconnect dialog instead of POSTing into
-    // a void.
-    if (urlConvId && isUnreachable) {
-      setReconnectDialogOpen(true);
-      return;
-    }
-    // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
-    // FIFO immediately when genuinely idle, so nothing stalls. With the
-    // always-steer preference on, a mid-turn follow-up skips the queue and is
-    // POSTed now instead.
-    const chat = useChatStore.getState();
-    if (
-      shouldQueueSend(
-        chat.conversationId,
-        chat.status,
-        chat.sessionStatus,
-        chat.queuedMessages,
-        readAlwaysSteer(),
-      )
-    ) {
-      chat.enqueueMessage(text, files);
-      return;
-    }
-    void useChatStore.getState().send(text, agentId, files, {
-      onConversationCreated: (newId) => {
-        // Eager URL update: the moment the server tells us this
-        // conversation's id, promote `/` → `/c/:newId`. Replace (not
-        // push) so the back button takes the user wherever they came
-        // from rather than to a stale `/`.
-        navigate(`/c/${newId}`, { replace: true });
-      },
-    });
-  }
+  const onSend = useCallback(
+    (text: string, files?: File[]) => {
+      if (!agentId) return;
+      // An unbound coding clone (fork-source label) needs a directory before
+      // it can run: open the picker and stash this message to replay after
+      // the bind. Pin the prompt to THIS session so it replays here, never
+      // into a session the user may switch to first; carry any attachments
+      // so the replay sends the same payload.
+      if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
+        setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [] });
+        setResumeDirDialogOpen(true);
+        return;
+      }
+      // Unreachable → no executor to dispatch this turn to, and no host to
+      // wake. Surface the reconnect dialog instead of POSTing into
+      // a void.
+      if (urlConvId && isUnreachable) {
+        setReconnectDialogOpen(true);
+        return;
+      }
+      // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
+      // FIFO immediately when genuinely idle, so nothing stalls. With the
+      // always-steer preference on, a mid-turn follow-up skips the queue and is
+      // POSTed now instead.
+      const chat = useChatStore.getState();
+      if (
+        shouldQueueSend(
+          chat.conversationId,
+          chat.status,
+          chat.sessionStatus,
+          chat.queuedMessages,
+          readAlwaysSteer(),
+        )
+      ) {
+        chat.enqueueMessage(text, files);
+        return;
+      }
+      void useChatStore.getState().send(text, agentId, files, {
+        onConversationCreated: (newId) => {
+          // Eager URL update: the moment the server tells us this
+          // conversation's id, promote `/` → `/c/:newId`. Replace (not
+          // push) so the back button takes the user wherever they came
+          // from rather than to a stale `/`.
+          navigate(`/c/${newId}`, { replace: true });
+        },
+      });
+    },
+    [
+      agentId,
+      urlConvId,
+      runnerOnline,
+      isUnboundFork,
+      canResumeOnLocalHost,
+      isUnreachable,
+      navigate,
+    ],
+  );
 
-  function onSendSlashCommand(name: string, args: string) {
-    if (!agentId) return;
-    // Slash commands aren't replayed (an edge), but still route an unbound
-    // coding clone to the directory picker so it isn't a dead end.
-    if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
-      setResumeDirDialogOpen(true);
-      return;
-    }
-    if (urlConvId && isUnreachable) {
-      setReconnectDialogOpen(true);
-      return;
-    }
-    void useChatStore.getState().sendSlashCommand(name, args, agentId, {
-      onConversationCreated: (newId) => {
-        navigate(`/c/${newId}`, { replace: true });
-      },
-    });
-  }
+  const onSendSlashCommand = useCallback(
+    (name: string, args: string) => {
+      if (!agentId) return;
+      // Slash commands aren't replayed (an edge), but still route an unbound
+      // coding clone to the directory picker so it isn't a dead end.
+      if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
+        setResumeDirDialogOpen(true);
+        return;
+      }
+      if (urlConvId && isUnreachable) {
+        setReconnectDialogOpen(true);
+        return;
+      }
+      void useChatStore.getState().sendSlashCommand(name, args, agentId, {
+        onConversationCreated: (newId) => {
+          navigate(`/c/${newId}`, { replace: true });
+        },
+      });
+    },
+    [
+      agentId,
+      urlConvId,
+      runnerOnline,
+      isUnboundFork,
+      canResumeOnLocalHost,
+      isUnreachable,
+      navigate,
+    ],
+  );
 
-  function onStop() {
+  const onStop = useCallback(() => {
     useChatStore.getState().stop();
-  }
+  }, []);
 
   // Sub-agent (child) sessions aren't returned by the sidebar list, so
   // ``activeConv`` is null for them — the snapshot (fetched above as
@@ -934,19 +954,26 @@ export function ChatPage() {
     conversationsData !== undefined,
   );
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
-  // Once present, the live session snapshot is authoritative.
-  const capabilitySource = {
-    labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
-    harness: activeSession?.harness ?? null,
-  };
+  // Once present, the live session snapshot is authoritative. Memoized so the
+  // derived props it feeds (modelPickerKind, effortLevels, wrapperLabel) keep a
+  // stable identity across the switch's re-render burst.
+  const capabilitySource = useMemo(
+    () => ({
+      labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+      harness: activeSession?.harness ?? null,
+    }),
+    [activeSession, activeConv],
+  );
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
   // Effort ladders key on the model the session is actually on — the
   // reported `llmModel` — falling back to the sticky preference only
-  // before the first report lands.
-  const effortLevels = effortLevelsForConv(
-    capabilitySource,
-    codexModelOptions,
-    llmModel ?? selectedModel,
+  // before the first report lands. Memoized because codex-native resolves
+  // via codexEffortLevelsForModel, which returns a fresh array each call;
+  // a new identity here would defeat the memo() on MainAgentSurface/Composer
+  // on every unrelated store tick (mirrors the codexModelOptions rationale).
+  const effortLevels = useMemo(
+    () => effortLevelsForConv(capabilitySource, codexModelOptions, llmModel ?? selectedModel),
+    [capabilitySource, codexModelOptions, llmModel, selectedModel],
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
@@ -957,17 +984,40 @@ export function ChatPage() {
   // Prefer the full agent object (with mcp_servers) from the session
   // endpoint when viewing a conversation. Fall back to the sessions-
   // derived list for the `/` (no session) picker view.
-  const visibleAgents = boundAgentId
-    ? boundAgentBySession
-      ? [boundAgentBySession]
-      : boundAgentName
-        ? [{ id: boundAgentId, name: boundAgentName } as Agent]
-        : agents?.filter((a) => a.id === boundAgentId)
-    : agents;
+  const visibleAgents = useMemo(
+    () =>
+      boundAgentId
+        ? boundAgentBySession
+          ? [boundAgentBySession]
+          : boundAgentName
+            ? [{ id: boundAgentId, name: boundAgentName } as Agent]
+            : agents?.filter((a) => a.id === boundAgentId)
+        : agents,
+    [boundAgentId, boundAgentBySession, boundAgentName, agents],
+  );
+
+  const onShowReconnectHelp = useCallback(() => {
+    // Route the banner to the SAME dialog typing a message would: an
+    // unbound coding clone or a host-less session the caller can resume
+    // in-app opens the directory picker (bind + launch), everything else
+    // gets the reconnect dialog.
+    if (isUnboundFork || canResumeOnLocalHost) setResumeDirDialogOpen(true);
+    else setReconnectDialogOpen(true);
+  }, [isUnboundFork, canResumeOnLocalHost]);
+
+  // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
+  // early return can't change the hook order between renders.
+  if (urlConvId) {
+    if (loadingConversation) return <HydratingPlaceholder />;
+    if (conversationLoadError) {
+      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
+    }
+  }
 
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
+      conversationKey={deferredConvId}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -978,14 +1028,7 @@ export function ChatPage() {
       onSend={onSend}
       onSendSlashCommand={onSendSlashCommand}
       onStop={onStop}
-      onShowReconnectHelp={() => {
-        // Route the banner to the SAME dialog typing a message would: an
-        // unbound coding clone or a host-less session the caller can resume
-        // in-app opens the directory picker (bind + launch), everything else
-        // gets the reconnect dialog.
-        if (isUnboundFork || canResumeOnLocalHost) setResumeDirDialogOpen(true);
-        else setReconnectDialogOpen(true);
-      }}
+      onShowReconnectHelp={onShowReconnectHelp}
       agents={visibleAgents}
       selectedAgentId={agentId}
       hasMoreHistory={hasMoreHistory}
@@ -1199,6 +1242,9 @@ interface MainAgentSurfaceProps {
    * session in terminal-first mode.
    */
   conversationId: string | null;
+  /** Deferred conversation id passed as the transcript key so <Conversation>
+   *  remounts at transition priority instead of blocking the interaction frame. */
+  conversationKey: string | null | undefined;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. Gates the
    *  composer's Stop/Interrupt button — the parent's OWN turn only. */
@@ -1365,8 +1411,9 @@ export function updateWarmTerminalSurfaces(
  * `MainTerminalView`. The switcher itself stays visible (in the header,
  * see ViewModeToggle) so the user can flip back to Chat.
  */
-function MainAgentSurface({
+const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
+  conversationKey,
   status,
   isWorking,
   showsWorking,
@@ -1522,6 +1569,12 @@ function MainAgentSurface({
   // with the full server-side slash_command path.
   const isTerminalFirst = terminalFirst?.isTerminalFirst === true;
   const isNativeWrapper = terminalFirst?.isNativeWrapper === true;
+  // Stable so they don't defeat Composer's memo on the switch re-render burst.
+  const removeReplyQuote = useCallback(
+    (i: number) => setReplyQuotes((prev) => prev.filter((_, idx) => idx !== i)),
+    [],
+  );
+  const clearReplyQuotes = useCallback(() => setReplyQuotes([]), []);
   const handleSendSlashCommand = useMemo(
     () =>
       onSendSlashCommand && !isNativeWrapper
@@ -1532,6 +1585,50 @@ function MainAgentSurface({
         : undefined,
     [onSendSlashCommand, isNativeWrapper],
   );
+
+  // Synchronous bottom re-pin for the composer's growth, called in the same
+  // task as the height change (before any paint — the only ordering Gecko
+  // doesn't paint past; every async pin leaves one intermediate frame).
+  // Guarded by the live lock state, not the public isAtBottom alias, so a
+  // reader who scrolled up mid-stream is never yanked down. The spacer
+  // re-measures first: its reserved height tracks the viewport, so it must
+  // shrink in this same task — otherwise the pin reads a stale scrollHeight
+  // and the browser paints the spacer's later RO settle as a visible shift.
+  const spacerMeasureRef = useRef<(() => void) | null>(null);
+  // Whether the transcript was physically at the bottom as of its last scroll
+  // event. Evaluated lazily-per-event (not at pin time) so the write never
+  // reads the just-shrunk viewport, where any distance readouts are already
+  // off the bottom by the growth amount — an escaped reader must be detected
+  // from their escape scroll, not from the shrink it preceded.
+  const pinnedToBottomRef = useRef(false);
+  useEffect(() => {
+    const scrollEl = scroller?.el;
+    if (!scrollEl) return;
+    const update = () => {
+      pinnedToBottomRef.current =
+        scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop <= 1;
+    };
+    update();
+    scrollEl.addEventListener("scroll", update, { passive: true });
+    return () => scrollEl.removeEventListener("scroll", update);
+  }, [scroller]);
+
+  const pinScrollOnComposerGrowth = useCallback(() => {
+    spacerMeasureRef.current?.();
+    // Read through a local so the linter doesn't flag the DOM write as
+    // a mutation of the outer `scroller` state ref.
+    const scrollEl = scroller?.el;
+    if (!scrollEl) return;
+    const lockState = scroller?.state;
+    if (!lockState?.isAtBottom || lockState.escapedFromLock) return;
+    // A reader who escaped the bottom (or never arrived) keeps their
+    // position: growth must not yank it down.
+    if (!pinnedToBottomRef.current) return;
+    // Park at the same position stick-to-bottom settles on (one pixel short
+    // of the maximum); writing the exact bottom would leave the settle one
+    // pixel lower than the library's park and trail a 1px snap-back.
+    scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight - 1);
+  }, [scroller]);
 
   // Persistent terminal surfaces for terminal-first sessions. Each is
   // mounted from the moment its terminal is reachable — not just when the
@@ -1613,6 +1710,7 @@ function MainAgentSurface({
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
           <Transcript
+            conversationKey={conversationKey}
             setConversationEl={setConversationEl}
             containerEl={containerEl}
             scroller={scroller}
@@ -1625,6 +1723,7 @@ function MainAgentSurface({
             agentsError={agentsError}
             sandboxLaunching={sandboxLaunching}
             terminalFirst={terminalFirst}
+            spacerMeasureRef={spacerMeasureRef}
           />
           {/* Floating reply button — scoped to the conversation container. */}
           <SelectionPopup
@@ -1649,8 +1748,8 @@ function MainAgentSurface({
             permissionLevel={permissionLevel}
             readOnlyReason={readOnlyReason}
             replyQuotes={replyQuotes}
-            onRemoveQuote={(i) => setReplyQuotes((prev) => prev.filter((_, idx) => idx !== i))}
-            onClearAllQuotes={() => setReplyQuotes([])}
+            onRemoveQuote={removeReplyQuote}
+            onClearAllQuotes={clearReplyQuotes}
             effortLevels={effortLevels}
             showEffort={showEffort}
             showModels={showModels}
@@ -1673,6 +1772,7 @@ function MainAgentSurface({
             subagentRoutingEligible={subagentRoutingEligible}
             subAgentLabel={subAgentLabel}
             wrapperLabel={wrapperLabel}
+            onViewportShrinkPinScroll={pinScrollOnComposerGrowth}
           />
 
           {/* Reconnect-or-fork banner when unreachable, nothing otherwise.
@@ -1683,7 +1783,7 @@ function MainAgentSurface({
       )}
     </>
   );
-}
+});
 
 function HydratingPlaceholder() {
   return (
@@ -1835,6 +1935,15 @@ interface ComposerProps {
    * keep using ``modelPickerKind`` / ``isNativeWrapper``.
    */
   wrapperLabel?: string | null;
+  /**
+   * Synchronous pin: called in the same task as the composer's height
+   * change so the transcript stays bottom-locked before the browser
+   * paints the now-smaller viewport with the scroll offset stale — Gecko
+   * visibly paints that intermediate frame, bouncing the last visible
+   * message. A same-task write is the only ordering no engine paints past.
+   * The callback itself decides whether the reader is bottom-locked.
+   */
+  onViewportShrinkPinScroll?: () => void;
 }
 
 /**
@@ -2387,7 +2496,7 @@ export function BackgroundTaskPill() {
  * suggestions menu, and the send/stop controls. Exported for direct
  * unit testing of the slash-command keyboard behavior.
  */
-export function Composer({
+function ComposerImpl({
   status,
   isWorking,
   disabled,
@@ -2420,6 +2529,7 @@ export function Composer({
   subagentRoutingEligible = false,
   subAgentLabel = null,
   wrapperLabel = null,
+  onViewportShrinkPinScroll,
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
@@ -2955,7 +3065,22 @@ export function Composer({
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
   // Growth stays in the flex column so the transcript viewport ends where the
   // composer begins instead of letting the card cover visible output.
-  useAutoGrowTextarea(textareaRef, value, 10);
+  // The onGrowth pin re-locks the transcript bottom in the same task as the
+  // height change, before any paint — see the prop doc on ComposerProps.
+  const onGrowthRef = useRef(onViewportShrinkPinScroll);
+  useLayoutEffect(() => {
+    onGrowthRef.current = onViewportShrinkPinScroll;
+  });
+  // The hook measures on every keystroke, but growth only changes at line
+  // wraps: skip the spacer re-measure and transcript pin while the box rests
+  // at an unchanged height.
+  const lastGrowthPxRef = useRef<number | null>(null);
+  const onGrowth = useCallback((px: number) => {
+    if (lastGrowthPxRef.current === px) return;
+    lastGrowthPxRef.current = px;
+    onGrowthRef.current?.();
+  }, []);
+  useAutoGrowTextarea(textareaRef, value, 10, onGrowth);
 
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
@@ -3736,6 +3861,8 @@ export function Composer({
     </form>
   );
 }
+
+export const Composer = memo(ComposerImpl);
 
 /**
  * Whether the main chat's display-only "Working…" indicator should light up.

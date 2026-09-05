@@ -11,12 +11,27 @@ Design notes:
 - Commands run via plain :func:`subprocess.run` in the workspace root, NOT the
   sandboxed OS-env shell helper. The helper strips secrets from the environment,
   which would break ``gh`` auth; a plain subprocess inherits the runner process
-  environment (the developer's ``gh`` auth in local dev).
+  environment, so ``gh`` authenticates as it normally does — the developer's
+  ``gh`` login in local dev, and in a managed sandbox the per-user ``hosts.yml``
+  that :func:`omnigent.git_credential_github.configure_host_gh` writes from the
+  credential broker at host startup. In a sandbox we additionally scrub
+  ``GH_TOKEN``/``GITHUB_TOKEN`` from ``gh``'s env (gh ranks those *above*
+  ``hosts.yml``), so a stray ambient token — e.g. a gh-MCP env passthrough —
+  can't silently make the panel act as a shared identity instead of the
+  connected owner. Outside a sandbox the env is inherited untouched.
 - The list and patch are GitHub-computed, never a local ``git diff``, so a stale
   local ``origin/<base>`` can't inflate them with files outside the PR.
 - Only the on-demand per-file expand-context reader (:func:`github_file_diff`)
   still uses ``git show`` for full before/after content — a unified-diff blob
   can't drive the viewer's context expansion.
+- The branch→PR lookup resolves in one ``gh`` call, picked by whether the pushed
+  ref (``branch.<name>.merge``) was renamed from the local branch — the mark of
+  a fork / triangular push (Databricks prefixes it with ``<user>/``). Renamed →
+  ``gh pr list --head <pushed-ref>``, which matches the head ref name alone and
+  so finds a fork head a bare ``gh pr view`` misses. Not renamed → a bare ``gh pr
+  view``, which is correct and more precise for same-repo branches and returns
+  nothing for a base branch like ``master`` (``gh pr list --head master`` would
+  wrongly match a stranger's PR whose head merely shares the name).
 - ``available: false`` payloads let the tab render a message ("gh not installed",
   "not a git repo") instead of surfacing an error.
 """
@@ -64,12 +79,15 @@ def _run(
     *,
     cwd: str,
     timeout: float,
+    env: dict[str, str] | None = None,
 ) -> tuple[int | None, str, str]:
     """Run a subprocess and capture its output, never raising.
 
     :param argv: Command and arguments.
     :param cwd: Working directory to run in.
     :param timeout: Wall-clock cap in seconds.
+    :param env: Full child environment, or ``None`` to inherit this process's
+        (the default).
     :returns: ``(returncode, stdout, stderr)``. ``returncode`` is ``None`` when
         the command could not run at all (spawn error / timeout), so callers can
         distinguish "ran and failed" from "never ran".
@@ -81,6 +99,7 @@ def _run(
             cwd=cwd,
             capture_output=True,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         _logger.warning(
@@ -104,8 +123,22 @@ def _git(argv: list[str], *, cwd: str) -> tuple[int | None, str, str]:
     return _run(["git", *argv], cwd=cwd, timeout=_git_timeout_seconds())
 
 
+def _in_sandbox() -> bool:
+    """Whether the panel is running inside a managed sandbox (``IS_SANDBOX=1``)."""
+    return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
+
+
 def _gh(argv: list[str], *, cwd: str) -> tuple[int | None, str, str]:
-    return _run(["gh", *argv], cwd=cwd, timeout=_gh_timeout_seconds())
+    # In a managed sandbox the panel must authenticate as the connected owner via
+    # the per-user hosts.yml that configure_host_gh writes — never an ambient
+    # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
+    # token in the sandbox/runner env (e.g. a gh-MCP passthrough) can't silently
+    # make the panel act as a shared identity. Outside a sandbox (local dev) the
+    # env is inherited untouched, so the developer's own gh auth still works.
+    env: dict[str, str] | None = None
+    if _in_sandbox():
+        env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN")}
+    return _run(["gh", *argv], cwd=cwd, timeout=_gh_timeout_seconds(), env=env)
 
 
 # Cap the per-check list so a pathological rollup can't bloat the payload; the
@@ -164,6 +197,84 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
     }
 
 
+def _current_branch(root: str) -> str | None:
+    """Return the workspace's current branch name, or ``None`` (detached / not a repo)."""
+    rc, out, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def _pushed_head_ref(root: str, branch: str) -> str | None:
+    """Return ``branch``'s pushed head ref name, or ``None``.
+
+    Reads the configured upstream (``branch.<name>.merge``), whose value is the
+    ref that was actually pushed — which may carry a ``<user>/`` prefix under a
+    fork / triangular push flow and so differ from the local branch name.
+    ``None`` with no upstream configured.
+    """
+    rc, out, _ = _git(["config", f"branch.{branch}.merge"], cwd=root)
+    if rc != 0 or not out.strip():
+        return None
+    return out.strip().removeprefix("refs/heads/") or None
+
+
+def _pr_view_json(root: str, fields: str) -> dict[str, Any] | None:
+    """Return the branch's PR as a ``gh``-JSON object for ``fields``, or ``None``.
+
+    Resolves the PR in a single ``gh`` call, choosing the query from a cheap git
+    signal: whether the pushed ref (``branch.<name>.merge``) was *renamed* from
+    the local branch name. A fork / triangular push renames it (Databricks pushes
+    carry a ``<user>/`` prefix), and only then does a bare ``gh pr view`` miss the
+    PR — its head-repo-owner guess looks in the wrong place. There we resolve by
+    the pushed ref with ``gh pr list --head`` (``--json`` takes the same fields,
+    and a row shares the shape of a ``gh pr view`` object, so it parses
+    identically; ``--state all`` keeps merged/closed PRs visible).
+
+    Otherwise a bare ``gh pr view`` is correct and *more precise*: it resolves
+    same-repo and standard-fork PRs, and returns nothing for a base branch like
+    ``master``. Using ``gh pr list --head`` there would be wrong — it matches on
+    the head ref name alone, so on ``master`` it returns a stranger's unrelated
+    PR whose head merely happens to be named ``master``.
+    """
+    branch = _current_branch(root)
+    pushed_ref = _pushed_head_ref(root, branch) if branch is not None else None
+    if pushed_ref is not None and pushed_ref != branch:
+        rc, out, _ = _gh(
+            [
+                "pr",
+                "list",
+                "--head",
+                pushed_ref,
+                "--state",
+                "all",
+                "--limit",
+                "1",
+                "--json",
+                fields,
+            ],
+            cwd=root,
+        )
+        if rc != 0:
+            return None
+        try:
+            rows = json.loads(out)
+        except ValueError:
+            return None
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            return rows[0]
+        return None
+
+    rc, out, _ = _gh(["pr", "view", "--json", fields], cwd=root)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def github_info(root: str) -> dict[str, Any]:
     """Resolve GitHub context for the workspace: repo, branch, base, and PR.
 
@@ -215,24 +326,20 @@ def github_info(root: str) -> dict[str, Any]:
             pass
 
     pr: dict[str, Any] | None = None
-    rc, out, _ = _gh(["pr", "view", "--json", _PR_VIEW_FIELDS], cwd=root)
-    if rc == 0:
-        try:
-            data = json.loads(out)
-            author = data.get("author")
-            pr = {
-                "number": data.get("number"),
-                "title": data.get("title"),
-                "state": data.get("state"),
-                "url": data.get("url"),
-                "is_draft": data.get("isDraft", False),
-                "author": author.get("login") if isinstance(author, dict) else None,
-                "base_ref": data.get("baseRefName"),
-                "head_ref": data.get("headRefName"),
-                "checks": _summarize_checks(data.get("statusCheckRollup")),
-            }
-        except (ValueError, AttributeError):
-            pr = None
+    data = _pr_view_json(root, _PR_VIEW_FIELDS)
+    if data is not None:
+        author = data.get("author")
+        pr = {
+            "number": data.get("number"),
+            "title": data.get("title"),
+            "state": data.get("state"),
+            "url": data.get("url"),
+            "is_draft": data.get("isDraft", False),
+            "author": author.get("login") if isinstance(author, dict) else None,
+            "base_ref": data.get("baseRefName"),
+            "head_ref": data.get("headRefName"),
+            "checks": _summarize_checks(data.get("statusCheckRollup")),
+        }
     payload["pr"] = pr
 
     # A pure PR view: the base is the PR's base branch, else null (no PR).
@@ -297,16 +404,13 @@ def _pr_number(root: str) -> int | None:
     """Return the PR number for the workspace's branch, or ``None``.
 
     :param root: Absolute workspace path.
-    :returns: The associated PR's number, or ``None`` when ``gh`` finds no PR
-        (none for the branch, ``gh`` missing, or not authenticated).
+    :returns: The associated PR's number, or ``None`` when no PR resolves (none
+        for the branch, ``gh`` missing, or not authenticated).
     """
-    rc, out, _ = _gh(["pr", "view", "--json", "number"], cwd=root)
-    if rc != 0:
+    data = _pr_view_json(root, "number")
+    if data is None:
         return None
-    try:
-        number = json.loads(out).get("number")
-    except (ValueError, AttributeError):
-        return None
+    number = data.get("number")
     return number if isinstance(number, int) else None
 
 
@@ -397,13 +501,19 @@ def github_file_diff(root: str, base: str, path: str) -> dict[str, Any]:
 def github_pr_diff(root: str) -> dict[str, Any]:
     """Return the whole PR as one unified diff patch, straight from GitHub.
 
-    ``gh pr diff`` yields the PR's "Files changed" patch (server-computed against
-    the base's merge-base), which the web view parses client-side into per-file
-    diffs. Empty when the branch has no PR.
+    ``gh pr diff <number>`` yields the PR's "Files changed" patch (server-computed
+    against the base's merge-base), which the web view parses client-side into
+    per-file diffs. The PR is resolved by number first (via :func:`_pr_number`,
+    which handles fork / triangular heads a bare ``gh pr diff`` can't); empty when
+    the branch has no PR.
 
     :param root: Absolute workspace path.
     :returns: A ``session.github.pr_diff`` object with the ``patch`` text
         (empty when there's no PR / no changes).
     """
-    rc, out, _ = _gh(["pr", "diff"], cwd=root)
+    empty: dict[str, Any] = {"object": "session.github.pr_diff", "patch": ""}
+    number = _pr_number(root)
+    if number is None:
+        return empty
+    rc, out, _ = _gh(["pr", "diff", str(number)], cwd=root)
     return {"object": "session.github.pr_diff", "patch": out if rc == 0 else ""}

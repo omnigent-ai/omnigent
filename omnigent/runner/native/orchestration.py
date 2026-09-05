@@ -3889,18 +3889,24 @@ async def _auto_create_codex_terminal(
     ):
         from dataclasses import replace as _dataclass_replace
 
+        from omnigent.codex_model_vocabulary import codex_reachable_model_slug
         from omnigent.codex_native_app_server import (
             codex_launch_catalog,
             codex_launch_catalog_is_stale,
         )
-        from omnigent.model_catalog_store import catalog_contains, default_row
+        from omnigent.model_catalog_store import default_row
 
         # Read staleness BEFORE the fetch — the fetch kicks the background
         # re-probe, which could land between the two reads.
         _codex_catalog_was_stale = await codex_launch_catalog_is_stale(codex_path=_codex_cli_path)
         _codex_catalog = await codex_launch_catalog(codex_path=_codex_cli_path)
         if launch_config.model_override and _codex_catalog:
-            if not catalog_contains(_codex_catalog, launch_config.model_override):
+            # Match by codex's vocabulary, not string equality: a persisted
+            # override carries the gateway spelling (``databricks-gpt-5-6-sol``)
+            # while the catalog lists codex's own slug (``gpt-5.6-sol``). The
+            # launch itself translates between the two, so the raw check refused
+            # a model this host serves.
+            if codex_reachable_model_slug(launch_config.model_override, _codex_catalog) is None:
                 raise click.ClickException(
                     f"the requested model {launch_config.model_override!r} is not in "
                     "this host's current model list — it may have changed since the "

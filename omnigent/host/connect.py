@@ -55,6 +55,7 @@ from omnigent.host.frames import (
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportedLocalSession,
+    HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
     HostImportLocalSessionFrame,
@@ -1526,10 +1527,12 @@ class HostProcess:
                 "registered to a different account on this server, so the "
                 "account you authenticated as cannot claim it. This usually "
                 "means the host was first registered under another identity "
-                "(e.g. the single-user 'local' owner before the server "
-                "switched to accounts auth). Ask an administrator to remove "
-                "the existing host registration, or reset this machine's host "
-                "id, then retry. " + self._login_fix_hint()
+                "(e.g. an M2M service principal selected from "
+                "~/.databrickscfg, or the single-user 'local' owner before "
+                "the server switched to accounts auth). Run "
+                f"`{cli_invocation()} host reset-id` to mint a fresh host id "
+                "for this machine and retry, or ask an administrator to "
+                "remove the existing host registration. " + self._login_fix_hint()
             )
         # Any other permanent 4xx (e.g. a 400 for a malformed host id, or an
         # edge/proxy rejection): the server's own body is the authoritative
@@ -2135,13 +2138,16 @@ class HostProcess:
         )
 
     async def _handle_import_local(
-        self, ws: websockets.asyncio.client.ClientConnection, frame: HostImportLocalFrame
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        frame: HostImportLocalFrame | HostImportLocalByIdFrame,
     ) -> None:
-        """Stream the host's recent local transcripts, one frame per session.
+        """Stream requested local transcripts, one frame per session.
 
-        The host owns the session files (``~/.claude`` etc.). It enumerates the
-        targets ("all" merges every harness into one global recency order, top
-        ``limit`` total), then reads + normalizes each and sends it immediately
+        The host owns the session files (``~/.claude`` etc.). An exact session
+        id is loaded directly; otherwise it enumerates the targets ("all"
+        merges every harness into one global recency order, top ``limit``
+        total). It reads + normalizes each and sends it immediately
         (``host.import_local_session``) so a large batch never rides in one frame
         and the server persists as each arrives. A terminal ``host.import_local_done``
         closes the stream. Sessions that fail to load are skipped; a single-harness
@@ -2155,6 +2161,8 @@ class HostProcess:
             )
             from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
 
+            if isinstance(frame, HostImportLocalByIdFrame):
+                return [(frame.source, frame.session_id)], None
             if frame.source == "all":
                 return list(list_recent_sessions_across_harnesses(limit=frame.limit)), None
             source = cast(ImportSource, frame.source)
@@ -3945,7 +3953,7 @@ class HostProcess:
                     error=f"model options resolution crashed for {frame.harness!r}",
                 )
             await ws.send(encode_host_frame(options_result))
-        elif isinstance(frame, HostImportLocalFrame):
+        elif isinstance(frame, (HostImportLocalFrame, HostImportLocalByIdFrame)):
             # Streams one host.import_local_session per session (reads run off the
             # event loop inside), then a terminal host.import_local_done.
             await self._handle_import_local(ws, frame)
@@ -4029,9 +4037,22 @@ def run_host_process(
     # broker and attribute commits to the owner. Best-effort; the host runs in
     # every executor and holds the launch token, so no launcher needs to inject
     # anything GitHub-specific.
-    from omnigent.git_credential_github import configure_host_git
+    from omnigent.git_credential_github import (
+        configure_host_gh,
+        configure_host_git,
+        start_host_gh_refresh,
+    )
 
     configure_host_git(server_url, identity.host_id)
+    # gh CLI ignores git's credential.helper for its own API calls, so also
+    # materialize the owner's brokered token into gh's hosts.yml, then keep it
+    # fresh: git re-fetches per op via the broker, but gh reads a static
+    # hosts.yml, so a background thread re-writes it before the GitHub token
+    # expires (~8h). All three are no-ops outside a managed sandbox; the refresher
+    # runs regardless of the startup write (its ticks re-fetch, so a transient
+    # broker blip at startup can't strand a connected owner for the whole session).
+    configure_host_gh(server_url, identity.host_id)
+    start_host_gh_refresh(server_url, identity.host_id)
 
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)

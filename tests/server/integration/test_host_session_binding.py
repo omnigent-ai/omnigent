@@ -1709,3 +1709,40 @@ async def test_managed_session_deleted_during_provision_terminates_sandbox(
     # don't surface as unretrieved-exception noise after the test.
     for future in host_futures:
         future.cancel()
+
+
+async def test_delete_reaped_managed_session_removes_durable_host(
+    managed_session_env: ManagedSessionEnv,
+) -> None:
+    """Deleting a reaped session removes its provider-marked durable host row."""
+    env = managed_session_env
+    host = env.host_store.register_managed_host(
+        host_id="8e616af6da4245de923023927b2f36d7",
+        name="managed-reaped-delete",
+        user_id=RESERVED_USER_LOCAL,
+        token="managed-reaped-delete-token",
+        provider="modal",
+        sandbox_id="sb-reaped-delete",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    assert env.host_store.detach_stale_managed_sandbox(
+        host.host_id,
+        sandbox_id="sb-reaped-delete",
+        expected_updated_at=host.updated_at,
+    )
+    assert env.host_store.mark_terminating_sandbox_terminated(
+        host.host_id,
+        sandbox_id="sb-reaped-delete",
+    )
+    agent = await create_test_agent(env.client, name="managed-reaped-delete-agent")
+    conversation = env.conv_store.create_conversation(
+        agent_id=agent["id"],
+        host_id=host.host_id,
+        workspace="/tmp/managed-reaped-delete",
+    )
+
+    response = await env.client.delete(f"/v1/sessions/{conversation.id}")
+
+    assert response.status_code == 200, response.text
+    assert env.conv_store.get_conversation(conversation.id) is None
+    assert env.host_store.get_host(host.host_id) is None

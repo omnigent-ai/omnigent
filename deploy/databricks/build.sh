@@ -6,11 +6,15 @@
 #   SKIP_WEB_UI=1         Skip the web SPA build for API-only deployments.
 #   EXTERNALIZE_WEB_UI=1  Build the SPA, then archive it outside the wheel so
 #                         the Databricks Apps source sync uploads one file.
+#   OMNIGENT_ENABLE_CANVAS=true
+#                         Build the first-party Canvas extension wheel. Canvas
+#                         is disabled by default.
 #
 # Outputs:
 #   dist/omnigent-<version>-py3-none-any.whl
 #   dist/omnigent_client-<version>-py3-none-any.whl
 #   dist/omnigent_ui_sdk-<version>-py3-none-any.whl
+#   dist/omnigent_canvas-<version>-py3-none-any.whl (when explicitly enabled)
 #   dist/web-ui.tar.gz    SPA archive, when EXTERNALIZE_WEB_UI=1
 
 set -euo pipefail
@@ -60,6 +64,16 @@ uv build --wheel --out-dir dist/ sdks/ui/
 
 echo "==> Building omnigent wheel"
 uv build --wheel --out-dir dist/ .
+
+CANVAS_ENABLED=0
+case "${OMNIGENT_ENABLE_CANVAS:-}" in
+    1|true|TRUE|True|yes|YES|Yes) CANVAS_ENABLED=1 ;;
+esac
+
+if [[ "${SKIP_WEB_UI:-}" != "1" && "${CANVAS_ENABLED}" == "1" ]]; then
+    echo "==> Building Canvas extension wheel"
+    uv build --wheel --out-dir dist/ extensions/canvas/
+fi
 
 echo ""
 echo "Built wheels:"

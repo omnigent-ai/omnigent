@@ -15,6 +15,7 @@ import {
   type CSSProperties,
   type ReactElement,
   lazy,
+  memo,
   Suspense,
   useCallback,
   useEffect,
@@ -664,7 +665,7 @@ interface WorkspacePanelProps {
  * right side) lives in AppShell — this component assumes it should
  * render when mounted.
  */
-export function WorkspacePanel({
+function WorkspacePanelImpl({
   conversationId,
   width,
   handleProps,
@@ -1002,3 +1003,5 @@ export function WorkspacePanel({
     </aside>
   );
 }
+
+export const WorkspacePanel = memo(WorkspacePanelImpl);
