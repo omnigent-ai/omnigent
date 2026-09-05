@@ -2788,6 +2788,33 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     assert "--disallowedTools" not in args
 
 
+def test_augment_claude_args_merges_endpoint_disallowed_tools(tmp_path: Path) -> None:
+    """
+    Endpoint-driven tool disallows land in ``--disallowedTools``.
+
+    A launch endpoint that cannot serve a tool (e.g. a gateway that rejects
+    WebSearch's nested server-side ``web_search`` request) passes it here;
+    dropping it would let the tool fail at use time with the endpoint's raw
+    API error surfaced to the user. A user-supplied ``--disallowedTools``
+    must be merged with, not clobbered.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        disallowed_tools=("WebSearch",),
+    )
+    assert args[args.index("--disallowedTools") + 1] == "WebSearch"
+
+    merged = augment_claude_args(
+        ("--disallowedTools", "Bash"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        disallowed_tools=("WebSearch",),
+    )
+    assert merged[merged.index("--disallowedTools") + 1] == "Bash,WebSearch"
+
+
 @pytest.mark.parametrize(
     "api_key_helper",
     (
