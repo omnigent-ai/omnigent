@@ -974,6 +974,15 @@ class MCPServerConfig:
     # ``Authorization`` header. Mutually usable with ``headers``:
     # explicit headers win if both set ``Authorization``.
     databricks_profile: str | None = None
+    # Generic MCP OAuth (RFC 8414/9728 discovery + authorization_code
+    # with PKCE, via the MCP SDK's OAuthClientProvider). When True, the
+    # connection authenticates with a browser sign-in on first use and
+    # auto-refreshes afterward, instead of a static Authorization header.
+    # Set from ``auth: {type: oauth}`` in YAML. Mutually usable with
+    # ``headers``, but an explicit ``Authorization`` header there takes
+    # priority over the OAuth token (same "explicit wins" convention as
+    # ``databricks_profile``).
+    oauth: bool = False
     # Stdio-only fields.
     command: str | None = None
     args: list[str] = field(default_factory=list)
@@ -1005,7 +1014,7 @@ class MCPServerConfig:
         return (
             f"MCPServerConfig(name={self.name!r}, transport={self.transport!r}, "
             f"url={self.url!r}, headers={redacted_headers!r}, "
-            f"databricks_profile={self.databricks_profile!r}, "
+            f"databricks_profile={self.databricks_profile!r}, oauth={self.oauth!r}, "
             f"command={self.command!r}, args={self.args!r}, "
             f"env={redacted_env!r}, "
             f"timeout={self.timeout!r}, retry={self.retry!r})"

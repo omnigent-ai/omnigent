@@ -1661,6 +1661,28 @@ def test_parse_inline_mcp_headers_and_env_expanded(
     assert stdio_srv.env == {"MY_KEY": "val-456"}
 
 
+def test_parse_inline_mcp_auth_oauth_sets_oauth_flag(tmp_path: Path) -> None:
+    """Inline ``type: mcp`` entries support ``auth: {type: oauth}``, same
+    as the directory-config path."""
+    config = {
+        "spec_version": 1,
+        "name": "inline-oauth",
+        "tools": {
+            "svc": {
+                "type": "mcp",
+                "url": "https://mcp.example.com/mcp",
+                "auth": {"type": "oauth"},
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    http_srv = next(s for s in spec.mcp_servers if s.name == "svc")
+    assert http_srv.oauth is True
+    assert http_srv.databricks_profile is None
+
+
 def test_parse_inline_mcp_url_expanded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Inline ``type: mcp`` entries expand ``${VAR}`` in ``url``, same
     as the directory-config path."""
@@ -2459,6 +2481,74 @@ def test_mcp_env_expansion_mixed_set_and_unset_raises(
     (mcp_dir / "mixed.yaml").write_text(yaml.dump(mcp_config))
     with pytest.raises(OmnigentError, match=r"Unresolved environment variable"):
         parse(agent_dir)
+
+
+# ── MCP auth block (directory configs) ─────────────────
+
+
+def test_mcp_directory_config_auth_oauth_sets_oauth_flag(agent_dir: Path) -> None:
+    """A directory MCP config's ``auth: {type: oauth}`` block sets
+    ``MCPServerConfig.oauth = True`` — this is the field that makes
+    :func:`omnigent.tools.mcp_oauth.build_oauth_client_provider` kick in
+    instead of a static header."""
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "oauth-server",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+        "auth": {"type": "oauth"},
+    }
+    (mcp_dir / "oauth.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    assert spec.mcp_servers[0].oauth is True
+    assert spec.mcp_servers[0].databricks_profile is None
+
+
+def test_mcp_directory_config_auth_databricks_sets_profile(agent_dir: Path) -> None:
+    """A directory MCP config's ``auth: {type: databricks, profile: ...}``
+    sets ``databricks_profile`` — previously only the inline ``tools:``
+    block supported this; directory configs silently ignored it."""
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "databricks-server",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+        "auth": {"type": "databricks", "profile": "my-profile"},
+    }
+    (mcp_dir / "databricks.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    assert spec.mcp_servers[0].databricks_profile == "my-profile"
+    assert spec.mcp_servers[0].oauth is False
+
+
+def test_mcp_directory_config_auth_databricks_missing_profile_raises(agent_dir: Path) -> None:
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "bad-databricks",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+        "auth": {"type": "databricks"},
+    }
+    (mcp_dir / "bad.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(OmnigentError, match=r"auth type 'databricks' requires a 'profile'"):
+        parse(agent_dir)
+
+
+def test_mcp_directory_config_no_auth_block_defaults(agent_dir: Path) -> None:
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "plain-server",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+    }
+    (mcp_dir / "plain.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    assert spec.mcp_servers[0].oauth is False
+    assert spec.mcp_servers[0].databricks_profile is None
 
 
 # ── MCP required field validation ─────────────────────

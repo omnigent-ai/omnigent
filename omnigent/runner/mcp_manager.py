@@ -173,6 +173,7 @@ def compute_server_hash(config: MCPServerConfig, cwd: Path | None = None) -> str
             "url": config.url,
             "headers": dict(config.headers or {}),
             "databricks_profile": config.databricks_profile,
+            "oauth": config.oauth,
             "command": config.command,
             "args": list(config.args or []),
             "env": dict(config.env or {}),
