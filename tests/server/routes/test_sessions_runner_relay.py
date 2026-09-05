@@ -16,6 +16,12 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from tests.server.helpers import start_session_stream_collector
 
+# Wall-clock ceiling for awaiting relay tasks / stream events. Generous on
+# purpose: the relay runs as a background task on a shared, 8-worker xdist
+# runner, and a tight budget (1-2s) times out under CPU contention while a
+# passing test never waits this long.
+_TASK_TIMEOUT_S = 10.0
+
 
 class _HeartbeatStreamResponse:
     """
@@ -142,7 +148,7 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
         release.set()
         handle = sessions_module._runner_relay_tasks.get("a7f039e9f1311474878eb7d4699c1013")
         if handle is not None:
-            await asyncio.wait_for(handle.task, timeout=1.0)
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
 
 
@@ -364,7 +370,7 @@ async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
             await collector.stop()
         handle = sessions_module._runner_relay_tasks.get(session_id)
         if handle is not None:
-            await asyncio.wait_for(handle.task, timeout=1.0)
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         session_stream.close(session_id)
 
@@ -465,10 +471,10 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
         gate.set()
 
         # The relay task should finish quickly after the ConnectionError.
-        await asyncio.wait_for(handle.task, timeout=2.0)
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         # Wait for the failed-status event to arrive at the collector.
-        event = await asyncio.wait_for(collector.queue.get(), timeout=2.0)
+        event = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
         assert event.get("type") == "session.status"
         assert event.get("status") == "failed"
         assert event["error"]["code"] == "runner_disconnected"
@@ -480,7 +486,7 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
         if handle is not None and not handle.task.done():
             handle.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(handle.task, timeout=1.0)
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
@@ -558,7 +564,7 @@ async def test_relay_persists_disconnect_error_labels_on_tunnel_close(
         gate.set()
 
         # The relay task should finish quickly after the ConnectionError.
-        await asyncio.wait_for(handle.task, timeout=2.0)
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         persisted = store.labels.get(session_id)
         assert persisted is not None, "disconnect did not persist failure labels"
@@ -581,7 +587,7 @@ async def test_relay_persists_disconnect_error_labels_on_tunnel_close(
         if handle is not None and not handle.task.done():
             handle.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(handle.task, timeout=1.0)
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
@@ -631,7 +637,7 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels(
         )
         assert handle is not None
         gate.set()
-        await asyncio.wait_for(handle.task, timeout=2.0)
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         persisted = store.labels.get(session_id)
         assert persisted is not None
@@ -662,7 +668,7 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels(
         if handle is not None and not handle.task.done():
             handle.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(handle.task, timeout=1.0)
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
@@ -705,10 +711,10 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop() -> None:
 
         collector = await start_session_stream_collector(session_id)
         gate.set()
-        await asyncio.wait_for(handle.task, timeout=2.0)
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         # The relay publishes a quiet idle, never a runner_disconnected failure.
-        event = await asyncio.wait_for(collector.queue.get(), timeout=2.0)
+        event = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
         assert event.get("type") == "session.status"
         assert event.get("status") == "idle"
         assert event.get("error") is None
@@ -730,7 +736,7 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop() -> None:
         if handle is not None and not handle.task.done():
             handle.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(handle.task, timeout=1.0)
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
@@ -846,7 +852,7 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
 
         collector = await start_session_stream_collector(session_id)
         gate.set()
-        await asyncio.wait_for(handle.task, timeout=2.0)
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         # The running edge cleared the marker, so the subsequent tunnel drop
         # is treated as a GENUINE disconnect: failed + runner_disconnected.
@@ -874,7 +880,7 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
         if handle is not None and not handle.task.done():
             handle.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(handle.task, timeout=1.0)
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
@@ -925,14 +931,14 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
 
         collector = await start_session_stream_collector(session_id)
         gate.set()
-        await asyncio.wait_for(handle.task, timeout=2.0)
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         # Wait for each edge rather than draining a snapshot: the quiet path
         # publishes nothing and awaits nothing, so the relay task can finish
         # before the collector's pump is ever scheduled.
         statuses: list[dict[str, Any]] = []
         while len([e for e in statuses if e.get("type") == "session.status"]) < 2:
-            statuses.append(await asyncio.wait_for(collector.queue.get(), timeout=2.0))
+            statuses.append(await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S))
         assert [e.get("status") for e in statuses if e.get("type") == "session.status"] == [
             "running",
             "idle",
@@ -953,7 +959,7 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
         if handle is not None and not handle.task.done():
             handle.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(handle.task, timeout=1.0)
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
@@ -1000,7 +1006,7 @@ async def test_relay_fails_mid_turn_session_from_the_row_when_the_cache_is_cold(
         assert handle is not None
 
         gate.set()
-        await asyncio.wait_for(handle.task, timeout=2.0)
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         assert sessions_module._session_status_cache.get(session_id) == "failed"
         persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
@@ -1012,7 +1018,7 @@ async def test_relay_fails_mid_turn_session_from_the_row_when_the_cache_is_cold(
         if handle is not None and not handle.task.done():
             handle.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(handle.task, timeout=1.0)
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
@@ -1062,7 +1068,7 @@ async def test_relay_reports_the_drop_when_the_live_status_read_fails(
         assert handle is not None
 
         gate.set()
-        await asyncio.wait_for(handle.task, timeout=2.0)
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         # The relay survived the store error and still reported the cause.
         assert handle.task.exception() is None
@@ -1076,7 +1082,7 @@ async def test_relay_reports_the_drop_when_the_live_status_read_fails(
         if handle is not None and not handle.task.done():
             handle.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(handle.task, timeout=1.0)
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
@@ -1140,7 +1146,7 @@ async def test_relay_retries_transport_drop_within_grace(
             conversation_store=store,  # type: ignore[arg-type]
         )
         assert handle is not None
-        await asyncio.wait_for(handle.task, timeout=2.0)
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         assert fake_runner.calls == 2, "relay did not retry after the drop"
         # The blip resolved silently: no failed status reached the cache
@@ -1152,7 +1158,7 @@ async def test_relay_retries_transport_drop_within_grace(
         if handle is not None and not handle.task.done():
             handle.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(handle.task, timeout=1.0)
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
 
@@ -1304,7 +1310,7 @@ async def test_relay_does_not_fail_turn_during_server_shutdown(
         )
         assert handle is not None
         gate.set()
-        await asyncio.wait_for(handle.task, timeout=2.0)
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         assert session_id not in store.labels, "shutdown-time drop persisted failure labels"
         assert sessions_module._session_status_cache.get(session_id) == "running"
@@ -1315,7 +1321,7 @@ async def test_relay_does_not_fail_turn_during_server_shutdown(
         if handle is not None and not handle.task.done():
             handle.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(handle.task, timeout=1.0)
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
