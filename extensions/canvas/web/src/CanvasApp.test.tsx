@@ -67,7 +67,8 @@ vi.mock("@xyflow/react", () => ({
       {children}
     </button>
   ),
-  useReactFlow: () => flowApi,
+  // React Flow replaces its instance wrapper when the viewport initializes.
+  useReactFlow: () => ({ ...flowApi }),
   applyNodeChanges: (_changes: unknown, nodes: unknown) => nodes,
 }));
 

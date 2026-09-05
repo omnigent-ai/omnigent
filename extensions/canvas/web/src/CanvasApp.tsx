@@ -121,7 +121,7 @@ function mergePartialSessions(
 }
 
 function CanvasSurface({ context }: { context: ExtensionContext }) {
-  const flow = useReactFlow();
+  const { fitView, getViewport, setViewport } = useReactFlow();
   const [nodes, setNodes] = useState<SessionNode[]>([]);
   const [sessions, setSessions] = useState<ExtensionSessionSummary[]>([]);
   const [projects, setProjects] = useState<ExtensionProjectSummary[]>([]);
@@ -180,12 +180,12 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
     (sessionCount: number, duration = 0) => {
       viewportDirtyRef.current = false;
       if (sessionCount > LARGE_CANVAS_SESSION_COUNT) {
-        void flow.setViewport(READABLE_VIEWPORT, { duration });
+        void setViewport(READABLE_VIEWPORT, { duration });
       } else {
-        void flow.fitView({ ...FIT_VIEW, duration });
+        void fitView({ ...FIT_VIEW, duration });
       }
     },
-    [flow],
+    [fitView, setViewport],
   );
 
   const containerSize = useCallback(() => {
@@ -206,7 +206,7 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
           saved !== null && saved.zoom >= MIN_ZOOM && saved.zoom <= MAX_ZOOM;
         if (usable) {
           viewportDirtyRef.current = true;
-          void flow.setViewport(
+          void setViewport(
             { x: saved.x, y: saved.y, zoom: saved.zoom },
             { duration: 0 },
           );
@@ -215,7 +215,7 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
         }
       });
     },
-    [applyDefaultViewport, flow],
+    [applyDefaultViewport, setViewport],
   );
 
   const openSession = useCallback(
@@ -594,7 +594,7 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
         ),
         writeCanvasViewport(
           context.storage.user,
-          { ...flow.getViewport(), ...containerSize() },
+          { ...getViewport(), ...containerSize() },
           activeCanvasRef.current,
         ),
       ])
@@ -607,7 +607,7 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
           }
         });
     },
-    [containerSize, context.storage.user, flow],
+    [containerSize, context.storage.user, getViewport],
   );
 
   const onMoveEnd = useCallback(
