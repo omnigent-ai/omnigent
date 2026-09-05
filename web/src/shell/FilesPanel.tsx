@@ -10,7 +10,7 @@ import {
   SlidersHorizontalIcon,
   XIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
 import { isOwnerLevel } from "@/lib/permissionsApi";
@@ -236,7 +236,14 @@ export function FilesPanel({
   onClose,
   frameless,
 }: FilesPanelProps) {
-  const { conversationId } = useParams<{ conversationId: string }>();
+  const { conversationId: urlConversationId } = useParams<{ conversationId: string }>();
+  // Defer the id the whole files/changes view keys off, so a conversation
+  // switch commits the cheap parts (sidebar highlight, header, composer)
+  // immediately and the expensive tree render happens in a non-blocking
+  // follow-up pass — React discards it if you switch again first. Only this
+  // panel lags; the main chat area and composer stay on the immediate id, so
+  // nothing desyncs. Everything below reads `conversationId`.
+  const conversationId = useDeferredValue(urlConversationId);
   // The runner went offline (e.g. its host restarted): `sessionStatus`
   // is "failed", set by `_on_runner_disconnect` server-side when the
   // runner's tunnel drops (and also client-side in chatStore when the

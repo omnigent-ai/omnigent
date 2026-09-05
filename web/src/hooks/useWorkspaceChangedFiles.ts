@@ -15,7 +15,7 @@
 // (e.g. cloud-only agents).
 
 import { useEffect, useRef } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { authenticatedFetch } from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
@@ -423,7 +423,13 @@ export function useWorkspaceAllFiles(
     // the session's `failed` status downstream, not by retries.
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
-    staleTime: 5_000,
+    // Keep the tree warm across conversation switches: within staleTime a
+    // return paints the cached tree with no loading flash, and placeholderData
+    // holds the last tree on screen during any background refetch instead of
+    // blanking to a spinner. Freshness on turn-completion is still handled by
+    // useTrailingInvalidate above.
+    staleTime: 30_000,
+    placeholderData: (prev) => prev,
   });
 }
 
@@ -871,4 +877,43 @@ export function useWorkspaceDirectory(
     enabled: !!conversationId && !!dirPath && serveable !== false,
     staleTime: 5_000,
   });
+}
+
+/** One expanded lazy directory's fetched children + load flag. */
+export interface DirectoryResult {
+  data: WorkspaceFile[] | undefined;
+  isLoading: boolean;
+}
+
+/**
+ * Batched form of {@link useWorkspaceDirectory}: subscribe to the listings of
+ * many expanded lazy directories at once, keyed by path.
+ *
+ * The virtualized tree flattens the visible node list from a central place, so
+ * it can't call one hook per rendered row (rows come and go with scrolling, and
+ * a scrolled-off row unmounting would drop its fetch). Fetching here — once,
+ * for every currently-expanded lazy dir — keeps the queries alive regardless of
+ * which rows are windowed in, and shares the same cache entries as the singular
+ * hook (identical query keys).
+ */
+export function useWorkspaceDirectories(
+  conversationId: string | undefined,
+  dirPaths: string[],
+  location = "",
+): Map<string, DirectoryResult> {
+  const serveable = useWorkspaceServeable(conversationId);
+  const enabled = !!conversationId && serveable !== false;
+  const results = useQueries({
+    queries: dirPaths.map((dirPath) => ({
+      queryKey: ["workspace-dir", conversationId, dirPath, location],
+      queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath, location),
+      enabled,
+      staleTime: 5_000,
+    })),
+  });
+  const map = new Map<string, DirectoryResult>();
+  dirPaths.forEach((dirPath, i) => {
+    map.set(dirPath, { data: results[i]?.data, isLoading: results[i]?.isLoading ?? false });
+  });
+  return map;
 }
