@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -15,6 +16,8 @@ from omnigent.db.utils import (
     _LAKEBASE_POOL_RECYCLE_SECONDS,
     _SERVER_POOL_RECYCLE_SECONDS,
     _build_alembic_config,
+    _engine_cache,
+    _engine_lock,
     _get_current_db_revision,
     _get_head_db_revision,
     _initialize_or_verify_schema,
@@ -423,6 +426,110 @@ def test_initialize_or_verify_schema_no_op_when_at_head(
         assert _get_current_db_revision(engine) == head
     finally:
         engine.dispose()
+
+
+def test_copied_sqlite_template_migrates_once_and_remains_isolated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copied test databases stay at head without replaying migrations."""
+    migration_uris: list[str] = []
+
+    def _counting_run_migrations(engine: Any, db_uri: str) -> None:
+        migration_uris.append(db_uri)
+        _run_migrations(engine, db_uri)
+
+    monkeypatch.setattr(
+        "omnigent.db.utils._run_migrations",
+        _counting_run_migrations,
+    )
+
+    template_path = tmp_path / "template.db"
+    template_uri = f"sqlite:///{template_path}"
+    template_engine = get_or_create_engine(template_uri)
+    try:
+        assert _get_current_db_revision(template_engine) == _get_head_db_revision(template_uri)
+    finally:
+        with _engine_lock:
+            _engine_cache.pop(template_uri, None)
+        template_engine.dispose()
+
+    copy_uris: list[str] = []
+    copy_engines: list[Any] = []
+    try:
+        for name in ("first.db", "second.db"):
+            copy_path = tmp_path / name
+            shutil.copyfile(template_path, copy_path)
+            copy_uri = f"sqlite:///{copy_path}"
+            copy_uris.append(copy_uri)
+            copy_engines.append(get_or_create_engine(copy_uri))
+
+        assert all(
+            _get_current_db_revision(engine) == _get_head_db_revision(uri)
+            for uri, engine in zip(copy_uris, copy_engines, strict=True)
+        )
+        assert migration_uris == [template_uri]
+
+        for engine in copy_engines:
+            with engine.begin() as conn:
+                conn.execute(text("CREATE TABLE isolation_probe (value TEXT)"))
+        with copy_engines[0].begin() as conn:
+            conn.execute(text("INSERT INTO isolation_probe (value) VALUES ('first')"))
+        with copy_engines[0].connect() as conn:
+            assert conn.execute(text("SELECT count(*) FROM isolation_probe")).scalar() == 1
+        with copy_engines[1].connect() as conn:
+            assert conn.execute(text("SELECT count(*) FROM isolation_probe")).scalar() == 0
+    finally:
+        with _engine_lock:
+            for uri in copy_uris:
+                _engine_cache.pop(uri, None)
+        for engine in copy_engines:
+            engine.dispose()
+
+
+@pytest.mark.parametrize("marker", ["first", "second"])
+def test_db_uri_uses_template_without_replaying_migrations(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: str,
+) -> None:
+    """The real SQLite ``db_uri`` path copies an at-head template."""
+    # Resolve the session template before installing the spy. Its one migration
+    # is expected; acquiring a per-test copy must not run another migration.
+    request.getfixturevalue("_sqlite_schema_template")
+    migration_uris: list[str] = []
+
+    def _counting_run_migrations(engine: Any, db_uri: str) -> None:
+        migration_uris.append(db_uri)
+        _run_migrations(engine, db_uri)
+
+    monkeypatch.setattr(
+        "omnigent.db.utils._run_migrations",
+        _counting_run_migrations,
+    )
+
+    db_uri = request.getfixturevalue("db_uri")
+    engine = get_or_create_engine(db_uri)
+    assert migration_uris == []
+    assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
+
+    # Two parametrized fixture acquisitions must each start from the pristine
+    # template. Reusing a prior test database would expose this marker table.
+    with engine.begin() as conn:
+        existing = conn.execute(
+            text(
+                "SELECT count(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'fixture_isolation_probe'"
+            )
+        ).scalar()
+        assert existing == 0
+        conn.execute(text("CREATE TABLE fixture_isolation_probe (value TEXT)"))
+        conn.execute(
+            text("INSERT INTO fixture_isolation_probe (value) VALUES (:marker)"),
+            {"marker": marker},
+        )
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT value FROM fixture_isolation_probe")).scalar() == marker
 
 
 def test_initialize_or_verify_schema_auto_migrates_when_stale(
