@@ -23,9 +23,9 @@ import {
   isRunnerUnavailable503,
   looksLikeWorkspaceFilePath,
   relativizeToWorkspace,
+  resolveChatFilePath,
   runnerOfflineRetryDelay,
   shouldRetryRunnerOffline,
-  toWorkspaceRelativePath,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
   useWorkspaceDirectory,
@@ -809,47 +809,64 @@ describe("relativizeToWorkspace", () => {
   });
 });
 
-describe("toWorkspaceRelativePath", () => {
+describe("resolveChatFilePath", () => {
   const ROOT = "/home/u/ws";
   const HOME = "/home/u";
+  const rel = (path: string) => ({ path, trusted: false });
+  const abs = (path: string) => ({ path, trusted: true });
   it.each([
     // [text, root, home, expected, why]
-    ["src/app.ts", ROOT, HOME, "src/app.ts", "plain relative path → unchanged"],
-    ["foo.md", ROOT, HOME, "foo.md", "bare relative basename → unchanged"],
-    ["~/ws/foo.md", ROOT, HOME, "foo.md", "tilde under root → root-level relative"],
-    ["~/ws/src/app.ts", ROOT, HOME, "src/app.ts", "tilde under root → nested relative"],
-    ["/home/u/ws/src/app.ts", ROOT, HOME, "src/app.ts", "absolute under root → relative"],
-    ["/home/u/ws/foo.md", ROOT, HOME, "foo.md", "absolute under root → root-level relative"],
-    ["/etc/hosts", ROOT, HOME, null, "absolute outside root → unresolvable"],
-    ["~/other/x.md", ROOT, HOME, null, "tilde outside root → unresolvable"],
+    ["src/app.ts", ROOT, HOME, rel("src/app.ts"), "plain relative path → unchanged"],
+    ["foo.md", ROOT, HOME, rel("foo.md"), "bare relative basename → unchanged"],
+    ["~/ws/foo.md", ROOT, HOME, abs("foo.md"), "tilde under root → root-level relative"],
+    ["~/ws/src/app.ts", ROOT, HOME, abs("src/app.ts"), "tilde under root → nested relative"],
+    ["/home/u/ws/src/app.ts", ROOT, HOME, abs("src/app.ts"), "absolute under root → relative"],
+    ["/home/u/ws/foo.md", ROOT, HOME, abs("foo.md"), "absolute under root → root-level relative"],
+    // Outside the workspace, a path stays host-absolute — the FileViewer and
+    // filesystem API open those via base=host (files-panel browse-anywhere).
+    ["/etc/hosts", ROOT, HOME, abs("/etc/hosts"), "absolute outside root → host-absolute"],
+    ["~/other/x.md", ROOT, HOME, abs("/home/u/other/x.md"), "tilde outside root → host-absolute"],
+    [
+      "/home/u/ws-old/x.md",
+      ROOT,
+      HOME,
+      abs("/home/u/ws-old/x.md"),
+      "root-name-prefixed sibling is outside",
+    ],
     ["/home/u/ws", ROOT, HOME, null, "the root dir itself, not a file"],
+    ["/", ROOT, HOME, null, "the filesystem root, not a file"],
     ["~/ws", ROOT, HOME, null, "tilde expands to the root dir itself"],
     ["~/ws/foo.md", ROOT, null, null, "tilde with no home → unresolvable"],
-    ["/home/u/ws/foo.md", null, HOME, null, "absolute with no root → unresolvable"],
+    ["/home/u/ws/foo.md", null, HOME, null, "absolute with unknown root → unresolvable"],
     ["", ROOT, HOME, null, "empty string"],
-    ["~/ws/foo.md", "/home/u/ws/", HOME, "foo.md", "trailing-slash root tolerated"],
-    // Interior traversal must not escape the workspace once stripped to relative.
+    ["~/ws/foo.md", "/home/u/ws/", HOME, abs("foo.md"), "trailing-slash root tolerated"],
+    // Interior traversal could land the fetch/FileViewer URL somewhere other
+    // than the cited text claims — inside or outside the workspace alike.
     ["/home/u/ws/../etc/hosts", ROOT, HOME, null, "absolute with interior .. → unresolvable"],
     ["/home/u/ws/a/../../etc", ROOT, HOME, null, "absolute climbing above root → unresolvable"],
     ["/home/u/ws/./foo.md", ROOT, HOME, null, "absolute with '.' segment → unresolvable"],
     ["/home/u/ws/sub//foo.md", ROOT, HOME, null, "absolute with empty segment → unresolvable"],
+    ["/etc/../home/u/secret", ROOT, HOME, null, "outside path with '..' → unresolvable"],
+    ["/etc//hosts", ROOT, HOME, null, "outside path with empty segment → unresolvable"],
+    ["/etc/ssl/", ROOT, HOME, null, "outside path with trailing slash → a directory form"],
     ["~/ws/../secret.md", ROOT, HOME, null, "tilde with interior .. → unresolvable"],
     ["a/../b.md", ROOT, HOME, null, "relative with '..' segment → unresolvable"],
     // URLs / query / fragment can't name a workspace file — rejected up-front
     // so a trusted absolute path doesn't strip to a non-matching candidate.
     ["/home/u/ws/foo.md#L12", ROOT, HOME, null, "absolute with #fragment → unresolvable"],
     ["/home/u/ws/foo.md?x=1", ROOT, HOME, null, "absolute with ?query → unresolvable"],
+    ["/etc/hosts#L1", ROOT, HOME, null, "outside path with #fragment → unresolvable"],
     ["https://example.com/x", ROOT, HOME, null, "URL → unresolvable"],
   ])("%o (root=%o, home=%o) → %o (%s)", (text, root, home, expected, _why) => {
     expect(
-      toWorkspaceRelativePath(text as string, root as string | null, home as string | null),
-    ).toBe(expected);
+      resolveChatFilePath(text as string, root as string | null, home as string | null),
+    ).toEqual(expected);
   });
 
   it("expands a root-user home ('/') without doubling the slash", () => {
     // home "/" + "/ws/foo.md" must not become "//ws/foo.md" (which wouldn't
     // match root "/ws"). Guards the trailing-slash strip on home expansion.
-    expect(toWorkspaceRelativePath("~/ws/foo.md", "/ws", "/")).toBe("foo.md");
+    expect(resolveChatFilePath("~/ws/foo.md", "/ws", "/")).toEqual(abs("foo.md"));
   });
 });
 
@@ -877,10 +894,28 @@ function FileExistsProbe({
 }) {
   // Report from an effect, not during render: invoking onResult mid-render is
   // a side effect that double-fires under StrictMode and risks flaky probes.
-  const exists = useWorkspaceFileExists(id, path, trusted);
+  const { exists } = useWorkspaceFileExists(id, path, trusted);
   useEffect(() => {
     onResult(exists);
   }, [exists, onResult]);
+  return null;
+}
+
+function FileExistenceProbe({
+  id,
+  path,
+  trusted = false,
+  onResult,
+}: {
+  id: string | undefined;
+  path: string | null;
+  trusted?: boolean;
+  onResult: (result: { exists: boolean; settled: boolean }) => void;
+}) {
+  const result = useWorkspaceFileExists(id, path, trusted);
+  useEffect(() => {
+    onResult(result);
+  }, [result, onResult]);
   return null;
 }
 
@@ -1024,6 +1059,86 @@ describe("useWorkspaceFileExists", () => {
     expect(results.length).toBeGreaterThan(0);
     expect(results).not.toContain(true);
     expect(results.at(-1)).toBe(false);
+  });
+
+  it("checks a host-absolute path against its absolute parent via base=host", async () => {
+    // A trusted outside-workspace path ("/etc/hosts") lists its absolute
+    // parent through the slash-merge-safe wire form: slashless segment plus
+    // base=host, never a leading %2F a proxy would collapse. Entries of an
+    // absolute listing echo back base-relative names (the real wire shape);
+    // the fetch re-attaches the listed dir so the comparison matches.
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        base: "/etc",
+        data: [dirEntry("hosts"), dirEntry("ssl", "directory")],
+        has_more: false,
+      }),
+    );
+    const results: boolean[] = [];
+    render(
+      <Wrap>
+        <FileExistsProbe id="conv_1" path="/etc/hosts" trusted onResult={(r) => results.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(results.at(-1)).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("/environments/default/filesystem/etc?");
+    expect(url).toContain("base=host");
+    expect(url).not.toContain("%2F");
+  });
+
+  it("reports false (and 403-tolerant) when an absolute parent is out of reach", async () => {
+    // 403 = outside a confined session's grants, or below the owner level
+    // absolute browsing requires. For linkification that reads as "no such
+    // openable file", not an error to surface.
+    fetchMock.mockResolvedValue(jsonResponse({ error: {} }, 403));
+    const results: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe
+          id="conv_1"
+          path="/root/secret.txt"
+          trusted
+          onResult={(r) => results.push(r)}
+        />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(results.at(-1)?.settled).toBe(true));
+    // Settles as a definitive "absent" (success with no entries), not an error.
+    expect(results.at(-1)).toEqual({ exists: false, settled: true });
+  });
+
+  it("stays unsettled while the listing is in flight, then settles", async () => {
+    // "settled" is what lets a renderer distinguish "definitively absent"
+    // (give feedback) from "not verified yet" (stay inert).
+    let release: (value: Response) => void = () => {};
+    fetchMock.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        release = resolve;
+      }),
+    );
+    const results: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe id="conv_1" path="docs/notes.md" onResult={(r) => results.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(results.at(-1)).toEqual({ exists: false, settled: false });
+
+    release(
+      jsonResponse({
+        object: "list",
+        data: [dirEntry("docs/notes.md")],
+        has_more: false,
+      }),
+    );
+    await waitFor(() => expect(results.at(-1)).toEqual({ exists: true, settled: true }));
   });
 });
 

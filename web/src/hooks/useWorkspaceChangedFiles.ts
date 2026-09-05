@@ -606,8 +606,10 @@ async function fetchWorkspaceDirectory(
  *
  * Keeps us from firing a directory listing for every backtick span (`git
  * status`, `useState`, `npm test`, …). A candidate must have a parent segment
- * before its first slash, not be absolute (the FileViewer rejects absolute
- * paths), not be a URL or carry a query/fragment, and not have whitespace
+ * before its first slash, not be absolute (absolute forms are collapsed or
+ * kept host-absolute by {@link resolveChatFilePath}, which marks its results
+ * trusted so they bypass this gate), not be a URL or carry a query/fragment,
+ * and not have whitespace
  * before its first slash (which marks a command like `git diff src/app`
  * rather than a path). Every slash-delimited segment must be non-empty and
  * not a `.`/`..` traversal segment (rejects `a/`, `a//b`, `../x`). Spaces
@@ -616,7 +618,7 @@ async function fetchWorkspaceDirectory(
  */
 export function looksLikeWorkspaceFilePath(text: string): boolean {
   if (!text) return false;
-  if (text.startsWith("/")) return false; // absolute paths are rejected by FileViewer
+  if (text.startsWith("/")) return false; // absolute forms go through resolveChatFilePath
   if (text.includes("://")) return false; // URLs (http://, file://, …)
   if (text.includes("?") || text.includes("#")) return false; // query/fragment → not a plain path
   const slash = text.indexOf("/");
@@ -630,42 +632,65 @@ export function looksLikeWorkspaceFilePath(text: string): boolean {
   return segments.every((seg) => seg !== "" && seg !== "." && seg !== "..");
 }
 
+/** A chat-cited path resolved to a form the filesystem API can open. */
+export interface ChatFileResolution {
+  /**
+   * Workspace-relative path (``src/app.ts``), or host-absolute path with its
+   * leading slash (``/etc/hosts``) when the file lies outside the workspace
+   * root. Both forms are what the FileViewer / filesystem API accept — the
+   * absolute one rides the same ``base=host`` wire form the files panel's
+   * outside-workspace browsing uses.
+   */
+  path: string;
+  /**
+   * True when resolution proved the path's shape by collapsing an absolute or
+   * ``~``-relative form, so the existence check's path-shape heuristic
+   * ({@link looksLikeWorkspaceFilePath}) must not re-gate it.
+   */
+  trusted: boolean;
+}
+
 /**
- * Resolve a path mentioned in chat to a workspace-relative path, or null.
+ * Resolve a path mentioned in chat to an openable form, or null.
  *
- * The filesystem API (existence check, FileViewer) speaks workspace-relative
- * paths, but the agent often writes absolute (``/home/u/ws/foo.md``) or
- * home-relative (``~/ws/foo.md``) forms. This collapses those onto ``root``:
+ * The agent writes paths in several shapes — plain relative
+ * (``src/app.tsx``), absolute (``/home/u/ws/foo.md``), or home-relative
+ * (``~/ws/foo.md``). This maps each onto what the filesystem API speaks:
  *
- *  - plain relative (``src/app.tsx``) → returned unchanged (the caller's
- *    existing path-shape heuristic still gates it).
- *  - ``~``-prefixed → expanded with ``home``, then stripped of ``root``.
- *  - absolute under ``root`` → stripped of ``root``.
+ *  - plain relative → returned unchanged (the caller's path-shape heuristic
+ *    still gates it).
+ *  - ``~``-prefixed → expanded with ``home``, then resolved like an absolute.
+ *  - absolute under ``root`` → stripped to workspace-relative, matching the
+ *    changed-files list and relative filesystem routes.
+ *  - absolute OUTSIDE ``root`` → kept host-absolute. The FileViewer and the
+ *    filesystem API already open such paths via ``base=host`` (the files
+ *    panel's browse-anywhere plumbing), so an agent-cited file outside the
+ *    workspace is openable exactly as far as the session's reach allows —
+ *    the existence check still confirms it before anything linkifies.
  *
- * Returns null when the path is absolute/home-relative but lies OUTSIDE the
- * workspace root (can't open in the FileViewer), is the root directory itself,
- * or is ``~``-relative with no ``home`` to expand.
+ * Returns null when the path is the workspace root itself (a directory),
+ * ``~``-relative with no ``home`` to expand, or absolute while the root is
+ * still unknown (inside/outside can't be told apart yet; the caller re-runs
+ * once the environment metadata loads).
  *
- * The returned relative path is always free of empty/``.``/``..`` segments: an
- * absolute path with interior traversal (``/root/ws/../etc/hosts``) would strip
- * to ``../etc/hosts``, which could escape the workspace once turned into a
- * fetch/FileViewer URL — those resolve to null instead. URLs and paths carrying
- * a query/fragment (``?``/``#``) are rejected up-front (mirroring
- * {@link looksLikeWorkspaceFilePath}) so an absolute span like
- * ``/root/ws/foo.md#L12`` doesn't strip to ``foo.md#L12`` and fire a doomed
- * existence check that can never match a real file.
+ * The returned path is always free of empty/``.``/``..`` segments: interior
+ * traversal (``/root/ws/../etc/hosts``) could land the normalized fetch /
+ * FileViewer URL somewhere other than the cited text claims — those resolve
+ * to null instead. URLs and paths carrying a query/fragment (``?``/``#``)
+ * are rejected up-front (mirroring {@link looksLikeWorkspaceFilePath}) so an
+ * absolute span like ``/root/ws/foo.md#L12`` doesn't strip to ``foo.md#L12``
+ * and fire a doomed existence check that can never match a real file.
  *
- * @param text Raw path string from an inline-code span.
+ * @param text Raw path string from an inline-code span or link href.
  * @param root Absolute workspace root, e.g. ``"/home/u/ws"``, or null.
  * @param home Absolute runner home, e.g. ``"/home/u"``, or null.
- * @returns Workspace-relative path (no leading slash), or null if not
- *   resolvable into the workspace.
+ * @returns The resolved path and its trust marker, or null if unresolvable.
  */
-export function toWorkspaceRelativePath(
+export function resolveChatFilePath(
   text: string,
   root: string | null,
   home: string | null,
-): string | null {
+): ChatFileResolution | null {
   if (!text) return null;
   // URLs / query / fragment can never name a workspace file. Reject before
   // any stripping so a "trusted" absolute path doesn't carry these markers
@@ -680,19 +705,25 @@ export function toWorkspaceRelativePath(
   if (!p.startsWith("/")) {
     // A leftover "~" means home-relative with no home to expand → unresolvable.
     if (p.startsWith("~")) return null;
-    return hasUnsafeSegments(p) ? null : p; // plain relative path
+    return hasUnsafeSegments(p) ? null : { path: p, trusted: false };
   }
-  // Absolute: must live under the workspace root to be openable.
+  // Absolute: with the root unknown, inside and outside the workspace are
+  // indistinguishable — resolve nothing rather than guess (re-resolved once
+  // the environment metadata loads).
   if (!root) return null;
   const normRoot = root.replace(/\/+$/, "");
-  if (p === normRoot) return null; // the root directory itself, not a file
+  if (p === normRoot || p === "/") return null; // a directory, not a file
   const prefix = `${normRoot}/`;
-  if (!p.startsWith(prefix)) return null; // absolute but outside the workspace
-  const rel = p.slice(prefix.length);
-  // The stripped tail may still contain interior traversal (e.g.
-  // "/root/ws/../etc/hosts" → "../etc/hosts"). Reject it so the resolved
-  // path can't escape the workspace via a normalized fetch/FileViewer URL.
-  return hasUnsafeSegments(rel) ? null : rel;
+  if (p.startsWith(prefix)) {
+    const rel = p.slice(prefix.length);
+    // The stripped tail may still contain interior traversal (e.g.
+    // "/root/ws/../etc/hosts" → "../etc/hosts"). Reject it so the resolved
+    // path can't escape the workspace via a normalized fetch/FileViewer URL.
+    return hasUnsafeSegments(rel) ? null : { path: rel, trusted: true };
+  }
+  // Outside the workspace: keep the host-absolute form (leading slash marks
+  // it for base=host routing). Same canonical-form bar as the relative case.
+  return hasUnsafeSegments(p.slice(1)) ? null : { path: p, trusted: true };
 }
 
 /**
@@ -709,48 +740,89 @@ async function fetchDirEntriesTolerant(
 ): Promise<WorkspaceFile[]> {
   // An empty dirPath is the workspace root — its listing lives at the bare
   // ``/filesystem`` endpoint, not ``/filesystem/`` (a root-level file like
-  // ``foo.md`` resolves to a "" parent).
+  // ``foo.md`` resolves to a "" parent). A leading slash marks a
+  // host-absolute parent (an agent-cited file outside the workspace); it
+  // rides the shared slash-merge-safe wire form: slashless segment plus
+  // ``base=host`` (see ``browseLocationSegment``). Entries of an absolute
+  // listing echo back base-relative names, so the listed dir is re-attached
+  // below and callers compare full paths uniformly.
   const base = `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem`;
-  const encodedPath = dirPath.split("/").map(encodeURIComponent).join("/");
+  const params = new URLSearchParams({ limit: "1000", order: "asc" });
+  const hostBase = browseLocationBase(dirPath);
+  if (hostBase) params.set("base", hostBase);
+  const segment = browseLocationSegment(dirPath);
   const res = await authenticatedFetch(
-    dirPath === "" ? `${base}?limit=1000&order=asc` : `${base}/${encodedPath}?limit=1000&order=asc`,
+    segment === "" ? `${base}?${params}` : `${base}/${segment}?${params}`,
   );
   // 404 = the directory (or the whole OS environment) is absent, so the file
-  // can't exist. Degrade to "no entries" rather than surfacing an error.
-  if (res.status === 404) return [];
+  // can't exist. 403 = the path is outside this session's reach (a confined
+  // sandbox, or a viewer below the owner level absolute browsing requires) —
+  // for this caller that reads the same as "no such openable file". Degrade
+  // both to "no entries" rather than surfacing an error.
+  if (res.status === 404 || res.status === 403) return [];
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return mapFilesystemEntries((await res.json()) as FilesystemListResponse);
+  // Relative listings echo full workspace-relative paths (kept as-is);
+  // host-absolute listings echo names relative to the listed dir, so the
+  // dir is re-attached to make them absolute.
+  return mapFilesystemEntries(
+    (await res.json()) as FilesystemListResponse,
+    "",
+    hostBase ? dirPath : "",
+  );
+}
+
+/** Result of {@link useWorkspaceFileExists}. */
+export interface WorkspaceFileExistence {
+  /** True when the parent listing confirms `path` names an existing file. */
+  exists: boolean;
+  /**
+   * True once the answer is final for the current inputs: the listing query
+   * resolved (successfully or not), or no check will ever run because the
+   * candidate isn't path-shaped. False while the query is still loading or
+   * disabled (no conversation, workspace not serveable) — callers use this to
+   * tell "definitively absent" apart from "not verified yet".
+   */
+  settled: boolean;
 }
 
 /**
- * Check whether `path` names an existing *file* in the session workspace.
+ * Check whether `path` names an existing *file* the session can open.
  *
  * Backed by a listing of the path's PARENT directory — cheap (one stat-level
  * listing, metadata only), shared across sibling files via the React Query
  * cache, and far lighter than a recursive `/search` walk or a full content
- * read. Returns `false` while loading, when `path` is null or not path-shaped,
- * or when the runner has no OS environment for this session.
+ * read. Reports `exists: false` while loading, when `path` is null or not
+ * path-shaped, or when the runner has no OS environment for this session.
+ *
+ * A host-absolute `path` (leading slash — a file outside the workspace root)
+ * lists its absolute parent via the ``base=host`` wire form; the entries echo
+ * back absolute, so the same comparison applies.
  *
  * @param conversationId Session/conversation id, or undefined when not ready.
- * @param path Candidate workspace-relative path, or null to disable the check.
+ * @param path Candidate workspace-relative or host-absolute path, or null to
+ *   disable the check.
  * @param trusted When true, skip the {@link looksLikeWorkspaceFilePath}
- *   heuristic — the caller already proved the path is workspace-relative by
- *   resolving an absolute/home-relative form against the root (see
- *   {@link toWorkspaceRelativePath}). Such a path may be a bare basename
+ *   heuristic — the caller already proved the path's shape by resolving an
+ *   absolute/home-relative form against the root (see
+ *   {@link resolveChatFilePath}). Such a path may be a bare basename
  *   (``foo.md``, no interior slash) that the heuristic would reject.
  */
 export function useWorkspaceFileExists(
   conversationId: string | undefined,
   path: string | null,
   trusted = false,
-): boolean {
+): WorkspaceFileExistence {
   const serveable = useWorkspaceServeable(conversationId);
   const candidate = path && (trusted || looksLikeWorkspaceFilePath(path)) ? path : null;
-  // Parent of a root-level file (no slash) is "" — the workspace root listing.
+  // Parent of a root-level file (no slash) is "" — the workspace root
+  // listing. For an absolute candidate the parent keeps its leading slash
+  // ("/etc/hosts" → "/etc", "/foo" → "/") so the fetch routes via base=host.
   const parentDir = candidate
-    ? candidate.includes("/")
-      ? candidate.slice(0, candidate.lastIndexOf("/"))
-      : ""
+    ? candidate.startsWith("/")
+      ? candidate.slice(0, candidate.lastIndexOf("/")) || "/"
+      : candidate.includes("/")
+        ? candidate.slice(0, candidate.lastIndexOf("/"))
+        : ""
     : null;
   const query = useQuery({
     // Distinct prefix from `useWorkspaceDirectory` ("workspace-dir") because
@@ -764,8 +836,9 @@ export function useWorkspaceFileExists(
     // path span, so a 30s cache keeps repeated mentions from re-listing.
     staleTime: 30_000,
   });
-  if (!candidate) return false;
-  return (query.data ?? []).some((e) => e.type === "file" && e.path === candidate);
+  if (!candidate) return { exists: false, settled: true };
+  const exists = (query.data ?? []).some((e) => e.type === "file" && e.path === candidate);
+  return { exists, settled: query.isSuccess || query.isError };
 }
 
 // ── Default environment (working folder root) ─────────────────────────────────

@@ -12,8 +12,12 @@ mentions three paths in backticks:
   - ``<abs-root>/README.md`` — absolute and under the root, resolves to
     ``README.md`` → link (the absolute-path half of the same fix; was
     rejected outright before).
-  - ``/etc/hosts`` — absolute and OUTSIDE the workspace → stays inert code
-    (must never linkify).
+  - ``/etc/hosts`` — absolute and OUTSIDE the workspace but present on the
+    host → links too, opening through the host-absolute (``base=host``)
+    routing the files panel already uses. Outside-workspace citations used
+    to be dropped outright, leaving dead text.
+  - ``/nonexistent-omnigent-e2e/absent.txt`` — absolute, outside, and
+    ABSENT → stays inert code (nothing openable must ever linkify).
 
 ``~`` expansion can only land inside the workspace when the root is itself
 under the runner's home. The default e2e workspace lives under ``$TMPDIR``
@@ -40,7 +44,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Browser, Page, expect
 
 _ROOT_FILE = "README.md"
 _README_CONTENT = "# Readme\n\nWorkspace-root file for the e2e link test.\n"
@@ -148,7 +152,10 @@ def linkify_session(
         tilde_path = f"~/{rel_from_home}/{_ROOT_FILE}" if rel_from_home else f"~/{_ROOT_FILE}"
         abs_path = f"{root}/{_ROOT_FILE}"
 
-        message_text = f"Files I referenced:\n\n- `{tilde_path}`\n- `{abs_path}`\n- `/etc/hosts`\n"
+        message_text = (
+            f"Files I referenced:\n\n- `{tilde_path}`\n- `{abs_path}`\n- `/etc/hosts`\n"
+            "- `/nonexistent-omnigent-e2e/absent.txt`\n"
+        )
         event_resp = httpx.post(
             f"{live_server}/v1/sessions/{session_id}/events",
             json={
@@ -184,15 +191,22 @@ def test_chat_linkifies_workspace_paths_including_home_relative(
     # before the fix because it starts with "/").
     expect(page.get_by_role("button", name=abs_path)).to_be_visible()
 
-    # The negative: an absolute path outside the workspace must NOT be a link and
-    # must remain an inert <code> span. A button here would mean we linkified a
-    # path the FileViewer can't open.
-    expect(page.get_by_role("button", name="/etc/hosts")).to_have_count(0)
-    hosts_span = page.get_by_text("/etc/hosts", exact=True)
-    expect(hosts_span).to_be_visible()
-    assert hosts_span.evaluate("el => el.tagName") == "CODE", (
-        "/etc/hosts should stay an inert <code> span, not a link — a different "
-        "tag means an outside-workspace path was wrongly linkified."
+    # An absolute path OUTSIDE the workspace that exists on the host links
+    # too: the existence check lists its absolute parent via base=host, so the
+    # span earns the same clickable affordance. Silence here was the bug —
+    # outside-workspace citations rendered as dead text.
+    hosts_link = page.get_by_role("button", name="/etc/hosts")
+    expect(hosts_link).to_be_visible(timeout=30_000)
+
+    # The negative: an outside-workspace path that does NOT exist must never
+    # linkify — a backtick span with nothing openable stays inert code.
+    absent = "/nonexistent-omnigent-e2e/absent.txt"
+    expect(page.get_by_role("button", name=absent)).to_have_count(0)
+    absent_span = page.get_by_text(absent, exact=True)
+    expect(absent_span).to_be_visible()
+    assert absent_span.evaluate("el => el.tagName") == "CODE", (
+        "an absent outside-workspace path should stay an inert <code> span, "
+        "not a link — a different tag means we linkified something unopenable."
     )
 
     # Clicking the tilde link opens the FileViewer on the RESOLVED relative path
@@ -209,3 +223,49 @@ def test_chat_linkifies_workspace_paths_including_home_relative(
     # Secondary confirmation the viewer mounted on the resolved file. to_contain_text
     # auto-waits on text content without requiring the flaky visibility state.
     expect(page.get_by_test_id("file-viewer").last).to_contain_text(_ROOT_FILE, timeout=15_000)
+
+    # Clicking the outside-workspace link opens the viewer on the
+    # host-absolute path itself (?file=%2Fetc%2Fhosts) — the base=host wire
+    # form end to end, not a workspace-relative mangling of it.
+    hosts_link.click()
+    page.wait_for_url(re.compile(r"[?&]file=%2Fetc%2Fhosts(?:&|$)"), timeout=15_000)
+    expect(page.get_by_test_id("file-viewer").last).to_contain_text("localhost", timeout=15_000)
+
+
+# A phone-sized touch context: no hover affordance exists there, so a file
+# link that does not react to a tap reads as simply broken.
+_MOBILE_CTX = {
+    "viewport": {"width": 390, "height": 844},
+    "has_touch": True,
+    "is_mobile": True,
+    "user_agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    ),
+}
+
+
+def test_chat_file_link_opens_on_mobile_tap(
+    browser: Browser,
+    linkify_session: tuple[str, str, str, str],
+) -> None:
+    """A tap on a chat file link opens the FileViewer in a touch viewport.
+
+    The tap-path of the same journey: the outside-workspace link must react
+    to a touch tap (mobile has no hover tooltip to fall back on), opening the
+    viewer on the host-absolute path.
+    """
+    base_url, session_id, _tilde_path, _abs_path = linkify_session
+    ctx = browser.new_context(**_MOBILE_CTX)
+    page = ctx.new_page()
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        hosts_link = page.get_by_role("button", name="/etc/hosts")
+        expect(hosts_link.first).to_be_visible(timeout=30_000)
+        hosts_link.first.tap()
+        page.wait_for_url(re.compile(r"[?&]file=%2Fetc%2Fhosts(?:&|$)"), timeout=15_000)
+        expect(page.get_by_test_id("file-viewer").last).to_contain_text(
+            "localhost", timeout=15_000
+        )
+    finally:
+        ctx.close()
