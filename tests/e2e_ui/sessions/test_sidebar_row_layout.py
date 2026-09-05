@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Callable
 
 import httpx
+import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
 from tests._helpers.session import post_session_bundle
@@ -114,16 +115,6 @@ def _horizontal_edges(locator: Locator) -> dict[str, float]:
     )
 
 
-def _horizontal_margins(locator: Locator) -> dict[str, float]:
-    """Read the browser-computed containing-block inset."""
-    return locator.evaluate(
-        """element => {
-            const style = getComputedStyle(element);
-            return {left: parseFloat(style.marginLeft), right: parseFloat(style.marginRight)};
-        }"""
-    )
-
-
 def test_session_row_uses_full_title_width_until_actions_are_revealed(
     page: Page,
     seeded_session: tuple[str, str],
@@ -208,13 +199,73 @@ def test_collapsing_sessions_keeps_the_sidebar_row_width(
             httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
 
 
+@pytest.mark.parametrize("width", [390, 1280], ids=["narrow", "desktop"])
+def test_session_row_keyboard_focus_outline_is_not_clipped(
+    page: Page,
+    seeded_session: tuple[str, str],
+    width: int,
+) -> None:
+    """Keyboard focus paints a complete outline inside every ancestor clip."""
+    base_url, session_id = seeded_session
+    page.set_viewport_size({"width": width, "height": 800})
+    page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+    link = _row(page, session_id).locator(f'a[href="/c/{session_id}"]')
+    expect(link).to_be_visible()
+    page.wait_for_function(
+        """() => Math.abs(document.querySelector('aside[aria-label="Conversations"]')
+            .getBoundingClientRect().left) < 0.01"""
+    )
+    for _ in range(60):
+        page.keyboard.press("Tab")
+        if link.evaluate("element => element === document.activeElement"):
+            break
+    expect(link).to_be_focused()
+    outline = link.evaluate(
+        """element => {
+            const style = getComputedStyle(element);
+            const width = parseFloat(style.outlineWidth);
+            const offset = parseFloat(style.outlineOffset);
+            const rect = element.getBoundingClientRect();
+            const bounds = {
+                left: rect.left - offset - width,
+                right: rect.right + offset + width,
+                top: rect.top - offset - width,
+                bottom: rect.bottom + offset + width,
+            };
+            const clips = [];
+            for (let ancestor = element.parentElement; ancestor;
+                ancestor = ancestor.parentElement) {
+                const overflow = getComputedStyle(ancestor);
+                const box = ancestor.getBoundingClientRect();
+                const left = box.left + ancestor.clientLeft;
+                const top = box.top + ancestor.clientTop;
+                if (overflow.overflowX !== 'visible') {
+                    clips.push({axis: 'x', start: left, end: left + ancestor.clientWidth});
+                }
+                if (overflow.overflowY !== 'visible') {
+                    clips.push({axis: 'y', start: top, end: top + ancestor.clientHeight});
+                }
+            }
+            return {width, style: style.outlineStyle, color: style.outlineColor, bounds, clips};
+        }"""
+    )
+    assert outline["width"] >= 2, outline
+    assert outline["style"] not in ("none", "hidden"), outline
+    assert outline["color"] not in ("transparent", "rgba(0, 0, 0, 0)"), outline
+    assert outline["clips"], "the regression requires a clipping ancestor"
+    for clip in outline["clips"]:
+        start, end = ("left", "right") if clip["axis"] == "x" else ("top", "bottom")
+        assert outline["bounds"][start] >= clip["start"] - 0.5, outline
+        assert outline["bounds"][end] <= clip["end"] + 0.5, outline
+
+
 def test_partial_swipe_reveal_is_adjacent_to_ellipsis_surface(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
     """Real layout keeps left/delete and right/archive reveals gapless and disjoint."""
     base_url, session_id = seeded_session
-    title = f"e2e-swipe-geometry-{uuid.uuid4().hex}-with-a-title-that-must-ellipsis"
+    title = f"e2e-swipe-geometry-{uuid.uuid4().hex}-" + "must-ellipsis-" * 10
     set_session_title(base_url, session_id, title)
     page.add_init_script(
         f"""Object.defineProperty(navigator, "maxTouchPoints", {{value: 1}});
@@ -231,10 +282,14 @@ def test_partial_swipe_reveal_is_adjacent_to_ellipsis_surface(
             open_sidebar = page.get_by_role("button", name="Open sidebar")
             if open_sidebar.is_visible():
                 open_sidebar.click()
-                page.wait_for_timeout(300)
             row = _row(page, session_id)
             link = row.locator(f'a[href="/c/{session_id}"]')
             expect(link).to_be_visible(timeout=30_000)
+            expect(link).to_contain_text(title)
+            page.wait_for_function(
+                """() => Math.abs(document.querySelector('aside[aria-label="Conversations"]')
+                    .getBoundingClientRect().left) < 0.01"""
+            )
             resting_edges = _horizontal_edges(row)
 
             _swipe(page, row, delta_x)
@@ -250,10 +305,16 @@ def test_partial_swipe_reveal_is_adjacent_to_ellipsis_surface(
             reveal_edges = _horizontal_edges(reveal)
             surface_edges = _horizontal_edges(surface)
             swiping_edges = _horizontal_edges(row)
-            assert _horizontal_margins(row) == {"left": 4, "right": 4}
-            assert swiping_edges["left"] == resting_edges["left"] + 4
-            assert swiping_edges["right"] == resting_edges["right"] - 4
+            assert swiping_edges == pytest.approx(resting_edges, abs=0.05)
+            assert surface_edges["left"] == pytest.approx(
+                resting_edges["left"] + delta_x, abs=0.05
+            )
+            assert surface_edges["right"] == pytest.approx(
+                resting_edges["right"] + delta_x, abs=0.05
+            )
             if delta_x < 0:
-                assert surface_edges["right"] <= reveal_edges["left"]
+                assert surface_edges["right"] == reveal_edges["left"]
+                assert reveal_edges["right"] == pytest.approx(resting_edges["right"], abs=0.05)
             else:
-                assert reveal_edges["right"] <= surface_edges["left"]
+                assert reveal_edges["right"] == surface_edges["left"]
+                assert reveal_edges["left"] == pytest.approx(resting_edges["left"], abs=0.05)
