@@ -714,6 +714,7 @@ from omnigent.inner.databricks_executor import (  # noqa: E402
     _read_databrickscfg,
     _read_databrickscfg_file_fallback,
     _read_databrickscfg_host,
+    _resolve_databricks_auth,
     databrickscfg_workspace_id_for_host,
     databrickscfg_workspace_id_for_profile,
 )
@@ -2013,6 +2014,77 @@ def test_stream_ended_without_finish_reason_with_content_completes() -> None:
         assert turn_events[0].response == "partial"
 
     _run(_t())
+
+
+@pytest.fixture
+def duplicate_default_cfg(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> _Path:
+    """
+    A ``~/.databrickscfg`` with a duplicated ``[DEFAULT]`` section, as written
+    by the Databricks VS Code extension. Strict ``configparser`` parsing (and
+    the databricks-sdk's own loader) raise ``DuplicateOptionError`` on it.
+    """
+    contents = textwrap.dedent(
+        """
+        [DEFAULT]
+        host = https://first.cloud.databricks.com
+        token = dapi-first
+        workspace_id = 111
+
+        [DEFAULT]
+        host = https://second.cloud.databricks.com
+        token = dapi-second
+        workspace_id = 222
+        """
+    ).lstrip()
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(contents)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    return cfg_path
+
+
+def test_databrickscfg_file_readers_tolerate_duplicate_default_section(
+    duplicate_default_cfg: _Path,
+) -> None:
+    """
+    A duplicated ``[DEFAULT]`` section must not crash the direct file readers.
+
+    ``configparser.ConfigParser`` defaults to ``strict=True`` and raises
+    ``DuplicateOptionError`` on such files; every cfg reader parses in
+    non-strict mode instead, where the last value wins.
+    """
+    creds = _read_databrickscfg_file_fallback()
+    assert creds is not None
+    assert creds.host == "https://second.cloud.databricks.com"
+    assert creds.token == "dapi-second"
+
+    # The host-only reader must survive the same file too.
+    assert _read_databrickscfg_host() == "https://second.cloud.databricks.com"
+
+    # The workspace-id readers must tolerate the duplicated file the same way,
+    # rather than treating it as unparseable.
+    assert databrickscfg_workspace_id_for_host("https://second.cloud.databricks.com") == "222"
+    assert databrickscfg_workspace_id_for_profile("DEFAULT") == "222"
+
+
+def test_read_databrickscfg_sdk_path_tolerates_duplicate_default_section(
+    duplicate_default_cfg: _Path,
+) -> None:
+    """
+    The SDK-backed credential resolvers must survive the duplicated file too:
+    the databricks-sdk's own strict parser raises on it, and that failure has
+    to route to the tolerant file fallback instead of propagating out of
+    ``_read_databrickscfg`` (which crashed bare ``omnigent`` at startup) or
+    surfacing as a bogus auth failure from ``_resolve_databricks_auth``.
+    """
+    creds = _read_databrickscfg(None)
+    assert creds is not None
+    assert creds.host == "https://second.cloud.databricks.com"
+    assert creds.token == "dapi-second"
+
+    _auth, host = _resolve_databricks_auth()
+    assert host == "https://second.cloud.databricks.com"
 
 
 def test_databrickscfg_workspace_id_for_host_reads_matching_profile(
