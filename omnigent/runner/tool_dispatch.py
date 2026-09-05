@@ -2275,6 +2275,7 @@ async def _execute_subagent_tool(
     assert not isinstance(existing, str)
     created_child = False
     child_wrapper_label: str | None = None
+    child_model: str | None = None
     work_id = _runner_app.new_subagent_work_id()
     if existing is not None:
         child_session_id = existing.get("id")
@@ -2318,6 +2319,9 @@ async def _execute_subagent_tool(
                 "fresh session with the requested budget."
             )
         child_wrapper_label = _session_wrapper_label(existing)
+        # A continued child keeps its create-time routing; the summary's
+        # routed_model is its persisted model_override.
+        child_model = _optional_string(existing.get("routed_model"))
         existing_work = _runner_app.get_subagent_work(child_session_id)
         if existing_work is not None and existing_work.status in (
             "launching",
@@ -2586,6 +2590,14 @@ async def _execute_subagent_tool(
             return "Error: server did not return child session_id"
         child_wrapper_label = _session_wrapper_label(child_data)
         created_child = True
+        # The model the child was routed onto: the server's echo of the
+        # persisted override, else the override this dispatch just sent,
+        # else the spec model the child falls back to.
+        child_model = (
+            _optional_string(child_data.get("model_override"))
+            or _optional_string(create_body.get("model_override"))
+            or _optional_string(child_data.get("llm_model"))
+        )
 
         # Attach a subagent_cost_budget policy to the child when requested.
         # Non-fatal: the child session is still usable without the budget.
@@ -2755,6 +2767,11 @@ async def _execute_subagent_tool(
             "kind": "sub_agent",
             "agent": sub_agent_name,
             "title": session_name,
+            # The child's routed model. The handle is the only per-child
+            # signal a fan-out orchestrator gets at dispatch time; without
+            # it the orchestrator cannot report which model each sub-agent
+            # runs on. None when no override or spec model is known.
+            "model": child_model,
             "status": "launching",
             "message": _subagent_launching_message(sub_agent_name, session_name, child_session_id),
         }
@@ -2908,6 +2925,10 @@ async def _send_to_existing_session(
             "kind": "sub_agent",
             "agent": agent_label,
             "title": instance_title,
+            # Effective model, mirroring sys_session_get_info: a per-session
+            # override wins over the spec default; None when neither is set.
+            "model": _optional_string(snap_data.get("model_override"))
+            or _optional_string(snap_data.get("llm_model")),
             "status": "launching",
             "message": _subagent_launching_message(agent_label, instance_title, target_session_id),
         }

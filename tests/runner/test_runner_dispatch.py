@@ -4081,6 +4081,206 @@ async def test_sys_session_send_strips_gateway_prefix_for_vendor_direct_child(
 
 
 @pytest.mark.asyncio
+async def test_sys_session_send_handle_reports_persisted_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A fresh-create launching handle exposes the child's routed model.
+
+    The handle is the only per-child signal a fan-out orchestrator gets
+    at dispatch time; without a ``model`` field it cannot report which
+    model each sub-agent runs on and defaults to its own for the whole
+    fan-out. The value must be the *persisted* override (the localized
+    spelling), never the raw requested id, so the handle can't disagree
+    with the child row.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir for the isolated provider config.
+    """
+    _isolate_model_providers(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  workspace:\n    kind: databricks\n    profile: prof-a\n    default: true\n",
+    )
+    result = await _dispatch_model_send(
+        monkeypatch,
+        agent_spec=_spec_with_real_subagent("claude-native"),
+        model="claude-sonnet-4-6",
+        conv_id="conv_parent_handle_model",
+    )
+    payload = json.loads(result.output)
+    assert payload["status"] == "launching"
+    assert result.create_bodies[0]["model_override"] == "databricks-claude-sonnet-4-6"
+    # The handle mirrors the persisted override verbatim, not the
+    # requested canonical spelling.
+    assert payload["model"] == "databricks-claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("routed_model", "expected"),
+    [
+        pytest.param(
+            "databricks-claude-opus-4-8", "databricks-claude-opus-4-8", id="routed-child"
+        ),
+        pytest.param(None, None, id="unrouted-child"),
+    ],
+)
+async def test_sys_session_send_continued_child_handle_reports_routed_model(
+    monkeypatch: pytest.MonkeyPatch,
+    routed_model: str | None,
+    expected: str | None,
+) -> None:
+    """
+    Continuing a named child returns a handle with its routed model.
+
+    A continuation carries no ``args.model`` (overrides apply only at
+    create), so the handle's ``model`` comes from the child summary's
+    ``routed_model`` — the persisted ``model_override``. A child that was
+    never routed reports ``None`` rather than a guessed value.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param routed_model: The summary's ``routed_model`` projection.
+    :param expected: The ``model`` the handle must carry.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_cont/child_sessions"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "conv_existing_routed",
+                            "tool": "claude",
+                            "session_name": "routing-check",
+                            "busy": False,
+                            "routed_model": routed_model,
+                        }
+                    ]
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_existing_routed":
+            return httpx.Response(200, json={"ok": True})
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_existing_routed/events"
+        ):
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"agent": "claude", "title": "routing-check", "args": "continue"}
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_cont",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_existing_routed")
+            runner_app._session_inboxes_ref.pop("conv_parent_cont", None)
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching"
+    assert payload["model"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_override", "llm_model", "expected"),
+    [
+        pytest.param(
+            "databricks-claude-opus-4-8",
+            "spec-default-model",
+            "databricks-claude-opus-4-8",
+            id="override-wins",
+        ),
+        pytest.param(None, "spec-default-model", "spec-default-model", id="spec-fallback"),
+    ],
+)
+async def test_sys_session_send_by_id_handle_reports_effective_model(
+    monkeypatch: pytest.MonkeyPatch,
+    model_override: str | None,
+    llm_model: str | None,
+    expected: str | None,
+) -> None:
+    """
+    By-id ``sys_session_send`` handles expose the child's effective model.
+
+    Mirrors ``sys_session_get_info``: a per-session ``model_override``
+    wins over the spec's ``llm_model`` default, so the parent sees the
+    same model for the child no matter which tool it asks.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param model_override: The child snapshot's persisted override.
+    :param llm_model: The child snapshot's spec-derived model.
+    :param expected: The ``model`` the handle must carry.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child_model":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child_model",
+                    "parent_session_id": "conv_caller_model",
+                    "title": "researcher:auth",
+                    "model_override": model_override,
+                    "llm_model": llm_model,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child_model":
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child_model/events":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_child_model", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_caller_model",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_model")
+            runner_app._session_inboxes_ref.pop("conv_caller_model", None)
+
+    handle = json.loads(output)
+    assert handle["status"] == "launching"
+    assert handle["model"] == expected
+
+
+@pytest.mark.asyncio
 async def test_sys_session_send_passes_model_through_when_provider_undeterminable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
