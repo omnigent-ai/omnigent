@@ -1609,6 +1609,7 @@ function HarnessConfigModal({
   piModelsLoading,
   pickedEffort,
   pickedHarness,
+  pickedSubHarness,
   costControlMode,
   setPermissionMode,
   setApprovalMode,
@@ -1618,6 +1619,7 @@ function HarnessConfigModal({
   setPickedModel,
   setPickedEffort,
   setPickedHarness,
+  setPickedSubHarness,
   setCostControlMode,
 }: {
   open: boolean;
@@ -1643,6 +1645,10 @@ function HarnessConfigModal({
   piModelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
+  // Harness per sub-agent, keyed by the sub-agent's declared name. Empty
+  // when the bundle has no team or none was picked; the session then runs
+  // whatever the bundle declared.
+  pickedSubHarness: Record<string, string>;
   costControlMode: CostControlMode;
   setPermissionMode: (mode: string) => void;
   setApprovalMode: (mode: string) => void;
@@ -1652,6 +1658,7 @@ function HarnessConfigModal({
   setPickedModel: (model: string) => void;
   setPickedEffort: (effort: string) => void;
   setPickedHarness: (harness: string | null, agentId?: string) => void;
+  setPickedSubHarness: (subHarness: Record<string, string>, agentId?: string) => void;
   setCostControlMode: (mode: CostControlMode) => void;
 }) {
   const info = useServerInfo();
@@ -1677,6 +1684,8 @@ function HarnessConfigModal({
   const [draftAgySkip, setDraftAgySkip] = useState(agySkipMode);
   const [draftBypass, setDraftBypass] = useState(bypassSandbox);
   const [draftHarness, setDraftHarness] = useState<string | null>(pickedHarness);
+  const [draftSubHarness, setDraftSubHarness] =
+    useState<Record<string, string>>(pickedSubHarness);
   const [draftRouting, setDraftRouting] = useState<CostControlMode>(costControlMode);
 
   useEffect(() => {
@@ -1689,6 +1698,7 @@ function HarnessConfigModal({
     setDraftAgySkip(agySkipMode);
     setDraftBypass(bypassSandbox);
     setDraftHarness(pickedHarness);
+    setDraftSubHarness(pickedSubHarness);
     setDraftRouting(costControlMode);
     // Seed once per open from the current live values.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1798,6 +1808,22 @@ function HarnessConfigModal({
     } else if (brainDefault) {
       // Picking the spec default clears the override so the session tracks it.
       setPickedHarness(draftHarness === brainDefault ? null : draftHarness, agent.id);
+    }
+    // The team, independent of the brain branch above: a bundle can keep its
+    // declared brain and still retarget a head. Only entries that DIFFER from
+    // what the bundle declares are kept, so leaving every row alone sends
+    // nothing and the session tracks the spec.
+    if ((agent.sub_agents ?? []).length > 0) {
+      const declared = new Map(
+        (agent.sub_agents ?? []).map((c) => [c.name, c.harness ?? null]),
+      );
+      const changed: Record<string, string> = {};
+      for (const [name, harness] of Object.entries(draftSubHarness)) {
+        if (harness && declared.has(name) && harness !== declared.get(name)) {
+          changed[name] = harness;
+        }
+      }
+      setPickedSubHarness(changed, agent.id);
     }
     // Smart Routing rides the Model dropdown on both routable harnesses
     // (Claude Code and Codex), so commit it outside the per-capability branches.
@@ -2058,7 +2084,14 @@ function HarnessConfigModal({
           that selected it, so hiding it would strand the choice with no way to
           read it back or switch away without cancelling. */}
           {!hasPermission && !hasApproval && !hasCursor && !hasAgySkip && brainDefault && (
-            <ConfigRow label="Agent Harness" description="Underlying coding harness">
+            <ConfigRow
+              label="Agent Harness"
+              description={
+                (agent.sub_agents ?? []).length > 0
+                  ? "The orchestrator — it delegates, the sub-agents below do the work"
+                  : "Underlying coding harness"
+              }
+            >
               <Select
                 value={draftHarness ?? brainDefault}
                 onValueChange={setDraftHarness}
@@ -2107,6 +2140,93 @@ function HarnessConfigModal({
                 </SelectContent>
               </Select>
             </ConfigRow>
+          )}
+
+          {/* The team, when the bundle has one.
+
+          Three things were wrong with rendering these as plain sibling rows.
+          The row above is the ORCHESTRATOR's harness and reads as if it were
+          the whole agent's. A head named `claude` sitting next to a control
+          reading "Claude SDK" says the same thing twice. And a head named
+          `gpt` retargeted onto Antigravity has a name that now lies -- the
+          names come from the bundle author, who picked them when they matched
+          the model, and they are identifiers the override is keyed by, not
+          labels written for this screen.
+
+          So the group is titled, indented under it, and each row says what
+          the bundle DECLARED for that head. The name stays visible because it
+          is what the choice is addressed by; the declared harness underneath
+          is what makes a renamed-by-retarget head legible. */}
+          {(agent.sub_agents ?? []).length > 0 && brainEntries.length > 0 && (
+            <div className="flex flex-col gap-3 border-l border-border/60 pl-3">
+              <div className="text-sm text-muted-foreground">
+                Delegates to — one harness per sub-agent
+              </div>
+              {(agent.sub_agents ?? []).map((child) => {
+                const declared = child.harness ?? null;
+                const current = draftSubHarness[child.name] ?? declared ?? "";
+                return (
+                  <ConfigRow
+                    key={child.name}
+                    label={child.name}
+                    description={
+                      declared
+                        ? `declared: ${brainHarnessLabels[declared] ?? declared}`
+                        : "no declared harness"
+                    }
+                  >
+                    <Select
+                      value={current}
+                      onValueChange={(value) =>
+                        setDraftSubHarness((prev) => ({ ...prev, [child.name]: value }))
+                      }
+                      componentId={`new_chat.config.sub_harness.${child.name}`}
+                      valueHasNoPii
+                    >
+                      <SelectTrigger
+                        className="w-full cursor-pointer"
+                        data-testid={`new-chat-landing-config-sub-harness-${child.name}`}
+                        aria-label={`${child.name} harness`}
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent
+                        position="popper"
+                        align="start"
+                        className="[&_[data-slot=select-item]]:pl-2.5"
+                      >
+                        {brainEntries
+                          // Auto routes the BRAIN; it means nothing for one
+                          // named head, so it is not offered here.
+                          .filter(([id]) => id !== AUTO_HARNESS_ID)
+                          .map(([id, label]) => (
+                            <SelectItem
+                              key={id}
+                              value={id}
+                              data-testid={`new-chat-landing-sub-harness-${child.name}-${id}`}
+                            >
+                              <span className="flex items-center gap-2">
+                                {label}
+                                {harnessUnconfiguredOnHost(id, host) && (
+                                  <Badge
+                                    variant="outline"
+                                    className="border-amber-300 bg-amber-50 text-sm text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
+                                  >
+                                    {harnessWarningBadgeText(
+                                      harnessUnavailableReasonOnHost(id, host),
+                                      collapsedBadge,
+                                    )}
+                                  </Badge>
+                                )}
+                              </span>
+                            </SelectItem>
+                          ))}
+                      </SelectContent>
+                    </Select>
+                  </ConfigRow>
+                );
+              })}
+            </div>
           )}
 
           {/* Top-level Smart Routing: the router owns the model, so Permissions
@@ -2637,6 +2757,12 @@ export function NewChatLandingScreen() {
       restoredDraft?.pickedHarness ??
       readLastHarness(restoredDraft?.pickedAgentId ?? readLastAgentId()),
   );
+  // Per-sub-agent harness for a multi-agent bundle, keyed by declared name.
+  // Deliberately NOT remembered across visits the way pickedHarness is: a
+  // team belongs to one bundle, and carrying "gpt -> antigravity" forward
+  // would leak onto a different bundle that happens to name a head "gpt".
+  // Empty means the session runs whatever the bundle declared.
+  const [pickedSubHarness, setPickedSubHarness] = useState<Record<string, string>>({});
   // Per-session model + reasoning effort for the claude-native model picker.
   // "" = unselected: nothing is checked and `model_override` / `reasoning_effort`
   // are omitted from the create, so Claude Code uses its own configured model.
@@ -4522,6 +4648,11 @@ export function NewChatLandingScreen() {
             harness_override: smartRoutingHarnessSelected
               ? AUTO_HARNESS_ID
               : (pickedHarness ?? undefined),
+            // Omitted when empty so a session with no per-head pick sends the
+            // same body it sent before this existed.
+            sub_harness_override: Object.keys(pickedSubHarness ?? {}).length
+              ? pickedSubHarness
+              : undefined,
             smart_routing_message:
               smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
           }),
@@ -5139,6 +5270,8 @@ export function NewChatLandingScreen() {
                     open={configOpen}
                     onOpenChange={setConfigOpen}
                     agent={selectedAgent}
+                    pickedSubHarness={pickedSubHarness}
+                    setPickedSubHarness={setPickedSubHarness}
                     brainHarnessLabels={brainHarnessLabels}
                     host={harnessWarningHost}
                     hideUnconfigured={hideUnconfiguredHarnesses}
