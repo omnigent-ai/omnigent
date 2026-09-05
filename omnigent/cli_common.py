@@ -25,6 +25,18 @@ RESUME_PICKER_SENTINEL = "__resume_picker__"
 CLAUDE_STARTUP_PROFILE_ENV_VAR = "OMNIGENT_CLAUDE_STARTUP_PROFILE"
 
 
+class AuthFailure(click.ClickException):
+    """A login or credential failure; recovery is re-authenticating.
+
+    The top-level CLI handler appends a stale-host recovery hint
+    (``run `omnigent stop```) to command errors because stale host
+    processes can cause runner tunnel rejections. Sign-in and token
+    verification failures are never caused by stale host processes, so
+    errors raised as :class:`AuthFailure` skip that hint instead of
+    sending users to chase process cleanup for an access problem.
+    """
+
+
 def reject_native_on_windows(harness: str) -> None:
     """Fail a native (tmux/PTY) harness command with an actionable message.
 
