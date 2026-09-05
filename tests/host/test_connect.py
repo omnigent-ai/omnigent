@@ -35,6 +35,7 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFsRequestFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportLocalByIdFrame,
@@ -332,6 +333,30 @@ async def test_handle_model_options_reports_the_endpoints_wider_catalog(
         "system.ai.claude-opus-4-8",
     ]
     _cleanup_host(host)
+
+
+async def test_managed_worktree_base_refresh_loop_runs_immediately() -> None:
+    host = _make_host_process()
+    called = asyncio.Event()
+
+    def refresh() -> dict[str, str]:
+        called.set()
+        return {"universe": "mirror/master"}
+
+    with patch.object(host._worktree_pool, "refresh_managed_bases", side_effect=refresh):
+        task = asyncio.create_task(host._managed_worktree_base_refresh_loop())
+        await asyncio.wait_for(called.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_managed_worktree_base_refresh_jitter_is_stable_per_host() -> None:
+    first = _make_host_process()
+    second = _make_host_process()
+
+    assert first._managed_base_refresh_jitter_s == second._managed_base_refresh_jitter_s
+    assert 0 <= first._managed_base_refresh_jitter_s < 5 * 60
 
 
 def _make_host_process() -> HostProcess:
@@ -1700,6 +1725,33 @@ def test_install_child_subreaper_is_safe_to_call() -> None:
     assert isinstance(result, bool)
     if sys.platform != "linux":
         assert result is False
+
+
+def test_managed_fs_request_resolves_session_lease(tmp_path: Path) -> None:
+    """Managed filesystem reads use the host's current physical lease."""
+    host = _make_host_process()
+    workspace = tmp_path / "managed-slot"
+    workspace.mkdir()
+    (workspace / "hello.txt").write_text("from managed slot\n")
+
+    with patch.object(
+        host._worktree_pool,
+        "workspace_for_session",
+        return_value=str(workspace),
+    ):
+        result = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="req_managed_fs",
+                op="list_or_read",
+                workspace="managed://universe",
+                session_id="session-1",
+                params={"path": "hello.txt"},
+            )
+        )
+
+    assert result.status == "ok"
+    assert result.payload is not None
+    assert result.payload["content"] == "from managed slot\n"
 
 
 def test_host_spawned_runner_has_parent_pid_env(

@@ -106,6 +106,22 @@ def test_create_preserves_existing_config(tmp_path: Path) -> None:
     assert data["profile"] == "oss", "Existing 'profile' key should survive host section creation"
 
 
+def test_create_identity_preserves_existing_host_settings(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    managed_worktrees = {
+        "idle_eviction_seconds": 3600,
+        "repos": {"universe": {"worktrees": ["/worktrees/universe-1"]}},
+    }
+    config_path.write_text(yaml.safe_dump({"host": {"managed_worktrees": managed_worktrees}}))
+
+    identity = load_or_create_host_identity(config_path)
+
+    data = yaml.safe_load(config_path.read_text())
+    assert data["host"]["host_id"] == identity.host_id
+    assert data["host"]["name"] == identity.name
+    assert data["host"]["managed_worktrees"] == managed_worktrees
+
+
 def test_name_only_config_gets_generated_host_id(tmp_path: Path) -> None:
     """
     A config.yaml that names the host but omits host_id should keep the

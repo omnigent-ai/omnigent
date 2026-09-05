@@ -42,6 +42,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.managed_workspace import parse_managed_workspace
 from omnigent.model_override import validate_model_override
 from omnigent.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
@@ -346,6 +347,7 @@ def register_core_routes(
         host_id: str,
         workspace: str | None,
         harness: str | None,
+        git_branch: str | None = None,
     ) -> tuple[str, bool] | None:
         """
         Bind a just-created session to a caller-supplied host and launch.
@@ -379,6 +381,9 @@ def register_core_routes(
             requires it with ``host_id``) and raises.
         :param harness: Canonical harness for the host-side
             configuration check, or ``None`` to skip it.
+        :param git_branch: Managed session's persisted branch, forwarded
+            so the host can restore it in a managed slot. ``None`` for
+            direct workspaces.
         :returns: ``(runner_id, launch_failed)`` after the bind, or
             ``None`` when the server has no host registry/store wired
             (minimal test wirings — nothing was attempted).
@@ -430,11 +435,20 @@ def register_core_routes(
                 "schema constraint should have prevented this",
                 code=ErrorCode.INTERNAL_ERROR,
             )
+        try:
+            managed_repo = parse_managed_workspace(workspace)
+        except ValueError as exc:
+            raise OmnigentError(
+                "session has an invalid managed workspace marker",
+                code=ErrorCode.INTERNAL_ERROR,
+            ) from exc
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
                 binding_token=binding_token,
                 workspace=workspace,
+                git_branch=git_branch if managed_repo is not None else None,
+                managed_repo=managed_repo,
                 session_id=session_id,
                 # Lets the host refuse an unconfigured harness before
                 # spawning. None (agent not resolvable) skips the
@@ -665,6 +679,7 @@ def register_core_routes(
                 # Already written by _create_session_from_existing_agent;
                 # only runner_id still needs the atomic set inside.
                 workspace=resp.workspace,
+                git_branch=resp.git_branch,
                 # Already canonical (see _resolve_harness).
                 harness=resp.harness,
             )

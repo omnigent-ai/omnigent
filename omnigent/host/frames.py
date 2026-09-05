@@ -50,6 +50,7 @@ class HostFrameKind(str, Enum):
     STOP_RUNNER = "host.stop_runner"
     STOP_RUNNER_RESULT = "host.stop_runner_result"
     RUNNER_EXITED = "host.runner_exited"
+    MANAGED_SESSION_RELEASED = "host.managed_session_released"
     RUNNER_STATUS = "host.runner_status"
     RUNNER_STATUS_RESULT = "host.runner_status_result"
     STAT = "host.stat"
@@ -165,6 +166,8 @@ class HostLaunchRunnerFrame:
     :param workspace: Absolute path on the host machine to use
         as the runner's working directory, e.g.
         ``"/Users/corey/projects/frontend"``.
+    :param git_branch: Git branch checked out in ``workspace`` when
+        Omnigent prepared a git worktree. ``None`` means no branch affinity.
     :param session_id: Conversation/session ID the runner is being
         launched for, e.g. ``"conv_abc123"``. ``None`` means an older
         server did not include it.
@@ -179,6 +182,8 @@ class HostLaunchRunnerFrame:
     request_id: str
     binding_token: str
     workspace: str
+    git_branch: str | None = None
+    managed_repo: str | None = None
     session_id: str | None = None
     harness: str | None = None
 
@@ -208,6 +213,8 @@ class HostLaunchRunnerResultFrame:
     runner_id: str | None = None
     error: str | None = None
     error_code: str | None = None
+    workspace: str | None = None
+    git_branch: str | None = None
 
 
 @dataclass
@@ -262,6 +269,13 @@ class HostRunnerExitedFrame:
 
     runner_id: str
     error: str
+
+
+@dataclass
+class HostManagedSessionReleasedFrame:
+    """Host → server: an idle managed worktree was finalized and released."""
+
+    session_id: str
 
 
 @dataclass
@@ -806,8 +820,9 @@ class HostFsRequestFrame:
     :param request_id: Correlates the result, e.g. ``"req_fs_1"``.
     :param op: Operation name — one of ``"list_or_read"``, ``"changes"``,
         ``"diff"``, ``"search"``.
-    :param workspace: Absolute path to the session's workspace on the
-        host, e.g. ``"/Users/alice/project"``.
+    :param workspace: Absolute path to the session's workspace, or a
+        ``managed://<repo>`` marker that the host resolves through its
+        active session lease.
     :param session_id: Session id, forwarded to the change registry.
     :param params: Operation-specific arguments (relative path, glob
         filters, pagination cursors), e.g.
@@ -970,6 +985,7 @@ HostFrame = (
     | HostStopRunnerFrame
     | HostStopRunnerResultFrame
     | HostRunnerExitedFrame
+    | HostManagedSessionReleasedFrame
     | HostRunnerStatusFrame
     | HostRunnerStatusResultFrame
     | HostStatFrame
@@ -1075,6 +1091,8 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "binding_token": frame.binding_token,
                 "workspace": frame.workspace,
+                "git_branch": frame.git_branch,
+                "managed_repo": frame.managed_repo,
                 "session_id": frame.session_id,
                 "harness": frame.harness,
             }
@@ -1088,6 +1106,8 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "runner_id": frame.runner_id,
                 "error": frame.error,
                 "error_code": frame.error_code,
+                "workspace": frame.workspace,
+                "git_branch": frame.git_branch,
             }
         )
     if isinstance(frame, HostStopRunnerFrame):
@@ -1113,6 +1133,13 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_EXITED.value,
                 "runner_id": frame.runner_id,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostManagedSessionReleasedFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.MANAGED_SESSION_RELEASED.value,
+                "session_id": frame.session_id,
             }
         )
     if isinstance(frame, HostRunnerStatusFrame):
@@ -1484,6 +1511,8 @@ def _decode_known_host_frame(
             return _decode_stop_runner_result(msg)
         case HostFrameKind.RUNNER_EXITED:
             return _decode_runner_exited(msg)
+        case HostFrameKind.MANAGED_SESSION_RELEASED:
+            return HostManagedSessionReleasedFrame(session_id=_required_str(msg, "session_id"))
         case HostFrameKind.RUNNER_STATUS:
             return _decode_runner_status(msg)
         case HostFrameKind.RUNNER_STATUS_RESULT:
@@ -1589,6 +1618,8 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         request_id=_required_str(msg, "request_id"),
         binding_token=_required_str(msg, "binding_token"),
         workspace=_required_str(msg, "workspace"),
+        git_branch=_optional_nullable_str(msg, "git_branch"),
+        managed_repo=_optional_nullable_str(msg, "managed_repo"),
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
     )
@@ -1608,6 +1639,8 @@ def _decode_launch_runner_result(
         runner_id=_optional_nullable_str(msg, "runner_id"),
         error=_optional_nullable_str(msg, "error"),
         error_code=_optional_nullable_str(msg, "error_code"),
+        workspace=_optional_nullable_str(msg, "workspace"),
+        git_branch=_optional_nullable_str(msg, "git_branch"),
     )
 
 
@@ -2242,4 +2275,14 @@ def _optional_nullable_str(msg: _JsonObject, key: str) -> str | None:
         return None
     if not isinstance(val, str):
         raise ValueError(f"frame field must be a string or null: {key!r}")
+    return val
+
+
+def _optional_nullable_int(msg: _JsonObject, key: str) -> int | None:
+    """Return an optional nullable integer field."""
+    val = msg.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, int) or isinstance(val, bool):
+        raise ValueError(f"frame field must be an int or null: {key!r}")
     return val

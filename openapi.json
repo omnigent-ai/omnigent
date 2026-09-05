@@ -2820,6 +2820,18 @@
         "type": "object"
       },
       "LaunchRunnerRequest": {
+        "anyOf": [
+          {
+            "required": [
+              "workspace"
+            ]
+          },
+          {
+            "required": [
+              "managed_repo"
+            ]
+          }
+        ],
         "description": "Request body for `POST /v1/hosts/{host_id}/runners`.",
         "properties": {
           "git": {
@@ -2833,20 +2845,33 @@
             ],
             "description": "Optional git worktree options. In create mode the server creates a worktree for a new branch off `workspace` on the host and binds the runner to it (the fork-resume path; mirrors `POST /v1/sessions`). In bind mode (`existing_worktree=True`) `workspace` already IS a worktree \u2014 no worktree is created; `branch_name` is recorded as the session's `git_branch` for display and opt-in cleanup. `None` binds `workspace` directly. `host_id` is always present (it is in the path), so no host check is needed here."
           },
+          "managed_repo": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional host-local managed repository alias. When set, the host selects the physical worktree and `workspace` may be omitted.",
+            "title": "Managed Repo"
+          },
           "session_id": {
             "description": "Session to bind the new runner to, e.g. `\"conv_abc123\"`.",
             "title": "Session Id",
             "type": "string"
           },
           "workspace": {
-            "description": "Absolute path on the host machine to use as the runner's working directory, e.g. `\"/Users/corey/projects/frontend\"`. When `git` is set, this is interpreted as the source repository directory and the runner starts in the created worktree instead.",
+            "default": "",
+            "description": "Absolute path on the host machine to use as the runner's working directory, e.g. `\"/Users/corey/projects/frontend\"`. When `git` is set, this is interpreted as the source repository directory and the runner starts in the created worktree instead. Required unless `managed_repo` selects a host-managed pool.",
+            "minLength": 1,
             "title": "Workspace",
             "type": "string"
           }
         },
         "required": [
-          "session_id",
-          "workspace"
+          "session_id"
         ],
         "title": "LaunchRunnerRequest",
         "type": "object"

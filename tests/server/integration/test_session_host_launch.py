@@ -999,6 +999,52 @@ async def test_stopped_host_session_message_relaunches_runner(
     )
 
 
+async def test_managed_session_relaunch_sends_repo_and_branch(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed binding relaunches by repository alias and branch."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(
+        session_id,
+        _HOST_ID,
+        "managed://universe",
+        "feature/session-123",
+    )
+
+    set_runner_client(None)
+    post_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+    )
+    try:
+        launch_frame = await _wait_for_launch(comm, budget_s=5.0)
+    finally:
+        post_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await post_task
+
+    assert launch_frame is not None
+    assert launch_frame.workspace == "managed://universe"
+    assert launch_frame.managed_repo == "universe"
+    assert launch_frame.git_branch == "feature/session-123"
+
+
 async def test_host_reports_runner_unknown_skips_connect_grace(
     client: httpx.AsyncClient,
     app: FastAPI,

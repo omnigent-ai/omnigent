@@ -2151,6 +2151,70 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
 
 
 @pytest.mark.asyncio
+async def test_managed_session_init_uses_runner_physical_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed bindings must initialize native resumes in the assigned slot."""
+    physical_workspace = tmp_path / "managed-slot"
+    physical_workspace.mkdir()
+    captured_workspaces: list[str | None] = []
+
+    async def _capture_auto_create(*args: Any, session_init: Any = None, **kwargs: Any) -> None:
+        del args, kwargs
+        captured_workspaces.append(session_init.snapshot.workspace)
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._auto_create_claude_terminal",
+        _capture_auto_create,
+    )
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="managed-claude",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        )
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+        runner_workspace=physical_workspace,
+    )
+    session_id = "managed_init_f26fcf4af9834868be68932109b620d1"
+    agent_id = "managed_agent_e4721ff7c6834a56aeb5856b276b094b"
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "sub_agent_name": None,
+                "session_init": {
+                    "protocol_version": 2,
+                    "server_version": "0.7.0.dev0",
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "sub_agent_name": None,
+                    "snapshot": {
+                        "created_at": 1234,
+                        "updated_at": 1234,
+                        "workspace": "managed://universe",
+                        "labels": {},
+                    },
+                },
+            },
+        )
+
+    assert response.status_code == 201, response.text
+    assert captured_workspaces == [str(physical_workspace.resolve())]
+
+
+@pytest.mark.asyncio
 async def test_create_session_preserves_existing_event_queue() -> None:
     """Session init must not orphan a stream subscriber's event queue.
 

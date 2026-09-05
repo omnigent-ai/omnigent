@@ -33,6 +33,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostManagedSessionReleasedFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
     HostRemoveWorktreeFrame,
@@ -1664,3 +1665,31 @@ def test_fs_result_null_payload_round_trip() -> None:
     assert isinstance(decoded, HostFsResultFrame)
     assert decoded.payload is None
     assert decoded.error_status == 500
+
+
+def test_managed_launch_fields_round_trip() -> None:
+    original = HostLaunchRunnerFrame(
+        request_id="req-managed",
+        binding_token="token",
+        workspace="managed://universe",
+        git_branch="feature/session",
+        managed_repo="universe",
+        session_id="session-1",
+    )
+    assert decode_host_frame(encode_host_frame(original)) == original
+
+
+def test_managed_launch_result_fields_round_trip() -> None:
+    original = HostLaunchRunnerResultFrame(
+        request_id="req-managed",
+        status="launched",
+        runner_id="runner-1",
+        workspace="/worktrees/universe-1",
+        git_branch="feature/session",
+    )
+    assert decode_host_frame(encode_host_frame(original)) == original
+
+
+def test_managed_session_released_round_trip() -> None:
+    original = HostManagedSessionReleasedFrame(session_id="session-1")
+    assert decode_host_frame(encode_host_frame(original)) == original

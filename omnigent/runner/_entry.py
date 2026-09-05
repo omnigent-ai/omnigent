@@ -1201,6 +1201,23 @@ def _runner_workspace_from_env() -> Path | None:
     return Path(stripped).expanduser().resolve()
 
 
+def _runner_git_branch_from_env() -> str | None:
+    """Return the optional git branch from runner process wiring.
+
+    :returns: The branch checked out in the runner workspace, or ``None``.
+    :raises RuntimeError: If the branch env var is set but empty.
+    """
+    from omnigent.runner.identity import RUNNER_GIT_BRANCH_ENV_VAR
+
+    raw = os.environ.get(RUNNER_GIT_BRANCH_ENV_VAR)
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if not stripped:
+        raise RuntimeError(f"{RUNNER_GIT_BRANCH_ENV_VAR} must not be empty")
+    return stripped
+
+
 def _runner_isolate_session_from_env() -> bool:
     """Return ``True`` when ``OMNIGENT_RUNNER_ISOLATE_SESSION`` is ``"1"``.
 
@@ -1336,6 +1353,7 @@ def create_app(
 
     server_url = _server_url_from_env()
     runner_workspace = _runner_workspace_from_env()
+    runner_git_branch = _runner_git_branch_from_env()
     isolate_session = _runner_isolate_session_from_env()
     # Stable runner UUID, persisted so resume works across
     # restarts (§5 "Persistence" in RUNNER.md).
@@ -1490,6 +1508,7 @@ def create_app(
         server_client=server_client,
         terminal_registry=_terminal_registry,
         runner_workspace=runner_workspace,
+        runner_git_branch=runner_git_branch,
         per_session_workspace=isolate_session,
         mcp_manager=mcp_manager,
         auth_token=runner_auth_token,
