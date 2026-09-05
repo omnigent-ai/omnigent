@@ -82,6 +82,11 @@ def test_released_swipe_archives_without_navigating_and_stationary_tap_navigates
         page.goto(f"{base_url}/?sidebar=open")
         link = _row_link(page, session_id)
         expect(link).to_be_visible()
+        expect(link.locator("xpath=ancestor::li[1]")).to_have_css("touch-action", "pan-y")
+        page.wait_for_function(
+            """() => Math.abs(document.querySelector('aside[aria-label="Conversations"]')
+                .getBoundingClientRect().left) < 0.01"""
+        )
         x, y = center(link)
 
         cdp = page.context.new_cdp_session(page)
@@ -94,12 +99,19 @@ def test_released_swipe_archives_without_navigating_and_stationary_tap_navigates
             link = _row_link(page, session_id)
             expect(link).to_be_visible()
             row = link.locator("xpath=ancestor::li[1]")
+            surface = row.get_by_test_id("conversation-swipe-surface")
+            expect(row).to_have_css("touch-action", "pan-y")
+            page.wait_for_function(
+                """() => Math.abs(document.querySelector('aside[aria-label="Conversations"]')
+                    .getBoundingClientRect().left) < 0.01"""
+            )
             x, y = center(link)
             touch(cdp, "touchStart", x, y)
             for offset in (16, 32, 50, 74, 90):
                 touch(cdp, "touchMove", x + offset, y)
                 page.wait_for_timeout(25)
-            expect(row).to_have_class(re.compile(r"\bmx-1\b"))
+            expect(surface).to_have_css("transform", "matrix(1, 0, 0, 1, 78, 0)")
+            expect(row.get_by_test_id("conversation-swipe-reveal")).to_be_visible()
             assert _unexpected_events(page) == []
             touch(cdp, "touchEnd")
         finally:
@@ -248,6 +260,8 @@ def test_horizontal_swipe_wins_before_hold_while_vertical_motion_yields_to_scrol
         # Freeze app timers without pausing the renderer that receives CDP input.
         pause_at = page.evaluate("new Date(Date.now() + 5000).toISOString()")
         page.clock.pause_at(pause_at)
+        surface = row.get_by_test_id("conversation-swipe-surface")
+        reveal = row.get_by_test_id("conversation-swipe-reveal")
 
         cdp = page.context.new_cdp_session(page)
         try:
@@ -257,11 +271,13 @@ def test_horizontal_swipe_wins_before_hold_while_vertical_motion_yields_to_scrol
             expect(row).not_to_have_class(re.compile(r"\bscale-\[1\.01\]\b"))
             expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
             touch(cdp, "touchMove", x - 11, y)
-            page.clock.run_for(1)
-            expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
+            page.clock.run_for(20)
+            expect(surface).to_have_css("transform", "matrix(1, 0, 0, 1, 0, 0)")
+            expect(reveal).to_have_count(0)
             touch(cdp, "touchMove", x - 13, y)
-            page.clock.run_for(1)
-            expect(row).to_have_class(re.compile(r"\bmx-1\b"))
+            page.clock.run_for(20)
+            expect(surface).to_have_css("transform", "matrix(1, 0, 0, 1, -13, 0)")
+            expect(reveal).to_be_visible()
             page.clock.run_for(500)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
             expect(row).not_to_have_class(re.compile(r"\bscale-\[1\.01\]\b"))
@@ -269,7 +285,8 @@ def test_horizontal_swipe_wins_before_hold_while_vertical_motion_yields_to_scrol
         finally:
             cdp.detach()
 
-        expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
+        expect(surface).to_have_css("transform", "matrix(1, 0, 0, 1, 0, 0)")
+        expect(reveal).to_have_count(0)
         assert _unexpected_events(page) == []
     finally:
         context.close()
@@ -334,13 +351,16 @@ def test_lost_pointer_capture_resets_swipe_and_allows_another_swipe(
         link = _row_link(page, session_id)
         expect(link).to_be_visible()
         row = link.locator("xpath=ancestor::li[1]")
+        surface = row.get_by_test_id("conversation-swipe-surface")
+        reveal = row.get_by_test_id("conversation-swipe-reveal")
         x, y = center(link)
 
         cdp = page.context.new_cdp_session(page)
         try:
             touch(cdp, "touchStart", x, y)
             touch(cdp, "touchMove", x - 40, y)
-            expect(row).to_have_class(re.compile(r"\bmx-1\b"))
+            expect(surface).to_have_css("transform", "matrix(1, 0, 0, 1, -40, 0)")
+            expect(reveal).to_be_visible()
             touch(cdp, "touchMove", x - 41, y)
             page.wait_for_function("window.__rowGestureCaptureEvents.length > 0")
             assert page.evaluate("window.__rowGestureCaptureEvents")[0]["target"] == "SPAN"
@@ -367,14 +387,17 @@ def test_lost_pointer_capture_resets_swipe_and_allows_another_swipe(
                 "target": "LI",
                 "trusted": True,
             }
-            expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
+            expect(surface).to_have_css("transform", "matrix(1, 0, 0, 1, 0, 0)")
+            expect(reveal).to_have_count(0)
             touch(cdp, "touchEnd")
 
             touch(cdp, "touchStart", x, y)
             touch(cdp, "touchMove", x - 40, y)
-            expect(row).to_have_class(re.compile(r"\bmx-1\b"))
+            expect(surface).to_have_css("transform", "matrix(1, 0, 0, 1, -40, 0)")
+            expect(reveal).to_be_visible()
             touch(cdp, "touchEnd")
-            expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
+            expect(surface).to_have_css("transform", "matrix(1, 0, 0, 1, 0, 0)")
+            expect(reveal).to_have_count(0)
         finally:
             cdp.detach()
 
