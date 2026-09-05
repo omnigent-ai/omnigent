@@ -7831,6 +7831,15 @@ def _build_evaluation_context(
     hook_harness = (
         supplied_harness if isinstance(supplied_harness, str) and supplied_harness else None
     )
+    # The harness's own approval mode, when a native hook stamped it, so a
+    # policy can gate a session launched with approvals disabled (e.g. Claude
+    # Code's ``bypassPermissions``). Carried through unchanged.
+    supplied_permission_mode = raw_context.get("permission_mode")
+    hook_permission_mode = (
+        supplied_permission_mode
+        if isinstance(supplied_permission_mode, str) and supplied_permission_mode
+        else None
+    )
     structured_data = data if isinstance(data, dict) else {}
     if phase == Phase.TOOL_CALL:
         raw_tool_name = structured_data.get("name")
@@ -7844,6 +7853,7 @@ def _build_evaluation_context(
             actor=actor,
             model=hook_model,
             harness=hook_harness,
+            permission_mode=hook_permission_mode,
         )
     if phase == Phase.TOOL_RESULT:
         tool_result = structured_data.get("result", "")
@@ -7863,6 +7873,7 @@ def _build_evaluation_context(
             actor=actor,
             model=hook_model,
             harness=hook_harness,
+            permission_mode=hook_permission_mode,
         )
     # LLM_REQUEST / LLM_RESPONSE — content is the full request/response dict.
     if phase in (Phase.LLM_REQUEST, Phase.LLM_RESPONSE):
@@ -7872,6 +7883,7 @@ def _build_evaluation_context(
             actor=actor,
             model=hook_model,
             harness=hook_harness,
+            permission_mode=hook_permission_mode,
         )
     # REQUEST / RESPONSE — content is the user/assistant text. The wire ``data``
     # is a dict for every current first-party producer (``{"text"|"content":
@@ -7902,6 +7914,7 @@ def _build_evaluation_context(
         actor=actor,
         model=hook_model,
         harness=hook_harness,
+        permission_mode=hook_permission_mode,
     )
 
 

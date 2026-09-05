@@ -601,6 +601,209 @@ def enforce_sandbox(
     return evaluate
 
 
+# ── Harness permission-bypass enforcement ──────────────────────────────────
+
+# Per-harness flags that disable the harness's own permission prompting.
+# Matched as substrings so an inline ``FOO=bar claude --flag`` is caught too.
+_PERMISSION_BYPASS_FLAGS: tuple[str, ...] = (
+    "--dangerously-skip-permissions",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--yolo",
+)
+
+# Scanning is limited to shell-shaped tools so prose and file contents
+# mentioning a flag aren't flagged as launches.
+_SHELL_TOOL_NAMES = frozenset(
+    {"sys_os_shell", "Bash", "Shell", "bash", "terminal", "execute_code", "developer__shell"}
+)
+
+# Argument keys the shell-shaped tools above use to carry the command string.
+_COMMAND_ARG_KEYS = ("command", "cmd", "script", "input")
+
+
+def deny_harness_permission_bypass(
+    extra_flags: list[str] | None = None,
+) -> PolicyCallable:
+    """Factory: block nested harness launches that skip permission prompts.
+
+    An agent with shell access can otherwise start a second agent with
+    approvals disabled, escaping every guardrail on this session in one
+    shell call.
+
+    Matching is case-insensitive on the command string, so a flag
+    assembled at runtime (from a variable) slips through — this is a
+    backstop for a real sandbox, not a replacement.
+
+    :param extra_flags: Additional bypass spellings to block, merged
+        with the built-in set, e.g. ``["--no-confirm"]``. Defaults to
+        ``None``.
+    :returns: A policy callable that DENYs bypass-flag shell calls.
+    """
+    flags = tuple(_PERMISSION_BYPASS_FLAGS) + tuple(extra_flags or ())
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Scan a shell command for permission-bypass flags.
+
+        :param event: Policy event dict.
+        :returns: DENY when a bypass flag is present, ALLOW otherwise.
+        """
+        if event.get("type") != "tool_call":
+            return _ALLOW
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return _ALLOW
+        if data.get("name", "") not in _SHELL_TOOL_NAMES:
+            return _ALLOW
+
+        args = data.get("arguments")
+        if not isinstance(args, dict):
+            return _ALLOW
+
+        for key in _COMMAND_ARG_KEYS:
+            command = args.get(key)
+            if not isinstance(command, str):
+                continue
+            lowered = command.lower()
+            for flag in flags:
+                if flag in lowered:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            f"Refusing to launch a nested agent with '{flag}', which "
+                            "disables its permission prompts and bypasses the "
+                            "guardrails on this session. Run the agent without "
+                            "the flag, or ask an administrator to grant an exception."
+                        ),
+                    }
+        return _ALLOW
+
+    return evaluate
+
+
+# ── Harness approval-mode enforcement ──────────────────────────────────────
+
+# The mode a harness reports when launched with a permission-bypass flag
+# (``--dangerously-skip-permissions``): prompting is off entirely. Narrower
+# modes such as ``acceptEdits`` still prompt for shell, so they are not
+# denied by default — pass *denied_modes* to include them.
+_PERMISSIVE_PERMISSION_MODES = frozenset({"bypassPermissions"})
+
+
+def deny_permissive_permission_mode(
+    denied_modes: list[str] | None = None,
+) -> PolicyCallable:
+    """Factory: refuse sessions whose harness has approvals disabled.
+
+    Complements :func:`deny_harness_permission_bypass`, which only catches a
+    *nested* launch: this gates the session the policy is running in, using
+    the approval mode a native hook stamps on the event context.
+
+    Denies on every phase the mode is visible, so the session is blocked at
+    its first gated action rather than only on shell calls. Abstains when the
+    mode is absent — web and API sessions never stamp one, and treating
+    unstamped as bypassed would deny every non-native session.
+
+    :param denied_modes: Modes to refuse, e.g.
+        ``["bypassPermissions", "acceptEdits"]``. Defaults to ``None``
+        (``bypassPermissions`` only).
+    :returns: A policy callable that DENYs permissive-mode sessions.
+    """
+    denied = frozenset(denied_modes) if denied_modes else _PERMISSIVE_PERMISSION_MODES
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Check the session's stamped approval mode.
+
+        :param event: Policy event dict.
+        :returns: DENY for a denied mode, ALLOW otherwise.
+        """
+        context = event.get("context")
+        if not isinstance(context, dict):
+            return _ALLOW
+        mode = context.get("permission_mode")
+        if not isinstance(mode, str) or mode not in denied:
+            return _ALLOW
+        return {
+            "result": "DENY",
+            "reason": (
+                f"This session's harness is running in '{mode}' mode, which "
+                "skips the approval prompts this deployment requires. Restart "
+                "it without the permission-bypass flag."
+            ),
+        }
+
+    return evaluate
+
+
+# ── Model allowlisting ─────────────────────────────────────────────────────
+
+
+def restrict_models(
+    denied_models: list[str] | None = None,
+    allowed_models: list[str] | None = None,
+) -> PolicyCallable:
+    """Factory: restrict which models a session may call.
+
+    Fires on ``llm_request`` and matches ``data["model"]``. Removes a
+    model outright, unlike
+    :func:`omnigent.policies.builtins.routing.deny_trivial_to_expensive_model`,
+    which keeps it available for complex work.
+
+    Matching is exact and case-sensitive — a substring rule would make
+    ``prov/model`` silently gate ``prov/model-mini``. *denied_models* is
+    checked first, so a model on both lists is denied.
+
+    :param denied_models: Model ids to refuse, e.g.
+        ``["provider/expensive-model"]``. Defaults to ``None``.
+    :param allowed_models: When non-empty, the only model ids permitted;
+        anything else is denied. Defaults to ``None`` (no allowlist).
+    :returns: A policy callable that DENYs disallowed models.
+    :raises ValueError: If neither list is supplied, which would make
+        the policy a silent no-op.
+    """
+    denied = frozenset(denied_models or ())
+    allowed = frozenset(allowed_models or ())
+    if not denied and not allowed:
+        raise ValueError(
+            "restrict_models requires denied_models, allowed_models, or both; "
+            "with neither it would allow every model."
+        )
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Check the requested model against the configured lists.
+
+        :param event: Policy event dict.
+        :returns: DENY for a disallowed model, ALLOW otherwise.
+        """
+        if event.get("type") != "llm_request":
+            return _ALLOW
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return _ALLOW
+        model = data.get("model")
+        if not isinstance(model, str) or not model:
+            return _ALLOW
+
+        if model in denied:
+            return {
+                "result": "DENY",
+                "reason": (
+                    f"Model '{model}' is not permitted on this deployment. "
+                    "Choose a different model or contact an administrator."
+                ),
+            }
+        if allowed and model not in allowed:
+            return {
+                "result": "DENY",
+                "reason": (
+                    f"Model '{model}' is not on the approved list for this "
+                    f"deployment. Approved models: {', '.join(sorted(allowed))}."
+                ),
+            }
+        return _ALLOW
+
+    return evaluate
+
+
 # ── PII detection on LLM requests ────────────────────────────────────────────
 
 # Built-in PII categories with their regex patterns. The UI shows
@@ -836,6 +1039,77 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                     "items": {"type": "string"},
                     "description": "Env vars to allow through the sandbox "
                     "(null inherits agent's config)",
+                },
+            },
+        },
+    },
+    {
+        "handler": "omnigent.policies.builtins.safety.deny_harness_permission_bypass",
+        "kind": "factory",
+        "name": "Block Nested Permission-Bypass Launches",
+        "description": "Denies shell commands that launch a nested coding agent with a "
+        "flag disabling its permission prompts (--dangerously-skip-permissions, "
+        "--dangerously-bypass-approvals-and-sandbox, --yolo), which would escape this "
+        "session's guardrails. A backstop for a real sandbox, not a replacement.",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "extra_flags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Additional bypass flag spellings to block, "
+                    "merged with the built-in set.",
+                },
+            },
+        },
+    },
+    {
+        "handler": "omnigent.policies.builtins.safety.deny_permissive_permission_mode",
+        "kind": "factory",
+        "name": "Deny Permission-Bypass Sessions",
+        "description": "Denies a session whose own harness was launched with permission "
+        "prompting disabled (bypassPermissions — what --dangerously-skip-permissions "
+        "produces), read from the mode a native hook stamps on the event. Covers the current "
+        "session, where Block Nested Permission-Bypass Launches only covers agents it "
+        "starts. No effect on web / API sessions, which stamp no mode.",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "denied_modes": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["bypassPermissions", "acceptEdits", "plan", "default"],
+                    },
+                    "uniqueItems": True,
+                    "description": "Approval modes to refuse. Leave empty for "
+                    "bypassPermissions only; add acceptEdits to also block "
+                    "auto-approved file writes.",
+                    "default": ["bypassPermissions"],
+                },
+            },
+        },
+    },
+    {
+        "handler": "omnigent.policies.builtins.safety.restrict_models",
+        "kind": "factory",
+        "name": "Restrict Models",
+        "description": "Allowlists or denylists models by exact id on llm_request. Use to "
+        "keep an expensive tier or unapproved provider off a deployment outright; use "
+        "Deny Trivial To Expensive Model instead to keep it available for complex work.",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "denied_models": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Model ids to refuse (checked before the allowlist)",
+                },
+                "allowed_models": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "When set, the only model ids permitted; "
+                    "everything else is denied.",
                 },
             },
         },
