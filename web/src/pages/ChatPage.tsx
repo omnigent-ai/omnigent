@@ -2685,6 +2685,9 @@ function ComposerImpl({
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
+  // "Mobile" is deliberately the canonical layout predicate (not provably
+  // at md+), so the keyboard-suppression boundary tracks the shell's layout
+  // pivot rather than a bespoke 767px threshold.
   const isMobile = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
   const preventsKeyboardSubmit = isMobile || isCoarsePointer;

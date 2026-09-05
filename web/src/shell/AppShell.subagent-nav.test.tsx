@@ -115,9 +115,13 @@ import { childSessionsQueryKey, useChildSessions } from "@/hooks/useChildSession
 import { useSession } from "@/hooks/useSession";
 import { useConversations } from "@/hooks/useConversations";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 beforeEach(() => {
+  vi.stubGlobal("innerWidth", 2000);
   // The rail's open-state persists per session in localStorage; clear it so
   // state written by one test (e.g. a collapse) can't leak into the next.
   localStorage.clear();

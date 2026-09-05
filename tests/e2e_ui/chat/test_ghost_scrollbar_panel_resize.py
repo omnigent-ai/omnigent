@@ -162,7 +162,8 @@ def test_panel_resize_must_not_summon_ghost_scrollbar(
 
     # Drag the panel's left-edge resize handle to widen the panel (narrowing
     # the chat column), sampling the scrollbar state along the way.
-    handle = workspace.locator('[aria-label="Resize panel"]')
+    # The gutter is a flex sibling of the workspace <aside>, not a child.
+    handle = page.get_by_role("separator", name="Resize panel")
     box = handle.bounding_box()
     assert box is not None
     hx = box["x"] + box["width"] / 2

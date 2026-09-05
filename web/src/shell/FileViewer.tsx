@@ -1669,31 +1669,32 @@ function FileViewerBody({
   }
 
   return (
-    <aside
-      ref={setViewerRoot}
-      data-testid="file-viewer"
-      style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
-      className={cn(
-        "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
-        // Mobile (default): fixed full-screen overlay, slide via translate-x.
-        "fixed inset-0 z-50 shadow-lg",
-        open ? "translate-x-0" : "translate-x-full",
-        // Desktop: static flex sibling; inline width from resize hook.
-        "md:relative md:inset-auto md:z-auto md:shadow-none md:translate-x-0 md:shrink-0",
-        open ? "md:border-border md:border-l" : "md:w-0 md:border-l-0",
-      )}
-      aria-hidden={!open}
-      data-collapsed={!open || undefined}
-      inert={!open}
-    >
-      {/* Resize handle — desktop only (mobile is full-screen overlay) */}
-      {isDesktop && (
+    <>
+      {isDesktop && open && (
         <div
           {...handleProps}
-          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
+          className="relative z-10 w-1 shrink-0 self-stretch cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
         />
       )}
-      {open && innerContent}
-    </aside>
+      <aside
+        ref={setViewerRoot}
+        data-testid="file-viewer"
+        style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
+        className={cn(
+          "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
+          // Mobile (default): fixed full-screen overlay, slide via translate-x.
+          "fixed inset-0 z-50 shadow-lg",
+          open ? "translate-x-0" : "translate-x-full",
+          // Desktop: static flex sibling; inline width from resize hook.
+          "md:relative md:inset-auto md:z-auto md:shadow-none md:translate-x-0 md:shrink-0",
+          open ? "md:border-border md:border-l" : "md:w-0 md:border-l-0",
+        )}
+        aria-hidden={!open}
+        data-collapsed={!open || undefined}
+        inert={!open}
+      >
+        {open && innerContent}
+      </aside>
+    </>
   );
 }

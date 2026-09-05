@@ -190,6 +190,15 @@ import {
   writeHideUnconfiguredHarnesses,
 } from "@/lib/harnessVisibilityPreferences";
 import {
+  DEFAULT_SWIPE_ACTIONS,
+  isSwipeAction,
+  type SwipeAction,
+  swipeActions as swipeActionOptions,
+  type SwipeDirection,
+  useSwipeActions,
+  writeSwipeActions,
+} from "@/lib/swipeActionPreferences";
+import {
   applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
@@ -754,6 +763,75 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
+const SWIPE_ACTION_LABELS: Record<SwipeAction, string> = {
+  archive: "Archive",
+  delete: "Delete",
+  none: "None",
+};
+
+/**
+ * Per-device swipe-action preference for session rows on touch devices. Two
+ * selects — one per direction — each mapping a horizontal swipe to Archive,
+ * Delete, or None. Both directions may map to the same action. Delete stays
+ * behind the row's confirm dialog; None makes that direction inert.
+ */
+function SwipeActionsControl() {
+  // Live subscription so the selects reflect writes from anywhere (other tabs,
+  // and the shared source every session row reads). writeSwipeActions notifies.
+  const actions = useSwipeActions();
+  const labelId = useId();
+
+  const choose = useCallback(
+    (direction: SwipeDirection, next: SwipeAction) => {
+      writeSwipeActions({ ...actions, [direction]: next });
+    },
+    [actions],
+  );
+
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Swipe actions"
+      helper="On touch devices, swipe a session row horizontally to run an action. Delete still asks to confirm."
+    >
+      <div className="flex flex-col gap-3">
+        {(["left", "right"] as const).map((direction) => (
+          <div key={direction} className="flex items-center justify-between gap-4">
+            <span className="text-sm">
+              Swipe {direction} <span aria-hidden>{direction === "left" ? "←" : "→"}</span>
+            </span>
+            <Select
+              value={actions[direction]}
+              onValueChange={(next: string) => {
+                if (isSwipeAction(next)) choose(direction, next);
+              }}
+            >
+              <SelectTrigger
+                aria-label={`Swipe ${direction} action`}
+                data-testid={`swipe-action-${direction}`}
+                className="w-40"
+              >
+                <SelectValue>{SWIPE_ACTION_LABELS[actions[direction]]}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {swipeActionOptions.map((action) => (
+                  <SelectItem
+                    key={action}
+                    value={action}
+                    data-testid={`swipe-action-${direction}-${action}`}
+                  >
+                    {SWIPE_ACTION_LABELS[action]}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        ))}
+      </div>
+    </ThemeSubsection>
+  );
+}
+
 function AppearanceSection() {
   // Embedded: the host owns light/dark, so the Mode picker would be a no-op —
   // replace it with a note (plus a link to the host's own theme settings when
@@ -785,6 +863,8 @@ function AppearanceSection() {
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
+    writeSwipeActions(DEFAULT_SWIPE_ACTIONS);
+
     applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
@@ -810,6 +890,7 @@ function AppearanceSection() {
           "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
           "omnigent:hide-unconfigured-harnesses",
+          "omnigent:swipe-actions",
         ]) {
           window.localStorage.removeItem(key);
         }
@@ -894,6 +975,8 @@ function AppearanceSection() {
         <WorkspacePanelDefaultControl />
 
         <HideUnconfiguredHarnessesControl />
+
+        <SwipeActionsControl />
 
         <UiFontSizeControl />
 

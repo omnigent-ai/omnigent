@@ -87,6 +87,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 }));
 
 import { Composer, detectMentionAt, mentionMarkerFor } from "./ChatPage";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   return {
@@ -204,6 +205,12 @@ describe("mentionMarkerFor", () => {
     expect(mentionMarkerFor(null, "a.ts")).toBe("[Attached: a.ts]");
     expect(mentionMarkerFor("some-sdk-harness", "a.ts")).toBe("[Attached: a.ts]");
   });
+});
+
+// Pin a desktop width for every test: the mention browser's keyboard
+// behavior (Enter acts on the highlighted row) is gated off on mobile.
+beforeEach(() => {
+  stubMatchMedia({ width: 1280 });
 });
 
 describe("Composer @-file-mention browser (native sessions)", () => {

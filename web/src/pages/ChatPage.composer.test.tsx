@@ -66,6 +66,7 @@ import {
   SlashCommandMenu,
   slashCommandMatches,
 } from "@/components/SlashCommandMenu";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 // These tests pin the slash-command suggestions menu UX in the composer:
 // (1) the first match is highlighted as soon as the menu opens, so Tab/Enter
@@ -112,21 +113,10 @@ function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
 }
 
+// A coarse pointer at a desktop width, so `useIsMobileViewport` stays false
+// and the test exercises the coarse-pointer branch alone.
 function forceDesktopCoarsePointer(): () => void {
-  const original = window.matchMedia;
-  window.matchMedia = ((query: string) => ({
-    matches: query.includes("pointer: coarse"),
-    media: query,
-    onchange: null,
-    addListener: () => {},
-    removeListener: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    dispatchEvent: () => false,
-  })) as typeof window.matchMedia;
-  return () => {
-    window.matchMedia = original;
-  };
+  return stubMatchMedia({ width: 1280, anyCoarse: true });
 }
 
 /** The currently highlighted menu row, or null when none is highlighted. */
@@ -212,6 +202,13 @@ describe("Composer growth layout", () => {
     );
     expect(ta.parentElement).toHaveClass("overflow-hidden");
   });
+});
+
+// These suites assert desktop composer behavior (mount autofocus,
+// Enter-sends, hover affordances); tests that need a mobile width re-pin it
+// themselves.
+beforeEach(() => {
+  stubMatchMedia({ width: 1280 });
 });
 
 describe("Composer send shortcut", () => {
@@ -1834,6 +1831,15 @@ describe("Composer reply-quote focus", () => {
       />,
     );
     expect(document.activeElement).toBe(ta);
+  });
+
+  // The mobile boundary is the canonical layout predicate (not provably at
+  // md+), not the historical bespoke 767px — 767.5px sits between the two,
+  // so this test pins the migrated boundary: suppression must apply there.
+  it("suppresses mount autofocus at 767.5px (below the canonical md boundary)", () => {
+    stubMatchMedia({ width: 767.5 });
+    render(<Composer {...composerProps()} />);
+    expect(document.activeElement).not.toBe(textarea());
   });
 
   it("does not steal focus when a quote is removed", () => {

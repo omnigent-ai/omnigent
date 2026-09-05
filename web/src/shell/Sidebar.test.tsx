@@ -169,6 +169,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -225,12 +226,15 @@ function renderSidebar(
   open = true,
   initialEntry = "/",
   onOpenSearch?: () => void,
-  info?: ServerInfo,
+  infoOrPeek?: ServerInfo | boolean,
   extensions: ExtensionCatalogItem[] = [],
   onClose = vi.fn(),
+  explicitPeek = false,
 ) {
+  const info = typeof infoOrPeek === "boolean" ? undefined : infoOrPeek;
+  const peek = typeof infoOrPeek === "boolean" ? infoOrPeek : explicitPeek;
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const sidebar = <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />;
+  const sidebar = <Sidebar open={open} peek={peek} onClose={onClose} onOpenSearch={onOpenSearch} />;
   return render(
     <QueryClientProvider client={qc}>
       <ExtensionCatalogProvider extensions={extensions}>
@@ -274,7 +278,24 @@ function closeProjectsMenu() {
   fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
 }
 
+// Evaluate min-/max-width media queries against a simulated viewport width,
+// so each test runs at an explicit real-browser width instead of inheriting
+// the global test-setup mock (which answers false to every query).
+function stubViewportWidth(
+  width: number,
+  anyCoarse = false,
+  coarsePrimary = anyCoarse,
+  canHover = false,
+  anyHover = canHover,
+) {
+  stubMatchMedia({ width, anyCoarse, coarsePrimary, canHover, anyHover });
+}
+
 beforeEach(() => {
+  // Default to a desktop width: these suites assert hover affordances
+  // (session tooltips, project flyouts) that are gated off on mobile. Tests
+  // that need a mobile width re-pin it themselves.
+  stubViewportWidth(1280);
   useConvMock.mockReset();
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
@@ -336,6 +357,87 @@ const TEST_EXTENSION: ExtensionCatalogItem = {
     style_url: null,
   },
 };
+
+describe("Sidebar resize handle geometry", () => {
+  it("positions the seam handle outside flex layout and the clipped content", () => {
+    mockConversations([]);
+    renderSidebar();
+
+    const sidebar = screen.getByLabelText("Conversations");
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    const clippedContent = screen.getByTestId("sidebar-clipped-content");
+
+    expect(handle.parentElement).toBe(sidebar);
+    expect(clippedContent.parentElement).toBe(sidebar);
+    expect(sidebar).toHaveClass("md:flex-row");
+    expect(sidebar).not.toHaveClass("md:overflow-hidden");
+    expect(clippedContent).toHaveClass("md:overflow-hidden");
+    expect(handle).toHaveClass("md:absolute", "md:inset-y-0");
+    expect(handle).not.toHaveClass("shrink-0", "md:order-2");
+    expect(clippedContent).not.toHaveClass("md:order-1");
+  });
+
+  it("anchors the hit box at the seam without reserving flex space", () => {
+    mockConversations([conv("edge-session", "Claude Code")]);
+    renderSidebar();
+
+    // Effective offsets, not class names: the border box's right edge sits at
+    // seam + |insetInlineEnd|, so the hit box spans
+    // [seam − inward reach, seam + outward reach] with the 4px painted strip
+    // flush at the seam (outward reach − end padding = 0). Margins must stay
+    // absent — on an absolutely positioned right-anchored box a negative
+    // marginInlineStart is absorbed by the auto left inset and shifts the
+    // whole box inward over the rows' hover kebab.
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    expect(handle.style.paddingInlineStart).toBe("5px");
+    expect(handle.style.paddingInlineEnd).toBe("11px");
+    expect(handle.style.insetInlineEnd).toBe("-11px");
+    expect(handle.style.marginInlineStart).toBe("");
+    expect(handle.style.marginInlineEnd).toBe("");
+    const outwardReach = -Number.parseFloat(handle.style.insetInlineEnd);
+    const boxWidth =
+      Number.parseFloat(handle.style.paddingInlineStart) +
+      4 +
+      Number.parseFloat(handle.style.paddingInlineEnd);
+    expect(outwardReach).toBeLessThanOrEqual(11);
+    expect(boxWidth - outwardReach).toBeLessThanOrEqual(9); // inward reach clears the kebab
+    expect(outwardReach - Number.parseFloat(handle.style.paddingInlineEnd)).toBe(0);
+    expect(handle).toHaveClass("md:absolute");
+    expect(handle).not.toHaveClass("md:right-0");
+    expect(screen.getByText("edge-session")).not.toBe(handle);
+  });
+
+  it("keeps the painted separator strip unchanged", () => {
+    mockConversations([]);
+    renderSidebar();
+
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    expect(handle).toHaveClass(
+      "z-10",
+      "hidden",
+      "w-1",
+      "cursor-col-resize",
+      "transition-colors",
+      "hover:bg-primary/30",
+      "active:bg-primary/50",
+      "md:absolute",
+      "md:inset-y-0",
+      "md:block",
+    );
+    expect(handle).not.toHaveClass("absolute", "inset-y-0", "right-0");
+    expect(handle.style.width).toBe("");
+    expect(handle.style.backgroundClip).toBe("content-box");
+  });
+
+  it("restores desktop overflow clipping for the rounded peek card", () => {
+    mockConversations([]);
+    renderSidebar(false, "/", undefined, true);
+
+    const sidebar = screen.getByLabelText("Conversations");
+    expect(sidebar).toHaveClass("is-peek", "rounded-xl", "md:overflow-hidden");
+    expect(screen.queryByTestId("sidebar-resize-handle")).toBeNull();
+  });
+});
 
 describe("Sidebar session list", () => {
   it("uses the interface text token for the empty session-list state", () => {
@@ -418,13 +520,14 @@ describe("Sidebar session list", () => {
     // as desktop; only desktop hover widens it for the revealed controls.
     expect(row).toHaveClass("pr-2");
     expect(row.className).not.toMatch(/(?:^|\s)pr-28(?:\s|$)/);
-    expect(row.className).toContain("md:group-hover:pr-20");
+    expect(row.className).toContain("fine-hover:md:group-hover:pr-20");
     // Keyed on `:focus-visible`, matching when the trailing controls appear and
     // the state marker fades. `focus-within` would also fire for a plain click,
     // narrowing the reserve on the selected row while the marker stayed put.
-    expect(row.className).toContain("md:group-has-[:focus-visible]:pr-20");
+    expect(row.className).toContain("fine-hover:md:group-has-[:focus-visible]:pr-20");
     expect(row.className).not.toContain("md:group-focus-within:pr-20");
     expect(row.className).not.toMatch(/(?:^|\s)md:pr-20(?:\s|$)/);
+    expect(row.className).not.toMatch(/(?:^|\s)fine-hover:md:pr-20(?:\s|$)/);
   });
 
   it("narrows the awaiting row's reserve on the same trigger that fades its tag", () => {
@@ -466,6 +569,36 @@ describe("Sidebar session list", () => {
 
     const slot = screen.getByTestId("session-state-badge").parentElement!;
     expect(slot).toHaveClass("right-1", "w-6", "justify-center");
+  });
+
+  it("shifts a row's dot marker clear of the persistent touch-tablet controls", () => {
+    // On a hover-incapable md+ device the pin + kebab stay visible (there is
+    // no hover to reveal them), so the badge can't share their right-1 anchor:
+    // it moves left of the control column (right-20) instead of being
+    // hover-faded away, and the row reserves width for both persistently.
+    mockConversations([
+      conv("conv_running", "Claude Code", { title: "Running row", status: "running" }),
+    ]);
+    renderSidebar();
+
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(slot).toHaveClass("no-fine-hover:md:right-20");
+    const row = screen.getByRole("link", { name: /Running row/ });
+    expect(row.className).toContain("no-fine-hover:md:pr-27");
+    // The fades and the hover reserve are gated the same way as the reveals,
+    // so a tap's sticky :hover or a keyboard focus on the persistent controls
+    // neither hides the badge nor collapses the reserve under it.
+    expect(slot).toHaveClass(
+      "fine-hover:md:group-hover:opacity-0",
+      "fine-hover:md:group-has-[:focus-visible]:opacity-0",
+    );
+    expect(slot).not.toHaveClass(
+      "md:group-hover:opacity-0",
+      "md:group-has-[:focus-visible]:opacity-0",
+    );
+    expect(row.className).not.toMatch(
+      /(?:^|\s)md:group-(?:hover|has-\[:focus-visible\]):pr-20(?:\s|$)/,
+    );
   });
 
   it("does not constrain a row's awaiting pill to the dot slot", () => {
@@ -797,10 +930,10 @@ describe("Sidebar session list", () => {
     expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
     expect(selectSessions.parentElement).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
+      "fine-hover:md:opacity-0",
+      "fine-hover:md:group-hover/header:opacity-100",
+      "fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
+      "fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
 
     const filterSessions = within(sessionsSection!).getByRole("button", {
@@ -869,6 +1002,7 @@ describe("Sidebar session list", () => {
   });
 
   it("closes the mobile sidebar when an extension nav row is selected", () => {
+    stubViewportWidth(375);
     mockConversations(THREE_TYPE_CONVERSATIONS);
     const onClose = vi.fn();
     renderSidebar(true, "/", undefined, undefined, [TEST_EXTENSION], onClose);
@@ -1635,9 +1769,10 @@ describe("Sidebar project sections", () => {
   });
 
   it("closes the mobile overlay when the project pencil is tapped", () => {
-    // jsdom's matchMedia mock reports non-desktop, so isMobileViewport() is
-    // true: a plain pencil tap must close the full-screen sidebar overlay,
-    // otherwise the pre-filed new-session page is left hidden behind it.
+    // At a phone width isMobileViewport() is true: a plain pencil tap must
+    // close the full-screen sidebar overlay, otherwise the pre-filed
+    // new-session page is left hidden behind it.
+    stubViewportWidth(375);
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -1905,7 +2040,7 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     const pencil = screen.getByTestId("project-new-session");
-    expect(pencil).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:flex");
+    expect(pencil).toHaveClass("hidden", "fine-hover:flex");
     // Genuinely absent on touch — not merely clipped — so it leaves the a11y
     // tree and tab order, unlike the kebab.
     // Separate assertions: toHaveClass with multiple classes only fails when
@@ -1922,11 +2057,7 @@ describe("Sidebar project sections", () => {
       ctrlKey: false,
     });
     const menuItem = await screen.findByTestId("project-new-session-menu");
-    for (const hiddenClass of [
-      "hidden",
-      "md:hidden",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:hidden",
-    ]) {
+    for (const hiddenClass of ["hidden", "md:hidden", "fine-hover:md:hidden"]) {
       expect(menuItem).not.toHaveClass(hiddenClass);
     }
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
@@ -1947,11 +2078,7 @@ describe("Sidebar project sections", () => {
     const kebab = screen.getByTestId("project-actions");
     // sr-only at rest; revealed only where a fine hover pointer exists, at ANY
     // width — no md gate that would drop it on a narrow hover desktop.
-    expect(kebab).toHaveClass(
-      "sr-only",
-      "[@media((hover:hover)_and_(pointer:fine))]:not-sr-only",
-      "[@media((hover:hover)_and_(pointer:fine))]:flex",
-    );
+    expect(kebab).toHaveClass("sr-only", "fine-hover:not-sr-only", "fine-hover:flex");
     // Never display:none — that would strip it from the a11y tree and tab order
     // on touch, where the long-press contextmenu isn't reliably dispatched.
     expect(kebab).not.toHaveClass("hidden");
@@ -2005,8 +2132,8 @@ describe("Sidebar project sections", () => {
     // Opacity reveal is capability-gated with NO md: hidden at rest, shown on
     // hover, at every width for a fine hover pointer.
     expect(revealWrapper).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-100",
+      "fine-hover:opacity-0",
+      "fine-hover:group-hover/header:opacity-100",
     );
     for (const cls of revealWrapper.classList) {
       expect(cls).not.toMatch(/:md:opacity-0$/);
@@ -2016,8 +2143,8 @@ describe("Sidebar project sections", () => {
     // narrow hover desktop doesn't let an invisible control swallow the tap.
     const outerBox = kebab.closest("div[class*=absolute]")!;
     expect(outerBox).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:pointer-events-none",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:pointer-events-auto",
+      "fine-hover:pointer-events-none",
+      "fine-hover:group-hover/header:pointer-events-auto",
     );
     for (const cls of outerBox.classList) {
       expect(cls).not.toMatch(/:md:pointer-events-none$/);
@@ -2095,12 +2222,12 @@ describe("Sidebar collapsed project marker", () => {
     // the rows' right edge.
     expect(slot).toHaveClass("-mr-1");
     expect(slot).not.toHaveClass("mr-14");
-    expect(slot).not.toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1");
+    expect(slot).not.toHaveClass("fine-hover:md:-mr-1");
     // The hover-driven fades track the fine-hover reveal (hover only exists on
     // fine), so they stay pointer-gated with no md.
     expect(slot).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0",
+      "fine-hover:group-hover/section:opacity-0",
+      "fine-hover:group-has-[[data-state=open]]/header:opacity-0",
     );
     // The focus-within fade tracks the pointer-UNgated focus-visible reveal, so
     // it is ungated too: a coarse-pointer tablet + keyboard can focus the kebab,
@@ -2108,13 +2235,42 @@ describe("Sidebar collapsed project marker", () => {
     // it. Asserted separately below (it must NOT carry the pointer/hover gate).
     expect(slot).toHaveClass("group-has-[[data-header-controls]:focus-within]/header:opacity-0");
     expect(slot).not.toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
+      "fine-hover:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
     );
     // No width-gated fade survives for a hover-only action — that mismatch is
     // the narrow-hover overlap regression.
     for (const cls of slot.classList) {
       expect(cls).not.toMatch(/:md:group-(hover|has-).*opacity-0$/);
     }
+  });
+
+  it("keeps the marker hidden while an open project menu is outside the header", async () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_running", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    const trigger = screen.getByRole("button", { name: "Project actions for Customer X" });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    await screen.findByTestId("rename-project");
+
+    fireEvent.pointerLeave(header.closest("section")!);
+    fireEvent.blur(trigger);
+    expect(trigger).toHaveAttribute("data-state", "open");
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    const markerGroup = slot.closest<HTMLElement>('[class~="group/header"]');
+    const triggerGroup = trigger.closest<HTMLElement>('[class~="group/header"]');
+    expect(markerGroup).not.toBeNull();
+    expect(triggerGroup).toBe(markerGroup);
+    expect(markerGroup).toHaveClass("group/header");
+    expect(markerGroup).toContainElement(trigger);
+    expect(markerGroup).toContainElement(slot);
+    expect(slot).toHaveClass("fine-hover:group-has-[[data-state=open]]/header:opacity-0");
   });
 
   // The "awaiting" pill is wider than the dot markers; constraining it to the
@@ -2222,9 +2378,9 @@ describe("Sidebar pin marker visibility", () => {
 
     const pinned = screen.getByText("Pinned").closest("section")!;
     const pinButton = within(pinned).getByTestId("quick-pin-conversation");
-    // Hover-gated like every other row (no persistent opacity-100 marker), and
-    // the control unpins.
-    expect(pinButton.className).toContain("md:opacity-0");
+    // Hover-gated like every other row (no persistent opacity-100 marker) —
+    // only where hover exists — and the control unpins.
+    expect(pinButton.className).toContain("fine-hover:md:opacity-0");
     expect(pinButton).toHaveAttribute("aria-label", "Unpin conversation");
   });
 
@@ -2233,8 +2389,9 @@ describe("Sidebar pin marker visibility", () => {
     renderSidebar();
 
     const pinButton = screen.getByTestId("quick-pin-conversation");
-    // Unpinned: hover-gated reveal (opacity-0 until group-hover).
-    expect(pinButton.className).toContain("md:opacity-0");
+    // Unpinned: hover-gated reveal (opacity-0 until group-hover), gated on
+    // hover capability so touch tablets keep the control visible.
+    expect(pinButton.className).toContain("fine-hover:md:opacity-0");
   });
 });
 

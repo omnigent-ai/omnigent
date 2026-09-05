@@ -1,7 +1,11 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
+import {
+  resetWidthStoreForTesting,
+  useResizableInlinePanel,
+} from "@/hooks/useResizableInlinePanel";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
@@ -57,6 +61,7 @@ const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 afterEach(() => {
   cleanup();
+  resetWidthStoreForTesting();
   vi.clearAllMocks();
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
   useCreateTerminalMock.mockReturnValue({
@@ -86,6 +91,7 @@ function renderWorkspace(
     selectedTerminalKey?: string | null;
     maximized?: boolean;
     liveness?: SessionLiveness;
+    handleProps?: React.HTMLAttributes<HTMLDivElement> & { tabIndex: number };
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -99,7 +105,7 @@ function renderWorkspace(
       <WorkspacePanel
         conversationId="conv_ws"
         width={360}
-        handleProps={{ tabIndex: 0 }}
+        handleProps={overrides.handleProps ?? { tabIndex: 0 }}
         rightRailTab={overrides.rightRailTab ?? "files"}
         onRightRailTabChange={onRightRailTabChange}
         showFilesPanel
@@ -718,5 +724,76 @@ describe("WorkspacePanel browser tab", () => {
     expect(screen.getByTestId("browser-pane-stub")).toBeInTheDocument();
     // And the file scope views are not mounted in that branch.
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+  });
+});
+
+// ── Resize handle geometry ────────────────────────────────────────────────────
+
+describe("WorkspacePanel resize handle geometry", () => {
+  it("renders the hook's resize target as a real flex gutter", () => {
+    const resize = renderHook(() => useResizableInlinePanel(null));
+    renderWorkspace({
+      handleProps: resize.result.current.handleProps,
+    });
+
+    const panel = screen.getByRole("complementary", { name: "Workspace" });
+    const separator = screen.getByRole("separator", { name: "Resize panel" });
+
+    expect(separator).toHaveAttribute("data-workspace-panel-resize-gutter");
+    expect(separator.nextElementSibling).toBe(panel);
+    expect(panel).toHaveClass("md:overflow-hidden");
+    expect(panel).not.toContainElement(separator);
+    expect(separator).not.toHaveClass("md:absolute", "md:inset-y-0");
+    expect(separator).toHaveClass("relative", "z-50");
+    expect(panel).toHaveClass("z-40");
+    expect(separator).toHaveClass("shrink-0");
+    expect(separator.style.right).toBe("");
+  });
+
+  it("enforces the shipped gutter's footprint and seam-ownership caps", () => {
+    const resize = renderHook(() => useResizableInlinePanel(null));
+    renderWorkspace({
+      handleProps: resize.result.current.handleProps,
+    });
+
+    const separator = screen.getByRole("separator", { name: "Resize panel" });
+    const painted = 4;
+    const padding =
+      parseFloat(separator.style.paddingLeft) + parseFloat(separator.style.paddingRight);
+    const margins =
+      parseFloat(separator.style.marginLeft) + parseFloat(separator.style.marginRight);
+    expect(painted + padding).toBeGreaterThanOrEqual(24);
+    expect(painted + padding + margins).toBeGreaterThanOrEqual(10);
+    expect(painted + padding + margins).toBeLessThanOrEqual(12);
+    expect(-parseFloat(separator.style.marginLeft)).toBeLessThanOrEqual(6);
+    expect(-parseFloat(separator.style.marginRight)).toBeLessThanOrEqual(8);
+  });
+
+  it("keeps the visible resize strip byte-identical", () => {
+    const resize = renderHook(() => useResizableInlinePanel(null));
+    renderWorkspace({
+      handleProps: resize.result.current.handleProps,
+    });
+
+    const separator = screen.getByRole("separator", { name: "Resize panel" });
+    expect(separator.className).toBe(
+      "relative z-50 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block",
+    );
+    expect(separator.style.boxSizing).toBe("content-box");
+    expect(separator.style.backgroundClip).toBe("content-box");
+  });
+
+  it("does not render the gutter when the hook marks it hidden", () => {
+    renderWorkspace({
+      handleProps: {
+        tabIndex: 0,
+        role: "separator",
+        "aria-label": "Resize panel",
+        "aria-disabled": true,
+        hidden: true,
+      },
+    });
+
+    expect(screen.queryByRole("separator", { name: "Resize panel" })).toBeNull();
   });
 });

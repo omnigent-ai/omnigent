@@ -355,6 +355,20 @@ function clearIOSViewport(): void {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+describe("FileViewer resize handle geometry", () => {
+  it("renders the handle as the panel's unclipped boundary sibling", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true });
+    const handle = screen.getByRole("separator", { name: "Resize panel" });
+    const panel = screen.getByTestId("file-viewer");
+
+    expect(handle.nextElementSibling).toBe(panel);
+    expect(panel.contains(handle)).toBe(false);
+    expect(handle.closest(".overflow-hidden, .overflow-auto, .overflow-y-auto")).toBeNull();
+    expect(handle.className).toMatch(/\bz-10\b/);
+  });
+});
+
 // The mobile viewer is a `fixed inset-0` overlay that the iOS shell-lock (which
 // only resizes flow content inside .app-shell) can't lift above the soft
 // keyboard. It pads its own bottom by the keyboard inset so the comments panel

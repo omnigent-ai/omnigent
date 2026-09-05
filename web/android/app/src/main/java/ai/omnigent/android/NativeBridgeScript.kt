@@ -158,7 +158,12 @@ object NativeBridgeScript {
                 // (overlays) Back should dismiss; at md+ they dock as persistent
                 // rails (md:relative md:translate-x-0, still data-state="open")
                 // that Back must NOT close. Modal dialogs dismiss at any width.
-                const narrow = window.innerWidth < 768;
+                // The web layer owns the breakpoint (web/src/lib/breakpoints.ts)
+                // and publishes it as __omnigentIsMobileViewport; the inline
+                // check is a fallback for older web builds without the signal.
+                const narrow = typeof window.__omnigentIsMobileViewport === "function"
+                  ? !!window.__omnigentIsMobileViewport()
+                  : window.innerWidth < 768;
                 // 1. Conversations sidebar (a drawer only when narrow; closed =
                 // data-collapsed).
                 if (narrow) {
