@@ -953,6 +953,20 @@ def register_hooks_routes(
         add_audit_attrs(policy_verdict=resp_body["result"], policy_phase=phase.value)
         if result.reason:
             add_audit_attrs(policy_reason=result.reason)
+        # Emit a structured log for non-ALLOW verdicts so operators can diagnose
+        # policy evaluation failures without needing audit-log access.
+        if result.action in (PolicyAction.DENY, PolicyAction.ASK):
+            _logger.info(
+                "policy_eval_verdict: session=%s phase=%s action=%s "
+                "policy=%s reason=%r tool=%s",
+                session_id,
+                phase.value,
+                result.action.value,
+                result.deciding_policy,
+                result.reason,
+                (data.get("name") if isinstance(data, dict) else None),
+                extra={"session_id": session_id},
+            )
         _policy_tool = data.get("name") if isinstance(data, dict) else None
         if _policy_tool:
             add_audit_attrs(policy_tool=_policy_tool)

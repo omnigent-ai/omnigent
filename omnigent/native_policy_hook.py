@@ -21,6 +21,7 @@ model sees it).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import shlex
@@ -30,6 +31,8 @@ from collections.abc import Callable, Mapping
 from typing import NotRequired, TypedDict
 
 import httpx
+
+_log = logging.getLogger(__name__)
 
 # How long to keep retrying transient 5xx / connect errors on the
 # policy evaluate POST before failing closed. Keeps the pre-execution
@@ -610,7 +613,16 @@ def post_evaluate_with_retry(
                             "(login redirect/401); re-minted token and retrying",
                             file=sys.stderr,
                         )
+                        _log.info(
+                            "policy_eval_reauth: hook=%s token_refreshed=true",
+                            hook_label,
+                        )
                         continue
+                    _log.warning(
+                        "policy_eval_reauth_failed: hook=%s "
+                        "token_refresh_returned_no_token=true; will fail-closed",
+                        hook_label,
+                    )
                 resp.raise_for_status()
                 return resp, None
         except httpx.HTTPStatusError as exc:
@@ -651,7 +663,13 @@ def post_evaluate_with_retry(
                 f"omnigent {hook_label}: retry budget exhausted",
                 file=sys.stderr,
             )
-            return None, f"retry budget exhausted (last error: {last_error})"
+            final_error = f"retry budget exhausted (last error: {last_error})"
+            _log.warning(
+                "policy_eval_budget_exhausted: hook=%s last_error=%r",
+                hook_label,
+                last_error,
+            )
+            return None, final_error
         # Two-step backoff; not worth a retry library in this dependency-light hook.
         time.sleep(backoff_s)
         backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)

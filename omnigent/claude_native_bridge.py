@@ -4765,9 +4765,33 @@ def _tool_relay_handler_factory(
                     last_error = "malformed EvaluationResponse body"
                 break
             if not isinstance(verdict, dict) or not verdict.get("result"):
+                _logger.warning(
+                    "policy_eval_relay_failure: session=%s hook_event=%s "
+                    "attempts=3 last_error=%r; falling back to fail-closed",
+                    session_id,
+                    hook_event,
+                    last_error,
+                    extra={"session_id": session_id},
+                )
                 self._respond_hook_output(fail_closed_hook_output(hook_event, last_error))
                 return
-            self._respond_hook_output(evaluation_response_to_hook_output(hook_event, verdict))
+            hook_output = evaluation_response_to_hook_output(hook_event, verdict)
+            decision = (
+                (hook_output or {}).get("hookSpecificOutput", {}).get("permissionDecision")
+                or (hook_output or {}).get("decision")
+            )
+            if decision in ("deny", "ask", "block"):
+                _logger.info(
+                    "policy_eval_relay_verdict: session=%s hook_event=%s "
+                    "decision=%s result=%s reason=%r",
+                    session_id,
+                    hook_event,
+                    decision,
+                    verdict.get("result"),
+                    verdict.get("reason"),
+                    extra={"session_id": session_id},
+                )
+            self._respond_hook_output(hook_output)
 
         def _handle_policy_evaluate(self, payload: _JsonObject) -> None:
             if policy_client is None or session_id is None:
