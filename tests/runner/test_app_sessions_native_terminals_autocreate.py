@@ -313,6 +313,152 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     assert "databricks auth login" in data["item_data"]["message"]
 
 
+class _PiLaunchRecordingRegistry:
+    """Fake resource registry that records the pi terminal launch spec."""
+
+    terminal_registry = None
+
+    def __init__(self, captured: dict[str, Any]) -> None:
+        self._captured = captured
+
+    async def launch_required_terminal(
+        self, *, session_id: str, terminal_name: str, **kwargs: Any
+    ) -> SessionResourceView:
+        del terminal_name
+        self._captured["spec"] = kwargs.get("spec")
+        return SessionResourceView(
+            id="terminal_pi_main",
+            type="terminal",
+            session_id=session_id,
+            name="pi:main",
+            metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+        )
+
+
+async def _launch_pi_with_model_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    model_override: str,
+    config: dict[str, Any],
+) -> list[str]:
+    """Run the pi-native auto-create against *config* and return the launch args.
+
+    Drives the real provider resolution (hermetic ``config`` via a wrapped
+    ``resolve_pi_native_provider``) so the ``--provider``/``--model`` launch
+    decision under test is production code, not a stub.
+    """
+    import omnigent.pi_native as pi_native
+    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.pi_native_credentials as pi_native_credentials
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    real_resolve = pi_native_credentials.resolve_pi_native_provider
+    monkeypatch.setattr(
+        pi_native_credentials,
+        "resolve_pi_native_provider",
+        lambda **kwargs: real_resolve(config_loader=lambda: config, **kwargs),
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+            model_override=model_override,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+    await _auto_create_pi_terminal(
+        "47f049b9d13df4db397c7f46859b825f",
+        _PiLaunchRecordingRegistry(captured),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    args = captured["spec"].args
+    assert isinstance(args, list)
+    return args
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_passes_unmanaged_picker_reference_through(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A picker reference to Pi's own provider survives a relaunch verbatim.
+
+    A pi-native session pinned to ``openai-codex/gpt-5.6-sol`` (a model served
+    by Pi's own openai-codex login, not by the configured ``default: pi``
+    gateway) is cold-resumed. Funneling the selection through the configured
+    provider used to relaunch Pi with ``--provider omnigent --model
+    omnigent/openai-codex/gpt-5.6-sol`` — an id no endpoint serves, so the
+    next message 400s and the model picker collapses to that single mangled
+    entry. The relaunch must pass the reference through to Pi unchanged and
+    leave provider selection to Pi's own catalog.
+    """
+    config = {
+        "providers": {
+            "openrouter": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "sk-or-testkey",
+                    "wire_api": "chat",
+                },
+            }
+        }
+    }
+
+    args = await _launch_pi_with_model_override(
+        tmp_path, monkeypatch, model_override="openai-codex/gpt-5.6-sol", config=config
+    )
+
+    assert "omnigent/openai-codex/gpt-5.6-sol" not in args
+    assert "--provider" not in args
+    assert args[args.index("--model") + 1] == "openai-codex/gpt-5.6-sol"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_routes_managed_picker_selection_through_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed-qualified picker value keeps routing through the provider.
+
+    ``omnigent/<model>`` explicitly selects the configured provider's catalog
+    — including gateway ids that themselves contain slashes — so the relaunch
+    must still resolve the managed provider and launch with its qualified
+    reference, not treat the value as one of Pi's own providers.
+    """
+    config = {
+        "providers": {
+            "openrouter": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "sk-or-testkey",
+                    "wire_api": "chat",
+                    "models": {"default": "openai/gpt-4o-mini"},
+                },
+            }
+        }
+    }
+
+    args = await _launch_pi_with_model_override(
+        tmp_path, monkeypatch, model_override="omnigent/openai/gpt-4o-mini", config=config
+    )
+
+    assert args[args.index("--provider") + 1] == "omnigent"
+    assert args[args.index("--model") + 1] == "omnigent/openai/gpt-4o-mini"
+
+
 @pytest.mark.asyncio
 async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolated_env(
     tmp_path: Path,

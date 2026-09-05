@@ -143,6 +143,35 @@ def _split_pi_native_model_selection(selection: str | None) -> tuple[str, str] |
     return None
 
 
+def is_unmanaged_pi_model_reference(selection: str | None) -> bool:
+    """Whether *selection* references a Pi provider Omnigent does not manage.
+
+    The pi-native picker stores live Pi model references (``provider/model``,
+    as the resident extension reports them). A reference such as
+    ``openai-codex/gpt-5.6-sol`` names one of Pi's OWN providers (e.g. its
+    openai-codex OAuth login): funneling it through the configured default
+    provider would rewrite it into the generated ``omnigent`` namespace — an
+    id no endpoint serves — so the launch passes it to Pi verbatim instead.
+
+    Only a session's persisted picker selection has these reference
+    semantics. A spec/config-sourced model id keeps bare-id routing through
+    :func:`resolve_pi_native_provider` even when slash-shaped (a gateway id
+    like ``zai-org/GLM-4.7``), so callers must gate on the value's origin.
+
+    :param selection: A persisted picker value, e.g.
+        ``"openai-codex/gpt-5.6-sol"`` or ``"omnigent/claude-opus-4-7"``.
+    :returns: ``True`` for a ``provider/model`` reference whose provider is
+        outside the managed set; ``False`` for managed references, bare model
+        ids, and empty values.
+    """
+    if not selection:
+        return False
+    provider_id, separator, model_id = selection.partition("/")
+    return bool(separator and provider_id and model_id) and (
+        provider_id not in _PI_MANAGED_PROVIDER_IDS
+    )
+
+
 class _PiProviderCompat(TypedDict, total=False):
     supportsDeveloperRole: bool
     supportsStore: bool
