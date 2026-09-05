@@ -4151,6 +4151,14 @@ def run_host_process(
     configure_host_gh(server_url, identity.host_id)
     start_host_gh_refresh(server_url, identity.host_id)
 
+    # Executor-agnostic Databricks setup: when the owner has linked a workspace,
+    # materialize their per-user token as a ``~/.databrickscfg`` profile so the
+    # agent's model serving + MCP route through their Databricks AI Gateway.
+    # Best-effort; a no-op when Databricks isn't connected/configured.
+    from omnigent.host.databricks_credential import configure_host_databricks
+
+    configure_host_databricks(server_url, identity.host_id)
+
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
     host = HostProcess(identity, server_url, lifecycle_lock=lifecycle_lock)
