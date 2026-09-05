@@ -2198,11 +2198,9 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("renders the inline command as a chip, not bare amber text", () => {
-    // Regression for #3987. The <code> commands in the flag-off guidance used
-    // to be bare, so Tailwind's preflight gave them nothing but the mono family
-    // and they inherited the notice's amber with no fill — the command, the one
-    // thing the user has to copy, was the least distinguished part of the
-    // sentence.
+    // The <code> commands in the flag-off guidance used to be bare, so they
+    // inherited the notice's amber with no fill and the command — the one
+    // thing the user has to copy — was the least distinguished part.
     mockHosts([
       { ...host("online"), configured_harnesses: { "codex-native": "needs-auth" } } as Host,
     ]);
