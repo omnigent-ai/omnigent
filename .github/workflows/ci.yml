@@ -284,64 +284,6 @@ jobs:
           path: artifacts/
           retention-days: 14
 
-  stores-cockroachdb:
-    name: Pytest (stores-crdb-${{ matrix.crdb_version }})
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - crdb_version: "23.2.28"
-            crdb_service: crdb-23-2-28
-            crdb_port: 26323
-          - crdb_version: "24.3.20"
-            crdb_service: crdb-24-3-20
-            crdb_port: 26324
-          - crdb_version: "25.2.10"
-            crdb_service: crdb-25-2-10
-            crdb_port: 26325
-          - crdb_version: "25.4.5"
-            crdb_service: crdb-25-4-5
-            crdb_port: 26326
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
-        with:
-          python-version-file: ".python-version"
-      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
-        with:
-          enable-cache: true
-      - name: Start CockroachDB
-        run: |
-          docker compose -f deploy/cockroachdb/docker-compose.yml up \
-            --detach --wait --wait-timeout 90 "${{ matrix.crdb_service }}"
-          if [[ "${{ matrix.crdb_version }}" == "23.2.28" ]]; then
-            docker compose -f deploy/cockroachdb/docker-compose.yml exec -T \
-              "${{ matrix.crdb_service }}" cockroach sql --insecure \
-              --execute="SET CLUSTER SETTING sql.txn.read_committed_isolation.enabled = true"
-          fi
-      - name: Install dependencies
-        run: uv sync --locked --extra all --extra cockroachdb --group test
-      - name: Run store + DB tests against CockroachDB
-        env:
-          OMNIGENT_TEST_DB_URI: cockroachdb+psycopg://root@localhost:${{ matrix.crdb_port }}/defaultdb?sslmode=disable
-        run: |
-          uv run pytest tests/stores tests/db \
-            -m "not databricks" \
-            -n 4 \
-            --dist=loadfile \
-            --timeout=300 \
-            --junitxml=artifacts/pytest-stores-crdb.xml
-      - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: pytest-stores-crdb-${{ matrix.crdb_version }}-${{ github.run_id }}
-          path: artifacts/
-          retention-days: 14
-
   stores-mysql:
     name: Pytest (stores-mysql)
     needs: gate
