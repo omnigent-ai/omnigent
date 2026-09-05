@@ -911,8 +911,14 @@ class ErrorDetail(BaseModel):
     """
     Machine-readable error information attached to a failed response.
 
+    Session-status failure codes include ``runner_disconnected`` (tunnel
+    close or newest-wins replacement — recoverable on reconnect) and
+    ``session_stream_lost`` (SSE stream failed while the runner tunnel is
+    still registered).
+
     :param code: Error code string, e.g. ``"server_error"``,
-        ``"invalid_input"``.
+        ``"invalid_input"``, ``"runner_disconnected"``,
+        ``"session_stream_lost"``.
     :param message: Human-readable error description. Always populated; older
         clients render this verbatim.
     :param title: Optional short headline naming what went wrong, e.g.

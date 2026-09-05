@@ -1052,6 +1052,7 @@ async def _reconnect_fires_connect_hook(
     fake_pm: Any,
     *,
     wait_for_recover: str,
+    unready_sessions: set[str] | None = None,
 ) -> AsyncIterator[list[str]]:
     """Drive a real tunnel disconnect/reconnect so ``_on_runner_connect`` fires.
 
@@ -1069,6 +1070,7 @@ async def _reconnect_fires_connect_hook(
     """
     from omnigent.runner.routing import RoutedRunner
     from omnigent.server.routes import sessions as sessions_routes
+    from omnigent.server.routes._sessions.common import _RelayHandle
 
     router = ap_app.state.runner_router
     real_resolver = router.client_for_session_resources
@@ -1090,9 +1092,18 @@ async def _reconnect_fires_connect_hook(
     router.client_for_session_resources = _spy_resolver  # type: ignore[method-assign]
 
     real_ensure = sessions_routes._ensure_runner_relay
+    stub_handles: list[tuple[str, _RelayHandle]] = []
 
     def _stub_ensure(sid, rid, client, store=None):  # type: ignore[no-untyped-def]
-        return None
+        del client, store
+        ready = asyncio.Event()
+        if unready_sessions is None or sid not in unready_sessions:
+            ready.set()
+        task = asyncio.create_task(asyncio.Event().wait())
+        handle = _RelayHandle(runner_id=rid, task=task, ready=ready)
+        sessions_routes._runner_relay_tasks[sid] = handle
+        stub_handles.append((sid, handle))
+        return handle
 
     sessions_routes._ensure_runner_relay = _stub_ensure  # type: ignore[assignment]
 
@@ -1152,6 +1163,12 @@ async def _reconnect_fires_connect_hook(
         router.client_for_session_resources = real_resolver  # type: ignore[method-assign]
         sessions_routes._ensure_runner_relay = real_ensure  # type: ignore[assignment]
         sessions_routes._publish_runner_recovered_status = real_recover  # type: ignore[assignment]
+        for sid, handle in stub_handles:
+            if sessions_routes._runner_relay_tasks.get(sid) is handle:
+                sessions_routes._runner_relay_tasks.pop(sid, None)
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await handle.task
         if forwarder_task is not None:
             forwarder_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1234,19 +1251,30 @@ def _isolated_session_status_cache() -> Iterator[None]:
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize(
+    ("error_code", "error_message"),
+    [
+        ("runner_disconnected", "Runner disconnected unexpectedly."),
+        ("session_stream_lost", "Session stream lost unexpectedly."),
+    ],
+)
 async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
     tunnel_three_layer_stack: _TunnelStack,
+    error_code: str,
+    error_message: str,
 ) -> None:
-    """Reconnect-to-idle clears a persisted ``runner_disconnected`` failure.
+    """Reconnect-to-idle clears a persisted transport failure.
 
     A transient WS blip drops and reconnects a runner whose process
-    survived, with no new turn. The disconnect left the session marked
-    ``failed`` with persisted ``runner_disconnected`` labels; before this
-    wiring nothing cleared them until the next user message, so the
-    Subagents panel kept the grey "Disconnected" dot forever. Drives a
-    real tunnel reconnect (which fires ``_on_runner_connect``) and asserts
-    the session leaves ``failed`` and the disconnect labels are cleared —
-    WITHOUT sending any message.
+    survived, with no new turn. The drop left the session marked
+    ``failed`` with persisted transport-failure labels — either
+    ``runner_disconnected`` (the runner went away) or
+    ``session_stream_lost`` (the stream died while the runner stayed
+    registered); before this wiring nothing cleared them until the next
+    user message, so the Subagents panel kept the grey "Disconnected" dot
+    forever. Drives a real tunnel reconnect (which fires
+    ``_on_runner_connect``) and asserts the session leaves ``failed`` and
+    the labels are cleared — WITHOUT sending any message.
     """
     from omnigent.runtime import get_conversation_store
     from omnigent.server.routes import sessions as sessions_module
@@ -1257,8 +1285,8 @@ async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
 
     session_id = await _bind_failed_session(
         ap_client,
-        error_code="runner_disconnected",
-        error_message="Runner disconnected unexpectedly.",
+        error_code=error_code,
+        error_message=error_message,
     )
     store = get_conversation_store()
 
@@ -1266,8 +1294,8 @@ async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
     conv = store.get_conversation(session_id)
     assert conv is not None
     assert sessions_module._last_task_error_from_labels(conv.labels) == {
-        "code": "runner_disconnected",
-        "message": "Runner disconnected unexpectedly.",
+        "code": error_code,
+        "message": error_message,
     }
     assert sessions_module._session_status_cache.get(session_id) == "failed"
 
@@ -1391,6 +1419,62 @@ async def test_on_runner_connect_no_op_when_no_sandbox_failure(
             assert session_id not in _session_sandbox_status_cache
     finally:
         sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_on_runner_connect_unready_session_does_not_block_later_session(
+    tunnel_three_layer_stack: _TunnelStack,
+) -> None:
+    """One unready relay cannot starve later sessions in the connect hook."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    fake_pm = tunnel_three_layer_stack.fake_pm
+    first_id = await _bind_failed_session(
+        ap_client,
+        error_code="session_stream_lost",
+        error_message="Session stream lost unexpectedly.",
+    )
+    second_id = await _bind_failed_session(
+        ap_client,
+        error_code="session_stream_lost",
+        error_message="Session stream lost unexpectedly.",
+    )
+    store = get_conversation_store()
+    test_ids = {first_id, second_id}
+    loop_order = [
+        conv.id
+        for conv in store.list_conversations_by_runner_id(_RUNNER_ID)
+        if conv.id in test_ids
+    ]
+    assert set(loop_order) == test_ids
+    blocked_id, later_id = loop_order
+
+    try:
+        async with _reconnect_fires_connect_hook(
+            ap_app,
+            fake_pm,
+            wait_for_recover=later_id,
+            unready_sessions={blocked_id},
+        ) as recovered:
+            assert recovered.index(blocked_id) < recovered.index(later_id)
+            assert sessions_module._session_status_cache.get(blocked_id) == "failed"
+            assert sessions_module._session_status_cache.get(later_id) == "idle"
+            blocked = store.get_conversation(blocked_id)
+            later = store.get_conversation(later_id)
+            assert blocked is not None
+            assert later is not None
+            assert sessions_module._last_task_error_from_labels(blocked.labels) == {
+                "code": "session_stream_lost",
+                "message": "Session stream lost unexpectedly.",
+            }
+            assert sessions_module._last_task_error_from_labels(later.labels) is None
+    finally:
+        sessions_module._session_status_cache.pop(first_id, None)
+        sessions_module._session_status_cache.pop(second_id, None)
 
 
 @pytest.mark.asyncio

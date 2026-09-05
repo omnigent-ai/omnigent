@@ -1749,7 +1749,7 @@
         "type": "object"
       },
       "ErrorDetail": {
-        "description": "Machine-readable error information attached to a failed response.",
+        "description": "Machine-readable error information attached to a failed response.\n\nSession-status failure codes include `runner_disconnected` (tunnel\nclose or newest-wins replacement \u2014 recoverable on reconnect) and\n`session_stream_lost` (SSE stream failed while the runner tunnel is\nstill registered).",
         "properties": {
           "cause": {
             "anyOf": [
@@ -1765,7 +1765,7 @@
             "title": "Cause"
           },
           "code": {
-            "description": "Error code string, e.g. `\"server_error\"`, `\"invalid_input\"`.",
+            "description": "Error code string, e.g. `\"server_error\"`, `\"invalid_input\"`, `\"runner_disconnected\"`, `\"session_stream_lost\"`.",
             "title": "Code",
             "type": "string"
           },
