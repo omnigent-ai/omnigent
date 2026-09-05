@@ -16,6 +16,7 @@ only an already-mirrored value is not re-posted.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1711,8 +1712,76 @@ async def test_persist_codex_compaction_item_empty_items_fallback() -> None:
     assert "compacted_messages" not in body["data"]
 
 
+@pytest.mark.asyncio
+async def test_persist_codex_compaction_item_retries_string_window_id_for_old_server(
+    tmp_path: Path,
+) -> None:
+    """A legacy 400 retries without Codex's optional UUID window id."""
+    codex_home = codex_home_for_bridge_dir(tmp_path)
+    rollout = codex_home / "sessions" / "2026" / "09" / "05" / "rollout-thread_1.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "compacted",
+                "payload": {
+                    "message": "summary",
+                    "replacement_history": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hi"}],
+                        }
+                    ],
+                    "window_id": "01a070e2-2665-7d62-9b74-973decf239b7",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_codex",
+            socket_path="ws://127.0.0.1:9999",
+            thread_id="thread_1",
+            codex_home=str(codex_home),
+            cwd="/tmp/workspace",
+        ),
+    )
+
+    get_resp = MagicMock()
+    get_resp.json.return_value = {"data": [{"id": "item_codex"}]}
+    get_resp.raise_for_status = MagicMock()
+    request = httpx.Request("POST", "http://test/v1/sessions/conv_codex/events")
+    client = MagicMock()
+    client.get = AsyncMock(return_value=get_resp)
+    client.post = AsyncMock(
+        side_effect=[
+            httpx.Response(400, request=request),
+            httpx.Response(202, request=request),
+        ]
+    )
+
+    await _persist_codex_compaction_item(
+        client,
+        session_id="conv_codex",
+        bridge_dir=tmp_path,
+    )
+
+    assert client.post.await_count == 2
+    first_body = client.post.await_args_list[0].kwargs["json"]
+    retry_body = client.post.await_args_list[1].kwargs["json"]
+    assert first_body["data"]["window_id"] == "01a070e2-2665-7d62-9b74-973decf239b7"
+    assert "window_id" not in retry_body["data"]
+    assert retry_body["data"]["compacted_messages"] == first_body["data"]["compacted_messages"]
+
+
+@pytest.mark.parametrize("window_id", [2, "01a070e2-2665-7d62-9b74-973decf239b7"])
 def test_read_compacted_history_extracts_replacement_history_and_window_id(
     tmp_path: Path,
+    window_id: int | str,
 ) -> None:
     """_read_compacted_history returns replacement_history and window_id."""
     import json as _json
@@ -1737,7 +1806,7 @@ def test_read_compacted_history_extracts_replacement_history_and_window_id(
                             "encrypted_content": "gAAAA_test_token",
                         },
                     ],
-                    "window_id": 2,
+                    "window_id": window_id,
                 },
             }
         ),
@@ -1747,7 +1816,7 @@ def test_read_compacted_history_extracts_replacement_history_and_window_id(
     result = fwd._read_compacted_history(rollout)
 
     assert result is not None
-    assert result["window_id"] == 2
+    assert result["window_id"] == window_id
     assert len(result["replacement_history"]) == 2
     assert result["replacement_history"][0]["type"] == "message"
     assert result["replacement_history"][0]["role"] == "user"

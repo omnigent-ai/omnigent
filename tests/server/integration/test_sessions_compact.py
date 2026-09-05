@@ -405,6 +405,7 @@ async def test_compaction_snapshot_persists_without_base64_payloads(
                 "last_item_id": "msg_boundary_abc123",
                 "model": "unknown",
                 "token_count": 0,
+                "window_id": "01a070e2-2665-7d62-9b74-973decf239b7",
                 "compacted_messages": [
                     {
                         "type": "message",
@@ -445,6 +446,7 @@ async def test_compaction_snapshot_persists_without_base64_payloads(
     )
 
     item = compaction_items[0]
+    assert item["window_id"] == "01a070e2-2665-7d62-9b74-973decf239b7"
     # to_api_dict spreads CompactionData onto the top level, so serialising the
     # whole item leaves nowhere for a stray copy of the payload to hide.
     item_json = json.dumps(item)

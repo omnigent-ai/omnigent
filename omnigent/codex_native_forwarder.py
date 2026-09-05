@@ -6286,10 +6286,20 @@ async def _persist_codex_compaction_item(
         if compacted.get("window_id") is not None:
             data["window_id"] = compacted["window_id"]
 
+    payload = {"type": "compaction", "data": data}
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
-        json={"type": "compaction", "data": data},
+        json=payload,
     )
+    if resp.status_code == 400 and isinstance(data.get("window_id"), str):
+        # Older Omnigent servers validated Codex window ids as integers.
+        # The id is optional, so preserve the compaction boundary across skew.
+        compatible_data = dict(data)
+        compatible_data.pop("window_id")
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "compaction", "data": compatible_data},
+        )
     resp.raise_for_status()
 
 
@@ -6297,7 +6307,7 @@ def _read_compacted_history(rollout_path: Path) -> dict[str, object] | None:
     """Read the last ``Compacted`` entry from a rollout JSONL.
 
     Codex appends a ``{type: "compacted", payload: {replacement_history: [...],
-    window_id: N}}`` entry after compaction. Returns a dict with
+    window_id: ID}}`` entry after compaction. Returns a dict with
     ``replacement_history`` and ``window_id`` for persistence, or ``None``.
 
     :param rollout_path: Path to the rollout JSONL.
