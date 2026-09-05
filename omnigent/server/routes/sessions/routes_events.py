@@ -114,6 +114,7 @@ from omnigent.server.routes._sessions.common import (
     _SLASH_COMMAND_TYPE,
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
+    _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
     _logger,
@@ -1267,6 +1268,29 @@ def register_events_routes(
             data = await _enrich_terminal_status_with_subagent_output(
                 body.data, status, session_id, conversation_store
             )
+            if conv.kind == "sub_agent":
+                durable_terminal_status = (
+                    ""
+                    if status in {"running", "waiting"}
+                    else "completed"
+                    if status == "idle"
+                    else status
+                )
+                if durable_terminal_status in (
+                    "",
+                    "completed",
+                    "failed",
+                    "stopped",
+                    "killed",
+                ):
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        session_id,
+                        {_SUBAGENT_TERMINAL_STATUS_LABEL_KEY: durable_terminal_status},
+                    )
+            published_status = "idle" if status in {"completed", "stopped", "killed"} else status
+            if status in {"completed", "failed", "stopped", "killed"} and bg_count is None:
+                bg_count = 0
             # Surface the failure reason a native forwarder carries so a
             # top-level session sees it on its own status edge and persisted
             # last_task_error, not only the sub-agent parent-inbox path.
@@ -1293,7 +1317,7 @@ def register_events_routes(
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
             _publish_status(
                 session_id,
-                status,
+                published_status,
                 status_error,
                 response_id=response_id,
                 background_task_count=bg_count,
@@ -1303,12 +1327,18 @@ def register_events_routes(
             # Emit a turn-end telemetry event for native harnesses. "idle"
             # means the turn completed normally; "failed" means it errored.
             # No latency or token deltas are available on this path.
-            if status in {"idle", "failed"}:
+            if status in {"idle", "completed", "failed", "stopped", "killed"}:
                 _tel_emit(
                     _TelTurnEndEvent(
                         installation_id=_get_installation_id(),
                         session_id=session_id,
-                        status="completed" if status == "idle" else "failed",
+                        status=(
+                            "failed"
+                            if status == "failed"
+                            else "cancelled"
+                            if status in {"stopped", "killed"}
+                            else "completed"
+                        ),
                         latency_ms=None,
                         model=None,
                         input_tokens=None,
@@ -1325,7 +1355,7 @@ def register_events_routes(
             )
             if (
                 conv.kind == "sub_agent"
-                and status in {"idle", "failed"}
+                and status in {"idle", "completed", "failed", "stopped", "killed"}
                 and not _is_codex_native_subagent(conv)
             ):
                 # Codex-internal children are tracked inside the same

@@ -417,7 +417,7 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 
 _NO_BODY_STATUS_CODES = {204, 304}
-_SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "stopped", "killed"})
 # Liveness budget for a sub-agent dispatch stuck in ``launching``: a child
 # that has produced NO edge at all (no running/waiting/terminal status, no
 # in-flight response) within this window never started — fail it loudly
@@ -1849,7 +1849,11 @@ async def _fetch_latest_assistant_text(
     server_client: httpx.AsyncClient, session_id: str
 ) -> str | None:
     """
-    Return the newest assistant message text of a session, reading newest first.
+    Return the newest item when it is a visible assistant message.
+
+    A newer user or tool boundary proves an older assistant message was an
+    opener or intermediate update, so recovery must not walk past that boundary
+    and replay stale text as the terminal result.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param session_id: Session to read, e.g. ``"conv_child456"``.
@@ -1862,13 +1866,15 @@ async def _fetch_latest_assistant_text(
     while True:
         page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
         for item in page.get("data", []):
-            if item.get("type") != "message" or item.get("role") != "assistant":
+            if item.get("type") == "message" and item.get("is_meta") is True:
                 continue
-            return "\n".join(
-                block["text"]
-                for block in item.get("content", [])
-                if block.get("type") in {"output_text", "text"} and block.get("text")
-            )
+            if item.get("type") == "message" and item.get("role") == "assistant":
+                return "\n".join(
+                    block["text"]
+                    for block in item.get("content", [])
+                    if block.get("type") in {"output_text", "text"} and block.get("text")
+                )
+            return None
         if not page.get("has_more") or not page.get("last_id"):
             return None
         params["after"] = page["last_id"]
@@ -1919,6 +1925,10 @@ async def _recover_subagent_results_from_server(
             output = message if isinstance(message, str) else None
         else:
             output = await _fetch_latest_assistant_text(server_client, child_id)
+            if output is None and status == "stopped":
+                output = "Sub-agent stopped before producing a reliable final result."
+            elif output is None and status == "killed":
+                output = "Sub-agent was killed before producing a reliable final result."
         entry = register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=child_id,
@@ -1979,8 +1989,13 @@ def mark_subagent_work_terminal(
         # and the error text is silently dropped. A parent may act on the false
         # success before the re-delivery arrives — that window is inherent to
         # the edge race; re-delivery is the mitigation, not a prevention.
-        if status == "failed" and entry.status == "completed":
+        if status in {"failed", "stopped", "killed"} and entry.status == "completed":
             entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.delivered = False
+            return _deliver_subagent_completion(entry)
+        if status == entry.status and output is not None and output != entry.output:
             entry.output = output
             entry.completed_at = time.time()
             entry.delivered = False
@@ -1996,7 +2011,7 @@ def mark_subagent_work_terminal(
         # already-recorded "completed"/"failed" still awaiting delivery, and a
         # trailing quiescence "completed" must not launder a recorded "failed".
         keep_recorded = (status == "cancelled" and entry.status != "cancelled") or (
-            status == "completed" and entry.status == "failed"
+            status == "completed" and entry.status in {"failed", "stopped", "killed"}
         )
         if not keep_recorded:
             entry.status = status
@@ -2439,7 +2454,18 @@ def _session_status_to_task_status(status: object) -> str | None:
         return "completed"
     if status == "failed":
         return "failed"
+    if status in ("completed", "stopped", "killed"):
+        return status
     return None
+
+
+def _safe_subagent_terminal_output(status: str) -> str:
+    """Return an honest fallback that cannot expose stale transcript text."""
+    return {
+        "failed": "Error: native sub-agent turn failed without a reliable detail.",
+        "stopped": "Sub-agent stopped before producing a reliable final result.",
+        "killed": "Sub-agent was killed before producing a reliable final result.",
+    }.get(status, "Sub-agent ended without a reliable final result.")
 
 
 def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
@@ -8628,27 +8654,28 @@ def create_runner_app(
             output = forwarded_output if isinstance(forwarded_output, str) else None
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
-            if status in ("running", "waiting", "idle", "failed"):
-                resource_registry.note_external_session_status(conversation_id, status)
+            display_status = "idle" if status in ("completed", "stopped", "killed") else status
+            if display_status in ("running", "waiting", "idle", "failed"):
+                resource_registry.note_external_session_status(conversation_id, display_status)
                 _fan_out_child_delta_to_parent(
                     conversation_id,
                     {"type": "session.status", "status": status},
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
-            if status in ("idle", "failed"):
+            if status in ("idle", "completed", "failed", "stopped", "killed"):
                 recovered_entry = await _ensure_subagent_work_entry(conversation_id)
-            if status == "idle":
+            if status in ("idle", "completed"):
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
                     status="completed",
                     output=output if output is not None else "",
                 )
-            elif status == "failed":
+            elif status in ("failed", "stopped", "killed"):
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
-                    status="failed",
-                    output=output or "Error: native sub-agent turn failed",
+                    status=status,
+                    output=output or _safe_subagent_terminal_output(status),
                 )
             if delivery_ack is not None:
                 is_known = (

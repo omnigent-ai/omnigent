@@ -600,6 +600,39 @@ async def test_runner_restart_recovers_text_less_final_turn_as_no_output(
 
 
 @pytest.mark.asyncio
+async def test_runner_restart_does_not_replay_opener_past_tool_boundary(
+    _clean_subagent_registry: None,
+) -> None:
+    """A newer tool item prevents restart recovery from reusing an opener."""
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    child_items = [
+        {
+            "type": "function_call_output",
+            "call_id": "toolu_still_running",
+            "output": "background task still running",
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "I will inspect it."}],
+        },
+    ]
+    app = create_runner_app(
+        server_client=_RecoveryServerClient(  # type: ignore[arg-type]
+            [_child_summary()],
+            child_items=child_items,
+        )
+    )
+
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+
+    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    assert payload["status"] == "completed"
+    assert payload["output"] == "[System: sub-agent completed with no output]"
+    assert "I will inspect it." not in payload["output"]
+
+
+@pytest.mark.asyncio
 async def test_runner_restart_recovers_failed_child_error(
     _clean_subagent_registry: None,
 ) -> None:
@@ -745,3 +778,23 @@ async def test_routed_child_off_its_native_spec_still_delivers(
     )
     assert items[0]["status"] == "completed"
     assert items[0]["conversation_id"] == CHILD_SESSION_ID
+
+
+@pytest.mark.parametrize("terminal_status", ["stopped", "killed"])
+async def test_runner_restart_preserves_structured_terminal_child_status(
+    _clean_subagent_registry: None,
+    terminal_status: str,
+) -> None:
+    """Restart recovery delivers stopped/killed without laundering to completed."""
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    server_client = _RecoveryServerClient(
+        [_child_summary(current_task_status=terminal_status)],
+        child_items=[],
+    )
+    app = create_runner_app(server_client=server_client)  # type: ignore[arg-type]
+
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+
+    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    assert payload["status"] == terminal_status
+    assert terminal_status in payload["output"]

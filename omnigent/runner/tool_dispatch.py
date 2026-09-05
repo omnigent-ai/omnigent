@@ -165,8 +165,10 @@ def _string_mapping(value: object) -> dict[str, str] | None:
 _INBOX_OUTPUT_MAX_CHARS = 12000
 _OS_ENV_SHELL_DEFAULT_TIMEOUT_S = 120.0
 _RUNNER_EXECUTION_TIMEOUT_S = 7200.0
-_SUBAGENT_POLICY_STATUSES = frozenset({"completed", "failed"})
-_SUBAGENT_INBOX_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_SUBAGENT_POLICY_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
+_SUBAGENT_INBOX_TERMINAL_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "stopped", "killed"}
+)
 _SUBAGENT_POLICY_FAILURE_OUTPUT = "[Result suppressed by policy: policy evaluation failed]"
 _SESSION_WRAPPER_LABEL_KEY = "omnigent.wrapper"
 # Read budget for runner→server message-send POSTs that are gated at the
@@ -7281,7 +7283,7 @@ def _truncate_inbox_output(output: object) -> str:
 
 def _format_async_task_item(payload: _JsonObject) -> str:
     """
-    Render a completed/failed/cancelled async-task inbox payload.
+    Render a terminal async-task inbox payload.
 
     :param payload: Async-task payload with ``handle_id``,
         ``tool_name``, ``status``, ``output`` keys.
@@ -7310,6 +7312,9 @@ def _format_async_task_item(payload: _JsonObject) -> str:
             return f"[System: sub-agent task {handle_id} failed — {target} error: {output}]"
         if status == "cancelled":
             return f"[System: sub-agent task {handle_id} cancelled — {target}]"
+        if status in {"stopped", "killed"}:
+            detail = f": {output}" if has_output else ""
+            return f"[System: sub-agent task {handle_id} {status} — {target}{detail}]"
         return f"[System: sub-agent task {handle_id} {status} — {target}: {output}]"
     if status == "completed":
         if not has_output:

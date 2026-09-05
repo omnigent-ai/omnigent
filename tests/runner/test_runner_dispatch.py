@@ -4987,6 +4987,20 @@ async def test_scaffold_subagent_defers_terminal_delivery_while_continuation_buf
             "SECRET_MARKER",
             id="failed-deny-suppresses",
         ),
+        pytest.param(
+            "stopped",
+            {"result": "POLICY_ACTION_DENY", "reason": "partial secret output"},
+            "[Result suppressed by policy: partial secret output]",
+            "SECRET_MARKER",
+            id="stopped-deny-suppresses",
+        ),
+        pytest.param(
+            "killed",
+            {"result": "POLICY_ACTION_DENY", "reason": "killed secret output"},
+            "[Result suppressed by policy: killed secret output]",
+            "SECRET_MARKER",
+            id="killed-deny-suppresses",
+        ),
     ],
 )
 async def test_sys_read_inbox_applies_subagent_tool_result_policy(

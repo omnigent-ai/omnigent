@@ -193,6 +193,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _SLASH_COMMAND_TYPE,
     _STOP_RUNNER_RESULT_TIMEOUT_S,
     _STOP_SESSION_TYPE,
+    _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
     _TURN_ACTOR_LABEL,
     _UI_ADDED_AGENT_TITLE_PREFIX,
     _UPLOAD_READ_CHUNK_BYTES,
@@ -3387,9 +3388,9 @@ async def _persist_external_subagent_start(
         claude-native parents from other harnesses.
     :param body: The POST event body. Required ``data`` keys:
         ``subagent_id`` (Claude-side id, e.g. ``"a5c7eff..."``),
-        ``agent_type`` (e.g. ``"Explore"``), ``description``
-        (free-form, used in the title), ``tool_use_id``
-        (e.g. ``"toolu_..."``).
+        ``agent_type`` (e.g. ``"Explore"``), and ``description``
+        (free-form, used in the title). Optional ``tool_use_id``
+        (e.g. ``"toolu_..."``) enables authoritative completion correlation.
     :param conversation_store: Store used to read existing children
         (for idempotency) and create the new row.
     :returns: The child conversation id, e.g. ``"conv_child456"``.
@@ -3417,9 +3418,9 @@ async def _persist_external_subagent_start(
             "external_subagent_start requires data.description (string)",
             code=ErrorCode.INVALID_INPUT,
         )
-    if not isinstance(tool_use_id, str) or not tool_use_id:
+    if tool_use_id is not None and (not isinstance(tool_use_id, str) or not tool_use_id):
         raise OmnigentError(
-            "external_subagent_start requires non-empty data.tool_use_id",
+            "external_subagent_start data.tool_use_id must be a non-empty string when present",
             code=ErrorCode.INVALID_INPUT,
         )
     if parent_conv.agent_id is None:
@@ -3465,9 +3466,10 @@ async def _persist_external_subagent_start(
     labels = {
         _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
         _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY: subagent_id,
-        _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY: tool_use_id,
         _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY: description,
     }
+    if isinstance(tool_use_id, str):
+        labels[_CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY] = tool_use_id
 
     try:
         child = await asyncio.to_thread(
@@ -3992,16 +3994,15 @@ def _latest_assistant_text_from_store(
         session_id,
         limit=_EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT,
         order="desc",
-        type="message",
     )
     for item in page.data:
-        if not isinstance(item.data, MessageData):
+        if isinstance(item.data, MessageData) and item.data.is_meta:
             continue
-        if item.data.role != "assistant" or item.data.is_meta:
-            continue
-        text = _message_text(item.data.content)
-        if text is not None:
-            return text
+        if isinstance(item.data, MessageData) and item.data.role == "assistant":
+            return _message_text(item.data.content)
+        # A newer user/tool boundary proves an older assistant message was an
+        # opener or intermediate update, not this turn's terminal result.
+        return None
     return None
 
 
@@ -9526,6 +9527,8 @@ def _child_session_current_task_status_from_cached_status(status: object) -> str
         return "completed"
     if status == "failed":
         return "failed"
+    if status in ("completed", "stopped", "killed"):
+        return status
     return None
 
 
@@ -9603,6 +9606,10 @@ def _child_session_summary_from_conversation(
     # Derive busy from the relay-fed cache; tasks table is gone.
     if cached_status is None:
         cached_status = _session_status_cache.get(conv.id)
+    if cached_status is None:
+        durable_status = labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
+        if durable_status in ("completed", "failed", "stopped", "killed"):
+            cached_status = durable_status
     if cached_status in ("running", "waiting"):
         busy = True
     else:
