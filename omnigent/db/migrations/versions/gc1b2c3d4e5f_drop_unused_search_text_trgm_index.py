@@ -32,15 +32,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Restore the legacy content trigram index."""
-    dialect = op.get_bind().dialect.name
-    if dialect == "postgresql":
+    """Restore the legacy content trigram index (Postgres only)."""
+    if op.get_bind().dialect.name == "postgresql":
         op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-        op.execute(
-            f"CREATE INDEX IF NOT EXISTS {_INDEX} ON conversation_items "
-            "USING gin (LOWER(search_text) gin_trgm_ops)"
-        )
-    elif dialect == "cockroachdb":
         op.execute(
             f"CREATE INDEX IF NOT EXISTS {_INDEX} ON conversation_items "
             "USING gin (LOWER(search_text) gin_trgm_ops)"
