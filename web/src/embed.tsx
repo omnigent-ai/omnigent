@@ -191,15 +191,23 @@ function OmnigentProviders({
 
   return (
     // Two nested wrappers on purpose:
-    //   - `.omnigent-app` (outer) is the scope anchor. The scoped stylesheet
-    //     rewrites `:root` → `.omnigent-app` (light tokens) and `.dark` →
-    //     `.omnigent-app .dark`, so the dark class must be a DESCENDANT of the
-    //     scope root, not the root itself.
-    //   - the inner div carries the host-driven `dark` class (when dark) and is
-    //     the Radix portal root, so both the app and its overlays read the dark
-    //     token overrides. Light mode = no class → inherits the scope root's
-    //     light tokens.
-    <div ref={scopeRootRef} className="omnigent-app" style={{ height: "100%", width: "100%" }}>
+    //   - `.omnigent-app` (outer) is the scope anchor the scoped stylesheet
+    //     collapses `:root`/`html`/`body` onto, so it must carry the theme
+    //     state like standalone's `<html class="dark">`: the collapsed
+    //     `body { background: var(--background) }` paints THIS element, and
+    //     without the class it resolves the light tokens — visible wherever
+    //     the app shell doesn't cover the viewport (e.g. the strip the mobile
+    //     software keyboard exposes). The scoped stylesheet emits both
+    //     `.omnigent-app.dark` and `.omnigent-app .dark` forms for
+    //     `.dark`-rooted rules (see vite.embed.config.ts).
+    //   - the inner div also carries the host-driven `dark` class and is the
+    //     Radix portal root, so portaled overlays and descendant-form rules
+    //     keep matching. Light mode = no class on either.
+    <div
+      ref={scopeRootRef}
+      className={isDarkMode ? "omnigent-app dark" : "omnigent-app"}
+      style={{ height: "100%", width: "100%" }}
+    >
       <div
         ref={scopeRef}
         className={isDarkMode ? "dark" : undefined}

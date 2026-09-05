@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <title>Omnigent managed-embed host harness</title>
+    <style>
+      /* The Databricks host mounts the embed as a full-viewport overlay (see
+         web/ios's workspace mount: the embed root covers the viewport from
+         y=0). Mirror that. A dark workspace paints its own dark chrome, so any
+         LIGHT pixel inside the embed region is the embed's own paint — never
+         the host page showing through. */
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: #1f2937;
+      }
+      #root {
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
