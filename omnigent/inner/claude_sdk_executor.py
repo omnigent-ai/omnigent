@@ -1038,7 +1038,87 @@ class _GatewayModelVocabulary(NamedTuple):
 _EMPTY_GATEWAY_VOCABULARY = _GatewayModelVocabulary(alias_pins={}, model_overrides={})
 
 
-def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _GatewayModelVocabulary:
+def _gateway_served_claude_ids(
+    base_url: str, auth_command: str | None, profile: str | None
+) -> list[str]:
+    """List the Claude model ids a gateway serves, for the vocabulary derivation.
+
+    The gateway's generic model listing is tried first. When it names no Claude
+    model — because the endpoint answered an error and the listing came back
+    unverified, or an OpenAI-compatible ``/v1/models`` probe simply is not
+    served there — a Databricks AI Gateway is listed directly off the
+    workspace's Unity Catalog model-services endpoint, the same live source the
+    launch model resolves from. Only when neither source names a Claude model
+    is an empty list returned, and a warning logged so an unpinned alias (and a
+    refusal-fallback dying on a canonical id) is diagnosable.
+
+    :param base_url: The gateway's ``ANTHROPIC_BASE_URL``.
+    :param auth_command: The gateway ``apiKeyHelper`` command, minted into the
+        bearer the generic listing is fetched with.
+    :param profile: Databricks CLI profile backing the gateway, used only to
+        resolve workspace credentials for the Databricks fallback listing.
+    :returns: The served Claude ids, or an empty list when none can be found.
+    """
+    from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GATEWAY_KIND
+
+    provider = model_catalog.ResolvedModelProvider(
+        kind=GATEWAY_KIND,
+        family=ANTHROPIC_FAMILY,
+        base_url=base_url,
+        auth_command=auth_command,
+        detail="claude-sdk gateway transport",
+    )
+    listing: model_catalog.ModelListing | None = None
+    try:
+        listing = model_catalog.listing_for_provider(provider)
+    except Exception:  # noqa: BLE001 — best-effort; unpinned aliases are the safe default
+        logger.warning("claude-sdk: could not list the gateway's models", exc_info=True)
+    served = (
+        [entry.id for entry in listing.models if entry.family == "claude"]
+        if listing is not None
+        else []
+    )
+    if served:
+        return served
+
+    # A Databricks anthropic-serving endpoint answers the OpenAI-compatible
+    # ``/v1/models`` probe with an error, so the generic listing is unverified
+    # and empty. List the workspace's Claude endpoints directly, as the launch
+    # model is, so the alias pins and refusal-fallback rewrites are populated.
+    if is_databricks_ai_gateway_url(base_url):
+        try:
+            from omnigent.databricks_model_discovery import discover_databricks_claude_catalog
+            from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+            creds = resolve_databricks_workspace(profile)
+            served = list(
+                discover_databricks_claude_catalog(creds.host, creds.token).model_ids
+            )
+        except Exception:  # noqa: BLE001 — the workspace listing is the last resort
+            logger.warning(
+                "claude-sdk: Databricks model discovery failed for the gateway; "
+                "leaving ANTHROPIC_DEFAULT_*_MODEL and modelOverrides unset",
+                exc_info=True,
+            )
+        if served:
+            return served
+
+    # No source named a Claude model. When the generic listing came back
+    # unverified the gateway rejected the probe without raising — surface it,
+    # since the previous exception-only warning never fired for that case.
+    if listing is not None and not listing.verified:
+        logger.warning(
+            "claude-sdk: the gateway listed no Claude models (%s); leaving "
+            "ANTHROPIC_DEFAULT_*_MODEL and modelOverrides unset — a "
+            "refusal-fallback naming a canonical id may not resolve",
+            listing.note or "listing unverified",
+        )
+    return served
+
+
+def _gateway_model_vocabulary(
+    base_url: str, auth_command: str | None, profile: str | None = None
+) -> _GatewayModelVocabulary:
     """Read Claude Code's model vocabulary off a gateway's model listing.
 
     Claude Code resolves a family alias — ``opus`` / ``sonnet`` / ``haiku`` /
@@ -1063,29 +1143,15 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
     :param base_url: The gateway's ``ANTHROPIC_BASE_URL``.
     :param auth_command: The gateway ``apiKeyHelper`` command; minted into the
         bearer the listing is fetched with.
+    :param profile: Databricks CLI profile backing the gateway, used only for
+        the Databricks fallback listing when the generic listing names none.
     :returns: The pins and rewrites the listing supports. Empty — leaving
         today's behavior — when the gateway lists no Claude models or the
         listing cannot be fetched.
     """
-    from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GATEWAY_KIND
-
-    provider = model_catalog.ResolvedModelProvider(
-        kind=GATEWAY_KIND,
-        family=ANTHROPIC_FAMILY,
-        base_url=base_url,
-        auth_command=auth_command,
-        detail="claude-sdk gateway transport",
-    )
-    try:
-        listing = model_catalog.listing_for_provider(provider)
-    except Exception:  # noqa: BLE001 — best-effort; unpinned aliases are the safe default
-        logger.warning(
-            "claude-sdk: could not list the gateway's models; leaving "
-            "ANTHROPIC_DEFAULT_*_MODEL and modelOverrides unset",
-            exc_info=True,
-        )
+    served = _gateway_served_claude_ids(base_url, auth_command, profile)
+    if not served:
         return _EMPTY_GATEWAY_VOCABULARY
-    served = [entry.id for entry in listing.models if entry.family == "claude"]
     return _GatewayModelVocabulary(
         alias_pins={
             ALIAS_MODEL_ENV_VARS[alias]: model_id
@@ -2155,7 +2221,7 @@ class ClaudeSDKExecutor(Executor):
             return {}
         if self._gateway_vocabulary is None:
             self._gateway_vocabulary = await run_sync_on_thread(
-                _gateway_model_vocabulary, base_url, auth_command
+                _gateway_model_vocabulary, base_url, auth_command, self._databricks_profile
             )
         for var, model_id in self._gateway_vocabulary.alias_pins.items():
             env.setdefault(var, model_id)

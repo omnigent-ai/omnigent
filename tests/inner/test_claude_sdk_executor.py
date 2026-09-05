@@ -1639,6 +1639,135 @@ class TestGatewayModelVocabulary(unittest.TestCase):
                 _EMPTY_GATEWAY_VOCABULARY,
             )
 
+    def test_databricks_gateway_pins_from_workspace_listing(self):
+        """A Databricks endpoint answers the generic /v1/models probe with an
+        error, so the listing is unverified and empty; the workspace's own
+        Claude listing then supplies the alias pins and refusal-fallback
+        rewrites that were left empty before.
+        """
+        from omnigent.inner.claude_sdk_executor import _gateway_model_vocabulary
+        from omnigent.model_catalog import ModelListing
+
+        # What a Databricks anthropic-serving endpoint yields for /v1/models:
+        # an HTTP error the catalog swallows into an unverified, empty listing.
+        unverified = ModelListing(
+            source="none",
+            verified=False,
+            models=(),
+            note="model enumeration failed: listing endpoint returned HTTP 400",
+        )
+        catalog = SimpleNamespace(
+            families={
+                "opus": "databricks-claude-opus-4-8",
+                "fable": "databricks-claude-fable-5",
+            },
+            model_ids=("databricks-claude-opus-4-8", "databricks-claude-fable-5"),
+        )
+        base_url = "https://wkspc.cloud.databricks.com/ai-gateway/anthropic"
+        with (
+            patch("omnigent.model_catalog.listing_for_provider", return_value=unverified),
+            patch(
+                "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+                return_value=SimpleNamespace(
+                    host="https://wkspc.cloud.databricks.com", token="tok"
+                ),
+            ) as resolver,
+            patch(
+                "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                return_value=catalog,
+            ) as discover,
+        ):
+            vocabulary = _gateway_model_vocabulary(base_url, "printf tok")
+
+        # Before the fix this was empty: the unverified listing named no Claude
+        # model and nothing consulted the workspace, so nothing was pinned.
+        self.assertEqual(
+            vocabulary.alias_pins,
+            {
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+                "ANTHROPIC_DEFAULT_FABLE_MODEL": "databricks-claude-fable-5",
+            },
+        )
+        self.assertEqual(
+            vocabulary.model_overrides,
+            {
+                "claude-opus-4-8": "databricks-claude-opus-4-8",
+                "claude-fable-5": "databricks-claude-fable-5",
+            },
+        )
+        # The fallback listed the workspace host directly, off resolved creds.
+        self.assertEqual(discover.call_args.args[0], "https://wkspc.cloud.databricks.com")
+        self.assertIsNone(resolver.call_args.args[0])
+
+    def test_warns_when_gateway_lists_no_claude_models(self):
+        """An unverified listing that names no Claude model now logs a warning.
+
+        The gateway rejected the /v1/models probe without raising, so the old
+        exception-only warning never fired and the empty vocabulary was silent.
+        """
+        from omnigent.inner.claude_sdk_executor import (
+            _EMPTY_GATEWAY_VOCABULARY,
+            _gateway_model_vocabulary,
+        )
+        from omnigent.model_catalog import ModelListing
+
+        unverified = ModelListing(
+            source="none",
+            verified=False,
+            models=(),
+            note="model enumeration failed: listing endpoint returned HTTP 400",
+        )
+        # A non-Databricks gateway, so no workspace fallback runs.
+        with patch("omnigent.model_catalog.listing_for_provider", return_value=unverified):
+            with self.assertLogs(
+                "omnigent.inner.claude_sdk_executor", level="WARNING"
+            ) as logs:
+                vocabulary = _gateway_model_vocabulary(
+                    "https://gw.example.com/anthropic", "printf tok"
+                )
+        self.assertEqual(vocabulary, _EMPTY_GATEWAY_VOCABULARY)
+        self.assertTrue(
+            any("listed no Claude models" in message for message in logs.output),
+            logs.output,
+        )
+
+    def test_apply_threads_databricks_profile_into_fallback(self):
+        """``_apply_gateway_model_vocabulary`` forwards the session's Databricks
+        profile so the workspace fallback resolves the right credentials and the
+        canonical-to-served rewrites come back populated.
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.model_catalog import ModelListing
+
+        unverified = ModelListing(source="none", verified=False, models=(), note="HTTP 400")
+        catalog = SimpleNamespace(
+            families={"opus": "databricks-claude-opus-4-8"},
+            model_ids=("databricks-claude-opus-4-8",),
+        )
+        executor = ClaudeSDKExecutor.__new__(ClaudeSDKExecutor)
+        executor._gateway = True
+        executor._gateway_vocabulary = None
+        executor._databricks_profile = "prod"
+        env = {"ANTHROPIC_BASE_URL": "https://wkspc.cloud.databricks.com/ai-gateway/anthropic"}
+        with (
+            patch("omnigent.model_catalog.listing_for_provider", return_value=unverified),
+            patch(
+                "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+                return_value=SimpleNamespace(
+                    host="https://wkspc.cloud.databricks.com", token="tok"
+                ),
+            ) as resolver,
+            patch(
+                "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                return_value=catalog,
+            ),
+        ):
+            overrides = _run(executor._apply_gateway_model_vocabulary(env, "printf tok"))
+        # Before the fix the fallback did not exist and overrides were empty.
+        self.assertEqual(overrides, {"claude-opus-4-8": "databricks-claude-opus-4-8"})
+        self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "databricks-claude-opus-4-8")
+        self.assertEqual(resolver.call_args.args[0], "prod")
+
     def test_direct_endpoint_never_lists_or_pins(self):
         """Off the gateway transport the CLI resolves canonical ids itself."""
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -1671,6 +1800,7 @@ class TestGatewayModelVocabulary(unittest.TestCase):
         executor = ClaudeSDKExecutor.__new__(ClaudeSDKExecutor)
         executor._gateway = True
         executor._gateway_vocabulary = None
+        executor._databricks_profile = None
         env = {
             "ANTHROPIC_BASE_URL": "https://gw.example.com/anthropic",
             "ANTHROPIC_DEFAULT_OPUS_MODEL": "gw-claude-opus-5",
