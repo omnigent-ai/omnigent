@@ -127,36 +127,52 @@ describe("markdown links to workspace files", () => {
 });
 
 // `path:line` is how agents habitually cite a file. The position is not part of
-// the filename, so resolving the span verbatim matched nothing on disk and the
-// citation rendered as inert inline code.
+// the filename (resolving the span verbatim matches nothing on disk), but it IS
+// the point of the citation — the click must carry the line to the viewer, not
+// just open the file at the top.
 describe("cited positions", () => {
-  it("opens an inline-code path that carries a line number", () => {
+  it("opens an inline-code path at its cited line", () => {
     renderMarkdown("`docs/notes.md:12` has the detail", ["docs/notes.md"]);
 
-    // The span still shows what the agent wrote; only the target drops :12.
+    // The span still shows what the agent wrote; the target drops :12 from the
+    // path but forwards the line so the viewer can land on it.
     fireEvent.click(screen.getByRole("button", { name: "docs/notes.md:12" }));
-    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12 });
   });
 
-  it("opens an absolute inline-code path with a line number", () => {
+  it("opens an absolute inline-code path at its cited line", () => {
     // The shape from the report: an absolute path under the workspace root.
     renderMarkdown(`\`${WORKSPACE}/docs/notes.md:1\` contains hi`, ["docs/notes.md"]);
 
     fireEvent.click(screen.getByRole("button", { name: `${WORKSPACE}/docs/notes.md:1` }));
-    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 1 });
   });
 
-  it("opens a path citing both line and column", () => {
+  it("opens a path citing both line and column at the cited line", () => {
     renderMarkdown("`docs/notes.md:12:7` is the spot", ["docs/notes.md"]);
 
     fireEvent.click(screen.getByRole("button", { name: "docs/notes.md:12:7" }));
-    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12 });
   });
 
-  it("opens a markdown link whose href carries a line number", () => {
+  it("opens a markdown link whose href carries a line number at that line", () => {
     renderMarkdown("[notes.md](docs/notes.md:12)", ["docs/notes.md"]);
 
     fireEvent.click(screen.getByRole("button", { name: "notes.md" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12 });
+  });
+
+  it("opens a path without a position as a plain open (no line)", () => {
+    renderMarkdown("see `docs/notes.md` for detail", ["docs/notes.md"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "docs/notes.md" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+  });
+
+  it("degrades a `:0` position to a plain open (no such line)", () => {
+    renderMarkdown("`docs/notes.md:0` is odd", ["docs/notes.md"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "docs/notes.md:0" }));
     expect(openFile).toHaveBeenCalledWith("docs/notes.md");
   });
 

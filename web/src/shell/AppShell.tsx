@@ -93,7 +93,7 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
-import { FileViewerContext } from "./FileViewerContext";
+import { FileViewerContext, type OpenFileOptions } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
@@ -1102,7 +1102,7 @@ export function AppShell() {
   }, []);
 
   const openFileViewer = useCallback(
-    (path: string) => {
+    (path: string, options?: OpenFileOptions) => {
       setSelectedFilePath(path);
       // A file and a shell tab can't both own the rail's content slot —
       // opening a file deselects any active shell tab (its tab stays in the
@@ -1143,6 +1143,10 @@ export function AppShell() {
           const next = new URLSearchParams(prev);
           next.set("file", path);
           next.delete("comment"); // stale comment belongs to the previous file
+          // A citation's cited line rides along so the viewer can land on it;
+          // a plain open clears any previous citation's line.
+          if (options?.line != null) next.set("line", String(options.line));
+          else next.delete("line");
           return next;
         },
         { replace: true },
@@ -1177,6 +1181,7 @@ export function AppShell() {
         next.delete("file");
         next.delete("diff");
         next.delete("comment");
+        next.delete("line");
         return next;
       },
       { replace: true },
@@ -1439,6 +1444,7 @@ export function AppShell() {
               const params = new URLSearchParams(sp);
               params.set("file", neighbor);
               params.delete("comment");
+              params.delete("line"); // stale citation belongs to the closed file
               return params;
             },
             { replace: true },

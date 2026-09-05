@@ -51,9 +51,15 @@ function useWorkspaceFileOpener(text: string): (() => void) | null {
 
   // Agents cite a file with the position they mean, `docs/notes.md:12` or
   // `:12:7`. The position is not part of the filename, so no such path is ever
-  // in the changed-files list or on disk; drop it before resolving. The span
-  // still displays the citation the agent wrote.
-  const cited = text.replace(POSITION_SUFFIX, "");
+  // in the changed-files list or on disk; drop it before resolving, but keep
+  // the line so the viewer can land on the cited change. The span still
+  // displays the citation the agent wrote.
+  const positionSuffix = text.match(POSITION_SUFFIX)?.[0] ?? null;
+  const cited = positionSuffix === null ? text : text.slice(0, -positionSuffix.length);
+  // ":12" / ":12:7" → 12 (parseInt stops at the column separator; a ":0" is
+  // not a real line, so it degrades to a plain file open).
+  const citedLine =
+    positionSuffix === null ? null : Number.parseInt(positionSuffix.slice(1), 10) || null;
   // Collapse absolute / "~"-relative forms onto a workspace-relative path so
   // they match the changed-files list and the filesystem API. null = absolute
   // or "~" path outside the workspace (or the root itself) → never a link.
@@ -73,7 +79,7 @@ function useWorkspaceFileOpener(text: string): (() => void) | null {
   );
 
   if (!openFile || !linkPath || !(isChanged || existsOnDisk)) return null;
-  return () => openFile(linkPath);
+  return () => (citedLine === null ? openFile(linkPath) : openFile(linkPath, { line: citedLine }));
 }
 
 /**
