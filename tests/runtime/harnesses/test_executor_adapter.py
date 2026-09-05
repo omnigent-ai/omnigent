@@ -1002,6 +1002,84 @@ def test_translate_input_to_messages_drops_empty_message_blocks() -> None:
     assert [m["role"] for m in messages] == ["user", "user"]
 
 
+def test_translate_input_to_messages_carries_tool_history() -> None:
+    """
+    ``function_call`` / ``function_call_output`` items translate into
+    ``tool_call`` / ``tool_result`` messages instead of being dropped.
+
+    This is what lets an executor replaying full history into a fresh
+    inner SDK session (a forked session, or a restart with no Layer-1
+    state) reconstruct recorded tool context. When these items were
+    dropped, a fork's first turn lost every tool output: asked a
+    follow-up about a fact that lived only in a tool result, the model
+    never saw it, could not answer, and re-invoked the tool.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        _translate_input_to_messages,
+    )
+
+    input_value = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "greet the new hire"}],
+        },
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "greet",
+            "arguments": '{"name": "Ada"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "Hello, Ada!",
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Done."}],
+        },
+    ]
+
+    messages = _translate_input_to_messages(input_value)
+
+    assert [m["role"] for m in messages] == ["user", "tool_call", "tool_result", "assistant"]
+    assert messages[1]["content"] == {"tool": "greet", "args": {"name": "Ada"}}
+    assert messages[1]["metadata"] == {"call_id": "call_1"}
+    assert messages[2]["content"] == "Hello, Ada!"
+    assert messages[2]["metadata"] == {"call_id": "call_1"}
+
+
+def test_translate_input_to_messages_tool_history_defensive_shapes() -> None:
+    """
+    Malformed tool items degrade instead of raising or emitting junk:
+    a ``function_call`` with no tool name has nothing replayable and is
+    dropped; non-JSON ``arguments`` fall back to empty args; a missing
+    ``output`` becomes an empty string (the call still happened).
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        _translate_input_to_messages,
+    )
+
+    input_value = [
+        {"type": "function_call", "call_id": "c1", "arguments": "{}"},
+        {"type": "function_call", "call_id": "c2", "name": "greet", "arguments": "not json"},
+        {"type": "function_call_output", "call_id": "c2"},
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hi"}],
+        },
+    ]
+
+    messages = _translate_input_to_messages(input_value)
+
+    assert [m["role"] for m in messages] == ["tool_call", "tool_result", "user"]
+    assert messages[0]["content"] == {"tool": "greet", "args": {}}
+    assert messages[1]["content"] == ""
+
+
 # ── MCP tool-call observed/dispatch correlation ──────────
 #
 # These unit tests pin the queue mechanic that fixes the tool-call

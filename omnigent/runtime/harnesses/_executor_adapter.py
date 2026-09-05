@@ -1131,7 +1131,7 @@ def _translate_input_to_messages(
 ) -> list[Message]:
     """Convert a CreateResponseRequest input to inner Message list.
 
-    Accepts conversation-history shape (role-keyed messages; tool items dropped) and
+    Accepts conversation-history shape (role-keyed messages plus tool history) and
     single-turn fallback shape (plain string or content blocks, collapsed to one user message).
     """
     if isinstance(input_value, str):
@@ -1148,16 +1148,30 @@ def _translate_input_to_messages(
 def _extract_role_keyed_messages(
     input_value: list[dict[str, Any]],
 ) -> list[Message]:
-    """Extract role-keyed message items from an Omnigent input list.
+    """Extract role-keyed message and tool-history items from an Omnigent input list.
 
-    Tool-call items (function_call, function_call_output, etc.) are skipped — the inner SDK
-    reconstructs them from its own Layer 1 state. Returns empty list for non-history inputs.
+    function_call / function_call_output items are translated to ``tool_call`` /
+    ``tool_result`` messages (the inner history vocabulary) so executors that replay
+    full history into a fresh inner SDK session — a forked session, or a restart with
+    no Layer-1 state to reconstruct from — retain the recorded tool context. On a
+    continued turn the inner SDK's own session state already holds the tool items and
+    executors send only the new-message delta, so nothing is duplicated. Returns empty
+    list for non-history inputs.
     """
     messages: list[Message] = []
     for item in input_value:
         if not isinstance(item, dict):
             continue
-        if item.get("type") != "message" or "role" not in item:
+        item_type = item.get("type")
+        if item_type == "function_call":
+            tool_call = _tool_call_message(item)
+            if tool_call is not None:
+                messages.append(tool_call)
+            continue
+        if item_type == "function_call_output":
+            messages.append(_tool_result_message(item))
+            continue
+        if item_type != "message" or "role" not in item:
             continue
         role = item["role"]
         content = _normalize_message_content(item.get("content"))
@@ -1165,6 +1179,37 @@ def _extract_role_keyed_messages(
             continue
         messages.append({"role": role, "content": content})
     return messages
+
+
+def _tool_call_message(item: dict[str, Any]) -> Message | None:
+    """Translate a ``function_call`` input item into a ``tool_call`` history message.
+
+    Returns ``None`` when the item carries no tool name (nothing replayable).
+    """
+    name = item.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    args: Any = item.get("arguments")
+    if isinstance(args, str):
+        with contextlib.suppress(TypeError, json.JSONDecodeError):
+            args = json.loads(args)
+    if not isinstance(args, dict):
+        args = {}
+    message: Message = {"role": "tool_call", "content": {"tool": name, "args": args}}
+    call_id = item.get("call_id")
+    if isinstance(call_id, str) and call_id:
+        message["metadata"] = {"call_id": call_id}
+    return message
+
+
+def _tool_result_message(item: dict[str, Any]) -> Message:
+    """Translate a ``function_call_output`` input item into a ``tool_result`` message."""
+    output = item.get("output")
+    message: Message = {"role": "tool_result", "content": output if output is not None else ""}
+    call_id = item.get("call_id")
+    if isinstance(call_id, str) and call_id:
+        message["metadata"] = {"call_id": call_id}
+    return message
 
 
 _MULTIMODAL_BLOCK_TYPES: frozenset[str] = frozenset({"input_image", "input_file", "input_audio"})
