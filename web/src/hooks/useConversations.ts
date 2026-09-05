@@ -607,7 +607,10 @@ export async function renameConversation(id: string, title: string): Promise<Con
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title }),
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  // Prefer the server's structured message (e.g. a storage backend
+  // rejecting characters in titles) over the bare status line, so the
+  // rename-failed toast tells the user what was wrong with the title.
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as Conversation;
 }
 
@@ -718,7 +721,7 @@ export function useRenameConversation() {
       overlayTitle(id, title);
       return previous;
     },
-    onError: (_err, { id }, previous) => {
+    onError: (err, { id, title }, previous) => {
       // Restore the first title we managed to snapshot. A snapshotted null
       // (previously-untitled row) is a real value to restore; only skip
       // when we never captured a title at all (all sources undefined).
@@ -729,6 +732,11 @@ export function useRenameConversation() {
             ? previous.session
             : previous?.backfill;
       if (restored !== undefined) overlayTitle(id, restored);
+      // The inline editor has unmounted by the time the PATCH settles, so
+      // (like a failed delete) the toast is the only failure signal — without
+      // it the row just flickers back to the old name. Keep it until dismiss
+      // and carry the server's reason so the user knows what to change.
+      showToast(renameFailedToast(title, err), { duration: 0 });
     },
     onSuccess: (updated) => {
       // The PATCH bumps server `updated_at`, which the unseen tracker
@@ -971,6 +979,20 @@ function deleteFailedToast(label: string | null | undefined, err: unknown): stri
   const serverMessage = err instanceof Error ? err.message.trim() : "";
   if (!serverMessage || /^\d{3}\b/.test(serverMessage)) return restored;
   return `${restored} ${serverMessage}`;
+}
+
+/**
+ * User-facing copy when an optimistic session rename is rolled back.
+ *
+ * Same status-line policy as {@link deleteFailedToast}: a structured
+ * server message (a storage backend rejecting title characters, a
+ * permission failure) is appended; a bare `"400 Bad Request"` is not.
+ */
+function renameFailedToast(title: string, err: unknown): string {
+  const reverted = `Couldn't rename the session to "${title}" — its previous name is back.`;
+  const serverMessage = err instanceof Error ? err.message.trim() : "";
+  if (!serverMessage || /^\d{3}\b/.test(serverMessage)) return reverted;
+  return `${reverted} ${serverMessage}`;
 }
 
 /**
