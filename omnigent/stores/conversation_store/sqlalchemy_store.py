@@ -2825,6 +2825,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
+        sub_harness_override: str | None = None,
+        _unset_sub_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
@@ -2920,6 +2922,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 overrides_changed = True
             elif harness_override is not None:
                 overrides["harness_override"] = harness_override
+                overrides_changed = True
+            if _unset_sub_harness_override:
+                overrides["sub_harness_override"] = None
+                overrides_changed = True
+            elif sub_harness_override is not None:
+                overrides["sub_harness_override"] = sub_harness_override
                 overrides_changed = True
             if overrides_changed:
                 row.session_overrides = _encode_session_overrides(overrides)

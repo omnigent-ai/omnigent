@@ -1488,6 +1488,15 @@ class _SessionCreateRequestBase(BaseModel):
         the spec's declared harness. Create-time only — there is no
         PATCH path, since the harness process spawns on the first
         turn.
+    :param sub_harness_override: Per-session harness override for the
+        bundle's SUB-agents, e.g. ``{"gpt": "antigravity-native"}``.
+        Keyed by each sub-agent's declared name. ``harness_override``
+        pins the brain and nothing pinned the heads, so a multi-agent
+        bundle's team was fixed at authoring time -- ``examples/debby``
+        fans out to a Claude head and a GPT head and predates the
+        Antigravity harness. ``None`` leaves the team as declared.
+        Rejected for a name the bound agent does not declare, so a typo
+        fails at create rather than silently running the old team.
     :param smart_routing_message: The user's first-message text, used to
         route the harness at create time. Only read on the top-level
         Smart Routing path (``harness_override: "auto"`` on a native
@@ -1519,6 +1528,11 @@ class _SessionCreateRequestBase(BaseModel):
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
+    # The bundle's heads, as ``{"name": "harness"}``. ``harness_override``
+    # above pins the brain; this pins who it delegates to. Keyed by each
+    # sub-agent's declared name. Create-time only, like its sibling: the
+    # spawn reads it, so it must be settled before the first turn.
+    sub_harness_override: dict[str, str] | None = None
     smart_routing_message: str | None = None
 
     @model_validator(mode="after")
