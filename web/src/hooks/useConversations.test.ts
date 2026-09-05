@@ -110,6 +110,24 @@ describe("renameConversation", () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 404 }));
     await expect(renameConversation("missing", "x")).rejects.toThrow(/404/);
   });
+
+  it("surfaces the backend's rejection message, not the bare status line", async () => {
+    // A storage backend that restricts title characters rejects the PATCH
+    // with a structured envelope; that reason must reach the caller so the
+    // failure toast can show it.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        {
+          error_code: "INVALID_PARAMETER_VALUE",
+          message: "Workspace items cannot contain the '/' character",
+        },
+        { ok: false, status: 400 },
+      ),
+    );
+    await expect(renameConversation("conv_x", "release notes/2026-09")).rejects.toThrow(
+      "Workspace items cannot contain the '/' character",
+    );
+  });
 });
 
 describe("useConversations refetch interval", () => {
@@ -1162,6 +1180,62 @@ describe("useRenameConversation cache patching", () => {
     expect(data!.pages[0].data.find((c) => c.id === "conv_x")!.title).toBe("Old name");
     const backfill = queryClient.getQueryData<Conversation>(["conversation-backfill", "conv_x"]);
     expect(backfill!.title).toBe("Old name");
+  });
+
+  function renameAgainstFailure(response: Response) {
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValueOnce(response);
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_x" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useRenameConversation(), { wrapper });
+    const toasts: string[] = [];
+    window.addEventListener("omnigent:toast", (e) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    });
+    return { rendered, toasts };
+  }
+
+  it("toasts when the rename fails, so the rollback isn't silent", async () => {
+    const { rendered, toasts } = renameAgainstFailure(
+      mockResponse({ error: "boom" }, { ok: false, status: 500 }),
+    );
+
+    rendered.result.current.mutate({ id: "conv_x", title: "New name" });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    // The inline editor unmounted on commit, so without a toast the row
+    // just flickers back to the old name with no explanation at all.
+    // Named with the attempted title; the bare status line is dropped.
+    expect(toasts).toEqual([
+      'Couldn\'t rename the session to "New name" — its previous name is back.',
+    ]);
+  });
+
+  it("puts the storage backend's rejection on the toast, not a bare 400", async () => {
+    const { rendered, toasts } = renameAgainstFailure(
+      mockResponse(
+        {
+          error_code: "INVALID_PARAMETER_VALUE",
+          message: "Workspace items cannot contain the '/' character",
+        },
+        { ok: false, status: 400 },
+      ),
+    );
+
+    rendered.result.current.mutate({ id: "conv_x", title: "release notes/2026-09" });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toContain('rename the session to "release notes/2026-09"');
+    expect(toasts[0]).toContain("Workspace items cannot contain the '/' character");
+    expect(toasts[0]).not.toMatch(/\b400\b/);
   });
 
   it("re-renders a subscribed list component with the new title before the PATCH resolves", async () => {

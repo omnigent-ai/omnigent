@@ -393,6 +393,10 @@ export class ApiError extends Error {
  * instead, so that shape is read too — otherwise those failures reach the
  * user as a bare status line ("415 ", with statusText empty over HTTP/2)
  * rather than the reason the server actually gave.
+ *
+ * Databricks-backed stores propagate rejections as a top-level
+ * `{"error_code": "…", "message": "…"}` envelope (e.g. a title the
+ * workspace storage refuses), so that shape is read as well.
  */
 export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`.trim();
@@ -401,12 +405,16 @@ export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
     const body = (await res.json()) as {
       error?: { code?: string; message?: string };
       detail?: unknown;
+      message?: unknown;
+      error_code?: unknown;
     };
     // FastAPI's validation errors put a list in `detail`; only a plain
     // string is a message meant for the user.
     if (body.error?.message) message = body.error.message;
     else if (typeof body.detail === "string" && body.detail) message = body.detail;
+    else if (typeof body.message === "string" && body.message) message = body.message;
     if (body.error?.code) code = body.error.code;
+    else if (typeof body.error_code === "string" && body.error_code) code = body.error_code;
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
   }
