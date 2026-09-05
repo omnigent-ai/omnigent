@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 
+import httpx
 import pytest
 
 from omnigent import cursor_native_forwarder as fwd
@@ -228,3 +230,78 @@ async def test_idle_restart_safe_does_not_rewake(tmp_path: Path, monkeypatch) ->
         await asyncio.gather(task, return_exceptions=True)
     assert recorder.statuses == []
     assert status.read_posted_count(bridge) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("race", ["finishes_after_read", "rejected_item", "connection_error"])
+async def test_completion_waits_for_final_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, race: str
+) -> None:
+    """The parent's completion must follow delivery of the child's final reply."""
+    bridge = tmp_path / "bridge"
+    store = tmp_path / "store.db"
+    with sqlite3.connect(store) as db:
+        db.execute("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
+
+    def finish_turn() -> None:
+        reply = {"role": "assistant", "content": [{"type": "text", "text": "pwd: /workspace"}]}
+        with sqlite3.connect(store) as db:
+            db.execute("INSERT INTO blobs VALUES (?, ?)", ("reply", json.dumps(reply)))
+        status.record_turn_end(bridge)
+
+    if race != "finishes_after_read":
+        finish_turn()
+    read_items = fwd._read_new_items
+    first_read = True
+
+    def read_then_finish(*args):
+        nonlocal first_read
+        items = read_items(*args)
+        if first_read and race == "finishes_after_read":
+            finish_turn()
+        first_read = False
+        return items
+
+    delivered: list[str] = []
+    attempts = 0
+
+    async def post_item(client, *, session_id, item):
+        nonlocal attempts
+        attempts += 1
+        if race == "rejected_item" and attempts == 1:
+            response = httpx.Response(503, request=httpx.Request("POST", "http://test/events"))
+            response.raise_for_status()
+        if race == "connection_error" and attempts == 1:
+            raise httpx.ConnectError("connection refused")
+        delivered.append(item.item_data["content"][0]["text"])
+
+    async def post_status(client, *, session_id, status):
+        delivered.append(status)
+
+    async def ignore_patch(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(fwd, "_discover_store", lambda *args: store)
+    monkeypatch.setattr(fwd, "_read_new_items", read_then_finish)
+    monkeypatch.setattr(fwd, "_read_last_used_model", lambda path: None)
+    monkeypatch.setattr(fwd, "_patch_external_session_id", ignore_patch)
+    monkeypatch.setattr(fwd, "_post_conversation_item", post_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", post_status)
+    task = asyncio.create_task(
+        fwd.forward_cursor_store_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="child",
+            bridge_dir=bridge,
+            agent_name="cursor-native-ui",
+            workspace=str(tmp_path),
+            launch_epoch_ms=1000,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        await _wait_until(lambda: status.read_posted_count(bridge) == 1)
+        assert delivered == ["pwd: /workspace", "idle"]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
