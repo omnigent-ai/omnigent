@@ -22,6 +22,8 @@ to it whenever Web Speech is unavailable.
 - Audio never leaves the operator's infrastructure.
 - Live partial transcripts stream into the composer while the user speaks
   (the Web Speech path today only inserts final utterances).
+- Completed Chinese/English transcripts receive automatic punctuation without
+  changing the recognizer that produced the words.
 - Zero new required dependencies: the STT engine ships as an optional extra
   (`omnigent[dictation]`), imported lazily, mirroring the `s3`/`modal`/
   `daytona` extras' posture. Servers without the extra (or without models)
@@ -85,9 +87,15 @@ preview reads like a sentence. This punctuation is **internal** to the
 sherpa engine — the raw transducer emits lowercase, unpunctuated text, so
 the streams beautify before returning; it is not part of the protocol.
 
+A separate lazy `SherpaPunctuationRestorer` uses the bilingual offline
+CT-Transformer on completed text. Server-recognized finals use it directly;
+browser Web Speech finals use the authenticated HTTP endpoint below. Keeping
+this as a text stage preserves the browser recognizer's accuracy and avoids
+sending microphone audio through a second recognizer.
+
 Decode calls are CPU-bound → they run via `asyncio.to_thread`, serialized by
 a per-engine `threading.Lock` (sherpa recognizer streams are not documented
-thread-safe), with a module-level semaphore capping concurrent dictation
+thread-safe), with a router-scoped semaphore capping concurrent dictation
 connections (default 2, `OMNIGENT_DICTATION_MAX_STREAMS`).
 
 ### Configuration
@@ -96,14 +104,20 @@ connections (default 2, `OMNIGENT_DICTATION_MAX_STREAMS`).
 |---|---|---|
 | `OMNIGENT_DICTATION_MODEL_DIR` | `~/.omnigent/models/dictation/asr` | dir containing `encoder*.onnx`, `decoder*.onnx`, `joiner*.onnx`, `tokens.txt` |
 | `OMNIGENT_DICTATION_PUNCT_DIR` | `~/.omnigent/models/dictation/punct` | optional online-punctuation model dir (`model*.onnx` + `bpe.vocab`) |
+| `OMNIGENT_DICTATION_FINAL_PUNCT_MODEL` | `~/.omnigent/models/dictation/punct-final/model.int8.onnx` | optional offline Chinese/English CT-Transformer used for completed transcripts |
 | `OMNIGENT_DICTATION_MAX_STREAMS` | `2` | concurrent dictation WebSockets |
 | `OMNIGENT_DICTATION_ENGINE` | unset (`sherpa`) | engine to use by registered name (`sherpa`, `remote`, `fake`) |
 | `OMNIGENT_DICTATION_REMOTE_URL` | unset | worker stream URL for the `remote` engine, e.g. `ws://venus:8100/v1/dictation/stream` |
 
-`scripts/fetch-dictation-models.sh` downloads a known-good pair (streaming
-Nemotron 0.6 B int8 + English online punctuation, both Apache-2.0 upstream)
-into the default locations. Availability is computed lazily and cached:
-extra installed **and** ASR model dir populated.
+`scripts/fetch-dictation-models.sh` downloads a known-good trio (streaming
+Nemotron 0.6 B int8, English online punctuation, and bilingual final
+punctuation; all Apache-2.0 upstream) into the default locations. ASR and final
+punctuation advertise independent capability bits and load lazily.
+
+`OMNIGENT_DICTATION_MODEL_ROOT` only controls where the fetch script installs
+the three model directories. If it is overridden, configure the corresponding
+engine paths (`OMNIGENT_DICTATION_MODEL_DIR`, `OMNIGENT_DICTATION_PUNCT_DIR`,
+and `OMNIGENT_DICTATION_FINAL_PUNCT_MODEL`) to that root as well.
 
 **Hardware sizing.** Any sherpa-onnx streaming transducer directory works —
 point `OMNIGENT_DICTATION_MODEL_DIR` at it. Streaming dictation needs ≥1×
@@ -126,22 +140,20 @@ whatever language the installed model was trained on. The
 includes Chinese, Chinese/English bilingual
 (`sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20`), French
 (`sherpa-onnx-streaming-zipformer-fr-2023-04-14`), Korean, and more; point
-`OMNIGENT_DICTATION_MODEL_DIR` at any of them. Two caveats: the fetch
-script's punctuation model is English-only, so leave
-`OMNIGENT_DICTATION_PUNCT_DIR` unpopulated for other languages (raw
-recognizer output is emitted as-is), and the mic button's `lang` prop only
-affects the Web Speech path — the server path's language is decided by the
-operator's model choice.
+`OMNIGENT_DICTATION_MODEL_DIR` at any of them. The optional online punctuation
+model remains English-only, while the final CT-Transformer supports Chinese
+and English. The mic button's `lang` prop only affects the Web Speech path —
+the server path's language is decided by the operator's model choice.
 
 ### Remote worker
 
 Where a mini-PC server can't run the model an operator wants at realtime, the
 `remote` engine relays each take to a **dictation worker** on a beefier LAN
-box. The worker is just `create_dictation_router` served on its own — it
-speaks the exact same wire protocol the browser does (PCM frames up,
-transcript events down), so no new protocol or code path was needed. The
-browser never talks to the worker; the main server authenticates the user on
-its own route, then relays over a `websockets` client.
+box. The worker mounts `create_dictation_router(include_punctuation=False)`,
+so it exposes only the audio WebSocket and speaks the exact same wire protocol
+the browser does (PCM frames up, transcript events down). The browser never
+talks to the worker; the main server authenticates the user on its own route,
+then relays over a `websockets` client.
 
 Run the worker wherever the models live (it is **unauthenticated** — bind it
 to a trusted LAN/VPN only):
@@ -176,16 +188,25 @@ as the worker finishes loading its model.
 
 ### Routes — `omnigent/server/routes/dictation.py`
 
-`create_dictation_router(*, auth_provider=None, engine_provider=None)`,
+`create_dictation_router(*, auth_provider=None, engine_provider=None,
+punctuation_provider=None, include_punctuation=True)`,
 registered in `create_app` under `/v1` like every other router. Dictation is
 not session-scoped (the new-chat composer has no session yet), so auth is
 identity-level only: authenticated user required when an auth provider is
 configured, open in single-user/dev mode — the same posture as
 `GET /v1/harnesses`.
 
-Availability rides the existing boot-time capability probe —
-`dictation_available` on **`GET /v1/info`** — rather than a dedicated
-endpoint; the UI needs one boolean, once per page load.
+Availability rides the existing boot-time capability probe:
+`dictation_available` reports audio transcription and
+`dictation_punctuation_available` independently reports final-text
+punctuation.
+
+- **`POST /v1/dictation/punctuation`** — accepts a completed transcript of at
+  most 500 characters
+  as `{"text": ...}` and returns `{"text": ...}` with Chinese/English
+  punctuation restored. Accounts deployments require an authenticated user;
+  one inference runs at a time, a concurrent request fails fast with 429, and
+  model load/inference failure returns 503 without logging transcript text.
 
 - **`WS /v1/dictation/stream`** — wire protocol (documented in the module
   docstring, mirroring `terminal_attach.py`):
@@ -226,8 +247,9 @@ Availability comes from the existing `/v1/info` capability context
 ### Mic button — `ComposerMicButton.tsx`
 
 Mode selection: **Web Speech when the browser has a working one, server
-dictation otherwise** — no behavior change for Chrome/Safari users;
-Electron, Firefox, and Chromium gain a working button. "Working" cannot be
+dictation otherwise** — Chrome/Safari keep their recognizer while completed
+phrases gain the optional punctuation stage; Electron, Firefox, and Chromium
+gain a working button. "Working" cannot be
 detected statically: Electron and plain Chromium expose the
 `SpeechRecognition` constructor but its cloud backend rejects them at
 runtime with a `network` error. So Web Speech stays primary whenever the
@@ -236,6 +258,11 @@ server **for that take** (retried immediately, so the user's click still
 lands); the next take tries Web Speech again, so a transient blip in real
 Chrome never permanently downgrades the page. With no constructor at all
 (Firefox), takes go to the server directly.
+
+When `dictation_punctuation_available` is true, completed Web Speech phrases
+are restored before insertion. Requests are serialized per composer so phrase
+order cannot change; a timeout or server failure inserts the original
+recognized words instead of losing the phrase.
 
 New optional prop `onInterim?: (text: string) => void`. In server mode the
 button emits `onInterim` for partial frames and the existing

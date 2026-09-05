@@ -3,7 +3,7 @@
 import { Button } from "@/components/ui/button";
 import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { DictationBusyError, DictationSession } from "@/lib/dictation";
+import { DictationBusyError, DictationSession, restoreDictationPunctuation } from "@/lib/dictation";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { MicIcon, SquareIcon } from "lucide-react";
@@ -115,6 +115,8 @@ export const ComposerMicButton = ({
   const [Ctor] = useState(getRecognitionCtor);
   const serverInfo = useServerInfo();
   const serverAvailable = serverInfo !== "loading" && serverInfo.dictation_available;
+  const punctuationAvailable =
+    serverInfo !== "loading" && serverInfo.dictation_punctuation_available === true;
   // Mirrored into a ref so the mount-time recognition handlers (closed
   // over [Ctor, lang]) see the current probe result.
   const serverAvailableRef = useRef(serverAvailable);
@@ -141,6 +143,62 @@ export const ComposerMicButton = ({
   // disabled mid-utterance.
   const disabledRef = useRef(disabled);
   disabledRef.current = disabled;
+  const punctuationAvailableRef = useRef(punctuationAvailable);
+  punctuationAvailableRef.current = punctuationAvailable;
+  // Web Speech can emit several final phrases in one continuous take. Restore
+  // them serially so a short later request can never overtake a longer earlier
+  // one and scramble the composer's word order.
+  const takeGenerationRef = useRef(0);
+  const punctuationQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const enqueueWebTranscriptRef = useRef<(text: string) => void>(() => {});
+  enqueueWebTranscriptRef.current = (text: string) => {
+    const transcript = text.trim();
+    if (!transcript) return;
+    const takeGeneration = takeGenerationRef.current;
+    if (!punctuationAvailableRef.current) {
+      if (!disabledRef.current && !discardingRef.current) {
+        onTranscriptRef.current(transcript);
+      }
+      return;
+    }
+    const deliver = async () => {
+      let displayText = transcript;
+      try {
+        displayText = await restoreDictationPunctuation(transcript);
+      } catch {
+        // Punctuation is an enhancement. Preserve recognized words when the
+        // model is cold, unavailable, or the request times out.
+      }
+      if (
+        takeGeneration === takeGenerationRef.current &&
+        !disabledRef.current &&
+        !discardingRef.current
+      ) {
+        onTranscriptRef.current(displayText);
+      }
+    };
+    punctuationQueueRef.current = punctuationQueueRef.current.then(deliver, deliver);
+  };
+  const enqueueServerTranscriptRef = useRef<(text: string, ordered: boolean) => void>(() => {});
+  enqueueServerTranscriptRef.current = (text: string, ordered: boolean) => {
+    const transcript = text.trim();
+    if (!transcript) return;
+    const takeGeneration = takeGenerationRef.current;
+    const deliver = () => {
+      if (
+        takeGeneration === takeGenerationRef.current &&
+        !disabledRef.current &&
+        !discardingRef.current
+      ) {
+        onTranscriptRef.current(transcript);
+      }
+    };
+    if (ordered) {
+      punctuationQueueRef.current = punctuationQueueRef.current.then(deliver, deliver);
+    } else {
+      deliver();
+    }
+  };
   // Click guard: true between toggle() and the matching start/end event.
   // Prevents rapid double-clicks from calling recognition.start() twice,
   // which throws InvalidStateError in Chrome.
@@ -151,7 +209,8 @@ export const ComposerMicButton = ({
   const serverBusyRef = useRef(false);
   // Lets the mount-time Web Speech error handler start the fallback take
   // without closing over toggleServer's identity.
-  const toggleServerRef = useRef<() => Promise<void>>(async () => {});
+  const toggleServerRef = useRef<(continueTake?: boolean) => Promise<void>>(async () => {});
+  const serverContinuesWebTakeRef = useRef(false);
 
   // Written via .style.transform from rAF — avoids 60Hz React re-renders.
   const barRefs = useRef<(HTMLSpanElement | null)[]>(BAR_BINS.map(() => null));
@@ -174,6 +233,8 @@ export const ComposerMicButton = ({
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
       discardingRef.current = false;
+      takeGenerationRef.current += 1;
+      punctuationQueueRef.current = Promise.resolve();
       setError(null);
       setIsListening(true);
       // Snapshot point: let the parent record the text so Esc can revert to it.
@@ -192,9 +253,14 @@ export const ComposerMicButton = ({
       // always the case in Electron/plain Chromium, occasionally a
       // transient blip in real Chrome. Serve THIS take from the server
       // instead; the next take tries Web Speech again.
-      if (err === "network" && serverAvailableRef.current && !disabledRef.current) {
+      if (
+        err === "network" &&
+        serverAvailableRef.current &&
+        !disabledRef.current &&
+        !discardingRef.current
+      ) {
         setIsListening(false);
-        void toggleServerRef.current();
+        void toggleServerRef.current(true);
         return;
       }
       // "no-speech" / "aborted" are routine (silence timeout, user stop).
@@ -217,8 +283,7 @@ export const ComposerMicButton = ({
           finalTranscript += result[0]?.transcript ?? "";
         }
       }
-      const trimmed = finalTranscript.trim();
-      if (trimmed) onTranscriptRef.current(trimmed);
+      enqueueWebTranscriptRef.current(finalTranscript);
     };
 
     recognition.addEventListener("start", handleStart);
@@ -243,7 +308,10 @@ export const ComposerMicButton = ({
   // cancelled outright (no tail flush) — the take is moot once the
   // composer can't accept text.
   useEffect(() => {
-    if (!(disabled && isListening)) return;
+    if (!disabled) return;
+    takeGenerationRef.current += 1;
+    punctuationQueueRef.current = Promise.resolve();
+    if (!isListening) return;
     if (sessionRef.current) {
       sessionRef.current.cancel();
       sessionRef.current = null;
@@ -263,6 +331,8 @@ export const ComposerMicButton = ({
   // new-chat dialog closes while dictating).
   useEffect(
     () => () => {
+      takeGenerationRef.current += 1;
+      punctuationQueueRef.current = Promise.resolve();
       sessionRef.current?.cancel();
       sessionRef.current = null;
     },
@@ -339,17 +409,19 @@ export const ComposerMicButton = ({
 
   // Server-dictation toggle. Start resolves only once the mic + socket
   // handshake are up, so isListening flips exactly when audio flows.
-  const toggleServer = useCallback(async () => {
+  const toggleServer = useCallback(async (continueTake = false) => {
     if (serverBusyRef.current) return;
     serverBusyRef.current = true;
     const session = sessionRef.current;
     if (session) {
       sessionRef.current = null;
+      const orderedWithWebTake = serverContinuesWebTakeRef.current;
+      serverContinuesWebTakeRef.current = false;
       const tail = (await session.stop()).trim();
       if (!disabledRef.current) {
         // A non-empty tail supersedes the pending interim via
         // onTranscript; an empty one just clears the interim region.
-        if (tail) onTranscriptRef.current(tail);
+        if (tail) enqueueServerTranscriptRef.current(tail, orderedWithWebTake);
         else onInterimRef.current?.("");
       }
       setIsListening(false);
@@ -357,9 +429,14 @@ export const ComposerMicButton = ({
       return;
     }
     try {
-      // Snapshot point: let the parent record the text so Esc can revert to it.
       discardingRef.current = false;
-      onVoiceStartRef.current?.();
+      if (!continueTake) {
+        // Snapshot point: let the parent record the text so Esc can revert to it.
+        takeGenerationRef.current += 1;
+        punctuationQueueRef.current = Promise.resolve();
+        onVoiceStartRef.current?.();
+      }
+      serverContinuesWebTakeRef.current = continueTake;
       const next = await DictationSession.start({
         onPartial: (text) => {
           // Drop late partials after an Esc discard — they'd repopulate the
@@ -367,13 +444,11 @@ export const ComposerMicButton = ({
           if (!disabledRef.current && !discardingRef.current) onInterimRef.current?.(text);
         },
         onFinal: (text) => {
-          const trimmed = text.trim();
-          if (trimmed && !disabledRef.current && !discardingRef.current) {
-            onTranscriptRef.current(trimmed);
-          }
+          enqueueServerTranscriptRef.current(text, continueTake);
         },
         onError: () => {
           sessionRef.current = null;
+          serverContinuesWebTakeRef.current = false;
           setError("Dictation unavailable");
           setIsListening(false);
           onInterimRef.current?.("");
@@ -383,6 +458,7 @@ export const ComposerMicButton = ({
       setError(null);
       setIsListening(true);
     } catch (startError) {
+      serverContinuesWebTakeRef.current = false;
       setError(
         startError instanceof DictationBusyError
           ? "Dictation is busy — try again shortly"
@@ -419,7 +495,13 @@ export const ComposerMicButton = ({
     transitionRef.current = true;
     try {
       if (isListening) recognition.stop();
-      else recognition.start();
+      else {
+        // Clicking start defines the new take immediately. Do not wait for the
+        // browser's asynchronous start event before invalidating old results.
+        takeGenerationRef.current += 1;
+        punctuationQueueRef.current = Promise.resolve();
+        recognition.start();
+      }
     } catch {
       // InvalidStateError from a double-call — drop the guard so the
       // user can try again, and let the next event reconcile state.
@@ -453,6 +535,8 @@ export const ComposerMicButton = ({
         e.preventDefault();
         e.stopPropagation();
         discardingRef.current = true;
+        takeGenerationRef.current += 1;
+        punctuationQueueRef.current = Promise.resolve();
         onVoiceDiscardRef.current?.();
         const session = sessionRef.current;
         if (session) {

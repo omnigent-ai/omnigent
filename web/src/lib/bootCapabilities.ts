@@ -19,6 +19,7 @@ export const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  dictation_punctuation_available: false,
   branding: null,
 };
 
