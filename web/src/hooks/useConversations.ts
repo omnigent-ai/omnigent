@@ -245,65 +245,110 @@ export interface ConversationsPage {
   has_more: boolean;
 }
 
-// ── Deleting-session tombstones ───────────────────────────────────────
+// ── Hidden-session tombstones (delete / archive in flight) ──────────
 //
-// Delete paints optimistically: the row leaves the sidebar the moment the
-// user confirms, long before the server finishes tearing the session down
-// (stop, runner resources, worktree, managed sandbox — seconds). Until
-// that lands, `GET /v1/sessions` still returns the session, and on the
-// search-indexed deployment it keeps returning it for a while after. Any
-// list fetch in that window — the reconcile poll, the refetch a WS frame
-// schedules, expanding a project folder — would repaint the row the user
-// just deleted.
-//
-// Ids recorded here are filtered out of every list fetch until the delete
-// settles: dropped immediately when it fails (the row comes back), or
-// after a grace window once it succeeds (the server's async reindex).
-const deletingSessionIds = new Set<string>();
+// Deleting ids are dropped from fetches/frames; archiving ids are pinned
+// `archived: true`. Each entry records its owning mutation generation, so
+// a superseded settle can neither release nor expire it.
+const sessionTombstones = new Map<
+  string,
+  { kind: "delete" | "archive"; gen: number; timer?: ReturnType<typeof setTimeout> }
+>();
+let tombstoneGen = 0;
 
-/** Grace window for the server's async delete reindex. */
+/** Grace window for the server's async list-index catch-up. */
 const DELETED_TOMBSTONE_MS = 60_000;
 
-/** Hide these sessions from every list fetch (optimistic delete). */
-export function markSessionsDeleting(ids: Iterable<string>): void {
-  for (const id of ids) deletingSessionIds.add(id);
+/** Tombstone the sessions for an in-flight delete/archive; returns the owning generation. */
+function markSessionTombstones(ids: Iterable<string>, kind: "delete" | "archive"): number {
+  const gen = ++tombstoneGen;
+  for (const id of ids) {
+    const prev = sessionTombstones.get(id);
+    if (prev?.timer !== undefined) clearTimeout(prev.timer);
+    sessionTombstones.set(id, { kind, gen });
+  }
+  return gen;
+}
+
+/** Release tombstones the caller still owns (`gen` matches) — the mutation failed or was undone. */
+function releaseSessionTombstones(ids: Iterable<string>, gen: number): void {
+  for (const id of ids) {
+    const entry = sessionTombstones.get(id);
+    if (entry === undefined || entry.gen !== gen) continue;
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
+    sessionTombstones.delete(id);
+  }
+}
+
+/** Clear archive tombstones outright — an explicit unarchive brings the row back. */
+function releaseArchiveTombstones(ids: Iterable<string>): void {
+  for (const id of ids) {
+    const entry = sessionTombstones.get(id);
+    if (entry?.kind !== "archive") continue;
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
+    sessionTombstones.delete(id);
+  }
+}
+
+/** Hold settled tombstones through the reindex grace window, then release them. */
+function expireSessionTombstones(ids: Iterable<string>, gen: number): void {
+  for (const id of ids) {
+    const entry = sessionTombstones.get(id);
+    if (entry === undefined || entry.gen !== gen) continue;
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      if (sessionTombstones.get(id) === entry) sessionTombstones.delete(id);
+    }, DELETED_TOMBSTONE_MS);
+  }
+}
+
+/** Re-arm archive tombstones a failed unarchive/delete cleared, with a fresh grace window. */
+function rearmArchiveTombstones(ids: readonly string[]): void {
+  const rearm = ids.filter((id) => sessionTombstones.get(id) === undefined);
+  if (rearm.length > 0) expireSessionTombstones(rearm, markSessionTombstones(rearm, "archive"));
+}
+
+/** Wipe every tombstone — exported for test cleanup. */
+export function clearSessionTombstones(): void {
+  for (const entry of sessionTombstones.values()) {
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
+  }
+  sessionTombstones.clear();
 }
 
 /** Whether a session has an optimistic delete in flight (tombstoned). */
 export function isSessionDeleting(id: string): boolean {
-  return deletingSessionIds.has(id);
+  return sessionTombstones.get(id)?.kind === "delete";
+}
+
+/** Whether a session has an optimistic archive in flight (tombstoned). */
+export function isSessionArchiving(id: string): boolean {
+  return sessionTombstones.get(id)?.kind === "archive";
 }
 
 /**
- * Stop hiding sessions — their delete failed, so the rows return.
- * Omit `ids` to release every tombstone at once.
+ * Apply tombstones to a freshly fetched page: drop deleting sessions; pin
+ * archiving sessions to `archived: true` (or drop them when `dropArchiving`
+ * — lists that never show archived rows). Cursors follow the survivors.
  */
-export function unmarkSessionsDeleting(ids?: Iterable<string>): void {
-  if (ids === undefined) {
-    deletingSessionIds.clear();
-    return;
+function applySessionTombstones(page: ConversationsPage, dropArchiving = false): ConversationsPage {
+  if (sessionTombstones.size === 0) return page;
+  let changed = false;
+  const data: Conversation[] = [];
+  for (const conv of page.data) {
+    const tombstone = sessionTombstones.get(conv.id);
+    if (tombstone?.kind === "delete" || (dropArchiving && tombstone !== undefined)) {
+      changed = true;
+      continue;
+    }
+    if (tombstone?.kind === "archive" && conv.archived !== true) {
+      changed = true;
+      data.push({ ...conv, archived: true });
+      continue;
+    }
+    data.push(conv);
   }
-  for (const id of ids) deletingSessionIds.delete(id);
-}
-
-/** Release confirmed-delete tombstones once the server has caught up. */
-function expireSessionsDeleting(ids: string[]): void {
-  setTimeout(() => unmarkSessionsDeleting(ids), DELETED_TOMBSTONE_MS);
-}
-
-/**
- * Drop rows for sessions with a delete in flight from a freshly fetched
- * page, recomputing the page cursors from the survivors so pagination
- * never anchors on an id the server is about to forget (mirrors
- * `removeIdsFromPages`).
- *
- * @param page - A page as returned by `GET /v1/sessions`.
- * @returns The page, or a filtered copy when it held a deleting session.
- */
-function withoutDeletingSessions(page: ConversationsPage): ConversationsPage {
-  if (deletingSessionIds.size === 0) return page;
-  const data = page.data.filter((conv) => !deletingSessionIds.has(conv.id));
-  if (data.length === page.data.length) return page;
+  if (!changed) return page;
   return {
     ...page,
     data,
@@ -332,7 +377,7 @@ export function markRecentlyCreated(conv: Conversation): void {
   setTimeout(() => recentlyCreatedSessions.delete(conv.id), CREATED_KEEPALIVE_MS);
 }
 
-/** Clear the keep-alive map — exported for test cleanup (mirrors `unmarkSessionsDeleting`). */
+/** Clear the keep-alive map — exported for test cleanup. */
 export function clearRecentlyCreated(): void {
   recentlyCreatedSessions.clear();
 }
@@ -341,7 +386,7 @@ export function clearRecentlyCreated(): void {
  * Prepend recently-created rows the first page doesn't yet include (the index
  * hasn't caught up). Only the unfiltered, unsearched first page — a create sorts
  * newest-first. Once the fetch returns the row itself, the keep-alive is dropped.
- * Applied before `withoutDeletingSessions`, so a create-then-delete stays gone.
+ * Applied before `applySessionTombstones`, so a create-then-delete stays gone.
  */
 function withRecentlyCreated(
   page: ConversationsPage,
@@ -479,7 +524,8 @@ async function fetchConversationsPage({
   // falling back to the modal. host_id is fixed for a session's life, so this
   // can't seed a stale value; a hostless row clears any prior mapping.
   for (const row of page.data) setSessionHost(row.id, row.host_id);
-  return withoutDeletingSessions(
+  // Non-archived queries exclude archived rows server-side — drop, don't pin.
+  return applySessionTombstones(
     withRecentlyCreated(
       page,
       after,
@@ -489,6 +535,7 @@ async function fetchConversationsPage({
       queryClient,
       visibility,
     ),
+    !includeArchived && visibility !== "archived",
   );
 }
 
@@ -793,34 +840,56 @@ function dropFromPinnedCache(queryClient: QueryClient, ids: Iterable<string>): v
   );
 }
 
+/**
+ * Paint an archive/unarchive before the server confirms it: tombstone the
+ * ids (an unarchive clears it), cancel in-flight list refetches, then overlay
+ * the flag into every cached list. Mirrors `paintConversationsDeleted`.
+ */
+async function paintConversationsArchived(
+  queryClient: QueryClient,
+  ids: readonly string[],
+  archived: boolean,
+): Promise<{ snapshot: ArchiveListsSnapshot; gen: number; restoreArchiving: string[] }> {
+  const restoreArchiving = ids.filter((id) => isSessionArchiving(id));
+  await Promise.all([
+    queryClient.cancelQueries({ queryKey: ["conversations"] }),
+    queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
+  ]);
+  // Unarchive marks nothing but still gets a gen, so gen-guarded release/expire are no-ops.
+  const gen = markSessionTombstones(archived ? ids : [], "archive");
+  if (!archived) releaseArchiveTombstones(ids);
+  const snapshot = snapshotArchiveLists(queryClient);
+  for (const id of ids) overlayArchivedIntoCaches(queryClient, id, archived);
+  if (archived) dropFromPinnedCache(queryClient, ids);
+  return { snapshot, gen, restoreArchiving };
+}
+
 export function useArchiveConversation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({ id, archived }: { id: string; archived: boolean }) =>
       archiveConversation(id, archived),
-    onMutate: async ({ id, archived }) => {
-      // Cancel any in-flight list refetch so it can't resolve after this
-      // overlay and clobber the flag with the stale search-indexed state.
-      await queryClient.cancelQueries({ queryKey: ["conversations"] });
-      const snapshot = snapshotArchiveLists(queryClient);
-      overlayArchivedIntoCaches(queryClient, id, archived);
-      // Drop an archived pin from the backfill cache too (mirrors delete).
-      if (archived) dropFromPinnedCache(queryClient, [id]);
-      return { snapshot };
-    },
-    onError: (_err, { archived }, context) => {
+    onMutate: ({ id, archived }) => paintConversationsArchived(queryClient, [id], archived),
+    onError: (_err, { id, archived }, context) => {
+      // A newer mutation owns the id — leave its tombstone and overlay alone.
+      const live = sessionTombstones.get(id);
+      if (context && live !== undefined && live.gen !== context.gen) return;
+      if (archived && context) releaseSessionTombstones([id], context.gen);
+      if (context) rearmArchiveTombstones(context.restoreArchiving);
       // Roll back to exactly the pre-archive caches, synchronously — so the
       // row (and any dropped pin) returns at once, rather than waiting on a
       // search-indexed refetch that lags the write.
-      if (context?.snapshot) restoreArchiveLists(queryClient, context.snapshot);
+      if (context) restoreArchiveLists(queryClient, context.snapshot);
+      if (context) reapplyLiveTombstones(queryClient);
       showToast(
         archived
           ? "Couldn't archive the session — it's back in the sidebar."
           : "Couldn't unarchive the session.",
       );
     },
-    onSuccess: (updated) => {
+    onSuccess: (updated, { archived }, context) => {
       markConversationSeen(updated.id, updated.updated_at);
+      if (archived && context) expireSessionTombstones([updated.id], context.gen);
       // Archiving/unarchiving the last (or first) non-archived member of a
       // project removes/restores it from the server's project list, and adds
       // or drops it from that project folder's own paginated list. These read
@@ -865,6 +934,18 @@ function removeConversationsFromLists(queryClient: QueryClient, ids: Set<string>
   );
 }
 
+/** Re-apply every live tombstone's optimistic state after a wholesale snapshot restore. */
+function reapplyLiveTombstones(queryClient: QueryClient): void {
+  const deleted = new Set<string>();
+  const archived = new Set<string>();
+  for (const [id, entry] of sessionTombstones)
+    if (entry.kind === "delete") deleted.add(id);
+    else archived.add(id);
+  for (const id of archived) overlayArchivedIntoCaches(queryClient, id, true);
+  if (archived.size > 0) dropFromPinnedCache(queryClient, archived);
+  if (deleted.size > 0) removeConversationsFromLists(queryClient, deleted);
+}
+
 /** Every cached list touched by an optimistic delete, as it was before. */
 interface DeletedListsSnapshot {
   lists: [readonly unknown[], ConversationsInfiniteData | undefined][];
@@ -885,12 +966,13 @@ interface DeletedListsSnapshot {
 async function paintConversationsDeleted(
   queryClient: QueryClient,
   ids: readonly string[],
-): Promise<DeletedListsSnapshot> {
-  markSessionsDeleting(ids);
+): Promise<{ snapshot: DeletedListsSnapshot; gen: number; restoreArchiving: string[] }> {
+  const restoreArchiving = ids.filter((id) => isSessionArchiving(id));
   await Promise.all([
     queryClient.cancelQueries({ queryKey: ["conversations"] }),
     queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
   ]);
+  const gen = markSessionTombstones(ids, "delete");
   const snapshot: DeletedListsSnapshot = {
     lists: [
       ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] }),
@@ -899,34 +981,33 @@ async function paintConversationsDeleted(
     pinned: queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY),
   };
   removeConversationsFromLists(queryClient, new Set(ids));
-  return snapshot;
+  return { snapshot, gen, restoreArchiving };
 }
 
 /**
  * Put optimistically-removed rows back after a failed delete.
  *
  * Restores the snapshot wholesale (the same rollback shape
- * `useMoveToProject` uses) rather than re-deriving positions, then
- * re-splices whatever DID delete — a bulk delete can fail for only part
- * of its selection. The lists are invalidated afterwards so the server
- * reconciles the window the snapshot froze over.
+ * `useMoveToProject` uses), then re-applies live tombstones so ids a newer
+ * mutation owns keep that mutation's state (and ids that DID delete in a
+ * partial bulk failure stay gone). The lists are invalidated afterwards so
+ * the server reconciles the window the snapshot froze over.
  *
  * @param queryClient - The app QueryClient.
- * @param snapshot - Cache state captured by `paintConversationsDeleted`.
+ * @param paint - Tombstone + cache state captured by `paintConversationsDeleted`.
  * @param failedIds - Conversation ids whose delete failed (rows return).
- * @param deletedIds - Conversation ids that did delete (rows stay gone).
  */
 function restoreDeletedConversations(
   queryClient: QueryClient,
-  snapshot: DeletedListsSnapshot | undefined,
+  paint: { snapshot: DeletedListsSnapshot; gen: number; restoreArchiving: string[] } | undefined,
   failedIds: readonly string[],
-  deletedIds: readonly string[] = [],
 ): void {
-  unmarkSessionsDeleting(failedIds);
-  if (snapshot) {
-    for (const [key, data] of snapshot.lists) queryClient.setQueryData(key, data);
-    queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, snapshot.pinned);
-    if (deletedIds.length > 0) removeConversationsFromLists(queryClient, new Set(deletedIds));
+  if (paint !== undefined) {
+    releaseSessionTombstones(failedIds, paint.gen);
+    rearmArchiveTombstones(paint.restoreArchiving.filter((id) => failedIds.includes(id)));
+    for (const [key, data] of paint.snapshot.lists) queryClient.setQueryData(key, data);
+    queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, paint.snapshot.pinned);
+    reapplyLiveTombstones(queryClient);
   }
   void queryClient.invalidateQueries({ queryKey: ["conversations"] });
   void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
@@ -942,12 +1023,16 @@ function restoreDeletedConversations(
  * @param queryClient - The app QueryClient.
  * @param ids - Conversation ids the server confirmed deleted.
  */
-function finalizeDeletedConversations(queryClient: QueryClient, ids: readonly string[]): void {
+function finalizeDeletedConversations(
+  queryClient: QueryClient,
+  ids: readonly string[],
+  gen: number,
+): void {
   for (const id of ids) {
     queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
     queryClient.removeQueries({ queryKey: ["session", id] });
   }
-  expireSessionsDeleting([...ids]);
+  expireSessionTombstones(ids, gen);
   // Deleting the last member of a project empties it, so refresh the
   // project list to drop the now-empty folder. Unlike the conversations
   // list, /v1/sessions/projects reads the DB directly (no search-index
@@ -993,7 +1078,7 @@ function deleteFailedToast(label: string | null | undefined, err: unknown): stri
  * round-trip — server-side teardown (runner resources, worktree, managed
  * sandbox) can take seconds, which is what made delete feel slower than
  * archive. The session is tombstoned for that window so a concurrent list
- * fetch can't repaint the row (see `withoutDeletingSessions`); `onError`
+ * fetch can't repaint the row (see `applySessionTombstones`); `onError`
  * drops the tombstone and refetches, restoring the row. Callers (the
  * sidebar row) are responsible for navigating away from `/c/{id}` if the
  * deleted conversation is the active one.
@@ -1013,11 +1098,11 @@ export function useStopAndDeleteConversation() {
       // Snapshot the label before the row leaves the cache — a failure
       // toast fired later can no longer look it up.
       const row = findCachedConversationRow(queryClient, id);
-      const snapshot = await paintConversationsDeleted(queryClient, [id]);
-      return { label: row ? conversationDisplayLabel(row) : null, snapshot };
+      const paint = await paintConversationsDeleted(queryClient, [id]);
+      return { label: row ? conversationDisplayLabel(row) : null, paint };
     },
     onError: (err, { id }, context) => {
-      restoreDeletedConversations(queryClient, context?.snapshot, [id]);
+      restoreDeletedConversations(queryClient, context?.paint, [id]);
       // The row is back in the sidebar but nothing else marks it as failed
       // (the row unmounted when it was spliced out, taking any in-row error
       // state with it), so the toast is the only failure signal. Keep it
@@ -1026,8 +1111,8 @@ export function useStopAndDeleteConversation() {
       // only hint for what to do next.
       showToast(deleteFailedToast(context?.label, err), { duration: 0 });
     },
-    onSuccess: (_data, { id }) => {
-      finalizeDeletedConversations(queryClient, [id]);
+    onSuccess: (_data, { id }, context) => {
+      if (context !== undefined) finalizeDeletedConversations(queryClient, [id], context.paint.gen);
     },
   });
 }
@@ -1130,25 +1215,26 @@ export function useBulkArchiveConversations() {
         .filter((r): r is PromiseFulfilledResult<Conversation> => r.status === "fulfilled")
         .map((r) => r.value);
     },
-    onMutate: async ({ ids, archived }) => {
-      await queryClient.cancelQueries({ queryKey: ["conversations"] });
-      const snapshot = snapshotArchiveLists(queryClient);
-      for (const id of ids) overlayArchivedIntoCaches(queryClient, id, archived);
-      if (archived) dropFromPinnedCache(queryClient, ids);
-      return { snapshot };
-    },
+    onMutate: ({ ids, archived }) => paintConversationsArchived(queryClient, ids, archived),
     onError: (err, { ids, archived }, context) => {
-      // Partial failure: restore the pre-archive caches, then RE-apply the
-      // overlay for the ids that DID archive so they stay hidden — only the
-      // failed ids return. Restoring from the snapshot rather than refetching
-      // ["conversations"] is what stops the search-index lag from resurrecting
-      // the successful archives (the exact regression this reconcile guards).
-      if (!context?.snapshot) return;
-      restoreArchiveLists(queryClient, context.snapshot);
+      if (!context) return;
       const failed = new Set(err instanceof BulkConversationMutationError ? err.failed : ids);
       const succeeded = ids.filter((id) => !failed.has(id));
-      for (const id of succeeded) overlayArchivedIntoCaches(queryClient, id, archived);
-      if (archived) dropFromPinnedCache(queryClient, succeeded);
+      if (archived) {
+        releaseSessionTombstones(failed, context.gen);
+        expireSessionTombstones(succeeded, context.gen);
+      }
+      rearmArchiveTombstones(context.restoreArchiving.filter((id) => failed.has(id)));
+      restoreArchiveLists(queryClient, context.snapshot);
+      reapplyLiveTombstones(queryClient);
+      // Succeeded unarchives own no tombstone — re-apply their flag by hand.
+      if (!archived) {
+        for (const id of succeeded.filter((sid) => !sessionTombstones.has(sid)))
+          overlayArchivedIntoCaches(queryClient, id, false);
+      }
+    },
+    onSuccess: (_data, { ids, archived }, context) => {
+      if (archived && context !== undefined) expireSessionTombstones(ids, context.gen);
     },
     onSettled: () => {
       // Project caches read the DB directly (no search-index lag), so unlike
@@ -1211,17 +1297,19 @@ export function useBulkDeleteConversations() {
       return { succeeded, failed };
     },
     onMutate: ({ ids }) => paintConversationsDeleted(queryClient, ids),
-    onSuccess: (_data, { ids }) => {
-      finalizeDeletedConversations(queryClient, ids);
+    onSuccess: (_data, { ids }, context) => {
+      if (context !== undefined) finalizeDeletedConversations(queryClient, ids, context.gen);
     },
-    onError: (error, { ids }, snapshot) => {
+    onError: (error, { ids }, context) => {
       // Partial failure: the sessions that did delete stay gone; the rest
       // come back. A non-bulk error (nothing reported) restores everything.
       const bulk = error instanceof BulkConversationMutationError ? error : null;
       const failed = bulk ? bulk.failed : [...ids];
       const succeeded = bulk ? bulk.succeeded : [];
-      restoreDeletedConversations(queryClient, snapshot, failed, succeeded);
-      if (succeeded.length > 0) finalizeDeletedConversations(queryClient, succeeded);
+      restoreDeletedConversations(queryClient, context, failed);
+      if (succeeded.length > 0 && context !== undefined) {
+        finalizeDeletedConversations(queryClient, succeeded, context.gen);
+      }
       showToast(
         failed.length === 1
           ? "Couldn't delete 1 session — it's back in the sidebar."
@@ -1353,7 +1441,7 @@ export async function fetchPinnedConversations(): Promise<PinnedConversationsRes
   });
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const rows = withoutDeletingSessions((await res.json()) as ConversationsPage).data;
+  const rows = applySessionTombstones((await res.json()) as ConversationsPage, true).data;
   const conversations = rows.filter((c) => c.labels?.[PINNED_LABEL_KEY] != null);
   // Honored iff the server returned nothing, or everything it returned is
   // actually pinned. An old server returns unfiltered rows (none pinned), so a
@@ -1965,7 +2053,7 @@ async function fetchProjectSessionsPage(
   if (after) params.set("after", after);
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return withoutDeletingSessions((await res.json()) as ConversationsPage);
+  return applySessionTombstones((await res.json()) as ConversationsPage, true);
 }
 
 /**

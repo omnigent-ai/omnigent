@@ -2,7 +2,7 @@
 // query-invalidation contract of the stop mutation hook.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, renderHook, screen, waitFor } from "@testing-library/react";
+import { act, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
@@ -29,7 +29,7 @@ import {
   useStopSession,
   useTogglePinnedConversation,
   fetchPinnedConversations,
-  unmarkSessionsDeleting,
+  clearSessionTombstones,
   markRecentlyCreated,
   clearRecentlyCreated,
   PINNED_CONVERSATIONS_KEY,
@@ -60,10 +60,8 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  // Optimistic delete hides ids from every list fetch until the delete
-  // settles, in module-level state that would otherwise leak into the next
-  // test (which reuses the same ids against a fresh cache).
-  unmarkSessionsDeleting();
+  // Tombstones are module-level state that would leak into the next test.
+  clearSessionTombstones();
   // Same for the recently-created keep-alive.
   clearRecentlyCreated();
 });
@@ -2367,6 +2365,15 @@ describe("useMoveToProject", () => {
 });
 
 describe("useArchiveConversation", () => {
+  // A list page the search index keeps serving while it lags the PATCH.
+  const staleListPage = {
+    object: "list",
+    data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 5 }],
+    first_id: "conv_a",
+    last_id: "conv_a",
+    has_more: false,
+  };
+
   it("PATCHes archived, overlays the flag optimistically, and doesn't race the reindex", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
@@ -2474,6 +2481,561 @@ describe("useArchiveConversation", () => {
       .pages[0].data;
     expect(rows[0].archived).toBe(false);
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
+
+  it("keeps the row out when a stale sidebar-list refetch lands mid-archive", async () => {
+    // Hold the PATCH open so the refetch lands while the server (and the
+    // search index behind it) still lists the session with archived:false.
+    let settlePatch = (_res: Response) => {};
+    const pendingPatch = new Promise<Response>((resolve) => {
+      settlePatch = resolve;
+    });
+    fetchMock.mockImplementationOnce(() => pendingPatch);
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_a" }), conversation({ id: "conv_other" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    // An active observer on the sidebar's own key, so the refetch below runs
+    // the real queryFn (the seeded data is fresh, so mounting fetches nothing).
+    renderHook(() => useConversations("", false), { wrapper });
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    result.current.mutate({ id: "conv_a", archived: true });
+    // The optimistic overlay drops the row from the default list immediately.
+    await waitFor(() => {
+      const data = queryClient.getQueryData<ConversationsInfiniteData>([
+        "conversations",
+        "",
+        false,
+      ]);
+      expect(data!.pages[0].data.map((c) => c.id)).toEqual(["conv_other"]);
+    });
+
+    // A stale refetch of the sidebar list lands mid-archive (debounced WS
+    // invalidation or reconcile poll). The tombstone drops the row, as the
+    // server would have, and cursors re-anchor on the survivor.
+    const stalePage = {
+      object: "list",
+      data: [
+        { id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 5 },
+        { id: "conv_other", object: "conversation", title: "B", created_at: 0, updated_at: 4 },
+      ],
+      first_id: "conv_a",
+      last_id: "conv_other",
+      has_more: false,
+    };
+    fetchMock.mockResolvedValueOnce(mockResponse(stalePage));
+    await act(() => queryClient.refetchQueries({ queryKey: ["conversations", "", false] }));
+    const page = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+      .pages[0];
+    expect(page.data.map((c) => c.id)).toEqual(["conv_other"]);
+    expect([page.first_id, page.last_id]).toEqual(["conv_other", "conv_other"]);
+
+    // The same stale page on an include-archived list keeps the row visible
+    // (the Archived tab), pinned archived:true.
+    fetchMock.mockResolvedValueOnce(mockResponse(stalePage));
+    const archivedList = renderHook(() => useConversations("", true), { wrapper });
+    await waitFor(() => expect(archivedList.result.current.data).toBeDefined());
+    const archivedRow = archivedList.result.current.data!.pages[0].data.find(
+      (c) => c.id === "conv_a",
+    );
+    expect(archivedRow?.archived).toBe(true);
+
+    settlePatch(
+      mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 10 }),
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  });
+
+  it("cancels in-flight conversations AND project-sessions fetches on archive", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 10 }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", true],
+      infinitePage([conversation({ id: "conv_a" })]),
+    );
+    const cancelSpy = vi.spyOn(queryClient, "cancelQueries");
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // Parity with rename/delete: a stale project-folder fetch resolving after
+    // the overlay would resurrect the row in its folder.
+    expect(cancelSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    expect(cancelSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+  });
+
+  it("clears the tombstone on unarchive so the returning row is never suppressed", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", true],
+      infinitePage([conversation({ id: "conv_a", archived: false })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useConversations("", true), { wrapper });
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    const cachedRow = () =>
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", true])!
+        .pages[0].data.find((c) => c.id === "conv_a");
+
+    // Archive succeeds; the tombstone pins the row archived:true for the
+    // grace window, so a stale refetch can't show it active again.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 10 }),
+    );
+    await result.current.mutateAsync({ id: "conv_a", archived: true });
+    fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
+    await act(() => queryClient.refetchQueries({ queryKey: ["conversations", "", true] }));
+    expect(cachedRow()?.archived).toBe(true);
+
+    // Unarchive clears the tombstone, so the SAME stale page now comes back
+    // with the flag the server sent — the returning row is never suppressed.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "conv_a", object: "conversation", archived: false, updated_at: 11 }),
+    );
+    await result.current.mutateAsync({ id: "conv_a", archived: false });
+    fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
+    await act(() => queryClient.refetchQueries({ queryKey: ["conversations", "", true] }));
+    expect(cachedRow()?.archived).toBeFalsy();
+  });
+
+  it("keeps the tombstone when a session is re-archived inside the first archive's grace window", async () => {
+    vi.useFakeTimers();
+    try {
+      // Stream connected → no safety poll would fire while time is advanced.
+      vi.mocked(useSessionUpdatesConnected).mockReturnValue(true);
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      queryClient.setQueryData(
+        ["conversations", "", true],
+        infinitePage([conversation({ id: "conv_a" })]),
+      );
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      renderHook(() => useConversations("", true), { wrapper });
+      const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 10 }),
+      );
+      await result.current.mutateAsync({ id: "conv_a", archived: true });
+      // Half the grace window passes, then an unarchive (clears the tombstone
+      // and its pending expiry)…
+      vi.advanceTimersByTime(30_000);
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ id: "conv_a", object: "conversation", archived: false, updated_at: 11 }),
+      );
+      await result.current.mutateAsync({ id: "conv_a", archived: false });
+      // …and a second archive re-arms both.
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 12 }),
+      );
+      await result.current.mutateAsync({ id: "conv_a", archived: true });
+
+      // Past the FIRST archive's original expiry: its timer was cleared by the
+      // unarchive, so it must not clear the second archive's live tombstone.
+      vi.advanceTimersByTime(31_000);
+      fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
+      await act(() => queryClient.refetchQueries({ queryKey: ["conversations", "", true] }));
+      const row = queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", true])!
+        .pages[0].data.find((c) => c.id === "conv_a");
+      expect(row?.archived).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("re-arms the tombstone when an unarchive fails inside the grace window", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", true],
+      infinitePage([conversation({ id: "conv_a", archived: false })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useConversations("", true), { wrapper });
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    // Archive succeeds — the tombstone is armed for the grace window.
+    const toasts: string[] = [];
+    window.addEventListener("omnigent:toast", (e) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    });
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 10 }),
+    );
+    result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // The unarchive fails: onMutate cleared the tombstone and onError must
+    // re-arm it — the session is still archived server-side, so a stale
+    // refetch must keep the row flagged archived.
+    fetchMock.mockResolvedValueOnce(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+    result.current.mutate({ id: "conv_a", archived: false });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(toasts).toEqual(["Couldn't unarchive the session."]);
+
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        object: "list",
+        data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 5 }],
+        first_id: "conv_a",
+        last_id: "conv_a",
+        has_more: false,
+      }),
+    );
+    await act(() => queryClient.refetchQueries({ queryKey: ["conversations", "", true] }));
+    const row = queryClient
+      .getQueryData<ConversationsInfiniteData>(["conversations", "", true])!
+      .pages[0].data.find((c) => c.id === "conv_a");
+    expect(row?.archived).toBe(true);
+  });
+
+  it("a failed unarchive after a newer archive neither rolls back nor toasts", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", true],
+      infinitePage([conversation({ id: "conv_a", archived: false })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useConversations("", true), { wrapper });
+    const archive = renderHook(() => useArchiveConversation(), { wrapper });
+    const unarchive = renderHook(() => useArchiveConversation(), { wrapper });
+    const toasts: string[] = [];
+    window.addEventListener("omnigent:toast", (e) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    });
+    const cachedRow = () =>
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", true])!
+        .pages[0].data.find((c) => c.id === "conv_a");
+
+    // Archive succeeds; the row is pinned archived for the grace window.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 10 }),
+    );
+    await archive.result.current.mutateAsync({ id: "conv_a", archived: true });
+
+    // An unarchive starts (PATCH held open)…
+    let settleUnarchive = (_res: Response) => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settleUnarchive = resolve;
+        }),
+    );
+    unarchive.result.current.mutate({ id: "conv_a", archived: false });
+    await waitFor(() => expect(cachedRow()?.archived).toBe(false));
+
+    // …then a NEWER archive succeeds and owns the tombstone again.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 12 }),
+    );
+    await archive.result.current.mutateAsync({ id: "conv_a", archived: true });
+
+    // The unarchive's PATCH fails last: the newer archive owns what the user
+    // sees, so no snapshot rollback and no failure toast.
+    settleUnarchive(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+    await waitFor(() => expect(unarchive.result.current.isError).toBe(true));
+    expect(cachedRow()?.archived).toBe(true);
+    expect(toasts).toEqual([]);
+  });
+
+  it("delete inside the archive grace window takes over the tombstone (no stranded pin)", async () => {
+    vi.useFakeTimers();
+    try {
+      // Stream connected → no safety poll would fire while time is advanced.
+      vi.mocked(useSessionUpdatesConnected).mockReturnValue(true);
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      queryClient.setQueryData(
+        ["conversations", "", true],
+        infinitePage([conversation({ id: "conv_a" })]),
+      );
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      renderHook(() => useConversations("", true), { wrapper });
+      const archive = renderHook(() => useArchiveConversation(), { wrapper });
+      const del = renderHook(() => useStopAndDeleteConversation(), { wrapper });
+
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 10 }),
+      );
+      await archive.result.current.mutateAsync({ id: "conv_a", archived: true });
+
+      // Delete while the archive pin is still in its grace window: the delete
+      // tombstone replaces the archive entry, including its pending expiry.
+      fetchMock.mockResolvedValueOnce(mockResponse({}));
+      fetchMock.mockResolvedValueOnce(mockResponse({ id: "conv_a", deleted: true }));
+      await del.result.current.mutateAsync({ id: "conv_a" });
+
+      // Past the grace window both tombstones are gone, so a stale page comes
+      // back exactly as the server sent it — no pin left behind.
+      vi.advanceTimersByTime(61_000);
+      fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
+      await act(() => queryClient.refetchQueries({ queryKey: ["conversations", "", true] }));
+      const row = queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", true])!
+        .pages[0].data.find((c) => c.id === "conv_a");
+      expect(row?.archived).toBeFalsy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a failed delete inside the archive grace window re-arms the archive pin", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", true],
+      infinitePage([conversation({ id: "conv_a", archived: false })]),
+    );
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_a" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useConversations("", true), { wrapper });
+    renderHook(() => useConversations("", false), { wrapper });
+    const archive = renderHook(() => useArchiveConversation(), { wrapper });
+    const del = renderHook(() => useStopAndDeleteConversation(), { wrapper });
+
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 10 }),
+    );
+    await archive.result.current.mutateAsync({ id: "conv_a", archived: true });
+
+    // The delete fails (stop ok, DELETE 500): onError releases the delete
+    // tombstone and re-arms the archive pin it replaced, so the rollback
+    // refetch's stale page stays pinned archived:true (off the default page).
+    fetchMock.mockResolvedValueOnce(mockResponse({}));
+    fetchMock.mockResolvedValueOnce(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+    fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
+    fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
+    del.result.current.mutate({ id: "conv_a" });
+    await waitFor(() => expect(del.result.current.isError).toBe(true));
+    // updated_at:5 only arrives via the stale refetch, proving it landed.
+    await waitFor(() => {
+      const row = queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", true])!
+        .pages[0].data.find((c) => c.id === "conv_a");
+      expect(row).toMatchObject({ archived: true, updated_at: 5 });
+    });
+    const defaultIds = queryClient
+      .getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+      .pages[0].data.map((c) => c.id);
+    expect(defaultIds).toEqual([]);
+  });
+
+  it("a failed bulk archive keeps a row a newer delete owns out of the restored lists", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_a" }), conversation({ id: "conv_b" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const bulk = renderHook(() => useBulkArchiveConversations(), { wrapper });
+    const del = renderHook(() => useStopAndDeleteConversation(), { wrapper });
+    const defaultIds = () =>
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+        .pages[0].data.map((c) => c.id);
+
+    // Bulk archive of conv_a: PATCH held open; the overlay drops the row.
+    let settleArchive = (_res: Response) => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settleArchive = resolve;
+        }),
+    );
+    bulk.result.current.mutate({ ids: ["conv_a"], archived: true });
+    await waitFor(() => expect(defaultIds()).toEqual(["conv_b"]));
+
+    // A newer delete takes over conv_a's tombstone and succeeds.
+    fetchMock.mockResolvedValueOnce(mockResponse({}));
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "conv_a", deleted: true }));
+    await del.result.current.mutateAsync({ id: "conv_a" });
+
+    // The bulk archive's PATCH finally fails: rolling its snapshot back must
+    // not resurrect the row the delete owns.
+    settleArchive(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+    await waitFor(() => expect(bulk.result.current.isError).toBe(true));
+    expect(defaultIds()).toEqual(["conv_b"]);
+  });
+
+  it("a failed bulk unarchive keeps a newer archive's pin on a succeeded id", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", true],
+      infinitePage([
+        conversation({ id: "conv_a", archived: true }),
+        conversation({ id: "conv_b", archived: true }),
+      ]),
+    );
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_c" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const bulk = renderHook(() => useBulkArchiveConversations(), { wrapper });
+    const archive = renderHook(() => useArchiveConversation(), { wrapper });
+    const archivedRow = (id: string) =>
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", true])!
+        .pages[0].data.find((c) => c.id === id);
+
+    // Bulk UNarchive of both: PATCHes held open; the overlay flags them active.
+    const settlers: ((res: Response) => void)[] = [];
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          settlers.push(resolve);
+        }),
+    );
+    bulk.result.current.mutate({ ids: ["conv_a", "conv_b"], archived: false });
+    await waitFor(() => expect(archivedRow("conv_a")?.archived).toBe(false));
+
+    // A newer single archive of conv_a succeeds and owns its tombstone.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 12 }),
+    );
+    await archive.result.current.mutateAsync({ id: "conv_a", archived: true });
+
+    // The bulk settles: conv_a's PATCH ok, conv_b's fails. The rollback must
+    // not strip the archive pin the newer mutation owns; conv_b rolls back.
+    settlers[0](
+      mockResponse({ id: "conv_a", object: "conversation", archived: false, updated_at: 13 }),
+    );
+    settlers[1](mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+    await waitFor(() => expect(bulk.result.current.isError).toBe(true));
+    expect(archivedRow("conv_a")?.archived).toBe(true);
+    expect(archivedRow("conv_b")?.archived).toBe(true);
+    const defaultIds = queryClient
+      .getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+      .pages[0].data.map((c) => c.id);
+    expect(defaultIds).toEqual(["conv_c"]);
+  });
+
+  it("a failed delete keeps a newer archive's pin through the snapshot rollback", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", true],
+      infinitePage([conversation({ id: "conv_a", archived: false })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const archive = renderHook(() => useArchiveConversation(), { wrapper });
+    const del = renderHook(() => useStopAndDeleteConversation(), { wrapper });
+    const archivedRow = () =>
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", true])!
+        .pages[0].data.find((c) => c.id === "conv_a");
+
+    // Delete starts: the row is spliced out; the DELETE is held open.
+    fetchMock.mockResolvedValueOnce(mockResponse({}));
+    let settleDelete = (_res: Response) => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settleDelete = resolve;
+        }),
+    );
+    del.result.current.mutate({ id: "conv_a" });
+    await waitFor(() => expect(archivedRow()).toBeUndefined());
+
+    // A newer archive takes over the id's tombstone and succeeds.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 10 }),
+    );
+    await archive.result.current.mutateAsync({ id: "conv_a", archived: true });
+
+    // The delete fails: its snapshot rollback restores the row archived:false
+    // — the live archive tombstone must re-pin it (no refetch involved).
+    settleDelete(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+    await waitFor(() => expect(del.result.current.isError).toBe(true));
+    expect(archivedRow()?.archived).toBe(true);
+  });
+
+  it("a superseded archive's late failure cannot release the newer tombstone", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", true],
+      infinitePage([conversation({ id: "conv_a", archived: false })]),
+    );
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_a" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useConversations("", true), { wrapper });
+    renderHook(() => useConversations("", false), { wrapper });
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    const archivedRow = () =>
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", true])!
+        .pages[0].data.find((c) => c.id === "conv_a");
+    const defaultIds = () =>
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+        .pages[0].data.map((c) => c.id);
+
+    // Archive #1: PATCH held open; the overlay drops the row from the
+    // default list immediately. A separate hook instance, so its isError
+    // reflects #1 even after later mutations run on the other instance.
+    let settleFirst = (_res: Response) => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settleFirst = resolve;
+        }),
+    );
+    const first = renderHook(() => useArchiveConversation(), { wrapper });
+    first.result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => expect(defaultIds()).toEqual([]));
+
+    // Unarchive, then archive #2 — both settle while #1 is still in flight,
+    // so #2 owns the live tombstone.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "conv_a", object: "conversation", archived: false, updated_at: 11 }),
+    );
+    await result.current.mutateAsync({ id: "conv_a", archived: false });
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 12 }),
+    );
+    await result.current.mutateAsync({ id: "conv_a", archived: true });
+
+    // Archive #1's PATCH finally fails: its onError must neither release the
+    // tombstone archive #2 owns nor roll the caches back to its own stale
+    // snapshot — the rows stay exactly as archive #2 painted them.
+    settleFirst(mockResponse({ error: "late" }, { ok: false, status: 500 }));
+    await waitFor(() => expect(first.result.current.isError).toBe(true));
+    expect(archivedRow()?.archived).toBe(true);
+    expect(defaultIds()).toEqual([]);
+
+    // A stale refetch of either list still finds the server mid-commit: the
+    // live tombstone pins the row archived:true on the include-archived page
+    // and drops it from the default page.
+    fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
+    fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
+    await act(() => queryClient.refetchQueries({ queryKey: ["conversations"] }));
+    expect(archivedRow()?.archived).toBe(true);
+    expect(defaultIds()).toEqual([]);
   });
 });
 

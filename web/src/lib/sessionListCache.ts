@@ -318,8 +318,8 @@ export function mergeItemsIntoPages(
  * refetch (which lags the search index). A new row sorts newest-first, so page 0
  * is its home. Skips: search lists (membership unknown), archived/wrong-project
  * rows, sub-agent children (`parent_session_id` — they live off the sidebar),
- * and ids the caller excludes via `skip` (e.g. an optimistic delete in flight).
- * `candidates` should already exclude rows the list holds.
+ * and ids the caller excludes via `skip` (e.g. an optimistic delete or
+ * archive in flight). `candidates` should already exclude rows the list holds.
  */
 export function insertNewRowsIntoPages(
   data: ConversationsInfiniteData | undefined,
@@ -492,13 +492,10 @@ export function overlayTitleIntoCaches(
  *
  * Patched in place rather than invalidated, for the same reason rename/delete
  * are: GET /v1/sessions may be served from a search index that lags the PATCH,
- * so an immediate refetch races the reindex and bounces the row back. The
- * server-confirmed state converges via the WS stream and the reconcile poll.
- *
- * ponytail: a reconcile poll firing inside the reindex-lag window (before the
- * index reflects the archive) can briefly bounce the row back; it self-heals on
- * the next poll. Add a fetch-time flag override (like `withoutDeletingSessions`)
- * if metrics show the bounce.
+ * so an immediate refetch races the reindex and bounces the row back. List
+ * fetches and push deltas landing inside that lag window are pinned to
+ * `archived: true` by the tombstone the archive mutations set (see
+ * `markSessionTombstones` in useConversations).
  */
 export function overlayArchivedIntoCaches(
   queryClient: QueryClient,

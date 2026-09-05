@@ -20,7 +20,11 @@ import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
-import { isSessionDeleting, markRecentlyCreated } from "@/hooks/useConversations";
+import {
+  isSessionArchiving,
+  isSessionDeleting,
+  markRecentlyCreated,
+} from "@/hooks/useConversations";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
@@ -64,7 +68,17 @@ function applyItemsToCache(
   // Frames are full rows with explicit nulls; convert null → undefined so a
   // cleared field overlays the cache in the same shape GET /v1/sessions
   // produces (absent), without tripping the permission_level === null sentinel.
-  const itemsById = new Map(items.map((item) => [item.id, nullsToUndefined(item)]));
+  // Frames for a session with an optimistic delete in flight are dropped.
+  // For an optimistic archive the frame still merges with `archived` pinned
+  // to true, so a stale pre-commit frame can't resurrect or hide the row.
+  const itemsById = new Map<string, SessionListWireItem>();
+  for (const item of items) {
+    if (isSessionDeleting(item.id)) continue;
+    itemsById.set(
+      item.id,
+      nullsToUndefined(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+    );
+  }
   const foundAnywhere = new Set<string>();
   let needsRefetch = false;
   const entries = queryClient.getQueriesData<ConversationsInfiniteData>({

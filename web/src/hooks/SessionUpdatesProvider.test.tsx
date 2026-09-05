@@ -5,12 +5,19 @@
 // covered separately in sessionListCache.test.ts; here we mock the socket
 // and assert exactly which ids reach `setWatched`.
 
-import { act, cleanup, render } from "@testing-library/react";
+import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useNavigate } from "react-router-dom";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import {
+  clearRecentlyCreated,
+  clearSessionTombstones,
+  useArchiveConversation,
+  type Conversation,
+  type ConversationsPage,
+} from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 
 // Mock the socket transport so setWatched is observable and start/stop are
@@ -91,6 +98,10 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  // Tombstones and the recently-created keep-alive are module-level state;
+  // clear them so an archive in one test can't suppress rows in the next.
+  clearSessionTombstones();
+  clearRecentlyCreated();
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
@@ -302,6 +313,73 @@ describe("SessionUpdatesProvider fingerprint pruning", () => {
     // got reverted, and unbounding the map. First sight must re-fire.
     act(() => handler({ type: "changed", items: [wireItem("conv_b", 1, 1_000)] }));
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["comments", "conv_b"] });
+  });
+});
+
+describe("SessionUpdatesProvider archive tombstone", () => {
+  it("a stale changed frame carrying archived:false cannot resurrect an archiving row", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ ...conv("conv_a"), archived: true, updated_at: 10 }),
+      }),
+    );
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a", "conv_b"]);
+      client.setQueryData<ConversationsInfiniteData>(["conversations", "", true], {
+        pages: [
+          {
+            data: [{ ...conv("conv_c"), archived: true }],
+            first_id: "conv_c",
+            last_id: "conv_c",
+            has_more: false,
+          },
+        ],
+        pageParams: [undefined],
+      });
+      renderProvider(client, ["/"]);
+      const handler = frameHandler();
+
+      // Drive the real archive mutation: onMutate tombstones the id and the
+      // optimistic overlay drops the row from this non-archived list.
+      const wrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+      result.current.mutate({ id: "conv_a", archived: true });
+      await waitFor(() => {
+        const data = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+        expect(data!.pages[0].data.map((c) => c.id)).toEqual(["conv_b"]);
+      });
+
+      // A pre-commit changed frame still carries archived:false for the row.
+      // The tombstone pins archived:true: the row stays out of the non-archived
+      // list but still merges (title applied, into the include-archived list).
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...conv("conv_a"), archived: false, title: "Late edit" }],
+        }),
+      );
+      const data = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+      expect(data!.pages[0].data.map((c) => c.id)).toEqual(["conv_b"]);
+      const archivedData = client.getQueryData<ConversationsInfiniteData>([
+        "conversations",
+        "",
+        true,
+      ]);
+      expect(archivedData!.pages[0].data.map((c) => c.id)).toEqual(["conv_a", "conv_c"]);
+      expect(archivedData!.pages[0].data[0]).toMatchObject({
+        title: "Late edit",
+        archived: true,
+      });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 
