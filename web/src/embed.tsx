@@ -63,7 +63,12 @@ import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 
-export type { OmnigentHostConfig } from "./lib/host";
+export type {
+  OmnigentExtensionFramePostMessage,
+  OmnigentExtensionFrameProps,
+  OmnigentExtensionFrameReady,
+  OmnigentHostConfig,
+} from "./lib/host";
 export type { RoutingApi } from "./lib/routing";
 
 // Re-export the host-config setter so the host can install transport config

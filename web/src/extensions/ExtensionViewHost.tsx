@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Spinner } from "@/components/ui/spinner";
+import {
+  getOmnigentHostConfig,
+  type OmnigentExtensionFramePostMessage,
+  type OmnigentExtensionFrameReady,
+} from "@/lib/host";
 import type { ExtensionCatalogItem, ExtensionPage } from "./types";
 import { buildExtensionDocument, createExtensionNonce, loadExtensionBundle } from "./rpc/host";
 import {
@@ -31,6 +36,8 @@ interface PendingRequest {
 
 interface DocumentState {
   srcDoc: string;
+  htmlContent: string;
+  contentSecurityPolicy: string;
   identity: ExtensionIdentity;
 }
 
@@ -48,6 +55,9 @@ export function ExtensionViewHost({
   events?: Readonly<Record<string, unknown>>;
 }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const framePostMessageRef = useRef<OmnigentExtensionFramePostMessage | null>(null);
+  const activeFrameNonceRef = useRef<string | null>(null);
+  const readyFrameNonceRef = useRef<string | null>(null);
   const portRef = useRef<MessagePort | null>(null);
   const identityRef = useRef<ExtensionIdentity | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -82,6 +92,9 @@ export function ExtensionViewHost({
     }
     portRef.current = null;
     identityRef.current = null;
+    framePostMessageRef.current = null;
+    activeFrameNonceRef.current = null;
+    readyFrameNonceRef.current = null;
   }, []);
 
   useEffect(() => {
@@ -108,6 +121,7 @@ export function ExtensionViewHost({
       .then((bundle) => {
         if (cancelled) return;
         const nextDocument = buildExtensionDocument(bundle, page, createExtensionNonce());
+        activeFrameNonceRef.current = nextDocument.identity.nonce;
         setFrameDocument(nextDocument);
         setStatus("activating");
         timeoutRef.current = setTimeout(() => {
@@ -143,8 +157,18 @@ export function ExtensionViewHost({
     }
   }, [events, status]);
 
-  const handleLoad = useCallback(() => {
-    if (!frameDocument || !iframeRef.current?.contentWindow) return;
+  const startHandshake = useCallback(() => {
+    if (!frameDocument || readyFrameNonceRef.current !== activeFrameNonceRef.current) return;
+    const contentWindow = iframeRef.current?.contentWindow;
+    const postMessage =
+      framePostMessageRef.current ??
+      (contentWindow
+        ? // A srcdoc frame has opaque origin "null"; the mount nonce and
+          // transferred port are the boundary, so targetOrigin must be "*".
+          (message: unknown, transfer?: Transferable[]) =>
+            contentWindow.postMessage(message, "*", transfer ?? [])
+        : null);
+    if (!postMessage) return;
     if (handshakeDoneRef.current) {
       closeRuntime();
       setError("Extension frame reloaded during activation");
@@ -269,10 +293,23 @@ export function ExtensionViewHost({
       type: "init",
       capabilities: Object.keys(methodsRef.current).sort(),
     };
-    // A srcdoc frame has opaque origin "null"; the per-mount nonce and the
-    // transferred port are the spoofing boundary, so targetOrigin must be "*".
-    iframeRef.current.contentWindow.postMessage(init, "*", [channel.port2]);
+    postMessage(init, [channel.port2]);
   }, [closeRuntime, frameDocument]);
+
+  const handleFrameReady = useCallback(
+    ({ nonce, postMessage }: OmnigentExtensionFrameReady) => {
+      if (nonce !== activeFrameNonceRef.current) return;
+      readyFrameNonceRef.current = nonce;
+      framePostMessageRef.current = postMessage;
+      startHandshake();
+    },
+    [startHandshake],
+  );
+
+  const handleDefaultFrameLoad = useCallback(() => {
+    readyFrameNonceRef.current = frameDocument?.identity.nonce ?? null;
+    startHandshake();
+  }, [frameDocument?.identity.nonce, startHandshake]);
 
   if (status === "error") {
     return (
@@ -295,20 +332,34 @@ export function ExtensionViewHost({
     );
   }
 
+  const ExtensionFrame = getOmnigentHostConfig().extensionFrame;
+  const frameClassName = "min-h-0 w-full flex-1 border-0 bg-background";
+
   return (
     <div className="extension-view-host relative flex h-full min-h-0 w-full flex-col overflow-hidden pt-14 md:pt-12">
-      {frameDocument && (
-        <iframe
-          key={frameDocument.identity.nonce}
-          ref={iframeRef}
-          title={page.title}
-          sandbox="allow-scripts"
-          allow=""
-          srcDoc={frameDocument.srcDoc}
-          onLoad={handleLoad}
-          className="min-h-0 w-full flex-1 border-0 bg-background"
-        />
-      )}
+      {frameDocument &&
+        (ExtensionFrame ? (
+          <ExtensionFrame
+            key={frameDocument.identity.nonce}
+            title={page.title}
+            htmlContent={frameDocument.htmlContent}
+            contentSecurityPolicy={frameDocument.contentSecurityPolicy}
+            nonce={frameDocument.identity.nonce}
+            className={frameClassName}
+            onReady={handleFrameReady}
+          />
+        ) : (
+          <iframe
+            key={frameDocument.identity.nonce}
+            ref={iframeRef}
+            title={page.title}
+            sandbox="allow-scripts"
+            allow=""
+            srcDoc={frameDocument.srcDoc}
+            onLoad={handleDefaultFrameLoad}
+            className={frameClassName}
+          />
+        ))}
       {status !== "ready" && (
         <div className="extension-view-status absolute inset-x-0 bottom-0 top-14 flex items-center justify-center bg-background md:top-12">
           <Spinner className="size-5 text-muted-foreground" aria-label="Loading extension" />
