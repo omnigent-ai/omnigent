@@ -33,3 +33,41 @@ AWS_PROFILE=my-profile AWS_REGION=us-east-1 omnigent run examples/aws_analyst
   a good default for a governed analytics agent.
 - Pairs naturally with a Databricks Genie connector for a Databricks-on-AWS
   "better together" analyst that reasons across both platforms.
+
+## Optional: centralize model governance via Databricks AI Gateway
+
+If you already run LLM spend through a gateway, you can run the agent's *reasoning* on
+**Amazon Bedrock** governed by **Databricks AI Gateway**, for a setup that's governed
+end to end. Otherwise, point the `claude-sdk` harness at Bedrock directly — the
+connectors above are unaffected either way.
+
+Amazon Bedrock is a supported provider for Databricks
+[external model endpoints](https://docs.databricks.com/aws/en/generative-ai/external-models/)
+(`amazon-bedrock`). Serve a Bedrock-hosted Anthropic Claude model as a Databricks
+serving endpoint, enable [AI Gateway](https://docs.databricks.com/aws/en/ai-gateway/)
+on it, then point this agent at that endpoint:
+
+```yaml
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+    # Name of YOUR Databricks external-model serving endpoint (backed by Bedrock).
+    model: databricks-claude-bedrock
+    auth:
+      type: databricks
+      profile: my-databricks-profile
+```
+
+`model` and `auth` must sit **inside** `executor.config`. This example is a bundle
+spec (`spec_version: 1` in a directory), and the omnigent executor reads both from
+there. Declaring them as siblings of `config:` still parses, but the run fails at
+launch with `There's an issue with the selected model`.
+
+The `claude-sdk` harness runs any Claude model; here the endpoint is served by
+Amazon Bedrock and fronted by Databricks AI Gateway, so every LLM call picks up rate
+limiting, usage/cost tracking, payload logging, and guardrails — while the Redshift
+and S3 Tables connectors keep the *data* access read-only. Reasoning on Bedrock, data
+governed in AWS, all model calls governed through Databricks.
+
+Substitute your own endpoint name and profile.
