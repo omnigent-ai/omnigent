@@ -1,13 +1,15 @@
-"""E2E: mermaid diagrams in chat render, and an un-renderable one degrades.
+"""E2E: a mermaid fence in an assistant bubble renders as a diagram.
 
-Streamdown renders mermaid diagrams behind ``React.lazy``. Suspense catches a
-*pending* import, not a failed one — a rejected lazy import is re-thrown on
-every subsequent render, so without an error boundary above it React unmounts
-the whole tree and the user sees a blank page instead of one broken diagram.
-
-The second test aborts the mermaid chunk request, which is the faithful stand-in
-for the real-world trigger: a tab holding a stale ``index.html`` after the SPA is
-rebuilt, whose hashed mermaid chunk no longer exists on the server.
+Streamdown mounts each ``mermaid`` fence behind ``React.lazy(() =>
+import('./mermaid-<hash>.js'))``, a facade chunk that only re-exports a
+component the static bundle already carries. That facade is pinned into the
+static bundle (``web/src/components/ai-elements/eagerMermaidFacade.ts``), so
+rendering a diagram never fetches a mermaid chunk and a mid-session chunk
+outage cannot degrade it — that journey is covered by
+``test_mermaid_mid_session_chunk_outage.py``. A boot-time chunk failure is not
+a mermaid-specific scenario anymore: the facade loads with the app shell, and a
+throw anywhere in the markdown pipeline is contained by
+``MarkdownErrorBoundary`` (unit-tested next to the component).
 """
 
 from __future__ import annotations
@@ -16,12 +18,9 @@ from collections.abc import Iterator
 
 import httpx
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Page, expect
 
 _AGENT_NAME = "hello_world"
-# Every emitted mermaid chunk, so this keeps matching across rebuilds (the
-# hashes change on every build).
-_MERMAID_CHUNKS = "**/mermaid-*.js"
 
 # Trailing prose after the fence: proves the surrounding message survives.
 _MERMAID_MESSAGE = (
@@ -63,18 +62,5 @@ def test_mermaid_fence_renders_as_a_diagram(
     # which distinguishes the diagram from the block's own control icons.
     expect(block.locator("svg[aria-roledescription]")).to_be_visible(timeout=30_000)
 
-
-def test_unrenderable_diagram_degrades_instead_of_blanking_the_app(
-    page: Page, mermaid_chat_session: tuple[str, str]
-) -> None:
-    """A diagram that cannot load must not unmount the app around it."""
-    base_url, session_id = mermaid_chat_session
-    page.route(_MERMAID_CHUNKS, lambda route: Route.abort(route, "failed"))
-    page.goto(f"{base_url}/c/{session_id}")
-
-    # The app is still mounted: the shell renders and the composer is usable.
-    expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=30_000)
-    assert page.evaluate("() => document.getElementById('root')?.children.length ?? 0") > 0
-
-    # The message's content survives as markdown source rather than vanishing.
+    # The prose around the fence renders alongside the diagram.
     expect(page.get_by_text("That is the shape of it.")).to_be_visible(timeout=30_000)

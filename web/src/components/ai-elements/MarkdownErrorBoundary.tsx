@@ -13,6 +13,10 @@ import { Component, type ErrorInfo, type ReactNode } from "react";
  * markdown source and the rest of the page keeps working. Deliberately does not
  * reset when `children` change: React.lazy caches a rejection forever, so a
  * retry would only throw again.
+ *
+ * The mermaid facade itself is pinned into the static bundle
+ * (eagerMermaidFacade.ts), so that particular import can no longer reject; the
+ * boundary stays as containment for any other throw in the pipeline.
  */
 export class MarkdownErrorBoundary extends Component<
   { children: ReactNode; source: ReactNode },
