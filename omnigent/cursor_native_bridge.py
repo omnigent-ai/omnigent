@@ -40,6 +40,8 @@ _TMUX_FILE = "tmux.json"
 _BRIDGE_CONFIG_FILE = "bridge.json"
 _MCP_CONFIG_FILE = "mcp.json"
 _HOOKS_CONFIG_FILE = "hooks.json"
+#: Module invoked by Omnigent's usage ``stop`` hook; marks entries we own.
+_USAGE_HOOK_MODULE = "omnigent.cursor_native_usage"
 _MCP_SERVER_NAME = "omnigent"
 _CURSOR_AUTO_APPROVE_TOOLS = [
     "list_comments",
@@ -388,7 +390,7 @@ def build_hooks_config(bridge_dir: Path, *, python_executable: str | None = None
             python,
             "-I",
             "-m",
-            "omnigent.cursor_native_usage",
+            _USAGE_HOOK_MODULE,
             "record-usage",
             "--bridge-dir",
             str(bridge_dir),
@@ -397,23 +399,61 @@ def build_hooks_config(bridge_dir: Path, *, python_executable: str | None = None
     return {"version": 1, "hooks": {"stop": [{"command": command}]}}
 
 
+def _is_omnigent_usage_hook(entry: object) -> bool:
+    """Whether a hooks.json entry is Omnigent's own usage-recorder hook.
+
+    The recorder command bakes a session-specific bridge dir, so entries from
+    earlier sessions are stale and must be replaced rather than accumulated.
+    """
+    if not isinstance(entry, dict):
+        return False
+    return _USAGE_HOOK_MODULE in str(entry.get("command", ""))
+
+
 def write_hooks_config(
     workspace: Path,
     bridge_dir: Path,
     *,
     python_executable: str | None = None,
 ) -> Path:
-    """Write the workspace-scoped Cursor ``hooks.json`` capturing per-turn usage.
+    """Merge Omnigent's usage ``stop`` hook into the workspace's ``hooks.json``.
 
     Sibling of :func:`write_mcp_config`: project-scoped Cursor config the TUI
-    loads on launch in a trusted workspace. Returns the written path.
+    loads on launch in a trusted workspace. Preserves the workspace's existing
+    hooks (e.g. a project ``preToolUse`` policy hook) and replaces only stale
+    Omnigent usage hooks from earlier sessions. Returns the written path.
     """
     cursor_dir = workspace / ".cursor"
     cursor_dir.mkdir(parents=True, exist_ok=True)
     path = cursor_dir / _HOOKS_CONFIG_FILE
+
+    loaded: object = None
+    if path.exists():
+        with contextlib.suppress(json.JSONDecodeError, OSError):
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+
+    # A hand-edited hooks.json can hold any JSON shape; discard non-dicts so a
+    # malformed file can't crash the session launch.
+    existing: _JsonObject = loaded if isinstance(loaded, dict) else {}
+    hooks = existing.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+    existing["hooks"] = hooks
+    existing.setdefault("version", 1)
+
     payload = build_hooks_config(bridge_dir, python_executable=python_executable)
+    omnigent_hooks = payload["hooks"]
+    if not isinstance(omnigent_hooks, dict):  # pragma: no cover - build_hooks_config invariant
+        raise ValueError("Omnigent hooks config is missing its hooks mapping")
+    for event, entries in omnigent_hooks.items():
+        current = hooks.get(event)
+        if not isinstance(current, list):
+            current = []
+        kept = [entry for entry in current if not _is_omnigent_usage_hook(entry)]
+        hooks[event] = kept + list(entries)
+
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return path
 
