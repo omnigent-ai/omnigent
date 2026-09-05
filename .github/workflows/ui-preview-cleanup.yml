@@ -1,0 +1,71 @@
+name: UI Preview Cleanup
+
+on:
+  schedule:
+    - cron: '43 * * * *'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Limit to one PR number (blank processes all PR previews)'
+        type: string
+        default: ''
+      dry_run:
+        description: 'Report matching apps without deleting them'
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  # A targeted cleanup shares the deployment workflow's per-PR lock.
+  group: ${{ inputs.pr_number && format('UI Preview-{0}', inputs.pr_number) || 'ui-preview-cleanup' }}
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/2260866f83a41a2df55e1cfe7ffe038b78325bf6/install.sh | sh
+      - name: Reconcile previews
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+          DATABRICKS_AUTH_TYPE: oauth-m2m
+          PR_NUMBER: ${{ inputs.pr_number }}
+          APPLY: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
+        run: |
+          set -euo pipefail
+          args=(--repo "$REPO" --report preview-cleanup-report.json)
+          if [[ -n "$PR_NUMBER" ]]; then
+            [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid PR number'; exit 1; }
+            args+=(--app "omnigent-ui-preview-pr-$PR_NUMBER")
+          fi
+          if [[ "$APPLY" == true ]]; then
+            args+=(--apply)
+          fi
+          python .github/scripts/ui-preview/reconcile.py "${args[@]}"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: preview-cleanup-report
+          path: preview-cleanup-report.json
+          retention-days: 14
+          if-no-files-found: warn

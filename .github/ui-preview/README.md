@@ -16,6 +16,64 @@ when a PR changes the frontend (`web/`).
 3. A comment with the preview URL is posted on the PR and updated on each push.
 4. The app is deleted automatically when the PR is closed.
 
+## Hourly preview cleanup
+
+The **UI Preview Cleanup** workflow runs hourly at minute 43 and automatically
+deletes PR-preview apps when **the PR is merged OR the app is more than 24 hours
+old**, including apps for open PRs. Age is measured from the app's `create_time`,
+not the PR's age or the app's latest deployment. Merged PRs have no grace period.
+This is a lifecycle policy, not an inference that nobody is currently using the
+preview: local sessions/artifacts are ephemeral and are lost on deletion.
+
+Apps must match `omnigent-ui-preview-pr-<N>` and the exact PR URL in their
+description, have the expected per-app source directory, and have no attached
+resources. Unknown states, API errors, pending updates, in-progress deployments,
+and unfinished preview workflows retain the app until a later hourly run.
+Shared apps such as `omnigent-repro` and `omnigent-ui-preview-dev` are excluded.
+The existing immediate close-event cleanup is unchanged.
+
+The workflow uses the same Databricks secrets as UI Preview and starts scheduling
+after merge to the default branch. Each run uploads `preview-cleanup-report` for
+14 days. Manual dispatch also deletes by default; check **dry_run** to preview
+the selection, and optionally enter a PR number to limit the run to one app.
+No per-app approval or reviewer-activity confirmation is required.
+
+To preview the selection locally (requires authenticated `gh` and Databricks CLIs):
+
+```bash
+python .github/scripts/ui-preview/reconcile.py --profile YOUR_PROFILE
+```
+
+If `DATABRICKS_HOST` points elsewhere, unset it for this command so it cannot
+override the selected profile. The app creator identifies the deploying identity,
+not necessarily Otto; the report includes the linked PR's author. These apps have
+no dedicated Otto tag. For human-authored PRs, inspect who applied `ui-preview`
+in the PR timeline to attribute an Otto-triggered deployment.
+
+To apply the same policy locally to all PR previews:
+
+```bash
+python .github/scripts/ui-preview/reconcile.py --profile YOUR_PROFILE --apply
+```
+
+Use `--app omnigent-ui-preview-pr-123` to limit either mode to one app. The script
+rechecks app identity, PR state, and deployment activity immediately before
+deletion. Targeted workflow runs share the deployment's per-PR concurrency group;
+there is no atomic cross-service check-and-delete for the full sweep.
+
+The reconciler preserves workspace source directories and does not delete
+Lakebase/UC resources or modify PR comments. Stopping alone does not free an app
+slot. After deletion, check that `databricks apps get` reports the exact app
+missing, and rerun the previously blocked deployment. For an open PR whose
+preview expired, pushing a new commit while `ui-preview` remains applied
+recreates the app with a fresh 24-hour TTL.
+
+Test the safety checks without external access:
+
+```bash
+python -m unittest discover -s .github/scripts/ui-preview -p 'test_*.py' -v
+```
+
 ## Fork PR safety
 
 `ui-preview.yml` runs its build/deploy on `pull_request_target`, so the label is
