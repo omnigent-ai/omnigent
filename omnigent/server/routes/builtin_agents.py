@@ -109,7 +109,12 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
                 description=child.description,
                 harness=child.executor.harness_kind,
             )
+            # A child with no declared name is not addressable -- the override
+            # is keyed by name -- so it is skipped rather than surfaced as an
+            # entry nothing can select. Also satisfies the type: `name` is
+            # `str | None` on the spec and required on the wire.
             for child in loaded.spec.sub_agents
+            if child.name
         ]
     except Exception:  # noqa: BLE001 — spec load failure must not break the list
         _logger.debug(

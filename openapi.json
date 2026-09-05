@@ -133,6 +133,13 @@
             "title": "Skills",
             "type": "array"
           },
+          "sub_agents": {
+            "items": {
+              "$ref": "#/components/schemas/SubAgentSummary"
+            },
+            "title": "Sub Agents",
+            "type": "array"
+          },
           "terminals": {
             "description": "Terminal names declared in the spec's `terminals:` block, in declaration order, e.g. `[\"shell\"]`. The Web UI gates its \"new terminal\" affordance on this list (creation is only offered for agents with terminal access) and offers these names as the launchable choices. Empty list when the spec declares no terminals or when the bundle cannot be loaded.",
             "items": {
@@ -7608,6 +7615,45 @@
           "kind"
         ],
         "title": "StoreHarnessCredentialRequest",
+        "type": "object"
+      },
+      "SubAgentSummary": {
+        "description": "One delegable sub-agent of a multi-agent bundle.\n\nExposed so a client can see, and let a person change, WHICH model\ndoes which job. Before this the catalog reported a single\n`harness` -- the orchestrator's brain -- so a bundle like polly or\ndebby looked like one agent, and the UI's Configure dialog could\nonly offer the brain. The team was legible only by reading the\nbundle's YAML off disk.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Its declared description, or `None`.",
+            "title": "Description"
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The harness it currently runs on, e.g. `\"antigravity-native\"`. `None` when the child spec declares no executor kind.",
+            "title": "Harness"
+          },
+          "name": {
+            "description": "The sub-agent's declared name, e.g. `\"gemini\"`.",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "SubAgentSummary",
         "type": "object"
       },
       "TerminalCommandData": {
