@@ -2266,3 +2266,125 @@ def test_cli_config_pi_provider_discovery_failure_falls_back_to_catalog_default(
     assert provider.model == "catalog-databricks-claude-default", (
         f"discovery failure must fall back to catalog default; got {provider.model!r}"
     )
+
+
+def test_inline_family_registers_curated_shortlist_as_extra_models() -> None:
+    """The family's ``models:`` tier map registers as Pi ``extra_models``.
+
+    Pi then shows exactly the deployment's curated, verified set in /model
+    (verified empirically: Pi lists only the models its models.json
+    declares), instead of just the launch model. Duplicate ids collapse to
+    their first occurrence; the selected model is not registered twice.
+    """
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                    "models": {
+                        "default": "GLM-5.3-Flash",
+                        "opus": "GLM-5.3",
+                        "fable": "claude-fable-5",
+                        "pro": "deepseek-v4-pro",
+                        "sonnet": "GLM-5.3-Flash",  # duplicate id of the default
+                    },
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+
+    extra_ids = [entry["id"] for entry in provider.extra_models]
+    assert extra_ids == ["GLM-5.3-Flash", "GLM-5.3", "claude-fable-5", "deepseek-v4-pro"]
+    by_id = {entry["id"]: entry for entry in provider.extra_models}
+    # The gateway entry builder flags reasoning for DeepSeek (reasoning
+    # channel) and for Claude (thinking-level controls) on every surface;
+    # GLM gets neither.
+    assert by_id["deepseek-v4-pro"].get("reasoning") is True
+    assert by_id["claude-fable-5"].get("reasoning") is True
+    assert "reasoning" not in by_id["GLM-5.3"]
+
+    # The rendered models.json registers the shortlist alongside the launch
+    # model, each exactly once (the launch model is not re-appended).
+    rendered = provider.to_models_config()
+    registered = rendered["providers"][provider.provider_id]["models"]
+    assert [entry["id"] for entry in registered] == [
+        "GLM-5.3-Flash",
+        "GLM-5.3",
+        "claude-fable-5",
+        "deepseek-v4-pro",
+    ]
+
+
+def test_inline_family_without_models_map_registers_only_the_launch_model() -> None:
+    """No ``models:`` map → no shortlist, behaviour unchanged."""
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(model="glm-5.3", config_loader=lambda: config)
+    assert provider is not None
+    assert [entry["id"] for entry in provider.extra_models] == ["glm-5.3"]
+
+
+def test_provider_launch_scopes_picker_via_enabled_models(tmp_path: Path) -> None:
+    """The managed settings.json scopes the picker to the rendered catalog.
+
+    ``enabledModels`` is the allowlist counterpart to the
+    ``OMNIGENT_PI_ENV_UNSET`` denylist: provider-qualified refs for every
+    model in the rendered models.json config, so Pi's picker shows exactly
+    the managed set even if a built-in provider's catalog gets activated.
+    """
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+        extra_models=[{"id": "GLM-5.3-Flash"}, {"id": "claude-fable-5"}],
+    )
+    agent_dir = tmp_path / "pi-agent"
+    creds.pi_native_provider_launch(agent_dir, provider)
+
+    settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
+    assert settings["enabledModels"] == [
+        "omnigent/GLM-5.3-Flash",
+        "omnigent/claude-fable-5",
+        "omnigent/claude-sonnet-4-6",
+    ]
+    assert settings["defaultThinkingLevel"] is None
+
+
+def test_provider_launch_without_curated_set_does_not_scope(tmp_path: Path) -> None:
+    """A single-model render writes no ``enabledModels`` — nothing was
+    curated, so the picker keeps its default behaviour (including working
+    built-ins activated by the user's real credentials)."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+    )
+    agent_dir = tmp_path / "pi-agent"
+    creds.pi_native_provider_launch(agent_dir, provider)
+
+    settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
+    assert "enabledModels" not in settings
+    assert settings["defaultThinkingLevel"] is None

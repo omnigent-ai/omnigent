@@ -2088,6 +2088,7 @@ async def _auto_create_pi_terminal(
     from omnigent.pi_native_bridge import (
         PI_NATIVE_CONFIG_ENV_VAR,
         clear_inbox,
+        pi_native_env_unset,
         pi_session_dir,
         prepare_bridge_dir,
         write_extension_files,
@@ -2235,6 +2236,13 @@ async def _auto_create_pi_terminal(
             command=pi_command,
             args=pi_args,
             env=pi_env,
+            # Credential vars the operator declared off-limits for Pi
+            # (OMNIGENT_PI_ENV_UNSET): Pi activates a built-in provider's
+            # whole catalog on the mere presence of its credential, flooding
+            # the picker with entries that bypass the managed models.json
+            # provider — and Pi needs no credential env (its auth rides the
+            # managed apiKey). Empty list = no scrubbing.
+            env_unset=pi_native_env_unset(os.environ),
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,

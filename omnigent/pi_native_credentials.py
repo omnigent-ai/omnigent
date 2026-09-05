@@ -1165,6 +1165,24 @@ def _inline_family_pi_provider(
             configured_context_window=family.context_window,
             configured_max_output_tokens=family.max_output_tokens,
         )
+        # Register the family's curated ``models:`` shortlist (its tier map)
+        # alongside the selected model, so Pi's /model picker offers exactly
+        # the deployment's verified set instead of just the launch model.
+        # Duplicate ids collapse to their first occurrence; the selected
+        # model's entry is already in the list, so skip a second copy.
+        shortlist: list[_PiModelEntry] = [model_entry]
+        seen_ids: set[str] = {resolved_model}
+        for tier_model in family.models.values():
+            if not isinstance(tier_model, str) or not tier_model or tier_model in seen_ids:
+                continue
+            seen_ids.add(tier_model)
+            shortlist.append(
+                _gateway_pi_model_entry(
+                    tier_model,
+                    configured_context_window=family.context_window,
+                    configured_max_output_tokens=family.max_output_tokens,
+                )
+            )
         return PiProviderConfig(
             provider_id=_PI_PROVIDER_ID,
             base_url=family.base_url,
@@ -1172,7 +1190,7 @@ def _inline_family_pi_provider(
             model=resolved_model,
             api_key=api_key,
             auth_header=auth_header,
-            extra_models=[model_entry],
+            extra_models=shortlist,
         )
     return None
 
@@ -1305,6 +1323,27 @@ def write_pi_models_config(
     return models_path
 
 
+def _enabled_model_refs(rendered: _PiModelsConfig) -> list[str]:
+    """Build provider-qualified ``enabledModels`` refs for a rendered config.
+
+    Every model of every rendered provider is included, so the picker shows
+    exactly the managed catalog — nothing more, nothing less.
+
+    :param rendered: The rendered ``models.json`` mapping.
+    :returns: ``["provider/model", ...]`` refs in rendered order (deterministic,
+        matching the picker's listing order).
+    """
+    refs: list[str] = []
+    providers = rendered.get("providers", {})
+    for provider_id, payload in providers.items():
+        if not isinstance(payload, dict):
+            continue
+        for model in payload.get("models", []):
+            if isinstance(model, dict) and isinstance(model.get("id"), str) and model["id"]:
+                refs.append(f"{provider_id}/{model['id']}")
+    return refs
+
+
 class PiNativeLaunch(NamedTuple):
     """Env, CLI args and any effort notice for a managed pi-native launch.
 
@@ -1373,9 +1412,25 @@ def pi_native_provider_launch(
     # applies the session-level thinking before the compat check fires).
     # Passing None in the overlay makes _deep_merge_settings write null for the
     # key; Pi's getDefaultThinkingLevel() returns null (falsy) → no thinking.
+    #
+    # ``enabledModels`` scopes Pi's picker (the /model dialog and Ctrl+P
+    # cycling both honour ``scopedModels``) to exactly the managed catalog.
+    # Refs are provider-qualified so they resolve via Pi's
+    # findExactModelReferenceMatch even when a built-in provider carries the
+    # same model id. Older Pi ignores the unknown settings key harmlessly.
+    # Written only when the render carries more than one model (see below).
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
-    prepare_managed_pi_agent_dir(agent_dir, overlay={"defaultThinkingLevel": None})
+    overlay: dict[str, object] = {"defaultThinkingLevel": None}
+    # Scope only when the deployment actually curated a set (a family
+    # ``models:`` map, or a lane that renders several managed models). A
+    # single-model render means nothing was curated — scoping there would
+    # hide working built-in entries from users whose real provider
+    # credentials legitimately activate them (local/hosted runners).
+    enabled_refs = _enabled_model_refs(rendered)
+    if len(enabled_refs) > 1:
+        overlay["enabledModels"] = enabled_refs
+    prepare_managed_pi_agent_dir(agent_dir, overlay=overlay)
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     # When the model id contains a "/" Pi's arg parser splits on the first
     # slash and treats the left part as a provider name, overriding
