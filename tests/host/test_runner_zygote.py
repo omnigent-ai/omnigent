@@ -9,23 +9,34 @@ daemon's Popen fallback are all covered.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
+import omnigent
 from omnigent.host.runner_zygote import (
     _ZYGOTE_LOST_EXIT_CODE,
     ZygoteManager,
     ZygoteRunnerProc,
     ZygoteUnavailable,
 )
+from omnigent.runner import _zygote
 from omnigent.runner._zygote import (
     _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR,
     _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR,
+    _disk_build_stamp,
+    _GraphStamp,
+    _package_source_stamps,
+    _source_file_stamps,
+    _source_files_match,
+    _ZygoteServer,
 )
 
 # The zygote is POSIX-only: these tests exercise os.fork() and pass_fds, which
@@ -88,10 +99,16 @@ def test_import_graph_is_single_threaded() -> None:
     probe = "\n".join(
         [
             "from omnigent.runner._zygote import _import_runner_graph",
+            "import sys",
             "import threading",
             "_import_runner_graph()",
             "print(threading.active_count())",
             "print([t.name for t in threading.enumerate()])",
+            "print(all(name in sys.modules for name in (",
+            "    'omnigent.runner.background_titles.claude_native',",
+            "    'omnigent.runner.background_titles.codex_native',",
+            "    'omnigent.runner.background_titles.sdk',",
+            ")))",
         ]
     )
     result = subprocess.run(
@@ -101,8 +118,9 @@ def test_import_graph_is_single_threaded() -> None:
         timeout=120,
     )
     assert result.returncode == 0, result.stderr
-    first_line = result.stdout.strip().splitlines()[0]
-    assert first_line == "1", result.stdout
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == "1", result.stdout
+    assert lines[-1] == "True", result.stdout
 
 
 def test_manager_starts_and_pings(manager: ZygoteManager) -> None:
@@ -334,6 +352,30 @@ def test_operator_malloc_override_wins_at_the_zygote_exec(monkeypatch, tmp_path)
     assert captured["MALLOC_ARENA_MAX"] == "16"
 
 
+def test_zygote_boots_from_inside_an_omnigent_checkout(monkeypatch, tmp_path) -> None:
+    """A daemon whose cwd holds an ``omnigent/`` package still starts a zygote.
+
+    The zygote inherits the daemon's cwd, which ``python -m`` would prepend to
+    ``sys.path``, so a daemon started inside an omnigent checkout would import
+    that checkout instead of the installed package. Booting against a poisoned
+    package proves the spawn keeps cwd off ``sys.path``.
+
+    :param monkeypatch: Fixture used to run from the poisoned directory.
+    :param tmp_path: Temp dir holding the poisoned package and the zygote log.
+    """
+    package = tmp_path / "omnigent"
+    package.mkdir()
+    (package / "__init__.py").write_text('raise ImportError("poisoned omnigent")\n')
+    monkeypatch.chdir(tmp_path)
+
+    mgr = ZygoteManager(log_path=tmp_path / "zygote.log")
+    mgr.start()
+    try:
+        assert mgr.is_running()
+    finally:
+        mgr.stop()
+
+
 # ── Harness-fork path (fork_harness) ──────────────────────────────
 #
 # The zygote also forks HARNESS children on request, sharing the harness import
@@ -434,6 +476,213 @@ def test_fork_harness_argv_round_trips_to_child(manager: ZygoteManager, tmp_path
     reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": argv, "env": env})
     assert _wait_harness_exit(manager, reply["pid"]) == 0
     assert f"harness_argv={' '.join(argv)}" in log.read_text()
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        pytest.param(
+            'BUILD_TIME_EPOCH = 1754848860\nCOMMIT_SHA = "b703a28b"\n',
+            (1754848860.0, "b703a28b"),
+            id="generated",
+        ),
+        pytest.param(None, None, id="missing"),
+        pytest.param("BUILD_TIME_EPOCH = (\n", None, id="half-written"),
+        pytest.param('COMMIT_SHA = "b703a28b"\n', None, id="field-missing"),
+    ],
+)
+def test_disk_build_stamp_reads_the_on_disk_file(tmp_path, content, expected) -> None:
+    """``_disk_build_stamp`` parses the generated file; any failure reads as unknown.
+
+    :param tmp_path: Directory standing in for the installed package dir.
+    :param content: ``_build_info.py`` body, or ``None`` to leave it absent.
+    :param expected: The stamp the probe must return.
+    """
+    if content is not None:
+        (tmp_path / "_build_info.py").write_text(content)
+    assert _disk_build_stamp(package_dir=tmp_path) == expected
+
+
+def test_disk_build_stamp_resolves_package_dir_without_top_level_file(monkeypatch) -> None:
+    """The probe finds ``_build_info.py`` even when ``omnigent.__file__`` is None.
+
+    The zygote is spawned as ``python -m``, which puts the daemon's cwd on
+    sys.path, so a daemon started from a directory that holds an ``omnigent``
+    checkout binds the top-level name to a namespace package with no
+    ``__file__``. Reading it raised ``TypeError`` and killed the zygote at boot
+    before it served a single fork, so the probe keys off its own module path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    probed: list[Path] = []
+    monkeypatch.setattr(omnigent, "__file__", None)
+    monkeypatch.setattr(
+        importlib.util,
+        "spec_from_file_location",
+        lambda name, location: probed.append(Path(location)),
+    )
+    assert _disk_build_stamp() is None
+    assert probed == [Path(_zygote.__file__).resolve().parents[1] / "_build_info.py"]
+
+
+def test_package_source_stamps_include_lazy_modules(tmp_path) -> None:
+    """The source baseline covers modules that the imported graph has not loaded."""
+    package_dir = tmp_path / "omnigent"
+    lazy_module = package_dir / "provider" / "lazy.py"
+    lazy_module.parent.mkdir(parents=True)
+    lazy_module.write_text("VALUE = 1\n")
+
+    stamps = _package_source_stamps(package_dir)
+
+    assert stamps is not None
+    assert [stamp.path for stamp in stamps] == [lazy_module]
+
+
+def test_source_stamps_ignore_metadata_only_changes(tmp_path) -> None:
+    """Permission changes do not force direct spawning when source is unchanged."""
+    source = tmp_path / "module.py"
+    source.write_text("VALUE = 1\n")
+    stamps = _source_file_stamps([source])
+    assert stamps is not None
+
+    source.chmod(source.stat().st_mode ^ 0o100)
+
+    assert _source_files_match(stamps)
+
+
+def test_source_stamp_capture_fails_closed_for_missing_file(tmp_path) -> None:
+    """An unreadable baseline is represented as incomplete rather than omitted."""
+    assert _source_file_stamps([tmp_path / "missing.py"]) is None
+
+
+def _dispatch_fork(
+    server: _ZygoteServer, conn: socket.socket, peer: socket.socket, cmd: str
+) -> dict:
+    """Dispatch one in-process fork request and return the reply.
+
+    :param server: The server under test.
+    :param conn: The socket end handed to the dispatcher.
+    :param peer: The other end, read for the reply.
+    :param cmd: ``"fork"`` (runner) or ``"fork_harness"``.
+    :returns: The decoded reply.
+    """
+    request = {"cmd": cmd, "argv": [], "env": {}}
+    server._dispatch(conn, json.dumps(request).encode("utf-8"))
+    return json.loads(peer.recv(65536).decode("utf-8"))
+
+
+@pytest.mark.parametrize(("cmd", "kind"), [("fork", "runner"), ("fork_harness", "harness")])
+def test_fork_refused_after_in_place_upgrade(monkeypatch, cmd, kind) -> None:
+    """A disk stamp differing from the boot stamp refuses the fork.
+
+    The child resolves its lazily-imported modules from the NEW on-disk files
+    against the OLD pre-imported graph. Both observed failures are this: a
+    harness missing ``describe_exception`` from an in-memory
+    ``omnigent.inner.executor`` that predates it, and a runner whose
+    ``create_app`` cannot import ``omnigent.cli_auth`` from the swapped-out
+    package directory. Refusing makes the caller fall back to a fresh
+    interpreter, which runs the new code coherently.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param cmd: The fork command under test.
+    :param kind: Child kind the error message must name.
+    """
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(
+        daemon,
+        graph_stamp=_GraphStamp(build=(1000.0, "oldsha"), sources=()),
+    )
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (2000.0, "newsha"))
+    monkeypatch.setattr(os, "fork", lambda: pytest.fail(f"must not fork a mixed-version {kind}"))
+    try:
+        reply = _dispatch_fork(server, conn, peer, cmd)
+        assert "changed on disk" in reply["error"]
+        assert kind in reply["error"]
+        assert server._live == set()
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
+
+
+@pytest.mark.parametrize("cmd", ["fork", "fork_harness"])
+def test_fork_proceeds_while_disk_stamp_matches(monkeypatch, cmd) -> None:
+    """An unchanged disk stamp forks exactly as before the gate existed.
+
+    ``os.fork`` is faked to a pid so the assertion is purely about the gate
+    letting the request through to the fork path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param cmd: The fork command under test.
+    """
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(
+        daemon,
+        graph_stamp=_GraphStamp(build=(1000.0, "sha"), sources=()),
+    )
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (1000.0, "sha"))
+    monkeypatch.setattr(os, "fork", lambda: 4242)
+    try:
+        reply = _dispatch_fork(server, conn, peer, cmd)
+        assert reply == {"pid": 4242}
+        assert 4242 in server._live
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
+
+
+@pytest.mark.parametrize(("cmd", "kind"), [("fork", "runner"), ("fork_harness", "harness")])
+def test_fork_refused_after_source_change_with_stale_build_info(
+    monkeypatch, tmp_path, cmd, kind
+) -> None:
+    """Changed package source refuses a fork even when build metadata is stale."""
+    source = tmp_path / "service.py"
+    source.write_text("old = True\n")
+    graph_stamp = _GraphStamp(
+        build=(1000.0, "stale-sha"),
+        sources=_source_file_stamps([source]),
+    )
+    source.write_text("new = True\n")
+
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(daemon, graph_stamp=graph_stamp)
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (1000.0, "stale-sha"))
+    monkeypatch.setattr(os, "fork", lambda: pytest.fail(f"must not fork a mixed-version {kind}"))
+    try:
+        reply = _dispatch_fork(server, conn, peer, cmd)
+        assert "changed on disk" in reply["error"]
+        assert kind in reply["error"]
+        assert server._live == set()
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
+
+
+@pytest.mark.parametrize(("cmd", "kind"), [("fork", "runner"), ("fork_harness", "harness")])
+def test_fork_refused_when_source_baseline_is_incomplete(monkeypatch, cmd, kind) -> None:
+    """An incomplete initial source baseline fails closed onto direct spawning."""
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(
+        daemon,
+        graph_stamp=_GraphStamp(build=(1000.0, "sha"), sources=None),
+    )
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (1000.0, "sha"))
+    monkeypatch.setattr(os, "fork", lambda: pytest.fail(f"must not fork a mixed-version {kind}"))
+    try:
+        reply = _dispatch_fork(server, conn, peer, cmd)
+        assert "changed on disk" in reply["error"]
+        assert kind in reply["error"]
+        assert server._live == set()
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
 
 
 def test_zygote_still_serves_daemon_after_harness_fork(manager: ZygoteManager, tmp_path) -> None:

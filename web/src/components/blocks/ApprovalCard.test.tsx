@@ -30,6 +30,95 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(screen.queryByTestId("approval-card-options")).toBeNull();
   });
 
+  it("shows the harness name instead of the synthetic policy stamp on native prompts", () => {
+    // Native-harness bridges stamp provenance ids ("claude_native_permission",
+    // phase "pre_tool_use"). The card header must show the product name and
+    // drop the constant phase chip — internal ids read as debug output.
+    const props = {
+      elicitationId: "elic_native",
+      message: "Claude wants to call **Bash**",
+      phase: "pre_tool_use",
+      policyName: "claude_native_permission",
+      contentPreview: "Bash({})",
+      requestedSchema: {},
+    } as const;
+    const { rerender } = render(<ApprovalCard {...props} status="pending" response={null} />);
+    expect(screen.getByText(/Claude Code/)).toBeDefined();
+    expect(screen.queryByText(/claude_native_permission/)).toBeNull();
+    expect(screen.queryByText(/pre_tool_use/)).toBeNull();
+
+    // Same mapping on the responded pill (the state that lingers in the
+    // transcript after the verdict).
+    rerender(<ApprovalCard {...props} status="responded" response={{ action: "accept" }} />);
+    expect(screen.getByText(/Claude Code/)).toBeDefined();
+    expect(screen.queryByText(/claude_native_permission/)).toBeNull();
+    // A plain tool approval has no content of its own, so the gating
+    // message is the only record of WHAT was approved — it stays.
+    expect(screen.getByText(/wants to call/)).toBeDefined();
+  });
+
+  it("names every native vendor, and shows no tag when the stamp names none", () => {
+    // The prefix table is derived from NATIVE_CODING_AGENTS, so vendors that
+    // stamp `<key>_native_permission` are covered without a per-vendor entry.
+    for (const [policyName, displayName] of [
+      ["kiro_native_permission", "Kiro"],
+      ["qwen_native_permission", "Qwen Code"],
+      ["agy_native_permission", "Antigravity"],
+    ]) {
+      render(
+        <ApprovalCard
+          elicitationId="elic_vendor"
+          message="Agent wants approval to run a tool"
+          phase="pre_tool_use"
+          policyName={policyName}
+          contentPreview=""
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+        />,
+      );
+      expect(screen.getByText(new RegExp(displayName))).toBeDefined();
+      expect(screen.queryByText(new RegExp(policyName))).toBeNull();
+      cleanup();
+    }
+
+    // The generic hook's vendor-less fallback: still provenance, so the tag
+    // slot stays empty rather than printing "native_permission".
+    render(
+      <ApprovalCard
+        elicitationId="elic_vendorless"
+        message="Agent wants approval to run a tool"
+        phase="pre_tool_use"
+        policyName="native_permission"
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+    expect(screen.queryByText(/native_permission/)).toBeNull();
+    expect(screen.queryByText(/pre_tool_use/)).toBeNull();
+  });
+
+  it("keeps user-authored policy names and phase verbatim", () => {
+    // Policy asks are gated by a policy the user wrote — its name and
+    // phase tell them which rule fired, so no prettifying.
+    render(
+      <ApprovalCard
+        elicitationId="elic_policy"
+        message="Approve running rm -rf /tmp/cache?"
+        phase="tool_call"
+        policyName="approve_shell_commands"
+        contentPreview="rm -rf /tmp/cache"
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+    expect(screen.getByText(/approve_shell_commands/)).toBeDefined();
+    expect(screen.getByText(/tool_call/)).toBeDefined();
+  });
+
   it("renders Codex command approvals from structured extras instead of raw JSON", () => {
     // Codex command approval frames carry internal correlation ids in
     // content_preview. The card should show only user-relevant command
@@ -327,6 +416,41 @@ describe("ApprovalCard — approve & don't ask again (persistent allow rule)", (
     );
 
     expect(screen.getByText(/won't ask again for github\.com/i)).toBeDefined();
+  });
+});
+
+describe("ApprovalCard — Codex MCP persistence choices", () => {
+  it("renders advertised persistence modes and returns the selected mode in _meta", () => {
+    const submitSpy = vi.fn();
+    render(
+      <ApprovalCard
+        elicitationId="elic_codex_mcp"
+        message={'Allow the omnigent MCP server to run tool "sys_read_inbox"?'}
+        phase="codex_mcp_elicitation"
+        policyName="codex_native_mcp_elicitation"
+        contentPreview="{}"
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        codexPersistModes={["session", "always"]}
+        onSubmit={submitSpy}
+      />,
+    );
+
+    const sessionButton = screen.getByRole("button", { name: /approve for this session/i });
+    const alwaysButton = screen.getByRole("button", { name: /always allow/i });
+    expect(sessionButton).toBeDefined();
+    expect(alwaysButton).toBeDefined();
+
+    fireEvent.click(sessionButton);
+    expect(submitSpy).toHaveBeenCalledWith("elic_codex_mcp", "accept", undefined, {
+      persist: "session",
+    });
+
+    fireEvent.click(alwaysButton);
+    expect(submitSpy).toHaveBeenLastCalledWith("elic_codex_mcp", "accept", undefined, {
+      persist: "always",
+    });
   });
 });
 
@@ -1007,6 +1131,10 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
     expect(screen.getByText(/Submitted/)).toBeDefined();
     expect(screen.getByText(/Vue/)).toBeDefined();
+    // The user already answered, so the pending-tense gating message
+    // ("wants to call AskUserQuestion") would read as if the prompt
+    // were still outstanding.
+    expect(screen.queryByText(/wants to call/)).toBeNull();
   });
 });
 
@@ -1176,6 +1304,9 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
       />,
     );
     expect(screen.getByText("Plan approved")).toBeDefined();
+    // Same as an answered question: the plan was already reviewed, so
+    // the verdict label stands alone without the pending-tense ask.
+    expect(screen.queryByText(/wants to call/)).toBeNull();
 
     rerender(
       <ApprovalCard

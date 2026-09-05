@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import fetch_with_retry, open_right_rail
 
 # Unix seconds well before now so a session whose runner reads offline is
 # outside the startup grace and classifies runner_asleep (not "starting").
@@ -57,7 +57,7 @@ def _patch_runner_asleep(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         payload["created_at"] = _OLD_CREATED_AT
         route.fulfill(
@@ -71,7 +71,7 @@ def _patch_runner_asleep(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/health":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         # Runner offline, host online → runner_asleep (host wakes it on demand).
         live = {"runner_online": False, "host_online": True}

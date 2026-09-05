@@ -478,3 +478,291 @@ def test_callback_accepts_boolean_and_string_true(
     # Accepted as a verified identity → redirect + session.
     assert resp.status_code == 302, resp.text
     assert resp.cookies.get("ap_session") is not None
+
+
+# ── Forced re-auth: callback verifies id_token auth_time ───────────
+
+
+def _do_callback_reauth(client: TestClient, id_token: str, *, reauth_at: int) -> httpx.Response:
+    """Drive ``/auth/callback`` with a state cookie that demanded re-auth.
+
+    Mirrors :func:`_do_callback` but stamps ``reauth_at`` into the signed
+    state — the marker ``/auth/login?reauth=1`` writes when it forwards
+    ``prompt=login``/``max_age=0`` to the IdP. The callback must then
+    verify the id_token's ``auth_time`` proves a real re-authentication.
+    """
+    client.app.state.pending_id_token[0] = id_token
+    state = "state-token-reauth"
+    state_jwt = jwt.encode(
+        {
+            "state": state,
+            "code_verifier": "verifier",
+            "return_to": "/",
+            "exp": int(time.time()) + 300,
+            "reauth_at": reauth_at,
+        },
+        _TEST_SECRET,
+        algorithm="HS256",
+    )
+    client.cookies.set(_AUTH_STATE_COOKIE_PLAIN, state_jwt)
+    return client.get(
+        f"/auth/callback?code=auth-code&state={state}",
+        follow_redirects=False,
+    )
+
+
+def test_reauth_callback_accepts_fresh_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A reauth login whose auth_time is at/after the demand mints a session.
+
+    Conformant IdP honoring prompt=login: it re-authenticated the user
+    now, so auth_time >= reauth_at and the freshness demand is satisfied.
+    """
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at + 1}
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+def test_reauth_callback_rejects_stale_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A reauth login whose auth_time predates the demand is refused.
+
+    This is the residual bypass the auth_time check closes: the IdP
+    silently reused its session (auth_time is the original login, before
+    we demanded prompt=login). Trusting it would mint a fresh-iat session
+    that sails past the device-consent freshness gate — a reflex-approve.
+    """
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at - 3600}
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 403, resp.text
+    assert "did not re-authenticate" in resp.json()["error"]
+    assert resp.cookies.get("ap_session") is None
+
+
+def test_reauth_callback_rejects_missing_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A reauth login with no auth_time claim is refused.
+
+    max_age makes auth_time REQUIRED in the id_token (OIDC Core §3.1.3.7);
+    an IdP that omits it leaves the re-auth unverifiable, so we refuse
+    rather than trust an unprovable claim.
+    """
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 403, resp.text
+    assert "did not confirm re-authentication" in resp.json()["error"]
+    assert resp.cookies.get("ap_session") is None
+
+
+def test_non_reauth_callback_ignores_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A plain login (no reauth_at) never consults auth_time.
+
+    Baseline: the new check must not affect the ordinary login path — a
+    token with no auth_time still mints a session when reauth was not
+    demanded.
+    """
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+# ── CLI login tickets + login-issued refresh grants ───────────────
+
+
+def test_cli_ticket_fulfillment_issues_refresh_grant(
+    tmp_path: Path,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CLI-ticket login returns refresh material the CLI can renew with.
+
+    End-to-end over the OIDC router + the standalone token router (the
+    OIDC mount): cli-login → callback (fulfills ticket + issues grant) →
+    cli-poll (hands out refresh_token once) → /oauth/token refresh.
+    This is the renewal path that keeps an unattended host alive past
+    session-JWT expiry.
+    """
+    from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.server.routes.device_auth import create_oauth_token_router
+
+    keys = _IdpKeys()
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    admins = tmp_path / "admins"
+    admins.write_text("")
+    config = _oidc_config()
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
+    grant_store = DeviceGrantStore(db_uri)
+
+    pending_id_token: list[str] = [""]
+
+    async def _fake_post(
+        self: httpx.AsyncClient,
+        url: str,
+        *,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        return httpx.Response(200, json={"id_token": pending_id_token[0]})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+    monkeypatch.setattr(
+        jwt.PyJWKClient,
+        "get_signing_key_from_jwt",
+        lambda self, token: keys.signing_key,
+    )
+
+    app = FastAPI()
+    app.include_router(
+        create_auth_router(
+            provider,
+            perm_store,
+            AdminList(admins),
+            device_grant_store=grant_store,
+        ),
+        prefix="/auth",
+    )
+    app.include_router(create_oauth_token_router(provider, grant_store))
+
+    with TestClient(app) as client:
+        # 1. CLI requests a ticket.
+        r = client.post("/auth/cli-login")
+        assert r.status_code == 200, r.text
+        ticket = r.json()["ticket"]
+
+        # 2. Browser completes the IdP flow; the state cookie carries the
+        # ticket so the callback fulfills it.
+        pending_id_token[0] = keys.sign_id_token(
+            {"email": "alice@example.com", "email_verified": True}
+        )
+        state = "state-token-xyz"
+        state_jwt = jwt.encode(
+            {
+                "state": state,
+                "code_verifier": "verifier",
+                "return_to": "/",
+                "ticket": ticket,
+                "exp": int(time.time()) + 300,
+            },
+            _TEST_SECRET,
+            algorithm="HS256",
+        )
+        client.cookies.set(_AUTH_STATE_COOKIE_PLAIN, state_jwt)
+        r = client.get(
+            f"/auth/callback?code=auth-code&state={state}",
+            follow_redirects=False,
+        )
+        assert r.status_code == 200, r.text  # HTML "Login successful" page
+
+        # 3. The CLI polls: session token AND refresh material.
+        r = client.get(f"/auth/cli-poll?ticket={ticket}")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["user_id"] == "alice@example.com"
+        refresh = body.get("refresh_token")
+        assert refresh, "cli-poll must include the login-issued refresh token"
+
+        # 4. The refresh token renews into a delegated access token.
+        r = client.post(
+            "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
+        )
+        assert r.status_code == 200, r.text
+        renewed = r.json()
+        assert renewed["access_token"]
+        # Login grants do not rotate — the same refresh token stays valid, so
+        # a lost response cannot brick an unattended host.
+        assert renewed["refresh_token"] == refresh
+        decoded = jwt.decode(renewed["access_token"], _TEST_SECRET, algorithms=["HS256"])
+        assert decoded["sub"] == "alice@example.com"
+        # Revocable (grant_id) but NOT scope-restricted: it renews the session
+        # JWT, so it keeps that authority rather than the delegated allowlist.
+        assert decoded["grant_id"]
+        assert "scope" not in decoded
+
+
+def test_cli_poll_without_grant_store_keeps_legacy_shape(
+    tmp_path: Path,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No grant store wired → the poll response has no refresh_token key
+    (old-server behavior, which new CLIs must tolerate)."""
+    keys = _IdpKeys()
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    admins = tmp_path / "admins"
+    admins.write_text("")
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=_oidc_config())
+
+    pending_id_token: list[str] = [""]
+
+    async def _fake_post(
+        self: httpx.AsyncClient,
+        url: str,
+        *,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        return httpx.Response(200, json={"id_token": pending_id_token[0]})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+    monkeypatch.setattr(
+        jwt.PyJWKClient,
+        "get_signing_key_from_jwt",
+        lambda self, token: keys.signing_key,
+    )
+
+    app = FastAPI()
+    app.include_router(
+        create_auth_router(provider, perm_store, AdminList(admins)),
+        prefix="/auth",
+    )
+    with TestClient(app) as client:
+        r = client.post("/auth/cli-login")
+        ticket = r.json()["ticket"]
+        pending_id_token[0] = keys.sign_id_token(
+            {"email": "alice@example.com", "email_verified": True}
+        )
+        state = "state-token-xyz"
+        state_jwt = jwt.encode(
+            {
+                "state": state,
+                "code_verifier": "verifier",
+                "return_to": "/",
+                "ticket": ticket,
+                "exp": int(time.time()) + 300,
+            },
+            _TEST_SECRET,
+            algorithm="HS256",
+        )
+        client.cookies.set(_AUTH_STATE_COOKIE_PLAIN, state_jwt)
+        client.get(f"/auth/callback?code=auth-code&state={state}", follow_redirects=False)
+        r = client.get(f"/auth/cli-poll?ticket={ticket}")
+        assert r.status_code == 200, r.text
+        assert "refresh_token" not in r.json()

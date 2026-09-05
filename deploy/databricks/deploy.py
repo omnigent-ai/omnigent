@@ -39,7 +39,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
-_WORKSPACE_WHEEL_LIMIT_BYTES = 10 * 1024 * 1024
+# Databricks Apps rejects any single source file over 10 MB. Keep wheels and
+# the externalized SPA archive under the same limit.
+_WORKSPACE_FILE_LIMIT_BYTES = 10 * 1024 * 1024
+_WORKSPACE_WHEEL_LIMIT_BYTES = _WORKSPACE_FILE_LIMIT_BYTES
+_WEB_UI_DIR_NAME = "web-ui"
+_WEB_UI_ARCHIVE_NAME = "web-ui.tar.gz"
 _APP_REQUIRES_PYTHON = ">=3.12,<3.13"
 # Public PyPI by default. Set UV_INDEX_URL to lock against a private mirror or
 # proxy instead (see run_uv_lock).
@@ -60,6 +65,9 @@ _ENV_VARS_TO_CLEAR = (
 _BUNDLE_RESOURCE_KEY = "omnigent"
 
 _WHEEL_PREFIXES = ("omnigent-", "omnigent_client-", "omnigent_ui_sdk-")
+_BUILTIN_EXTENSION_WHEEL_PREFIXES = ("omnigent_canvas-",)
+_ENABLE_CANVAS_ENV_VAR = "OMNIGENT_ENABLE_CANVAS"
+_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes"})
 
 
 def _log(msg: str) -> None:
@@ -192,14 +200,39 @@ def _clean_build_artifacts() -> None:
             shutil.rmtree(target)
 
 
-def _build_wheels(skip_web_ui: bool) -> list[Path]:
+def _dist_web_ui_archive() -> Path:
+    """Return the SPA archive produced outside the Python wheel."""
+    return _repo_root() / "dist" / _WEB_UI_ARCHIVE_NAME
+
+
+def _env_var_is_truthy(name: str) -> bool:
+    """Return whether an environment variable contains a supported true value."""
+    return os.environ.get(name, "").strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def _build_wheels(skip_web_ui: bool, *, enable_canvas: bool = False) -> list[Path]:
     """Invoke build.sh and return the resulting wheel paths."""
     root = _repo_root()
     build_sh = _deploy_dir() / "build.sh"
     env = os.environ.copy()
     if skip_web_ui:
         env["SKIP_WEB_UI"] = "1"
-    _log(f"$ {build_sh}" + (" (SKIP_WEB_UI=1)" if skip_web_ui else ""))
+        env.pop("EXTERNALIZE_WEB_UI", None)
+    else:
+        # Keep the SPA out of the wheel: bundled it takes the main wheel over
+        # the 10 MB Workspace per-file cap. build.sh writes a fixed archive,
+        # so no caller-controlled path reaches rm or mv.
+        env["EXTERNALIZE_WEB_UI"] = "1"
+        env.pop("SKIP_WEB_UI", None)
+        env.pop("OMNIGENT_SKIP_WEB_UI", None)
+    if enable_canvas and not skip_web_ui:
+        env[_ENABLE_CANVAS_ENV_VAR] = "1"
+    else:
+        env.pop(_ENABLE_CANVAS_ENV_VAR, None)
+    modes = ["SKIP_WEB_UI=1" if skip_web_ui else "EXTERNALIZE_WEB_UI=1"]
+    if enable_canvas and not skip_web_ui:
+        modes.append(f"{_ENABLE_CANVAS_ENV_VAR}=1")
+    _log(f"$ {build_sh} ({', '.join(modes)})")
     subprocess.run([str(build_sh)], cwd=root, env=env, check=True)
     wheels = sorted((root / "dist").glob("*.whl"))
     if not wheels:
@@ -212,7 +245,7 @@ class _ClassifiedWheels:
     """Result of sorting built wheels by size for upload routing.
 
     :param main: The top-level ``omnigent`` wheel — always uploaded
-        with the ``[databricks]`` extra.
+        with the ``[databricks,tracing]`` extras.
     :param small: Wheels ≤ 10 MB. Uploaded into the bundle's
         ``source_code_path`` and referenced by relative path.
     :param oversize: Wheels > 10 MB. These cannot be used by the
@@ -235,6 +268,70 @@ def _classify_wheels(wheels: Iterable[Path]) -> _ClassifiedWheels:
         else:
             oversize.append(wheel)
     return _ClassifiedWheels(main=main_wheel, small=small, oversize=oversize)
+
+
+def _partition_built_wheels(
+    wheels: Iterable[Path], explicit_extensions: Iterable[Path] = ()
+) -> tuple[list[Path], list[Path]]:
+    """Separate core release wheels from bundled first-party extensions."""
+    explicit_paths = {wheel.resolve() for wheel in explicit_extensions}
+    core: list[Path] = []
+    extensions: list[Path] = []
+    unexpected: list[Path] = []
+    for wheel in wheels:
+        if wheel.name.startswith(_WHEEL_PREFIXES):
+            core.append(wheel)
+        elif wheel.name.startswith(_BUILTIN_EXTENSION_WHEEL_PREFIXES):
+            extensions.append(wheel)
+        elif wheel.resolve() in explicit_paths:
+            continue
+        else:
+            unexpected.append(wheel)
+    if unexpected:
+        names = ", ".join(wheel.name for wheel in unexpected)
+        raise SystemExit(
+            f"unexpected wheel(s) in dist/: {names}; pass additional extensions "
+            "with --extension-wheel from a separate output directory"
+        )
+    return core, extensions
+
+
+def _is_canvas_wheel(wheel: Path) -> bool:
+    """Return whether ``wheel`` is the first-party Canvas distribution."""
+    return wheel.name.startswith(_BUILTIN_EXTENSION_WHEEL_PREFIXES)
+
+
+def _select_extension_wheels(
+    builtin_extensions: Iterable[Path],
+    explicit_extensions: Iterable[Path],
+    *,
+    enable_canvas: bool,
+) -> list[Path]:
+    """Select deploy extensions while keeping Canvas behind its env opt-in."""
+    builtin = list(builtin_extensions)
+    explicit = list(explicit_extensions)
+    explicit_canvas = [wheel for wheel in explicit if _is_canvas_wheel(wheel)]
+    if explicit_canvas and not enable_canvas:
+        raise SystemExit(
+            f"Canvas is disabled; set {_ENABLE_CANVAS_ENV_VAR}=true instead of "
+            "passing its wheel directly"
+        )
+
+    canvas_wheels = list(
+        {wheel.resolve(): wheel for wheel in [*builtin, *explicit_canvas]}.values()
+    )
+    if enable_canvas and len(canvas_wheels) != 1:
+        names = ", ".join(wheel.name for wheel in canvas_wheels) or "none"
+        raise SystemExit(
+            f"{_ENABLE_CANVAS_ENV_VAR}=true requires exactly one Canvas wheel; "
+            f"found {names}. Rebuild without --skip-build or provide one with "
+            "--extension-wheel."
+        )
+
+    selected = [wheel for wheel in explicit if not _is_canvas_wheel(wheel)]
+    if enable_canvas:
+        selected.insert(0, canvas_wheels[0])
+    return selected
 
 
 def _wheel_version(wheel: Path, prefix: str) -> str:
@@ -289,12 +386,65 @@ def _sweep_local_src_wheels(keep: set[str]) -> None:
     for entry in src.iterdir():
         if not entry.is_file() or entry.suffix != ".whl":
             continue
-        if not any(entry.name.startswith(p) for p in _WHEEL_PREFIXES):
-            continue
         if entry.name in keep:
             continue
         _log(f"removing stale local wheel {entry.relative_to(_repo_root())}")
         entry.unlink()
+
+
+def _stage_web_ui(skip_web_ui: bool) -> Path | None:
+    """Copy the externalized SPA archive into the app source directory.
+
+    A previous version staged the SPA as hundreds of loose files. The archive
+    keeps the same source-code sync path while reducing the Workspace upload
+    round-trips to one file. ``src/app.py`` extracts it before importing the
+    server and points ``OMNIGENT_WEB_UI_DIST`` at the extracted directory.
+    """
+    src = _src_dir()
+    stale_dir = src / _WEB_UI_DIR_NAME
+    if stale_dir.exists():
+        shutil.rmtree(stale_dir)
+        _log(f"removed stale {stale_dir.relative_to(_repo_root())}")
+
+    destination = src / _WEB_UI_ARCHIVE_NAME
+    if destination.exists():
+        if destination.is_dir():
+            shutil.rmtree(destination)
+        else:
+            destination.unlink()
+
+    if skip_web_ui:
+        _log("--skip-web-ui: deploying without the SPA (API-only)")
+        return None
+
+    source = _dist_web_ui_archive()
+    if not source.is_file():
+        _log(f"no externalized SPA at {source.relative_to(_repo_root())}; skipping web UI staging")
+        return None
+
+    shutil.copy2(source, destination)
+    _log(
+        f"copy SPA archive {source.relative_to(_repo_root())} → "
+        f"{destination.relative_to(_repo_root())}"
+    )
+    return destination
+
+
+def _assert_app_files_under_limit() -> None:
+    """Fail before upload if any app source file exceeds the Workspace cap."""
+    src = _src_dir()
+    offenders = [
+        (path, path.stat().st_size)
+        for path in src.rglob("*")
+        if path.is_file() and path.stat().st_size > _WORKSPACE_FILE_LIMIT_BYTES
+    ]
+    if offenders:
+        listing = ", ".join(
+            f"{path.relative_to(src)} ({size / 1024 / 1024:.2f} MB)" for path, size in offenders
+        )
+        raise SystemExit(
+            f"app source files exceed the Databricks Apps 10 MB per-file cap: {listing}"
+        )
 
 
 def _toml_string(value: str) -> str:
@@ -323,10 +473,22 @@ def _wheel_source_path(wheel: Path) -> str:
     )
 
 
+def _wheel_name_version(wheel: Path) -> tuple[str, str]:
+    """
+    Return the normalized distribution name and version from a wheel filename.
+
+    :param wheel: Wheel path, e.g. ``dist/omnigent_canvas-0.1.0-py3-none-any.whl``.
+    :returns: ``("omnigent-canvas", "0.1.0")``.
+    """
+    name, version = wheel.name.split("-")[:2]
+    return name.lower().replace("_", "-"), version
+
+
 def _uv_source_lines(
     main_wheel: Path,
     small_wheels: list[Path],
     oversize_wheels: list[Path],
+    extension_wheels: list[Path] = (),
 ) -> list[str]:
     """Build ``[tool.uv.sources]`` lines for the three deploy wheels.
 
@@ -348,6 +510,21 @@ def _uv_source_lines(
         wheel = next(wheel for name, wheel in wheels.items() if name.startswith(wheel_prefix))
         source = _wheel_source_path(wheel)
         source_lines.append(f"{package_name} = {{ path = {_toml_string(source)} }}")
+    core_names = {"omnigent", "omnigent-client", "omnigent-ui-sdk"}
+    seen: set[str] = set()
+    for wheel in extension_wheels:
+        package_name, _ = _wheel_name_version(wheel)
+        if package_name in core_names:
+            raise SystemExit(
+                f"--extension-wheel {wheel.name} would shadow the core package {package_name}"
+            )
+        if package_name in seen:
+            raise SystemExit(
+                f"--extension-wheel {wheel.name} repeats the extension {package_name}"
+            )
+        seen.add(package_name)
+        source = _wheel_source_path(wheel)
+        source_lines.append(f"{package_name} = {{ path = {_toml_string(source)} }}")
     return source_lines
 
 
@@ -356,6 +533,7 @@ def build_uv_pyproject(
     small_wheels: list[Path],
     oversize_wheels: list[Path],
     deploy_version: str,
+    extension_wheels: list[Path] = (),
 ) -> str:
     """Compose the app-level ``pyproject.toml`` for Databricks Apps.
 
@@ -365,14 +543,20 @@ def build_uv_pyproject(
     :param oversize_wheels: Wheels too large for the app source directory.
     :param deploy_version: Version stamped into the wheels, e.g.
         ``"0.1.0.post123"``.
+    :param extension_wheels: Omnigent extension wheels (``omnigent.extensions``
+        entry points) installed alongside the server, e.g.
+        ``src/omnigent_canvas-0.1.0-py3-none-any.whl``.
     :returns: Complete TOML text for ``src/pyproject.toml``.
     """
-    source_lines = _uv_source_lines(main_wheel, small_wheels, oversize_wheels)
+    source_lines = _uv_source_lines(main_wheel, small_wheels, oversize_wheels, extension_wheels)
     dependencies = [
-        f'"omnigent[databricks]=={deploy_version}"',
+        f'"omnigent[databricks,tracing]=={deploy_version}"',
         f'"omnigent-client=={deploy_version}"',
         f'"omnigent-ui-sdk=={deploy_version}"',
     ]
+    for wheel in extension_wheels:
+        package_name, version = _wheel_name_version(wheel)
+        dependencies.append(f'"{package_name}=={version}"')
     return (
         "[project]\n"
         'name = "omnigent-databricks-app"\n'
@@ -414,6 +598,7 @@ def write_uv_dependency_files(
     small_wheels: list[Path],
     oversize_wheels: list[Path],
     deploy_version: str,
+    extension_wheels: list[Path] = (),
 ) -> None:
     """Write the uv dependency files Databricks Apps should install.
 
@@ -424,6 +609,7 @@ def write_uv_dependency_files(
     :param oversize_wheels: Wheels too large for ``src``.
     :param deploy_version: Version stamped into the wheels, e.g.
         ``"0.1.0.post123"``.
+    :param extension_wheels: Extension wheels already copied into ``src``.
     """
     requirements = src / "requirements.txt"
     if requirements.exists():
@@ -435,6 +621,7 @@ def write_uv_dependency_files(
         small_wheels,
         oversize_wheels,
         deploy_version,
+        extension_wheels,
     )
     (src / "pyproject.toml").write_text(pyproject)
     _log("src/pyproject.toml:\n" + pyproject)
@@ -524,6 +711,30 @@ def _assert_clean_tree(skip: bool) -> None:
     _log(f"clean tree at origin/main {head[:12]}")
 
 
+# Variables a target must override for --no-otel to actually take effect;
+# `prod-no-otel` in databricks.yml is the reference implementation.
+_OTEL_OFF_VARS = ("app_command", "app_env", "otel_export_destinations")
+
+
+def _target_overrides_otel_vars(target: str) -> bool | None:
+    """Whether ``target`` overrides every OTel-off variable in databricks.yml.
+
+    Returns ``None`` when the bundle can't be inspected (no PyYAML, unreadable
+    or malformed file) so callers warn rather than assert either way.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        bundle = yaml.safe_load((_deploy_dir() / "databricks.yml").read_text())
+    except (OSError, yaml.YAMLError):
+        return None
+    targets = (bundle or {}).get("targets") or {}
+    variables = (targets.get(target) or {}).get("variables") or {}
+    return all(name in variables for name in _OTEL_OFF_VARS)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -568,6 +779,25 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--features",
+        default="",
+        help=(
+            "Comma-separated deployment-wide release features, e.g. "
+            "'usage_page'. Empty keeps every release feature off."
+        ),
+    )
+    parser.add_argument(
+        "--no-otel",
+        action="store_true",
+        help=(
+            "Deploy without OpenTelemetry: run 'python app.py' instead of "
+            "under opentelemetry-instrument, drop OTEL_TRACES_SAMPLER, and "
+            "drop the platform telemetry_export_destinations. Use for "
+            "workspaces with no OTel collector / UC OTel tables — otherwise "
+            "span exports fail DEADLINE_EXCEEDED to localhost:4317."
+        ),
+    )
+    parser.add_argument(
         "--target",
         default="prod",
         help=(
@@ -604,6 +834,18 @@ def _parse_args() -> argparse.Namespace:
         help="Build without the SPA (API-only deploy).",
     )
     parser.add_argument(
+        "--extension-wheel",
+        action="append",
+        default=[],
+        type=Path,
+        metavar="WHEEL",
+        help=(
+            "Prebuilt Omnigent extension wheel to install alongside the server "
+            "(repeatable), e.g. dist-ext/omnigent_canvas-0.1.0-py3-none-any.whl. "
+            "The server discovers it through its omnigent.extensions entry point."
+        ),
+    )
+    parser.add_argument(
         "--app-url",
         default=None,
         help=(
@@ -634,7 +876,24 @@ def _parse_args() -> argparse.Namespace:
             "known commit on main."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    # --no-otel selects the tracer-off DAB target (same workspace + state as
+    # `prod`, OTel variables overridden off). Only auto-switch the default
+    # target so an explicit --target still wins — but then the flag is a no-op
+    # unless that target defines the OTel-off overrides itself, so say so
+    # instead of silently deploying with OTel on.
+    if args.no_otel:
+        if args.target == "prod":
+            args.target = "prod-no-otel"
+        elif _target_overrides_otel_vars(args.target) is not True:
+            _log(
+                f"warning: --no-otel has no effect on --target {args.target!r}: it "
+                f"only swaps the default 'prod' target for 'prod-no-otel'. That "
+                f"target does not override {', '.join(_OTEL_OFF_VARS)}, so OTel "
+                "stays ON for this deploy — copy the overrides from the "
+                "prod-no-otel block in databricks.yml, or drop --target."
+            )
+    return args
 
 
 def _clear_env_vars() -> None:
@@ -735,6 +994,10 @@ def _ensure_compute_size(
 
 def _bundle_vars(args: argparse.Namespace) -> list[str]:
     """CLI args to pass to `databricks bundle` as --var pairs."""
+    # The Apps API rejects an environment entry with an empty source. A single
+    # space is trimmed by the feature parser and therefore preserves the
+    # documented "no features" behavior while providing a valid value source.
+    features = args.features if args.features.strip() else " "
     return [
         "--var",
         f"app_name={args.app_name}",
@@ -746,11 +1009,39 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         f"volume_name={args.volume_name}",
         "--var",
         f"otel_table_schema={args.otel_table_schema}",
+        "--var",
+        f"features={features}",
     ]
 
 
 def _profile_arg(args: argparse.Namespace) -> list[str]:
     return ["--profile", args.profile] if args.profile else []
+
+
+# Credential-shaped fragments the CLI can echo back inside an error: a token in
+# a config dump, an Authorization header in a transport error. A grant warning is
+# diagnostic only, so scrub these before it reaches a deploy log or CI transcript.
+# The key half deliberately allows surrounding word characters so an
+# underscore-prefixed env name (DATABRICKS_TOKEN=..., DATABRICKS_CLIENT_SECRET=...)
+# is caught too — a plain \b would not match after the underscore.
+_SECRET_ECHO_RE = re.compile(
+    r"(?i)(bearer\s+|[\w.-]*(?:token|password|passwd|secret|credential|authorization"
+    r"|api[_-]?key)[\w.-]*\s*[=:]\s*)(?:bearer\s+)?\S+"
+)
+
+
+def _grant_failure_detail(exc: subprocess.CalledProcessError) -> str:
+    """Bounded, secret-scrubbed one-line summary of a failed grant subprocess.
+
+    Falls back to the return code when the CLI said nothing on stderr.
+    """
+    first_line = next(
+        (line.strip() for line in (exc.stderr or "").splitlines() if line.strip()),
+        "",
+    )
+    if not first_line:
+        return f"rc={exc.returncode}"
+    return _SECRET_ECHO_RE.sub(r"\1<redacted>", first_line)[:200]
 
 
 def _ensure_app_sp_uc_traversal(
@@ -762,6 +1053,14 @@ def _ensure_app_sp_uc_traversal(
     Apps' ``uc_securable`` only grants the leaf (WRITE_VOLUME); the
     SP can boot but 403s on first volume read if the parent catalog
     doesn't grant USE to ``account users``. Idempotent.
+
+    A grant that cannot be applied is warned about, not fatal: the SP often
+    already has traversal by group inheritance, and a deployer without MANAGE
+    on a shared catalog cannot add it. Aborting the deploy there fails a
+    workspace that would have booted fine, and the app-boot smoke check later
+    in :func:`main` is the real gate on whether traversal actually works.
+    With ``--no-smoke-check``, this warning is the only post-grant signal that
+    traversal may still be unavailable.
     """
     if not app_sp:
         _log("app SP not resolved yet; skipping UC traversal grants")
@@ -781,27 +1080,36 @@ def _ensure_app_sp_uc_traversal(
     ):
         _log(f"granting {priv} on {kind} {fqn} → app SP {app_sp}")
         payload = _json.dumps({"changes": [{"principal": app_sp, "add": [priv]}]})
-        subprocess.run(
-            [
-                "databricks",
-                "grants",
-                "update",
-                kind,
-                fqn,
-                *_profile_arg(args),
-                "--json",
-                payload,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            subprocess.run(
+                [
+                    "databricks",
+                    "grants",
+                    "update",
+                    kind,
+                    fqn,
+                    *_profile_arg(args),
+                    "--json",
+                    payload,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            _log(f"warning: {priv} grant on {fqn} failed ({_grant_failure_detail(exc)})")
 
 
 def main() -> int:
     args = _parse_args()
     _clear_env_vars()
     _assert_clean_tree(skip=args.allow_dirty)
+
+    enable_canvas = _env_var_is_truthy(_ENABLE_CANVAS_ENV_VAR)
+    if enable_canvas and args.skip_web_ui:
+        _log(f"{_ENABLE_CANVAS_ENV_VAR}=true ignored with --skip-web-ui")
+        enable_canvas = False
+    _log(f"Canvas extension: {'enabled' if enable_canvas else 'disabled'}")
 
     base_version = _read_base_version()
     deploy_version = _compute_deploy_version(base_version, args.version)
@@ -812,7 +1120,10 @@ def main() -> int:
         if not args.skip_build:
             _clean_build_artifacts()
             backups = _stamp_versions(deploy_version)
-            wheels = _build_wheels(skip_web_ui=args.skip_web_ui)
+            wheels = _build_wheels(
+                skip_web_ui=args.skip_web_ui,
+                enable_canvas=enable_canvas,
+            )
         else:
             dist = _repo_root() / "dist"
             wheels = sorted(dist.glob("*.whl"))
@@ -831,16 +1142,29 @@ def main() -> int:
         if backups and not args.keep_version_bump:
             _restore_versions(backups)
 
-    classified = _classify_wheels(wheels)
+    explicit_extension_wheels = [wheel.resolve() for wheel in args.extension_wheel]
+    for wheel in explicit_extension_wheels:
+        if not wheel.is_file():
+            raise SystemExit(f"--extension-wheel {wheel} does not exist")
+    core_wheels, builtin_extension_wheels = _partition_built_wheels(
+        wheels, explicit_extension_wheels
+    )
+    classified = _classify_wheels(core_wheels)
+    extension_wheels = _select_extension_wheels(
+        builtin_extension_wheels,
+        explicit_extension_wheels,
+        enable_canvas=enable_canvas,
+    )
     for wheel in wheels:
         size_mb = wheel.stat().st_size / 1024 / 1024
         _log(f"  {wheel.name}  {size_mb:.2f} MB")
-    if classified.oversize:
+    if classified.oversize or any(
+        wheel.stat().st_size > _WORKSPACE_WHEEL_LIMIT_BYTES for wheel in extension_wheels
+    ):
         raise SystemExit(
-            "uv-based Databricks Apps deploys require all Omnigent wheels "
-            "to fit in the app source snapshot. Rebuild with --skip-web-ui "
-            "or reduce wheel size; UC Volume wheel paths are not used "
-            "because uv lock validates path sources locally."
+            "uv-based Databricks Apps deploys require every Omnigent wheel to "
+            "fit under the 10 MB Workspace file cap. Reduce the Python payload "
+            "or pass --skip-web-ui; the SPA ships outside the wheel."
         )
 
     # Late-import the SDK so `--help` works without it installed.
@@ -852,11 +1176,15 @@ def main() -> int:
     # wheels locally, then copy the new small wheels in.
     src = _src_dir()
     src.mkdir(parents=True, exist_ok=True)
-    _sweep_local_src_wheels(keep={w.name for w in classified.small})
-    for wheel in classified.small:
+    _sweep_local_src_wheels(keep={w.name for w in [*classified.small, *extension_wheels]})
+    for wheel in [*classified.small, *extension_wheels]:
         dest = src / wheel.name
         _log(f"copy {wheel.name} → {dest.relative_to(_repo_root())}")
         shutil.copy2(wheel, dest)
+
+    # 1a) Ship the SPA as one archive beside app.py so no wheel exceeds the
+    # cap and Databricks does not sync hundreds of individual UI files.
+    _stage_web_ui(args.skip_web_ui)
 
     # 2) Generate pyproject.toml + uv.lock. Remove requirements.txt
     # first because Databricks Apps gives it precedence over uv.
@@ -866,7 +1194,11 @@ def main() -> int:
         classified.small,
         classified.oversize,
         deploy_version,
+        [src / wheel.name for wheel in extension_wheels],
     )
+
+    # 3) Guard every uploaded source file before touching the workspace.
+    _assert_app_files_under_limit()
 
     # 4) Bind the bundle to the existing app (if any).
     _ensure_bound(args)

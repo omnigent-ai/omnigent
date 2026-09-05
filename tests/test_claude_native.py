@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import importlib.metadata
 import io
 import json
 import os
+import re
 import shlex
 import ssl
+from collections.abc import Iterator
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -29,10 +34,23 @@ from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
 from omnigent.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.runtime import tool_result_replay as trc
 from omnigent.spec import load_omnigent_yaml
-from omnigent.terminals.ws_bridge import (
+from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
+)
+from tests._image_fixtures import (
+    _TINY_CMYK_JPEG_BASE64,
+    _TINY_GIF_BASE64,
+    _TINY_JPEG_BASE64,
+    _TINY_PNG_BASE64,
+    _TINY_PROGRESSIVE_GRAY_JPEG_BASE64,
+    _TINY_PROGRESSIVE_JPEG_BASE64,
+    _TINY_WEBP_BASE64,
+)
+from tests._image_fixtures import (
+    mcp_call_output as _mcp_call_output,
 )
 
 
@@ -94,6 +112,7 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     assert spec["env"] == {
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
+        "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     }
     assert spec["os_env_type"] == "caller_process"
     # Claude Code emits long interactive transcripts; this value is
@@ -219,6 +238,7 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
+        "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     }
     args = spec["args"]
     assert args[:9] == [
@@ -318,9 +338,10 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "123456",
             "CLAUDE_CODE_USE_GATEWAY": "1",
             "ANTHROPIC_CUSTOM_HEADERS": "x-databricks-use-coding-agent-mode: true",
-            # The gateway allowlists beta flags and 400s the whole request on
-            # an unknown one, so the CLI's experimental betas stay off.
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+            # No CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: this path launches in
+            # gateway mode (CLAUDE_CODE_USE_GATEWAY=1), where Claude Code
+            # negotiates the anthropic-beta set with the gateway and keeps MCP
+            # tool search on (it rides on the advanced-tool-use beta).
         },
         api_key_helper="printf token",
         model="databricks-claude-opus-test",
@@ -699,15 +720,17 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
     ]
 
 
-def test_claude_native_static_model_options_keep_alias_as_model(
+def test_claude_native_static_model_options_list_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Direct Claude auth rows preserve the alias/model/label contract."""
-    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
-    options = claude_native.claude_native_model_options(None)
+    """Direct Claude auth has no configured rows — the probe is the catalog.
 
-    assert options
-    assert all(option["model"] == option["id"] for option in options)
+    The static alias table is gone: a subscription launch's rows come from
+    the harness's own enumeration, so inventing configured rows here would
+    let the picker drift from what the harness can actually run.
+    """
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    assert claude_native.claude_native_model_options(None) == []
 
 
 def test_claude_native_model_options_follow_managed_claude_catalog(
@@ -756,19 +779,24 @@ def test_claude_native_model_options_follow_managed_claude_catalog(
     ]
 
 
-def test_unpinned_family_alias_resolves_to_the_provider_default_model(
+def test_unpinned_family_alias_is_never_swapped_for_the_provider_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A tier alias with no env pin cannot reach the gateway as a canonical id."""
+    """Picking an alias never silently runs a different model.
+
+    The old degrade swapped an unpinned family alias for the provider's
+    default model on a gateway endpoint — a Fable pick landed on Opus with
+    no error. Picker rows are pin-backed or probe-vouched now, so the alias
+    passes through; an out-of-band unpinned pick fails visibly at inference
+    instead of silently running the default.
+    """
     monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
     config = claude_native.ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
         model="databricks-claude-sonnet-4-5",
     )
-    assert (
-        claude_native.resolve_claude_native_model_selection("opus", config)
-        == "databricks-claude-sonnet-4-5"
-    )
+    assert claude_native.resolve_claude_native_model_selection("fable", config) == "fable"
+    assert claude_native.resolve_claude_native_model_selection("opus", config) == "opus"
 
 
 def test_unpinned_family_alias_passes_through_on_the_anthropic_api() -> None:
@@ -875,15 +903,18 @@ def test_provider_config_without_pins_offers_only_the_default_model_row() -> Non
     )
 
 
-def test_anthropic_endpoint_config_without_pins_keeps_the_alias_rows() -> None:
-    """API-key providers on the Anthropic API keep the alias catalog Claude resolves."""
+def test_anthropic_endpoint_config_without_pins_lists_nothing_configured() -> None:
+    """API-key providers on the Anthropic API have no configured rows either.
+
+    The static alias fallback is gone: the harness's own enumeration
+    supplies the rows for canonical endpoints, so the configured listing
+    stays empty rather than inventing aliases.
+    """
     config = claude_native.ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
         model="claude-sonnet-5",
     )
-    options = claude_native.claude_native_model_options(config)
-    assert options
-    assert all(option["model"] == option["id"] for option in options)
+    assert claude_native.claude_native_model_options(config) == []
 
 
 def test_sonnet_5_selection_resolves_to_the_configured_custom_model() -> None:
@@ -899,45 +930,14 @@ def test_sonnet_5_selection_resolves_to_the_configured_custom_model() -> None:
     )
 
 
-def test_sonnet_5_subscription_selection_uses_owned_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The direct-login custom row resolves from the central fallback record."""
-    fallback = SimpleNamespace(model_ids=("future-claude-sonnet-5",))
-    monkeypatch.setattr(claude_native, "static_model_fallback", lambda *_args: fallback)
+def test_sonnet_5_subscription_selection_degrades_to_the_sonnet_alias() -> None:
+    """The direct-login custom row degrades to Claude's own family alias.
 
-    assert (
-        claude_native.resolve_claude_native_model_selection("sonnet_5", None)
-        == "future-claude-sonnet-5"
-    )
-
-
-def test_sonnet_5_subscription_selection_uses_first_sonnet_family_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A renamed Sonnet release stays routable when its display label drifts."""
-    fallback = SimpleNamespace(model_ids=("future-claude-opus-5", "future-claude-sonnet-5-1"))
-    monkeypatch.setattr(claude_native, "static_model_fallback", lambda *_args: fallback)
-
-    assert (
-        claude_native.resolve_claude_native_model_selection("sonnet_5", None)
-        == "future-claude-sonnet-5-1"
-    )
-
-
-@pytest.mark.parametrize(
-    "fallback",
-    [None, SimpleNamespace(model_ids=("future-claude-opus-5",))],
-)
-def test_sonnet_5_subscription_selection_fails_without_sonnet_fallback(
-    fallback: object,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The private picker id never reaches Claude when its fallback disappears."""
-    monkeypatch.setattr(claude_native, "static_model_fallback", lambda *_args: fallback)
-
-    with pytest.raises(ValueError, match="no routable Sonnet model"):
-        claude_native.resolve_claude_native_model_selection("sonnet_5", None)
+    With no provider config to pin the custom slot there is no static list
+    to hunt — the harness resolves ``sonnet`` to its current Sonnet itself,
+    so the private picker id never reaches Claude.
+    """
+    assert claude_native.resolve_claude_native_model_selection("sonnet_5", None) == "sonnet"
 
 
 def test_removed_sonnet_5_selection_falls_back_to_routable_databricks_sonnet() -> None:
@@ -1426,6 +1426,180 @@ def test_local_run_persists_launch_state_on_fresh_session(
     assert opened == [("http://127.0.0.1:12345", "conv_local_fresh", True)]
 
 
+def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The real outer call site (``_run_with_local_server``) threads the
+    wrapper spec's raw instructions all the way into ``_prepare_claude_terminal``
+    on a FRESH session — with ``_prepare_claude_terminal`` itself REAL, not
+    faked, so the outer-to-inner threading is what is exercised rather than a
+    hand-supplied ``append_system_prompt``. Only ``_launch_claude_terminal``
+    — one level further in — is faked here, to observe what the real
+    ``_prepare_claude_terminal`` call actually forwards.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec_path = claude_native._materialize_claude_agent_spec(tmp_path)
+
+    class _Proc:
+        def poll(self) -> None:
+            return None
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    launch_kwargs: dict[str, Any] = {}
+
+    async def _fake_create_session(
+        _client: object, _bundle: bytes, *, bridge_id: str, terminal_launch_args: object = None
+    ) -> str:
+        del _client, _bundle, bridge_id, terminal_launch_args
+        return "conv_local_fresh_raw"
+
+    async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def _fake_launch_claude_terminal(
+        _client: object,
+        _session_id: str,
+        _claude_args: tuple[str, ...],
+        *,
+        command: str,
+        bridge_dir: Path,
+        claude_config: object = None,
+        append_system_prompt: str | None = None,
+        allowed_tools: tuple[str, ...] = (),
+    ) -> str:
+        del _client, _session_id, _claude_args, command, bridge_dir, claude_config, allowed_tools
+        launch_kwargs["append_system_prompt"] = append_system_prompt
+        return "terminal_claude_main"
+
+    async def fake_attach(
+        attach_url: str, *, headers: dict[str, str], terminal_gone_probe: object | None = None
+    ) -> bool:
+        del attach_url, headers, terminal_gone_probe
+        return True
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12346)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr(claude_native, "_create_claude_session", _fake_create_session)
+    monkeypatch.setattr(claude_native, "_bind_session_runner", _fake_bind_session_runner)
+    monkeypatch.setattr(claude_native, "_launch_claude_terminal", _fake_launch_claude_terminal)
+    monkeypatch.setattr(claude_native, "attach_local_terminal", fake_attach)
+    monkeypatch.setattr(claude_native, "prepare_bridge_dir", lambda *a, **k: tmp_path / "bridge")
+    monkeypatch.setattr(claude_native, "reset_transcript_forward_state", lambda bridge_dir: None)
+    monkeypatch.setattr(claude_native, "open_conversation_link_if_enabled", lambda **kwargs: None)
+    monkeypatch.setattr(claude_native, "_record_launch_for_fresh_session", lambda session_id: None)
+
+    claude_native._run_with_local_server(
+        spec_path,
+        session_id=None,
+        resume_picker=False,
+        claude_args=(),
+        command="claude",
+        auto_open_conversation=False,
+    )
+
+    assert launch_kwargs.get("append_system_prompt") is not None
+    assert (
+        "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
+    )
+
+
+def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Same as the fresh-session sibling, but for the COLD-RESUME branch: an
+    existing session with no live terminal launches a NEW one (unlike hot
+    reattach, which returns before ``_launch_claude_terminal`` is ever
+    called) and must still receive the wrapper's raw instructions.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec_path = claude_native._materialize_claude_agent_spec(tmp_path)
+
+    class _Proc:
+        def poll(self) -> None:
+            return None
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    launch_kwargs: dict[str, Any] = {}
+
+    async def _fake_find_running(_client: object, _session_id: str) -> str | None:
+        return None
+
+    async def _fake_fetch_labels(_client: object, _session_id: str) -> dict[str, str]:
+        return {}
+
+    async def _fake_resolve_cold_resume_args(_client: object, _session_id: str) -> tuple[str, ...]:
+        return ("--resume", "claude-sid-cold")
+
+    async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def _fake_launch_claude_terminal(
+        _client: object,
+        _session_id: str,
+        _claude_args: tuple[str, ...],
+        *,
+        command: str,
+        bridge_dir: Path,
+        claude_config: object = None,
+        append_system_prompt: str | None = None,
+        allowed_tools: tuple[str, ...] = (),
+    ) -> str:
+        del _client, _session_id, _claude_args, command, bridge_dir, claude_config, allowed_tools
+        launch_kwargs["append_system_prompt"] = append_system_prompt
+        return "terminal_claude_main"
+
+    async def fake_attach(
+        attach_url: str, *, headers: dict[str, str], terminal_gone_probe: object | None = None
+    ) -> bool:
+        del attach_url, headers, terminal_gone_probe
+        return True
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12347)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr(claude_native, "_find_running_claude_terminal", _fake_find_running)
+    monkeypatch.setattr(claude_native, "_fetch_claude_session_labels", _fake_fetch_labels)
+    monkeypatch.setattr(claude_native, "_resolve_cold_resume_args", _fake_resolve_cold_resume_args)
+    monkeypatch.setattr(claude_native, "_bind_session_runner", _fake_bind_session_runner)
+    monkeypatch.setattr(claude_native, "_launch_claude_terminal", _fake_launch_claude_terminal)
+    monkeypatch.setattr(claude_native, "attach_local_terminal", fake_attach)
+    monkeypatch.setattr(claude_native, "prepare_bridge_dir", lambda *a, **k: tmp_path / "bridge")
+    monkeypatch.setattr(claude_native, "reset_transcript_forward_state", lambda bridge_dir: None)
+    monkeypatch.setattr(claude_native, "open_conversation_link_if_enabled", lambda **kwargs: None)
+
+    claude_native._run_with_local_server(
+        spec_path,
+        session_id="conv_cold_resume_raw",
+        resume_picker=False,
+        claude_args=(),
+        command="claude",
+        auto_open_conversation=False,
+    )
+
+    assert launch_kwargs.get("append_system_prompt") is not None
+    assert (
+        "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
+    )
+
+
 def test_local_resume_does_not_print_redundant_resume_hint(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1570,9 +1744,9 @@ def test_remote_daemon_run_attaches_without_cli_forwarder(
     monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
     monkeypatch.setattr(
         "omnigent.chat._remote_headers",
-        lambda server_url=None: {"Authorization": "Bearer tok"},
+        lambda server_url=None, **_kw: {"Authorization": "Bearer tok"},
     )
-    monkeypatch.setattr("omnigent.chat._server_auth", lambda server_url=None: None)
+    monkeypatch.setattr("omnigent.chat._server_auth", lambda server_url=None, **_kw: None)
     monkeypatch.setattr("omnigent.cli._ensure_host_daemon", lambda base_url: None)
     monkeypatch.setattr(
         "omnigent.host.identity.load_or_create_host_identity",
@@ -1679,6 +1853,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         host_id: str,
         session_id: str,
         workspace: str,
+        fresh: bool = False,
     ) -> str:
         """
         Return the runner id that production should wait on.
@@ -1781,7 +1956,6 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
     assert updates == [
         "Creating Claude session...",
         "Starting runner...",
-        "Waiting for runner...",
         "Starting Claude terminal...",
         "Claude terminal ready.",
     ]
@@ -2608,6 +2782,294 @@ async def test_ensure_local_claude_resume_transcript_returns_none_when_no_record
     assert not expected.exists()
 
 
+@pytest.mark.asyncio
+async def test_fetch_resume_items_retries_smaller_pages_on_5xx() -> None:
+    """
+    A 5xx on a large item page retries at smaller page sizes.
+
+    A deployed backend can fail reading one oversized page of a big
+    conversation while serving the same rows fine at smaller page sizes.
+    The history is recoverable, so the fetch must shrink the page and keep
+    going instead of raising (which would silently cold-start a blank
+    Claude session).
+    """
+    requested_limits: list[int] = []
+    total = 600
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        limit = int(request.url.params["limit"])
+        requested_limits.append(limit)
+        if limit > 400:
+            return httpx.Response(500, json={"error": {"code": "internal_error"}})
+        after = request.url.params.get("after")
+        start = int(after) + 1 if after is not None else 0
+        page = [
+            {"type": "message", "id": str(i), "role": "user", "content": []}
+            for i in range(start, min(start + limit, total))
+        ]
+        last = page[-1]["id"] if page else None
+        return httpx.Response(
+            200,
+            json={"data": page, "has_more": start + limit < total, "last_id": last},
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        items = await claude_native._fetch_all_session_items_for_claude_resume(client, "conv_abc")
+
+    # Every item arrives exactly once, in order — the degrade must not
+    # drop or duplicate rows across the retried page boundary.
+    assert [item["id"] for item in items] == [str(i) for i in range(total)]
+    # The first request went out at the full page size, 500'd, and the
+    # fetch degraded (halving through the still-failing 500) until pages
+    # served, instead of raising.
+    assert requested_limits[0] == 1000
+    assert requested_limits == sorted(requested_limits, reverse=True)
+    assert requested_limits[-1] <= 400
+
+
+@pytest.mark.asyncio
+async def test_fetch_resume_items_retries_smaller_pages_on_dropped_connection() -> None:
+    """
+    A connection dropped mid-response on a large page degrades like a 5xx.
+
+    A backend choking on an oversized page may sever the connection instead
+    of returning a clean 500; the fetch must retry the page smaller rather
+    than abandoning the resume.
+    """
+    requested_limits: list[int] = []
+    total = 300
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        limit = int(request.url.params["limit"])
+        requested_limits.append(limit)
+        if limit > 400:
+            raise httpx.ReadError("connection dropped", request=request)
+        after = request.url.params.get("after")
+        start = int(after) + 1 if after is not None else 0
+        page = [
+            {"type": "message", "id": str(i), "role": "user", "content": []}
+            for i in range(start, min(start + limit, total))
+        ]
+        last = page[-1]["id"] if page else None
+        return httpx.Response(
+            200,
+            json={"data": page, "has_more": start + limit < total, "last_id": last},
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        items = await claude_native._fetch_all_session_items_for_claude_resume(client, "conv_abc")
+
+    assert [item["id"] for item in items] == [str(i) for i in range(total)]
+    assert requested_limits[0] == 1000
+    assert requested_limits[-1] <= 400
+
+
+@pytest.mark.asyncio
+async def test_fetch_resume_items_raises_on_4xx_without_retry() -> None:
+    """A 4xx is a contract error: raise immediately, no page-size retry."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        del request
+        calls += 1
+        return httpx.Response(404, json={"error": {"code": "not_found"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._fetch_all_session_items_for_claude_resume(client, "conv_abc")
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_resume_items_raises_when_5xx_persists_at_floor() -> None:
+    """A backend that 500s even at the smallest page size still raises."""
+    requested_limits: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_limits.append(int(request.url.params["limit"]))
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._fetch_all_session_items_for_claude_resume(client, "conv_abc")
+
+    # Degraded down to the floor, then gave up — bounded, no infinite loop.
+    assert requested_limits[-1] == claude_native._CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR
+    assert requested_limits == sorted(requested_limits, reverse=True)
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Server history unreachable + intact local transcript → resume from it.
+
+    When every page size fails, a previous run's local
+    ``~/.claude/projects/<ws>/<sid>.jsonl`` still holds the conversation;
+    resuming from it beats silently launching a blank session.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = Path("/work/some-repo")
+    target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+    target_dir.mkdir(parents=True)
+    local = target_dir / "sid123.jsonl"
+    local.write_text('{"type":"user"}\n', encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="sid123",
+            workspace=workspace,
+        )
+
+    assert written == local
+    # The untouched local transcript is used as-is, never overwritten with
+    # partial server state.
+    assert local.read_text(encoding="utf-8") == '{"type":"user"}\n'
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_ignores_corrupt_local_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-JSONL local file is not a resumable fallback.
+
+    ``claude --resume`` against a corrupt transcript exits fatally instead
+    of starting, so the fallback must reject it and surface the fetch
+    failure.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = Path("/work/some-repo")
+    target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+    target_dir.mkdir(parents=True)
+    (target_dir / "sid123.jsonl").write_text("not json at all\n", encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._ensure_local_claude_resume_transcript(
+                client,
+                session_id="conv_abc",
+                external_session_id="sid123",
+                workspace=workspace,
+            )
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_ignores_binary_local_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A binary (non-UTF-8) local file is not a resumable fallback.
+
+    Decoding fails mid-iteration rather than at ``json.loads``, so the
+    validator must degrade to "not resumable" instead of propagating a
+    ``UnicodeDecodeError`` out of the fallback path.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = Path("/work/some-repo")
+    target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+    target_dir.mkdir(parents=True)
+    (target_dir / "sid123.jsonl").write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\n")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._ensure_local_claude_resume_transcript(
+                client,
+                session_id="conv_abc",
+                external_session_id="sid123",
+                workspace=workspace,
+            )
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_ignores_local_file_on_4xx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 4xx contract error never falls back to a local transcript.
+
+    A 404/401/403 means the server explicitly rejected the conversation;
+    reviving local history could resume the wrong (e.g. deleted or
+    reassigned) session, so the failure must surface even when an intact
+    local transcript exists.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = Path("/work/some-repo")
+    target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+    target_dir.mkdir(parents=True)
+    (target_dir / "sid123.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(404, json={"error": {"code": "not_found"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._ensure_local_claude_resume_transcript(
+                client,
+                session_id="conv_abc",
+                external_session_id="sid123",
+                workspace=workspace,
+            )
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_raises_when_history_unfetchable_and_no_local_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No server history and no local transcript → the failure surfaces."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._ensure_local_claude_resume_transcript(
+                client,
+                session_id="conv_abc",
+                external_session_id="sid123",
+                workspace=Path("/work/some-repo"),
+            )
+
+
 def _resume_rebuild_handler(
     *,
     fail_file_fetch: bool = False,
@@ -2980,7 +3442,7 @@ async def test_attach_with_reconnect_exits_immediately_on_user_request(
         attach=attach,
         attach_url="wss://example.com/attach",
         headers={"Authorization": "Bearer tok"},
-        recover=lambda: _noop_async(),
+        recover=_noop_async,
     )
 
     # Exactly one attach call — no retries after a clean user exit.
@@ -3120,6 +3582,28 @@ async def test_attach_with_reconnect_retries_after_websocket_exception(
         f"expected 3 attach calls (2 fail + 1 succeed), got {len(attach.calls)}; "
         "the reconnect loop is not retrying after a transient WS error"
     )
+
+
+@pytest.mark.asyncio
+async def test_attach_with_reconnect_uses_session_name_in_clean_close_message(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Shared reconnect messages identify the active native wrapper."""
+    monkeypatch.setattr(claude_native, "_sleep", _noop_sleep)
+    attach = _ScriptedAttach(script=[False, True])
+
+    await claude_native._attach_with_reconnect(
+        attach=attach,
+        attach_url="wss://example.com/attach",
+        headers={"Authorization": "Bearer tok"},
+        recover=lambda: _noop_async(),
+        session_name="Codex",
+    )
+
+    captured = capsys.readouterr()
+    assert "Codex session connection closed by server; reconnecting..." in captured.err
+    assert "Claude session" not in captured.err
 
 
 @pytest.mark.asyncio
@@ -4750,6 +5234,13 @@ async def test_resolve_cold_resume_args_bootstraps_missing_local_claude_transcri
     ]
     assert records[2]["parentUuid"] == records[1]["uuid"]
     assert records[3]["message"]["content"] == [{"type": "text", "text": "TODO.md says contents"}]
+    # An item's wire "model" is the Omnigent agent name, not a Claude model
+    # id. Writing it through makes `--resume` reject it ("Session model
+    # claude-native-ui could not be restored") and silently fall back to a
+    # different model, so no record may carry one.
+    assert all("model" not in record["message"] for record in records), (
+        f"agent name leaked into Claude's model slot: {records!r}"
+    )
     assert all(record["sessionId"] == "claude-uuid-abc" for record in records)
     assert all(record["cwd"] == str(workspace.resolve()) for record in records)
     assert any("after=fc_read_1" in path for path in requested_paths), (
@@ -4837,6 +5328,82 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
         if line.strip()
     ]
     assert [record["message"]["content"] for record in records] == ["fresh Omnigent text"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_claude_resume_transcript_repairs_stale_duplicated_image(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    An already-generated transcript with the old duplicate self-heals.
+
+    Pre-fix rebuilds wrote an intact image's base64 twice — once in the
+    rehydrated ``tool_result`` content block and again verbatim in
+    ``toolUseResult``. The resume helper always rewrites the transcript
+    from Omnigent items before launch (no cache, no migration), so a
+    stale affected file is repaired on the next resume: after the
+    rebuild the payload must appear exactly once.
+    """
+    # Padded so the fixture is already canonical standard base64.
+    b64 = "iVBORw0KGgo" + "D" * 5000 + "="
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    projects = tmp_path / "claude-projects"
+    transcript_path = (
+        projects
+        / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
+        / "claude-uuid-img.jsonl"
+    )
+    transcript_path.parent.mkdir(mode=0o700, parents=True)
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": b64},
+    }
+    stale_record = {
+        "type": "user",
+        "sessionId": "claude-uuid-img",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [image_block]}
+            ],
+        },
+        "toolUseResult": json.dumps([image_block], separators=(",", ":")),
+    }
+    transcript_path.write_text(json.dumps(stale_record) + "\n", encoding="utf-8")
+    assert transcript_path.read_text(encoding="utf-8").count(b64) == 2, "pre-fix wedged state"
+
+    image_item = {
+        "id": "fco_1",
+        "response_id": "resp_1",
+        "type": "function_call_output",
+        "call_id": "toolu_1",
+        "output": json.dumps([image_block], separators=(",", ":")),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the AP-authoritative item page carrying the image output."""
+        del request
+        return httpx.Response(200, json=_items_response_body([image_item]))
+
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="claude-uuid-img",
+            workspace=workspace.resolve(),
+        )
+
+    assert written == transcript_path
+    text = written.read_text(encoding="utf-8")
+    assert text.count(b64) == 1, "rebuild must drop the duplicated toolUseResult base64"
+    record = json.loads(text.splitlines()[0])
+    content = record["message"]["content"][0]["content"]
+    assert content[0]["source"]["data"] == b64, "the model-visible image must survive"
+    assert b64 not in record["toolUseResult"]
 
 
 @pytest.mark.asyncio
@@ -5096,6 +5663,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
             session_bundle=None,
             claude_args=("--print", "hello"),
             command="claude",
+            append_system_prompt="Wrapper bridge instructions.",
         )
         del http_client  # context-managed by the with block
 
@@ -5113,7 +5681,9 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
         "--print",
         "hello",
     )
-    assert captured_terminal_args["append_system_prompt"] is None
+    # Cold resume launches a new terminal (no early reattach return), so raw
+    # author instructions must reach --append-system-prompt exactly as given.
+    assert captured_terminal_args["append_system_prompt"] == "Wrapper bridge instructions."
     assert captured_terminal_args["allowed_tools"] == ()
 
     # Load-bearing for the duplicate-message bug: cold resume
@@ -5179,7 +5749,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
         allowed_tools: tuple[str, ...] = (),
     ) -> str:
         """Return a fixed terminal id without spawning anything."""
-        assert append_system_prompt is None
+        assert append_system_prompt == "Fresh session bridge instructions."
         assert allowed_tools == ()
         del _client, _session_id, _claude_args, command, bridge_dir, claude_config
         return "terminal_claude_main"
@@ -5209,6 +5779,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
             session_bundle=b"fake-bundle",
             claude_args=(),
             command="claude",
+            append_system_prompt="Fresh session bridge instructions.",
         )
         del http_client
 
@@ -5220,6 +5791,27 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     # claude writes on cold start), the first turn would be dropped.
     assert prepared.cold_resumed is False
     assert prepared.reattached is False
+
+
+def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
+    """The ``omnigent claude`` wrapper's own materialized spec is resolvable.
+
+    Its ``prompt`` field is real ``AgentSpec.instructions`` content (the
+    bridge-behavior description), not framework-composed text, so it must
+    reach ``--append-system-prompt`` like any other claude-native author
+    instructions.
+    """
+    spec_path = claude_native._materialize_claude_agent_spec(tmp_path)
+    result = claude_native._wrapper_spec_raw_instructions(spec_path)
+    assert result is not None
+    assert "Claude Code is running in the session terminal" in result
+
+
+def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+    """A malformed wrapper spec must not block the terminal launch."""
+    bad_spec = tmp_path / "bad.yaml"
+    bad_spec.write_text("not: [valid, agent, spec")
+    assert claude_native._wrapper_spec_raw_instructions(bad_spec) is None
 
 
 @pytest.mark.asyncio
@@ -5398,7 +5990,7 @@ def test_is_claude_native_conversation_returns_true_on_matching_label(
         )
 
     monkeypatch.setattr(chat.httpx, "get", _fake_get)
-    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None: {})
+    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None, **_kw: {})
 
     assert (
         chat._is_claude_native_conversation(
@@ -5435,7 +6027,7 @@ def test_is_claude_native_conversation_returns_false_on_non_matching_label(
         return httpx.Response(200, json={"labels": labels})
 
     monkeypatch.setattr(chat.httpx, "get", _fake_get)
-    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None: {})
+    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None, **_kw: {})
 
     assert (
         chat._is_claude_native_conversation(
@@ -5470,7 +6062,7 @@ def test_is_claude_native_conversation_logs_warning_on_non_200(
 
     captured_warnings: list[str] = []
     monkeypatch.setattr(chat.httpx, "get", _fake_get)
-    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None: {})
+    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None, **_kw: {})
     monkeypatch.setattr(
         chat.logger,
         "warning",
@@ -5510,7 +6102,7 @@ def test_is_claude_native_conversation_returns_false_on_transport_error(
 
     captured_warnings: list[str] = []
     monkeypatch.setattr(chat.httpx, "get", _raises)
-    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None: {})
+    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None, **_kw: {})
     monkeypatch.setattr(
         chat.logger,
         "warning",
@@ -5908,6 +6500,7 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
         :param base_url: Omnigent server base URL.
         :param headers: HTTP headers passed by the wrapper.
         :param timeout: Request timeout in seconds.
+        :param trust_env: Whether env proxy settings are honored.
         """
 
         def __init__(
@@ -5916,6 +6509,7 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
             base_url: str,
             headers: dict[str, str],
             timeout: float,
+            trust_env: bool,
         ) -> None:
             """
             Capture construction arguments for later assertions.
@@ -5923,6 +6517,7 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
             :param base_url: Omnigent server base URL.
             :param headers: HTTP headers passed by the wrapper.
             :param timeout: Request timeout in seconds.
+            :param trust_env: Whether env proxy settings are honored.
             :returns: None.
             """
             calls.append(
@@ -5930,6 +6525,7 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
                     "base_url": base_url,
                     "headers": headers,
                     "timeout": timeout,
+                    "trust_env": trust_env,
                 }
             )
 
@@ -5987,6 +6583,9 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
             "base_url": "http://ap.example",
             "headers": {"Authorization": "Bearer token"},
             "timeout": 10.0,
+            # A remote host keeps the environment's proxy — only loopback
+            # targets, which a proxy cannot reach, opt out.
+            "trust_env": True,
         },
         {"url": "/v1/sessions/conv%20with%20space"},
     ]
@@ -6478,6 +7077,643 @@ def test_clone_claude_transcript_returns_none_when_source_missing(
     assert not clone_project_dir.exists() or not any(clone_project_dir.iterdir())
 
 
+def test_clone_claude_transcript_repairs_stale_image_duplication(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A fork's FIRST launch must not replay a stale duplicated transcript.
+
+    The clone path byte-copies the source's local JSONL, so a transcript
+    synthesized before the ``toolUseResult`` redaction fix (image base64
+    in both the structured content and the metadata) — or one holding an
+    MCP screenshot as a raw string — would overflow the clone's first
+    ``--resume`` before any later rebuild could heal it. The copy must
+    repair image-bearing tool-result records on the way through: exactly
+    one structured image copy per payload, redacted metadata, and no
+    string-valued content carrying base64. Records without image
+    duplication must pass through unchanged.
+    """
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source repo"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone worktree"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    target_uuid = "22222222-2222-2222-2222-222222222222"
+    source_project_dir = projects_dir / claude_native._sanitize_claude_project_name(
+        str(source_workspace.resolve())
+    )
+    source_project_dir.mkdir(parents=True)
+    source_path = source_project_dir / f"{source_uuid}.jsonl"
+
+    b64_structured = "iVBORw0KGgo" + "K" * 4000 + "="
+    b64_mcp = _TINY_PNG_BASE64
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": b64_structured},
+    }
+    mcp_object = {"type": "image", "data": b64_mcp, "mimeType": "image/png"}
+    mixed_string = "screenshot taken\n" + json.dumps(mcp_object, separators=(",", ":"))
+    stale_structured = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u1",
+        "parentUuid": None,
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [image_block]}
+            ],
+        },
+        # Pre-fix metadata: the verbatim block array, base64 included.
+        "toolUseResult": json.dumps([image_block], separators=(",", ":")),
+    }
+    stale_mixed = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u2",
+        "parentUuid": "u1",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_2", "content": mixed_string}
+            ],
+        },
+        # Pre-fix metadata for the unparseable mixed string: a JSON
+        # string literal that still embeds the full payload.
+        "toolUseResult": json.dumps(mixed_string),
+    }
+    plain_result = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u3",
+        "parentUuid": "u2",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_3", "content": "file written"}
+            ],
+        },
+        "toolUseResult": json.dumps("file written"),
+    }
+    source_path.write_text(
+        "".join(
+            json.dumps(record) + "\n" for record in (stale_structured, stale_mixed, plain_result)
+        ),
+        encoding="utf-8",
+    )
+    source_text = source_path.read_text(encoding="utf-8")
+    assert source_text.count(b64_structured) == 2, "pre-fix wedged state"
+    assert source_text.count(b64_mcp) == 2, "pre-fix wedged state"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    result = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id=target_uuid,
+        clone_workspace=clone_workspace.resolve(),
+    )
+
+    assert result is not None
+    text = result.read_text(encoding="utf-8")
+    assert text.count(b64_structured) == 1, "first-launch transcript must be repaired"
+    assert text.count(b64_mcp) == 1, "first-launch transcript must be repaired"
+    records = [json.loads(line) for line in text.splitlines() if line.strip()]
+    # Structured duplicate: content keeps the one image copy, metadata redacted.
+    content_one = records[0]["message"]["content"][0]["content"]
+    assert content_one == [image_block]
+    repaired_result = json.loads(records[0]["toolUseResult"])
+    assert b64_structured not in json.dumps(repaired_result)
+    assert repaired_result[0]["source"]["media_type"] == "image/png"
+    # MCP mixed string: normalized to a text+image block list, metadata repaired.
+    content_two = records[1]["message"]["content"][0]["content"]
+    assert content_two == [
+        {"type": "text", "text": "screenshot taken"},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": b64_mcp},
+        },
+    ]
+    assert b64_mcp not in records[1]["toolUseResult"]
+    # No image duplication: the plain record is preserved untouched.
+    assert records[2]["message"]["content"][0]["content"] == "file written"
+    assert records[2]["toolUseResult"] == json.dumps("file written")
+    # The fork must not mutate the source session's transcript.
+    assert source_path.read_text(encoding="utf-8") == source_text
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "invalid-base64",
+        "under-floor-jpeg",
+        "non-image-bytes",
+        "mime-mismatch",
+        "riff-not-webp",
+    ],
+)
+def test_clone_claude_transcript_leaves_invalid_image_shaped_text_unchanged(
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The fork sanitizer must not "repair" text that only looks like an image.
+
+    A cloned record whose tool_result content is image-shaped text with
+    an invalid payload passes the same validation guard as the rebuild
+    path: no block conversion, no metadata rewrite — the record arrives
+    exactly as copied (modulo the usual cwd/sessionId rewrites).
+    """
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source repo"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone worktree"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    target_uuid = "22222222-2222-2222-2222-222222222222"
+    source_project_dir = projects_dir / claude_native._sanitize_claude_project_name(
+        str(source_workspace.resolve())
+    )
+    source_project_dir.mkdir(parents=True)
+    source_path = source_project_dir / f"{source_uuid}.jsonl"
+    if case == "invalid-base64":
+        fake_data, fake_mime = "not!valid!base64", "image/png"
+    elif case == "under-floor-jpeg":
+        fake_data, fake_mime = _UNDER_FLOOR_JPEGS["soi-eoi"], "image/jpeg"
+    elif case == "non-image-bytes":
+        fake_data, fake_mime = base64.b64encode(b"plain text " * 8).decode(), "image/png"
+    elif case == "mime-mismatch":
+        fake_data, fake_mime = _TINY_PNG_BASE64, "image/jpeg"
+    else:
+        fake_data = base64.b64encode(b"RIFF" + b"\x00" * 4 + b"AVI " + b"\x00" * 40).decode()
+        fake_mime = "image/webp"
+    fake_text = json.dumps({"type": "image", "data": fake_data, "mimeType": fake_mime})
+    record = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u1",
+        "parentUuid": None,
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": fake_text}],
+        },
+        "toolUseResult": json.dumps(fake_text),
+    }
+    source_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    result = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id=target_uuid,
+        clone_workspace=clone_workspace.resolve(),
+    )
+
+    assert result is not None
+    cloned = [json.loads(line) for line in result.read_text(encoding="utf-8").splitlines()]
+    assert cloned[0]["message"]["content"][0]["content"] == fake_text
+    assert cloned[0]["toolUseResult"] == json.dumps(fake_text)
+
+
+def _stale_duplicated_jpeg_record(b64: str) -> dict[str, Any]:
+    """A pre-fix synthesized record: image base64 in content AND metadata."""
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+    }
+    return {
+        "type": "user",
+        "sessionId": "sid",
+        "uuid": "u1",
+        "parentUuid": None,
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [image_block]}
+            ],
+        },
+        "toolUseResult": json.dumps([image_block], separators=(",", ":")),
+    }
+
+
+def _decoded_payload_copies(record: object, raw: bytes) -> int:
+    """Count copies of *raw* by decoding, defeating wrapping and JSON escapes.
+
+    A canonical-substring search cannot see a duplicate stored in the producer's
+    wrapped spelling, which is exactly how one hid from an earlier fix.
+    """
+    run = re.compile(r"[A-Za-z0-9+/=\s]{64,}")
+
+    def _strings(value: object) -> Iterator[str]:
+        if isinstance(value, str):
+            yield value
+            try:
+                nested = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                return
+            if isinstance(nested, (dict, list, str)):
+                yield from _strings(nested)
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from _strings(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from _strings(item)
+
+    copies = 0
+    for text in _strings(record):
+        for candidate in run.findall(text):
+            compact = "".join(candidate.split())
+            padded = compact + "=" * (-len(compact) % 4)
+            try:
+                if raw in base64.b64decode(padded, validate=False):
+                    copies += 1
+            except (binascii.Error, ValueError):
+                continue
+    return copies
+
+
+def _wrapped_image_spellings() -> tuple[bytes, dict[str, str]]:
+    """A realistic PNG payload in every base64 spelling a producer may emit."""
+    raw = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 28
+    canonical = base64.b64encode(raw).decode()
+    return raw, {
+        "canonical": canonical,
+        "mime-wrapped": "\n".join(canonical[i : i + 76] for i in range(0, len(canonical), 76)),
+        "crlf-wrapped": "\r\n".join(canonical[i : i + 64] for i in range(0, len(canonical), 64)),
+        "unpadded": canonical.rstrip("="),
+        "space-separated": " ".join(canonical[i : i + 40] for i in range(0, len(canonical), 40)),
+    }
+
+
+def _assert_provider_ready_image(block: dict[str, Any], raw: bytes, canonical: str) -> None:
+    """Assert a rebuilt block is exactly what the provider accepts.
+
+    The provider validates ``source.data`` strictly and rejected a whole request
+    on a wrapped payload (``invalid base64 image data: Invalid symbol 13, offset
+    76``), so the emitted spelling — not just the bytes — is the contract.
+    """
+    data = block["source"]["data"]
+    assert data == canonical, "structured payload must be canonical standard base64"
+    assert not any(character.isspace() for character in data)
+    assert "\\" not in data
+    assert len(data) % 4 == 0
+    # Provider compatibility: strict decoding must succeed on the emitted string.
+    assert base64.b64decode(data, validate=True) == raw
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["canonical", "mime-wrapped", "crlf-wrapped", "unpadded", "space-separated"],
+)
+@pytest.mark.parametrize("stored", ["source-shaped", "mcp-shaped", "nested-escaped"])
+def test_rebuilt_image_block_is_canonical_for_the_provider(spelling: str, stored: str) -> None:
+    """Every valid payload reaches the model as canonical base64.
+
+    A real hosted smoke failed 4/4 attempts at 0 tokens because the
+    Anthropic-shaped passthrough kept the producer's CRLF wrapping — the shape
+    the affected session actually stores. Bytes were intact throughout; only the
+    spelling was fatal.
+    """
+    raw, spellings = _wrapped_image_spellings()
+    canonical = base64.b64encode(raw).decode()
+    payload = spellings[spelling]
+    if stored == "mcp-shaped":
+        output = json.dumps(
+            {"type": "image", "data": payload, "mimeType": "image/png"}, separators=(",", ":")
+        )
+    else:
+        blocks = [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": payload},
+            }
+        ]
+        output = json.dumps(blocks, separators=(",", ":"))
+        if stored == "nested-escaped":
+            # A JSON document nested inside a JSON string, as metadata stores it.
+            output = json.loads(json.dumps(output))
+
+    records = _image_output_records(output)
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    _assert_provider_ready_image(content[-1], raw, canonical)
+    assert _decoded_payload_copies(record, raw) == 1
+    assert _decoded_payload_copies(record["toolUseResult"], raw) == 0
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["canonical", "mime-wrapped", "crlf-wrapped", "unpadded", "space-separated"],
+)
+@pytest.mark.parametrize("path", ["clone-string", "clone-list", "cwd-copy"])
+def test_repair_paths_emit_canonical_source_data(spelling: str, path: str, tmp_path: Path) -> None:
+    """Clone repair and the cwd copy canonicalize the same way."""
+    raw, spellings = _wrapped_image_spellings()
+    canonical = base64.b64encode(raw).decode()
+    blocks = [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": spellings[spelling]},
+        }
+    ]
+    serialized = json.dumps(blocks, separators=(",", ":"))
+
+    if path == "cwd-copy":
+        source = tmp_path / "source.jsonl"
+        target = tmp_path / "target.jsonl"
+        source.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "cwd": "/old/workspace",
+                    "sessionId": "11111111-1111-1111-1111-111111111111",
+                    "uuid": "u1",
+                    "parentUuid": None,
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "t", "content": serialized}
+                        ],
+                    },
+                    "toolUseResult": json.dumps(serialized),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        claude_native._copy_transcript_with_cwd(source=source, target=target, current=tmp_path)
+        record = next(json.loads(line) for line in target.read_text().splitlines() if line.strip())
+    else:
+        inner: Any = serialized if path == "clone-string" else blocks
+        record = {
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t", "content": inner}],
+            },
+            "toolUseResult": json.dumps(inner if isinstance(inner, str) else json.dumps(inner)),
+        }
+        claude_native._sanitize_cloned_tool_result_record(record)
+
+    content = record["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    _assert_provider_ready_image(content[-1], raw, canonical)
+    assert _decoded_payload_copies(record, raw) == 1
+    assert _decoded_payload_copies(record["toolUseResult"], raw) == 0
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["canonical", "mime-wrapped", "crlf-wrapped", "unpadded", "space-separated"],
+)
+@pytest.mark.parametrize("shape", ["string", "list"])
+def test_clone_repair_leaves_one_payload_copy_in_any_spelling(spelling: str, shape: str) -> None:
+    """Canonicalizing the content must not hide the metadata duplicate.
+
+    The rebuilt block carries canonical base64 while metadata keeps the
+    producer's original spelling, so an exact-substring guard skipped the record
+    and left two bytes-equal copies. Counting decoded bytes across the whole
+    record is what makes that visible.
+    """
+    raw, spellings = _wrapped_image_spellings()
+    payload = spellings[spelling]
+    if shape == "list":
+        inner: Any = [{"type": "image", "data": payload, "mimeType": "image/png"}]
+        metadata = json.dumps(json.dumps(inner))
+    else:
+        inner = json.dumps(
+            {"type": "image", "data": payload, "mimeType": "image/png"}, separators=(",", ":")
+        )
+        metadata = json.dumps(inner)
+    record: dict[str, Any] = {
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": inner}],
+        },
+        "toolUseResult": metadata,
+    }
+    assert _decoded_payload_copies(record, raw) >= 2, "pre-repair wedged state"
+
+    claude_native._sanitize_cloned_tool_result_record(record)
+
+    assert _decoded_payload_copies(record, raw) == 1
+    assert _decoded_payload_copies(record["toolUseResult"], raw) == 0
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["canonical", "mime-wrapped", "crlf-wrapped", "unpadded", "space-separated"],
+)
+def test_reconstruction_and_cwd_copy_keep_one_payload_copy(spelling: str, tmp_path: Path) -> None:
+    """Cold-resume synthesis and the cwd copy hold the same invariant."""
+    raw, spellings = _wrapped_image_spellings()
+    payload = spellings[spelling]
+    output = json.dumps(
+        {"type": "image", "data": payload, "mimeType": "image/png"}, separators=(",", ":")
+    )
+
+    records = _image_output_records(output)
+    assert _decoded_payload_copies(records[0], raw) == 1
+
+    source = tmp_path / "source.jsonl"
+    target = tmp_path / "target.jsonl"
+    stale = {
+        "type": "user",
+        "cwd": "/old/workspace",
+        "sessionId": "11111111-1111-1111-1111-111111111111",
+        "uuid": "u1",
+        "parentUuid": None,
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": output}],
+        },
+        "toolUseResult": json.dumps(output),
+    }
+    source.write_text(json.dumps(stale) + "\n", encoding="utf-8")
+
+    claude_native._copy_transcript_with_cwd(source=source, target=target, current=tmp_path)
+
+    copied = [json.loads(line) for line in target.read_text().splitlines() if line.strip()]
+    assert _decoded_payload_copies(copied, raw) == 1
+
+
+def _oversized_invalid_image_object(marker: str) -> tuple[str, str]:
+    """Return a valid-JSON MCP image object whose payload fails the gate.
+
+    Large enough to cross the collapse threshold, so normalization drops it for
+    a placeholder and reports ``dropped_oversized_image``.
+    """
+    payload = base64.b64encode(marker.encode() + b"not an image " * 4_000).decode()
+    return payload, json.dumps(
+        {"type": "image", "data": payload, "mimeType": "image/png"}, separators=(",", ":")
+    )
+
+
+@pytest.mark.parametrize("spelling", ["string", "errored-string", "list"])
+def test_clone_repair_collapses_a_dropped_oversized_payload(spelling: str) -> None:
+    """A payload normalization *dropped* must not survive clone repair.
+
+    The sanitizer used to project straight to ``.blocks``; a placeholder carries
+    no image payload, so the repair skipped the record and left the original
+    base64 in both ``tool_result`` content and ``toolUseResult``.
+    """
+    payload, image_object = _oversized_invalid_image_object("clone")
+    errored = spelling == "errored-string"
+    content: Any = {
+        "string": image_object,
+        "errored-string": f"Error: {image_object}",
+        "list": [{"type": "image", "data": payload, "mimeType": "image/png"}],
+    }[spelling]
+    record: dict[str, Any] = {
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": content}],
+        },
+        "toolUseResult": json.dumps(content if isinstance(content, str) else json.dumps(content)),
+    }
+    assert json.dumps(record).count(payload) == 2, "pre-repair wedged state"
+
+    claude_native._sanitize_cloned_tool_result_record(record)
+
+    blob = json.dumps(record)
+    assert blob.count(payload) == 0
+    assert len(blob) < len(payload) // 10
+    repaired = record["message"]["content"][0]["content"]
+    assert isinstance(repaired, list)
+    assert "omitted from history" in json.dumps(repaired)
+    assert payload not in json.dumps(record["toolUseResult"])
+    if errored:
+        assert repaired[0] == {"type": "text", "text": "Error:"}
+
+
+def test_clone_and_cwd_copy_paths_both_collapse_a_dropped_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Both transcript-copy entry points repair a dropped-payload record."""
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source repo"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone worktree"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    target_uuid = "22222222-2222-2222-2222-222222222222"
+    source_project_dir = projects_dir / claude_native._sanitize_claude_project_name(
+        str(source_workspace.resolve())
+    )
+    source_project_dir.mkdir(parents=True)
+    source_path = source_project_dir / f"{source_uuid}.jsonl"
+    payload, image_object = _oversized_invalid_image_object("paths")
+    record = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u1",
+        "parentUuid": None,
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": image_object}
+            ],
+        },
+        "toolUseResult": json.dumps(image_object),
+    }
+    source_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    source_text = source_path.read_text(encoding="utf-8")
+    assert source_text.count(payload) == 2, "pre-repair wedged state"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    cloned = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id=target_uuid,
+        clone_workspace=clone_workspace.resolve(),
+    )
+    assert cloned is not None
+    assert cloned.read_text(encoding="utf-8").count(payload) == 0
+
+    redirected = tmp_path / "redirected.jsonl"
+    claude_native._copy_transcript_with_cwd(
+        source=source_path, target=redirected, current=clone_workspace.resolve()
+    )
+    assert redirected.read_text(encoding="utf-8").count(payload) == 0
+    # Neither copy path mutates the source transcript.
+    assert source_path.read_text(encoding="utf-8") == source_text
+
+
+def test_clone_claude_transcript_repairs_progressive_jpeg_duplication(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A stale two-copy progressive JPEG repairs to one on fork clone.
+
+    Before the multi-scan JPEG parser fix, a progressive JPEG stayed raw
+    (validator rejected it), so the clone sanitizer could not recognize
+    the record's image and left both payload copies in place. The clone
+    must now repair the first-launch transcript to exactly one copy.
+    """
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source repo"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone worktree"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    target_uuid = "22222222-2222-2222-2222-222222222222"
+    source_project_dir = projects_dir / claude_native._sanitize_claude_project_name(
+        str(source_workspace.resolve())
+    )
+    source_project_dir.mkdir(parents=True)
+    source_path = source_project_dir / f"{source_uuid}.jsonl"
+    b64 = _TINY_PROGRESSIVE_JPEG_BASE64
+    source_path.write_text(json.dumps(_stale_duplicated_jpeg_record(b64)) + "\n", encoding="utf-8")
+    assert source_path.read_text(encoding="utf-8").count(b64) == 2, "pre-fix wedged state"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    result = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id=target_uuid,
+        clone_workspace=clone_workspace.resolve(),
+    )
+
+    assert result is not None
+    text = result.read_text(encoding="utf-8")
+    assert text.count(b64) == 1
+    record = json.loads(text.splitlines()[0])
+    content = record["message"]["content"][0]["content"]
+    assert content[0]["source"]["data"] == b64
+    assert b64 not in json.dumps(json.loads(record["toolUseResult"]))
+
+
+def test_copy_transcript_with_cwd_repairs_progressive_jpeg_duplication(
+    tmp_path: Path,
+) -> None:
+    """
+    The cwd-redirect copy path gets the same first-launch repair.
+
+    ``_copy_transcript_with_cwd`` without ``new_session_id`` is the
+    redirect/move form; a stale two-copy progressive JPEG record must be
+    repaired to exactly one structured copy there too.
+    """
+    b64 = _TINY_PROGRESSIVE_JPEG_BASE64
+    source = tmp_path / "source.jsonl"
+    source.write_text(json.dumps(_stale_duplicated_jpeg_record(b64)) + "\n", encoding="utf-8")
+    target = tmp_path / "target.jsonl"
+
+    claude_native._copy_transcript_with_cwd(source=source, target=target, current=tmp_path)
+
+    text = target.read_text(encoding="utf-8")
+    assert text.count(b64) == 1
+    record = json.loads(text.splitlines()[0])
+    content = record["message"]["content"][0]["content"]
+    assert content[0]["source"]["data"] == b64
+    assert b64 not in json.dumps(json.loads(record["toolUseResult"]))
+
+
 # ── _record_launch_for_fresh_session ────────────────────────
 
 
@@ -6577,16 +7813,21 @@ def _no_auth_claude_spec() -> Any:
     )
 
 
-def test_provider_config_for_native_claude_key_injects_base_url_and_helper() -> None:
+def test_provider_config_for_native_claude_key_injects_base_url_and_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A ``key`` provider becomes ANTHROPIC_BASE_URL + a printf apiKeyHelper.
 
     Mirrors what ucode injects, but from a configured OSS key — so a native
     Claude Code terminal routes through the provider. The static key must be
     delivered via the helper (the runner env strips ANTHROPIC_API_KEY), and
     the base_url + default model carried through. Failure means a native
-    launch would ignore the configured provider.
+    launch would ignore the configured provider. With no CLAUDE_CODE_USE_GATEWAY
+    in the ambient env the gateway-safety beta-disable flag is set.
     """
     from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
 
     entry = load_providers(
         {
@@ -6606,19 +7847,111 @@ def test_provider_config_for_native_claude_key_injects_base_url_and_helper() -> 
     cfg = claude_native._provider_config_for_native_claude(entry)
     assert cfg is not None
     # ANTHROPIC_BASE_URL plus the gateway-safety beta-disable flag (gateways
-    # 400 on beta flags they don't implement; see _provider_config_for_native_claude).
+    # 400 on beta flags they don't implement; see _provider_config_for_native_claude)
+    # plus the declared default pinning its own family alias, so /model and
+    # the harness probe resolve ``sonnet`` to the entry's model.
     assert cfg.env == {
         "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
     }
     # Static key delivered via the apiKeyHelper, never the env (allowlist).
     assert cfg.api_key_helper == "printf %s sk-ant-test"
     assert cfg.model == "claude-sonnet-4-6"
+    assert cfg.routable_models == ("claude-sonnet-4-6",)
 
 
-def test_provider_config_for_native_claude_uses_auth_command_verbatim() -> None:
+def test_provider_config_for_native_claude_pins_declared_tier_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway entry's ``models:`` tier keys pin the alias vocabulary.
+
+    The flat tier keys (``opus``/``sonnet``/…) pin their aliases directly and
+    ``models.default`` pins its own family's alias when that family has no
+    explicit key — so every declared model becomes a servable ``/model``
+    spelling (and a probed catalog row) instead of the alias falling back to
+    a canonical Anthropic id the gateway rejects.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
+
+    entry = load_providers(
+        {
+            "providers": {
+                "gw": {
+                    "kind": "gateway",
+                    "anthropic": {
+                        "base_url": "https://gw.example/anthropic",
+                        "auth_command": "my-cli print-token",
+                        "models": {
+                            "default": "system.ai.claude-opus-4-8[1m]",
+                            "sonnet": "system.ai.claude-sonnet-5",
+                            "haiku": "system.ai.claude-haiku-4-5",
+                        },
+                    },
+                }
+            }
+        }
+    )["gw"]
+
+    cfg = claude_native._provider_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env == {
+        "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-5",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "system.ai.claude-haiku-4-5",
+        # The default's own family (opus) had no explicit key, so the
+        # default pins it — bracket markers ride along verbatim.
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
+    assert cfg.model == "system.ai.claude-opus-4-8[1m]"
+    assert set(cfg.routable_models) == {
+        "system.ai.claude-opus-4-8[1m]",
+        "system.ai.claude-sonnet-5",
+        "system.ai.claude-haiku-4-5",
+    }
+
+
+def test_provider_config_for_native_claude_explicit_tier_key_beats_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``models.default`` never overwrites an explicitly keyed family pin."""
+    from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
+
+    entry = load_providers(
+        {
+            "providers": {
+                "gw": {
+                    "kind": "gateway",
+                    "anthropic": {
+                        "base_url": "https://gw.example/anthropic",
+                        "auth_command": "my-cli print-token",
+                        "models": {
+                            "default": "system.ai.claude-opus-4-8",
+                            "opus": "system.ai.claude-opus-5",
+                        },
+                    },
+                }
+            }
+        }
+    )["gw"]
+
+    cfg = claude_native._provider_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-5"
+
+
+def test_provider_config_for_native_claude_uses_auth_command_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A provider ``auth_command`` is used as the apiKeyHelper verbatim."""
     from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
 
     entry = load_providers(
         {
@@ -6643,14 +7976,50 @@ def test_provider_config_for_native_claude_uses_auth_command_verbatim() -> None:
     }
 
 
-def test_bedrock_config_for_native_claude_static_key() -> None:
+def test_provider_config_for_native_claude_keeps_betas_under_use_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With CLAUDE_CODE_USE_GATEWAY=1, the beta-disable flag is NOT set.
+
+    Gateway-aware mode negotiates the anthropic-beta set with the gateway and
+    keeps MCP tool search on (it rides on the ``advanced-tool-use`` beta), so
+    disabling betas here would force every MCP tool schema to load eagerly.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.setenv("CLAUDE_CODE_USE_GATEWAY", "1")
+
+    entry = load_providers(
+        {
+            "providers": {
+                "gw": {
+                    "kind": "gateway",
+                    "anthropic": {
+                        "base_url": "https://gw.example/v1",
+                        "auth_command": "my-cli print-token",
+                    },
+                }
+            }
+        }
+    )["gw"]
+
+    cfg = claude_native._provider_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env == {"ANTHROPIC_BASE_URL": "https://gw.example/v1"}
+    assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in cfg.env
+
+
+def test_bedrock_config_for_native_claude_static_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """A ``bedrock`` provider sets the Bedrock env trio and no apiKeyHelper.
 
     Bedrock mode authenticates from ``AWS_BEARER_TOKEN_BEDROCK`` in the env and
     ignores ``apiKeyHelper``, so a static key must land in the env (never a
-    helper) and the base_url maps to ``ANTHROPIC_BEDROCK_BASE_URL``.
+    helper) and the base_url maps to ``ANTHROPIC_BEDROCK_BASE_URL``. With no
+    ``CLAUDE_CODE_USE_GATEWAY`` in the ambient env the beta-disable flag is set.
     """
     from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
 
     entry = load_providers(
         {
@@ -6709,6 +8078,44 @@ def test_bedrock_config_for_native_claude_resolves_auth_command() -> None:
     assert cfg is not None
     assert cfg.env["AWS_BEARER_TOKEN_BEDROCK"] == "minted-bedrock-token"
     assert cfg.api_key_helper is None
+
+
+def test_bedrock_config_for_native_claude_keeps_betas_under_use_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bedrock-style gateway with CLAUDE_CODE_USE_GATEWAY=1 keeps betas on.
+
+    Bedrock-compatible corporate gateways can run in gateway-aware mode; when
+    CLAUDE_CODE_USE_GATEWAY=1 the beta-disable flag is skipped so MCP tool
+    search stays enabled, matching the generic gateway provider path.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.setenv("CLAUDE_CODE_USE_GATEWAY", "1")
+
+    entry = load_providers(
+        {
+            "providers": {
+                "nexus": {
+                    "kind": "bedrock",
+                    "anthropic": {
+                        "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                        "api_key": "absk-test",
+                        "models": {"default": "us.anthropic.claude-opus-4-5-20251101-v1:0"},
+                    },
+                }
+            }
+        }
+    )["nexus"]
+
+    cfg = claude_native._bedrock_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env == {
+        "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        "AWS_BEARER_TOKEN_BEDROCK": "absk-test",
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+    }
+    assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in cfg.env
 
 
 def test_bedrock_config_for_native_claude_non_anthropic_returns_none() -> None:
@@ -6855,7 +8262,10 @@ def test_resolve_native_claude_config_ambient_key(
     routes through the detected env key. Failure means a fresh machine's
     native Claude would ignore the ambient credential.
     """
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-ambient")
+    # The default-endpoint assertion must not inherit an ambient gateway URL.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
 
     cfg = claude_native.resolve_native_claude_config(spec=None)
     assert cfg is not None
@@ -6868,16 +8278,20 @@ def test_resolve_native_claude_config_ambient_prefixed_key(
     _isolated_provider_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A prefixed Anthropic key routes native Claude without raw env exposure."""
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # The default-endpoint assertion must not inherit an ambient gateway URL.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.setenv("OMNIGENT_ANTHROPIC_API_KEY", "sk-ant-prefixed")
 
     cfg = claude_native.resolve_native_claude_config(spec=None)
 
     assert cfg is not None
-    assert cfg.env == {
-        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
-        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-    }
+    assert cfg.env["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
+    assert cfg.env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] == "1"
+    # The ambient entry's declared default pins its own family alias too —
+    # one behavior for every provider-entry shape.
+    assert cfg.env.get("ANTHROPIC_DEFAULT_OPUS_MODEL") == cfg.model
     assert cfg.api_key_helper == "printf %s sk-ant-prefixed"
 
 
@@ -7037,6 +8451,156 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
     assert boundaries[0]["compactMetadata"]["postTokens"] == 4321
 
 
+def test_claude_transcript_records_handles_native_compaction_messages() -> None:
+    """Claude-native compacted messages survive cold-resume reconstruction."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_before",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "discarded before compaction"}],
+        },
+        {
+            "id": "cmp_native",
+            "type": "compaction",
+            "token_count": 1234,
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "native compact summary",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "native reply"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_native",
+                            "name": "Read",
+                            "input": {"file_path": "README.md"},
+                        },
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_native",
+                            "content": "native tool result",
+                        }
+                    ],
+                },
+            ],
+        },
+        {
+            "id": "msg_after",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "after compaction"}],
+        },
+    ]
+
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_native",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+
+    assert [record.get("type") for record in records] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "user",
+    ]
+    assert records[1]["message"] == {"role": "user", "content": "native compact summary"}
+    assert records[2]["message"] == {
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": "native reply"},
+            {
+                "type": "tool_use",
+                "id": "toolu_native",
+                "name": "Read",
+                "input": {"file_path": "README.md"},
+            },
+        ],
+    }
+    assert records[3]["message"] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_native",
+                "content": "native tool result",
+            }
+        ],
+    }
+    assert records[4]["message"] == {"role": "user", "content": "after compaction"}
+    assert all(record["parentUuid"] == previous["uuid"] for previous, record in pairwise(records))
+    assert "discarded before compaction" not in json.dumps(records)
+
+
+def test_claude_transcript_records_downgrades_compaction_stripped_image() -> None:
+    """A compaction-stripped image block never resumes as an invalid image.
+
+    Compaction replaces an image block's base64 with the marker
+    ``[image/png content omitted from the compaction snapshot]``. Replayed
+    verbatim that marker reaches the provider as ``source.data`` and fails the
+    resume with ``invalid base64 image data: Invalid symbol 91, offset 0`` (the
+    leading ``[``). The rebuild must downgrade it to a text placeholder.
+    """
+    marker = "[image/png content omitted from the compaction snapshot]"
+    items: list[dict[str, Any]] = [
+        {
+            "id": "cmp",
+            "type": "compaction",
+            "token_count": 42,
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": marker,
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        },
+    ]
+
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_img",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+
+    tool_result = records[1]["message"]["content"][0]
+    inner = tool_result["content"][0]
+    assert inner["type"] == "text", f"stripped image replayed as invalid image: {inner}"
+    assert marker not in json.dumps(records)
+
+
 def test_websocket_connect_passes_ssl_context_for_wss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7090,12 +8654,9 @@ def test_websocket_connect_no_ssl_context_for_ws(
         ),
         # Ordinary plain text must also round-trip to a string.
         ("plain text output", "plain text output"),
-        # Already-JSON output (e.g. an image content-block array) must pass
-        # through verbatim, not get double-encoded into a string literal.
-        (
-            '[{"type":"image","source":{"type":"base64","data":"AAA"}}]',
-            [{"type": "image", "source": {"type": "base64", "data": "AAA"}}],
-        ),
+        # Already-JSON output passes through verbatim, not double-encoded.
+        # (Image block arrays are JSON too; their redaction is covered below.)
+        ('{"a":1}', {"a": 1}),
     ],
 )
 def test_claude_transcript_tool_use_result_is_json_parseable(
@@ -7154,29 +8715,711 @@ def test_json_safe_tool_use_result_wraps_non_json() -> None:
     assert claude_native._json_safe_tool_use_result('{"a":1}') == '{"a":1}'
 
 
-def test_claude_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:
-    """Only a non-empty list of text/image block dicts rehydrates; else ``None``."""
-    fn = claude_native._claude_tool_result_content_blocks
-    # An image content-block array rehydrates to the parsed list.
-    assert fn('[{"type":"image","source":{"type":"base64","data":"AAA"}}]') == [
-        {"type": "image", "source": {"type": "base64", "data": "AAA"}}
+# Header + zero-padding: signature-matching but structurally invalid per format.
+# A structurally valid minimal SOF0 + SOS pair for building marker-only fakes.
+_FAKE_SOF0 = b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00"
+_FAKE_SOS = b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00"
+
+# JPEG-signature strings too short to be any real image: below
+# ``_MIN_IMAGE_BYTES``, so the payload gate still rejects them.
+_UNDER_FLOOR_JPEGS: dict[str, str] = {
+    name: base64.b64encode(payload).decode()
+    for name, payload in {
+        "soi-eoi": b"\xff\xd8\xff\xd9",
+        "rst0-only": b"\xff\xd8\xff\xd0",
+        "dht-only": b"\xff\xd8\xff\xc4\x00\x08\x01\x01\x01\x01\x01\x01\xff\xd9",
+    }.items()
+}
+
+# JPEG-signature strings that clear the byte floor but carry no decodable
+# frame or scan. The magic-byte gate accepts these by design; see
+# ``test_signature_valid_but_undecodable_payloads_convert_by_design``.
+_HEADER_VALID_CORRUPT_JPEGS: dict[str, str] = {
+    name: base64.b64encode(payload).decode()
+    for name, payload in {
+        "app0-only": (
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+        ),
+        "empty-sos": b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\xff\xd9",
+        "repeated-soi": b"\xff\xd8\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\x01\x02\xff\xd9",
+        "restart-only-entropy": (b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\xff\xd0" + b"\xff\xd9"),
+        "fill-only-entropy": b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\xff\xff" + b"\xff\xd9",
+    }.items()
+}
+
+_FAKE_IMAGE_PAYLOADS: dict[str, str] = {
+    "image/png": base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 512).decode(),
+    "image/jpeg": base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 512).decode(),
+    "image/gif": base64.b64encode(b"GIF89a" + b"\x00" * 512).decode(),
+    "image/webp": base64.b64encode(b"RIFF" + b"\x00" * 4 + b"WEBP" + b"\x00" * 512).decode(),
+}
+
+
+def _image_output_records(output: str) -> list[dict[str, Any]]:
+    """Run one ``function_call_output`` item through the shared converter.
+
+    Both fork carry-history rebuilds and cold resumes funnel through
+    ``_claude_transcript_records_from_session_items``, so record-level
+    coverage here protects both launch paths at once.
+    """
+    items: list[dict[str, Any]] = [
+        {
+            "id": "fco_1",
+            "response_id": "resp_1",
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": output,
+        }
     ]
-    # A text block array rehydrates too.
-    assert fn('[{"type":"text","text":"hi"}]') == [{"type": "text", "text": "hi"}]
-    # Plain text is not JSON → keep the raw string.
-    assert fn("file written") is None
-    # A JSON string / number / object is not a block array → keep raw.
-    assert fn('"just a string"') is None
-    assert fn("42") is None
-    assert fn('{"type":"image"}') is None
-    # An empty array carries nothing to rehydrate.
-    assert fn("[]") is None
-    # A list whose entries are not typed block dicts is not a block array.
-    assert fn('["a","b"]') is None
-    assert fn('[{"no_type":1}]') is None
-    # A typed block the API does not accept in a tool_result stays a raw
-    # string, so resume keeps sending exactly what it sent before.
-    assert fn('[{"type":"file","path":"/x"}]') is None
+    return claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+
+
+def test_tool_use_result_redacts_inline_image_base64() -> None:
+    """
+    An intact replayed image exists exactly once in the rebuilt record.
+
+    The structured ``tool_result`` content block keeps the real base64 —
+    that is the image the model re-sees on ``--resume``. The
+    ``toolUseResult`` metadata copy is replaced with a short marker, so a
+    single screenshot no longer doubles its ~250K-token payload in the
+    resumed transcript. Non-binary fields (media type, sibling text,
+    renderer metadata) survive the redaction.
+    """
+    b64 = "iVBORw0KGgo" + "A" * 5000 + "="
+    output = json.dumps(
+        [
+            {"type": "text", "text": "screenshot taken"},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": b64},
+                "width": 1280,
+            },
+        ],
+        separators=(",", ":"),
+    )
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    # The model-visible image survives intact in the content block.
+    content = record["message"]["content"][0]["content"]
+    assert content[0] == {"type": "text", "text": "screenshot taken"}
+    assert content[1]["source"]["data"] == b64
+    # The metadata copy is redacted but keeps its shape and non-binary fields.
+    tool_use_result = json.loads(record["toolUseResult"])
+    assert tool_use_result[0] == {"type": "text", "text": "screenshot taken"}
+    redacted_source = tool_use_result[1]["source"]
+    assert b64 not in redacted_source["data"]
+    assert "image/png" in redacted_source["data"]
+    assert redacted_source["media_type"] == "image/png"
+    assert tool_use_result[1]["width"] == 1280
+    # Whole-record invariant: the payload exists exactly once.
+    assert json.dumps(record).count(b64) == 1
+
+
+def test_tool_use_result_redaction_is_tool_name_independent() -> None:
+    """
+    Redaction keys on the payload shape, not the tool that produced it.
+
+    Any tool or MCP server returning inline image data (e.g. a browser
+    screenshot tool returning an object with a nested image block) gets
+    the same treatment as a built-in image result: the payload leaves
+    ``toolUseResult`` and is carried once by the ``tool_result`` content.
+    Object-shaped output is not a text/image block array, so the content
+    stays the raw string — the one surviving copy of the payload.
+    """
+    b64 = "U05BUFNIT1Q" + "B" * 4000
+    output = json.dumps(
+        {
+            "tool": "mcp__browser__screenshot",
+            "status": "ok",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+                }
+            ],
+        },
+        separators=(",", ":"),
+    )
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    assert record["message"]["content"][0]["content"] == output
+    tool_use_result = json.loads(record["toolUseResult"])
+    assert tool_use_result["tool"] == "mcp__browser__screenshot"
+    assert tool_use_result["status"] == "ok"
+    redacted_block = tool_use_result["content"][0]
+    assert b64 not in json.dumps(redacted_block)
+    assert "image/jpeg" in redacted_block["source"]["data"]
+    assert json.dumps(record).count(b64) == 1
+
+
+def test_tool_use_result_redacts_inline_data_uris() -> None:
+    """A ``data:`` URI is an inline base64 copy too; it is redacted as well."""
+    b64 = "R0lGODdh" + "C" * 3000
+    output = json.dumps(
+        {"preview": f"data:image/gif;base64,{b64}", "ok": True},
+        separators=(",", ":"),
+    )
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    assert record["message"]["content"][0]["content"] == output
+    tool_use_result = json.loads(record["toolUseResult"])
+    assert b64 not in tool_use_result["preview"]
+    assert "image/gif" in tool_use_result["preview"]
+    assert tool_use_result["ok"] is True
+    assert json.dumps(record).count(b64) == 1
+
+
+@pytest.mark.parametrize("is_error", [False, True], ids=["ok", "error"])
+def test_mcp_single_image_result_replays_as_one_structured_image(is_error: bool) -> None:
+    """
+    A lone MCP ``ImageContent`` replays as a real image block, once.
+
+    Real MCP screenshot results persist as a JSON *object* string
+    (``{"type":"image","data":...,"mimeType":...}``), which the old
+    rehydrator could not recognize: the base64 stayed ~250K tokens of
+    model-visible text AND sat in ``toolUseResult``. The rebuild must
+    normalize it to one structured image block with redacted metadata.
+
+    The failed spelling is the same payload behind an ``"Error: "``
+    prefix, which is not valid JSON — so it regressed to the exact
+    two-copy, model-visible-text shape after the object form was fixed.
+    It must normalize identically, with the error preserved as a compact
+    text block ahead of the image rather than silently dropped.
+    """
+    from mcp.types import ImageContent
+
+    b64 = _TINY_PNG_BASE64
+    output = _mcp_call_output(
+        ImageContent(type="image", data=b64, mimeType="image/png"), is_error=is_error
+    )
+    assert output.startswith("Error: ") is is_error
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert isinstance(content, list), "MCP image must not stay string-valued model content"
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": b64},
+    }
+    if is_error:
+        assert content == [{"type": "text", "text": "Error:"}, image_block]
+    else:
+        assert content == [image_block]
+    tool_use_result = json.loads(record["toolUseResult"])
+    assert b64 not in json.dumps(tool_use_result)
+    assert tool_use_result[-1]["source"]["media_type"] == "image/png"
+    assert json.dumps(record).count(b64) == 1
+
+
+def test_mcp_errored_image_clone_record_is_repaired_like_the_ok_form() -> None:
+    """
+    A legacy cloned record holding the errored spelling is repaired too.
+
+    A fork clone byte-copies the source transcript, so a record written
+    before this fix carries the ``"Error: "``-prefixed string as
+    model-visible content with the payload mirrored in metadata. The clone
+    sanitizer runs through the same normalization seam, so it must
+    recover the structured image and drop the duplicate — otherwise the
+    stale record replays the overflow on the clone's first ``--resume``.
+    """
+    from mcp.types import ImageContent
+
+    b64 = _TINY_PNG_BASE64
+    output = _mcp_call_output(
+        ImageContent(type="image", data=b64, mimeType="image/png"), is_error=True
+    )
+    record: dict[str, Any] = {
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": output}],
+        },
+        "toolUseResult": json.dumps(output),
+    }
+    claude_native._sanitize_cloned_tool_result_record(record)
+    content = record["message"]["content"][0]["content"]
+    assert content == [
+        {"type": "text", "text": "Error:"},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": b64},
+        },
+    ]
+    assert b64 not in json.dumps(record["toolUseResult"])
+    assert json.dumps(record).count(b64) == 1
+
+
+def test_mcp_errored_non_image_result_representation_is_unchanged() -> None:
+    """
+    The prefix is only unwrapped when an image payload is at stake.
+
+    Stripping it wherever it appears would silently restructure every
+    errored tool result. With no payload to protect there is nothing to
+    gain, so an errored text or non-image JSON result keeps replaying the
+    raw string exactly as it did before.
+    """
+    from mcp.types import TextContent
+
+    for output in (
+        _mcp_call_output(TextContent(type="text", text="tool exploded"), is_error=True),
+        _mcp_call_output(TextContent(type="text", text='{"foo":1}'), is_error=True),
+    ):
+        assert output.startswith("Error: ")
+        rehydrated = trc.tool_result_content_blocks(output)
+        assert rehydrated.blocks is None
+        records = _image_output_records(output)
+        assert records[0]["message"]["content"][0]["content"] == output
+
+
+@pytest.mark.parametrize("is_error", [False, True], ids=["ok", "error"])
+def test_mcp_mixed_text_and_image_result_replays_as_block_list(is_error: bool) -> None:
+    """
+    Text-plus-screenshot MCP output replays as a structured block list.
+
+    ``_format_call_result`` newline-joins multi-block results, so the
+    persisted string is NOT one JSON document — the worst pre-fix case:
+    unparseable, so neither rehydration nor metadata redaction applied
+    and the base64 survived in both places. The rebuild must recover the
+    original block stream, keep the text verbatim, and hold the payload
+    exactly once.
+
+    The errored spelling only prefixes the first line, which is text
+    either way, so this shape never regressed — pinned here so the lone
+    image's prefix handling cannot change it.
+    """
+    from mcp.types import ImageContent, TextContent
+
+    b64 = _TINY_PNG_BASE64
+    output = _mcp_call_output(
+        TextContent(type="text", text="took a screenshot"),
+        ImageContent(type="image", data=b64, mimeType="image/png"),
+        is_error=is_error,
+    )
+    # The persisted form is genuinely not one JSON document.
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(output)
+    expected_text = "Error: took a screenshot" if is_error else "took a screenshot"
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert content == [
+        {"type": "text", "text": expected_text},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": b64},
+        },
+    ]
+    tool_use_result = json.loads(record["toolUseResult"])
+    assert tool_use_result[0] == {"type": "text", "text": expected_text}
+    assert b64 not in json.dumps(tool_use_result)
+    assert json.dumps(record).count(b64) == 1
+
+
+def test_mcp_image_replay_does_not_depend_on_tool_name() -> None:
+    """
+    An image from an arbitrarily named MCP tool gets the same replay.
+
+    The converter only ever sees the output string — nothing keys on the
+    producing tool — so this pins the invariant end-to-end with a
+    realistic MCP-namespaced call preceding its result.
+    """
+    from mcp.types import ImageContent
+
+    b64 = _TINY_JPEG_BASE64
+    output = _mcp_call_output(ImageContent(type="image", data=b64, mimeType="image/jpeg"))
+    items: list[dict[str, Any]] = [
+        {
+            "id": "fc_1",
+            "response_id": "resp_1",
+            "type": "function_call",
+            "name": "mcp__playwright__browser_take_screenshot",
+            "call_id": "toolu_1",
+            "arguments": "{}",
+        },
+        {
+            "id": "fco_1",
+            "response_id": "resp_1",
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": output,
+        },
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+    assert len(records) == 2
+    content = records[1]["message"]["content"][0]["content"]
+    assert content[0]["source"]["data"] == b64
+    assert content[0]["source"]["media_type"] == "image/jpeg"
+    assert json.dumps(records[1]).count(b64) == 1
+
+
+def test_mcp_multiple_images_replay_as_separate_blocks() -> None:
+    """Two newline-joined MCP images become two blocks, each payload once."""
+    from mcp.types import ImageContent
+
+    b64_one = _TINY_PNG_BASE64
+    b64_two = _TINY_GIF_BASE64
+    output = _mcp_call_output(
+        ImageContent(type="image", data=b64_one, mimeType="image/png"),
+        ImageContent(type="image", data=b64_two, mimeType="image/gif"),
+    )
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert [block["source"]["data"] for block in content] == [b64_one, b64_two]
+    blob = json.dumps(record)
+    assert blob.count(b64_one) == 1
+    assert blob.count(b64_two) == 1
+
+
+def test_multiline_non_image_result_stays_raw_string() -> None:
+    """
+    Multi-line plain-text results keep their raw-string representation.
+
+    Lines that parse as JSON but are not image blocks (and image-shaped
+    lines without an ``image/*`` MIME type) must not be "recovered" into
+    blocks — the newline-join normalization only fires on real images.
+    """
+    output = 'first line\n{"type": "image", "data": "QUJD", "mimeType": "text/plain"}\nlast line'
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    assert record["message"]["content"][0]["content"] == output
+    # Image-free: the legacy metadata passthrough applies verbatim.
+    assert record["toolUseResult"] == json.dumps(output)
+
+
+def test_invalid_base64_image_shaped_text_stays_raw() -> None:
+    """
+    Image-shaped text with undecodable data is never converted.
+
+    Documentation or logs can contain a line like
+    ``{"type":"image","data":"not!valid!base64","mimeType":"image/png"}``.
+    Converting it would emit an image block Claude rejects on every
+    resume of the session — a persistent wedge rebuilt from the same
+    stored item each launch. Both the lone-object and the newline-joined
+    form must stay raw text.
+    """
+    fake = '{"type": "image", "data": "not!valid!base64", "mimeType": "image/png"}'
+    lone_records = _image_output_records(fake)
+    assert lone_records[0]["message"]["content"][0]["content"] == fake
+    mixed_output = f"some log line\n{fake}"
+    mixed_records = _image_output_records(mixed_output)
+    assert mixed_records[0]["message"]["content"][0]["content"] == mixed_output
+
+
+def test_valid_base64_of_non_image_bytes_stays_raw() -> None:
+    """
+    Decodable but non-image bytes must not become an image block.
+
+    Uses the array-entry path: a base64 string that decodes cleanly but
+    carries no image signature fails validation, so the whole output
+    keeps its raw-string representation.
+    """
+    not_an_image = base64.b64encode(b"definitely just text bytes" * 100).decode()
+    output = json.dumps(
+        [{"type": "image", "data": not_an_image, "mimeType": "image/png"}],
+        separators=(",", ":"),
+    )
+    records = _image_output_records(output)
+    assert records[0]["message"]["content"][0]["content"] == output
+
+
+def test_image_mime_signature_mismatch_stays_raw() -> None:
+    """
+    A payload whose signature disagrees with ``mimeType`` stays raw.
+
+    Claude validates the bytes against the block's declared media type,
+    so PNG-as-JPEG would fail the resume just like invalid data. An
+    ``image/*`` type outside the supported set (SVG here) is rejected
+    too — the prefix alone proves nothing.
+    """
+    mismatched = json.dumps(
+        {"type": "image", "data": _TINY_PNG_BASE64, "mimeType": "image/jpeg"},
+        separators=(",", ":"),
+    )
+    records = _image_output_records(mismatched)
+    assert records[0]["message"]["content"][0]["content"] == mismatched
+
+    svg = base64.b64encode(b"<svg xmlns='http://www.w3.org/2000/svg'/>").decode()
+    unsupported = json.dumps(
+        {"type": "image", "data": svg, "mimeType": "image/svg+xml"},
+        separators=(",", ":"),
+    )
+    records = _image_output_records(unsupported)
+    assert records[0]["message"]["content"][0]["content"] == unsupported
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "payload"),
+    [
+        ("image/png", _TINY_PNG_BASE64),
+        ("image/jpeg", _TINY_JPEG_BASE64),
+        ("image/gif", _TINY_GIF_BASE64),
+        ("image/webp", _TINY_WEBP_BASE64),
+    ],
+)
+def test_mcp_image_result_replays_as_one_structured_image_all_formats(
+    mime_type: str,
+    payload: str,
+) -> None:
+    """
+    Every supported format normalizes through the real MCP path.
+
+    A genuine 1x1 image of each format Claude accepts is serialized by
+    the real ``_format_call_result`` and must replay as exactly one
+    structured image block with redacted metadata.
+    """
+    from mcp.types import ImageContent
+
+    output = _mcp_call_output(ImageContent(type="image", data=payload, mimeType=mime_type))
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert content == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime_type, "data": payload},
+        }
+    ]
+    assert payload not in json.dumps(json.loads(record["toolUseResult"]))
+    assert json.dumps(record).count(payload) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _TINY_PROGRESSIVE_JPEG_BASE64,
+        _TINY_PROGRESSIVE_GRAY_JPEG_BASE64,
+        _TINY_CMYK_JPEG_BASE64,
+    ],
+    ids=["progressive-rgb", "progressive-grayscale", "cmyk"],
+)
+def test_mcp_progressive_jpeg_result_replays_as_one_structured_image(payload: str) -> None:
+    """
+    Progressive and CMYK JPEGs normalize through the real MCP path.
+
+    Multi-scan (progressive) and CMYK JPEGs carry interleaved table
+    segments and several SOS scans after the first; the structural
+    validator must accept them (they are what real screenshot pipelines
+    emit) so replay produces exactly one structured image block.
+    """
+    from mcp.types import ImageContent
+
+    output = _mcp_call_output(ImageContent(type="image", data=payload, mimeType="image/jpeg"))
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert content == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": payload},
+        }
+    ]
+    assert payload not in json.dumps(json.loads(record["toolUseResult"]))
+    assert json.dumps(record).count(payload) == 1
+
+
+@pytest.mark.parametrize("mime_type", ["image/png", "image/jpeg", "image/gif", "image/webp"])
+@pytest.mark.parametrize("form", ["lone", "mixed", "array"])
+def test_signature_matching_padding_converts_in_every_form(mime_type: str, form: str) -> None:
+    """
+    Magic bytes plus padding convert in every persisted form, by design.
+
+    The gate matches the declared type's signature and does not decode the
+    container, so these convert rather than staying raw. What still holds in
+    all three forms — lone object, newline-joined, array entry — is the
+    invariant this workstream exists for: the payload lands in the structured
+    block exactly once and never in the metadata.
+    """
+    payload = _FAKE_IMAGE_PAYLOADS[mime_type]
+    image_object = json.dumps(
+        {"type": "image", "data": payload, "mimeType": mime_type},
+        separators=(",", ":"),
+    )
+    if form == "lone":
+        output = image_object
+    elif form == "mixed":
+        output = f"log line\n{image_object}"
+    else:
+        output = json.dumps(
+            [{"type": "image", "data": payload, "mimeType": mime_type}],
+            separators=(",", ":"),
+        )
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    assert content[-1] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": mime_type, "data": payload},
+    }
+    assert payload not in json.dumps(json.loads(record["toolUseResult"]))
+    assert json.dumps(record).count(payload) == 1
+
+
+@pytest.mark.parametrize("case", sorted(_UNDER_FLOOR_JPEGS))
+@pytest.mark.parametrize("form", ["lone", "mixed", "array"])
+def test_under_floor_image_payloads_stay_raw(case: str, form: str) -> None:
+    """
+    Payloads below the byte floor stay raw text in every persisted form.
+
+    SOI+EOI, RST-only, and DHT-only are JPEG-signature strings far too short
+    to be any real image, so the floor rejects them; converting them would
+    emit image blocks Claude refuses on every resume. Each stays small, so it
+    also stays raw rather than collapsing to the oversized placeholder.
+    """
+    payload = _UNDER_FLOOR_JPEGS[case]
+    assert len(base64.b64decode(payload)) < trc._MIN_IMAGE_BYTES
+    image_object = json.dumps(
+        {"type": "image", "data": payload, "mimeType": "image/jpeg"},
+        separators=(",", ":"),
+    )
+    if form == "lone":
+        output = image_object
+    elif form == "mixed":
+        output = f"log line\n{image_object}"
+    else:
+        output = json.dumps(
+            [{"type": "image", "data": payload, "mimeType": "image/jpeg"}],
+            separators=(",", ":"),
+        )
+    records = _image_output_records(output)
+    assert len(records) == 1
+    assert records[0]["message"]["content"][0]["content"] == output
+
+
+@pytest.mark.parametrize("case", sorted(_HEADER_VALID_CORRUPT_JPEGS))
+def test_signature_valid_but_undecodable_payloads_convert_by_design(case: str) -> None:
+    """
+    A signature-valid but undecodable payload is converted, deliberately.
+
+    The gate checks strict base64, a byte floor, and the declared type's magic
+    bytes — it does not walk containers, so APP0-only, empty-SOS, repeated-SOI
+    and restart/fill-only-entropy strings all become image blocks. Consequence
+    if a producer ever emits one: Claude rejects that resume until the record
+    ages out. Accepted because a store-truncated payload never parses as JSON
+    and so never reaches here, and because source-shaped Claude image blocks
+    already pass with no validation at all.
+    """
+    payload = _HEADER_VALID_CORRUPT_JPEGS[case]
+    assert trc._is_supported_image_payload(payload, "image/jpeg")
+    output = json.dumps(
+        {"type": "image", "data": payload, "mimeType": "image/jpeg"},
+        separators=(",", ":"),
+    )
+    records = _image_output_records(output)
+    assert records[0]["message"]["content"][0]["content"] == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": payload},
+        }
+    ]
+    # Still exactly one copy: the metadata never gets a second one.
+    assert json.dumps(records[0]).count(payload) == 1
+
+
+def test_oversized_invalid_image_collapses_instead_of_replaying_base64() -> None:
+    """
+    Rejecting a big invalid image must not cost more than accepting it.
+
+    An image-shaped payload the gate rejects cannot become an image block, and
+    the fallback keeps the raw string as ``tool_result`` content — which for a
+    large payload replays the whole base64 as prompt text, the shape that
+    overflowed the context window. Past ``_MAX_INVALID_IMAGE_REPLAY_CHARS`` it
+    collapses to the omitted-image placeholder instead; small invalid snippets
+    still replay verbatim so their text survives.
+    """
+    oversized = base64.b64encode(b"not an image payload " * 2_000).decode()
+    assert len(oversized) > trc._MAX_INVALID_IMAGE_REPLAY_CHARS
+    assert not trc._is_supported_image_payload(oversized, "image/jpeg")
+    image_object = json.dumps(
+        {"type": "image", "data": oversized, "mimeType": "image/jpeg"},
+        separators=(",", ":"),
+    )
+    forms = {
+        "lone": image_object,
+        "mixed": f"screenshot follows\n{image_object}",
+        "array": json.dumps(
+            [{"type": "image", "data": oversized, "mimeType": "image/jpeg"}],
+            separators=(",", ":"),
+        ),
+    }
+    for form, output in forms.items():
+        records = _image_output_records(output)
+        assert len(records) == 1, form
+        rendered = json.dumps(records[0])
+        # The payload is gone from the whole record — content and metadata.
+        assert oversized[:64] not in rendered, form
+        assert "omitted from history" in rendered, form
+        # And the record cannot recreate the overflow: it is a tiny
+        # fraction of the payload it replaced.
+        assert len(rendered) < len(oversized) // 10, form
+    # The mixed form keeps its text alongside the placeholder.
+    mixed_records = _image_output_records(forms["mixed"])
+    content = mixed_records[0]["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "screenshot follows"}
+    assert "omitted from history" in content[1]["text"]
+    # Below the threshold nothing changes: the raw string still replays.
+    small = base64.b64encode(b"not an image").decode()
+    assert len(small) <= trc._MAX_INVALID_IMAGE_REPLAY_CHARS
+    assert not trc._is_supported_image_payload(small, "image/jpeg")
+    small_output = json.dumps(
+        [{"type": "image", "data": small, "mimeType": "image/jpeg"}],
+        separators=(",", ":"),
+    )
+    small_records = _image_output_records(small_output)
+    assert small_records[0]["message"]["content"][0]["content"] == small_output
+
+
+def test_large_text_block_array_keeps_byte_for_byte_tool_use_result() -> None:
+    """
+    An image-free result keeps its passthrough however large it is.
+
+    The metadata fallback exists only to stop a *dropped* image payload
+    from sneaking back in via the raw output, so it has to key on that
+    explicit signal rather than on the passthrough's size. A big text
+    block array drops nothing: it rehydrates into real blocks, carries no
+    image payload, and must keep its documented byte-for-byte
+    ``toolUseResult``.
+    """
+    long_text = "log line that goes on and on. " * 400
+    output = json.dumps([{"type": "text", "text": long_text}], separators=(",", ":"))
+    assert len(output) > trc._MAX_INVALID_IMAGE_REPLAY_CHARS
+    rehydrated = trc.tool_result_content_blocks(output)
+    assert rehydrated.blocks is not None
+    assert rehydrated.dropped_oversized_image is False
+    records = _image_output_records(output)
+    assert len(records) == 1
+    # Byte-for-byte passthrough, not the redacted block list.
+    assert records[0]["toolUseResult"] == output
+    assert records[0]["message"]["content"][0]["content"] == [{"type": "text", "text": long_text}]
+    # And the dropped-payload case still swaps in the block list.
+    oversized = base64.b64encode(b"not an image payload " * 2_000).decode()
+    dropped = trc.tool_result_content_blocks(
+        json.dumps({"type": "image", "data": oversized, "mimeType": "image/png"})
+    )
+    assert dropped.dropped_oversized_image is True
 
 
 def test_claude_transcript_image_result_sent_as_blocks_not_text() -> None:
@@ -7265,6 +9508,232 @@ def test_claude_transcript_truncated_image_result_stripped_not_leaked() -> None:
     assert "omitted from history" in blob
 
 
+def _store_truncated(clipped_prefix: str) -> str:
+    """Append the store's truncation marker, leaving unterminated JSON."""
+    return clipped_prefix + "…[truncated by conversation-store: item exceeded 245760B cap]"
+
+
+def _capped_mcp_image_output(
+    *, is_error: bool = False, text: str | None = None
+) -> tuple[str, str]:
+    """Build a real MCP image result clipped by the real store cap.
+
+    Goes through ``_format_call_result(ImageContent(...))`` and
+    ``cap_tool_output`` so the fixture is the exact persisted shape, which
+    carries no ``"base64"`` literal.
+    """
+    from mcp.types import CallToolResult, ImageContent, TextContent
+
+    from omnigent.runtime.tool_output import cap_tool_output
+    from omnigent.tools.mcp import _format_call_result
+
+    payload = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\xa5" * 900_000).decode()
+    blocks: list[Any] = [ImageContent(type="image", data=payload, mimeType="image/png")]
+    if text is not None:
+        blocks.insert(0, TextContent(type="text", text=text))
+    raw = _format_call_result(CallToolResult(content=blocks, isError=is_error))
+    return payload, cap_tool_output(raw)
+
+
+@pytest.mark.parametrize("spell", ["line-wrapped", "unpadded"])
+def test_wrapped_base64_image_replays_as_one_structured_copy(spell: str) -> None:
+    """A wrapped or unpadded payload replays as a real image, not a placeholder.
+
+    Strict decoding used to reject both, so a valid screenshot was replaced with
+    an omission placeholder and the image was lost for good.
+    """
+    canonical = base64.b64encode(base64.b64decode(_TINY_PNG_BASE64)).decode()
+    payload = {
+        "line-wrapped": "\n".join(canonical[i : i + 76] for i in range(0, len(canonical), 76)),
+        "unpadded": canonical.rstrip("="),
+    }[spell]
+    output = json.dumps(
+        {"type": "image", "data": payload, "mimeType": "image/png"}, separators=(",", ":")
+    )
+
+    rehydrated = trc.tool_result_content_blocks(output)
+    assert rehydrated.dropped_oversized_image is False
+    records = _image_output_records(output)
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert content == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": canonical},
+        }
+    ]
+    blob = json.dumps(record)
+    # Exactly one copy, and none of it in the metadata.
+    assert blob.count(canonical) == 1
+    assert canonical not in json.dumps(json.loads(record["toolUseResult"]))
+    assert "omitted from history" not in blob
+
+
+def test_clone_repair_keeps_a_wrapped_payload_as_one_image() -> None:
+    """The clone path normalizes a wrapped payload instead of dropping it."""
+    canonical = base64.b64encode(base64.b64decode(_TINY_PNG_BASE64)).decode()
+    wrapped = "\n".join(canonical[i : i + 76] for i in range(0, len(canonical), 76))
+    content = json.dumps(
+        {"type": "image", "data": wrapped, "mimeType": "image/png"}, separators=(",", ":")
+    )
+    record: dict[str, Any] = {
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": content}],
+        },
+        "toolUseResult": json.dumps(content),
+    }
+
+    claude_native._sanitize_cloned_tool_result_record(record)
+
+    repaired = record["message"]["content"][0]["content"]
+    assert repaired == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": canonical},
+        }
+    ]
+    assert json.dumps(record).count(canonical) == 1
+    assert canonical not in json.dumps(record["toolUseResult"])
+
+
+@pytest.mark.parametrize("is_error", [False, True], ids=["ok", "error"])
+@pytest.mark.parametrize("text", [None, "took a screenshot"], ids=["lone", "mixed"])
+def test_store_capped_mcp_image_result_does_not_leak_base64(
+    is_error: bool, text: str | None
+) -> None:
+    """A store-capped MCP ``ImageContent`` result collapses instead of replaying.
+
+    The persisted MCP shape is ``{"type":"image","data":...,"mimeType":...}`` —
+    no ``"base64"`` literal — so the old token-based guard never fired on it and
+    the clipped payload replayed as ``tool_result`` text and again in metadata.
+    """
+    payload, capped = _capped_mcp_image_output(is_error=is_error, text=text)
+    assert '"base64"' not in capped
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(capped.removeprefix("Error: "))
+
+    records = _image_output_records(capped)
+    assert len(records) == 1
+    blob = json.dumps(records[0])
+    assert blob.count(payload[:64]) == 0, "clipped payload must not survive"
+    # The record is bounded: a placeholder, not a copy of the capped output.
+    assert len(blob) < len(capped) // 100
+    content = records[0]["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    rendered = json.dumps(content)
+    assert "omitted from history" in rendered
+    if is_error:
+        assert "Error:" in rendered
+    if text is not None:
+        assert text in rendered
+
+
+def test_store_capped_multi_image_result_keeps_the_intact_image() -> None:
+    """A clipped trailing image is collapsed without discarding earlier ones.
+
+    The newline-joined form is several JSON documents, so a whole-body parse
+    failure says nothing about the intact lines; only the clipped line is stood
+    down to a placeholder.
+    """
+    from mcp.types import CallToolResult, ImageContent
+
+    from omnigent.runtime.tool_output import cap_tool_output
+    from omnigent.tools.mcp import _format_call_result
+
+    clipped = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\xa5" * 900_000).decode()
+    capped = cap_tool_output(
+        _format_call_result(
+            CallToolResult(
+                content=[
+                    ImageContent(type="image", data=_TINY_PNG_BASE64, mimeType="image/png"),
+                    ImageContent(type="image", data=clipped, mimeType="image/png"),
+                ],
+                isError=False,
+            )
+        )
+    )
+
+    records = _image_output_records(capped)
+    blob = json.dumps(records[0])
+    assert blob.count(_TINY_PNG_BASE64) == 1, "the intact image must survive"
+    assert blob.count(clipped[:64]) == 0, "the clipped payload must not"
+    assert len(blob) < len(capped) // 100
+    content = records[0]["message"]["content"][0]["content"]
+    assert content[0]["source"]["data"] == _TINY_PNG_BASE64
+    assert "omitted from history" in json.dumps(content[1:])
+
+
+def test_errored_truncated_image_result_does_not_leak_base64() -> None:
+    """
+    An errored *and* truncated image payload leaks in neither place.
+
+    Two independent guards each assumed the payload starts the string.
+    ``_strip_unparseable_image_output`` checks for a leading ``[``/``{``,
+    and rehydration needs parseable JSON — a failed MCP call puts
+    ``"Error: "`` in front of the first, and store truncation breaks the
+    second. Together they slipped past both, so the record fell back to
+    the raw string and replayed the partial base64 twice: as
+    model-visible ``tool_result`` text and again in ``toolUseResult``.
+    The error must survive as compact text, the payload in neither place.
+    """
+    from mcp.types import ImageContent
+
+    b64 = "iVBORw0KGgo" + "A" * 100_000
+    # Real prefix from the real formatter, then the store's real clipping.
+    errored = _mcp_call_output(
+        ImageContent(type="image", data=b64, mimeType="image/png"), is_error=True
+    )
+    assert errored.startswith(trc._MCP_ERROR_PREFIX)
+    truncated = _store_truncated(
+        trc._MCP_ERROR_PREFIX + '[{"type":"image","source":{"type":"base64","data":"' + b64
+    )
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(truncated)
+    records = _image_output_records(truncated)
+    assert len(records) == 1
+    record = records[0]
+    blob = json.dumps(record)
+    assert b64 not in blob, "truncated base64 must not survive, prefixed or not"
+    # The error is preserved as structured compact text, not discarded.
+    content = record["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "Error:"}
+    assert "omitted from history" in content[1]["text"]
+    # Metadata carries the same collapsed form — no payload, still parseable.
+    tool_use_result = json.loads(record["toolUseResult"])
+    assert b64 not in json.dumps(tool_use_result)
+    assert "omitted from history" in json.dumps(tool_use_result)
+
+
+def test_errored_truncated_image_clone_record_is_collapsed_too() -> None:
+    """
+    A cloned record holding the errored+truncated shape is collapsed too.
+
+    The clone sanitizer normally only touches records whose payload it can
+    recover as an image block, and a truncated payload is exactly the one
+    it cannot — so without a second route the byte-copied record replays
+    the partial base64 on the clone's first ``--resume``.
+    """
+    b64 = "iVBORw0KGgo" + "A" * 100_000
+    truncated = _store_truncated(
+        trc._MCP_ERROR_PREFIX + '[{"type":"image","source":{"type":"base64","data":"' + b64
+    )
+    record: dict[str, Any] = {
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": truncated}],
+        },
+        "toolUseResult": json.dumps(truncated),
+    }
+    claude_native._sanitize_cloned_tool_result_record(record)
+    content = record["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "Error:"}
+    assert "omitted from history" in content[1]["text"]
+    assert b64 not in json.dumps(record)
+
+
 def test_tool_use_result_regression_old_flatten_would_crash_resume() -> None:
     """
     Pin the resume crash to the old ``toolUseResult = output`` flatten.
@@ -7351,3 +9820,805 @@ def test_routed_arms_keep_the_existing_pin_when_no_spelling_is_servable() -> Non
     )
     assert claude_native.claude_config_with_routed_arms_pinned(None, ("claude-opus-4-8",)) is None
     assert claude_native.claude_config_with_routed_arms_pinned(config, ()) is config
+
+
+# ── Harness model probe (harness-truth listing) ───────────────────────────
+
+
+def _gateway_probe_config(**env_extra: str) -> Any:
+    """A ucode-shaped config routed through a gateway endpoint."""
+    return claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
+            **env_extra,
+        },
+        api_key_helper="printf token",
+    )
+
+
+def test_parse_claude_model_aliases_reads_the_usage_line() -> None:
+    """The harness's printed alias enumeration parses verbatim.
+
+    Only the trailing prose fragment is dropped — no alias names are known
+    to the parser, so a new alias in a future Claude release flows through.
+    """
+    stdout = (
+        "Current model: Opus 4.8 (1M context) (effort: high)\n"
+        "Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, "
+        "sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.\n"
+    )
+    assert claude_native._parse_claude_model_aliases(stdout) == [
+        "sonnet",
+        "opus",
+        "haiku",
+        "fable",
+        "best",
+        "sonnet[1m]",
+        "opus[1m]",
+        "fable[1m]",
+        "opusplan",
+        "default",
+    ]
+    assert claude_native._parse_claude_model_aliases("no usage line here") == []
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        pytest.param(
+            json.dumps({"type": "system", "subtype": "init", "model": "claude-opus-5"})
+            + "\n"
+            + json.dumps({"type": "result", "result": "Current model: Opus 5 (effort: high)"}),
+            {"model": "claude-opus-5", "label": "Opus 5"},
+            id="id-and-label",
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "Current model: Opus 4.8 (1M context) (effort: high)",
+                }
+            ),
+            {"label": "Opus 4.8 (1M context)"},
+            id="only-the-effort-suffix-is-stripped",
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "Current model: Opus in plan mode, else Sonnet (effort: high)",
+                }
+            ),
+            {"label": "Opus in plan mode, else Sonnet"},
+            id="prose-label-kept-verbatim",
+        ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: `Sonnet 5` (effort: high)"}),
+            {"label": "Sonnet 5"},
+            id="markdown-backticks-around-the-name-are-stripped",
+        ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: `Opus 5 (1M context)`"}),
+            {"label": "Opus 5 (1M context)"},
+            id="markdown-backticks-around-the-whole-label-are-stripped",
+        ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: `Opus 5 (effort: high)`"}),
+            {"label": "Opus 5"},
+            id="effort-suffix-inside-the-backticks-still-strips",
+        ),
+        pytest.param(
+            json.dumps(
+                {"type": "result", "result": "Current model: `Opus 5 (1M context) (default)`"}
+            ),
+            {"label": "Opus 5 (1M context)"},
+            id="default-marker-on-the-enumeration-run-is-stripped",
+        ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: Sonnet 5 (default)"}),
+            {"label": "Sonnet 5"},
+            id="default-marker-without-backticks-is-stripped",
+        ),
+        pytest.param("Current model: Opus 5\nnot json", {}, id="non-stream-json-yields-nothing"),
+    ],
+)
+def test_parse_claude_current_model(stdout: str, expected: dict[str, str]) -> None:
+    """The stream-json run's exact id and printed label parse verbatim.
+
+    Only markdown backticks and the trailing ``(effort: …)`` / ``(default)``
+    suffixes are stripped from the label — context markers and prose like
+    opusplan's description survive, because the parser knows no model names.
+    """
+    assert claude_native._parse_claude_current_model(stdout) == expected
+
+
+@pytest.mark.parametrize(
+    ("alias", "label", "model", "expected"),
+    [
+        pytest.param(
+            "sonnet[1m]",
+            "`Sonnet 5`",
+            "claude-sonnet-5[1m]",
+            "Sonnet 5 (1M context)",
+            id="marker-appended-outside-stripped-backticks",
+        ),
+        pytest.param(
+            "opus[1m]",
+            "`Opus 5 (1M context)`",
+            "claude-opus-5[1m]",
+            "Opus 5 (1M context)",
+            id="marker-already-present-inside-backticks",
+        ),
+    ],
+)
+def test_claude_alias_row_marks_1m_context_consistently(
+    alias: str, label: str, model: str, expected: str
+) -> None:
+    """A markdown-quoted harness label cannot split the 1M-context marker.
+
+    Backticks leave at parse time, so the marker lands on plain text and
+    the guard against a duplicate marker sees the name it is guarding.
+    """
+    resolution = claude_native._parse_claude_current_model(
+        json.dumps({"type": "system", "subtype": "init", "model": model})
+        + "\n"
+        + json.dumps({"type": "result", "result": f"Current model: {label} (effort: high)"})
+    )
+
+    row = claude_native._claude_alias_row(alias, resolution)
+
+    assert row == {"id": alias, "model": model, "displayName": expected}
+
+
+async def test_probe_claude_model_options_runs_bare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare subscription launch (no config) asks the harness itself.
+
+    No ``--settings`` rides along without an apiKeyHelper to deliver, and
+    the plain-text usage line still parses when the harness answers
+    without stream-json events (failed per-alias resolutions leave the
+    bare alias rows).
+    """
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (
+                b"Usage: /model <name>. Available: sonnet, opus, or a full model ID.\n",
+                b"",
+            )
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FakeProcess:
+        # No --settings without an apiKeyHelper to deliver.
+        assert "--settings" not in args
+        return _FakeProcess()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    probe = await claude_native.probe_claude_model_options(None)
+
+    assert probe is not None
+    assert probe.alias_rows == [
+        {"id": "sonnet", "model": "sonnet", "displayName": "sonnet"},
+        {"id": "opus", "model": "opus", "displayName": "opus"},
+    ]
+    assert probe.default_model is None
+
+
+async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every kept alias gets its own ``--model`` resolution run.
+
+    The harness resolves each alias itself (exact id from the init event,
+    label from the printed line); rows show only the resolved label with
+    1M-context resolutions marked, aliases resolving to a model an
+    earlier row already covers are dropped (``best``, ``fable[1m]``, and
+    ``opusplan`` here), ``default`` never becomes a row (the picker has
+    its own Default choice), and a failing resolution leaves that alias's
+    bare row, never the whole probe.
+    """
+    resolutions = {
+        "sonnet": ("claude-sonnet-5", "Sonnet 5"),
+        "opus": ("claude-opus-5", "Opus 5"),
+        "fable": ("claude-fable-5", "Fable 5"),
+        "best": ("claude-fable-5", "Fable 5"),
+        "sonnet[1m]": ("claude-sonnet-5[1m]", "Sonnet 5"),
+        "opus[1m]": ("claude-opus-5[1m]", "Opus 5 (1M context)"),
+        "fable[1m]": ("claude-fable-5", "Fable 5"),
+        "opusplan": ("claude-sonnet-5", "Opus in plan mode, else Sonnet"),
+    }
+
+    class _Run:
+        def __init__(self, stdout: bytes, returncode: int = 0) -> None:
+            self.returncode = returncode
+            self._stdout = stdout
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return self._stdout, b""
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _Run:
+        if "--model" not in args:
+            return _Run(
+                b"Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, "
+                b"sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.\n"
+            )
+        assert "--output-format" in args and "stream-json" in args and "--verbose" in args
+        alias = args[args.index("--model") + 1]
+        assert alias != "default", "the skipped alias must not spawn a resolution run"
+        if alias == "haiku":
+            return _Run(b"", returncode=1)
+        model, label = resolutions[alias]
+        events = [
+            {"type": "system", "subtype": "init", "model": model},
+            {"type": "result", "result": f"Current model: {label} (effort: high)"},
+        ]
+        return _Run("\n".join(json.dumps(event) for event in events).encode())
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    probe = await claude_native.probe_claude_model_options(None)
+
+    assert probe is not None
+    alias_rows = probe.alias_rows
+    assert alias_rows == [
+        {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
+        {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+        {"id": "haiku", "model": "haiku", "displayName": "haiku"},
+        {"id": "fable", "model": "claude-fable-5", "displayName": "Fable 5"},
+        {
+            "id": "sonnet[1m]",
+            "model": "claude-sonnet-5[1m]",
+            "displayName": "Sonnet 5 (1M context)",
+        },
+        {"id": "opus[1m]", "model": "claude-opus-5[1m]", "displayName": "Opus 5 (1M context)"},
+    ]
+
+
+async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe launches Claude Code with the exact launch env.
+
+    Speed env vars ride along, the nonessential-traffic kill-switch is
+    stripped (Claude treats it as covering the probe's own runs), and the
+    apiKeyHelper is delivered via ``--settings`` — so the enumeration
+    answers for the session the user would actually get.
+    """
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+    monkeypatch.setenv("CLAUDECODE", "1")
+    captured: dict[str, Any] = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (
+                b"Current model: Opus\n"
+                b"Usage: /model <name>. Available: opus, or a full model ID.\n",
+                b"",
+            )
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FakeProcess:
+        if "command" not in captured:
+            # The first spawn is the enumeration run; per-alias resolution
+            # runs reuse the same launch env.
+            captured["command"] = command
+            captured["args"] = list(args)
+            captured["env"] = dict(kwargs["env"])
+        return _FakeProcess()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    probe = await claude_native.probe_claude_model_options(_gateway_probe_config())
+
+    assert probe is not None
+    assert probe.alias_rows == [{"id": "opus", "model": "opus", "displayName": "opus"}]
+    args = captured["args"]
+    assert args[:2] == ["-p", "/model"]
+    assert "--strict-mcp-config" in args and "--no-session-persistence" in args
+    settings_payload = json.loads(args[args.index("--settings") + 1])
+    assert settings_payload == {"apiKeyHelper": "printf token"}
+    env = captured["env"]
+    assert env["ANTHROPIC_BASE_URL"] == "https://gw.example/anthropic"
+    assert env["DISABLE_TELEMETRY"] == "1"
+    assert env["DISABLE_AUTOUPDATER"] == "1"
+    assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in env
+    assert "CLAUDECODE" not in env
+
+
+async def test_claude_model_catalog_marks_the_enumerated_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The enumeration run's own model marks its row as the default."""
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
+                {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+            ],
+            default_model="claude-opus-5",
+            default_label="Opus 5",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    rows = await claude_native.claude_model_catalog(None)
+    assert rows is not None
+    assert [row["id"] for row in rows] == ["sonnet", "opus"]
+    assert "isDefault" not in rows[0]
+    assert rows[1]["isDefault"] is True
+
+
+async def test_claude_model_catalog_appends_an_off_list_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settings-pinned default absent from the aliases becomes its own row.
+
+    On this shape a bare launch runs a model no alias resolves to (e.g. a
+    ``settings.json`` ``ANTHROPIC_MODEL`` pin); the catalog appends it as a
+    row so every visible row is launchable and the Default label is honest.
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
+            ],
+            default_model="claude-opus-4-8[1m]",
+            default_label="Opus 4.8 (1M context)",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    rows = await claude_native.claude_model_catalog(None)
+    assert rows is not None
+    assert rows[-1] == {
+        "id": "claude-opus-4-8[1m]",
+        "model": "claude-opus-4-8[1m]",
+        "displayName": "Opus 4.8 (1M context)",
+        "isDefault": True,
+    }
+
+
+async def test_claude_model_catalog_never_appends_an_unservable_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare-Anthropic default is not appended on a gateway endpoint.
+
+    The gateway rejects canonical Anthropic spellings, so claiming claude's
+    own default is launchable there would offer a row that cannot work.
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {
+                    "id": "sonnet",
+                    "model": "databricks-claude-sonnet-5",
+                    "displayName": "Sonnet 5",
+                },
+                {"id": "fable", "model": "claude-fable-5", "displayName": "Fable 5"},
+            ],
+            default_model="claude-opus-5[1m]",
+            default_label="Opus 5 (1M context)",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    rows = await claude_native.claude_model_catalog(_gateway_probe_config())
+    assert rows is not None
+    # The unservable alias row is filtered AND the unservable default is not
+    # appended; no row claims the default.
+    assert [row["id"] for row in rows] == ["sonnet"]
+    assert all(row.get("isDefault") is not True for row in rows)
+
+
+async def test_claude_model_catalog_marks_the_launch_pin_as_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider-configured shape's default is its LAUNCH PIN, not claude's.
+
+    Default launches on these shapes pass ``--model <config.model>``
+    explicitly, so that pin — not the enumeration run's own model — is what
+    a Default launch actually runs. The gateway-entry shape (one pinned
+    alias) must mark its row, or the picker reads a bare "Default".
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {
+                    "id": "opus",
+                    "model": "system.ai.claude-opus-4-8[1m]",
+                    "displayName": "Opus 4.8 (1M context)",
+                }
+            ],
+            default_model=None,
+            default_label=None,
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]",
+        },
+        api_key_helper="printf token",
+        model="system.ai.claude-opus-4-8[1m]",
+    )
+    rows = await claude_native.claude_model_catalog(config)
+    assert rows == [
+        {
+            "id": "opus",
+            "model": "system.ai.claude-opus-4-8[1m]",
+            "displayName": "Opus 4.8 (1M context)",
+            "isDefault": True,
+        }
+    ]
+
+
+async def test_claude_launch_catalog_reads_the_store_then_probes_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The launch catalog is store-first; a miss probes once and persists."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    calls: list[int] = []
+
+    async def _fake_catalog(config: object) -> list[dict[str, object]]:
+        del config
+        calls.append(1)
+        return [{"id": "sonnet", "model": "claude-sonnet-5", "isDefault": True}]
+
+    monkeypatch.setattr(claude_native, "claude_model_catalog", _fake_catalog)
+    first = await claude_native.claude_launch_catalog(None)
+    second = await claude_native.claude_launch_catalog(None)
+    assert first == second == [{"id": "sonnet", "model": "claude-sonnet-5", "isDefault": True}]
+    assert len(calls) == 1, "the second read must come from the store, not a re-probe"
+
+
+async def test_probe_claude_model_options_returns_none_on_probe_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failing harness run yields None so callers keep configured rows."""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    class _FailedProcess:
+        returncode = 1
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b"boom"
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FailedProcess:
+        return _FailedProcess()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    assert await claude_native.probe_claude_model_options(_gateway_probe_config()) is None
+
+
+def _subscription_catalog() -> list[dict[str, object]]:
+    """
+    A direct-login catalog: alias rows plus the appended settings default."""
+    return [
+        {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
+        {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+        {"id": "fable", "model": "fable", "displayName": "fable"},
+        {"id": "opus[1m]", "model": "claude-opus-5[1m]", "displayName": "Opus 5 (1M context)"},
+        {
+            "id": "claude-opus-4-8[1m]",
+            "model": "claude-opus-4-8[1m]",
+            "displayName": "Opus 4.8 (1M context)",
+            "isDefault": True,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model", "config", "served"),
+    [
+        # Exact rows always serve: a picker id, a wire model, the appended default.
+        ("opus", None, True),
+        ("claude-sonnet-5", None, True),
+        ("claude-opus-4-8[1m]", None, True),
+        # A canonical id the endpoint serves but no row spells: the default's
+        # plain twin, an older generation, the bare id behind a bare alias row,
+        # a 1M request on a listed family.
+        ("claude-opus-4-8", None, True),
+        ("claude-sonnet-4-5-20250929", None, True),
+        ("claude-fable-5", None, True),
+        ("claude-sonnet-5[1m]", None, True),
+        # Anthropic's own endpoint behind a key serves canonical ids too.
+        (
+            "claude-opus-4-8",
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+                api_key_helper="printf sk-key",
+            ),
+            True,
+        ),
+        # A family the catalog does not list is a genuinely stale pick.
+        ("claude-haiku-4-5", None, False),
+        ("claude-mythos-5", None, False),
+        # Not a canonical Anthropic id: only an exact row could serve it.
+        ("gpt-5.4", None, False),
+        ("", None, False),
+        # Gateways and Bedrock route their own spellings only.
+        (
+            "claude-opus-4-8",
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+                api_key_helper="printf sk-key",
+            ),
+            False,
+        ),
+        (
+            "claude-opus-4-8",
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example"},
+                api_key_helper=None,
+            ),
+            False,
+        ),
+    ],
+)
+def test_claude_catalog_serves_model(
+    model: str, config: claude_native.ClaudeNativeUcodeConfig | None, served: bool
+) -> None:
+    """
+    Exact rows serve; a canonical id serves on a canonical endpoint when its family is listed."""
+    assert (
+        claude_native.claude_catalog_serves_model(_subscription_catalog(), model, config) is served
+    )
+
+
+@pytest.mark.parametrize(
+    ("config", "label"),
+    [
+        (None, "Claude Code's own login"),
+        (
+            claude_native.ClaudeNativeUcodeConfig(
+                env={
+                    "ANTHROPIC_BASE_URL": "https://user:secret@gateway.example:8443/anthropic?sig=1"
+                },
+                api_key_helper="printf sk-key",
+            ),
+            "the gateway at https://gateway.example:8443",
+        ),
+        (
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example/v1"},
+                api_key_helper=None,
+            ),
+            "the Bedrock endpoint at https://bedrock.example",
+        ),
+    ],
+)
+def test_claude_launch_endpoint_label_names_where_inference_goes(
+    config: claude_native.ClaudeNativeUcodeConfig | None, label: str
+) -> None:
+    """
+    The label names only the endpoint's origin: no path, userinfo, or query.
+    """
+    assert claude_native.claude_launch_endpoint_label(config) == label
+
+
+# ── Bare --resume picker: host scoping and concise errors ────────────
+
+
+def test_resolve_session_id_for_resume_threads_local_host_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bare ``--resume`` scopes the picker to this machine's host id.
+
+    Native transcript/workspace state is host-local; without the
+    invoking host id the picker offers dead-end rows from other hosts.
+    """
+    from omnigent.host import identity as host_identity
+
+    captured: dict[str, Any] = {}
+
+    async def fake_picker(client: Any, **kwargs: Any) -> str | None:
+        """Capture the picker kwargs; skip any real listing."""
+        del client
+        captured.update(kwargs)
+        return "conv_picked"
+
+    monkeypatch.setattr(
+        "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk",
+        fake_picker,
+    )
+    monkeypatch.setattr(
+        host_identity,
+        "load_host_identity_if_present",
+        lambda *a, **k: host_identity.HostIdentity(
+            host_id="aaaa1111aaaa1111aaaa1111aaaa1111", name="test-host"
+        ),
+    )
+
+    resolved = claude_native._resolve_session_id_for_resume(
+        base_url="http://127.0.0.1:1",
+        headers={},
+        session_id=None,
+        resume_picker=True,
+    )
+    assert resolved == "conv_picked"
+    assert captured["host_id"] == "aaaa1111aaaa1111aaaa1111aaaa1111"
+
+
+def test_resolve_session_id_for_resume_unregistered_machine_lists_unfiltered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No persisted host identity → the picker lists without a host filter.
+
+    The lookup must be read-only: resolving a resume must never mint a
+    host identity on a machine that is not a host.
+    """
+    from omnigent.host import identity as host_identity
+
+    captured: dict[str, Any] = {}
+
+    async def fake_picker(client: Any, **kwargs: Any) -> str | None:
+        """Capture the picker kwargs; skip any real listing."""
+        del client
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk",
+        fake_picker,
+    )
+    monkeypatch.setattr(host_identity, "load_host_identity_if_present", lambda *a, **k: None)
+
+    resolved = claude_native._resolve_session_id_for_resume(
+        base_url="http://127.0.0.1:1",
+        headers={},
+        session_id=None,
+        resume_picker=True,
+    )
+    assert resolved is None
+    assert captured["host_id"] is None
+
+
+def test_resolve_session_id_for_resume_wraps_sdk_error_as_click_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent SDK failure surfaces as a concise ``ClickException``.
+
+    The bare-``--resume`` journey must never end in a raw SDK
+    traceback: a list failure that outlives the picker's bounded
+    retries (e.g. a persistent 429) becomes a one-line CLI error.
+    """
+    from omnigent_client import RateLimitedError
+
+    from omnigent.host import identity as host_identity
+
+    async def fake_picker(client: Any, **kwargs: Any) -> str | None:
+        """Simulate the list call failing past the retry budget."""
+        del client, kwargs
+        raise RateLimitedError("rate limited", 429, "rate_limited")
+
+    monkeypatch.setattr(
+        "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk",
+        fake_picker,
+    )
+    monkeypatch.setattr(host_identity, "load_host_identity_if_present", lambda *a, **k: None)
+
+    with pytest.raises(click.ClickException) as exc_info:
+        claude_native._resolve_session_id_for_resume(
+            base_url="http://127.0.0.1:1",
+            headers={},
+            session_id=None,
+            resume_picker=True,
+        )
+    assert "Could not list sessions to resume" in exc_info.value.message
+
+
+def test_resolve_session_id_for_resume_explicit_id_bypasses_host_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit ``--resume <id>`` returns as-is — no picker, no filtering."""
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("picker must not run for explicit --resume <id>")
+
+    monkeypatch.setattr(
+        "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk",
+        boom,
+    )
+    resolved = claude_native._resolve_session_id_for_resume(
+        base_url="http://127.0.0.1:1",
+        headers={},
+        session_id="conv_explicit",
+        resume_picker=False,
+    )
+    assert resolved == "conv_explicit"
+
+
+def test_resolve_session_id_for_resume_partial_env_identity_is_concise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A half-set host-identity env pair fails as a concise CLI error.
+
+    ``load_host_identity_if_present`` raises ``ValueError`` when only
+    one of the managed-host launch env vars is set; bare ``--resume``
+    must surface that as a ``ClickException``, not a raw traceback.
+    """
+    from omnigent.host import identity as host_identity
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise ValueError("OMNIGENT_HOST_ID and OMNIGENT_HOST_NAME must be set together")
+
+    monkeypatch.setattr(host_identity, "load_host_identity_if_present", boom)
+
+    with pytest.raises(click.ClickException) as exc_info:
+        claude_native._resolve_session_id_for_resume(
+            base_url="http://127.0.0.1:1",
+            headers={},
+            session_id=None,
+            resume_picker=True,
+        )
+    assert "host identity" in exc_info.value.message
+
+
+# ── catalog fingerprint keys on the CLI binary ───────────
+
+
+def _point_claude_at(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    """Make the fingerprint resolve the Claude binary to *path*."""
+    monkeypatch.setattr(
+        "omnigent.claude_launcher.resolve_claude_launch",
+        lambda command, args: (str(path), list(args)),
+    )
+
+
+def test_catalog_fingerprint_changes_when_the_cli_is_upgraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upgraded Claude Code misses the catalog its predecessor wrote.
+
+    The catalog stores the model names one binary printed. Without the
+    binary in the key, an upgrade keeps serving the old names until the
+    entry ages out, which hides models a release adds or renames.
+    """
+    old_release = tmp_path / "2.1.247"
+    new_release = tmp_path / "2.1.250"
+    old_release.write_text("old")
+    new_release.write_text("newer build")
+    link = tmp_path / "claude"
+    link.symlink_to(old_release)
+    _point_claude_at(monkeypatch, link)
+
+    before = claude_native.claude_catalog_fingerprint(None)
+
+    link.unlink()
+    link.symlink_to(new_release)
+    after = claude_native.claude_catalog_fingerprint(None)
+
+    assert before != after
+
+
+def test_catalog_fingerprint_is_stable_for_one_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged binary keeps its catalog, so no probe is repaid."""
+    binary = tmp_path / "claude"
+    binary.write_text("build")
+    _point_claude_at(monkeypatch, binary)
+
+    assert claude_native.claude_catalog_fingerprint(None) == (
+        claude_native.claude_catalog_fingerprint(None)
+    )
+
+
+def test_catalog_fingerprint_survives_a_missing_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A binary the resolver cannot find still yields a usable key."""
+    _point_claude_at(monkeypatch, tmp_path / "absent")
+
+    assert isinstance(claude_native.claude_catalog_fingerprint(None), str)

@@ -278,7 +278,12 @@ def register_native_commands(cli: click.Group) -> None:
             explicit=claude_command,
             cfg=cfg,
         )
-        extra_args = _resolve_harness_startup_args(cfg, "claude-native", claude_args)
+        # The daemon runner is the single merge point for harness.<id>.args on
+        # the native claude/codex terminal (_auto_create_*_terminal resolves
+        # them), and every CLI launch here reaches that daemon path. Persist the
+        # RAW pass-through so the runner merge is not stacked on top of a
+        # CLI-merged prefix — that doubled the wrapper (e.g. `isaac -- -- …`).
+        extra_args = claude_args
         if smart_routing:
             # Arming creates the session (that is where Smart Routing is turned
             # on and the decision card lands), so attach to it instead of
@@ -434,7 +439,7 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            extra_args=_resolve_harness_startup_args(cfg, "codex-native", codex_args),
+            extra_args=codex_args,  # raw; runner is the sole arg-merge point (see claude)
             model=model,
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
@@ -1104,10 +1109,10 @@ def register_native_commands(cli: click.Group) -> None:
 
         \b
         Examples:
-          omnigent antigravity
-          omnigent antigravity --resume conv_abc123
-          omnigent antigravity --resume                  # interactive picker
-          omnigent antigravity --server https://<app>.databricksapps.com
+          omni agy
+          omni agy --resume conv_abc123
+          omni agy --resume                  # interactive picker
+          omni agy --server https://<app>.databricksapps.com
         """
         # Validate option combinations BEFORE any side effects (daemon spawn,
         # server discovery) -- see the same comment in the claude command.
@@ -1154,6 +1159,9 @@ def register_native_commands(cli: click.Group) -> None:
             auto_open_conversation=auto_open_conversation,
             command=resolved_command or None,
         )
+
+    # Register ``agy`` CLI shortcut for parity with the upstream binary name.
+    cli.add_command(antigravity, name="agy")
 
     @cli.command(
         context_settings={

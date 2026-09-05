@@ -41,6 +41,7 @@ import logging
 from dataclasses import dataclass, replace
 from typing import Literal
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.policies import FunctionPolicy, resolve_function_policy
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.spec.types import (
@@ -173,7 +174,9 @@ class RunnerToolPolicyGate:
                 policy = resolve_function_policy(ps)
             except Exception as exc:  # noqa: BLE001 - all resolution failures deny
                 diagnostic = _resolve_failure_diagnostic(ps, exc)
-                _logger.error("runner %s", diagnostic)
+                _logger.error(
+                    "runner %s", diagnostic, extra={"session_id": runner_primary_session_id()}
+                )
                 policy = _unresolved_policy_sentinel(ps, exc)
                 phases = frozenset([Phase.TOOL_CALL, Phase.TOOL_RESULT])
             out.append(_GatedPolicy(name=ps.name, policy=policy, phases=phases))
@@ -304,6 +307,7 @@ class RunnerToolPolicyGate:
                     "runner policy %r raised on %s; treating as DENY",
                     gated.name,
                     phase.value,
+                    extra={"session_id": runner_primary_session_id()},
                 )
                 return PolicyVerdict(
                     action="deny",

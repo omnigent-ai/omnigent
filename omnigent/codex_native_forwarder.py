@@ -26,6 +26,7 @@ from omnigent._native_post_delivery import (
     replay_dead_letters,
 )
 from omnigent.claude_native_bridge import url_component
+from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.codex_native_app_server import (
     CodexAppServerClient,
     CodexMessage,
@@ -36,10 +37,12 @@ from omnigent.codex_native_bridge import (
     MCP_STARTUP_STARTING,
     MCP_STARTUP_STATES,
     CodexNativeBridgeState,
+    DeveloperInstructionsReadState,
     clear_active_turn_id_if_matches,
     codex_home_for_bridge_dir,
     pending_mcp_servers,
     read_bridge_state,
+    read_codex_config_developer_instructions_state,
     read_codex_config_model,
     read_mcp_startup,
     settle_pending_mcp_startup,
@@ -192,14 +195,10 @@ _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
     }
 )
 
-# Turn-error surfacing. A failed Codex turn arrives as ``turn/completed``
-# (or ``turn/failed``) with ``turn.status == "failed"`` and a ``turn.error``
-# object ``{message, codexErrorInfo?, additionalDetails?}``; keying status off
-# the method alone mapped such turns to ``idle`` — a "silent success". The
-# forwarder inspects ``turn.status``/``turn.error``, forces ``failed``, and
-# surfaces the reason. As a fallback it also catches an ``error`` ThreadItem in
-# ``turn.items``: both shapes exist in the app-server type system and the wire
-# shape varies by version, so detecting either keeps the fix robust.
+# Turn-error surfacing. Codex reports failures through a standalone ``error``
+# notification and on terminal turn boundaries via ``turn.error`` / failed
+# status. The forwarder handles both, plus the older ``error`` ThreadItem
+# fallback, so every non-retrying failure reaches the session UI.
 #
 # ``codexErrorInfo`` is the app-server's structured classification (e.g.
 # ``unauthorized``, ``usage_limit_exceeded``); auth-class values get a re-auth
@@ -324,6 +323,11 @@ class _CodexForwarderState:
         the resume/startup model so the spawn default is not echoed back as
         a change; only a later in-TUI ``/model`` switch is mirrored. ``None``
         until seeded.
+    :param developer_instructions: Last known value from config.toml.
+        ``None`` is ambiguous — see :attr:`developer_instructions_known`.
+    :param developer_instructions_known: ``True`` once a PRESENT/ABSENT
+        read has been confirmed; ``False`` means never yet read (guards
+        against sending ``null`` before the first successful config read).
     :param effort: Latest known Codex reasoning effort for this thread, e.g.
         ``"medium"``. ``None`` means Codex is using its model/default effort.
     :param posted_effort: Last reasoning effort already mirrored to Omnigent
@@ -359,6 +363,9 @@ class _CodexForwarderState:
     :param synced_item_keys: Stable item keys already posted to Omnigent this
         connection, e.g. ``{"thread_c:turn_c:item-1"}``. In-memory only;
         guards replay-vs-live overlap within one forwarder lifetime.
+    :param surfaced_terminal_error_turns: Turn ids whose standalone terminal
+        ``error`` notification was already surfaced. Used to suppress a later
+        terminal boundary for the same turn.
     :param posted_user_turns: Turn ids whose ``userMessage`` has been
         posted to Omnigent this connection, e.g. ``{"turn_123"}``. Used to
         enforce user-before-assistant ordering: before posting a turn's
@@ -393,6 +400,8 @@ class _CodexForwarderState:
     # The config.toml model as of the last _refresh_model_from_config read,
     # so the refresh can tell an unchanged file from a rewritten one.
     last_config_model: str | None = None
+    developer_instructions: str | None = None
+    developer_instructions_known: bool = False
     effort: str | None = None
     posted_effort: str | None = None
     posted_effort_known: bool = False
@@ -400,12 +409,15 @@ class _CodexForwarderState:
     posted_collaboration_mode: str | None = None
     terminal_launch_args: list[str] | None = None
     posted_terminal_launch_args: list[str] | None = None
+    approval_preset: str | None = None
+    posted_approval_preset: str | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     synced_item_keys: set[str] = field(default_factory=set)
+    surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
     posted_tool_calls: set[str] = field(default_factory=set)
     partial_text_by_turn: dict[str, list[_PartialTextBuffer]] = field(default_factory=dict)
@@ -470,6 +482,7 @@ class _CodexForwarderState:
         settings = params.get("threadSettings")
         if isinstance(settings, dict):
             self._note_model_fields(settings)
+            self._note_developer_instructions_fields(settings)
             self._note_effort_fields(settings)
             self._note_collaboration_mode_fields(settings)
             self._note_approval_mode_fields(settings)
@@ -803,6 +816,34 @@ class _CodexForwarderState:
         if isinstance(model, str) and model:
             self.model = model
 
+    def _note_developer_instructions_fields(self, payload: _JsonObject) -> None:
+        """
+        Record ``developer_instructions`` from a Codex settings-like payload.
+
+        :param payload: Settings payload; checks both flat and nested
+            ``collaborationMode.settings.developer_instructions`` shapes.
+        """
+        # Bare truthiness on a whitespace-only string is True, which broke
+        # this two ways: (1) a whitespace-only FLAT value would short-circuit
+        # the nested-shape check below even though it carries no real
+        # content, hiding a genuine nested value; (2) a whitespace-only
+        # value (flat or nested) would be stored and marked confirmed —
+        # the same malformed-shape class the config.toml tri-state reader
+        # already treats as UNREADABLE (not a real read), not PRESENT.
+        # ``.strip()`` everywhere below matches that contract.
+        instructions = payload.get("developer_instructions")
+        if not (isinstance(instructions, str) and instructions.strip()):
+            raw_mode = payload.get("collaborationMode")
+            if not isinstance(raw_mode, dict):
+                raw_mode = payload.get("collaboration_mode")
+            if isinstance(raw_mode, dict):
+                nested_settings = raw_mode.get("settings")
+                if isinstance(nested_settings, dict):
+                    instructions = nested_settings.get("developer_instructions")
+        if isinstance(instructions, str) and instructions.strip():
+            self.developer_instructions = instructions
+            self.developer_instructions_known = True
+
     def _note_effort_fields(self, payload: _JsonObject) -> None:
         """
         Record reasoning effort from a Codex settings-like payload.
@@ -842,10 +883,17 @@ class _CodexForwarderState:
             self.collaboration_mode = mode
 
     def _note_approval_mode_fields(self, payload: _JsonObject) -> None:
-        """Record Codex approval/sandbox settings as launch args."""
+        """Record Codex approval/sandbox settings as launch args + a runtime preset."""
         args = _codex_terminal_launch_args_from_settings(payload)
         if args is not None:
             self.terminal_launch_args = args
+        # Also resolve the /permissions preset for the web read-back label. A
+        # payload that maps to no preset (e.g. a custom permission profile) has no
+        # preset value to show, so the last-known one stays put — the picker keeps
+        # its prior value rather than blanking. Known limitation for custom profiles.
+        preset = codex_permission_preset_from_thread_settings(payload)
+        if preset is not None:
+            self.approval_preset = preset
 
 
 @dataclass(frozen=True)
@@ -1006,6 +1054,15 @@ def _terminal_error_from_turn(params: _JsonObject) -> _CodexTerminalError | None
     return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
 
 
+def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalError | None:
+    """Return the failure carried by Codex's standalone ``error`` notification."""
+    payload = params.get("error")
+    if not isinstance(payload, dict):
+        return None
+    message = _error_payload_message(payload)
+    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+
+
 @dataclass(frozen=True)
 class _CodexTurnStatusEdge:
     """
@@ -1025,6 +1082,14 @@ class _CodexTurnStatusEdge:
     turn_id: str | None
     source: str
     error: _CodexTerminalError | None = None
+
+
+@dataclass(frozen=True)
+class _PreparedTerminalTurn:
+    """Terminal control-state result retained while output delivery drains."""
+
+    handled: bool
+    edge: _CodexTurnStatusEdge | None
 
 
 # Codex ``item/completed`` item types that represent a built-in tool call.
@@ -1804,8 +1869,10 @@ async def supervise_forwarder(
     if client is None:
         client = client_for_transport(app_server_url, client_name="omnigent-codex-forwarder")
         await client.connect()
-    async with httpx.AsyncClient(
-        base_url=base_url,
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(
+        base_url,
         headers=headers,
         auth=auth,
         timeout=httpx.Timeout(30.0),
@@ -1957,6 +2024,12 @@ async def _maybe_rotate_session_on_thread_started(
     # its own Omnigent child session by ``_handle_event``.
     if _thread_started_is_subagent(event):
         return False
+    # Codex CLI 0.150.1 emits a second ``thread/started`` mid-turn for an
+    # internal system/housekeeping thread (``ephemeral=true``, ``path=null``).
+    # That thread is never persistable and cannot host goals; rotating onto it
+    # strands the real turn's output as stale. Ignore all ephemeral threads.
+    if _thread_started_is_ephemeral(event):
+        return False
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()
     old_usage_coalescer = target.usage_coalescer
@@ -2077,6 +2150,9 @@ async def _create_thread_replacement_session(
                 if state is not None
                 else str(codex_home_for_bridge_dir(bridge_dir))
             ),
+            # Carry the workspace across the rotation, or the executor
+            # falls back to the harness process's own cwd for new turns.
+            cwd=state.cwd if state is not None else None,
         ),
     )
 
@@ -2200,6 +2276,7 @@ async def _subscribe_until_ready(
             # the first tool call, not a turn later. Falls back to the resume
             # response's model when config.toml has none.
             _refresh_model_from_config(bridge_dir, forwarder_state)
+            _refresh_developer_instructions_from_config(bridge_dir, forwarder_state)
             await _sync_model_change(
                 ap_client, session_id=session_id, forwarder_state=forwarder_state
             )
@@ -2833,6 +2910,28 @@ def _refresh_model_from_config(bridge_dir: Path, forwarder_state: _CodexForwarde
         forwarder_state.model = config_model
 
 
+def _refresh_developer_instructions_from_config(
+    bridge_dir: Path, forwarder_state: _CodexForwarderState
+) -> None:
+    """
+    Update the forwarder's known ``developer_instructions`` from ``config.toml``.
+
+    Read ``developer_instructions`` from config.toml and update ``forwarder_state``.
+    PRESENT sets, ABSENT clears, UNREADABLE is a no-op (preserves prior value).
+
+    :param bridge_dir: The session's native-Codex bridge directory.
+    :param forwarder_state: Updated in place.
+    """
+    result = read_codex_config_developer_instructions_state(bridge_dir)
+    if result.state is DeveloperInstructionsReadState.PRESENT:
+        forwarder_state.developer_instructions = result.value
+        forwarder_state.developer_instructions_known = True
+    elif result.state is DeveloperInstructionsReadState.ABSENT:
+        forwarder_state.developer_instructions = None
+        forwarder_state.developer_instructions_known = True
+    # UNREADABLE: no-op — preserve prior value.
+
+
 async def _sync_model_change(
     client: httpx.AsyncClient,
     *,
@@ -2940,19 +3039,35 @@ async def _sync_codex_approval_mode_change(
     session_id: str,
     forwarder_state: _CodexForwarderState,
 ) -> None:
-    """Mirror Codex ``/permissions`` changes into session metadata."""
+    """Mirror Codex ``/permissions`` changes into session metadata.
+
+    Posts two things the server persists differently: ``terminal_launch_args``
+    (the create/fork/resume vocabulary) and ``approval_mode`` (the runtime
+    ``/permissions`` preset that drives the web read-back label + live picker).
+    """
     args = forwarder_state.terminal_launch_args
-    if args is None or args == forwarder_state.posted_terminal_launch_args:
+    preset = forwarder_state.approval_preset
+    args_changed = args is not None and args != forwarder_state.posted_terminal_launch_args
+    preset_changed = preset is not None and preset != forwarder_state.posted_approval_preset
+    if not args_changed and not preset_changed:
         return
+    data: _JsonObject = {}
+    if args is not None:
+        data["terminal_launch_args"] = args
+    if preset is not None:
+        data["approval_mode"] = preset
     response = await _post_session_event(
         client,
         session_id,
         event_type="external_codex_approval_mode_change",
-        data={"terminal_launch_args": args},
+        data=data,
     )
     _log_failed_session_event_post("external_codex_approval_mode_change", response)
     if response is not None and response.status_code < 400:
-        forwarder_state.posted_terminal_launch_args = list(args)
+        if args is not None:
+            forwarder_state.posted_terminal_launch_args = list(args)
+        if preset is not None:
+            forwarder_state.posted_approval_preset = preset
 
 
 async def _maybe_handle_turn_event(
@@ -2983,6 +3098,41 @@ async def _maybe_handle_turn_event(
     :param forwarder_state: Optional forwarder state.
     :returns: ``True`` when this event was handled.
     """
+    if method == "error":
+        if params.get("willRetry") is True:
+            _logger.info(
+                "Codex forwarder observed retryable turn error: turn_id=%s",
+                _turn_id_from_payload(params),
+            )
+            return True
+        if delta_coalescer is not None:
+            await delta_coalescer.flush()
+        error = _terminal_error_from_notification(params)
+        if error is None:
+            _logger.warning("Codex forwarder ignored malformed error notification")
+            return True
+        turn_id = _turn_id_from_payload(params)
+        if forwarder_state is not None and turn_id is not None:
+            if turn_id in forwarder_state.surfaced_terminal_error_turns:
+                _logger.info(
+                    "Codex forwarder ignored duplicate terminal error: turn_id=%s",
+                    turn_id,
+                )
+                return True
+            forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+            clear_active_turn_id_if_matches(bridge_dir, turn_id)
+        await _post_turn_status_edge(
+            client,
+            session_id,
+            _CodexTurnStatusEdge(
+                status="failed",
+                turn_id=turn_id,
+                source="error",
+                error=error,
+            ),
+        )
+        await usage_coalescer.flush()
+        return True
     if method == "turn/started":
         if delta_coalescer is not None:
             await delta_coalescer.flush()
@@ -2996,6 +3146,7 @@ async def _maybe_handle_turn_event(
             # start so a switch made since the last turn lands ``model_override``
             # on Omnigent before this turn's first tool call reaches the cost gate.
             _refresh_model_from_config(bridge_dir, forwarder_state)
+            _refresh_developer_instructions_from_config(bridge_dir, forwarder_state)
             await _sync_model_change(
                 client, session_id=session_id, forwarder_state=forwarder_state
             )
@@ -3206,6 +3357,15 @@ async def _handle_terminal_turn_boundary(
     :param forwarder_state: Optional Plan-mode prompt state.
     :returns: None.
     """
+    # Reconcile control state before any network-backed output flush. Transcript
+    # and status posts retain their original order below, but a slow consumer
+    # can no longer leave a completed Codex turn steerable in bridge state.
+    terminal = _prepare_terminal_turn_event(
+        bridge_dir,
+        method,
+        params,
+        forwarder_state=forwarder_state,
+    )
     if delta_coalescer is not None:
         await delta_coalescer.flush()
     # Safety net: if a compaction was reported in progress but Codex never
@@ -3228,7 +3388,9 @@ async def _handle_terminal_turn_boundary(
         params=params,
         forwarder_state=forwarder_state,
     )
-    handled = await _handle_terminal_turn_event(client, session_id, bridge_dir, method, params)
+    handled = terminal.handled
+    if terminal.edge is not None:
+        await _post_turn_status_edge(client, session_id, terminal.edge)
     if handled:
         await elicitation_tracker.resolve_by_terminal_turn_event(
             client,
@@ -3673,7 +3835,7 @@ async def _codex_elicitation_hook_result(
     :param client: HTTP client for Omnigent hook posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param event: Codex JSON-RPC request envelope.
-    :returns: Parsed JSON-RPC result payload, or ``None``.
+    :returns: Parsed JSON-RPC result, a safe command rejection, or ``None``.
     """
     method = event.get("method")
     request_id = event.get("id")
@@ -3691,6 +3853,10 @@ async def _codex_elicitation_hook_result(
             response.status_code,
             response.text[:512],
         )
+        # A malformed optional execpolicy decision must not leave Codex's
+        # command request unanswered and strand the active turn.
+        if method == _CODEX_COMMAND_EXECUTION_REQUEST_APPROVAL_METHOD:
+            return {"decision": "decline"}
         return None
     if not response.content:
         _logger.info(
@@ -3992,7 +4158,10 @@ async def _start_plan_implementation_turn(
     """
     collaboration_mode = _default_collaboration_mode(forwarder_state)
     if collaboration_mode is None:
-        _logger.warning("Codex plan implementation skipped: current model is unknown")
+        _logger.warning(
+            "Codex plan implementation skipped: current model or "
+            "developer_instructions state is unknown"
+        )
         return
     response = await codex_client.request(
         "turn/start",
@@ -4025,9 +4194,11 @@ async def _start_clear_context_plan_implementation_turn(
     :param forwarder_state: Mutable state with the current model.
     :returns: None.
     """
-    if not forwarder_state.model:
+    # Gate before creating the new thread — a gate failure after switch leaves an orphaned thread.
+    if _default_collaboration_mode(forwarder_state) is None:
         _logger.warning(
-            "Codex clear-context plan implementation skipped: current model is unknown"
+            "Codex clear-context plan implementation skipped: current model or "
+            "developer_instructions state is unknown"
         )
         return
     thread_response = await codex_client.request(
@@ -4057,21 +4228,19 @@ def _default_collaboration_mode(
     """
     Build Codex's Default collaboration mode for ``turn/start``.
 
-    ``developer_instructions: null`` deliberately asks Codex
-    app-server to fill in the built-in Default-mode instructions via
-    its own normalization path.
-
-    :param forwarder_state: Mutable state with the current model.
-    :returns: Codex ``CollaborationMode`` JSON object, or ``None``.
+    :returns: Codex ``CollaborationMode`` JSON object, or ``None`` when the
+        model or developer-instructions state is not yet confirmed.
     """
     if not forwarder_state.model:
+        return None
+    if not forwarder_state.developer_instructions_known:
         return None
     return {
         "mode": "default",
         "settings": {
             "model": forwarder_state.model,
             "reasoning_effort": None,
-            "developer_instructions": None,
+            "developer_instructions": forwarder_state.developer_instructions,
         },
     }
 
@@ -4116,35 +4285,46 @@ def _turn_started_status_edge(
     )
 
 
-async def _handle_terminal_turn_event(
-    client: httpx.AsyncClient,
-    session_id: str,
+def _prepare_terminal_turn_event(
     bridge_dir: Path,
     method: str,
     params: _JsonObject,
-) -> bool:
+    *,
+    forwarder_state: _CodexForwarderState | None = None,
+) -> _PreparedTerminalTurn:
     """
-    Forward a terminal-observed Codex turn completion/failure event.
+    Reconcile a terminal Codex turn and retain its later status post.
 
-    :param client: HTTP client for Omnigent event posts.
-    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param bridge_dir: Native Codex bridge directory.
     :param method: Codex method, e.g. ``"turn/completed"``.
     :param params: Codex turn event params.
-    :returns: ``True`` when the terminal event belonged to the active
-        turn and was forwarded, ``False`` when it was stale.
+    :param forwarder_state: Optional connection state used to suppress a
+        terminal boundary whose standalone error was already surfaced.
+    :returns: Whether the event was handled and its optional status edge.
     """
+    terminal_turn_id = _terminal_turn_id_from_params(params)
+    if (
+        forwarder_state is not None
+        and terminal_turn_id is not None
+        and terminal_turn_id in forwarder_state.surfaced_terminal_error_turns
+    ):
+        clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id)
+        _logger.info(
+            "Codex forwarder suppressed terminal boundary after standalone error: "
+            "method=%s turn_id=%s",
+            method,
+            terminal_turn_id,
+        )
+        return _PreparedTerminalTurn(handled=True, edge=None)
     edge = _terminal_turn_status_edge(bridge_dir, method, params)
     if edge is None:
-        terminal_turn_id = _terminal_turn_id_from_params(params)
         _logger.info(
             "Codex forwarder ignored stale terminal turn event: method=%s turn_id=%s",
             method,
             terminal_turn_id,
         )
-        return False
-    await _post_turn_status_edge(client, session_id, edge)
-    return True
+        return _PreparedTerminalTurn(handled=False, edge=None)
+    return _PreparedTerminalTurn(handled=True, edge=edge)
 
 
 def _terminal_turn_status_edge(
@@ -6276,7 +6456,9 @@ def _session_usage_data_from_params(params: _JsonObject) -> dict[str, int] | Non
     if not isinstance(total, dict):
         return None
     cumulative_input_tokens = total.get("inputTokens")
-    context_window = total.get("contextWindow")
+    context_window = token_usage.get("modelContextWindow")
+    if not isinstance(context_window, int) or context_window <= 0:
+        context_window = total.get("contextWindow")
     output_tokens = total.get("outputTokens")
     cached_input_tokens = total.get("cachedInputTokens")
     data: dict[str, int] = {}
@@ -6830,10 +7012,33 @@ def _thread_started_is_subagent(event: CodexMessage) -> bool:
     return _thread_spawn_source(thread) is not None
 
 
+def _thread_started_is_ephemeral(event: CodexMessage) -> bool:
+    """
+    Return whether a ``thread/started`` event announces an ephemeral thread.
+
+    Codex CLI 0.150.1 emits a second ``thread/started`` mid-turn for an
+    internal system/housekeeping thread marked ``ephemeral=true``. These
+    threads cannot host goals or persist history; rotating onto one strands
+    the real turn's output and breaks goal reads.
+
+    :param event: Codex app-server notification envelope.
+    :returns: ``True`` when the started thread carries ``ephemeral=true``.
+    """
+    if event.get("method") != "thread/started":
+        return False
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return False
+    thread = params.get("thread")
+    if not isinstance(thread, dict):
+        return False
+    return thread.get("ephemeral") is True
+
+
 async def wait_for_thread_started(
     client: CodexAppServerClient,
     *,
-    timeout: float = _THREAD_START_TIMEOUT_SECONDS,
+    timeout: float | None = _THREAD_START_TIMEOUT_SECONDS,
 ) -> str:
     """
     Wait for a freshly launched Codex TUI to create its app-server thread.
@@ -6849,7 +7054,10 @@ async def wait_for_thread_started(
 
     :param client: A connected :class:`CodexAppServerClient` listening for
         app-server notifications.
-    :param timeout: Seconds to wait for ``thread/started`` before failing.
+    :param timeout: Seconds to wait for ``thread/started`` before failing,
+        or ``None`` to wait without a deadline (used when startup failure
+        was already recorded up front and the wait only serves a possible
+        interactive sign-in).
     :returns: The Codex thread id, e.g.
         ``"019e8720-98d7-7b23-ac0a-bfb0eb02e0c9"``.
     :raises TimeoutError: If no ``thread/started`` arrives within *timeout*.

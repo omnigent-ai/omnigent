@@ -14,7 +14,7 @@
 //  12. Comments are marked seen (inbox-clearing registry) only while the
 //      comments panel is open — never from merely opening the file.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -29,12 +29,18 @@ vi.mock("./CodeViewer", () => ({
   // (onDirtyChange) so the mode-switch / navigation guard can be exercised.
   CodeViewer: ({
     viewMode,
+    searchOpen,
     onDirtyChange,
   }: {
     viewMode: string;
+    searchOpen?: boolean;
     onDirtyChange?: (dirty: boolean) => void;
   }) => (
-    <div data-testid="code-viewer" data-view-mode={viewMode}>
+    <div
+      data-testid="code-viewer"
+      data-view-mode={viewMode}
+      data-search-open={String(!!searchOpen)}
+    >
       <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
     </div>
   ),
@@ -46,15 +52,22 @@ vi.mock("./CommentsPanel", () => ({
   // Expose each comment as a button so tests can trigger onClickComment.
   CommentsPanel: ({
     onClickComment,
+    onAddressAll,
     comments,
+    addressedComments,
+    activeSelection,
   }: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     onClickComment?: (comment: any) => void;
+    onAddressAll?: () => void;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     comments?: any[];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    addressedComments?: any[];
+    activeSelection?: { comment_id?: string } | null;
   }) => (
-    <div data-testid="comments-panel">
-      {comments?.map((c: { id: string }) => (
+    <div data-testid="comments-panel" data-active-comment-id={activeSelection?.comment_id ?? ""}>
+      {[...(comments ?? []), ...(addressedComments ?? [])].map((c: { id: string }) => (
         <button
           key={c.id}
           type="button"
@@ -62,6 +75,7 @@ vi.mock("./CommentsPanel", () => ({
           onClick={() => onClickComment?.(c)}
         />
       ))}
+      <button type="button" aria-label="address all comments" onClick={onAddressAll} />
     </div>
   ),
 }));
@@ -72,14 +86,17 @@ vi.mock("./MonacoDiffViewer", () => ({
   MonacoDiffViewer: ({
     wrapLines,
     hideWhitespace,
+    searchOpen,
   }: {
     wrapLines?: boolean;
     hideWhitespace?: boolean;
+    searchOpen?: boolean;
   }) => (
     <div
       data-testid="diff-viewer"
       data-wrap-lines={String(!!wrapLines)}
       data-hide-whitespace={String(!!hideWhitespace)}
+      data-search-open={String(!!searchOpen)}
     />
   ),
 }));
@@ -142,6 +159,7 @@ vi.mock("@/store/chatStore", () => ({
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 import { useComments } from "@/hooks/useComments";
+import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
@@ -151,12 +169,13 @@ import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
 
 const useCommentsMock = vi.mocked(useComments);
+const useOptionalCommentSenderMock = vi.mocked(useOptionalCommentSender);
 
 function makeCommentsQuery(data: Comment[] | undefined) {
   return { data } as ReturnType<typeof useComments>;
 }
 
-function makeComment(id: string): Comment {
+function makeComment(id: string, status: Comment["status"] = "draft"): Comment {
   return {
     id,
     conversation_id: "conv_1",
@@ -164,7 +183,7 @@ function makeComment(id: string): Comment {
     start_index: 0,
     end_index: 5,
     body: "test comment",
-    status: "draft",
+    status,
     created_at: 0,
     updated_at: 0,
     anchor_content: "hello",
@@ -240,6 +259,7 @@ function renderViewer(props: RenderProps = {}) {
 
 beforeEach(() => {
   useCommentsMock.mockReset();
+  useOptionalCommentSenderMock.mockReturnValue(null);
   // FileViewer persists global view preferences (diff/layout/preview) to
   // localStorage. Clear it between tests so a preference written by one test
   // can't leak into another that asserts the hardcoded defaults.
@@ -278,6 +298,38 @@ function installContentWidth(width: number): void {
     y: 0,
     toJSON: () => ({}),
   } as DOMRect);
+}
+
+/**
+ * Force the header's inline toolbar into its collapsed "⋯" overflow state.
+ *
+ * useToolbarOverflow bails in jsdom (no ResizeObserver, zero clientWidth, and
+ * empty computed padding → NaN reserve), so the toolbar never collapses on its
+ * own. This stubs a ResizeObserver so the measure effect runs, numeric header
+ * padding so the reserve math resolves, and a tiny-but-positive header width
+ * that sits below the minimum required width (the title reserve alone is 48px),
+ * which flips `collapsed` to true. getComputedStyle is proxied (not replaced)
+ * so Radix's own positioning reads still see real values.
+ */
+function installCollapsedToolbar(): void {
+  class StubResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  vi.stubGlobal("ResizeObserver", StubResizeObserver);
+  const originalGetComputedStyle = window.getComputedStyle.bind(window);
+  vi.spyOn(window, "getComputedStyle").mockImplementation((el, pseudo) => {
+    const real = originalGetComputedStyle(el, pseudo ?? undefined);
+    return new Proxy(real, {
+      get(target, prop) {
+        if (prop === "paddingLeft" || prop === "paddingRight") return "0px";
+        const val = Reflect.get(target, prop);
+        return typeof val === "function" ? val.bind(target) : val;
+      },
+    });
+  });
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(10);
 }
 
 /**
@@ -703,6 +755,39 @@ describe("FileViewer URL sync — comment param (write)", () => {
     // URL must reflect the NEW selection, not accumulate both.
     expect(screen.getByTestId("url-params").textContent).toContain("comment=c2");
     expect(screen.getByTestId("url-params").textContent).not.toContain("comment=c1");
+  });
+
+  it("does not write an addressed card selection to the URL", () => {
+    const open = makeComment("c1");
+    const addressed = makeComment("c2", "addressed");
+    useCommentsMock.mockReturnValue(makeCommentsQuery([open, addressed]));
+
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(screen.getByTestId("url-params").textContent).toContain("comment=c1");
+
+    fireEvent.click(screen.getByRole("button", { name: "comment c2" }));
+
+    expect(screen.getByTestId("url-params").textContent).not.toContain("comment=");
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c2");
+  });
+});
+
+describe("FileViewer addressed selection", () => {
+  it("keeps the selected comment active while Address All moves it", () => {
+    const mutate = vi.fn();
+    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    const comment = makeComment("c1");
+    useCommentsMock.mockReturnValue(makeCommentsQuery([comment]));
+
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).toHaveBeenCalledWith({ comment_ids: ["c1"] });
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c1");
   });
 });
 
@@ -1305,6 +1390,62 @@ describe("FileViewer view-settings menu", () => {
   });
 });
 
+// ── Collapsed toolbar overflow "⋯" menu ─────────────────────────────────────
+//
+// When the header is too narrow for the inline action buttons, they all fold
+// into one "⋯" ("More actions") overflow menu. The settings menu's items
+// (Find, Download, and the diff-only wrap/whitespace toggles) are already
+// independent, so they flatten straight into this overflow rather than nesting
+// a second "⋯" submenu inside it. The mutually-exclusive view-mode picker still
+// collapses to a submenu (its "one selected choice" semantics need it).
+
+describe("FileViewer collapsed-toolbar overflow menu", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    installCollapsedToolbar();
+  });
+
+  const openOverflowMenu = () =>
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions" }), { button: 0 });
+
+  it("collapses the inline actions into a single '⋯' overflow menu", () => {
+    render(viewerTree({ open: true }));
+    // The inline buttons are gone; only the single overflow trigger remains.
+    expect(screen.getByRole("button", { name: "More actions" })).toBeInTheDocument();
+  });
+
+  it("flattens the settings items into the overflow menu (no '⋯'-in-'⋯' submenu)", () => {
+    render(viewerTree({ open: true }));
+    openOverflowMenu();
+    // The settings items appear as flat rows in the overflow menu…
+    expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Download file" })).toBeInTheDocument();
+    // …and there is no nested "View settings" submenu trigger wrapping them.
+    expect(screen.queryByRole("menuitem", { name: "View settings" })).toBeNull();
+  });
+
+  it("flattens the diff-only wrap/whitespace toggles too, and they still work", async () => {
+    render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    const diff = await screen.findByTestId("diff-viewer");
+    expect(diff).toHaveAttribute("data-wrap-lines", "false");
+    openOverflowMenu();
+    // Diff toggles are flat rows here, not behind a "View settings" submenu.
+    expect(screen.queryByRole("menuitem", { name: "View settings" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Wrap lines" }));
+    expect(screen.getByTestId("diff-viewer")).toHaveAttribute("data-wrap-lines", "true");
+  });
+
+  it("keeps the mutually-exclusive view-mode picker as a submenu", () => {
+    render(viewerTree({ open: true, path: "notes.md" }));
+    openOverflowMenu();
+    // Markdown's Preview/Edit/Source picker still nests (a submenu trigger),
+    // since it carries a single highlighted "selected choice".
+    expect(screen.getByRole("menuitem", { name: "View mode" })).toBeInTheDocument();
+    // Its choices are not surfaced at the top level of the overflow menu.
+    expect(screen.queryByRole("menuitem", { name: "Preview" })).toBeNull();
+  });
+});
+
 describe("FileViewer keyboard shortcut — Alt+← / Alt+→", () => {
   const multipleFiles = [
     { path: "a.py", bytes: 1, modified_at: 100, name: "a.py", status: "modified" as const },
@@ -1410,6 +1551,130 @@ describe("FileViewer keyboard shortcut — Alt+← / Alt+→", () => {
     expect(onNavigateTo).not.toHaveBeenCalled();
 
     document.body.removeChild(input);
+  });
+});
+
+describe("FileViewer Cmd+F opens find on Monaco surfaces", () => {
+  // The Monaco-backed surfaces (code source/editor and the diff view) open
+  // find via the shared `searchOpen` toggle rather than Monaco's own Cmd+F
+  // keybinding — the keybinding needs editor focus and doesn't fire inside the
+  // managed same-root embed, so cmd+f silently did nothing there. These assert
+  // that a Cmd/Ctrl+F flips the toggle FileViewer hands each surface.
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  const searchOpenOf = (testId: string) =>
+    screen.getByTestId(testId).getAttribute("data-search-open");
+
+  it("opens find on the code (source) surface with Cmd+F", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    expect(searchOpenOf("code-viewer")).toBe("false");
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("true");
+  });
+
+  it("opens find on the code surface with Ctrl+F (Windows/Linux)", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("true");
+  });
+
+  it("opens find in the diff view with Cmd+F", async () => {
+    renderViewer({ open: true, path: "file1.py", initialSearch: "diff=1" });
+    // Diff view renders MonacoDiffViewer, not CodeViewer.
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+    expect(searchOpenOf("diff-viewer")).toBe("false");
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("diff-viewer")).toBe("true");
+  });
+
+  it("does not intercept Cmd+Shift+F (leaves other chords alone)", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.keyDown(window, { key: "f", metaKey: true, shiftKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("false");
+  });
+
+  it("leaves the markdown editor surface to CodeViewer's own find handler", () => {
+    // Markdown defaults to the rich-text editor — a non-Monaco surface whose
+    // Cmd+F is owned by CodeViewer, so FileViewer's handler must stay inert
+    // (the mocked CodeViewer never flips searchOpen on its own).
+    renderViewer({ open: true, path: "notes.md" });
+    expect(screen.getByTestId("code-viewer").getAttribute("data-view-mode")).toBe("editor");
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("false");
+  });
+
+  const insideButton = () =>
+    within(screen.getByTestId("file-viewer")).getByRole("button", { name: "make dirty" });
+
+  it("opens find when the last interaction was inside the file viewer", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.mouseDown(insideButton());
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("true");
+  });
+
+  it("does NOT open file find when focus moves to the chat composer (outside the viewer)", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    // The viewer stays mounted beside the chat; focusing the composer must leave
+    // Cmd+F to the browser's find-in-page, not the file's find.
+    const composer = document.createElement("textarea");
+    document.body.appendChild(composer);
+    composer.focus();
+    fireEvent.keyDown(composer, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("false");
+    document.body.removeChild(composer);
+  });
+
+  it("does NOT open file find after the user clicks a non-focusable chat area", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    // Clicking a non-focusable region of the chat page drops focus to <body>,
+    // but the click marks the chat as the active surface — the exact case that
+    // used to still open the file's find.
+    const chatArea = document.createElement("div");
+    document.body.appendChild(chatArea);
+    fireEvent.mouseDown(chatArea);
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("false");
+    document.body.removeChild(chatArea);
+  });
+
+  it("re-claims Cmd+F after the user clicks back into the viewer", () => {
+    renderViewer({ open: true, path: "file1.py" });
+    const chatArea = document.createElement("div");
+    document.body.appendChild(chatArea);
+    fireEvent.mouseDown(chatArea); // leave the viewer
+    fireEvent.mouseDown(insideButton()); // click back into the viewer
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("true");
+    document.body.removeChild(chatArea);
+  });
+
+  it.each(["pic.png", "doc.pdf", "widget.stl", "blob.bin"])(
+    "does NOT claim Cmd+F on non-Monaco viewers (%s)",
+    (path) => {
+      // Images, PDFs, 3D models, and binary files render CodeViewer's own
+      // viewers / "preview not available" notice, not Monaco — there is no find
+      // widget, so Cmd+F must fall through to the browser's find-in-page.
+      renderViewer({ open: true, path });
+      fireEvent.keyDown(window, { key: "f", metaKey: true });
+      expect(searchOpenOf("code-viewer")).toBe("false");
+    },
+  );
+
+  it("re-seeds the active surface when the viewer reopens the same path", () => {
+    const { rerender } = renderViewer({ open: true, path: "file1.py" });
+    // User clicks into the chat → the viewer is no longer the active surface.
+    const chatArea = document.createElement("div");
+    document.body.appendChild(chatArea);
+    fireEvent.mouseDown(chatArea);
+    // Close, then reopen the SAME path (no path change to re-seed on).
+    rerender(viewerTree({ open: false, path: "file1.py" }));
+    rerender(viewerTree({ open: true, path: "file1.py" }));
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("true");
+    document.body.removeChild(chatArea);
   });
 });
 

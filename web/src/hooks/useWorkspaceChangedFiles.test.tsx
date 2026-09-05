@@ -15,10 +15,14 @@ vi.mock("@/store/chatStore", () => ({
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
+  type WorkspaceEnvironment,
   MAX_RUNNER_OFFLINE_RETRIES,
   RunnerOfflineError,
+  browseLocationBase,
+  browseLocationSegment,
   isRunnerUnavailable503,
   looksLikeWorkspaceFilePath,
+  relativizeToWorkspace,
   runnerOfflineRetryDelay,
   shouldRetryRunnerOffline,
   toWorkspaceRelativePath,
@@ -108,7 +112,7 @@ function EnvironmentDataProbe({
   onData,
 }: {
   id: string | undefined;
-  onData: (data: { available: boolean; root: string | null; home: string | null }) => void;
+  onData: (data: WorkspaceEnvironment) => void;
 }) {
   const query = useWorkspaceEnvironment(id);
   useEffect(() => {
@@ -141,6 +145,45 @@ function FileSearchProbe({
   enabled?: boolean;
 }) {
   useWorkspaceFileSearch(id, query, include, exclude, { enabled });
+  return null;
+}
+
+function AllFilesPathsProbe({
+  id,
+  location,
+  onPaths,
+}: {
+  id: string;
+  location: string;
+  onPaths: (paths: string[]) => void;
+}) {
+  const query = useWorkspaceAllFiles(id, {}, location);
+  useEffect(() => {
+    if (query.isSuccess) onPaths(query.data.data.map((f) => f.path));
+  }, [query.isSuccess, query.data, onPaths]);
+  return null;
+}
+
+function DirectoryPathsProbe({
+  id,
+  path,
+  location,
+  onPaths,
+}: {
+  id: string;
+  path: string;
+  location: string;
+  onPaths: (paths: string[]) => void;
+}) {
+  const query = useWorkspaceDirectory(id, path, location);
+  useEffect(() => {
+    if (query.isSuccess) onPaths(query.data.map((f) => f.path));
+  }, [query.isSuccess, query.data, onPaths]);
+  return null;
+}
+
+function AllFilesProbeAt({ id, location }: { id: string; location: string }) {
+  useWorkspaceAllFiles(id, {}, location);
   return null;
 }
 
@@ -313,6 +356,37 @@ describe("useWorkspaceChangedFiles gating", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("surfaces the session's reach so the panel knows where it may navigate", async () => {
+    // The panel decides whether to offer navigation at all from this field;
+    // if it were dropped the control would never appear.
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        metadata: {
+          root: "/home/u/ws",
+          home: "/home/u",
+          reachable: {
+            unconfined: true,
+            roots: [{ path: "/home/u/ws", access: "write", origin: "cwd" }],
+          },
+        },
+      }),
+    );
+    const results: WorkspaceEnvironment[] = [];
+
+    render(
+      <Wrap>
+        <EnvironmentDataProbe id="conv_live" onData={(data) => results.push(data)} />
+      </Wrap>,
+    );
+    await waitFor(() =>
+      expect(results.at(-1)?.reachable).toEqual({
+        unconfined: true,
+        roots: [{ path: "/home/u/ws", access: "write", origin: "cwd" }],
+      }),
+    );
+  });
+
   it("does not fetch when disabled by the caller", async () => {
     onlineMock.mockReturnValue(true);
 
@@ -440,7 +514,7 @@ describe("useWorkspaceEnvironment gating", () => {
   it("marks the environment unavailable when the server omits metadata.root", async () => {
     onlineMock.mockReturnValue(true);
     fetchMock.mockResolvedValue(jsonResponse({ metadata: {} }));
-    const results: { available: boolean; root: string | null; home: string | null }[] = [];
+    const results: WorkspaceEnvironment[] = [];
 
     render(
       <Wrap>
@@ -448,7 +522,12 @@ describe("useWorkspaceEnvironment gating", () => {
       </Wrap>,
     );
     await waitFor(() =>
-      expect(results.at(-1)).toEqual({ available: false, root: null, home: null }),
+      expect(results.at(-1)).toEqual({
+        available: false,
+        root: null,
+        home: null,
+        reachable: null,
+      }),
     );
   });
 
@@ -459,7 +538,7 @@ describe("useWorkspaceEnvironment gating", () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ metadata: { root: "/home/u/ws", home: "/home/u" } }),
     );
-    const results: { available: boolean; root: string | null; home: string | null }[] = [];
+    const results: WorkspaceEnvironment[] = [];
 
     render(
       <Wrap>
@@ -467,7 +546,12 @@ describe("useWorkspaceEnvironment gating", () => {
       </Wrap>,
     );
     await waitFor(() =>
-      expect(results.at(-1)).toEqual({ available: true, root: "/home/u/ws", home: "/home/u" }),
+      expect(results.at(-1)).toEqual({
+        available: true,
+        root: "/home/u/ws",
+        home: "/home/u",
+        reachable: null,
+      }),
     );
   });
 
@@ -703,6 +787,25 @@ describe("looksLikeWorkspaceFilePath", () => {
     ["/a", false, "leading slash → no parent segment"],
   ])("returns %o → %s (%s)", (input, expected) => {
     expect(looksLikeWorkspaceFilePath(input as string)).toBe(expected);
+  });
+});
+
+describe("relativizeToWorkspace", () => {
+  // The wire form decides the authorization level the server applies: an
+  // absolute location is owner-gated (it can name any path on the host), a
+  // relative one is not. So a folder INSIDE the workspace must go out
+  // relative, or every collaborator browsing their own workspace gets a 403.
+  it.each([
+    [null, "/work/proj", "", "the root is the empty location"],
+    ["/work/proj", "/work/proj", "", "the root itself normalizes to empty"],
+    ["/work/proj/", "/work/proj", "", "a trailing slash on the root still matches"],
+    ["/work/proj/src", "/work/proj", "src", "a child goes out relative"],
+    ["/work/proj/src/ui", "/work/proj", "src/ui", "a deep child keeps its subpath"],
+    ["/etc", "/work/proj", "/etc", "an outside path stays absolute"],
+    ["/work/proj-old", "/work/proj", "/work/proj-old", "a name-prefixed sibling is NOT a child"],
+    ["/work/proj", null, "/work/proj", "an unknown root cannot be relativized"],
+  ])("%s under %s -> %s (%s)", (browsed, root, expected, why) => {
+    expect(relativizeToWorkspace(browsed, root), why).toBe(expected);
   });
 });
 
@@ -953,5 +1056,153 @@ describe("runnerOfflineRetryDelay", () => {
     expect(runnerOfflineRetryDelay(3)).toBe(8000);
     expect(runnerOfflineRetryDelay(4)).toBe(15_000);
     expect(runnerOfflineRetryDelay(10)).toBe(15_000);
+  });
+});
+
+describe("browse-location listings normalize to paths relative to the location", () => {
+  // The runner answers the two wire forms with DIFFERENT path shapes: a
+  // relative location is echoed back as a prefix on every entry, an absolute
+  // one is not. The panel picks the wire form on authorization grounds, so it
+  // must not also inherit a shape change -- an un-stripped prefix renders the
+  // browsed folder as an extra level inside its own tree.
+  function entries(...paths: string[]): Response {
+    return jsonResponse({
+      object: "list",
+      data: paths.map((path) => ({
+        id: path,
+        name: path.split("/").pop(),
+        path,
+        type: "file",
+        bytes: 1,
+        modified_at: null,
+      })),
+      has_more: false,
+    });
+  }
+
+  beforeEach(() => {
+    onlineMock.mockReturnValue(true);
+  });
+
+  it("strips the echoed prefix a relative location comes back with", async () => {
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(entries("reports/summary.md", "reports/q3.csv"));
+    const onPaths = vi.fn();
+
+    render(
+      <Wrap>
+        <AllFilesPathsProbe id="conv_rel" location="reports" onPaths={onPaths} />
+      </Wrap>,
+    );
+    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+
+    expect(onPaths).toHaveBeenLastCalledWith(["summary.md", "q3.csv"]);
+  });
+
+  it("leaves an absolute location's already-bare paths alone", async () => {
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(entries("summary.md"));
+    const onPaths = vi.fn();
+
+    render(
+      <Wrap>
+        <AllFilesPathsProbe id="conv_abs" location="/elsewhere/reports" onPaths={onPaths} />
+      </Wrap>,
+    );
+    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+
+    expect(onPaths).toHaveBeenLastCalledWith(["summary.md"]);
+  });
+
+  it.each([
+    ["reports", "reports/quarterly/q3.csv", "a relative location echoes the whole target"],
+    ["/elsewhere/reports", "q3.csv", "an absolute one lists bare"],
+  ])("roots a lazily-expanded directory's children under it (%s)", async (location, wirePath) => {
+    // Children address themselves relative to the tree's root, not to the
+    // directory that was listed -- otherwise expanding one level deeper
+    // would request the wrong path.
+    fetchMock.mockResolvedValueOnce(entries(wirePath));
+    const onPaths = vi.fn();
+
+    render(
+      <Wrap>
+        <DirectoryPathsProbe id="conv_dir" path="quarterly" location={location} onPaths={onPaths} />
+      </Wrap>,
+    );
+    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+
+    expect(onPaths).toHaveBeenLastCalledWith(["quarterly/q3.csv"]);
+  });
+});
+
+describe("browse-location wire form (survives a slash-merging proxy)", () => {
+  // The absolute/relative distinction must NOT ride on a leading "%2F" in the
+  // path: that decodes to a "//" which reverse proxies (the Databricks Apps
+  // front door) merge to a single "/", turning an absolute path into a
+  // workspace-relative one. Paths go out with literal slashes and no leading
+  // "%2F"; the base is named out of band via `?base=host`.
+  describe("browseLocationSegment", () => {
+    it.each([
+      ["", "", "root is empty"],
+      ["/", "", "filesystem root is empty (base names it)"],
+      ["src/app.ts", "src/app.ts", "relative path is bare"],
+      ["/Users/me", "Users/me", "absolute path drops its leading slash"],
+      ["/a/b/c", "a/b/c", "deep absolute path drops only the leading slash"],
+      ["/my docs/f", "my%20docs/f", "segments are still percent-encoded"],
+    ])("%s -> %s (%s)", (location, expected) => {
+      const seg = browseLocationSegment(location);
+      expect(seg, expected).toBe(expected);
+      expect(seg.includes("%2F"), "no %2F leading marker").toBe(false);
+    });
+  });
+
+  describe("browseLocationBase", () => {
+    it.each([
+      ["", null],
+      ["src/app.ts", null],
+      ["/", "host"],
+      ["/Users/me", "host"],
+    ])("%s -> %s", (location, expected) => {
+      expect(browseLocationBase(location)).toBe(expected);
+    });
+  });
+
+  it("requests an absolute location with a bare path plus base=host", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    render(
+      <Wrap>
+        <AllFilesProbeAt id="conv_abs_url" location="/Users/me/reports" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    const url = String(fetchMock.mock.calls[1][0]);
+    expect(url).toContain("/filesystem/Users/me/reports?");
+    expect(url).toContain("base=host");
+    expect(url.includes("%2F"), "no %2F in the absolute request").toBe(false);
+  });
+
+  it("requests a workspace-relative location with no base param", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    render(
+      <Wrap>
+        <AllFilesProbeAt id="conv_rel_url" location="src/inner" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    const url = String(fetchMock.mock.calls[1][0]);
+    expect(url).toContain("/filesystem/src/inner?");
+    expect(url).not.toContain("base=");
   });
 });

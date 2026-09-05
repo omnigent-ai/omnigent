@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import re
+import sys
+import types
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,11 +17,22 @@ import click
 import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
+from pydantic import BaseModel
 
 from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
 from omnigent.entities.agent import Agent
-from omnigent.onboarding.sandboxes.base import render_host_config_write_command
+from omnigent.onboarding.sandboxes.base import (
+    SandboxHostLauncher,
+    render_host_config_write_command,
+)
+from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
+from omnigent.onboarding.sandboxes.registry import (
+    COMMUNITY_MODULE_PREFIX,
+    SandboxProviderContribution,
+    SandboxProviderMetadata,
+    reset_plugin_state_for_tests,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
@@ -30,6 +45,7 @@ from omnigent.server.managed_hosts import (
     ManagedLaunch,
     ManagedLaunchTracker,
     ManagedSandboxConfig,
+    ManagedSandboxDeployment,
     RepoWorkspace,
     host_resume_supported,
     launch_managed_host,
@@ -40,14 +56,16 @@ from omnigent.server.managed_hosts import (
     resume_managed_host,
     terminate_managed_host,
 )
+from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
-from omnigent.stores.host_store import HostStore
+from omnigent.stores.host_store import Host, HostStore
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
+    install_fake_blaxel_launcher,
     install_fake_boxlite_launcher,
     install_fake_daytona_launcher,
     install_fake_e2b_launcher,
@@ -68,22 +86,25 @@ def _injected_config(
     server_url: str = "https://srv.example.com",
     token_ttl_s: int = 3600,
     host_config: dict[str, object] | None = None,
-) -> ManagedSandboxConfig:
+) -> ManagedSandboxDeployment:
     """
-    Build a config that injects *fake* through the launcher-factory seam
-    — the same way an embedding deployment injects a custom launcher.
+    Build a one-provider deployment that injects *fake* through the
+    launcher-factory seam — the same way an embedding deployment injects
+    a custom launcher.
 
     :param fake: The launcher every launch should use.
     :param server_url: Server URL the sandbox host dials back to.
     :param token_ttl_s: Launch-token lifetime in seconds.
     :param host_config: In-sandbox config.yaml content to forward, or ``None``.
-    :returns: A ready :class:`ManagedSandboxConfig`.
+    :returns: A ready one-provider :class:`ManagedSandboxDeployment`.
     """
-    return ManagedSandboxConfig(
-        server_url=server_url,
-        launcher_factory=lambda: fake,
-        token_ttl_s=token_ttl_s,
-        host_config=host_config,
+    return ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url=server_url,
+            launcher_factory=lambda: fake,
+            token_ttl_s=token_ttl_s,
+            host_config=host_config,
+        )
     )
 
 
@@ -132,6 +153,81 @@ def test_parse_absent_section_disables_managed_hosts() -> None:
     assert parse_sandbox_config(None) is None
 
 
+def test_parse_reaper_defaults_disabled_with_thirty_day_cutoff() -> None:
+    """Managed sandbox cleanup is opt-in and defaults to a 30-day age."""
+    config = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
+    assert config is not None
+    assert config.reaper.enabled is False
+    assert config.reaper.terminate_after_offline_days == 30
+    assert config.reaper.sweep_interval_s == 86400
+
+
+def test_parse_reaper_is_one_deployment_wide_policy_for_multiple_providers() -> None:
+    """One top-level reaper config applies across every offered provider."""
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "reaper": {
+                "enabled": True,
+                "terminate_after_offline_days": 7,
+                "sweep_interval_s": 1234,
+            },
+            "providers": [
+                {"provider": "modal"},
+                {"provider": "e2b"},
+            ],
+        }
+    )
+    assert config is not None
+    assert config.reaper.enabled is True
+    assert config.reaper.terminate_after_offline_days == 7
+    assert config.reaper.sweep_interval_s == 1234
+    assert [entry.provider for entry in config.offered()] == ["modal", "e2b"]
+
+
+@pytest.mark.parametrize(
+    ("reaper", "expected_fragment"),
+    [
+        (True, "must be a mapping"),
+        ({"enabled": "yes"}, "enabled.*boolean"),
+        ({"terminate_after_offline_days": 0}, "positive integer"),
+        ({"terminate_after_offline_days": True}, "positive integer"),
+        ({"terminate_after_offline_days": "30d"}, "positive integer"),
+        ({"sweep_interval_s": 0}, "positive integer"),
+        ({"sweep_interval_s": True}, "positive integer"),
+        ({"sweep_interval_s": "1d"}, "positive integer"),
+        ({"offline_after_s": 60}, "unknown key"),
+    ],
+)
+def test_parse_reaper_rejects_malformed_config(
+    reaper: object,
+    expected_fragment: str,
+) -> None:
+    """Reaper typos fail server startup instead of silently disabling cleanup."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "reaper": reaper,
+            }
+        )
+
+
+def test_parse_reaper_rejects_per_provider_override() -> None:
+    """The reaper loop is configured once, never independently per provider."""
+    with pytest.raises(ValueError, match="deployment-wide"):
+        parse_sandbox_config(
+            {
+                "server_url": "https://s.example.com",
+                "providers": [
+                    {"provider": "modal", "reaper": {"enabled": True}},
+                    {"provider": "e2b"},
+                ],
+            }
+        )
+
+
 def test_parse_valid_modal_config_builds_image_parameterized_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -150,6 +246,7 @@ def test_parse_valid_modal_config_builds_image_parameterized_factory(
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     assert cfg.server_url == "https://srv.example.com"
     assert cfg.token_ttl_s == MODAL_MANAGED_TOKEN_TTL_S
     # modal is in PROVIDERS_WITH_MANAGED_LAUNCH, so the parsed config
@@ -180,6 +277,7 @@ def test_parse_modal_without_image_defaults_to_official(
     """
     cfg = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_modal_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -196,6 +294,7 @@ def test_parse_non_modal_provider_yields_rejecting_factory() -> None:
     """
     cfg = parse_sandbox_config({"provider": "lakebox", "server_url": "https://s.example.com"})
     assert cfg is not None
+    cfg = cfg.default
     # A staged provider must not advertise managed launch on /v1/info —
     # the web UI would offer a sandbox option every create rejects.
     assert cfg.managed_launch_supported is False
@@ -228,6 +327,7 @@ def test_parse_valid_daytona_config_builds_parameterized_factory(
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     assert cfg.server_url == "https://srv.example.com"
     assert cfg.token_ttl_s == DAYTONA_MANAGED_TOKEN_TTL_S
     assert cfg.managed_launch_supported is True
@@ -248,11 +348,93 @@ def test_parse_daytona_without_section_defaults(
     """
     cfg = parse_sandbox_config({"provider": "daytona", "server_url": "https://s.example.com"})
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_daytona_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
     assert fake.image is None
     assert fake.env is None
+
+
+def test_parse_valid_blaxel_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = parse_sandbox_config(
+        {
+            "provider": "blaxel",
+            "server_url": "https://srv.example.com/",
+            "blaxel": {
+                "image": "blaxel/omnigent-host:test-tag",
+                "env": ["OPENAI_API_KEY"],
+                "region": "us-test-1",
+                "memory_mb": 8192,
+                "ttl": "24h",
+            },
+        }
+    )
+
+    assert cfg is not None
+    cfg = cfg.default
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == blaxel_managed_token_ttl_s("24h")
+    assert cfg.managed_launch_supported is True
+    fake = FakeSandboxLauncher()
+    install_fake_blaxel_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image == "blaxel/omnigent-host:test-tag"
+    assert fake.env == ["OPENAI_API_KEY"]
+    assert fake.region == "us-test-1"
+    assert fake.memory_mb == 8192
+    assert fake.ttl == "24h"
+
+
+def test_parse_blaxel_without_section_uses_launcher_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = parse_sandbox_config({"provider": "blaxel", "server_url": "https://s.example"})
+
+    assert cfg is not None
+    cfg = cfg.default
+    fake = FakeSandboxLauncher()
+    install_fake_blaxel_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image is None
+    assert fake.env is None
+    assert fake.region is None
+    assert fake.memory_mb is None
+    assert fake.ttl is None
+    assert cfg.token_ttl_s == blaxel_managed_token_ttl_s()
+
+
+def test_parse_blaxel_token_ttl_tracks_configured_sandbox_ttl() -> None:
+    """
+    A managed session sized past the 24h default raises the sandbox age and
+    the launch-token lifetime together, so the token never expires while
+    Blaxel still keeps the host alive.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "blaxel",
+            "server_url": "https://s.example",
+            "blaxel": {"ttl": "7d"},
+        }
+    )
+
+    assert cfg is not None
+    cfg = cfg.default
+    assert cfg.token_ttl_s == 7 * 24 * 3600 + 3600
+    assert cfg.token_ttl_s > blaxel_managed_token_ttl_s()
+
+
+def test_parse_blaxel_rejects_malformed_sandbox_ttl() -> None:
+    with pytest.raises(ValueError, match=re.escape("sandbox.blaxel.ttl")):
+        parse_sandbox_config(
+            {
+                "provider": "blaxel",
+                "server_url": "https://s.example",
+                "blaxel": {"ttl": "forever"},
+            }
+        )
 
 
 def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
@@ -277,6 +459,7 @@ def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     assert cfg.server_url == "https://srv.example.com"
     assert cfg.token_ttl_s == BOXLITE_MANAGED_TOKEN_TTL_S
     assert cfg.managed_launch_supported is True
@@ -300,6 +483,7 @@ def test_parse_boxlite_without_section_defaults_local(
     """
     cfg = parse_sandbox_config({"provider": "boxlite", "server_url": "https://s.example.com"})
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_boxlite_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -333,6 +517,7 @@ def test_parse_boxlite_local_customization_reaches_launcher(
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_boxlite_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -371,6 +556,7 @@ def test_parse_valid_islo_config_builds_parameterized_factory(
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     assert cfg.server_url == "https://srv.example.com"
     assert cfg.token_ttl_s == ISLO_MANAGED_TOKEN_TTL_S
     assert cfg.managed_launch_supported is True
@@ -400,6 +586,7 @@ def test_parse_islo_without_section_defaults(
     """
     cfg = parse_sandbox_config({"provider": "islo", "server_url": "https://s.example.com"})
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_islo_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -427,6 +614,7 @@ def test_parse_islo_config_idle_pause_null_disables_lifecycle(
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_islo_launcher(monkeypatch, fake)
 
@@ -454,6 +642,7 @@ def test_parse_valid_e2b_config_builds_parameterized_factory(
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     assert cfg.server_url == "https://srv.example.com"
     assert cfg.token_ttl_s == e2b_managed_token_ttl_s()
     assert cfg.managed_launch_supported is True
@@ -475,6 +664,7 @@ def test_parse_e2b_without_section_defaults(
     """
     cfg = parse_sandbox_config({"provider": "e2b", "server_url": "https://s.example.com"})
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_e2b_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -515,6 +705,7 @@ def test_parse_valid_openshell_config_builds_parameterized_factory(
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     assert cfg.server_url == "https://srv.example.com"
     assert cfg.token_ttl_s == OPENSHELL_MANAGED_TOKEN_TTL_S
     assert cfg.managed_launch_supported is True
@@ -538,6 +729,7 @@ def test_parse_openshell_without_section_defaults(
     """
     cfg = parse_sandbox_config({"provider": "openshell", "server_url": "https://s.example.com"})
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_openshell_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -553,7 +745,8 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
     """
     The documented kubernetes YAML shape parses into a config whose factory
     constructs Kubernetes launchers carrying namespace / Secret / SA / node
-    selector / in-cluster / resources, with the 7-day token TTL.
+    selector / in-cluster / resources / pod-ready timeout, with the 7-day
+    token TTL.
     """
     cfg = parse_sandbox_config(
         {
@@ -566,12 +759,15 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
                 "secret_name": "omnigent-creds",
                 "service_account": "omnigent-runner",
                 "node_selector": {"omnigent.ai/runner-ready": "true"},
+                "runtime_class": "kata",
                 "in_cluster": True,
                 "resources": {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}},
+                "pod_ready_timeout_s": 300,
             },
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     assert cfg.server_url == "http://omnigent.omnigent.svc.cluster.local"
     assert cfg.token_ttl_s == KUBERNETES_MANAGED_TOKEN_TTL_S
     assert cfg.managed_launch_supported is True
@@ -585,8 +781,10 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
     assert fake.secret_name == "omnigent-creds"
     assert fake.service_account == "omnigent-runner"
     assert fake.node_selector == {"omnigent.ai/runner-ready": "true"}
+    assert fake.runtime_class == "kata"
     assert fake.in_cluster is True
     assert fake.resources == {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}}
+    assert fake.pod_ready_timeout_s == 300
 
 
 def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -598,6 +796,7 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
         {"provider": "kubernetes", "server_url": "http://s.svc.cluster.local"}
     )
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_kubernetes_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -606,6 +805,7 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.in_cluster is None
     assert fake.resources is None
     assert fake.pvc_mounts is None
+    assert fake.pod_ready_timeout_s is None
 
 
 def test_parse_host_config_threads_verbatim_without_resolving_secrets(
@@ -638,6 +838,7 @@ def test_parse_host_config_threads_verbatim_without_resolving_secrets(
     )
 
     assert cfg is not None
+    cfg = cfg.default
     assert cfg.host_config == host_config
 
 
@@ -645,6 +846,7 @@ def test_parse_absent_host_config_is_none() -> None:
     """No host_config key → nothing forwarded, existing configs unchanged."""
     cfg = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
     assert cfg is not None
+    cfg = cfg.default
     assert cfg.host_config is None
 
 
@@ -733,12 +935,18 @@ def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
     [
         ({"namespace": "Bad_NS"}, "sandbox.kubernetes.namespace"),
         ({"node_selector": {"omnigent.ai/x": "Bad Value"}}, "node_selector"),
+        ({"runtime_class": "Not_A_DNS_Name"}, "sandbox.kubernetes.runtime_class"),
         ({"resources": {"requests": {"cpu": "not a quantity!"}}}, "valid Kubernetes quantity"),
         ({"resources": {"requests": {"disk": "1Gi"}}}, "unknown key"),
         ({"in_cluster": "yes"}, "must be a boolean"),
         # A misspelled section key would silently no-op (e.g. no PVCs mounted)
         # without the allowlist check.
         ({"pvc_mount": [{"claim_name": "c", "mount_path": "/mnt/x"}]}, "unknown key"),
+        # The wait budget must be a real positive integer — a coerced "90" or
+        # a YAML boolean would silently change how long launches may take.
+        ({"pod_ready_timeout_s": 0}, "positive integer"),
+        ({"pod_ready_timeout_s": "90"}, "positive integer"),
+        ({"pod_ready_timeout_s": True}, "positive integer"),
     ],
 )
 def test_parse_kubernetes_invalid_block_fails_loud(
@@ -772,6 +980,7 @@ def test_parse_kubernetes_pvc_mounts_normalizes_and_reaches_launcher(
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_kubernetes_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -791,6 +1000,7 @@ def test_parse_kubernetes_without_pvc_mounts_is_none(monkeypatch: pytest.MonkeyP
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_kubernetes_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -888,6 +1098,7 @@ def test_parse_kubernetes_pvc_mounts_reserved_check_is_segment_aware(mount_path:
         }
     )
     assert cfg is not None
+    cfg = cfg.default
 
 
 def test_parse_kubernetes_pvc_mounts_sibling_prefix_is_not_nested() -> None:
@@ -905,6 +1116,7 @@ def test_parse_kubernetes_pvc_mounts_sibling_prefix_is_not_nested() -> None:
         }
     )
     assert cfg is not None
+    cfg = cfg.default
 
 
 def test_parse_kubernetes_pvc_mounts_nesting_is_rejected_regardless_of_order() -> None:
@@ -963,6 +1175,7 @@ def test_parse_kubernetes_pvc_mounts_allows_same_claim_at_two_paths() -> None:
         }
     )
     assert cfg is not None
+    cfg = cfg.default
 
 
 def test_parse_kubernetes_secret_mounts_normalizes_and_reaches_launcher(
@@ -982,6 +1195,7 @@ def test_parse_kubernetes_secret_mounts_normalizes_and_reaches_launcher(
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_kubernetes_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -1001,6 +1215,7 @@ def test_parse_kubernetes_without_secret_mounts_is_none(monkeypatch: pytest.Monk
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_kubernetes_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -1075,6 +1290,7 @@ def test_parse_kubernetes_secret_mounts_reserved_check_is_segment_aware(mount_pa
         }
     )
     assert cfg is not None
+    cfg = cfg.default
 
 
 @pytest.mark.parametrize(
@@ -1113,6 +1329,7 @@ def test_parse_kubernetes_pvc_and_secret_mounts_coexist_at_distinct_paths(
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_kubernetes_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -1137,6 +1354,7 @@ def test_parse_kubernetes_secret_mounts_sibling_prefix_is_not_nested() -> None:
         }
     )
     assert cfg is not None
+    cfg = cfg.default
 
 
 def test_parse_kubernetes_secret_mounts_nesting_is_rejected_regardless_of_order() -> None:
@@ -1172,6 +1390,7 @@ def test_parse_kubernetes_secret_mounts_allows_same_secret_at_two_paths() -> Non
         }
     )
     assert cfg is not None
+    cfg = cfg.default
 
 
 @pytest.mark.parametrize(
@@ -1204,6 +1423,24 @@ def test_parse_kubernetes_secret_mounts_allows_same_secret_at_two_paths() -> Non
         (
             {"provider": "daytona", "server_url": "https://s", "daytona": {"env": ["", "X"]}},
             "sandbox.daytona.env",
+        ),
+        # blaxel section present but malformed.
+        ({"provider": "blaxel", "server_url": "https://s", "blaxel": "x"}, "sandbox.blaxel"),
+        (
+            {"provider": "blaxel", "server_url": "https://s", "blaxel": {"image": " "}},
+            "OMNIGENT_BLAXEL_HOST_IMAGE",
+        ),
+        (
+            {"provider": "blaxel", "server_url": "https://s", "blaxel": {"memory_mb": 0}},
+            "sandbox.blaxel.memory_mb",
+        ),
+        (
+            {"provider": "blaxel", "server_url": "https://s", "blaxel": {"region": " "}},
+            "sandbox.blaxel.region",
+        ),
+        (
+            {"provider": "blaxel", "server_url": "https://s", "blaxel": {"timeout": 10}},
+            "unknown key",
         ),
         # boxlite section present but malformed.
         ({"provider": "boxlite", "server_url": "https://s", "boxlite": "x"}, "sandbox.boxlite"),
@@ -1497,7 +1734,9 @@ def test_parse_repo_workspace_rejects_malformed(workspace: str, expected_fragmen
 def _capability_probe_app(
     db_uri: str,
     tmp_path: Path,
-    sandbox_config: ManagedSandboxConfig | None,
+    sandbox_config: ManagedSandboxDeployment | None,
+    *,
+    host_store: HostStore | None = None,
 ) -> FastAPI:
     """
     Build a real app wired with *sandbox_config* to probe ``GET /v1/info``.
@@ -1509,6 +1748,7 @@ def _capability_probe_app(
     :param tmp_path: Per-test scratch dir for artifact/cache stores.
     :param sandbox_config: The sandbox config under test, or ``None``
         when managed hosts are not configured.
+    :param host_store: Optional managed-host store for lifespan tests.
     :returns: The assembled FastAPI app.
     """
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
@@ -1518,8 +1758,46 @@ def _capability_probe_app(
         conversation_store=SqlAlchemyConversationStore(db_uri),
         artifact_store=artifact_store,
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        host_store=host_store,
         sandbox_config=sandbox_config,
     )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_lifespan_gates_one_deployment_wide_managed_sandbox_reaper(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    enabled: bool,
+) -> None:
+    """One lifespan task covers all providers and obeys the global enable flag."""
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "reaper": {"enabled": enabled},
+            "providers": [{"provider": "modal"}, {"provider": "e2b"}],
+        }
+    )
+    assert config is not None
+    app = _capability_probe_app(
+        db_uri,
+        tmp_path,
+        config,
+        host_store=HostStore(db_uri),
+    )
+
+    async with app.router.lifespan_context(app):
+        reaper = getattr(app.state, "managed_sandbox_reaper", None)
+        if enabled:
+            assert isinstance(reaper, ManagedSandboxReaper)
+            assert reaper._sandbox_config is config
+            assert reaper._task is not None
+            assert not reaper._task.done()
+        else:
+            assert reaper is None
+
+    if enabled:
+        assert reaper._task is None
 
 
 @pytest.mark.parametrize(
@@ -1528,6 +1806,8 @@ def _capability_probe_app(
         # Launch-capable provider configured → the web UI may offer the
         # sandbox option, labeled with the provider name ("Modal Sandbox").
         ({"provider": "modal", "server_url": "https://s.example.com"}, True, "modal"),
+        # Blaxel supports managed launch and must be exposed to the web UI.
+        ({"provider": "blaxel", "server_url": "https://s.example.com"}, True, "blaxel"),
         # No `sandbox:` section → a managed create would 400; the option
         # must not be advertised and no provider is named.
         (None, False, None),
@@ -1577,10 +1857,12 @@ async def test_info_reports_enabled_for_injected_custom_launcher(
     falls back to the generic "New Sandbox" label (``sandbox_provider``
     is None).
     """
-    config = ManagedSandboxConfig(
-        server_url="https://s.example.com",
-        launcher_factory=lambda: FakeSandboxLauncher(),
-        token_ttl_s=3600,
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://s.example.com",
+            launcher_factory=lambda: FakeSandboxLauncher(),
+            token_ttl_s=3600,
+        )
     )
     app = _capability_probe_app(db_uri, tmp_path, config)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -1739,6 +2021,7 @@ async def test_launch_materializes_host_config_before_host_start(db_uri: str) ->
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1758,7 +2041,7 @@ async def test_launch_materializes_host_config_before_host_start(db_uri: str) ->
 async def test_resume_rematerializes_host_config_before_host_restart(db_uri: str) -> None:
     """
     Waking a dormant sandbox re-runs the config write before re-execing the
-    host — resume_managed_host bypasses _arm_and_start_host, so this is a
+    host — resume_managed_host bypasses _register_and_start_host, so this is a
     distinct wiring point, and re-materializing is what lets an operator's
     host_config change land on the next wake without a new sandbox.
     """
@@ -2216,6 +2499,67 @@ async def test_launch_entrypoint_provider_cleans_up_on_launch_failure(db_uri: st
 # ── relaunch_managed_host ───────────────────────────────────
 
 
+class _ReusedIdFakeLauncher(FakeSandboxLauncher):
+    provider: ClassVar[str] = "blaxel"
+
+    def provision(self, name: str) -> str:
+        self.provisioned_names.append(name)
+        return name
+
+
+async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str) -> None:
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        )
+
+    fake = _ReusedIdFakeLauncher(on_host_start=_register)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    active = host_store.get_host(first.host_id)
+    assert active is not None
+    assert active.sandbox_id is not None
+    assert host_store.detach_stale_managed_sandbox(
+        active.host_id,
+        sandbox_id=active.sandbox_id,
+        expected_updated_at=active.updated_at,
+    )
+    pending = host_store.get_host(active.host_id)
+    assert pending is not None
+
+    with pytest.raises(HTTPException) as exc:
+        await relaunch_managed_host(config=config, host=pending, host_store=host_store)
+
+    assert exc.value.status_code == 409
+    assert "pending cleanup" in exc.value.detail
+    assert len(fake.host_starts) == 1
+    assert fake.terminated == []
+    still_pending = host_store.get_host(active.host_id)
+    assert still_pending is not None
+    assert still_pending.sandbox_id is None
+    assert still_pending.terminating_sandbox_id == active.name
+
+    reaper = ManagedSandboxReaper(host_store=host_store, sandbox_config=config)
+    assert await reaper.sweep_once() == 1
+    assert fake.terminated == [active.name]
+    cleared = host_store.get_host(active.host_id)
+    assert cleared is not None
+    assert cleared.sandbox_id is None
+    assert cleared.terminating_sandbox_id is None
+
+    relaunched = await relaunch_managed_host(config=config, host=cleared, host_store=host_store)
+    assert relaunched.host_id == active.host_id
+    current = host_store.get_host(active.host_id)
+    assert current is not None
+    assert current.status == "online"
+    assert current.sandbox_id == active.name
+    assert current.terminating_sandbox_id is None
+
+
 async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) -> None:
     """
     A relaunch terminates the dead generation, provisions a fresh
@@ -2427,7 +2771,7 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
 async def test_resume_managed_host_forwards_on_stage(db_uri: str) -> None:
     """A wake reports launch-pipeline stages through ``on_stage``.
 
-    Parity with the fresh-launch path (``_arm_and_start_host``): base
+    Parity with the fresh-launch path (``_register_and_start_host``): base
     ``start_host`` emits ``"starting"`` before it execs the host, so a wake
     with an observer must surface at least that stage rather than leaving the
     caller on a single frozen ``"provisioning"`` band for the whole resume.
@@ -2453,9 +2797,97 @@ async def test_resume_managed_host_forwards_on_stage(db_uri: str) -> None:
     assert "starting" in stages
 
 
+async def test_resume_threads_agent_name_to_classifying_start_host(db_uri: str) -> None:
+    """
+    A wake re-stamps the runner's classifier.
+
+    The resume rebuilds the runner from scratch under the same sandbox id, so a
+    classifier the first launch stamped is NOT carried over by the provider. If
+    the wake omits it, the woken runner comes back unclassified, the admission
+    policy that selects on the label stops matching, and the runner silently
+    loses the credential the label exists to attract.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = _ClassifyingFakeSandboxLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(
+        config=config, owner=_OWNER, host_store=host_store, agent_name="code-reviewer"
+    )
+    host_store.set_offline(first.host_id)
+
+    await resume_managed_host(first.host_id, host_store, config, agent_name="code-reviewer")
+
+    assert fake.resumed == ["sb-fake-1"]
+    assert fake.agent_names == ["code-reviewer", "code-reviewer"]
+
+
+async def test_resume_never_passes_agent_name_to_a_non_classifying_launcher(
+    db_uri: str,
+) -> None:
+    """
+    The wake gates on the capability, not on the value.
+
+    An exec-model launcher has no ``agent_name`` keyword, so a wake that reached
+    it with one would raise ``TypeError`` and 502. The wake succeeding proves the
+    keyword was omitted.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(first.host_id)
+
+    await resume_managed_host(first.host_id, host_store, config, agent_name="code-reviewer")
+
+    assert fake.resumed == ["sb-fake-1"]
+    assert host_store.get_host(first.host_id) is not None
+
+
+async def test_resume_without_a_classifier_leaves_the_woken_runner_unstamped(
+    db_uri: str,
+) -> None:
+    """No resolved name means the classifying launcher is told nothing to stamp."""
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = _ClassifyingFakeSandboxLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(first.host_id)
+
+    await resume_managed_host(first.host_id, host_store, config)
+
+    assert fake.agent_names == [None, None]
+
+
 async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> None:
     """A local missing-tunnel wake can bypass stale cross-replica DB freshness."""
     host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+            managed_token=invocation.token,
+        )
+
     host_store.register_managed_host(
         host_id="62d4405ba38711fe34bebfeb5a7adaf2",
         name="managed-resume-force",
@@ -2471,7 +2903,7 @@ async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> 
         user_id=_OWNER,
     )
     assert host_store.is_online("62d4405ba38711fe34bebfeb5a7adaf2") is True
-    fake = _IsloFakeLauncher(can_resume=True)
+    fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
 
     await resume_managed_host(
         "62d4405ba38711fe34bebfeb5a7adaf2", host_store, _injected_config(fake), force=True
@@ -2519,8 +2951,8 @@ async def test_resume_managed_host_noops_for_non_resumable_provider(db_uri: str)
     )
 
 
-async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_uri: str) -> None:
-    """A failed wake leaves the dormant host retryable."""
+async def test_resume_managed_host_failure_preserves_existing_row(db_uri: str) -> None:
+    """A failed wake leaves the dormant host generation retryable."""
     host_store = HostStore(db_uri)
     host_store.register_managed_host(
         host_id="efbef7dede7be6577770cbb1287992f2",
@@ -2547,8 +2979,59 @@ async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_u
     assert host.sandbox_id == "sb-resume-fail"
     assert (
         host_store.resolve_launch_token("efbef7dede7be6577770cbb1287992f2", "tok-resume-fail")
-        is not None
+        is None
     )
+
+
+async def test_resume_managed_host_does_not_resume_detached_generation(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reaper detach that wins the CAS prevents the provider resume call."""
+    host_store = HostStore(db_uri)
+    host_id = "ade43acaaaf44af59388dc2109a8557f"
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-resume-race",
+        user_id=_OWNER,
+        token="tok-resume-race",
+        provider="islo",
+        sandbox_id="sb-resume-race",
+        token_expires_at=now_epoch() + 3600,
+    )
+    original_rearm = host_store.rearm_managed_host
+
+    def _detach_before_rearm(
+        requested_host_id: str,
+        *,
+        sandbox_id: str,
+        expected_updated_at: int,
+        token: str,
+        token_expires_at: int,
+    ) -> Host | None:
+        assert host_store.detach_stale_managed_sandbox(
+            requested_host_id,
+            sandbox_id=sandbox_id,
+            expected_updated_at=expected_updated_at,
+        )
+        return original_rearm(
+            requested_host_id,
+            sandbox_id=sandbox_id,
+            expected_updated_at=expected_updated_at,
+            token=token,
+            token_expires_at=token_expires_at,
+        )
+
+    monkeypatch.setattr(host_store, "rearm_managed_host", _detach_before_rearm)
+    fake = _IsloFakeLauncher(can_resume=True)
+
+    await resume_managed_host(host_id, host_store, _injected_config(fake))
+
+    assert fake.resumed == []
+    detached = host_store.get_host(host_id)
+    assert detached is not None
+    assert detached.sandbox_id is None
+    assert detached.terminating_sandbox_id == "sb-resume-race"
 
 
 # ── terminate_managed_host ──────────────────────────────────
@@ -2579,6 +3062,43 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
     assert (
         host_store.resolve_launch_token("62a91eb065624754c6a6dfb5869dd7e8", "tok-term-1") is None
     )
+
+
+async def test_terminate_managed_host_cleans_active_and_pending_generations(db_uri: str) -> None:
+    """Full host teardown best-effort terminates both persisted sandbox ids."""
+    fake = FakeSandboxLauncher()
+    host_store = HostStore(db_uri)
+    host_id = "b63810fdd86a4f04988b3e53a930ad08"
+    original = host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-term-both",
+        user_id=_OWNER,
+        token="tok-term-old",
+        provider="modal",
+        sandbox_id="sb-term-old",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert host_store.detach_stale_managed_sandbox(
+        host_id,
+        sandbox_id="sb-term-old",
+        expected_updated_at=original.updated_at,
+    )
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-term-both",
+        user_id=_OWNER,
+        token="tok-term-new",
+        provider="modal",
+        sandbox_id="sb-term-new",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host = host_store.get_host(host_id)
+    assert host is not None
+
+    await terminate_managed_host(host, host_store, _injected_config(fake))
+
+    assert fake.terminated == ["sb-term-new", "sb-term-old"]
+    assert host_store.get_host(host_id) is None
 
 
 async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
@@ -2672,6 +3192,7 @@ def test_parse_modal_secrets_thread_to_launcher(monkeypatch: pytest.MonkeyPatch)
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_modal_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -2698,6 +3219,379 @@ def test_parse_modal_secrets_malformed_fails_loud(secrets: object) -> None:
                 "modal": {"secrets": secrets},
             }
         )
+
+
+# ── multi-provider sandbox config ──────────────────────────────────────
+
+
+def test_parse_multi_provider_offers_every_provider() -> None:
+    """
+    A ``providers:`` list configures several providers side by side, each
+    carrying its own provider name and TTL.
+    """
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "providers": [{"provider": "modal"}, {"provider": "daytona"}],
+        }
+    )
+    assert config is not None
+    assert config.default.provider == "modal"
+    assert config.default.token_ttl_s == MODAL_MANAGED_TOKEN_TTL_S
+    assert config.managed_launch_supported is True
+    assert config.launchable_providers() == ("modal", "daytona")
+    # Each entry carries its own provider name and TTL, not the first's.
+    assert [entry.provider for entry in config.offered()] == ["modal", "daytona"]
+    assert config.offered()[1].token_ttl_s == DAYTONA_MANAGED_TOKEN_TTL_S
+
+
+def test_parse_single_provider_still_offers_itself() -> None:
+    """
+    The scalar shape wraps into a one-provider deployment that reads
+    through the plural accessors.
+    """
+    config = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
+    assert config is not None
+    entry = config.default
+    assert config.offered() == (entry,)
+    assert config.launchable_providers() == ("modal",)
+    assert config.for_provider(None) is entry
+    assert config.for_provider("modal") is entry
+    assert config.for_provider("daytona") is None
+
+
+def test_deployment_rejects_empty_configs() -> None:
+    """
+    The 'never empty' invariant the accessors rely on is enforced at
+    construction, so a direct constructor can't slip past the parser's
+    non-empty check and later IndexError inside ``default``.
+    """
+    with pytest.raises(ValueError, match="at least one provider config"):
+        ManagedSandboxDeployment(configs=())
+
+
+def test_parse_multi_provider_shares_top_level_keys() -> None:
+    """
+    ``server_url`` / ``host_config`` are written once and ride into
+    every entry.
+    """
+    host_config: dict[str, object] = {"telemetry": {"enabled": False}}
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "host_config": host_config,
+            "providers": [{"provider": "modal"}, {"provider": "e2b"}],
+        }
+    )
+    assert config is not None
+    for entry in config.offered():
+        assert entry.server_url == "https://s.example.com"
+        assert entry.host_config == host_config
+
+
+def test_parse_multi_provider_validates_provider_blocks() -> None:
+    """
+    A per-provider block inside an entry validates as it does in the
+    scalar shape: a malformed value fails startup, not a launch.
+    """
+    with pytest.raises(ValueError, match=re.escape("sandbox.modal.image")):
+        parse_sandbox_config(
+            {
+                "server_url": "https://s.example.com",
+                "providers": [{"provider": "modal", "modal": {"image": 17}}],
+            }
+        )
+
+
+def test_parse_multi_provider_excludes_staged_providers_from_choices() -> None:
+    """
+    A staged provider (lakebox parses, then rejects at launch) stays
+    configurable but is never offered as a choice.
+    """
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "providers": [{"provider": "modal"}, {"provider": "lakebox"}],
+        }
+    )
+    assert config is not None
+    assert config.launchable_providers() == ("modal",)
+    # Still resolvable by name, so a host launched on it can be torn down.
+    assert config.for_provider("lakebox") is not None
+
+
+def test_parse_multi_provider_default_skips_leading_staged_provider() -> None:
+    """
+    A staged provider (parse-but-reject) listed first is never the
+    default: the default is the first launch-capable entry, so the
+    default launcher and ``managed_launch_supported`` agree.
+    """
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "providers": [{"provider": "lakebox"}, {"provider": "modal"}],
+        }
+    )
+    assert config is not None
+    assert config.managed_launch_supported is True
+    # lakebox is first in configured order but cannot launch, so modal
+    # backs a provider-less request.
+    assert config.default.provider == "modal"
+    assert config.for_provider(None) is config.default
+
+
+def test_parse_multi_provider_default_falls_back_when_none_launchable() -> None:
+    """
+    A deployment of only staged providers still resolves a default (the
+    first entry), rather than raising — teardown of a host launched
+    before support was pulled must still find a config.
+    """
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "providers": [{"provider": "lakebox"}],
+        }
+    )
+    assert config is not None
+    assert config.managed_launch_supported is False
+    assert config.default.provider == "lakebox"
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        (
+            {
+                "server_url": "https://s.example.com",
+                "provider": "modal",
+                "providers": [{"provider": "e2b"}],
+            },
+            "not both",
+        ),
+        ({"server_url": "https://s.example.com", "providers": []}, "non-empty list"),
+        ({"server_url": "https://s.example.com", "providers": "modal"}, "non-empty list"),
+        ({"server_url": "https://s.example.com", "providers": ["modal"]}, "must be a mapping"),
+        (
+            {
+                "server_url": "https://s.example.com",
+                "providers": [{"provider": "modal"}, {"provider": "modal"}],
+            },
+            "more than once",
+        ),
+        (
+            {
+                "server_url": "https://s.example.com",
+                "providers": [{"provider": "nope"}],
+            },
+            "must be one of",
+        ),
+    ],
+)
+def test_parse_multi_provider_invalid_fails_loud(raw: dict[str, object], message: str) -> None:
+    """Malformed multi-provider config stops startup with the reason named."""
+    with pytest.raises(ValueError, match=message):
+        parse_sandbox_config(raw)
+
+
+async def test_launch_uses_requested_provider(db_uri: str) -> None:
+    """
+    A create naming a provider launches on that provider, and the choice
+    lands on the host row so teardown dispatches back to it.
+    """
+    host_store = HostStore(db_uri)
+
+    class _AlphaLauncher(FakeSandboxLauncher):
+        provider: ClassVar[str] = "alpha"
+
+    class _BetaLauncher(FakeSandboxLauncher):
+        provider: ClassVar[str] = "beta"
+
+    def _register(invocation: HostStartInvocation) -> None:
+        """Simulate the sandbox host connecting over the tunnel."""
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        )
+
+    alpha = _AlphaLauncher(on_host_start=_register)
+    beta = _BetaLauncher(on_host_start=_register)
+    config = ManagedSandboxDeployment(
+        configs=(
+            ManagedSandboxConfig(
+                server_url="https://srv.example.com",
+                launcher_factory=lambda: alpha,
+                token_ttl_s=3600,
+                provider="alpha",
+            ),
+            ManagedSandboxConfig(
+                server_url="https://srv.example.com",
+                launcher_factory=lambda: beta,
+                token_ttl_s=7200,
+                provider="beta",
+            ),
+        ),
+    )
+
+    result = await launch_managed_host(
+        config=config, owner=_OWNER, host_store=host_store, provider="beta"
+    )
+
+    # Only the requested provider ran.
+    assert beta.provisioned_names == ["managed-" + result.host_id[:8]]
+    assert alpha.provisioned_names == []
+    host = host_store.get_host(result.host_id)
+    assert host is not None
+    assert host.sandbox_provider == "beta"
+    # Resolved by the row, so the same provider's terminate runs.
+    await terminate_managed_host(host, host_store, config)
+    assert beta.terminated == ["sb-fake-1"]
+    assert alpha.terminated == []
+
+
+async def test_launch_defaults_to_first_provider(db_uri: str) -> None:
+    """
+    A create naming no provider takes the first configured one.
+    """
+    host_store = HostStore(db_uri)
+
+    class _AlphaLauncher(FakeSandboxLauncher):
+        provider: ClassVar[str] = "alpha"
+
+    def _register(invocation: HostStartInvocation) -> None:
+        """Simulate the sandbox host connecting over the tunnel."""
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        )
+
+    alpha = _AlphaLauncher(on_host_start=_register)
+    config = ManagedSandboxDeployment(
+        configs=(
+            ManagedSandboxConfig(
+                server_url="https://srv.example.com",
+                launcher_factory=lambda: alpha,
+                token_ttl_s=3600,
+                provider="alpha",
+            ),
+        ),
+    )
+
+    result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host = host_store.get_host(result.host_id)
+    assert host is not None
+    assert host.sandbox_provider == "alpha"
+
+
+async def test_launch_unknown_provider_rejects_before_provisioning(db_uri: str) -> None:
+    """
+    An unoffered provider is a 400 naming the available ones, with
+    nothing provisioned.
+    """
+    host_store = HostStore(db_uri)
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "providers": [{"provider": "modal"}, {"provider": "daytona"}],
+        }
+    )
+    assert config is not None
+    with pytest.raises(HTTPException) as exc:
+        await launch_managed_host(
+            config=config, owner=_OWNER, host_store=host_store, provider="nope"
+        )
+    assert exc.value.status_code == 400
+    assert "nope" in exc.value.detail
+    assert "modal, daytona" in exc.value.detail
+    assert host_store.list_hosts(_OWNER) == []
+
+
+async def test_teardown_never_crosses_providers(db_uri: str) -> None:
+    """
+    A host is never torn down by another provider's launcher, even when
+    both are configured.
+    """
+    host_store = HostStore(db_uri)
+
+    class _AlphaLauncher(FakeSandboxLauncher):
+        provider: ClassVar[str] = "alpha"
+
+    class _BetaLauncher(FakeSandboxLauncher):
+        provider: ClassVar[str] = "beta"
+
+    alpha = _AlphaLauncher()
+    beta = _BetaLauncher()
+    config = ManagedSandboxDeployment(
+        configs=(
+            ManagedSandboxConfig(
+                server_url="https://srv.example.com",
+                launcher_factory=lambda: alpha,
+                token_ttl_s=3600,
+                provider="alpha",
+            ),
+            ManagedSandboxConfig(
+                server_url="https://srv.example.com",
+                launcher_factory=lambda: beta,
+                token_ttl_s=3600,
+                provider="beta",
+            ),
+        ),
+    )
+    # A row recorded against the SECOND provider.
+    beta_host_id = uuid.uuid4().hex
+    host_store.register_managed_host(
+        host_id=beta_host_id,
+        name="managed-beta",
+        user_id=_OWNER,
+        token="tok",
+        provider="beta",
+        sandbox_id="sb-beta",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host = host_store.get_host(beta_host_id)
+    assert host is not None
+
+    await terminate_managed_host(host, host_store, config)
+    assert beta.terminated == ["sb-beta"]
+    assert alpha.terminated == []
+
+
+async def test_info_lists_every_offered_provider(db_uri: str, tmp_path: Path) -> None:
+    """
+    ``GET /v1/info`` reports every launch-capable provider, while
+    ``sandbox_provider`` keeps naming the first for older bundles.
+    """
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "providers": [{"provider": "modal"}, {"provider": "e2b"}, {"provider": "lakebox"}],
+        }
+    )
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/info")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["managed_sandboxes_enabled"] is True
+    assert body["sandbox_provider"] == "modal"
+    # Staged lakebox is configurable but never offered as a choice.
+    assert body["sandbox_providers"] == ["modal", "e2b"]
+
+
+async def test_info_lists_single_provider(db_uri: str, tmp_path: Path) -> None:
+    """
+    A single-provider server reports its one provider in the list too, so
+    the picker can render from the list alone.
+    """
+    config = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/info")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["sandbox_provider"] == "modal"
+    assert body["sandbox_providers"] == ["modal"]
 
 
 # ── resolve_managed_agent_label (built-in gate) ─────────────
@@ -3022,6 +3916,138 @@ async def test_run_managed_launch_omits_the_classifier_for_a_session_scoped_impo
     assert captured["agent_name"] is None
 
 
+async def test_kick_managed_wake_defers_the_classifier_to_the_wake_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The wake hands the agent store and the bound agent id to the wake task rather
+    than resolving the classifier itself, matching the relaunch path: the
+    claim-to-task region stays synchronous and only the winning caller pays for
+    the read.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(orchestration, "_run_managed_wake", _capture)
+
+    builtin = Agent(
+        id=builtin_agent_id("code-reviewer"),
+        created_at=now_epoch(),
+        name="code-reviewer",
+        bundle_location="bundle/loc",
+        session_id=None,
+    )
+
+    reads: list[str] = []
+
+    class _RecordingStore(_StubAgentStore):
+        def get(self, agent_id: str) -> Agent | None:
+            reads.append(agent_id)
+            return super().get(agent_id)
+
+    store = _RecordingStore({builtin.id: builtin})
+    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
+    before = set(orchestration._managed_launch_tasks)
+    orchestration._kick_managed_wake_impl(
+        session_id="conv_1",
+        conv=conv,
+        sandbox_config=SimpleNamespace(),
+        tracker=ManagedLaunchTracker(),
+        conversation_store=SimpleNamespace(),
+        host_store=SimpleNamespace(),
+        app_state=SimpleNamespace(agent_store=store),
+    )
+    scheduled = set(orchestration._managed_launch_tasks) - before
+    assert scheduled, "the claim was taken but no task was scheduled to settle it"
+    await asyncio.gather(*scheduled)
+    assert reads == [], "the kick must not read the agent store; the wake task does"
+    assert captured["agent_store"] is store
+    assert captured["agent_id"] == builtin.id
+
+
+async def test_run_managed_wake_re_stamps_the_woken_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The wake task resolves the bound agent through the built-in gate and forwards
+    the name into the resume, so the rebuilt runner carries its classifier again.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _resume(*args: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", _resume)
+
+    builtin = Agent(
+        id=builtin_agent_id("code-reviewer"),
+        created_at=now_epoch(),
+        name="code-reviewer",
+        bundle_location="bundle/loc",
+        session_id=None,
+    )
+    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
+    await orchestration._run_managed_wake(
+        session_id="conv_1",
+        conv=conv,
+        sandbox_config=SimpleNamespace(),
+        tracker=ManagedLaunchTracker(),
+        conversation_store=SimpleNamespace(get_conversation=lambda _sid: None),
+        host_store=SimpleNamespace(),
+        host_registry=None,
+        tunnel_registry=None,
+        agent_store=_StubAgentStore({builtin.id: builtin}),
+        agent_id=builtin.id,
+    )
+    assert captured["agent_name"] == "code-reviewer"
+
+
+async def test_run_managed_wake_omits_the_classifier_for_a_session_scoped_impostor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A session-scoped agent named after a built-in resolves to no classifier on
+    the wake path too, so a wake cannot be used to obtain a label the initial
+    launch would have refused.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _resume(*args: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", _resume)
+
+    impostor = Agent(
+        id="9f2c1b7e4a5d4c8fa1b2c3d4e5f60718",
+        created_at=now_epoch(),
+        name="code-reviewer",
+        bundle_location="bundle/loc",
+        session_id="conv_1",
+    )
+    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=impostor.id)
+    await orchestration._run_managed_wake(
+        session_id="conv_1",
+        conv=conv,
+        sandbox_config=SimpleNamespace(),
+        tracker=ManagedLaunchTracker(),
+        conversation_store=SimpleNamespace(get_conversation=lambda _sid: None),
+        host_store=SimpleNamespace(),
+        host_registry=None,
+        tunnel_registry=None,
+        agent_store=_StubAgentStore({impostor.id: impostor}),
+        agent_id=impostor.id,
+    )
+    assert captured["agent_name"] is None
+
+
 async def test_concurrent_relaunch_messages_kick_a_single_launch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3087,7 +4113,9 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
         bundle_location="bundle/loc",
         session_id=None,
     )
-    dead_host = SimpleNamespace(sandbox_provider="modal", user_id=_OWNER)
+    dead_host = SimpleNamespace(
+        sandbox_provider="modal", user_id=_OWNER, status="offline", updated_at=0
+    )
     app_state = SimpleNamespace(
         host_store=SimpleNamespace(get_host=lambda _hid: dead_host, is_online=lambda _hid: False),
         sandbox_config=SimpleNamespace(),
@@ -3114,3 +4142,185 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
     assert engaged == [True, True]
     assert len(calls) == 1
     assert calls[0]["agent_id"] == builtin.id
+
+
+# ── contributed sandbox providers ───────────────────────────
+
+
+class _AcmeConfig(BaseModel):
+    """Config model for the contributed provider used below."""
+
+    namespace: str = "default"
+
+
+class _AcmeLauncher(SandboxHostLauncher):
+    """Minimal contributed launcher; records the config it was handed."""
+
+    provider: ClassVar[str] = "acme"
+
+    def __init__(self, *, config: _AcmeConfig) -> None:
+        self.config = config
+
+    def prepare(self) -> None:
+        """No preflight needed for a test double."""
+
+    def provision(self, name: str) -> str:
+        """Reserve a name, matching the entrypoint-as-host providers."""
+        return name
+
+    def start_host(self, sandbox_id: str, **kwargs: Any) -> str:
+        """Return a workspace path without starting anything."""
+        return "/workspace"
+
+    def terminate(self, sandbox_id: str) -> None:
+        """Nothing to tear down."""
+
+
+@pytest.fixture
+def contributed_acme_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register an `acme` provider through the entry point group.
+
+    Installs a real module under the `omnigent.community.sandbox.*` namespace
+    the registry requires, so `instantiate` can import the launcher class
+    rather than only resolve its name.
+    """
+    module_name = f"{COMMUNITY_MODULE_PREFIX}acme"
+    module = types.ModuleType(module_name)
+    module.AcmeSandboxLauncher = _AcmeLauncher  # type: ignore[attr-defined]
+    module.AcmeConfig = _AcmeConfig  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, module_name, module)
+    # The registry requires the config model to live in that namespace too,
+    # not just the launcher, so both classes have to claim the fake module.
+    monkeypatch.setattr(_AcmeLauncher, "__module__", module_name)
+    monkeypatch.setattr(_AcmeConfig, "__module__", module_name)
+
+    def _contribution() -> SandboxProviderContribution:
+        return SandboxProviderContribution(
+            name="omnigent-acme",
+            providers={
+                "acme": SandboxProviderMetadata(
+                    name="acme",
+                    launcher_class=f"{module_name}:AcmeSandboxLauncher",
+                    config_model=_AcmeConfig,
+                    managed_token_ttl_s=1234,
+                )
+            },
+        )
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.sandboxes.registry._entry_points",
+        lambda: (SimpleNamespace(name="acme", load=lambda: _contribution),),
+    )
+    reset_plugin_state_for_tests()
+    yield
+    reset_plugin_state_for_tests()
+
+
+def test_parse_contributed_provider_builds_registry_backed_factory(
+    contributed_acme_provider: None,
+) -> None:
+    """
+    A provider contributed through the entry point group is configurable and
+    serves managed sessions, without being named in this module.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "acme",
+            "server_url": "https://s.example.com",
+            "acme": {"namespace": "sandboxes"},
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    assert cfg.provider == "acme"
+    # Contributed providers register in order to serve, so the web UI must be
+    # told the sandbox option works rather than offered one that 400s.
+    assert cfg.managed_launch_supported is True
+    assert cfg.token_ttl_s == 1234
+
+    launcher = cfg.launcher_factory()
+    assert isinstance(launcher, _AcmeLauncher)
+    # The `sandbox.acme` block reached the launcher through the config_model
+    # the registry documents, rather than being silently dropped.
+    assert launcher.config.namespace == "sandboxes"
+
+
+def test_contributed_provider_config_is_validated(
+    contributed_acme_provider: None,
+) -> None:
+    """A malformed provider block fails at parse time with the provider named."""
+    with pytest.raises(ValueError, match=r"acme"):
+        parse_sandbox_config(
+            {
+                "provider": "acme",
+                "server_url": "https://s.example.com",
+                "acme": {"namespace": ["not", "a", "string"]},
+            }
+        )
+
+
+def test_contributed_provider_non_mapping_block_is_rejected(
+    contributed_acme_provider: None,
+) -> None:
+    """A non-mapping ``sandbox.<provider>`` block is rejected at parse time."""
+    with pytest.raises(ValueError, match=r"sandbox\.acme"):
+        parse_sandbox_config(
+            {
+                "provider": "acme",
+                "server_url": "https://s.example.com",
+                "acme": "oops",
+            }
+        )
+
+
+def test_unknown_provider_is_still_rejected(contributed_acme_provider: None) -> None:
+    """Consulting the registry does not make every name acceptable."""
+    with pytest.raises(ValueError, match=r"sandbox\.provider"):
+        parse_sandbox_config({"provider": "nope", "server_url": "https://s.example.com"})
+
+
+def test_builtin_without_a_branch_is_unaffected_by_the_registry(
+    contributed_acme_provider: None,
+) -> None:
+    """
+    `lakebox` is registered in the registry AND listed as supported here, but
+    has no config branch, so it must keep falling through to the staged
+    rejection instead of gaining a launcher from the registry.
+    """
+    cfg = parse_sandbox_config({"provider": "lakebox", "server_url": "https://s.example.com"})
+    assert cfg is not None
+    assert cfg.default.managed_launch_supported is False
+    with pytest.raises(HTTPException):
+        cfg.default.launcher_factory()
+
+
+def test_agent_sandbox_reuses_the_kubernetes_config_block() -> None:
+    """
+    `provider: agent_sandbox` reads the same `sandbox.kubernetes` block as the
+    Job provider, so switching between them needs no other config change, and
+    builds the agent-sandbox launcher.
+    """
+    from omnigent.onboarding.sandboxes.agent_sandbox import AgentSandboxLauncher
+
+    cfg = parse_sandbox_config(
+        {
+            "provider": "agent_sandbox",
+            "server_url": "http://omnigent.omnigent.svc.cluster.local/",
+            "kubernetes": {
+                "namespace": "omnigent-sandboxes",
+                "secret_name": "omnigent-creds",
+                "in_cluster": True,
+            },
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    assert cfg.provider == "agent_sandbox"
+    assert cfg.managed_launch_supported is True
+    assert cfg.token_ttl_s == KUBERNETES_MANAGED_TOKEN_TTL_S
+    launcher = cfg.launcher_factory()
+    assert isinstance(launcher, AgentSandboxLauncher)
+    assert launcher.provider == "agent_sandbox"
+    # keep_alive is what the managed path needs from it, so it must not be the
+    # raising capability default it inherits two levels up.
+    assert type(launcher).keep_alive is not SandboxHostLauncher.keep_alive

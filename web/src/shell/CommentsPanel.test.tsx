@@ -438,16 +438,17 @@ describe("CommentsPanel resize affordance", () => {
 // ── Active-comment reveal (selecting a highlight in the file) ──────────────
 //
 // Selecting a highlighted range in the file sets activeSelection to that
-// comment's range. The panel must reveal the matching card: switch to the tab
-// that holds it (if needed) and scroll it into view. scrollIntoView isn't
-// implemented in jsdom, so it's stubbed to record the call.
+// comment's range. The panel must reveal the matching open card or the new-
+// comment form and scroll it into view. scrollIntoView isn't implemented in
+// jsdom, so it's stubbed to record the call.
 
-function renderWithSelection(
+function panelWithSelection(
   comments: Comment[],
   addressedComments: Comment[],
   activeSelection: ActiveSelection | null,
+  onClickComment = vi.fn(),
 ) {
-  return render(
+  return (
     <CommentsPanel
       comments={comments}
       addressedComments={addressedComments}
@@ -456,11 +457,19 @@ function renderWithSelection(
       onAddressAll={vi.fn()}
       onEditComment={vi.fn()}
       onDeleteComment={vi.fn()}
-      onClickComment={vi.fn()}
+      onClickComment={onClickComment}
       canAddress={false}
       addressPending={false}
-    />,
+    />
   );
+}
+
+function renderWithSelection(
+  comments: Comment[],
+  addressedComments: Comment[],
+  activeSelection: ActiveSelection | null,
+) {
+  return render(panelWithSelection(comments, addressedComments, activeSelection));
 }
 
 /** Run pending requestAnimationFrame callbacks (the scroll effect defers via rAF). */
@@ -486,6 +495,7 @@ describe("CommentsPanel active-comment reveal", () => {
       start_index: 40,
       end_index: 60,
       anchor_content: "hello",
+      comment_id: "c2",
     });
     await flushRaf();
 
@@ -495,19 +505,56 @@ describe("CommentsPanel active-comment reveal", () => {
     expect(scrollSpy).toHaveBeenCalledWith({ block: "nearest", behavior: "smooth" });
   });
 
-  it("switches to the Addressed tab when the active comment lives there", async () => {
+  it("keeps a new selection open when an addressed comment shares its range", async () => {
     Element.prototype.scrollIntoView = vi.fn();
 
     const addressed = makeComment("c2", "addressed", { start_index: 40, end_index: 60 });
-    renderWithSelection([makeComment("c1")], [addressed], {
+    renderWithSelection([], [addressed], {
       start_index: 40,
       end_index: 60,
       anchor_content: "hello",
     });
     await flushRaf();
 
-    // The Addressed tab must become active so the card is rendered; its body
-    // ("Comment c2") is then in the document.
+    expect(screen.getByPlaceholderText("Add a comment…")).toBeInTheDocument();
+    expect(screen.queryByText("Comment c2")).not.toBeInTheDocument();
+  });
+
+  it("follows a selected comment into Addressed once without locking the tabs", async () => {
+    Element.prototype.scrollIntoView = vi.fn();
+
+    // Matching ids model one comment changing status; only one tab renders at a time.
+    const open = makeComment("c2", "draft", { start_index: 40, end_index: 60 });
+    const addressed = makeComment("c2", "addressed", { start_index: 40, end_index: 60 });
+    const activeSelection: ActiveSelection = {
+      start_index: 40,
+      end_index: 60,
+      anchor_content: "hello",
+      comment_id: "c2",
+    };
+    const { rerender } = renderWithSelection([open], [], activeSelection);
+
+    rerender(panelWithSelection([], [addressed], activeSelection));
+    await flushRaf();
     expect(screen.getByText("Comment c2")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Address All" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Open/ }));
+    expect(screen.getByText("No open comments.")).toBeInTheDocument();
+
+    rerender(panelWithSelection([], [{ ...addressed }], activeSelection));
+    await flushRaf();
+    expect(screen.getByText("No open comments.")).toBeInTheDocument();
+  });
+
+  it("activates an addressed comment when its card is clicked", () => {
+    const addressed = makeComment("c2", "addressed");
+    const onClickComment = vi.fn();
+    render(panelWithSelection([], [addressed], null, onClickComment));
+
+    fireEvent.click(screen.getByRole("button", { name: /^Addressed/ }));
+    fireEvent.click(screen.getByText("Comment c2"));
+
+    expect(onClickComment).toHaveBeenCalledWith(addressed);
   });
 });

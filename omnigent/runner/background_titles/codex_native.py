@@ -8,10 +8,11 @@ import logging
 import tempfile
 from pathlib import Path
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
-    BACKGROUND_TITLE_INSTRUCTIONS,
     BackgroundTitleContext,
+    build_background_title_instructions,
 )
 
 _logger = logging.getLogger("omnigent.runner.background_titles.codex_native")
@@ -31,7 +32,11 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     )
     from omnigent.runner.native.orchestration import _codex_native_model_from_spec
 
-    model = context.model_override or _codex_native_model_from_spec(context.session_spec)
+    model = (
+        context.title_model
+        or context.model_override
+        or _codex_native_model_from_spec(context.session_spec)
+    )
     # Thread the spec so a title exec honors spec-level auth too (#2744).
     launch = resolve_native_codex_launch(model=model, spec=context.session_spec)
     with tempfile.TemporaryDirectory(prefix="omnigent-codex-title-") as temp_dir:
@@ -45,7 +50,9 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             _codex_home_config_source_from_env(),
             minimal_config=True,
         )
-        native_server = build_codex_native_server(
+        # Profile/model discovery can block in SDK initialization; keep the runner responsive.
+        native_server = await asyncio.to_thread(
+            build_codex_native_server,
             socket_path=temp_root / "unused.sock",
             codex_home=codex_home,
             cwd=title_workdir,
@@ -83,14 +90,15 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             "features.computer_use=false",
             "features.image_generation=false",
             "features.multi_agent=false",
+            "features.plugins=false",
             "features.tool_search=false",
         ):
             args.extend(("--config", override))
         if launch.model:
             args.extend(("--model", launch.model))
+        instructions = build_background_title_instructions(context.additional_instructions)
         args.append(
-            f"{BACKGROUND_TITLE_INSTRUCTIONS} Do not use tools.\n"
-            f"<user_message>\n{context.prompt}\n</user_message>"
+            f"{instructions} Do not use tools.\n<user_message>\n{context.prompt}\n</user_message>"
         )
         env = {**native_server.env, "CODEX_HOME": str(codex_home)}
         process = await asyncio.create_subprocess_exec(
@@ -119,6 +127,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
                 "background native Codex title failed returncode=%s detail=%s",
                 process.returncode,
                 detail[-1000:],
+                extra={"session_id": runner_primary_session_id()},
             )
             return None
         if not output_path.is_file():

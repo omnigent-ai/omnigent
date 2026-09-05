@@ -31,6 +31,7 @@ from omnigent.inner.executor import (
     Message,
     ToolSpec,
     TurnComplete,
+    describe_exception,
 )
 from omnigent.qwen_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
@@ -131,7 +132,7 @@ class QwenNativeExecutor(Executor):
             async with self._inject_lock:
                 await asyncio.to_thread(submit_user_message, self._bridge_dir, content=text)
         except RuntimeError as exc:
-            yield ExecutorError(message=str(exc))
+            yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
 

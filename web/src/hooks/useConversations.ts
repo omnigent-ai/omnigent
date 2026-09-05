@@ -1,7 +1,7 @@
 // TanStack Query wrapper around `GET /v1/sessions`, plus mutation
 // hooks for `PATCH /v1/sessions/{id}` (rename) and
-// `DELETE /v1/sessions/{id}`. Rename and delete patch the cached
-// lists in place (see `useRenameConversation` /
+// `DELETE /v1/sessions/{id}`. Rename and delete are optimistic and patch
+// the cached lists in place (see `useRenameConversation` /
 // `useStopAndDeleteConversation` — a refetch would race the server's
 // async search reindex); the remaining mutations invalidate the
 // conversations list on success so the sidebar reflects the change.
@@ -25,17 +25,24 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
   filtersFromConversationQueryKey,
   mergeItemsIntoPages,
+  overlayArchivedIntoCaches,
+  overlayTitleIntoCaches,
   PINNED_LABEL_KEY,
+  PROJECT_FOLDER_FILTERS,
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
   type ConversationsInfiniteData,
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
-import { setLegacyPinnedConversationId } from "@/shell/sidebarNav";
-import { stopSession } from "@/lib/sessionsApi";
+import { showToast } from "@/components/ui/toast";
+import { revokePermission } from "@/lib/permissionsApi";
+import { conversationDisplayLabel, setLegacyPinnedConversationId } from "@/shell/sidebarNav";
+import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
+import { setSessionHost } from "@/lib/sessionHost";
 import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
@@ -45,13 +52,38 @@ import {
   renameProject as apiRenameProject,
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
-import { useChatStore } from "@/store/chatStore";
+import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
 
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
+
+/**
+ * Client-side deadline for a *search* page fetch (`?search_query=`). Content
+ * search is a substring scan server-side; if its trigram index is ever missing
+ * the query can run for tens of seconds, and the palette would otherwise sit on
+ * "Searching…" forever (the fetch has no timeout of its own). Aborting here
+ * settles the query to a terminal state so the user sees "No results found"
+ * rather than an endless spinner. Deliberately shorter than the server's own
+ * search `statement_timeout` (see `_SEARCH_STATEMENT_TIMEOUT_MS` in the store)
+ * so the client gives up first and the row-limited fast path still has room.
+ * Only search fetches are bounded — ordinary (indexed) list pagination is left
+ * untouched.
+ */
+export const SEARCH_FETCH_TIMEOUT_MS = 10_000;
+
+/**
+ * True for the DOMException a fetch raises when its `AbortSignal.timeout`
+ * fires. Used to keep the query layer from retrying a client-side search
+ * timeout: retrying would just re-arm the same slow request three more times
+ * (React Query's default), turning one hung spinner into a retry storm. A real
+ * server/network error still retries normally.
+ */
+function isAbortTimeout(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "TimeoutError";
+}
 
 /**
  * Query key for the archived-project-names scan (see `useArchivedProjectNames`).
@@ -67,6 +99,16 @@ const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 
 export interface UseConversationsOptions {
   reconcileWhileConnected?: boolean;
+  // When false, the query is disabled (no fetch fires). Lets callers mount
+  // the hook unconditionally while suppressing the request until it's needed.
+  enabled?: boolean;
+  /**
+   * Which result fields trigger a consumer re-render (passed to the infinite
+   * query). Lets a consumer that holds the whole query object avoid re-rendering
+   * on the live-updates merge's per-frame result-object churn. Omit to notify on
+   * any observed field.
+   */
+  notifyOnChangeProps?: readonly (keyof ReturnType<typeof useInfiniteQuery>)[];
 }
 
 export class BulkConversationMutationError extends Error {
@@ -203,6 +245,143 @@ export interface ConversationsPage {
   has_more: boolean;
 }
 
+// ── Deleting-session tombstones ───────────────────────────────────────
+//
+// Delete paints optimistically: the row leaves the sidebar the moment the
+// user confirms, long before the server finishes tearing the session down
+// (stop, runner resources, worktree, managed sandbox — seconds). Until
+// that lands, `GET /v1/sessions` still returns the session, and on the
+// search-indexed deployment it keeps returning it for a while after. Any
+// list fetch in that window — the reconcile poll, the refetch a WS frame
+// schedules, expanding a project folder — would repaint the row the user
+// just deleted.
+//
+// Ids recorded here are filtered out of every list fetch until the delete
+// settles: dropped immediately when it fails (the row comes back), or
+// after a grace window once it succeeds (the server's async reindex).
+const deletingSessionIds = new Set<string>();
+
+/** Grace window for the server's async delete reindex. */
+const DELETED_TOMBSTONE_MS = 60_000;
+
+/** Hide these sessions from every list fetch (optimistic delete). */
+export function markSessionsDeleting(ids: Iterable<string>): void {
+  for (const id of ids) deletingSessionIds.add(id);
+}
+
+/** Whether a session has an optimistic delete in flight (tombstoned). */
+export function isSessionDeleting(id: string): boolean {
+  return deletingSessionIds.has(id);
+}
+
+/**
+ * Stop hiding sessions — their delete failed, so the rows return.
+ * Omit `ids` to release every tombstone at once.
+ */
+export function unmarkSessionsDeleting(ids?: Iterable<string>): void {
+  if (ids === undefined) {
+    deletingSessionIds.clear();
+    return;
+  }
+  for (const id of ids) deletingSessionIds.delete(id);
+}
+
+/** Release confirmed-delete tombstones once the server has caught up. */
+function expireSessionsDeleting(ids: string[]): void {
+  setTimeout(() => unmarkSessionsDeleting(ids), DELETED_TOMBSTONE_MS);
+}
+
+/**
+ * Drop rows for sessions with a delete in flight from a freshly fetched
+ * page, recomputing the page cursors from the survivors so pagination
+ * never anchors on an id the server is about to forget (mirrors
+ * `removeIdsFromPages`).
+ *
+ * @param page - A page as returned by `GET /v1/sessions`.
+ * @returns The page, or a filtered copy when it held a deleting session.
+ */
+function withoutDeletingSessions(page: ConversationsPage): ConversationsPage {
+  if (deletingSessionIds.size === 0) return page;
+  const data = page.data.filter((conv) => !deletingSessionIds.has(conv.id));
+  if (data.length === page.data.length) return page;
+  return {
+    ...page,
+    data,
+    first_id: data[0]?.id ?? null,
+    last_id: data[data.length - 1]?.id ?? null,
+  };
+}
+
+// ── Recently-created keep-alive ───────────────────────────────────────
+//
+// The push stream inserts a just-created session into the sidebar instantly
+// (SessionUpdatesProvider → insertNewRowsIntoPages), but the create path also
+// fires a `["conversations"]` refetch, and on the search-indexed deployment
+// that fetch lags the write — so it comes back WITHOUT the new session and
+// replaces the cache, dropping the row until the index catches up (it flashes
+// in, then out). We keep the row in the first-page fetch until the index
+// reflects it — the additive mirror of the delete tombstone above.
+const recentlyCreatedSessions = new Map<string, Conversation>();
+
+/** Grace window for the server's async create reindex. */
+const CREATED_KEEPALIVE_MS = 60_000;
+
+/** Keep a just-created session in the first-page list fetch until it's indexed. */
+export function markRecentlyCreated(conv: Conversation): void {
+  recentlyCreatedSessions.set(conv.id, conv);
+  setTimeout(() => recentlyCreatedSessions.delete(conv.id), CREATED_KEEPALIVE_MS);
+}
+
+/** Clear the keep-alive map — exported for test cleanup (mirrors `unmarkSessionsDeleting`). */
+export function clearRecentlyCreated(): void {
+  recentlyCreatedSessions.clear();
+}
+
+/**
+ * Prepend recently-created rows the first page doesn't yet include (the index
+ * hasn't caught up). Only the unfiltered, unsearched first page — a create sorts
+ * newest-first. Once the fetch returns the row itself, the keep-alive is dropped.
+ * Applied before `withoutDeletingSessions`, so a create-then-delete stays gone.
+ */
+function withRecentlyCreated(
+  page: ConversationsPage,
+  after: string | undefined,
+  searchQuery: string,
+  project: string | undefined,
+  includeArchived: boolean,
+  queryClient: QueryClient,
+  visibility?: "mine" | "shared" | "archived",
+): ConversationsPage {
+  // Recently-created sessions are always owned (active, not archived), so skip
+  // injection for "shared" and "archived" filters where they would not belong.
+  if (
+    after !== undefined ||
+    searchQuery ||
+    project ||
+    visibility === "shared" ||
+    visibility === "archived" ||
+    recentlyCreatedSessions.size === 0
+  ) {
+    return page;
+  }
+  const present = new Set(page.data.map((c) => c.id));
+  const inject: Conversation[] = [];
+  for (const [id, snapshot] of recentlyCreatedSessions) {
+    // Already listed — skip (no duplicate). Don't drop the entry: a sibling
+    // list catching up first must not disarm the keep-alive for a still-lagging
+    // list; the 60s timer is the sole cleanup.
+    if (present.has(id)) continue;
+    // Inject the freshest copy: the cache row (kept current by WS overlays)
+    // beats the frozen snapshot, so a WS-confirmed title — or archive flag —
+    // isn't reverted by re-injecting stale data.
+    const row = findCachedConversationRow(queryClient, id) ?? snapshot;
+    if (row.archived && !includeArchived) continue;
+    inject.push(row);
+  }
+  if (inject.length === 0) return page;
+  return { ...page, data: [...inject, ...page.data], first_id: inject[0].id };
+}
+
 /**
  * Fetch a single session as a sidebar-shaped ``Conversation`` object.
  *
@@ -215,6 +394,12 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const wire = await res.json();
+  // Seed the session→host map on this pin-backfill path too, not just the list
+  // seed / `sessionFromWire`: a pinned session outside the paginated window can
+  // enter client state only through here, and terminal-attach / session-scoped
+  // requests key their slice off this map — so record the host before returning
+  // the row, or those requests fall back to the modal and can miss the replica.
+  setSessionHost(wire.id, wire.host_id);
   return {
     id: wire.id,
     object: "conversation",
@@ -243,11 +428,15 @@ async function fetchConversationsPage({
   searchQuery,
   includeArchived,
   project,
+  visibility,
+  queryClient,
 }: {
   after?: string;
   searchQuery: string;
   includeArchived: boolean;
   project?: string;
+  visibility?: "mine" | "shared" | "archived";
+  queryClient: QueryClient;
 }): Promise<ConversationsPage> {
   // `updated_at` matches the sidebar's sort, which keeps server
   // pagination consistent with the visible order as the user scrolls.
@@ -268,9 +457,39 @@ async function fetchConversationsPage({
   // query key (which drops `project`) and the cache-membership check. This
   // list never requests the server's "unfiled" (`project=`) slice.
   if (project) params.set("project", project);
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+  // Server-side ownership filter for the sidebar's My/Shared split. Omitting
+  // the param keeps the legacy "all accessible" behaviour (no regression for
+  // callers that don't pass visibility).
+  if (visibility) params.set("visibility", visibility);
+  // Bound search fetches with a client-side deadline (see
+  // SEARCH_FETCH_TIMEOUT_MS): a search whose server-side index is missing can
+  // hang, and the palette shows "Searching…" for the whole in-flight window.
+  // Plain list pagination is indexed/fast, so it keeps no timeout.
+  const signal = searchQuery ? AbortSignal.timeout(SEARCH_FETCH_TIMEOUT_MS) : undefined;
+  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return (await res.json()) as ConversationsPage;
+  const page = (await res.json()) as ConversationsPage;
+  // Seed the session→host map from every list row, not just sessions the user
+  // has opened (which is all `sessionFromWire` covers). Two payoffs: (1) the
+  // modal-host pick (`resolveModalHost`, latched on this query's first settle)
+  // sees ALL the user's sessions, so it picks the true most-common host rather
+  // than whichever single session happened to be fetched individually first;
+  // (2) a session-scoped request (`/v1/sessions/{id}/*`) issued before that
+  // session's own snapshot loads still keys to the right replica instead of
+  // falling back to the modal. host_id is fixed for a session's life, so this
+  // can't seed a stale value; a hostless row clears any prior mapping.
+  for (const row of page.data) setSessionHost(row.id, row.host_id);
+  return withoutDeletingSessions(
+    withRecentlyCreated(
+      page,
+      after,
+      searchQuery,
+      project,
+      includeArchived,
+      queryClient,
+      visibility,
+    ),
+  );
 }
 
 /**
@@ -290,11 +509,19 @@ async function fetchConversationsPage({
  * distinct four-element key that refetches when the picker changes. Used by
  * the Archived settings view's project filter.
  */
+// Latch so the list_sessions CUJ times only the first full-list fetch per app
+// load. `useConversations` is observed by several components sharing one query
+// cache, and it also refetches on a background poll / WS reconcile / pagination —
+// none of which are the user "open the list" action. A module-scoped flag times
+// exactly one fetch regardless of observer count, then stays latched.
+let initialListLoadTimed = false;
+
 export function useConversations(
   searchQuery = "",
   includeArchived = false,
   options: UseConversationsOptions = {},
   project?: string,
+  visibility?: "mine" | "shared" | "archived",
 ) {
   // Live updates arrive over the `WS /v1/sessions/updates` push stream
   // (SessionUpdatesProvider), which patches this cache in place as watched
@@ -304,21 +531,45 @@ export function useConversations(
   // enter the sidebar without making every consumer poll `/v1/sessions`.
   // If the socket is down, all consumers use a safety poll.
   const streamConnected = useSessionUpdatesConnected();
+  const queryClient = useQueryClient();
   return useInfiniteQuery({
     // Keep the base three-element key for the unfiltered callers (byte-for-byte
     // unchanged, so the sidebar / rename / push-delta paths are untouched); only
-    // append `project` for a concrete name. A falsy project (`undefined` or `""`)
-    // is "all projects" and shares the base key — there is no distinct "" variant.
-    queryKey: project
-      ? ["conversations", searchQuery, includeArchived, project]
-      : ["conversations", searchQuery, includeArchived],
-    queryFn: ({ pageParam }) =>
-      fetchConversationsPage({
-        after: pageParam as string | undefined,
-        searchQuery,
-        includeArchived,
-        project,
-      }),
+    // append `project` for a concrete name; append `visibility` only when set so
+    // the "mine"/"shared" tab queries get their own cache entries without
+    // disturbing the existing all-sessions key used by every other caller.
+    queryKey: visibility
+      ? ["conversations", searchQuery, includeArchived, project ?? null, visibility]
+      : project
+        ? ["conversations", searchQuery, includeArchived, project]
+        : ["conversations", searchQuery, includeArchived],
+    queryFn: async ({ pageParam }) => {
+      const fetchPage = () =>
+        fetchConversationsPage({
+          after: pageParam as string | undefined,
+          searchQuery,
+          includeArchived,
+          project,
+          visibility,
+          queryClient,
+        });
+      // Time the first full-list load per app session; skip pagination
+      // (pageParam set), every later fetch (poll / reconcile / invalidation),
+      // and tab-scoped visibility queries (the CUJ measures the full-list only).
+      if (initialListLoadTimed || pageParam !== undefined || visibility !== undefined)
+        return fetchPage();
+      initialListLoadTimed = true;
+      const interaction = startTimedInteraction("list_sessions");
+      try {
+        const page = await fetchPage();
+        interaction.complete();
+        return page;
+      } catch (error) {
+        interaction.fail();
+        throw error;
+      }
+    },
+
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
@@ -327,11 +578,25 @@ export function useConversations(
     // share the cache instead of each triggering a background refetch.
     // The WS stream handles real-time updates within that window.
     staleTime: 30_000,
+    // A client-side search timeout is terminal — retrying would just re-arm the
+    // same slow request (default 3×) and prolong the spinner. Any other failure
+    // keeps React Query's default retry behaviour.
+    retry: (failureCount, error) => !isAbortTimeout(error) && failureCount < 3,
     refetchInterval: streamConnected
       ? options.reconcileWhileConnected
         ? CONNECTED_STREAM_REFETCH_INTERVAL_MS
         : false
       : DISCONNECTED_STREAM_REFETCH_INTERVAL_MS,
+    // Lets callers mount the hook unconditionally while suppressing the fetch
+    // until it's actually needed (e.g. the sidebar's tab-scoped query is
+    // disabled when the user is not on the "mine" or "shared" tab).
+    enabled: options.enabled ?? true,
+    // Coalesce the live-updates object churn for consumers that opt in (see
+    // UseConversationsOptions.notifyOnChangeProps). Mutable copy — the query
+    // options type wants a mutable array.
+    ...(options.notifyOnChangeProps
+      ? { notifyOnChangeProps: [...options.notifyOnChangeProps] }
+      : {}),
   });
 }
 
@@ -375,10 +640,15 @@ export async function deleteConversation(id: string, deleteBranch = false): Prom
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}${query}`, {
     method: "DELETE",
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  // Prefer the server's `error.message` (e.g. runner-offline worktree
+  // cleanup) over the bare status line so the delete-failed toast is
+  // actionable instead of "404 Not Found".
+  if (!res.ok) throw await apiErrorFromResponse(res);
   // Drop any client-side queued messages for the now-deleted session; bound to
   // a dead conversation, they could never flush.
   useChatStore.getState().clearQueuedMessages(id);
+  // A deleted conversation must stop pumping and let go of its stream.
+  releaseConversation(id);
 }
 
 /**
@@ -401,59 +671,14 @@ export async function deleteConversation(id: string, deleteBranch = false): Prom
  * polls. Callers (the sidebar row) trigger this on blur / Enter in
  * the inline-edit input.
  */
-// Project folders (["project-sessions", name]) are non-archived, unsearched
-// lists — the same filters the push-delta merge uses to overlay them.
-const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
-
 export function useRenameConversation() {
   const queryClient = useQueryClient();
 
-  // Overlay a title into every cache that holds a row for this session.
-  // Only the fields the rename changes are written — the full PATCH
-  // snapshot carries nulls for absent fields that would clobber
-  // list-shaped rows (see `nullsToUndefined` in sessionListCache).
-  const overlayTitle = (id: string, title: string | null, updatedAt?: number) => {
-    const wire: SessionListWireItem = {
-      id,
-      title,
-      ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
-    };
-    const itemsById = new Map([[id, wire]]);
-    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-      queryKey: ["conversations"],
-    })) {
-      const { data: next } = mergeItemsIntoPages(
-        data,
-        itemsById,
-        filtersFromConversationQueryKey(key),
-        // activeId only gates `needsRefetch`, which is unused here —
-        // we deliberately skip the refetch (see hook docstring).
-        undefined,
-      );
-      if (next !== data) queryClient.setQueryData(key, next);
-    }
-    // A filed session renders from its own ["project-sessions", name] list,
-    // not the flat ["conversations"] cache, so patch those (non-archived,
-    // unsearched — PROJECT_FOLDER_FILTERS) too or the folder row stays stale.
-    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-      queryKey: ["project-sessions"],
-    })) {
-      const { data: next } = mergeItemsIntoPages(
-        data,
-        itemsById,
-        PROJECT_FOLDER_FILTERS,
-        undefined,
-      );
-      if (next !== data) queryClient.setQueryData(key, next);
-    }
-    // The pinned-row backfill cache (staleTime 60s) and the per-session
-    // snapshot (staleTime Infinity) are not covered by the list patch and
-    // would serve the old title long after.
-    queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
-      old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
-    );
-    queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, title } : old));
-  };
+  // Overlay a title into every cache holding a row for this session. Shared
+  // with the `session.title` SSE handler so a terminal-side `/rename` and a
+  // Web UI rename patch exactly the same caches.
+  const overlayTitle = (id: string, title: string | null, updatedAt?: number) =>
+    overlayTitleIntoCaches(queryClient, id, title, updatedAt);
 
   return useMutation({
     mutationFn: ({ id, title }: { id: string; title: string }) => renameConversation(id, title),
@@ -520,23 +745,86 @@ export function useRenameConversation() {
 /**
  * Archive / unarchive a conversation via `PATCH /v1/sessions/{id}`.
  *
- * Invalidates the conversations list on success so the row moves
- * into (or out of) the sidebar's "Archived" section. Mirrors the
- * rename hook's `markConversationSeen` anchoring: the PATCH bumps
- * server `updated_at`, and without this the unseen tracker would
- * flag the user's own archive action as new activity.
+ * Optimistic: `onMutate` overlays the new `archived` flag into every cached
+ * list (see `overlayArchivedIntoCaches`), so the sidebar — which filters
+ * archived rows out client-side — repaints on the next frame instead of after
+ * the PATCH round-trips. `onError` reconciles the flag from the server (the
+ * row returns to its old section) and toasts. `onSuccess` anchors the unseen
+ * tracker (the PATCH bumps server `updated_at`, which would otherwise flag the
+ * user's own archive as new activity) and refreshes the project caches, which
+ * read the DB directly (no search-index lag).
  */
+/**
+ * Snapshot of every cache an optimistic archive overlays — the flat lists,
+ * the project folders, and the pinned backfill — captured before the overlay
+ * so a failed archive rolls back to exactly this state. Mirrors delete's
+ * `DeletedListsSnapshot`: restoring the snapshot rather than refetching keeps
+ * the rollback off the search-indexed list fetch, which lags the write and
+ * would otherwise resurrect a row that DID archive (a bulk partial failure).
+ */
+interface ArchiveListsSnapshot {
+  lists: [readonly unknown[], ConversationsInfiniteData | undefined][];
+  pinned: PinnedConversationsResult | undefined;
+}
+
+function snapshotArchiveLists(queryClient: QueryClient): ArchiveListsSnapshot {
+  return {
+    lists: [
+      ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] }),
+      ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] }),
+    ],
+    pinned: queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY),
+  };
+}
+
+function restoreArchiveLists(queryClient: QueryClient, snapshot: ArchiveListsSnapshot): void {
+  for (const [key, data] of snapshot.lists) queryClient.setQueryData(key, data);
+  queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, snapshot.pinned);
+}
+
+/**
+ * Drop conversations from the pinned backfill cache — a pinned session outside
+ * the paginated window lives only there, so the list overlay can't hide it.
+ */
+function dropFromPinnedCache(queryClient: QueryClient, ids: Iterable<string>): void {
+  const drop = new Set(ids);
+  queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+    old ? { ...old, conversations: old.conversations.filter((c) => !drop.has(c.id)) } : old,
+  );
+}
+
 export function useArchiveConversation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({ id, archived }: { id: string; archived: boolean }) =>
       archiveConversation(id, archived),
+    onMutate: async ({ id, archived }) => {
+      // Cancel any in-flight list refetch so it can't resolve after this
+      // overlay and clobber the flag with the stale search-indexed state.
+      await queryClient.cancelQueries({ queryKey: ["conversations"] });
+      const snapshot = snapshotArchiveLists(queryClient);
+      overlayArchivedIntoCaches(queryClient, id, archived);
+      // Drop an archived pin from the backfill cache too (mirrors delete).
+      if (archived) dropFromPinnedCache(queryClient, [id]);
+      return { snapshot };
+    },
+    onError: (_err, { archived }, context) => {
+      // Roll back to exactly the pre-archive caches, synchronously — so the
+      // row (and any dropped pin) returns at once, rather than waiting on a
+      // search-indexed refetch that lags the write.
+      if (context?.snapshot) restoreArchiveLists(queryClient, context.snapshot);
+      showToast(
+        archived
+          ? "Couldn't archive the session — it's back in the sidebar."
+          : "Couldn't unarchive the session.",
+      );
+    },
     onSuccess: (updated) => {
       markConversationSeen(updated.id, updated.updated_at);
-      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       // Archiving/unarchiving the last (or first) non-archived member of a
       // project removes/restores it from the server's project list, and adds
-      // or drops it from that project folder's own paginated list.
+      // or drops it from that project folder's own paginated list. These read
+      // the DB directly, so refetching them can't resurrect the archived row.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       // Archive membership just changed, so the archived-view picker's option
@@ -547,37 +835,168 @@ export function useArchiveConversation() {
 }
 
 /**
+ * Splice conversations out of every cached sidebar list at once.
+ *
+ * Covers the global `["conversations", ...]` variants, each project
+ * folder's own `["project-sessions", <name>]` list (same page shape), and
+ * the sibling Pinned cache the two sweeps above don't reach — a deleted
+ * pinned row would otherwise linger there until a reload.
+ *
+ * Patched in place rather than invalidated: `GET /v1/sessions` may be
+ * served from a search index that catches up to the delete asynchronously
+ * (the Databricks deployment lists via search-midtier over WHS), so a
+ * refetch races the reindex and can resurrect the row (the same race
+ * `useRenameConversation` documents for titles).
+ *
+ * @param queryClient - The app QueryClient.
+ * @param ids - Conversation ids to drop from the lists.
+ */
+function removeConversationsFromLists(queryClient: QueryClient, ids: Set<string>): void {
+  for (const queryKey of [["conversations"], ["project-sessions"]]) {
+    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey,
+    })) {
+      const { data: next, removed } = removeIdsFromPages(data, ids);
+      if (removed) queryClient.setQueryData(key, next);
+    }
+  }
+  queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+    old ? { ...old, conversations: old.conversations.filter((c) => !ids.has(c.id)) } : old,
+  );
+}
+
+/** Every cached list touched by an optimistic delete, as it was before. */
+interface DeletedListsSnapshot {
+  lists: [readonly unknown[], ConversationsInfiniteData | undefined][];
+  pinned: PinnedConversationsResult | undefined;
+}
+
+/**
+ * Paint a delete before the server confirms it: hide the sessions from
+ * every list fetch, then splice their rows out of the cached lists.
+ *
+ * In-flight list refetches are cancelled first so one can't resolve after
+ * the splice and repaint the rows the user just deleted.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param ids - Conversation ids being deleted.
+ * @returns The pre-delete cache state, for `restoreDeletedConversations`.
+ */
+async function paintConversationsDeleted(
+  queryClient: QueryClient,
+  ids: readonly string[],
+): Promise<DeletedListsSnapshot> {
+  markSessionsDeleting(ids);
+  await Promise.all([
+    queryClient.cancelQueries({ queryKey: ["conversations"] }),
+    queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
+  ]);
+  const snapshot: DeletedListsSnapshot = {
+    lists: [
+      ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] }),
+      ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] }),
+    ],
+    pinned: queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY),
+  };
+  removeConversationsFromLists(queryClient, new Set(ids));
+  return snapshot;
+}
+
+/**
+ * Put optimistically-removed rows back after a failed delete.
+ *
+ * Restores the snapshot wholesale (the same rollback shape
+ * `useMoveToProject` uses) rather than re-deriving positions, then
+ * re-splices whatever DID delete — a bulk delete can fail for only part
+ * of its selection. The lists are invalidated afterwards so the server
+ * reconciles the window the snapshot froze over.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param snapshot - Cache state captured by `paintConversationsDeleted`.
+ * @param failedIds - Conversation ids whose delete failed (rows return).
+ * @param deletedIds - Conversation ids that did delete (rows stay gone).
+ */
+function restoreDeletedConversations(
+  queryClient: QueryClient,
+  snapshot: DeletedListsSnapshot | undefined,
+  failedIds: readonly string[],
+  deletedIds: readonly string[] = [],
+): void {
+  unmarkSessionsDeleting(failedIds);
+  if (snapshot) {
+    for (const [key, data] of snapshot.lists) queryClient.setQueryData(key, data);
+    queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, snapshot.pinned);
+    if (deletedIds.length > 0) removeConversationsFromLists(queryClient, new Set(deletedIds));
+  }
+  void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+  void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+}
+
+/**
+ * Drop the caches that only a confirmed delete makes dead: the
+ * per-session snapshot and the pinned-row backfill entry (a pinned
+ * session would otherwise re-enter the sidebar from the still-fresh
+ * `["conversation-backfill", id]` entry the moment it leaves the
+ * paginated pages, and stay until a full reload).
+ *
+ * @param queryClient - The app QueryClient.
+ * @param ids - Conversation ids the server confirmed deleted.
+ */
+function finalizeDeletedConversations(queryClient: QueryClient, ids: readonly string[]): void {
+  for (const id of ids) {
+    queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
+    queryClient.removeQueries({ queryKey: ["session", id] });
+  }
+  expireSessionsDeleting([...ids]);
+  // Deleting the last member of a project empties it, so refresh the
+  // project list to drop the now-empty folder. Unlike the conversations
+  // list, /v1/sessions/projects reads the DB directly (no search-index
+  // lag), so this can't resurrect the deleted rows.
+  void queryClient.invalidateQueries({ queryKey: ["projects"] });
+  // Deleting an archived session may empty its project of archived members.
+  void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+}
+
+/**
+ * User-facing copy when an optimistic session delete is rolled back.
+ *
+ * Bare HTTP status lines (`"404 Not Found"`) are not appended — they
+ * are what made the runner-offline worktree failure look like a missing
+ * session. Structured server messages (409 conflict, etc.) are.
+ */
+function deleteFailedToast(label: string | null | undefined, err: unknown): string {
+  const restored = label
+    ? `Couldn't delete ${label} — it's back in the sidebar.`
+    : "Couldn't delete the session — it's back in the sidebar.";
+  const serverMessage = err instanceof Error ? err.message.trim() : "";
+  if (!serverMessage || /^\d{3}\b/.test(serverMessage)) return restored;
+  return `${restored} ${serverMessage}`;
+}
+
+/**
  * Delete a conversation: stop the running session, then
  * `DELETE /v1/sessions/{id}`.
  *
- * The DELETE route only tears down resources (env, terminals) and
- * removes the conversation row — it does NOT kill the running agent,
- * so a claude-native tmux pane or a host-spawned runner would keep
- * executing orphaned after the chat disappears from the UI. We send
- * the same `stop_session` the Stop action uses first so the live
- * process is terminated as part of the delete.
+ * The DELETE route tears down resources (env, terminals) and removes the
+ * conversation row, but only the `stop_session` event tears down a
+ * host-spawned session's dedicated runner — without it that runner stays
+ * connected after the chat is gone. We send the same `stop_session` the
+ * Stop action uses first so the live process is terminated as part of the
+ * delete.
  *
  * The stop is best-effort: a failure (offline/wedged runner, an
  * already-stopped or never-running session) must not block the
  * delete, so it's swallowed and the DELETE proceeds regardless.
  *
- * Server-side, the DELETE also tears down associated tasks and tmux
- * terminals (see `routes/conversations.py:delete_conversation`).
- *
- * On success the deleted row is removed from every cached
- * `["conversations", ...]` page in place — NOT via invalidation.
- * `GET /v1/sessions` may be served from a search index that catches
- * up to the delete asynchronously (the Databricks deployment lists
- * via search-midtier over WHS), so an immediate refetch races the
- * reindex and can resurrect the just-deleted row (same race
- * `useRenameConversation` documents for titles). The per-session
- * caches are dropped too: a pinned session would otherwise re-enter
- * the sidebar from the still-fresh `["conversation-backfill", id]`
- * entry the moment it leaves the paginated pages, and stay until a
- * full reload. List pagination converges later via the
- * `WS /v1/sessions/updates` stream and the low-rate reconciliation
- * polls. Callers (the sidebar row) are responsible for navigating
- * away from `/c/{id}` if the deleted conversation is the active one.
+ * Optimistic: the row leaves every cached list in `onMutate`, so the
+ * sidebar repaints on the next frame instead of after the stop + DELETE
+ * round-trip — server-side teardown (runner resources, worktree, managed
+ * sandbox) can take seconds, which is what made delete feel slower than
+ * archive. The session is tombstoned for that window so a concurrent list
+ * fetch can't repaint the row (see `withoutDeletingSessions`); `onError`
+ * drops the tombstone and refetches, restoring the row. Callers (the
+ * sidebar row) are responsible for navigating away from `/c/{id}` if the
+ * deleted conversation is the active one.
  */
 export function useStopAndDeleteConversation() {
   const queryClient = useQueryClient();
@@ -590,13 +1009,53 @@ export function useStopAndDeleteConversation() {
       }
       await deleteConversation(id, deleteBranch);
     },
+    onMutate: async ({ id }) => {
+      // Snapshot the label before the row leaves the cache — a failure
+      // toast fired later can no longer look it up.
+      const row = findCachedConversationRow(queryClient, id);
+      const snapshot = await paintConversationsDeleted(queryClient, [id]);
+      return { label: row ? conversationDisplayLabel(row) : null, snapshot };
+    },
+    onError: (err, { id }, context) => {
+      restoreDeletedConversations(queryClient, context?.snapshot, [id]);
+      // The row is back in the sidebar but nothing else marks it as failed
+      // (the row unmounted when it was spliced out, taking any in-row error
+      // state with it), so the toast is the only failure signal. Keep it
+      // until dismiss: a default-duration toast is easy to miss, and the
+      // server message (runner offline / delete without branch) is the
+      // only hint for what to do next.
+      showToast(deleteFailedToast(context?.label, err), { duration: 0 });
+    },
+    onSuccess: (_data, { id }) => {
+      finalizeDeletedConversations(queryClient, [id]);
+    },
+  });
+}
+
+/**
+ * Leave a session shared with you — revoking your OWN grant via
+ * `DELETE /v1/sessions/{id}/permissions/{viewerId}` — so it drops out of the
+ * sidebar. The server allows a self-revoke with only read access; `viewerId`
+ * must be the caller's own id (the sidebar reads it from the resolved identity
+ * it already uses to decide the row isn't owned).
+ *
+ * The row is spliced out of the cached list pages in place rather than
+ * invalidated, for the same reason delete does it (see
+ * `useStopAndDeleteConversation`): `GET /v1/sessions` may be served from a
+ * search index that catches up asynchronously, so an immediate refetch can
+ * resurrect the row the user just dismissed. Nothing is deleted server-side —
+ * only the caller's grant — so the owner re-sharing brings it back.
+ *
+ * Callers are responsible for navigating away from `/c/{id}` when leaving the
+ * session currently being viewed; it 404s for them afterwards.
+ */
+export function useLeaveSession() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, viewerId }: { id: string; viewerId: string }) =>
+      revokePermission(id, viewerId),
     onSuccess: (_data, { id }) => {
       const ids = new Set([id]);
-      // Drop the row from the global list AND every project folder's own
-      // paginated list (["project-sessions", <name>]) — both share the same
-      // page shape. Patched in place rather than invalidated for the same
-      // reason as the global list: an immediate refetch races the server's
-      // async search reindex and can resurrect the just-deleted row.
       for (const queryKey of [["conversations"], ["project-sessions"]]) {
         for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
           queryKey,
@@ -605,22 +1064,13 @@ export function useStopAndDeleteConversation() {
           if (removed) queryClient.setQueryData(key, next);
         }
       }
+      // Drop the per-session caches too, so the row can't re-enter the sidebar
+      // from a still-fresh backfill entry once it leaves the paginated pages.
       queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
       queryClient.removeQueries({ queryKey: ["session", id] });
-      // The Pinned section reads a separate, sibling cache that the
-      // ["conversations"] sweep above deliberately skips, so a deleted pinned
-      // row lingers there until a reload unless we drop it explicitly. Patched
-      // (not invalidated) for the same reindex-lag reason as the list.
       queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
         old ? { ...old, conversations: old.conversations.filter((c) => !ids.has(c.id)) } : old,
       );
-      // Deleting the last member of a project empties it, so refresh the
-      // project list to drop the now-empty folder. Unlike the conversations
-      // list, /v1/sessions/projects reads the DB directly (no search-index
-      // lag), so this can't resurrect the deleted row.
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      // Deleting an archived session may empty its project of archived members.
-      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }
@@ -653,10 +1103,11 @@ export function useStopSession() {
 /**
  * Archive multiple conversations in parallel via `PATCH /v1/sessions/{id}`.
  *
- * Each session is archived independently — individual failures don't
- * block the rest. The conversations list is invalidated once on
- * completion so the sidebar refreshes. Returns an array of session IDs
- * that failed.
+ * Optimistic like the single-session archive: `onMutate` overlays the new flag
+ * onto every selected row so the sidebar repaints immediately. Each session is
+ * archived independently — individual failures don't block the rest — and
+ * `onError` reconciles the whole selection from the server (rows whose PATCH
+ * failed snap back). Returns the session IDs that failed.
  */
 export function useBulkArchiveConversations() {
   const queryClient = useQueryClient();
@@ -679,8 +1130,30 @@ export function useBulkArchiveConversations() {
         .filter((r): r is PromiseFulfilledResult<Conversation> => r.status === "fulfilled")
         .map((r) => r.value);
     },
+    onMutate: async ({ ids, archived }) => {
+      await queryClient.cancelQueries({ queryKey: ["conversations"] });
+      const snapshot = snapshotArchiveLists(queryClient);
+      for (const id of ids) overlayArchivedIntoCaches(queryClient, id, archived);
+      if (archived) dropFromPinnedCache(queryClient, ids);
+      return { snapshot };
+    },
+    onError: (err, { ids, archived }, context) => {
+      // Partial failure: restore the pre-archive caches, then RE-apply the
+      // overlay for the ids that DID archive so they stay hidden — only the
+      // failed ids return. Restoring from the snapshot rather than refetching
+      // ["conversations"] is what stops the search-index lag from resurrecting
+      // the successful archives (the exact regression this reconcile guards).
+      if (!context?.snapshot) return;
+      restoreArchiveLists(queryClient, context.snapshot);
+      const failed = new Set(err instanceof BulkConversationMutationError ? err.failed : ids);
+      const succeeded = ids.filter((id) => !failed.has(id));
+      for (const id of succeeded) overlayArchivedIntoCaches(queryClient, id, archived);
+      if (archived) dropFromPinnedCache(queryClient, succeeded);
+    },
     onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      // Project caches read the DB directly (no search-index lag), so unlike
+      // ["conversations"] they can be refreshed on every settle without
+      // racing the reindex and resurrecting an archived row.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
@@ -692,13 +1165,26 @@ export function useBulkArchiveConversations() {
  * Delete multiple conversations in parallel (stop + delete each).
  *
  * Each session is stopped (best-effort) then deleted independently.
- * The conversations list cache is patched to remove successful
- * deletions. Returns an array of session IDs that failed.
+ * Optimistic like the single-session delete: every selected row leaves
+ * the cached lists in `onMutate` so the sidebar repaints immediately,
+ * and only the ones whose delete failed are restored. Returns the
+ * succeeded / failed session IDs.
+ *
+ * `deleteBranchIds` opts individual worktree sessions into git cleanup:
+ * a session whose id is in the set is deleted with `?delete_branch=true`
+ * (the server removes its worktree and branch). Ids absent from the set
+ * — or all ids when it's omitted — delete without touching any branch.
  */
 export function useBulkDeleteConversations() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (ids: string[]) => {
+    mutationFn: async ({
+      ids,
+      deleteBranchIds,
+    }: {
+      ids: string[];
+      deleteBranchIds?: ReadonlySet<string>;
+    }) => {
       const results = await Promise.allSettled(
         ids.map(async (id) => {
           try {
@@ -706,7 +1192,7 @@ export function useBulkDeleteConversations() {
           } catch {
             // Best-effort stop
           }
-          await deleteConversation(id);
+          await deleteConversation(id, deleteBranchIds?.has(id) ?? false);
         }),
       );
       const succeeded: string[] = [];
@@ -724,54 +1210,23 @@ export function useBulkDeleteConversations() {
       }
       return { succeeded, failed };
     },
-    onSuccess: (_data, ids) => {
-      const idSet = new Set(ids);
-      // Splice deleted rows out of the global list AND every project folder's
-      // own paginated list (same page shape) so filed sessions leave their
-      // folder without a refresh.
-      for (const queryKey of [["conversations"], ["project-sessions"]]) {
-        for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-          queryKey,
-        })) {
-          const { data: next, removed } = removeIdsFromPages(data, idSet);
-          if (removed) queryClient.setQueryData(key, next);
-        }
-      }
-      for (const id of ids) {
-        queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
-        queryClient.removeQueries({ queryKey: ["session", id] });
-      }
-      // Drop deleted rows from the sibling Pinned cache the sweep above skips.
-      queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
-        old ? { ...old, conversations: old.conversations.filter((c) => !idSet.has(c.id)) } : old,
-      );
-      // Refresh the project list so a project emptied by these deletes drops
-      // its now-empty folder (DB-direct read, no search-index lag).
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+    onMutate: ({ ids }) => paintConversationsDeleted(queryClient, ids),
+    onSuccess: (_data, { ids }) => {
+      finalizeDeletedConversations(queryClient, ids);
     },
-    onError: (error) => {
-      if (error instanceof BulkConversationMutationError && error.succeeded.length > 0) {
-        const idSet = new Set(error.succeeded);
-        for (const queryKey of [["conversations"], ["project-sessions"]]) {
-          for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-            queryKey,
-          })) {
-            const { data: next, removed } = removeIdsFromPages(data, idSet);
-            if (removed) queryClient.setQueryData(key, next);
-          }
-        }
-        for (const id of error.succeeded) {
-          queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
-          queryClient.removeQueries({ queryKey: ["session", id] });
-        }
-        // Drop the successfully-deleted rows from the sibling Pinned cache too.
-        queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
-          old ? { ...old, conversations: old.conversations.filter((c) => !idSet.has(c.id)) } : old,
-        );
-        void queryClient.invalidateQueries({ queryKey: ["projects"] });
-        void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
-      }
+    onError: (error, { ids }, snapshot) => {
+      // Partial failure: the sessions that did delete stay gone; the rest
+      // come back. A non-bulk error (nothing reported) restores everything.
+      const bulk = error instanceof BulkConversationMutationError ? error : null;
+      const failed = bulk ? bulk.failed : [...ids];
+      const succeeded = bulk ? bulk.succeeded : [];
+      restoreDeletedConversations(queryClient, snapshot, failed, succeeded);
+      if (succeeded.length > 0) finalizeDeletedConversations(queryClient, succeeded);
+      showToast(
+        failed.length === 1
+          ? "Couldn't delete 1 session — it's back in the sidebar."
+          : `Couldn't delete ${failed.length} sessions — they're back in the sidebar.`,
+      );
     },
   });
 }
@@ -804,6 +1259,38 @@ export function useBulkStopSessions() {
     },
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    },
+  });
+}
+
+/**
+ * Move multiple sessions to a project (or remove from all projects when
+ * `project=""`). Each session is moved independently; partial failures don't
+ * block the rest.
+ */
+export function useBulkMoveToProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ ids, project }: { ids: string[]; project: string }) => {
+      const results = await Promise.allSettled(
+        ids.map((id) => moveConversationToProject(id, project)),
+      );
+      const failed: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "rejected") failed.push(ids[i]);
+      }
+      if (failed.length > 0) {
+        throw new BulkConversationMutationError("move", { failed, total: ids.length });
+      }
+      return results
+        .filter((r): r is PromiseFulfilledResult<Conversation> => r.status === "fulfilled")
+        .map((r) => r.value);
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }
@@ -866,7 +1353,7 @@ export async function fetchPinnedConversations(): Promise<PinnedConversationsRes
   });
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const rows = ((await res.json()) as ConversationsPage).data;
+  const rows = withoutDeletingSessions((await res.json()) as ConversationsPage).data;
   const conversations = rows.filter((c) => c.labels?.[PINNED_LABEL_KEY] != null);
   // Honored iff the server returned nothing, or everything it returned is
   // actually pinned. An old server returns unfiltered rows (none pinned), so a
@@ -1100,6 +1587,9 @@ export { PROJECT_LABEL_KEY };
 export interface ProjectSummary {
   id: string | null;
   name: string;
+  /** Chosen emoji icon (a unicode grapheme), or null/absent for the default
+      folder glyph. Sourced from the project's `config.icon`. */
+  icon?: string | null;
 }
 
 /**
@@ -1135,6 +1625,8 @@ export function useProjects() {
  */
 export async function fetchAllArchivedProjectNames(): Promise<string[]> {
   const names = new Set<string>();
+  // First-class memberships to resolve to names once the scan is done.
+  const memberProjectIds = new Set<string>();
   let after: string | undefined;
   for (;;) {
     const params = new URLSearchParams({
@@ -1157,9 +1649,20 @@ export async function fetchAllArchivedProjectNames(): Promise<string[]> {
       if (conv.archived !== true) continue;
       const name = conv.labels?.[PROJECT_LABEL_KEY];
       if (name) names.add(name);
+      // Dual-read, like the sidebar's grouping: a session born filed (or
+      // moved) carries first-class `project_id` and no legacy label.
+      if (conv.project_id) memberProjectIds.add(conv.project_id);
     }
     if (!page.has_more || !page.last_id) break;
     after = page.last_id;
+  }
+  if (memberProjectIds.size > 0) {
+    // One list call resolves every collected id; an id with no surviving
+    // project row (deleted project) is silently dropped.
+    const projects = await apiListProjects();
+    for (const project of projects) {
+      if (memberProjectIds.has(project.id)) names.add(project.name);
+    }
   }
   return [...names].sort((a, b) => a.localeCompare(b));
 }
@@ -1462,7 +1965,7 @@ async function fetchProjectSessionsPage(
   if (after) params.set("after", after);
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return (await res.json()) as ConversationsPage;
+  return withoutDeletingSessions((await res.json()) as ConversationsPage);
 }
 
 /**
@@ -1563,7 +2066,8 @@ export function useDeleteProject() {
 export function useCreateProject() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (name: string) => apiCreateProject(name),
+    mutationFn: ({ name, icon }: { name: string; icon?: string }) =>
+      apiCreateProject(name, icon ? { icon } : undefined),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
@@ -1624,6 +2128,10 @@ export function useRenameProject() {
           if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
         }),
       );
+      // Return the resolved id so a caller promoting a label-only folder can
+      // target the just-created row for a follow-up write instead of passing
+      // the stale `null` and re-creating it (which 409s on the duplicate name).
+      return projectId;
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
@@ -1683,7 +2191,7 @@ export function useUpdateProjectConfig() {
       // config to `{}` and drop the saved defaults on that first visit.
       queryClient.setQueryData<ProjectSummary[]>(["projects"], (prev) => {
         if (!prev) return prev;
-        const summary = { id: project.id, name: project.name };
+        const summary = { id: project.id, name: project.name, icon: project.config?.icon };
         return prev.some((p) => p.name === project.name)
           ? prev.map((p) => (p.name === project.name ? summary : p))
           : [...prev, summary];

@@ -15,12 +15,50 @@ import httpx
 from mcp.types import ElicitRequestParams, ElicitResult
 from mcp.types import Tool as McpToolDef
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.spec.types import AgentSpec, MCPServerConfig, RetryPolicy
 from omnigent.tools.base import is_valid_tool_name
 from omnigent.tools.mcp import McpServerConnection
 
 _logger = logging.getLogger(__name__)
+
+
+def _schema_requires_fields(params: ElicitRequestParams) -> bool:
+    """
+    Whether the server's ``requestedSchema`` names fields it requires.
+
+    A schema with no properties is a bare consent prompt, and one whose
+    properties are all optional legally accepts an answer with no content —
+    only a non-empty ``required`` list makes an empty accept malformed.
+
+    :param params: The elicitation params from the MCP server.
+    :returns: ``True`` when at least one property is required.
+    """
+    from omnigent.tools._elicitation_schema import schema_requires_fields
+
+    schema = getattr(params, "requestedSchema", None)
+    return schema_requires_fields(schema if isinstance(schema, dict) else None)
+
+
+def _validated_content(
+    content: dict[str, str | int | float | bool | list[str] | None] | None,
+    params: ElicitRequestParams,
+) -> dict[str, str | int | float | bool | list[str] | None] | None:
+    """
+    Keep answered content only when it fits what the server asked for.
+
+    Delegates to the shared
+    :func:`omnigent.tools._elicitation_schema.validate_content_against_schema`.
+
+    :param content: The content the person's verdict carried, or ``None``.
+    :param params: The elicitation params from the MCP server.
+    :returns: The content when it conforms, otherwise ``None``.
+    """
+    from omnigent.tools._elicitation_schema import validate_content_against_schema
+
+    schema = getattr(params, "requestedSchema", None)
+    return validate_content_against_schema(content, schema if isinstance(schema, dict) else None)
 
 
 def _build_accept_content(
@@ -186,6 +224,7 @@ def _mcp_tool_schema(
             "(must match [a-zA-Z0-9_-]{1,256}) — skipping",
             bare_name,
             server_name,
+            extra={"session_id": runner_primary_session_id()},
         )
         return None
     # Namespace: ``{server_name}__{bare_name}`` so two servers with a tool
@@ -269,6 +308,7 @@ class RunnerMcpManager:
             if server_client is None:
                 _logger.warning(
                     "MCP elicitation callback: no Omnigent server client available — declining",
+                    extra={"session_id": session_id},
                 )
                 return ElicitResult(action="decline")
 
@@ -296,6 +336,7 @@ class RunnerMcpManager:
                 _logger.warning(
                     "MCP elicitation callback: Omnigent server POST failed (%s) — declining",
                     exc,
+                    extra={"session_id": session_id},
                 )
                 return ElicitResult(action="decline")
 
@@ -304,28 +345,54 @@ class RunnerMcpManager:
                 _logger.warning(
                     "MCP elicitation callback: Omnigent server returned no "
                     "elicitation_id — declining",
+                    extra={"session_id": session_id},
                 )
                 return ElicitResult(action="decline")
 
             # Park until the user approves or declines (or timeout).
-            # ``pending_approvals`` resolves a bool (accept/decline)
-            # — it does not carry the user's form data. Content is
-            # auto-filled from the requestedSchema below.
             # No-op publish_event: ``response.elicitation_resolved``
             # won't fire on timeout/cancellation, so the Omnigent server's
             # sidebar badge may stay stale. Same pattern as
             # proxy_mcp_manager. A future enhancement could POST
             # the resolved event back to the Omnigent server here.
-            approved = await pending_approvals.wait_for_user_approval(
+            verdict = await pending_approvals.wait_for_user_verdict(
                 elicitation_id=elicitation_id,
                 conversation_id=session_id,
                 publish_event=lambda _s, _e: None,
             )
 
-            if not approved:
+            if not verdict.approved:
                 return ElicitResult(action="decline")
 
-            content = _build_accept_content(params)
+            # The person's own answer wins. The schema auto-fill is the
+            # fallback for a surface that collected no fields — a bare
+            # approve/reject card, or the REPL — where a consent-shaped
+            # schema (a boolean, a lone enum, an explicit default) has only
+            # one sensible value anyway.
+            content = _validated_content(verdict.content, params)
+            if content is None and verdict.content:
+                # An answer WAS given but does not fit the schema. Guessing a
+                # different one would repeat the very bug this path fixes —
+                # the server acting on a value nobody chose — so fail closed.
+                _logger.warning(
+                    "MCP elicitation %s answer does not conform to the "
+                    "requestedSchema — declining instead of substituting one",
+                    elicitation_id,
+                )
+                return ElicitResult(action="decline")
+            if content is None:
+                content = _build_accept_content(params)
+            if content is None and _schema_requires_fields(params):
+                # The server requires fields nobody supplied, and the schema
+                # gives nothing to fall back on. An accept without the fields
+                # it requires is a malformed answer; declining is the outcome
+                # the server already knows how to handle.
+                _logger.info(
+                    "MCP elicitation %s accepted with no content for a schema "
+                    "that requires fields — declining instead",
+                    elicitation_id,
+                )
+                return ElicitResult(action="decline")
             return ElicitResult(action="accept", content=content)
 
         return _elicit
@@ -367,7 +434,10 @@ class RunnerMcpManager:
                 try:
                     await asyncio.gather(*connect_tasks.values())
                 except Exception:
-                    _logger.exception("runner mcp connect task raised; surfacing partial results")
+                    _logger.exception(
+                        "runner mcp connect task raised; surfacing partial results",
+                        extra={"session_id": runner_primary_session_id()},
+                    )
 
             schemas: list[_JsonObject] = []
             tool_names: set[str] = set()
@@ -610,6 +680,7 @@ class RunnerMcpManager:
                     "error closing MCP %r (%s) during shutdown",
                     server.config.name,
                     server.server_hash,
+                    extra={"session_id": runner_primary_session_id()},
                 )
 
         if self._evict_tasks:
@@ -657,6 +728,7 @@ class RunnerMcpManager:
                 "runner mcp pool evicting spec %s (over capacity %d)",
                 victim,
                 _POOL_SPEC_CAPACITY,
+                extra={"session_id": runner_primary_session_id()},
             )
             self._release_spec_entry(victim, entry)
 
@@ -672,7 +744,12 @@ class RunnerMcpManager:
         try:
             await conn.close()
         except Exception:
-            _logger.exception("error closing MCP %r for %s", name, owner)
+            _logger.exception(
+                "error closing MCP %r for %s",
+                name,
+                owner,
+                extra={"session_id": runner_primary_session_id()},
+            )
 
     def _schedule_close(self, conn: McpServerConnection, owner: str, name: str) -> None:
         task = asyncio.create_task(
@@ -748,6 +825,7 @@ class RunnerMcpManager:
                         server.server_hash,
                         server.config.name,
                         server.error,
+                        extra={"session_id": runner_primary_session_id()},
                     )
                     return
 
@@ -767,6 +845,7 @@ class RunnerMcpManager:
                     server.server_hash,
                     server.config.name,
                     len(tools),
+                    extra={"session_id": runner_primary_session_id()},
                 )
         finally:
             cleanup_conn: McpServerConnection | None = None

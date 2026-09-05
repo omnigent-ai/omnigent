@@ -1,79 +1,48 @@
 import {
-  type DragEvent,
   type FormEvent,
   type KeyboardEvent,
-  createContext,
   memo,
   useCallback,
-  useContext,
+  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import {
   ArrowUpIcon,
   BotIcon,
-  CheckIcon,
-  AlertTriangleIcon,
   CornerUpLeftIcon,
-  CopyIcon,
   FileTextIcon,
   FolderIcon,
   GitBranchIcon,
-  GitForkIcon,
   ImageIcon,
   Loader2Icon,
   PaperclipIcon,
   SettingsIcon,
   SquareIcon,
-  WifiOffIcon,
+  SquareTerminalIcon,
   XIcon,
 } from "lucide-react";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
+import {
+  composerSendShortcutKeys,
+  KeyboardShortcutTooltipContent,
+} from "@/components/KeyboardShortcut";
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import {
-  Conversation,
-  ConversationContent,
-  ConversationEmptyState,
-  ConversationScrollButton,
-} from "@/components/ai-elements/conversation";
-import { useStickToBottomContext } from "use-stick-to-bottom";
-import {
-  Message,
-  MessageActions,
-  MessageAction,
-  MessageContent,
-} from "@/components/ai-elements/message";
-import { Shimmer } from "@/components/ai-elements/shimmer";
-import { ElicitationCard } from "@/components/blocks/ApprovalCard";
-import {
-  BlockRenderer,
-  FilePathAwareMessageResponse,
-  rendersOnlyWorkedFold,
-} from "@/components/blocks/BlockRenderer";
-import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
-import { SystemMessageView } from "@/components/blocks/SystemMessage";
-import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
-import { OttoIcon } from "@/components/icons/OttoIcon";
+import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
-import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
-import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
-import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import {
-  isIOSShell,
-  onNativeSidebarDrag,
-  onNativeViewModeChanged,
-  setNativeServerSwitcherHidden,
-  setNativeViewMode,
-} from "@/lib/nativeBridge";
+  serverSwitcherHiddenForSurface,
+  useSurfaceFrontmost,
+} from "@/hooks/useNativeServerSwitcher";
+import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
 import {
@@ -83,43 +52,35 @@ import {
 } from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
-import type { NativeModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
+import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
-import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
-import type { MessageContentBlock } from "@/lib/blocks";
 import {
   derivePermissionLevel,
   isOwnerLevel,
   isSessionSharedWithOthers,
 } from "@/lib/permissionsApi";
-import {
-  type Bubble,
-  type RenderItem,
-  type BubbleCache,
-  buildBubbles,
-  bubblesEqual,
-  createBubbleCache,
-  liveCandidateAssistantIndex,
-} from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
+import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   composerAttachmentKey,
   consumePendingInitialPrompt,
   type PendingInitialPrompt,
-  type PendingUserMessage,
   type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
 import {
   isNativeTerminalSession,
+  nativeCodingAgentForSession,
   nativeCodingAgentForHarness,
   nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
+import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -131,23 +92,68 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 // Re-exported so existing tests importing these from "./ChatPage" keep working
 // after the pure helpers moved to the shared lib.
 export { detectMentionAt, mentionMarkerFor };
 export type { MentionItem, MentionState };
+// Bubble rendering, scroll helpers, and the working-indicator cluster moved to
+// chatBubbleParts to break the ChatPage ↔ Transcript cycle. Re-exported so
+// existing importers (tests + components) that reach them via "./ChatPage"
+// keep working. SessionSharedContext and computeIsWorking are also imported
+// back below for ChatPage's own use.
+export {
+  BubbleView,
+  ConversationScrollRefBridge,
+  HistoryAutoLoader,
+  HistoryLoadingIndicator,
+  JumpToTopButton,
+  KeepBottomOnViewportResize,
+  LatestTurnSpacer,
+  ScrollToBottomOnSend,
+  SessionSharedContext,
+  UserMessageNavConnected,
+  WORKING_MESSAGES,
+  WorkingIndicator,
+  bubbleKey,
+  buildPendingBubbles,
+  collectBubbleMarkdown,
+  collectPendingElicitations,
+  computeIsWorking,
+  containsDisplayMath,
+  containsMarkdownTable,
+  extractUserText,
+  isBackgroundTasksOnly,
+  isSystemBubble,
+  mergePendingBubbles,
+  reorderCommittedRequestElicitations,
+  shouldShowAuthorBadge,
+  shouldShowWorkingIndicator,
+  stripGatedSubagentRoutingChips,
+  stripPendingElicitations,
+  workingIndicatorLabel,
+} from "@/components/chat/chatBubbleParts";
+export type { ConversationScroller } from "@/components/chat/chatBubbleParts";
+import {
+  type ConversationScroller,
+  SessionSharedContext,
+  computeIsWorking,
+} from "@/components/chat/chatBubbleParts";
+import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useSession } from "@/hooks/useSession";
+import { useGithubInfo } from "@/hooks/useGithub";
+import { useOpenGithubTab } from "@/shell/FileViewerContext";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
   type LivenessRow,
   type SessionLiveness,
+  IMPORT_SOURCE_LABEL_KEY,
   livenessRowFromSession,
   useSessionLiveness,
 } from "@/hooks/useSessionLiveness";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
-import { useUserMessageNav } from "@/hooks/useUserMessageNav";
-import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
-import { UserMessageNav } from "@/components/UserMessageNav";
+import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -156,6 +162,7 @@ import {
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
+import { FileDropOverlay } from "@/components/FileDropOverlay";
 import {
   useWorkspaceAllFiles,
   useWorkspaceDirectory,
@@ -163,7 +170,12 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
-import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
+import {
+  SMART_ROUTING_ARMS,
+  hostBacksHarnessWithGateway,
+  smartRoutingSourceFor,
+} from "@/lib/smartRoutingAvailability";
+import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import {
   Dialog,
   DialogContent,
@@ -186,6 +198,8 @@ import {
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
   RoutingModelSelect,
+  defaultModelLabel,
+  nativeModelLabel,
 } from "@/components/HarnessConfigControls";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -195,20 +209,25 @@ import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { useForkDialog } from "@/shell/ForkDialogContext";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import {
+  CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
+  claudePermissionModeLabel,
+  isClaudeNativeSession,
+} from "@/lib/claudePermissionMode";
+import {
+  CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+  codexApprovalModeLabel,
+} from "@/lib/codexApprovalMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
-import { SessionImage } from "@/components/SessionImage";
+import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
-import { copyText } from "@/lib/clipboard";
-import { showToast } from "@/components/ui/toast";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-
-// Matches both wordings the native executors emit: "[Attached: <path>]"
-// (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
-// is the path. Global so all markers in a message are found / stripped.
-const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
+import { ConnectionIndicator } from "./ChatIndicators";
+import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+import { Transcript } from "@/components/chat/Transcript";
 
 /** Server-info as consumers see it: the probe's result, or "loading". */
 type ServerInfoValue = ServerInfo | "loading";
@@ -226,18 +245,35 @@ function smartRoutingEnabled(serverInfo: ServerInfoValue): boolean {
 }
 
 /**
- * Whether the session's own model can be routed per turn: the deployment flag,
- * plus a top-level agent session that is not a native terminal (their CLI bakes
- * the model at launch and can't per-turn route).
+ * Whether the session's own model can be routed per turn.
+ *
+ * SDK/bundle agent sessions need only the deployment flag. Native Claude
+ * Code / Codex panes ARE routable per turn — the server injects the routed
+ * pick via ``/model`` when ``cost_control_mode_override`` is on, the same
+ * apparatus the create-time gear arms — but only when a router can answer
+ * for their family (the server rejects a routing-on create otherwise): the
+ * external AI-Gateway router needs the family's inference gateway-backed on
+ * the session's host, and the built-in judge covers the rest. An absent
+ * host row reads as backed, mirroring {@link hostBacksHarnessWithGateway}.
  */
 export function isCostRoutingEligible(
   serverInfo: ServerInfoValue,
   session: Session | null | undefined,
+  host?: { gateway_inference?: Record<string, boolean> | null } | null,
 ): boolean {
+  if (serverInfo === "loading" || !serverInfo.smart_routing_enabled) return false;
+  if (!isCostRoutingSession(session)) return false;
+  if (!isNativeTerminalSession(session)) return true;
+  const native = nativeCodingAgentForSession(session);
+  if (native === undefined || !SMART_ROUTING_ARMS.some((arm) => arm === native.harness)) {
+    return false;
+  }
   return (
-    smartRoutingEnabled(serverInfo) &&
-    isCostRoutingSession(session) &&
-    !isNativeTerminalSession(session)
+    smartRoutingSourceFor({
+      externalConfigured: serverInfo.smart_routing_sources.external,
+      ossConfigured: serverInfo.smart_routing_sources.oss,
+      gatewayBacked: hostBacksHarnessWithGateway(host, native.harness),
+    }) !== null
   );
 }
 
@@ -251,70 +287,6 @@ export function isSubagentRoutingEligible(
   session: Session | null | undefined,
 ): boolean {
   return smartRoutingEnabled(serverInfo) && isSubagentRoutingSession(session);
-}
-
-function extractUserText(content: MessageContentBlock[]): string {
-  return content
-    .filter(
-      (c): c is Extract<MessageContentBlock, { type: "input_text" }> => c.type === "input_text",
-    )
-    .map((c) => c.text)
-    .join("")
-    .replace(ATTACHED_RE, "")
-    .trim();
-}
-
-/**
- * Pull the paths out of the "[Attached: …]" markers an "@"-mention adds to a
- * user message, so the bubble can show what was attached (the marker text
- * itself is stripped from the rendered text by {@link extractUserText}). A
- * trailing "/" marks a folder. Returns [] for ordinary messages.
- *
- * Explicitly *uploaded* files share this marker wording: the native executor
- * materializes the upload to disk and injects `[Attached: <abs-path>]` so the
- * vendor CLI can read it. Those uploads already ride in as an
- * `input_image`/`input_file` block (rendered as the image / a file chip), so
- * surfacing them again here would double-render — as the path of an internal
- * bridge temp dir, no less. "@"-mention paths are always workspace-relative
- * while upload markers are absolute, so skip absolute paths (see
- * {@link isAbsolutePath}).
- */
-// An absolute filesystem path in any form a native executor might materialize
-// an upload to: POSIX ("/…"), Windows drive ("C:\…" or "C:/…"), or UNC
-// ("\\host\share"). Workspace "@"-mention paths are always relative, so this
-// reliably tells a materialized upload apart from a tagged workspace file
-// regardless of the host OS the runner happens to be on.
-function isAbsolutePath(p: string): boolean {
-  return /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
-}
-
-function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
-  const text = content
-    .filter(
-      (c): c is Extract<MessageContentBlock, { type: "input_text" }> => c.type === "input_text",
-    )
-    .map((c) => c.text)
-    .join("");
-  const out: MentionItem[] = [];
-  for (const m of text.matchAll(ATTACHED_RE)) {
-    const raw = m[1].trim();
-    if (!raw) continue;
-    // Absolute path → a materialized upload, already shown via its file block.
-    if (isAbsolutePath(raw)) continue;
-    // Split a trailing ":start-end" line span back out so the chip can show
-    // it without truncation (it's the whole point of a partial-file attach).
-    const range = /^(.*):(\d+)-(\d+)$/.exec(raw);
-    if (range) {
-      out.push({
-        path: range[1],
-        isDir: false,
-        lineRange: { start: Number(range[2]), end: Number(range[3]) },
-      });
-    } else {
-      out.push({ path: raw.replace(/\/$/, ""), isDir: raw.endsWith("/") });
-    }
-  }
-  return out;
 }
 
 // Leading whitespace + the command token, so the composer overlay can tint
@@ -336,258 +308,6 @@ export function splitSlashCommand(
   return { before, token, after: value.slice(before.length + token.length) };
 }
 
-/** Joins all `kind: "text"` items into a single markdown string for copying. */
-export function collectBubbleMarkdown(items: RenderItem[]): string {
-  return items
-    .filter((item): item is Extract<RenderItem, { kind: "text" }> => item.kind === "text")
-    .map((item) => item.text)
-    .join("\n\n")
-    .trim();
-}
-
-// All chat-column elements must share this width to stay aligned.
-const CHAT_COLUMN_WIDTH = "max-w-3xl min-[1921px]:max-w-4xl min-[2561px]:max-w-5xl";
-
-const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
-const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
-
-function isMarkdownTableRow(line: string): boolean {
-  return line.trim().includes("|");
-}
-
-export function containsMarkdownTable(items: RenderItem[]): boolean {
-  return items.some((item) => {
-    if (item.kind !== "text") return false;
-    const lines = item.text.split("\n");
-    return lines.some(
-      (line, index) =>
-        TABLE_SEPARATOR_RE.test(line) &&
-        index > 0 &&
-        index < lines.length - 1 &&
-        isMarkdownTableRow(lines[index - 1] ?? "") &&
-        isMarkdownTableRow(lines[index + 1] ?? ""),
-    );
-  });
-}
-
-export function containsDisplayMath(items: RenderItem[]): boolean {
-  return items.some((item) => item.kind === "text" && DISPLAY_MATH_RE.test(item.text));
-}
-
-/**
- * Build optimistic user bubbles from the pending-send queue.
- *
- * Author priority per bubble: `p.author` (captured at send time for
- * fresh sends, or from the snapshot's `created_by` for replayed entries)
- * falls back to `selfAuthor` (the current viewer's identity).
- * This covers two cases:
- *   1. A fresh send: `selfAuthor` is the viewer; `p.author` is the same
- *      value stamped at `send()` time, so either works.
- *   2. A snapshot-replayed pending entry (reconnect): `p.author` carries
- *      the original sender's email from the server, so a collaborator
- *      reconnecting sees the correct attribution rather than their own
- *      email stamped on someone else's message.
- *
- * `selfAuthor` is null before identity resolves and in single-user
- * mode (no label shown).
- *
- * @param pending - the queued optimistic sends, in FIFO order.
- * @param selfAuthor - the viewer's attribution id, or null.
- */
-export function buildPendingBubbles(
-  pending: PendingUserMessage[],
-  selfAuthor: string | null,
-): Bubble[] {
-  return pending.map((p) => {
-    const author = p.author ?? selfAuthor;
-    return {
-      kind: "user",
-      // No server item id yet; tempId keeps React keys stable until promotion.
-      itemId: p.tempId,
-      content: p.content,
-      ...(author !== null ? { createdBy: author } : {}),
-    };
-  });
-}
-
-// A committed bubble that exists ONLY to render one or more
-// REQUEST-phase policy elicitation cards. A REQUEST-phase ASK parks the
-// user message server-side (it is not persisted / consumed until the
-// human approves — POLICIES.md §7.2), so the message lingers as an
-// optimistic pending bubble (and later a consumed committed bubble) while
-// its elicitation card arrives as a standalone committed assistant
-// bubble. Used by `mergePendingBubbles` and
-// `reorderCommittedRequestElicitations` to keep the prompt above the card
-// that asks about it, both before and after approval.
-function isStandaloneElicitationBubble(bubble: Bubble): boolean {
-  // A committed assistant bubble that is ENTIRELY an elicitation card with no
-  // turn to anchor to, so it must sit BELOW the user message it gated:
-  //   • REQUEST-phase policy ASKs (gate the prompt before any turn), and
-  //   • terminal-driven harness gates such as cursor-native `pre_tool_use`,
-  //     which never emit `response_created` (blockStream stamps these with
-  //     their own `elicit_*` id, so they land as standalone bubbles).
-  // A `tool_call` card inside an active SDK turn renders inline — it is grouped
-  // WITH the turn, so it is never an all-elicitation standalone bubble — and is
-  // intentionally excluded here.
-  return (
-    bubble.kind === "assistant" &&
-    bubble.items.length > 0 &&
-    bubble.items.every(
-      (it) => it.kind === "elicitation" && (it.phase === "request" || it.phase === "pre_tool_use"),
-    )
-  );
-}
-
-// Pull a committed REQUEST-phase elicitation card below the user message
-// it gated.
-//
-// Once a REQUEST-phase ASK is approved, the parked user message is
-// consumed and appended to `blocks` — but AFTER the elicitation card,
-// which arrived (and committed) while the message was still parked
-// server-side. The committed order is therefore [card, message], so the
-// approved card would sit ABOVE the prompt that triggered it. Swap each
-// such card with the user bubble that immediately follows it so the
-// prompt stays on top, matching the pre-approval pending layout
-// (`mergePendingBubbles`). A card with no following user bubble (declined
-// / still pending) is left untouched. Returns the input array unchanged
-// (same reference) when no swap applies, so the memo stays stable.
-export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble[] {
-  let result: Bubble[] | null = null;
-  for (let i = 0; i < committed.length - 1; i += 1) {
-    if (isStandaloneElicitationBubble(committed[i]!) && committed[i + 1]!.kind === "user") {
-      if (result === null) result = [...committed];
-      const card = result[i]!;
-      result[i] = result[i + 1]!;
-      result[i + 1] = card;
-    }
-  }
-  return result ?? committed;
-}
-
-// Insertion point above a run of create-time routing chips — session-scope
-// decisions recorded before the session had any conversation, so they open
-// the committed timeline. Only a run that STARTS the timeline qualifies: a
-// chip anywhere else already sits where it belongs (below its message, or
-// standalone for a sub-agent spawn), and lifting a prompt above it would
-// reorder history.
-function liftAboveCreateRoutingChips(committed: Bubble[], end: number): number {
-  let start = end;
-  while (start > 0) {
-    const chip = committed[start - 1]!;
-    if (chip.kind !== "routing_decision" || !isSessionScopedDecision(chip.routing?.scope)) break;
-    start -= 1;
-  }
-  return start === 0 ? start : end;
-}
-
-// Place optimistic pending user bubbles into the committed timeline.
-//
-// Pending sends normally trail everything (the input should be visible
-// immediately, and they migrate into `blocks` once their
-// `session.input.consumed` event lands). Two exceptions put committed
-// bubbles below the pending prompt:
-//
-//   • a REQUEST-phase policy ASK — that message never gets a consumed event
-//     until approval, so it stays pending while its elicitation card renders
-//     as a committed bubble, and appending after the card would show the
-//     approval prompt ABOVE the message that triggered it;
-//   • a create-time routing chip — a pinned Smart Routing create routes
-//     before the pane launches, so the chip is committed while the prompt it
-//     decides is still pending, and `buildBubbles` cannot see a pending
-//     message. Splicing above the chip renders it below the prompt from the
-//     first paint, where the persisted message will pair it anyway.
-//
-// When the timeline ends in a run of either, splice the pending bubbles in
-// just before that run so the prompt stays on top.
-export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
-  if (pending.length === 0) return committed;
-  let insertAt = committed.length;
-  while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
-    insertAt -= 1;
-  }
-  insertAt = liftAboveCreateRoutingChips(committed, insertAt);
-  if (insertAt === committed.length) return [...committed, ...pending];
-  return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
-}
-
-type ElicitationItem = Extract<RenderItem, { kind: "elicitation" }>;
-
-// A pending elicitation is unanswered — only these float to the bottom.
-function isPendingElicitation(item: RenderItem): item is ElicitationItem {
-  return item.kind === "elicitation" && item.status === "pending";
-}
-
-// Pending elicitation cards float to the bottom of the chat: lifted out of
-// their inline position and re-rendered as the last items in the scroll flow,
-// so stick-to-bottom keeps an outstanding question in view no matter how much
-// text the agent streams after it (otherwise the card scrolls up off the top
-// of the viewport). Collect them in document order — oldest first, so the
-// newest sits last, closest to the composer. Once answered, a card drops out
-// of this list (status flips to "responded") and stays inline at its natural
-// spot (it is no longer removed by `stripPendingElicitations`).
-export function collectPendingElicitations(bubbles: Bubble[]): ElicitationItem[] {
-  const pending: ElicitationItem[] = [];
-  for (const bubble of bubbles) {
-    if (bubble.kind !== "assistant") continue;
-    for (const item of bubble.items) {
-      if (isPendingElicitation(item)) pending.push(item);
-    }
-  }
-  return pending;
-}
-
-// Drop the pending elicitation cards from the transcript bubbles so they
-// don't render twice — once at the bottom, once inline. Only clones the
-// assistant bubbles that actually carry a pending card; every other bubble
-// keeps its reference so `BubbleView`'s memo holds. An assistant bubble left
-// with no items renders nothing (`AssistantBubble` returns null), so a
-// standalone elicitation bubble collapses cleanly while its gating user
-// message stays put. Returns the input array unchanged when nothing is
-// pending, so the memo stays stable.
-export function stripPendingElicitations(bubbles: Bubble[]): Bubble[] {
-  let result: Bubble[] | null = null;
-  for (let i = 0; i < bubbles.length; i += 1) {
-    const bubble = bubbles[i]!;
-    if (bubble.kind !== "assistant" || !bubble.items.some(isPendingElicitation)) continue;
-    if (result === null) result = [...bubbles];
-    result[i] = { ...bubble, items: bubble.items.filter((it) => !isPendingElicitation(it)) };
-  }
-  return result ?? bubbles;
-}
-
-// Hide the sub-agent spawn chips of a session whose sub-agent routing is not
-// "on". Deliberate product decision: the toggle hides `native_subagent` chips
-// WHOLESALE, including historic chips for spawns that already ran routed while
-// the switch was on — the display follows the current setting, not per-row
-// history. Rows stay persisted (audit trail; flipping the switch back reveals
-// them) and the session's own session/turn chips are untouched. Returns the
-// input array unchanged when nothing is hidden, so the memo stays stable.
-export function stripGatedSubagentRoutingChips(
-  bubbles: Bubble[],
-  subagentRoutingOverride: "on" | "off" | null,
-): Bubble[] {
-  if (subagentRoutingOverride === "on") return bubbles;
-  const shown = bubbles.filter(
-    (b) =>
-      b.kind !== "routing_decision" ||
-      showsRoutingDecisionChip(b.routing?.scope, subagentRoutingOverride),
-  );
-  return shown.length === bubbles.length ? bubbles : shown;
-}
-
-// Whether a user bubble should carry the author's avatar badge (and the
-// author-tinted background): only in a shared session, only when a human
-// author is attached (agent/tool/system output and pre-attribution
-// history leave createdBy undefined), and NEVER on the viewer's own
-// messages — you know what you sent; the badge marks OTHER contributors.
-export function shouldShowAuthorBadge(
-  author: string | undefined,
-  viewerId: string | null,
-  isSessionShared: boolean,
-): boolean {
-  return isSessionShared && author !== undefined && author !== viewerId;
-}
-
 /**
  * Whether a submitted message should be queued rather than POSTed now.
  *
@@ -602,22 +322,26 @@ export function shouldShowAuthorBadge(
  * turn immediately instead of stalling behind that background work. (The
  * "Working…" spinner and sidebar dot still treat ``waiting`` as active — those
  * reflect background activity, which is a separate concern from send gating.)
+ *
+ * ``alwaysSteer`` (a per-device preference) drops the busy gate entirely: a
+ * follow-up sent mid-turn is POSTed now — steered into the running turn —
+ * instead of parking in the queue strip. The ``hasQueued`` guard still holds:
+ * once this conversation has a queued message it must drain in order, or a
+ * direct send could overtake a still-queued earlier one on an idle flicker.
  */
 export function shouldQueueSend(
   conversationId: string | null,
   status: "idle" | "streaming",
   sessionStatus: SessionStatus,
   queuedMessages: QueuedMessage[],
+  alwaysSteer = false,
 ): boolean {
   if (conversationId === null) return false;
-  const isBusy = status === "streaming" || sessionStatus === "running";
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
+  if (alwaysSteer) return hasQueued;
+  const isBusy = status === "streaming" || sessionStatus === "running";
   return isBusy || hasQueued;
 }
-
-// Author labels render only in a shared session; ChatPage provides the
-// value and UserBubble reads it, so the gate lives in one place.
-const SessionSharedContext = createContext(false);
 
 // Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
 // prefer the last word boundary within 10 chars of the limit so we don't
@@ -631,47 +355,6 @@ function truncateTitle(raw: string, max = 60): string {
   return slice.slice(0, cut).join("").trimEnd() + "…";
 }
 
-// Per-session draft storage — module-level so it survives the Composer
-// unmount/remount that happens during the loading gate between session
-// switches (ChatPage returns <HydratingPlaceholder /> while
-// loadingConversation is true, which unmounts the entire chat surface).
-// Text drafts are also persisted to sessionStorage so they survive page
-// refreshes; File objects can't be serialized, so only text round-trips.
-const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
-
-function loadDraftsFromStorage(): Map<string, { text: string; files: File[] }> {
-  try {
-    const raw = window.sessionStorage.getItem(SESSION_DRAFTS_KEY);
-    if (!raw) return new Map();
-    const entries = JSON.parse(raw) as Record<string, string>;
-    const map = new Map<string, { text: string; files: File[] }>();
-    for (const [id, text] of Object.entries(entries)) {
-      if (text) map.set(id, { text, files: [] });
-    }
-    return map;
-  } catch {
-    return new Map();
-  }
-}
-
-function saveDraftsToStorage(drafts: Map<string, { text: string; files: File[] }>): void {
-  try {
-    const obj: Record<string, string> = {};
-    for (const [id, draft] of drafts) {
-      if (draft.text) obj[id] = draft.text;
-    }
-    if (Object.keys(obj).length === 0) {
-      window.sessionStorage.removeItem(SESSION_DRAFTS_KEY);
-    } else {
-      window.sessionStorage.setItem(SESSION_DRAFTS_KEY, JSON.stringify(obj));
-    }
-  } catch {
-    // Storage full or unavailable — drafts still work in-memory.
-  }
-}
-
-const sessionDrafts = loadDraftsFromStorage();
-
 /**
  * Single component that drives the chat surface. Streaming + history
  * state lives in `useChatStore` (a Zustand store at module scope), so
@@ -681,7 +364,12 @@ const sessionDrafts = loadDraftsFromStorage();
  */
 export function ChatPage() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
+  // Defer only the transcript key so the <Conversation> subtree remounts at
+  // transition priority. switchTo, routing, and the composer all stay on the
+  // immediate urlConvId — sends always target the conversation the URL shows.
+  const deferredConvId = useDeferredValue(urlConvId);
   const navigate = useNavigate();
+  const appName = useAppName();
   // Optional first message handed off by the landing composer through the
   // shared chatStore (keyed by conversation id), not router state — router state
   // doesn't survive the embed's host-provided routing. Consumed read-once
@@ -787,10 +475,13 @@ export function ChatPage() {
   // Subscribe to the bits of store state we render. Each is a
   // primitive selector so re-renders fire only when that specific
   // field changes — no `useShallow` needed.
-  const blocks = useChatStore((s) => s.blocks);
-  const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
-  const activeResponse = useChatStore((s) => s.activeResponse);
-  const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
+  //
+  // The streaming-hot fields (`blocks`, `activeResponse`,
+  // `pendingUserMessages`, `interruptedResponseIds`) are NOT subscribed here:
+  // they live in <Transcript>, so an SSE frame re-renders that subtree alone
+  // and this root (and the composer/chrome it feeds) bails out. See
+  // `hasPendingElicitation` below for the one blocks-derived value the root
+  // still needs, read through an edge-stable boolean selector.
   const status = useChatStore((s) => s.status);
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   // True while the session's managed-sandbox launch is still running
@@ -798,6 +489,9 @@ export function ChatPage() {
   // handling). Overrides the liveness-derived unreachable affordances
   // below, which misread the not-yet-host-bound session as stranded.
   const sandboxLaunching = sandboxStatus !== null && sandboxStatus.stage !== "failed";
+  // Terminal-first spin-up state, read here (not just in the child surfaces) so
+  // the working-indicator gate below can defer to the "Starting up…" cue.
+  const chatTerminalFirst = useTerminalFirst();
   // Read runner liveness from the app-level batch poller (see
   // RunnerHealthProvider). `undefined` = not yet polled — the indicator
   // stays hidden until the first poll for this session resolves.
@@ -818,49 +512,6 @@ export function ChatPage() {
   const { data: boundAgentBySession } = useSessionAgent(urlConvId ?? null);
   const hasMoreHistory = useChatStore((s) => s.hasMoreHistory);
   const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
-  // Gates the sub-agent spawn chips: only a session that explicitly turned
-  // sub-agent routing on shows them (see stripGatedSubagentRoutingChips).
-  const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
-
-  // Build bubbles once per blocks/activeResponse change. Memo here so
-  // unrelated store updates (status, loading flags) don't re-walk.
-  // Pending user messages (POSTed but not yet acked by
-  // `session.input.consumed`) render as trailing user bubbles so the
-  // input is visible immediately. They migrate into `blocks` the moment
-  // their consumed event arrives.
-  // Per-surface reuse cache so a streaming append rebuilds only the
-  // active bubble, reusing the finalized prefix by reference.
-  const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
-  const bubbles = useMemo<Bubble[]>(() => {
-    // A REQUEST-phase elicitation card commits before the user message it
-    // gates: while pending, the message is an optimistic trailing bubble
-    // (`mergePendingBubbles` lifts it above the card); once approved, the
-    // consumed message lands in `blocks` AFTER the card
-    // (`reorderCommittedRequestElicitations` swaps the card below it).
-    // Both keep the prompt on top across the pending → approved flip.
-    const committed = stripGatedSubagentRoutingChips(
-      reorderCommittedRequestElicitations(
-        buildBubbles(blocks, activeResponse, bubbleCacheRef.current, interruptedResponseIds),
-      ),
-      subagentRoutingOverride,
-    );
-    // claude-native live previews are NOT trailing bubbles — they live in
-    // `blocks` as provisional `live:*` text blocks at their streamed
-    // position (see chatStore), so they render in-order with later tool /
-    // elicitation cards. The optimistic pending user message trails too,
-    // except when the timeline ends in a REQUEST-phase elicitation card.
-    if (pendingUserMessages.length === 0) return committed;
-    return mergePendingBubbles(
-      committed,
-      buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
-    );
-  }, [
-    blocks,
-    activeResponse,
-    interruptedResponseIds,
-    pendingUserMessages,
-    subagentRoutingOverride,
-  ]);
 
   // Picker selection. ChatPage stays mounted across `/` to `/c/:id`,
   // so the pick survives sidebar clicks; resets on full page reload.
@@ -966,10 +617,12 @@ export function ChatPage() {
   const [reconnectDialogOpen, setReconnectDialogOpen] = useState(false);
 
   // Pending elicitation = parked on user input — suppress shimmer. Must
-  // sit before the early-return guards below (Rules of Hooks).
-  const hasPendingElicitation = useMemo(
-    () => blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
-    [blocks],
+  // sit before the early-return guards below (Rules of Hooks). Read through
+  // a boolean selector (not the whole `blocks` array): Zustand bails out when
+  // the flag is unchanged, so `blocks` reference churn on every streaming
+  // frame no longer re-renders this root — only an elicitation edge does.
+  const hasPendingElicitation = useChatStore((s) =>
+    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
   );
 
   // Single-session snapshot (shared cache with chatStore.bindStream).
@@ -980,13 +633,16 @@ export function ChatPage() {
 
   // Orchestrator-only: polly's children inherit its agentName, so the gate
   // needs the session predicate (parent linkage), not a bare name check. An
-  // eligible session's Smart Routing toggle lives in the gear modal — Claude
-  // folds it into the Model dropdown; other routable agents get a standalone
-  // Switch row. Native terminal sessions (Claude Code / Codex / Pi / …) are
-  // excluded: their CLI bakes the model at launch and can't per-turn route, so
-  // Smart Routing is meaningless there.
+  // eligible session's Smart Routing option lives in the gear modal — Claude
+  // Code / Codex fold it into the Model dropdown (the server routes native
+  // panes per turn via /model injection); other routable agents get a
+  // standalone Switch row. The session's host row feeds the per-family
+  // gateway check the external router requires.
   const serverInfo = useServerInfo();
-  const costRoutingEligible = isCostRoutingEligible(serverInfo, activeSession);
+  const { data: hostRows } = useHosts();
+  const sessionHost =
+    hostRows?.find((row) => row.host_id === (activeSession?.hostId ?? null)) ?? null;
+  const costRoutingEligible = isCostRoutingEligible(serverInfo, activeSession, sessionHost);
   // Sub-agent routing is a separate knob with a different gate: a native CLI
   // can't per-turn route itself, but the sub-agents it spawns are routed per
   // spawn — where the launch actually installed that apparatus. See
@@ -1007,10 +663,25 @@ export function ChatPage() {
   // + shimmer/pill) for the main chat and is suppressed mid-elicitation or
   // when the runner is known offline.
   const isWorking = !hasPendingElicitation && computeIsWorking(sessionStatus);
+  // A spin-up in flight owns the in-progress slot with more specific copy
+  // ("Starting up…" / "Cloning repository…") than the generic shimmer, and
+  // `RunnerStartingIndicator` only renders when the shimmer is absent. So the
+  // OPTIMISTIC path must stand down here: a send that has to boot a runner is
+  // exactly when the user needs to know it's booting, not just that we asked.
+  // A server-confirmed `running`/`waiting` still wins — by then the harness is
+  // up and the spin-up cue has self-gated to null.
+  const spinUpInFlight =
+    sandboxLaunching ||
+    Boolean(chatTerminalFirst?.isTerminalFirst && chatTerminalFirst.terminalStartingUp);
   const showsWorking = computeShowsWorking(sessionStatus, {
     hasPendingElicitation,
     runnerOnline,
     backgroundTaskCount,
+    // Optimistic: light up the moment this client dispatches, without waiting
+    // for the server's ``running``. The sidebar row already reads this same
+    // flag (``isStartingUp`` in Sidebar.tsx), so the two agreed only once the
+    // server confirmed; now they agree immediately.
+    localSendInFlight: status === "streaming" && !spinUpInFlight,
   });
 
   // A fork of a coding session carries the source id in this label (set by
@@ -1030,6 +701,28 @@ export function ChatPage() {
   const isUnboundFork = isUnboundCodingFork({
     forkSourceId,
     workspace: activeSession?.workspace ?? activeConv?.workspace ?? null,
+  });
+  // An unbound session (no host, no runner — e.g. an imported one) routes the
+  // offline guard to the directory picker (bind + launch a runner on a chosen
+  // machine) instead of the terminal reconnect dead-end — but only when that
+  // resume would actually work. The picker calls launch_runner, which requires
+  // the caller to OWN the session (a shared non-owner 404s), and — for imports —
+  // only harnesses that reconstruct context from the omnigent transcript carry
+  // onto a chosen host (kimi can't resume at all; kiro/qwen resume from a local
+  // file that lives on the original machine). Everything else falls through to
+  // the reconnect path rather than a picker that would fail or start blank.
+  // See unboundSessionResumableInApp. The picker itself handles the no-online-
+  // host case, so we don't gate on host availability here.
+  const importSource =
+    activeSession?.labels?.[IMPORT_SOURCE_LABEL_KEY] ??
+    activeConv?.labels?.[IMPORT_SOURCE_LABEL_KEY] ??
+    null;
+  const canResumeOnLocalHost = unboundSessionResumableInApp({
+    unbound:
+      (activeSession?.hostId ?? activeConv?.host_id ?? null) === null &&
+      (activeSession?.runnerId ?? activeConv?.runner_id ?? null) === null,
+    isOwner: isOwnerLevel(activeSession?.permissionLevel ?? activeConv?.permission_level ?? null),
+    importSource,
   });
 
   // Author labels show only once a session is shared. A non-owner viewer
@@ -1078,10 +771,18 @@ export function ChatPage() {
         permission_level: activeSession?.permissionLevel ?? activeConv.permission_level,
         host_resumable: activeSession?.hostResumable ?? false,
         kind: activeSession?.kind,
+        // Skip the cold-boot grace for imports (nothing is booting) so the
+        // resume picker shows at once. Snapshot labels win; sidebar row is the
+        // fallback for an off-page session.
+        imported: Boolean((activeSession?.labels ?? activeConv.labels)?.[IMPORT_SOURCE_LABEL_KEY]),
       }
     : livenessRowFromSession(activeSession);
+  // Host-switch launch marker; see the store field. Keeps this surface's
+  // liveness in step with AppShell's, which drives the startup spinner.
+  const runnerLaunchedAt = useChatStore((s) => s.runnerLaunchedAt);
   const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
     turnActive: status === "streaming",
+    launchedAt: runnerLaunchedAt,
   });
 
   // Browser tab title: "● Title" while the main session is working so
@@ -1097,22 +798,45 @@ export function ChatPage() {
       ? (boundAgentBySession?.name ?? boundAgentName ?? subAgentLabel ?? null)
       : null;
   useEffect(() => {
-    const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : "Omnigent";
+    const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : appName;
     const base = truncateTitle(activeConv?.title ?? subAgentTabTitle ?? fallback);
     document.title = showsWorking ? `● ${base}` : base;
-  }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId]);
+  }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId, appName]);
 
-  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
+  const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
-
-  // Loading + error gates for `/c/:id` hydration.
-  if (urlConvId) {
-    if (loadingConversation) return <HydratingPlaceholder />;
-    if (conversationLoadError) {
-      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
-    }
-  }
+  // Pre-catalog fallback: a fresh native session's own catalog only arrives
+  // once its CLI is up (codex answers model/list after app-server boot,
+  // ~15s cold), which left the gear's Model list sparse and its Effort row
+  // hidden until then. The session's host already probed the same harness
+  // for the new-chat picker — ride those cached rows (same ids the launch
+  // accepts, ~90ms warm) until the runner's per-session catalog lands;
+  // the runner truth replaces them the moment it arrives. Must stay above
+  // the hydration early-returns below (hook order).
+  const fallbackPickerKind = modelPickerKindForConv({
+    labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+    harness: activeSession?.harness ?? null,
+  });
+  const hostProbeHarness =
+    fallbackPickerKind === "codex"
+      ? "codex-native"
+      : fallbackPickerKind === "claude"
+        ? "claude-native"
+        : null;
+  const { data: hostProbeOptions } = useHostModelOptions(
+    activeSession?.hostId ?? null,
+    hostProbeHarness ?? "",
+    hostProbeHarness !== null && sessionModelOptions.length === 0,
+  );
+  // Identity-stable on purpose: substitute only when the host rows actually
+  // exist, else keep the store's own array reference — a fresh [] here would
+  // re-render every options consumer (composer, gear, agent-info popover) on
+  // each streaming/liveness tick.
+  const codexModelOptions =
+    sessionModelOptions.length === 0 && hostProbeOptions != null && hostProbeOptions.length > 0
+      ? hostProbeOptions
+      : sessionModelOptions;
 
   // The session is unreachable and a message can't wake it: the host is
   // offline (host-bound) or it isn't host-bound and the runner is down.
@@ -1126,67 +850,97 @@ export function ChatPage() {
   const isUnreachable =
     !sandboxLaunching && (liveness.kind === "host_offline" || liveness.kind === "local_stranded");
 
-  function onSend(text: string, files?: File[]) {
-    if (!agentId) return;
-    // An unbound coding clone (fork-source label) needs a directory before
-    // it can run: open the picker and stash this message to replay after
-    // the bind. Pin the prompt to THIS session so it replays here, never
-    // into a session the user may switch to first; carry any attachments
-    // so the replay sends the same payload.
-    if (urlConvId && runnerOnline === false && isUnboundFork) {
-      setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [] });
-      setResumeDirDialogOpen(true);
-      return;
-    }
-    // Unreachable → no executor to dispatch this turn to, and no host to
-    // wake. Surface the reconnect dialog instead of POSTing into
-    // a void.
-    if (urlConvId && isUnreachable) {
-      setReconnectDialogOpen(true);
-      return;
-    }
-    // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
-    // FIFO immediately when genuinely idle, so nothing stalls.
-    const chat = useChatStore.getState();
-    if (
-      shouldQueueSend(chat.conversationId, chat.status, chat.sessionStatus, chat.queuedMessages)
-    ) {
-      chat.enqueueMessage(text, files);
-      return;
-    }
-    void useChatStore.getState().send(text, agentId, files, {
-      onConversationCreated: (newId) => {
-        // Eager URL update: the moment the server tells us this
-        // conversation's id, promote `/` → `/c/:newId`. Replace (not
-        // push) so the back button takes the user wherever they came
-        // from rather than to a stale `/`.
-        navigate(`/c/${newId}`, { replace: true });
-      },
-    });
-  }
+  const onSend = useCallback(
+    (text: string, files?: File[]) => {
+      if (!agentId) return;
+      // An unbound coding clone (fork-source label) needs a directory before
+      // it can run: open the picker and stash this message to replay after
+      // the bind. Pin the prompt to THIS session so it replays here, never
+      // into a session the user may switch to first; carry any attachments
+      // so the replay sends the same payload.
+      if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
+        setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [] });
+        setResumeDirDialogOpen(true);
+        return;
+      }
+      // Unreachable → no executor to dispatch this turn to, and no host to
+      // wake. Surface the reconnect dialog instead of POSTing into
+      // a void.
+      if (urlConvId && isUnreachable) {
+        setReconnectDialogOpen(true);
+        return;
+      }
+      // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
+      // FIFO immediately when genuinely idle, so nothing stalls. With the
+      // always-steer preference on, a mid-turn follow-up skips the queue and is
+      // POSTed now instead.
+      const chat = useChatStore.getState();
+      if (
+        shouldQueueSend(
+          chat.conversationId,
+          chat.status,
+          chat.sessionStatus,
+          chat.queuedMessages,
+          readAlwaysSteer(),
+        )
+      ) {
+        chat.enqueueMessage(text, files);
+        return;
+      }
+      void useChatStore.getState().send(text, agentId, files, {
+        onConversationCreated: (newId) => {
+          // Eager URL update: the moment the server tells us this
+          // conversation's id, promote `/` → `/c/:newId`. Replace (not
+          // push) so the back button takes the user wherever they came
+          // from rather than to a stale `/`.
+          navigate(`/c/${newId}`, { replace: true });
+        },
+      });
+    },
+    [
+      agentId,
+      urlConvId,
+      runnerOnline,
+      isUnboundFork,
+      canResumeOnLocalHost,
+      isUnreachable,
+      navigate,
+    ],
+  );
 
-  function onSendSlashCommand(name: string, args: string) {
-    if (!agentId) return;
-    // Slash commands aren't replayed (an edge), but still route an unbound
-    // coding clone to the directory picker so it isn't a dead end.
-    if (urlConvId && runnerOnline === false && isUnboundFork) {
-      setResumeDirDialogOpen(true);
-      return;
-    }
-    if (urlConvId && isUnreachable) {
-      setReconnectDialogOpen(true);
-      return;
-    }
-    void useChatStore.getState().sendSlashCommand(name, args, agentId, {
-      onConversationCreated: (newId) => {
-        navigate(`/c/${newId}`, { replace: true });
-      },
-    });
-  }
+  const onSendSlashCommand = useCallback(
+    (name: string, args: string) => {
+      if (!agentId) return;
+      // Slash commands aren't replayed (an edge), but still route an unbound
+      // coding clone to the directory picker so it isn't a dead end.
+      if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
+        setResumeDirDialogOpen(true);
+        return;
+      }
+      if (urlConvId && isUnreachable) {
+        setReconnectDialogOpen(true);
+        return;
+      }
+      void useChatStore.getState().sendSlashCommand(name, args, agentId, {
+        onConversationCreated: (newId) => {
+          navigate(`/c/${newId}`, { replace: true });
+        },
+      });
+    },
+    [
+      agentId,
+      urlConvId,
+      runnerOnline,
+      isUnboundFork,
+      canResumeOnLocalHost,
+      isUnreachable,
+      navigate,
+    ],
+  );
 
-  function onStop() {
+  const onStop = useCallback(() => {
     useChatStore.getState().stop();
-  }
+  }, []);
 
   // Sub-agent (child) sessions aren't returned by the sidebar list, so
   // ``activeConv`` is null for them — the snapshot (fetched above as
@@ -1200,15 +954,26 @@ export function ChatPage() {
     conversationsData !== undefined,
   );
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
-  // Once present, the live session snapshot is authoritative.
-  const capabilitySource = {
-    labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
-  };
+  // Once present, the live session snapshot is authoritative. Memoized so the
+  // derived props it feeds (modelPickerKind, effortLevels, wrapperLabel) keep a
+  // stable identity across the switch's re-render burst.
+  const capabilitySource = useMemo(
+    () => ({
+      labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+      harness: activeSession?.harness ?? null,
+    }),
+    [activeSession, activeConv],
+  );
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
-  const effortLevels = effortLevelsForConv(
-    capabilitySource,
-    codexModelOptions,
-    selectedModel ?? llmModel,
+  // Effort ladders key on the model the session is actually on — the
+  // reported `llmModel` — falling back to the sticky preference only
+  // before the first report lands. Memoized because codex-native resolves
+  // via codexEffortLevelsForModel, which returns a fresh array each call;
+  // a new identity here would defeat the memo() on MainAgentSurface/Composer
+  // on every unrelated store tick (mirrors the codexModelOptions rationale).
+  const effortLevels = useMemo(
+    () => effortLevelsForConv(capabilitySource, codexModelOptions, llmModel ?? selectedModel),
+    [capabilitySource, codexModelOptions, llmModel, selectedModel],
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
@@ -1219,18 +984,40 @@ export function ChatPage() {
   // Prefer the full agent object (with mcp_servers) from the session
   // endpoint when viewing a conversation. Fall back to the sessions-
   // derived list for the `/` (no session) picker view.
-  const visibleAgents = boundAgentId
-    ? boundAgentBySession
-      ? [boundAgentBySession]
-      : boundAgentName
-        ? [{ id: boundAgentId, name: boundAgentName } as Agent]
-        : agents?.filter((a) => a.id === boundAgentId)
-    : agents;
+  const visibleAgents = useMemo(
+    () =>
+      boundAgentId
+        ? boundAgentBySession
+          ? [boundAgentBySession]
+          : boundAgentName
+            ? [{ id: boundAgentId, name: boundAgentName } as Agent]
+            : agents?.filter((a) => a.id === boundAgentId)
+        : agents,
+    [boundAgentId, boundAgentBySession, boundAgentName, agents],
+  );
+
+  const onShowReconnectHelp = useCallback(() => {
+    // Route the banner to the SAME dialog typing a message would: an
+    // unbound coding clone or a host-less session the caller can resume
+    // in-app opens the directory picker (bind + launch), everything else
+    // gets the reconnect dialog.
+    if (isUnboundFork || canResumeOnLocalHost) setResumeDirDialogOpen(true);
+    else setReconnectDialogOpen(true);
+  }, [isUnboundFork, canResumeOnLocalHost]);
+
+  // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
+  // early return can't change the hook order between renders.
+  if (urlConvId) {
+    if (loadingConversation) return <HydratingPlaceholder />;
+    if (conversationLoadError) {
+      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
+    }
+  }
 
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
-      bubbles={bubbles}
+      conversationKey={deferredConvId}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -1241,13 +1028,7 @@ export function ChatPage() {
       onSend={onSend}
       onSendSlashCommand={onSendSlashCommand}
       onStop={onStop}
-      onShowReconnectHelp={() => {
-        // Route the banner to the SAME dialog typing a message would: an
-        // unbound coding clone opens the directory picker (bind + launch),
-        // everything else gets the reconnect dialog.
-        if (isUnboundFork) setResumeDirDialogOpen(true);
-        else setReconnectDialogOpen(true);
-      }}
+      onShowReconnectHelp={onShowReconnectHelp}
       agents={visibleAgents}
       selectedAgentId={agentId}
       hasMoreHistory={hasMoreHistory}
@@ -1260,6 +1041,8 @@ export function ChatPage() {
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
+      showClaudePermissionMode={shouldShowClaudePermissionModeControl(capabilitySource)}
+      showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
       showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
@@ -1306,12 +1089,19 @@ export function ChatPage() {
         sourceHostId={activeSession?.hostId}
         sourceGitBranch={activeSession?.gitBranch}
       />
-      {isUnboundFork && forkSourceId && (
+      {((isUnboundFork && forkSourceId) || canResumeOnLocalHost) && (
         <ResumeWithDirectoryDialog
           open={resumeDirDialogOpen}
           onOpenChange={setResumeDirDialogOpen}
           sessionId={urlConvId}
-          sourceSessionId={forkSourceId}
+          // Fork clone prefills from its source; a host-less session has none
+          // and prefills from its own recorded host/workspace/branch instead.
+          sourceSessionId={isUnboundFork ? forkSourceId : null}
+          prefill={{
+            hostId: activeSession?.hostId ?? null,
+            workspace: activeSession?.workspace ?? null,
+            gitBranch: activeSession?.gitBranch ?? null,
+          }}
           serverUrl={getCliServerUrl()}
           wrapper={activeConv?.labels?.["omnigent.wrapper"]}
         />
@@ -1336,7 +1126,12 @@ interface SessionLayoutProps {
 function SessionLayout({ mainAgent }: SessionLayoutProps) {
   return (
     <div className="flex min-h-0 flex-1 overflow-hidden">
-      <div className="flex min-w-0 flex-1 flex-col">{mainAgent}</div>
+      {/* `relative`: positions MainAgentSurface's persistent terminal overlay
+          and the composer's file-drop overlay (both absolute inset-0) against
+          the main column. */}
+      <div data-chat-surface className="relative flex min-w-0 flex-1 flex-col">
+        {mainAgent}
+      </div>
     </div>
   );
 }
@@ -1447,7 +1242,9 @@ interface MainAgentSurfaceProps {
    * session in terminal-first mode.
    */
   conversationId: string | null;
-  bubbles: Bubble[];
+  /** Deferred conversation id passed as the transcript key so <Conversation>
+   *  remounts at transition priority instead of blocking the interaction frame. */
+  conversationKey: string | null | undefined;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. Gates the
    *  composer's Stop/Interrupt button — the parent's OWN turn only. */
@@ -1456,9 +1253,8 @@ interface MainAgentSurfaceProps {
    *  Never includes child-session activity and never gates Stop/Interrupt. */
   showsWorking: boolean;
   /**
-   * Strict runner-tunnel liveness, used only to gate the inline terminal
-   * view (the PTY dies the moment the runner tunnel drops). The reconnect
-   * affordances key off `liveness` instead.
+   * Strict runner-tunnel liveness. The terminal view remains selectable when
+   * this is false and uses it to show the stopped-harness resume state.
    */
   runnerOnline: boolean | undefined;
   /** Derived open-session liveness — drives the reconnect hint/banner. */
@@ -1495,6 +1291,8 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  showClaudePermissionMode?: boolean;
+  showCodexApprovalMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -1540,17 +1338,82 @@ export function shouldShowTerminalSurface(
 }
 
 /**
+ * Whether the terminal surface should be MOUNTED (kept alive), as opposed
+ * to shown. Broader than {@link shouldShowTerminalSurface}: once a
+ * terminal is reachable, the surface mounts hidden behind the chat view
+ * so the WS attach pre-warms in the background and survives Chat/Terminal
+ * flips — making both the first open and every return near-instant. With
+ * no reachable terminal the surface still mounts while the view is open
+ * (it owns the "No terminals available" / reconnect states), but a hidden
+ * mount would just dial a dead runner, so it stays unmounted.
+ */
+export function shouldMountTerminalSurface(
+  conversationId: string | null,
+  terminalFirst:
+    | {
+        isTerminalFirst: boolean;
+        view: "chat" | "terminal";
+        terminalsAvailable: boolean;
+      }
+    | null
+    | undefined,
+): boolean {
+  if (!conversationId || terminalFirst?.isTerminalFirst !== true) return false;
+  return terminalFirst.view === "terminal" || terminalFirst.terminalsAvailable;
+}
+
+/**
+ * One recently-viewed terminal-first session whose terminal surface stays
+ * mounted (hidden) after navigating away, so switching back re-reveals a
+ * live attach instead of re-dialing. ``readOnly`` is snapshotted from the
+ * session's own permission level while it was active — the current
+ * session's permissions must never leak onto a warm background surface.
+ */
+export interface WarmTerminalEntry {
+  conversationId: string;
+  readOnly: boolean;
+}
+
+/**
+ * How many sessions' terminal surfaces stay warm at once (the active one
+ * included). Each warm surface holds a WebSocket + a runner-side
+ * tmux control client, a WebGL context (browsers cap those per page; losing
+ * one falls back to xterm's DOM renderer), and keeps parsing any output
+ * its TUI streams while hidden — so the cache is bounded rather than
+ * unbounded, but sized to cover a working set of sessions, not just a
+ * pair. Idle shells cost ~nothing in the background; the practical
+ * ceiling is many simultaneously *busy* TUIs.
+ */
+export const MAX_WARM_TERMINAL_SURFACES = 8;
+
+/**
+ * LRU update for the warm terminal-surface cache: move (or insert)
+ * *conversationId* at the most-recent end with the given *readOnly*
+ * snapshot, evicting the least-recent entry past
+ * {@link MAX_WARM_TERMINAL_SURFACES}. Pure — exported for direct unit
+ * testing.
+ */
+export function updateWarmTerminalSurfaces(
+  prev: WarmTerminalEntry[],
+  conversationId: string,
+  readOnly: boolean,
+): WarmTerminalEntry[] {
+  const rest = prev.filter((e) => e.conversationId !== conversationId);
+  return [...rest, { conversationId, readOnly }].slice(-MAX_WARM_TERMINAL_SURFACES);
+}
+
+/**
  * The conversation scroll surface + composer — the content of the
  * "Main Agent" tab (and also the standalone view on `/`).
  *
- * In terminal-first sessions, when the connection pill is set to
+ * In terminal-first sessions, when the header switcher is set to
  * Terminal, the conversation + composer are replaced by an inline
- * `MainTerminalView`. The pill itself stays visible (rendered via
- * `ConnectionIndicator`) so the user can flip back to Chat.
+ * `MainTerminalView`. The switcher itself stays visible (in the header,
+ * see ViewModeToggle) so the user can flip back to Chat.
  */
-function MainAgentSurface({
+const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
-  bubbles,
+  conversationKey,
   status,
   isWorking,
   showsWorking,
@@ -1574,6 +1437,8 @@ function MainAgentSurface({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showClaudePermissionMode = false,
+  showCodexApprovalMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
@@ -1583,6 +1448,7 @@ function MainAgentSurface({
   wrapperLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
+  // Streaming-hot subscriptions and the bubble pipeline live in <Transcript>.
   // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
   // under `md`). Gate its MOUNT — not just its visibility — on the viewport so
   // mobile never mounts observers and history listeners for a rail it can't see.
@@ -1593,11 +1459,6 @@ function MainAgentSurface({
   // the not-yet-host-bound session as stranded.
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   const sandboxLaunching = sandboxStatus !== null && sandboxStatus.stage !== "failed";
-  // True while the harness reports MCP-server startup state (codex-native).
-  // Forces the message-flow branch below even with zero bubbles, so a user
-  // staring at a fresh session during a slow MCP boot sees the startup band
-  // instead of a bare "What should we work on?" empty state.
-  const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   // Render the inline terminal whenever the user has opted in via the
   // connection pill. The terminal surface owns its no-terminal state,
   // including stopped/resumable sessions, and the connection indicator
@@ -1605,103 +1466,15 @@ function MainAgentSurface({
   const showTerminal = shouldShowTerminalSurface(conversationId, terminalFirst, runnerOnline);
 
   // All hook calls below must run on every render regardless of
-  // `showTerminal` — Rules of Hooks. The early return for the terminal
-  // branch lives below, after every hook has run.
-
-  // Single nav instance shared by hotkey + buttons (see useUserMessageNav).
-  // System-message bubbles (`[System: ...]` notifications rendered via
-  // SystemMessageView) are excluded — the hotkey is for navigating real
-  // user turns, not runtime markers.
-  const userMessageIds = useMemo(
-    () =>
-      bubbles
-        .filter(
-          (b): b is Extract<Bubble, { kind: "user" }> => b.kind === "user" && !isSystemBubble(b),
-        )
-        .map((b) => b.itemId),
-    [bubbles],
-  );
-  const nav = useUserMessageNav(userMessageIds);
-
-  // One rail tick per real user turn, paired with a preview of the reply that
-  // followed. Walk bubbles in order: each non-system user bubble opens a turn,
-  // and the first assistant text after it (before the next user bubble) is the
-  // preview. It mirrors the transcript's loaded window and grows lazily as
-  // older pages arrive.
-  const turns = useMemo<Turn[]>(() => {
-    const out: Turn[] = [];
-    for (let i = 0; i < bubbles.length; i++) {
-      const b = bubbles[i];
-      if (b.kind !== "user" || isSystemBubble(b)) continue;
-      let preview = "";
-      for (let j = i + 1; j < bubbles.length; j++) {
-        const next = bubbles[j];
-        // Stop at the next REAL user turn only. A system-marker user bubble
-        // isn't a tick of its own, so breaking on it would strand this turn
-        // with a blank preview even though its reply follows the marker.
-        if (next.kind === "user" && !isSystemBubble(next)) break;
-        if (next.kind === "assistant") {
-          const textItem = next.items.find((it) => it.kind === "text" && it.text.trim());
-          if (textItem && textItem.kind === "text") {
-            preview = textItem.text.trim();
-            break;
-          }
-        }
-      }
-      out.push({
-        itemId: b.itemId,
-        userText: extractUserText(b.content),
-        responsePreview: preview.slice(0, 240),
-      });
-    }
-    return out;
-  }, [bubbles]);
-
-  // Pending elicitation cards float to the bottom of the chat: rendered as the
-  // last items in the scroll flow and removed from their inline position so
-  // they don't render twice. Stick-to-bottom then keeps an outstanding
-  // question in view instead of letting trailing text scroll it off the top.
-  // Answered cards stay inline at their natural spot. `streamBubbles` keeps
-  // `bubbles`' reference when nothing is pending, so the common case allocates
-  // nothing.
-  const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
-  const streamBubbles = useMemo(
-    () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
-    [bubbles, pendingElicitations.length],
-  );
-  // While the session runs, the last assistant bubble is (or may be) the
-  // live turn even if its lifecycle reads settled — BlockRenderer keeps
-  // its "Worked for" fold suppressed until a terminal status edge lands.
-  // Once a newer real user message follows it (optimistic pending bubbles
-  // included — they're merged into `bubbles` above), the running status
-  // belongs to that newer turn instead, so no bubble is possibly-live and
-  // no fold is suppressed (index -1).
-  const lastAssistantIndex = useMemo(
-    () => liveCandidateAssistantIndex(streamBubbles),
-    [streamBubbles],
-  );
-
-  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — guarded so the composer's
-  // own unmodified ArrowUp/Down history-recall still works.
-  useEffect(() => {
-    // globalThis prefix because React's KeyboardEvent is imported above.
-    const handler = (e: globalThis.KeyboardEvent) => {
-      if (!(e.metaKey || e.ctrlKey) || !e.altKey) return;
-      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
-      const target = e.target;
-      if (
-        target instanceof HTMLElement &&
-        target.closest('textarea, input, [contenteditable="true"]')
-      ) {
-        return;
-      }
-      e.preventDefault();
-      if (e.key === "ArrowUp") nav.goPrev();
-      else nav.goNext();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [nav]);
+  // `showTerminal` — Rules of Hooks. The single return at the bottom
+  // renders the persistent terminal overlay and, when the terminal view
+  // is closed, the chat surface beside it.
+  //
+  // The bubble pipeline (buildBubbles, the turn rail, elicitation floats,
+  // the working indicator) and its streaming-hot store subscriptions live in
+  // `<Transcript>` — the only subtree that re-renders per SSE frame. This
+  // surface subscribes to nothing hot, so the composer and chrome below bail
+  // out of streaming-frame re-renders.
 
   // Active reply quotes — each "Reply ↵" click appends; consumed by Composer.
   const [replyQuotes, setReplyQuotes] = useState<ReplyQuote[]>([]);
@@ -1719,15 +1492,6 @@ function MainAgentSurface({
     conversationRef.current = el;
     setContainerEl(el);
   }, []);
-  // How far the composer has grown past its resting height. The composer keeps
-  // that growth out of the flex column, so the wrapper's box never moves —
-  // this only lifts the overlays pinned to its bottom edge (the scroll-to-
-  // bottom button, the Working… tab, the message nav) clear of the taller
-  // card. Written straight to the DOM: a re-render per line of typing would
-  // re-render the whole transcript for a purely visual offset.
-  const publishComposerGrowth = useCallback((px: number) => {
-    conversationRef.current?.style.setProperty("--composer-growth", `${px}px`);
-  }, []);
   const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
   // True only while the chat/terminal surface is the frontmost thing on screen.
   // Drives both native overlays so neither floats over an opened drawer.
@@ -1737,7 +1501,7 @@ function MainAgentSurface({
   );
   useEffect(() => {
     if (!isIOSShell()) return;
-    setNativeServerSwitcherHidden(!surfaceFrontmost);
+    setNativeServerSwitcherHidden(serverSwitcherHiddenForSurface(surfaceFrontmost));
   }, [surfaceFrontmost]);
   useEffect(() => {
     if (!isIOSShell()) return;
@@ -1805,6 +1569,12 @@ function MainAgentSurface({
   // with the full server-side slash_command path.
   const isTerminalFirst = terminalFirst?.isTerminalFirst === true;
   const isNativeWrapper = terminalFirst?.isNativeWrapper === true;
+  // Stable so they don't defeat Composer's memo on the switch re-render burst.
+  const removeReplyQuote = useCallback(
+    (i: number) => setReplyQuotes((prev) => prev.filter((_, idx) => idx !== i)),
+    [],
+  );
+  const clearReplyQuotes = useCallback(() => setReplyQuotes([]), []);
   const handleSendSlashCommand = useMemo(
     () =>
       onSendSlashCommand && !isNativeWrapper
@@ -1816,259 +1586,204 @@ function MainAgentSurface({
     [onSendSlashCommand, isNativeWrapper],
   );
 
-  // "Working…" stays lit for the whole busy turn — through streaming text,
-  // tool runs, and reasoning gaps — including after a reload that hydrates
-  // `running` before any bubbles exist locally. Only a trailing compaction
-  // spinner suppresses it (that bubble owns the slot with its own animation).
-  const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
+  // Synchronous bottom re-pin for the composer's growth, called in the same
+  // task as the height change (before any paint — the only ordering Gecko
+  // doesn't paint past; every async pin leaves one intermediate frame).
+  // Guarded by the live lock state, not the public isAtBottom alias, so a
+  // reader who scrolled up mid-stream is never yanked down. The spacer
+  // re-measures first: its reserved height tracks the viewport, so it must
+  // shrink in this same task — otherwise the pin reads a stale scrollHeight
+  // and the browser paints the spacer's later RO settle as a visible shift.
+  const spacerMeasureRef = useRef<(() => void) | null>(null);
+  // Whether the transcript was physically at the bottom as of its last scroll
+  // event. Evaluated lazily-per-event (not at pin time) so the write never
+  // reads the just-shrunk viewport, where any distance readouts are already
+  // off the bottom by the growth amount — an escaped reader must be detected
+  // from their escape scroll, not from the shrink it preceded.
+  const pinnedToBottomRef = useRef(false);
+  useEffect(() => {
+    const scrollEl = scroller?.el;
+    if (!scrollEl) return;
+    const update = () => {
+      pinnedToBottomRef.current =
+        scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop <= 1;
+    };
+    update();
+    scrollEl.addEventListener("scroll", update, { passive: true });
+    return () => scrollEl.removeEventListener("scroll", update);
+  }, [scroller]);
 
-  if (showTerminal && conversationId) {
+  const pinScrollOnComposerGrowth = useCallback(() => {
+    spacerMeasureRef.current?.();
+    // Read through a local so the linter doesn't flag the DOM write as
+    // a mutation of the outer `scroller` state ref.
+    const scrollEl = scroller?.el;
+    if (!scrollEl) return;
+    const lockState = scroller?.state;
+    if (!lockState?.isAtBottom || lockState.escapedFromLock) return;
+    // A reader who escaped the bottom (or never arrived) keeps their
+    // position: growth must not yank it down.
+    if (!pinnedToBottomRef.current) return;
+    // Park at the same position stick-to-bottom settles on (one pixel short
+    // of the maximum); writing the exact bottom would leave the settle one
+    // pixel lower than the library's park and trail a 1px snap-back.
+    scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight - 1);
+  }, [scroller]);
+
+  // Persistent terminal surfaces for terminal-first sessions. Each is
+  // mounted from the moment its terminal is reachable — not just when the
+  // view is open — and kept mounted as a visibility-toggled overlay, so
+  // the attach (WS dial through the host tunnel + a forked `tmux attach`
+  // + full repaint) pre-warms in the background and survives both
+  // Chat/Terminal flips AND session switches: a small LRU keeps the last
+  // few sessions' surfaces alive after navigating away, so coming back is
+  // near-instant instead of re-dialing from scratch. `invisible` (not
+  // display:none) keeps a hidden overlay's layout size, so FitAddon
+  // geometry stays correct and no resize churn hits tmux; hidden elements
+  // don't paint, hit-test, or take focus. The chat surface still unmounts
+  // while the terminal is shown — a heavy transcript shouldn't render
+  // behind a live terminal.
+  const mountTerminal = shouldMountTerminalSurface(conversationId, terminalFirst);
+  // Non-owners attach read-only: a shared PTY can't attribute input
+  // per-user, so only the owner may type. They drive the agent via the
+  // composer instead. Server enforces this too.
+  const terminalReadOnly = !isOwnerLevel(permissionLevel);
+  const [warmTerminals, setWarmTerminals] = useState<WarmTerminalEntry[]>([]);
+  useEffect(() => {
+    if (!mountTerminal || !conversationId) return;
+    setWarmTerminals((prev) => updateWarmTerminalSurfaces(prev, conversationId, terminalReadOnly));
+  }, [mountTerminal, conversationId, terminalReadOnly]);
+  // Derive from warmTerminals only — the effect above adds the active session
+  // after the first paint, so xterm (a lazy chunk) never loads on the initial
+  // render. Previously the active session was included here same-commit to
+  // avoid the one-frame delay; that optimization is removed so the terminal
+  // chunk defers until after first paint. Returning to an already-warm
+  // background session is still same-commit (it's already in warmTerminals).
+  const renderedTerminals = warmTerminals;
+  const handleTerminalResume = useCallback(async () => {
+    if (!conversationId) throw new Error("Session is not available");
+    if (liveness.kind === "host_offline" || liveness.kind === "local_stranded") {
+      onShowReconnectHelp();
+      return;
+    }
+    const result = await retrySession(conversationId);
+    if (!result.recovered) {
+      throw new Error("The session is already connected; no recovery was performed");
+    }
+  }, [conversationId, liveness.kind, onShowReconnectHelp]);
+  const terminalSurfaces = renderedTerminals.map((entry) => {
+    const isActive = mountTerminal && entry.conversationId === conversationId;
+    const isShown = isActive && showTerminal;
     return (
-      <>
-        <MainTerminalView
-          conversationId={conversationId}
-          initialTerminalKey={terminalFirst?.terminalViewKey}
-          onSurfaceElement={setTerminalSurfaceEl}
-          // Non-owners attach read-only: a shared PTY can't attribute
-          // input per-user, so only the owner may type. They drive the
-          // agent via the composer instead. Server enforces this too.
-          readOnly={!isOwnerLevel(permissionLevel)}
-        />
-        <ConnectionIndicator
-          liveness={liveness}
-          onShowReconnectHelp={onShowReconnectHelp}
-          surfaceFrontmost={surfaceFrontmost}
-        />
-      </>
-    );
-  }
-
-  return (
-    <>
-      {/* Wrapper div gives us a ref to scope the SelectionPopup to the
-          conversation area without requiring Conversation to forward refs. */}
       <div
-        ref={setConversationEl}
-        className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
+        key={entry.conversationId}
+        className={cn("absolute inset-0 flex flex-col", !isShown && "invisible")}
+        aria-hidden={!isShown}
       >
-        {/* chat-scroll-fade masks the viewport's top edge so scrolling
-            content dissolves into the canvas before reaching the
-            ChatHeader overlay's controls (geometry in index.css). */}
-        <Conversation className="chat-scroll-fade flex-1">
-          {/* Override ConversationContent's default spacing so the thread keeps
-              16px side gutters and consecutive agent turns read as one thread.
-              The left inset grows *continuously* as the conversation area
-              narrows: the centered column slides left with the area until its
-              edge nears the left-edge TurnRail, then the inset ramps up to hold
-              a minimum gap from the ticks — capped at 1.5rem so it stops moving
-              rather than stepping. Keyed on the area's width via cqi (the
-              @container/chat context on the wrapper), not the viewport, so
-              opening the sidebar — which narrows the area — feeds it too. The
-              ramp (1rem→1.5rem as the area crosses ~54rem) matches where the
-              48rem column's auto-margins shrink past the clearance. md+ only:
-              the rail is hidden on mobile, which keeps the plain 1rem gutter. */}
-          {/* Native scroll anchoring holds position across a history prepend —
-              the browser does it off the main thread, so it can't interrupt an
-              in-flight scroll the way an imperative scrollTop write does. */}
-          <ConversationContent
-            scrollClassName="transcript-hide-native-scrollbar"
-            className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-6",
-              "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
-              CHAT_COLUMN_WIDTH,
-            )}
-          >
-            {/* Scroll helpers — must live inside StickToBottom to access context. */}
-            <ScrollToBottomOnSend nonce={sendScrollNonce} />
-            <PreserveScrollDistanceOnResize />
-            <ConversationScrollRefBridge onScroller={setScroller} />
-            <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
-            {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
-              // Cold launch: a centered spinner instead of the "ready to
-              // type" empty state (the create-then-send path uses the
-              // "row" variant). Two launch shapes land here: a
-              // terminal-first spin-up (gate on isTerminalFirst too —
-              // terminalStartingUp is set for non-terminal-first sessions
-              // as well) and a managed-sandbox launch, whose stage text
-              // renders in the same spot for ANY session type.
-              (terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp) ||
-              sandboxLaunching ? (
-                <RunnerStartingIndicator variant="hero" />
-              ) : (
-                <ConversationEmptyState>
-                  <div className="space-y-1.5">
-                    <h3 className="text-2xl font-medium tracking-[-0.02em]">
-                      What should we work on?
-                    </h3>
-                    <p className="text-muted-foreground text-ui">
-                      {agentsError
-                        ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
-                        : "Send a message to get started."}
-                    </p>
-                  </div>
-                </ConversationEmptyState>
-              )
-            ) : (
-              <>
-                {/* Older pages prepend here while their request is in flight. */}
-                {loadingMoreHistory && <HistoryLoadingIndicator />}
-                {streamBubbles.map((bubble, bubbleIndex) => (
-                  <BubbleView
-                    key={bubbleKey(bubble)}
-                    bubble={bubble}
-                    isLastAssistant={bubbleIndex === lastAssistantIndex}
-                    showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
-                  />
-                ))}
-                {/* Pending elicitation cards, floated to the bottom of the
-                    chat so an outstanding question stays in view (stick-to-
-                    bottom) no matter how much text the agent streamed after
-                    it. Wrapped in an assistant Message so each matches an
-                    inline card's look; removed from their inline slot by
-                    `stripPendingElicitations`. Newest renders last, nearest
-                    the composer. Rendered ABOVE the Working… indicator so the
-                    card sits closest to the prompt and the shimmer stays the
-                    last thing in the flow. */}
-                {pendingElicitations.map((item) => (
-                  <Message
-                    key={item.elicitationId}
-                    from="assistant"
-                    className="max-w-full"
-                    data-testid="bottom-elicitation"
-                  >
-                    <MessageContent className="w-full">
-                      <ElicitationCard item={item} />
-                    </MessageContent>
-                  </Message>
-                ))}
-                {/* Working… shimmer, lit for the whole busy turn so the user
-                    always sees the session is still going. Suppressed when the
-                    last bubble is a compaction spinner — that bubble already
-                    owns the "in-progress" slot. aria-hidden: the pinned pill
-                    owns the single aria-live region (see WorkingStatusPin). */}
-                {showWorkingIndicator && <WorkingIndicator />}
-                {/* Terminal-first spin-up cue beneath the just-sent first
-                    message: the prompt bubble renders immediately (no
-                    runner-online send gate), but `showWorkingIndicator` stays
-                    suppressed while the runner is offline, so without this the
-                    user's message sits with no sign anything is happening.
-                    Self-gates to null off the spin-up window; rendered only
-                    when not already showing Working… so the two never stack. */}
-                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
-                {/* MCP-server startup band (codex-native): renders while the
-                    harness boots its MCP servers and, after startup settles,
-                    when servers failed or were cancelled. Independent of the
-                    Working… shimmer — it is strictly more specific about why
-                    the turn hasn't produced output yet. */}
-                <McpStartupIndicator />
-              </>
-            )}
-            {/* Frames the initially loaded turn at the top of the viewport and
-                keeps the pane scrollable so older history stays reachable.
-                Always mounted — including for an empty new conversation — so
-                a fast first send cannot become the captured initial anchor.
-                Last child so it measures everything above it. */}
-            <LatestTurnSpacer scrollElement={scroller?.el ?? null} />
-          </ConversationContent>
-          <ConversationScrollButton />
-          {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
-              Suppressed in a sub-agent session: the composer's "Chatting with sub-agent …" tray owns this slot. */}
-          <WorkingStatusPin show={showWorkingIndicator} suppress={subAgentLabel != null} />
-          <UserMessageNavConnected
-            goPrev={nav.goPrev}
-            goNext={nav.goNext}
-            canPrev={nav.canPrev}
-            canNext={nav.canNext}
-            hidden={userMessageIds.length === 0}
-          />
-        </Conversation>
-        {/* Constant-height scrollbar. Sibling of Conversation for the same
-            reason as JumpToTopButton — outside the chat-scroll-fade mask, which
-            would otherwise dissolve it against the header. */}
-        <TranscriptScrollbar scroller={scroller} />
-        {/* Hover the top edge to reveal a pill that loads all older history and
-            scrolls to the first message. Rendered here (a wrapper sibling of
-            Conversation) rather than inside it so it escapes the chat-scroll-fade
-            mask and can sit right at the fade border. */}
-        <JumpToTopButton
-          containerEl={containerEl}
-          scroller={scroller}
-          hasMoreHistory={hasMoreHistory}
+        <MainTerminalView
+          conversationId={entry.conversationId}
+          initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
+          visible={isShown}
+          runnerOnline={isActive ? runnerOnline : undefined}
+          onResume={isActive ? handleTerminalResume : undefined}
+          onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
+          readOnly={entry.readOnly}
         />
-        {/* Left-edge minimap: one tick per turn, scrolls independently, pages
-            in older history on scroll-up. Sibling of Conversation for the same
-            reason as JumpToTopButton — it escapes the chat-scroll-fade mask.
-            Desktop-only: not mounted on mobile where the rail is hidden. */}
-        {!isMobileViewport && (
-          <TurnRail
-            turns={turns}
-            scroller={scroller}
-            hasMoreHistory={hasMoreHistory}
-            loadingMoreHistory={loadingMoreHistory}
-          />
+        {isShown && (
+          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
         )}
       </div>
-      {/* Floating reply button — scoped to the conversation container. */}
-      <SelectionPopup
-        containerRef={conversationRef}
-        onReply={(text) =>
-          setReplyQuotes((prev) => [
-            ...prev,
-            { id: `reply-quote-${nextReplyQuoteId.current++}`, text },
-          ])
-        }
-      />
+    );
+  });
 
-      <Composer
-        disabled={disabled}
-        status={status}
-        isWorking={isWorking}
-        onSend={handleSend}
-        onSendSlashCommand={handleSendSlashCommand}
-        onStop={onStop}
-        agents={agents}
-        selectedAgentId={selectedAgentId}
-        permissionLevel={permissionLevel}
-        readOnlyReason={readOnlyReason}
-        replyQuotes={replyQuotes}
-        onRemoveQuote={(i) => setReplyQuotes((prev) => prev.filter((_, idx) => idx !== i))}
-        onClearAllQuotes={() => setReplyQuotes([])}
-        effortLevels={effortLevels}
-        showEffort={showEffort}
-        showModels={showModels}
-        modelPickerKind={modelPickerKind}
-        codexModelOptions={codexModelOptions}
-        showCodexPlanMode={showCodexPlanMode}
-        showGoalControl={showGoalControl}
-        showClaudeGoalControl={showClaudeGoalControl}
-        showPollyCodexGoalControl={showPollyCodexGoalControl}
-        isTerminalFirst={isTerminalFirst}
-        isNativeWrapper={isNativeWrapper}
-        reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
-        sandboxAsleepHint={liveness.kind === "host_asleep"}
-        unreachable={
-          !sandboxLaunching &&
-          (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
-        }
-        onShowReconnectHelp={onShowReconnectHelp}
-        costRoutingEligible={costRoutingEligible}
-        subagentRoutingEligible={subagentRoutingEligible}
-        subAgentLabel={subAgentLabel}
-        wrapperLabel={wrapperLabel}
-        onGrowthChange={publishComposerGrowth}
-      />
+  // Single return so both surfaces keep stable fragment positions across
+  // view flips — an early return would change the tree shape and remount
+  // the terminal overlays, disposing the live attaches they exist to
+  // preserve. The chat surface still unmounts entirely while the
+  // terminal is shown (a heavy transcript shouldn't render behind it).
+  return (
+    <>
+      {terminalSurfaces}
+      {!showTerminal && (
+        <>
+          {/* The scrolling transcript column owns every streaming-hot store
+          subscription and the bubble pipeline, so an SSE frame re-renders it
+          alone — this surface's composer and chrome below bail out. */}
+          <Transcript
+            conversationKey={conversationKey}
+            setConversationEl={setConversationEl}
+            containerEl={containerEl}
+            scroller={scroller}
+            setScroller={setScroller}
+            sendScrollNonce={sendScrollNonce}
+            hasMoreHistory={hasMoreHistory}
+            loadingMoreHistory={loadingMoreHistory}
+            isMobileViewport={isMobileViewport}
+            showsWorking={showsWorking}
+            agentsError={agentsError}
+            sandboxLaunching={sandboxLaunching}
+            terminalFirst={terminalFirst}
+            spacerMeasureRef={spacerMeasureRef}
+          />
+          {/* Floating reply button — scoped to the conversation container. */}
+          <SelectionPopup
+            containerRef={conversationRef}
+            onReply={(text) =>
+              setReplyQuotes((prev) => [
+                ...prev,
+                { id: `reply-quote-${nextReplyQuoteId.current++}`, text },
+              ])
+            }
+          />
 
-      {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
-          fork banner when unreachable, nothing otherwise. Sits below the
-          composer so its position is consistent with the terminal view. */}
-      <ConnectionIndicator
-        liveness={liveness}
-        onShowReconnectHelp={onShowReconnectHelp}
-        surfaceFrontmost={surfaceFrontmost}
-      />
+          <Composer
+            disabled={disabled}
+            status={status}
+            isWorking={isWorking}
+            onSend={handleSend}
+            onSendSlashCommand={handleSendSlashCommand}
+            onStop={onStop}
+            agents={agents}
+            selectedAgentId={selectedAgentId}
+            permissionLevel={permissionLevel}
+            readOnlyReason={readOnlyReason}
+            replyQuotes={replyQuotes}
+            onRemoveQuote={removeReplyQuote}
+            onClearAllQuotes={clearReplyQuotes}
+            effortLevels={effortLevels}
+            showEffort={showEffort}
+            showModels={showModels}
+            modelPickerKind={modelPickerKind}
+            codexModelOptions={codexModelOptions}
+            showCodexPlanMode={showCodexPlanMode}
+            showClaudePermissionMode={showClaudePermissionMode}
+            showCodexApprovalMode={showCodexApprovalMode}
+            showGoalControl={showGoalControl}
+            showClaudeGoalControl={showClaudeGoalControl}
+            showPollyCodexGoalControl={showPollyCodexGoalControl}
+            isTerminalFirst={isTerminalFirst}
+            isNativeWrapper={isNativeWrapper}
+            unreachable={
+              !sandboxLaunching &&
+              (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
+            }
+            onShowReconnectHelp={onShowReconnectHelp}
+            costRoutingEligible={costRoutingEligible}
+            subagentRoutingEligible={subagentRoutingEligible}
+            subAgentLabel={subAgentLabel}
+            wrapperLabel={wrapperLabel}
+            onViewportShrinkPinScroll={pinScrollOnComposerGrowth}
+          />
+
+          {/* Reconnect-or-fork banner when unreachable, nothing otherwise.
+          Sits below the composer so its position is consistent with the
+          terminal view. */}
+          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+        </>
+      )}
     </>
   );
-}
+});
 
 function HydratingPlaceholder() {
   return (
@@ -2110,1621 +1825,6 @@ function ConversationLoadError({
         </Button>
       </div>
     </div>
-  );
-}
-
-/**
- * Adds scroll-state CSS classes to UserMessageNav. The responsive behavior
- * itself stays in Tailwind classes: hidden below `md` only while pinned to
- * the bottom, visible again as soon as the user scrolls up.
- */
-function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageNav>) {
-  const { isAtBottom } = useStickToBottomContext();
-  return (
-    <UserMessageNav
-      {...props}
-      // Mobile-only: the TurnRail (a hover minimap) replaces these buttons on
-      // desktop, but mobile has no hover, so the ↑↓ nav stays there. Hidden at
-      // the bottom on mobile too — nothing above to page up to matters less
-      // than keeping the composer area clear. Keyboard ⌘⌥↑↓ still works on all
-      // sizes regardless of the buttons.
-      className={cn(props.className, "md:hidden", isAtBottom && "max-md:hidden")}
-    />
-  );
-}
-
-/**
- * Scroll-pinned "Working…" pill — sole aria-live region (inline shimmer is
- * aria-hidden).
- *
- * @param show - True while the main session is working; gates both the
- *   aria-live announcement and the painted tab.
- * @param suppress - Hides the painted tab without silencing the aria-live
- *   region (still gated on ``show``). Set in a sub-agent session, where the
- *   composer's "Chatting with sub-agent …" tray rises in this same slot and
- *   the "Working…" tab would otherwise stack on top of it.
- */
-function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?: boolean }) {
-  const { isAtBottom } = useStickToBottomContext();
-  const bgCount = useChatStore((s) => s.backgroundTaskCount);
-  const blockedOn = useChatStore((s) => s.blockedOn);
-  const tick = useWorkingLabelTick();
-  const visible = show && !isAtBottom && !suppress;
-  return (
-    <div
-      // Always mounted (the aria-live region announces on show); bottom-0 sits
-      // it flush on the composer so the tab reads as rising from behind it.
-      role="status"
-      aria-live="polite"
-      data-testid="working-indicator-pin"
-      className={cn(
-        // bottom tracks --composer-growth so the tab keeps meeting the card's
-        // top edge while the composer is grown (it overlaps this wrapper).
-        "pointer-events-none absolute inset-x-0 bottom-[var(--composer-growth,0px)] z-20 transition-opacity duration-200",
-        visible ? "opacity-100" : "opacity-0",
-      )}
-    >
-      {/* The single announced string. Held stable at "Working…" so the rotating
-          tab text below never re-announces every few seconds. Present whenever
-          the agent is working, so it announces whether the tab is painted
-          (scrolled up) or collapsed (at the bottom, where the inline shimmer
-          owns the visuals). */}
-      {show && <span className="sr-only">Working…</span>}
-      {/* Mirror the conversation content column (mx-auto + px-4 + width) so the
-          tab's left edge lines up with the inline shimmer's. */}
-      <div className={cn("mx-auto w-full px-4", CHAT_COLUMN_WIDTH)}>
-        {show && (
-          // Tab shape (rounded top, no bottom border, composer-matching bg) so
-          // its flat bottom edge merges into the chat box. aria-hidden: the
-          // sr-only span above owns the announcement, so the rotating label
-          // here stays silent to screen readers. Collapses to sr-only when at
-          // the bottom (`!visible`) — the inline shimmer paints there instead.
-          <div
-            aria-hidden="true"
-            className={cn(
-              "flex w-fit items-center gap-1.5 rounded-t-lg border border-b-0 border-border bg-card px-3 pt-1 pb-1.5",
-              !visible && "sr-only",
-            )}
-          >
-            <OttoIcon className="otto-working h-4 w-auto shrink-0" />
-            <Shimmer className="text-sm font-mono" duration={1.5}>
-              {workingIndicatorLabel(bgCount, tick, blockedOn)}
-            </Shimmer>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/**
- * Forces the conversation back to the bottom when this client submits a
- * new message. StickToBottom intentionally respects a user who has scrolled
- * up while streaming, but an explicit send should bring the fresh user bubble
- * and ensuing response back into view.
- */
-function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
-  const { scrollToBottom } = useStickToBottomContext();
-
-  useLayoutEffect(() => {
-    if (nonce === 0) return;
-    scrollToBottom("instant");
-    requestAnimationFrame(() => scrollToBottom("instant"));
-  }, [nonce, scrollToBottom]);
-
-  return null;
-}
-
-/**
- * Preserves the transcript's distance-from-bottom whenever its scroll container
- * resizes on the iOS shell — so the content you're looking at stays put while
- * the soft keyboard opens/closes (and while the composer grows on focus).
- *
- * Two things resize the container, and neither is handled by `use-stick-to-
- * bottom` (which only re-anchors on *content* resize): the keyboard, via
- * `useIOSViewportLock` shrinking the app-shell; and the composer growing taller
- * when focused (its send row / status line), which steals flex height from the
- * transcript a couple of lines at a time — *without* firing a visualViewport
- * resize. Watching only visualViewport missed the composer growth, which is why
- * the transcript crept up ~2 lines on focus.
- *
- * So we watch the scroll container itself with a `ResizeObserver` and, on any
- * size change, hold the scroll position relative to the bottom constant:
- * `scrollTop = scrollHeight - clientHeight - distance`. `distance` is tracked
- * from genuine user scrolls only — scrolls that coincide with a dimension change
- * (the resize's own clamp, or our restore) are ignored so they can't corrupt it.
- * At the bottom (distance 0) you stay at the bottom; scrolled up reading
- * history, you keep seeing the same messages. New messages still go through the
- * library (content resize doesn't change the container's box). Stateless across
- * any number of keyboard cycles.
- */
-function PreserveScrollDistanceOnResize() {
-  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
-    scrollRef?: React.RefObject<HTMLElement>;
-  };
-  const scrollRef = ctx.scrollRef;
-
-  useEffect(() => {
-    if (!isIOSShell()) return;
-    const el = scrollRef?.current;
-    if (!el) return;
-
-    const measure = () => el.scrollHeight - el.clientHeight - el.scrollTop;
-    let distance = Math.max(0, measure());
-    let prevSH = el.scrollHeight;
-    let prevCH = el.clientHeight;
-
-    const onScroll = () => {
-      const sh = el.scrollHeight;
-      const ch = el.clientHeight;
-      // A scroll that lands on the same frame as a size change is resize-induced
-      // (the browser's clamp, or our own restore below) — not the user. Skip it
-      // so it can't overwrite the distance we're trying to preserve.
-      if (sh !== prevSH || ch !== prevCH) {
-        prevSH = sh;
-        prevCH = ch;
-        return;
-      }
-      distance = Math.max(0, measure());
-    };
-
-    const observer = new ResizeObserver(() => {
-      el.scrollTop = el.scrollHeight - el.clientHeight - distance;
-      prevSH = el.scrollHeight;
-      prevCH = el.clientHeight;
-    });
-
-    el.addEventListener("scroll", onScroll, { passive: true });
-    observer.observe(el);
-    return () => {
-      el.removeEventListener("scroll", onScroll);
-      observer.disconnect();
-    };
-  }, [scrollRef]);
-
-  return null;
-}
-
-function HistoryLoadingIndicator() {
-  return (
-    <div
-      role="status"
-      className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-ui"
-    >
-      <Loader2Icon className="size-4 animate-spin" aria-hidden />
-      Loading earlier messages…
-    </div>
-  );
-}
-
-/**
- * Builds the initial history window, then keeps loading near the top.
- *
- * The fetch fires this many viewports from the top. It has to be generous:
- * the browser suppresses scroll anchoring at offset 0, so a page that lands
- * while the reader is sitting at the very top shifts the transcript with
- * nothing to absorb it. Firing viewports early means the prepend settles far
- * from that edge, where anchoring holds — and out of sight either way.
- */
-const HISTORY_LOAD_TOP_VIEWPORTS = 2.5;
-/** Floor for very short viewports, where 2.5x would still be a few hundred px. */
-const HISTORY_LOAD_TOP_MIN_PX = 1200;
-
-function historyLoadThreshold(el: HTMLElement): number {
-  return Math.max(HISTORY_LOAD_TOP_MIN_PX, el.clientHeight * HISTORY_LOAD_TOP_VIEWPORTS);
-}
-
-/** Finger travel before a touch drag counts as "show me what's above". */
-const TOUCH_DRAG_SLOP_PX = 8;
-
-export function HistoryAutoLoader({
-  scrollElement,
-}: {
-  scrollElement?: HTMLElement | null;
-} = {}) {
-  // useStickToBottomContext exposes scrollRef (the actual scroll container
-  // element) in the runtime context even though the public TS types only
-  // declare isAtBottom and scrollToBottom. Cast to access it.
-  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
-    scrollRef: React.RefObject<HTMLElement>;
-  };
-  const historyGeneration = useChatStore((s) => s.historyGeneration);
-  const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
-  // A successful page updates this cursor in the same store transaction that
-  // prepends its items and clears loadingMoreHistory. Unlike scrollHeight, it
-  // still changes when many fetched tool calls collapse into one visual row.
-  const oldestItemId = useChatStore((s) => s.oldestItemId);
-  const generationRef = useRef(historyGeneration);
-  const [scrollRevision, setScrollRevision] = useState(0);
-  const handledScrollRevisionRef = useRef(scrollRevision);
-  const oldestItemIdRef = useRef(oldestItemId);
-  // Whether the reader has asked to move the transcript upward yet.
-  //
-  // "Near the top" alone is not a request for older history: opening a session
-  // scrolls the pane to the bottom, and on a transcript shorter than the fetch
-  // threshold that lands trivially near the top — so the open fetched a page,
-  // the prepend moved the cursor, and that fed the next fetch. Fifteen
-  // requests and a "Loading earlier messages…" row, for someone who never
-  // touched the scrollbar.
-  //
-  // Intent, not movement: a window taller than the transcript has no scroll
-  // range at all, so waiting for scrollTop to fall would strand older history
-  // behind a gesture the pane can never report.
-  const scrolledUpRef = useRef(false);
-  const lastScrollTopRef = useRef<number | null>(null);
-  const touchStartYRef = useRef<number | null>(null);
-
-  // Position across a prepend is held by native scroll anchoring, not by this
-  // component. Writing scrollTop here instead used to interrupt the reader's
-  // gesture — an imperative write cancels in-flight momentum, so a page landing
-  // mid-flick yanked the transcript (measured: corrections up to ~2000px, every
-  // one of them while the wheel was still moving). The browser does the same
-  // correction off the main thread without touching the gesture.
-  useLayoutEffect(() => {
-    const el = scrollElement ?? ctx.scrollRef?.current;
-    if (!el) return;
-    // Baseline from where the pane currently sits, so the reader's very first
-    // upward scroll already has something to compare against.
-    lastScrollTopRef.current = el.scrollTop;
-    // Arming has to re-run the paging effect itself: a pane with no scroll
-    // range fires no scroll event, so nothing else would notice the gesture.
-    const armScrollUp = () => {
-      if (scrolledUpRef.current) return;
-      scrolledUpRef.current = true;
-      setScrollRevision((revision) => revision + 1);
-    };
-    const handleScroll = () => {
-      const previous = lastScrollTopRef.current;
-      lastScrollTopRef.current = el.scrollTop;
-      // Only an upward move counts. The open's scroll-to-bottom and a
-      // prepend's native anchor correction both move scrollTop DOWN the
-      // document (larger), so neither can arm paging on its own.
-      if (previous !== null && el.scrollTop < previous - 0.5) scrolledUpRef.current = true;
-      // Every scroll re-runs the paging effect, armed or not: staying near the
-      // top has to keep paging, not just the moment the reader arrives there.
-      setScrollRevision((revision) => revision + 1);
-    };
-    // Wheel/trackpad up, and a touch drag downward (which reveals what is
-    // above). These fire whether or not the pane has anywhere to scroll.
-    const handleWheel = (event: WheelEvent) => {
-      if (event.deltaY < 0) armScrollUp();
-    };
-    const handleTouchStart = (event: TouchEvent) => {
-      touchStartYRef.current = event.touches[0]?.clientY ?? null;
-    };
-    const handleTouchMove = (event: TouchEvent) => {
-      const start = touchStartYRef.current;
-      const current = event.touches[0]?.clientY;
-      if (start !== null && current !== undefined && current > start + TOUCH_DRAG_SLOP_PX) {
-        armScrollUp();
-      }
-    };
-    el.addEventListener("scroll", handleScroll, { passive: true });
-    el.addEventListener("wheel", handleWheel, { passive: true });
-    el.addEventListener("touchstart", handleTouchStart, { passive: true });
-    el.addEventListener("touchmove", handleTouchMove, { passive: true });
-    return () => {
-      el.removeEventListener("scroll", handleScroll);
-      el.removeEventListener("wheel", handleWheel);
-      el.removeEventListener("touchstart", handleTouchStart);
-      el.removeEventListener("touchmove", handleTouchMove);
-    };
-  }, [ctx.scrollRef, scrollElement]);
-
-  // This is the single paging effect. Fetches are driven by user scrolls or a
-  // changed oldest item, including a visually height-neutral prepend.
-  useLayoutEffect(() => {
-    const el = scrollElement ?? ctx.scrollRef?.current;
-    if (!el) return;
-
-    const generationChanged = generationRef.current !== historyGeneration;
-    const itemsChanged = !generationChanged && oldestItemIdRef.current !== oldestItemId;
-    const scrollPositionChanged =
-      !generationChanged && handledScrollRevisionRef.current !== scrollRevision;
-    oldestItemIdRef.current = oldestItemId;
-    handledScrollRevisionRef.current = scrollRevision;
-
-    if (generationChanged) {
-      generationRef.current = historyGeneration;
-      // A new window is a new open: require a fresh upward scroll.
-      scrolledUpRef.current = false;
-      lastScrollTopRef.current = el.scrollTop;
-    }
-
-    const state = useChatStore.getState();
-
-    // Reader-driven only. Opening a session used to keep paging from here
-    // until it found the previous prompt, so history kept landing for seconds
-    // after the page had settled and the transcript shifted under someone who
-    // had not scrolled at all. The bind now fetches its whole window in one
-    // request, and this waits for the reader to actually scroll up.
-    if (
-      !scrolledUpRef.current ||
-      !state.oldestItemId ||
-      !state.hasMoreHistory ||
-      state.loadingMoreHistory ||
-      !(itemsChanged || scrollPositionChanged) ||
-      el.scrollTop >= historyLoadThreshold(el)
-    ) {
-      return;
-    }
-
-    void state.loadMoreHistory();
-  }, [
-    ctx.scrollRef,
-    historyGeneration,
-    loadingMoreHistory,
-    oldestItemId,
-    scrollElement,
-    scrollRevision,
-  ]);
-
-  // No visible control — history loads purely on scroll-up.
-  return null;
-}
-
-/** Top inset for a pinned anchor: 16px beyond the fade's fully opaque edge. */
-const PINNED_ANCHOR_TOP_GAP_PX = 96;
-
-/**
- * Ceiling on the reserved space, as a share of the viewport. Pinning a SHORT
- * latest turn to the top costs almost a full screen of blank, with readable
- * history sitting just above the fold. Capping it keeps most of the viewport
- * showing real messages; a long turn is unaffected, since it already needs
- * little or no reserved space to reach the top.
- */
-const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
-
-/**
- * Trailing spacer that pins the initially loaded turn's anchor to the top of
- * the viewport — the newest committed user prompt, or (on a page deep in a
- * long tool chain with no prompt yet) the newest assistant text output. The
- * anchor is captured once when the hydrated chat surface mounts. Live sends
- * therefore consume the reserved space instead of becoming a new anchor and
- * jumping to the top before the harness starts processing them.
- *
- * As a side effect it keeps the transcript taller than its scroll container
- * whenever any content sits above the anchor, so older history stays reachable
- * by scroll-up without a viewport-fill loop.
- *
- * Height = clientHeight − (anchor-top → content-bottom) − top gap, clamped to
- * ≥ 0: a short reply leaves empty space below (anchor stays pinned at top);
- * once the reply alone exceeds the viewport the spacer collapses to 0 and
- * normal stick-to-bottom following resumes. The "content-bottom" edge is the
- * spacer's own top, whose position is fixed by the content above it and so is
- * independent of the height we set — the measurement can't feed back on itself.
- */
-export function LatestTurnSpacer({
-  scrollElement,
-}: {
-  scrollElement?: HTMLElement | null;
-} = {}) {
-  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
-    scrollRef: React.RefObject<HTMLElement>;
-  };
-  // Block changes remeasure the frozen anchor; streaming growth is covered by
-  // the ResizeObserver. The hydration gate remounts this component on a
-  // conversation switch, which captures that conversation's initial anchor.
-  const blockCount = useChatStore((s) => s.blocks.length);
-  const spacerRef = useRef<HTMLDivElement>(null);
-  // `undefined` means capture has not run; `null` is a completed capture with
-  // no suitable initial anchor (for example a brand-new empty conversation).
-  const initialAnchorRef = useRef<HTMLElement | null | undefined>(undefined);
-  const initialCommittedUserIdsRef = useRef<Set<string> | null>(null);
-  if (initialCommittedUserIdsRef.current === null) {
-    const ids = new Set<string>();
-    for (const block of useChatStore.getState().blocks) {
-      if (
-        block.type === "user_message" &&
-        !isSystemUserContent(block.content) &&
-        block.ctx.itemId !== null
-      ) {
-        ids.add(block.ctx.itemId);
-      }
-    }
-    initialCommittedUserIdsRef.current = ids;
-  }
-
-  const measure = useCallback(() => {
-    const scrollEl = scrollElement ?? ctx.scrollRef?.current;
-    const spacerEl = spacerRef.current;
-    if (!scrollEl || !spacerEl) return;
-    if (initialAnchorRef.current === undefined) {
-      // Match DOM bubbles against committed blocks so an optimistic pending
-      // send visible during this first layout can never become the anchor.
-      const users = scrollEl.querySelectorAll<HTMLElement>(
-        '[data-role="user"][data-user-message-id]',
-      );
-      let initialUser: HTMLElement | null = null;
-      for (let index = users.length - 1; index >= 0; index -= 1) {
-        const candidate = users[index]!;
-        const itemId = candidate.dataset.userMessageId;
-        if (itemId !== undefined && initialCommittedUserIdsRef.current!.has(itemId)) {
-          initialUser = candidate;
-          break;
-        }
-      }
-      const texts = scrollEl.querySelectorAll<HTMLElement>(
-        '[data-testid="assistant-text-section"]',
-      );
-      initialAnchorRef.current = initialUser ?? texts[texts.length - 1] ?? null;
-    }
-    const anchor = initialAnchorRef.current;
-    if (!anchor) {
-      // Do not let the always-mounted sentinel become a zero-height flex item:
-      // the content column's gap would otherwise shift an empty-state layout.
-      spacerEl.style.display = "none";
-      return;
-    }
-    // rect diffs are scroll-invariant (both edges shift together), and the
-    // spacer's top is fixed by the content above it, so this is stable across
-    // the height we're about to set — it converges in one pass.
-    const anchorToEnd = spacerEl.getBoundingClientRect().top - anchor.getBoundingClientRect().top;
-    const viewport = scrollEl.clientHeight;
-    const next = Math.max(
-      0,
-      Math.min(
-        viewport - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX,
-        viewport * MAX_RESERVED_VIEWPORT_FRACTION,
-      ),
-    );
-    const current = Number.parseFloat(spacerEl.style.height) || 0;
-    if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
-  }, [ctx.scrollRef, scrollElement]);
-
-  useLayoutEffect(() => {
-    measure();
-  }, [measure, blockCount]);
-
-  useLayoutEffect(() => {
-    const scrollEl = scrollElement ?? ctx.scrollRef?.current;
-    const contentEl = spacerRef.current?.parentElement;
-    if (!scrollEl || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => measure());
-    observer.observe(scrollEl); // viewport (clientHeight) changes
-    if (contentEl) observer.observe(contentEl); // streaming / reflow growth
-    return () => observer.disconnect();
-  }, [ctx.scrollRef, measure, scrollElement]);
-
-  return <div ref={spacerRef} aria-hidden style={{ flexShrink: 0 }} />;
-}
-
-/**
- * The conversation's scroll container plus the minimal StickToBottom controls
- * the JumpToTopButton needs to override the library's bottom-lock. `state` is a
- * stable, mutable object: clearing `isAtBottom`/`escapedFromLock` makes the
- * resize-driven `scrollToBottom({preserveScrollPosition})` — fired on every
- * history prepend — bail instead of yanking the view back to the bottom.
- */
-interface ConversationScroller {
-  el: HTMLElement;
-  state: { isAtBottom: boolean; escapedFromLock: boolean };
-  stopScroll: () => void;
-}
-
-/**
- * Lifts the StickToBottom scroll container (and lock controls) out of the
- * context so a sibling rendered *outside* `<Conversation>` (and thus outside
- * its `chat-scroll-fade` mask) can still read and drive it. `scrollRef`,
- * `state`, and `stopScroll` are stable identities (see HistoryAutoLoader for
- * the runtime-vs-types cast). Renders nothing.
- */
-function ConversationScrollRefBridge({
-  onScroller,
-}: {
-  onScroller: (s: ConversationScroller | null) => void;
-}) {
-  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
-    scrollRef: React.RefObject<HTMLElement>;
-    state: ConversationScroller["state"];
-    stopScroll: () => void;
-  };
-  useEffect(() => {
-    // Runs after commit, when StickToBottom has populated scrollRef.current.
-    const el = ctx.scrollRef?.current ?? null;
-    onScroller(el ? { el, state: ctx.state, stopScroll: ctx.stopScroll } : null);
-    return () => onScroller(null);
-  }, [ctx.scrollRef, ctx.state, ctx.stopScroll, onScroller]);
-  return null;
-}
-
-/**
- * Hover-revealed "Jump to top" pill, mirroring {@link ConversationScrollButton}
- * but for the other end. Hovering near the top edge of the conversation
- * surfaces a pill at the fade border; clicking it pages in every older history
- * block (the conversation is lazily paginated — see {@link HistoryAutoLoader})
- * and then scrolls to the very first message.
- *
- * Rendered as a sibling of `<Conversation>`, not a child: the scroll viewport's
- * top ~80px is mask-faded (`chat-scroll-fade`), so a pill inside it would fade
- * out too. Sitting in the wrapper keeps it at full opacity right at the fade
- * line, and `z-40` lifts it over the `z-30` ChatHeader so it stays clickable.
- *
- * Hover is detected in JS off the **wrapper** (`containerEl`), the common
- * ancestor of both the scroll area and this pill — listening on the scroll
- * element instead would fire `mouseleave` the instant the cursor crossed onto
- * the pill (a non-descendant), killing the click. `scroller` carries the inner
- * scroll container plus the StickToBottom lock controls.
- *
- * @param containerEl - The conversation wrapper; hover/anchor reference.
- * @param scroller - Scroll container + lock controls (ConversationScrollRefBridge).
- * @param hasMoreHistory - Whether older messages exist before the loaded window.
- */
-export function JumpToTopButton({
-  containerEl,
-  scroller,
-  hasMoreHistory,
-}: {
-  containerEl: HTMLElement | null;
-  scroller: ConversationScroller | null;
-  hasMoreHistory: boolean;
-}) {
-  const [atTop, setAtTop] = useState(true);
-  const [hovering, setHovering] = useState(false);
-  const [jumping, setJumping] = useState(false);
-  // Reveal the pill while the user is scrolling up, then fade it back out once
-  // they pause — so it's reachable without having to find the top hover band.
-  const [scrolledUp, setScrolledUp] = useState(false);
-
-  // How long the pill lingers after the last upward scroll before fading out.
-  const SCROLL_REVEAL_MS = 2000;
-
-  // Pixels below the conversation's top edge that count as "hovering the top".
-  // Comfortably clears the pill (anchored at the fade border, ~50px) so moving
-  // onto it to click never drops the hover state.
-  const HOVER_BAND_PX = 140;
-
-  // Hover detection on the wrapper so the pill (a wrapper child) stays in-band.
-  useEffect(() => {
-    if (!containerEl) return;
-    const onMove = (e: MouseEvent) => {
-      const next = e.clientY - containerEl.getBoundingClientRect().top < HOVER_BAND_PX;
-      // Only commit on a transition — mousemove fires continuously, and React
-      // bails on a no-op setState anyway, but skipping it avoids the work.
-      setHovering((prev) => (prev === next ? prev : next));
-    };
-    const onLeave = () => setHovering(false);
-    containerEl.addEventListener("mousemove", onMove, { passive: true });
-    containerEl.addEventListener("mouseleave", onLeave);
-    return () => {
-      containerEl.removeEventListener("mousemove", onMove);
-      containerEl.removeEventListener("mouseleave", onLeave);
-    };
-  }, [containerEl]);
-
-  // Track whether the loaded window is scrolled to its very top, and reveal the
-  // pill whenever the user scrolls up (auto-hiding after they pause).
-  const scrollEl = scroller?.el ?? null;
-  useEffect(() => {
-    if (!scrollEl) return;
-    let lastTop = scrollEl.scrollTop;
-    let hideTimer: ReturnType<typeof setTimeout> | undefined;
-    const onScroll = () => {
-      const top = scrollEl.scrollTop;
-      const next = top <= 1;
-      setAtTop((prev) => (prev === next ? prev : next));
-      // Upward scroll (and not already pinned to the top): show the pill and
-      // (re)arm the idle timer that fades it out once scrolling settles.
-      if (top < lastTop - 1 && top > 1) {
-        setScrolledUp(true);
-        clearTimeout(hideTimer);
-        hideTimer = setTimeout(() => setScrolledUp(false), SCROLL_REVEAL_MS);
-      }
-      lastTop = top;
-    };
-    onScroll();
-    scrollEl.addEventListener("scroll", onScroll, { passive: true });
-    return () => {
-      clearTimeout(hideTimer);
-      scrollEl.removeEventListener("scroll", onScroll);
-    };
-  }, [scrollEl]);
-
-  // Somewhere to go: older pages exist, or we're scrolled down within the
-  // loaded window. At the very first message there's nothing to jump to.
-  const canJump = hasMoreHistory || !atTop;
-  const visible = jumping || ((hovering || scrolledUp) && canJump);
-
-  const jumpToTop = useCallback(async () => {
-    if (!scroller) return;
-    const { el, state, stopScroll } = scroller;
-    const nextFrame = () =>
-      new Promise<void>((resolve) => {
-        requestAnimationFrame(() => resolve());
-      });
-    setJumping(true);
-    try {
-      // Release StickToBottom's bottom-lock. Without this, every history prepend
-      // resizes the content and the library's ResizeObserver yanks the view back
-      // to the bottom (scrollToBottom with preserveScrollPosition, which sticks
-      // whenever state.isAtBottom is true) — so our scrollTop=0 lost the fight
-      // and only a *second* click (everything already loaded, no resizes) won.
-      // Clearing the lock here makes those prepend-driven scrolls bail.
-      stopScroll();
-      state.isAtBottom = false;
-      state.escapedFromLock = true;
-
-      // Page in every older block before scrolling. loadMoreHistory serializes
-      // via its own loadingMoreHistory guard (so a concurrent HistoryAutoLoader
-      // fetch is harmless), and flips hasMoreHistory to false at the start of
-      // history or on error. The rAF wait yields a frame for the prepend to
-      // commit and for the in-flight flag to settle between pages. The
-      // iteration cap is a backstop against a server that never reports done.
-      /* oxlint-disable no-await-in-loop */
-      for (let i = 0; i < 1000 && useChatStore.getState().hasMoreHistory; i++) {
-        await useChatStore.getState().loadMoreHistory();
-        // Keep the lock released — a prepend that briefly lands us near the
-        // bottom can otherwise re-arm it via the library's scroll handler.
-        state.isAtBottom = false;
-        state.escapedFromLock = true;
-        await nextFrame();
-      }
-      // Pin to the very top, re-asserting across frames until it holds. The last
-      // prepends keep growing scrollHeight after the store settles, and
-      // HistoryAutoLoader's offset-preservation can bump scrollTop right after
-      // we zero it. Force 0 each frame until it stays 0 for two consecutive
-      // frames (or we hit the frame cap).
-      for (let i = 0, stable = 0; i < 60 && stable < 2; i++) {
-        if (el.scrollTop === 0) stable += 1;
-        else {
-          el.scrollTop = 0;
-          stable = 0;
-        }
-        await nextFrame();
-      }
-      /* oxlint-enable no-await-in-loop */
-    } finally {
-      setJumping(false);
-    }
-  }, [scroller]);
-
-  return (
-    <div
-      // top 50px centers the pill on the chat-scroll-fade border (the mask ramps
-      // 48px→80px), just below the h-14 ChatHeader. z-40 > header z-30. On the
-      // iOS shell the header and fade border shift down by the safe-area inset
-      // (see .chat-scroll-fade in index.css), so add --omnigent-inset-top here
-      // too to keep the pill centered on the border. The var is 0px off-shell.
-      style={{ top: "calc(50px + var(--omnigent-inset-top))" }}
-      className={cn(
-        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150",
-        visible ? "opacity-100" : "opacity-0",
-      )}
-    >
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        disabled={jumping}
-        onClick={() => void jumpToTop()}
-        aria-label="Jump to the first message"
-        // When hidden (opacity-0 / pointer-events-none) keep the button out of
-        // the tab order and the accessibility tree so it can't take focus or be
-        // announced while invisible.
-        tabIndex={visible ? 0 : -1}
-        aria-hidden={!visible}
-        className={cn(
-          "h-7 gap-1.5 rounded-full px-3 text-sm shadow-sm",
-          // Force an OPAQUE background in both themes and on hover. The outline
-          // variant's hover (bg-muted) is a translucent black wash (--muted is
-          // #0000000f), so over the faded chat text behind the pill it bleeds
-          // through and reads as transparent. bg-background is opaque (#fff /
-          // #0e1013); hover feedback comes from a brightness filter, which keeps
-          // the fill fully opaque.
-          "bg-background hover:bg-background hover:brightness-95",
-          "dark:bg-background dark:hover:bg-background dark:hover:brightness-125",
-          visible ? "pointer-events-auto" : "pointer-events-none",
-        )}
-      >
-        {jumping ? (
-          <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
-        ) : (
-          <ArrowUpIcon className="size-3.5" aria-hidden />
-        )}
-        {jumping ? "Loading history…" : "Jump to top"}
-      </Button>
-    </div>
-  );
-}
-
-/** Stable React key per bubble. */
-function bubbleKey(bubble: Bubble): string {
-  // Prefer stableKey (the optimistic temp id) for promoted user bubbles
-  // so the key holds steady across the optimistic→committed swap on
-  // `session.input.consumed` — a changing key remounts the node (flink).
-  if (bubble.kind === "user") return `user:${bubble.stableKey ?? bubble.itemId}`;
-  if (bubble.kind === "compaction_loading") return `compaction_loading:${bubble.itemId}`;
-  if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
-  if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
-  return `assistant:${bubble.stableId}`;
-}
-
-/**
- * Playful labels the idle-but-busy indicator rotates through (one per
- * `ROTATE_MS`). Index 0 MUST stay "Working…": it's the label a fresh tick
- * (and every unit test) lands on. Keep each entry a single short word +
- * ellipsis — `Shimmer` scales its sweep width to the text length, so uniform
- * lengths keep the animation steady across rotations.
- */
-export const WORKING_MESSAGES = [
-  "Working…",
-  "Cooking…",
-  "Crunching…",
-  "Tinkering…",
-  "Pondering…",
-  "Brewing…",
-] as const;
-
-/**
- * The label shown next to the working spinner. When the agent is parked on a
- * dialog (`blockedOn`) it says so — that outranks everything else, because it
- * is the one case where the session needs the user rather than time, and the
- * dialog may live only in the terminal tab. Otherwise, when background shells
- * outlive the turn (`bgCount > 0`) it names how many are still running (the
- * tick is ignored — that count is information, not decoration). Failing both
- * it rotates through `WORKING_MESSAGES` by wall-clock `tick`.
- */
-export function workingIndicatorLabel(
-  bgCount: number,
-  tick = 0,
-  blockedOn: string | null = null,
-): string {
-  if (blockedOn) {
-    return `Blocked on: ${blockedOn}`;
-  }
-  if (bgCount > 0) {
-    return bgCount === 1
-      ? "1 background task still running"
-      : `${bgCount} background tasks still running`;
-  }
-  return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
-}
-
-function WorkingIndicator() {
-  const bgCount = useChatStore((s) => s.backgroundTaskCount);
-  const blockedOn = useChatStore((s) => s.blockedOn);
-  const tick = useWorkingLabelTick();
-  const label = workingIndicatorLabel(bgCount, tick, blockedOn);
-  return (
-    <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
-      <MessageContent>
-        <div className="flex items-center gap-1.5 py-0.5">
-          <OttoIcon className="otto-working h-4 w-auto shrink-0" />
-          <Shimmer className="text-sm font-mono" duration={1.5}>
-            {label}
-          </Shimmer>
-        </div>
-      </MessageContent>
-    </Message>
-  );
-}
-
-/**
- * Decide whether to render the main chat's "Working…" indicator.
- *
- * Lit for the whole busy turn — through streaming text, tool runs, and
- * reasoning gaps — so the user always sees the session is still going. A
- * reload can hydrate a custom-agent session as ``running`` before any bubble
- * exists locally; the indicator stays visible in that empty-but-busy state
- * too.
- *
- * @param showsWorking - True when the session snapshot or local response
- *   state says the main session is still working.
- * @param bubbles - Rendered chat bubbles currently hydrated in the main
- *   session, e.g. assistant, user, or compaction-loading bubbles.
- * @returns True when the standalone working indicator should render; false
- *   when the session is idle, or a compaction-loading bubble is last and
- *   already represents the busy state with its own animation.
- */
-export function shouldShowWorkingIndicator(showsWorking: boolean, bubbles: Bubble[]): boolean {
-  if (!showsWorking) return false;
-  return bubbles[bubbles.length - 1]?.kind !== "compaction_loading";
-}
-
-/**
- * Band copy for each in-flight managed-sandbox launch stage, in
- * pipeline order: provisioning → cloning (repo workspaces only) →
- * starting → connecting. `starting` is the in-sandbox host booting
- * and dialing back to the server (so it reads "Connecting host");
- * `connecting` is the agent runner being launched on that host
- * (so it reads "Starting agent"). Terminal stages are absent on
- * purpose — `ready` clears the band and `failed` renders its own
- * error band.
- */
-const SANDBOX_STAGE_LABELS: Record<string, string | undefined> = {
-  provisioning: "Provisioning sandbox",
-  cloning: "Cloning repository",
-  starting: "Connecting host",
-  connecting: "Starting agent",
-};
-
-/**
- * Failure band for a managed-sandbox session whose background launch
- * died. Renders the recorded reason so a dead launch explains itself
- * instead of presenting a silent dead chat. In-flight launch progress
- * does NOT render here — it shares the in-thread
- * :func:`RunnerStartingIndicator` spot so all launch states live on
- * one consistent line.
- */
-export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
-  return (
-    <div
-      data-testid="sandbox-failed-indicator"
-      role="status"
-      className={cn(
-        "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-destructive text-sm",
-        CHAT_COLUMN_WIDTH,
-      )}
-    >
-      <AlertTriangleIcon className="size-3.5 shrink-0" aria-hidden />
-      <span>Sandbox launch failed{status.error ? `: ${status.error}` : ""}</span>
-    </div>
-  );
-}
-
-export function ConnectionIndicator({
-  liveness,
-  onShowReconnectHelp,
-  surfaceFrontmost = true,
-}: {
-  liveness: SessionLiveness;
-  onShowReconnectHelp: () => void;
-  // Whether the chat/terminal surface is frontmost (not under a drawer). Gates
-  // the native iOS bar so it doesn't float over an opened sidebar/panel.
-  surfaceFrontmost?: boolean;
-}) {
-  const terminalFirst = useTerminalFirst();
-  const keyboardVisible = useIOSNativeKeyboardVisible(
-    terminalFirst?.isTerminalFirst === true,
-    terminalFirst?.view === "chat",
-  );
-  const sandboxStatus = useChatStore((s) => s.sandboxStatus);
-  // Genuinely-unreachable states get the reconnect banner, for
-  // both terminal-first and regular sessions. `runner_asleep` (host up,
-  // runner relaunches on the next message), `host_asleep` (resumable managed
-  // host the server wakes on the next message), and `unknown` (pre-poll) are
-  // NOT unreachable — they're handled below.
-  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
-
-  // In the iOS shell the Chat/Terminal toggle is the native Liquid Glass bar,
-  // not the in-page pill. Drive it from here (always mounted) with the SAME
-  // visibility the pill would have, expressed as a stable boolean so switching
-  // views never flickers the bar. Hook is called unconditionally (before any
-  // early return) to satisfy the rules of hooks.
-  const nativeBarVisible =
-    isIOSShell() &&
-    terminalFirst?.isTerminalFirst === true &&
-    !terminalFirst.isShellView &&
-    sandboxStatus?.stage !== "failed" &&
-    !unreachable &&
-    !keyboardVisible &&
-    surfaceFrontmost;
-  useNativeChatTerminalBar(terminalFirst, nativeBarVisible);
-
-  if (sandboxStatus !== null) {
-    // A failed launch owns this band with its reason. An IN-FLIGHT
-    // launch renders in the chat thread (RunnerStartingIndicator)
-    // instead — but still suppresses the liveness bands below, which
-    // would misread the not-yet-bound session as stranded.
-    if (sandboxStatus.stage === "failed") {
-      return <SandboxFailedIndicator status={sandboxStatus} />;
-    }
-    return null;
-  }
-  if (unreachable) {
-    // A host-bound session carries the reconnect affordance in the composer's
-    // host badge (ComposerStatusLine), which names the host that dropped — so
-    // render nothing here whenever that composer is on screen (sub-agent
-    // sessions included; their badge carries it just like a normal session's).
-    // The composer is hidden only in the terminal-first *terminal* view (the
-    // PTY owns the surface); there the banner still carries the affordance.
-    // `local_stranded` keeps the banner everywhere (no host, hence no badge).
-    const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
-    if (liveness.kind === "host_offline" && composerOnScreen) {
-      return null;
-    }
-    return (
-      <button
-        type="button"
-        data-testid="disconnected-indicator"
-        onClick={onShowReconnectHelp}
-        className={cn(
-          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-sm text-destructive underline-offset-2 hover:underline",
-          CHAT_COLUMN_WIDTH,
-        )}
-      >
-        <WifiOffIcon className="size-3.5 shrink-0" />
-        <span>
-          {liveness.kind === "host_offline"
-            ? "Host is offline — click to reconnect"
-            : "Agent disconnected — click to reconnect"}
-        </span>
-      </button>
-    );
-  }
-
-  // Terminal-first sessions: the Chat/Terminal toggle lives in the header
-  // (ViewModeToggle) for every reachable state — only the unreachable
-  // states above replace this band with the reconnect banner. In the iOS
-  // shell the toggle is the native Liquid Glass bar, so this band still
-  // reserves a spacer for its footprint.
-  if (terminalFirst?.isTerminalFirst) {
-    // In the iOS shell the toggle is the native bar (driven above). Render only
-    // a spacer reserving its fixed footprint so the composer clears it — and
-    // nothing when the bar is hidden.
-    if (isIOSShell()) {
-      // Chat reserves a touch less than terminal: the composer's own bottom
-      // content (the status line) already cushions the gap to the bar.
-      return nativeBarVisible ? (
-        <div
-          aria-hidden
-          className={cn(
-            "omnigent-native-bottom-spacer",
-            terminalFirst.view === "chat" && "omnigent-native-bottom-spacer--chat",
-          )}
-        />
-      ) : null;
-    }
-    // Outside the iOS shell the Chat/Terminal switcher lives in the header
-    // (ViewModeToggle) — this band renders nothing for terminal-first
-    // sessions now that the in-page pill is gone.
-    return null;
-  }
-
-  // A regular (non-terminal-first) session whose runner is still spinning
-  // up shows a passive "Connecting…" row — no action, no banner, just a
-  // heartbeat so the empty chat doesn't read as broken.
-  if (liveness.kind === "starting") {
-    return (
-      <div
-        data-testid="connecting-indicator"
-        className={cn(
-          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-muted-foreground text-sm",
-          CHAT_COLUMN_WIDTH,
-        )}
-      >
-        <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden />
-        <span>Connecting…</span>
-      </div>
-    );
-  }
-
-  // `online`/`unknown` for a non-terminal-first session and
-  // `runner_asleep`/`host_asleep` for any session: status lives in the
-  // sidebar / the composer stays open, so render nothing here.
-  return null;
-}
-
-/**
- * Main-pane launch indicator — the single in-thread line for every
- * "session is coming up" state. Two launch shapes feed it, in
- * priority order:
- *
- * 1. A managed-sandbox launch (`sandboxStatus` in flight): shows the
- *    current pipeline stage ("Provisioning sandbox…", "Cloning
- *    repository…", …) for ANY session type.
- * 2. A terminal-first runner spin-up (`terminalStartingUp`): shows the
- *    generic "Starting up…" terminal copy. The sandbox stages win
- *    while both are active — they're strictly more specific.
- *
- * Self-gates to null when neither applies. `hero` is the centered
- * empty-state placeholder (no bubbles yet); `row` is the in-thread
- * spinner beneath the user's first message (the create-then-send path
- * renders that bubble immediately, so the empty state never shows
- * there).
- */
-export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }) {
-  const terminalFirst = useTerminalFirst();
-  const sandboxStatus = useChatStore((s) => s.sandboxStatus);
-  // `ready` never reaches the store (cleared) and `failed` renders the
-  // destructive band in ConnectionIndicator — only in-flight stages
-  // with known copy show here.
-  const sandboxLabel =
-    sandboxStatus !== null && sandboxStatus.stage !== "failed"
-      ? SANDBOX_STAGE_LABELS[sandboxStatus.stage]
-      : undefined;
-  // `terminalStartingUp` is computed for ALL sessions in AppShell (it does not
-  // check isTerminalFirst), so gate on isTerminalFirst too: regular agents
-  // (e.g. polly) get the generic ConnectionIndicator "Connecting…" band and
-  // must not also render this.
-  const terminalSpinUp = Boolean(
-    terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp,
-  );
-  if (sandboxLabel === undefined && !terminalSpinUp) {
-    return null;
-  }
-  const line = sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…";
-  // role=status + aria-live so assistive tech announces the transient wait;
-  // the spinner glyph itself is decorative (aria-hidden).
-  if (variant === "hero") {
-    return (
-      <ConversationEmptyState
-        data-testid="runner-starting-indicator"
-        role="status"
-        aria-live="polite"
-        icon={<Loader2Icon className="size-7 animate-spin" aria-hidden />}
-        title={sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…"}
-        description={
-          sandboxLabel !== undefined
-            ? "Setting up your sandbox — this can take a minute."
-            : "This can take a few seconds."
-        }
-      />
-    );
-  }
-  return (
-    <Message
-      from="assistant"
-      data-testid="runner-starting-indicator"
-      role="status"
-      aria-live="polite"
-    >
-      <MessageContent>
-        <span className="flex items-center gap-2 text-muted-foreground text-ui">
-          <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
-          {line}
-        </span>
-      </MessageContent>
-    </Message>
-  );
-}
-
-// How many still-starting server names the startup band spells out
-// before collapsing the rest into "…" — mirrors the Codex TUI's own
-// startup header, and keeps a 20-server config to one line.
-const MCP_STARTING_NAMES_SHOWN = 3;
-// Cap for the settled warning's failed/cancelled name lists. Longer
-// than the starting cap because these name servers the user may need
-// to fix; beyond this the count carries the signal.
-const MCP_SETTLED_NAMES_SHOWN = 8;
-
-/**
- * The startup band's in-flight line, mirroring the Codex TUI's header.
- *
- * @param starting Still-starting server names, sorted.
- * @param total Total servers in the round.
- * @returns e.g. `"Starting MCP servers (1/20): glean, jira, safe, …"`.
- */
-export function mcpStartingLine(starting: string[], total: number): string {
-  if (total === 1 && starting.length === 1) {
-    return `Starting MCP server: ${starting[0]}…`;
-  }
-  const shown = starting.slice(0, MCP_STARTING_NAMES_SHOWN);
-  if (starting.length > MCP_STARTING_NAMES_SHOWN) shown.push("…");
-  return `Starting MCP servers (${total - starting.length}/${total}): ${shown.join(", ")}`;
-}
-
-/**
- * A settled warning's name list, capped so the band stays scannable.
- *
- * @param names Failed or cancelled server names, sorted.
- * @returns e.g. `"a, b, c, d, e, f, g, h, +12 more"`.
- */
-export function mcpSettledNames(names: string[]): string {
-  if (names.length <= MCP_SETTLED_NAMES_SHOWN) return names.join(", ");
-  const shown = names.slice(0, MCP_SETTLED_NAMES_SHOWN);
-  return `${shown.join(", ")}, +${names.length - MCP_SETTLED_NAMES_SHOWN} more`;
-}
-
-/**
- * Per-MCP-server startup band for native harness sessions (codex-native).
- * Codex defers a mid-startup turn's execution until its MCP servers
- * settle, and the session previously showed nothing during that window.
- * Renders a spinner naming the still-starting servers; once startup
- * settles with failures/cancellations, a one-line notice says which
- * servers never came up. Self-gates to null when the store carries no
- * startup state (an all-ready map is cleared by the store handler).
- */
-export function McpStartupIndicator() {
-  const mcpStartup = useChatStore((s) => s.mcpStartup);
-  if (mcpStartup === null) return null;
-  const names = Object.keys(mcpStartup).sort();
-  const starting = names.filter((name) => mcpStartup[name].status === "starting");
-  if (starting.length > 0) {
-    return (
-      <Message
-        from="assistant"
-        data-testid="mcp-startup-indicator"
-        role="status"
-        aria-live="polite"
-      >
-        <MessageContent>
-          <span className="flex items-center gap-2 text-muted-foreground text-ui">
-            <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
-            {mcpStartingLine(starting, names.length)}
-          </span>
-        </MessageContent>
-      </Message>
-    );
-  }
-  const failed = names.filter((name) => mcpStartup[name].status === "failed");
-  const cancelled = names.filter((name) => mcpStartup[name].status === "cancelled");
-  if (failed.length === 0 && cancelled.length === 0) return null;
-  const parts: string[] = [];
-  if (failed.length > 0) parts.push(`failed: ${mcpSettledNames(failed)}`);
-  if (cancelled.length > 0) parts.push(`cancelled: ${mcpSettledNames(cancelled)}`);
-  return (
-    <Message from="assistant" data-testid="mcp-startup-indicator" role="status">
-      <MessageContent>
-        <span className="flex items-center gap-2 text-muted-foreground text-ui">
-          <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
-          {`MCP startup incomplete (${parts.join("; ")})`}
-        </span>
-      </MessageContent>
-    </Message>
-  );
-}
-
-/**
- * Mirrors the Chat/Terminal state onto the iOS shell's native Liquid Glass
- * switcher and routes its taps back into `setView`. Driven by a stable
- * `visible` boolean (not this hook's mount/unmount), so toggling Chat/Terminal
- * updates the bar in place instead of flickering it hidden→shown. A no-op
- * outside the iOS shell; the caller renders its own in-page pill there.
- */
-function useNativeChatTerminalBar(
-  ctx: ReturnType<typeof useTerminalFirst> | null,
-  visible: boolean,
-): void {
-  const native = isIOSShell();
-  const view = ctx?.view ?? "chat";
-  const terminalsAvailable = ctx?.terminalsAvailable ?? false;
-  const terminalStartingUp = ctx?.terminalStartingUp ?? false;
-
-  // Keep `setView` reachable from the subscribe-once effect without
-  // resubscribing whenever the callback identity changes.
-  const setViewRef = useRef(ctx?.setView);
-  setViewRef.current = ctx?.setView;
-
-  // Push current state + visibility down whenever any of it changes.
-  useEffect(() => {
-    if (!native) return;
-    setNativeViewMode({
-      mode: view,
-      terminalEnabled: terminalsAvailable,
-      terminalStartingUp,
-      visible,
-    });
-  }, [native, view, terminalsAvailable, terminalStartingUp, visible]);
-
-  // Belt-and-suspenders: hide the bar if the host component ever unmounts.
-  useEffect(() => {
-    if (!native) return;
-    return () => {
-      setNativeViewMode({
-        mode: "chat",
-        terminalEnabled: false,
-        terminalStartingUp: false,
-        visible: false,
-      });
-    };
-  }, [native]);
-
-  // Route native taps back into the web layer.
-  useEffect(() => {
-    if (!native) return;
-    return onNativeViewModeChanged((mode) => setViewRef.current?.(mode));
-  }, [native]);
-}
-
-/**
- * Whether a user-role bubble is a runtime-injected `[System: ...]`
- * notification (rendered via SystemMessageView, not as a normal user
- * bubble). Matches the gate in `UserBubble`: pure text, no attachments,
- * recognizable system header.
- */
-function isSystemBubble(bubble: Bubble): boolean {
-  if (bubble.kind !== "user") return false;
-  return isSystemUserContent(bubble.content);
-}
-
-function CompactionLoadingIndicator() {
-  const [elapsed, setElapsed] = useState(0);
-  const startRef = useRef(performance.now());
-
-  useEffect(() => {
-    const id = window.setInterval(() => {
-      setElapsed(Math.round((performance.now() - startRef.current) / 1000));
-    }, 1000);
-    return () => window.clearInterval(id);
-  }, []);
-
-  return (
-    <Message from="assistant" data-testid="compacting-indicator">
-      <MessageContent>
-        <div className="flex items-center gap-2 text-sm font-mono">
-          <Shimmer as="span" duration={1.5}>
-            Compacting conversation…
-          </Shimmer>
-          {elapsed > 0 && <span className="text-muted-foreground">({elapsed}s)</span>}
-        </div>
-        <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
-          <div
-            className="h-full w-1/3 rounded-full bg-muted-foreground/40"
-            style={{ animation: "compaction-slide 1.5s ease-in-out infinite alternate" }}
-          />
-        </div>
-      </MessageContent>
-    </Message>
-  );
-}
-
-// Memoized so a streaming delta (which rebuilds the whole bubble array) only
-// re-renders the bubble that actually changed, not every prior message's
-// markdown/syntax-highlighting subtree. See `bubblesEqual`. Exported for
-// the user-bubble markdown render tests.
-export const BubbleView = memo(
-  function BubbleView({
-    bubble,
-    isLastAssistant = false,
-    showsWorking = false,
-  }: {
-    bubble: Bubble;
-    isLastAssistant?: boolean;
-    showsWorking?: boolean;
-  }) {
-    if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
-    if (bubble.kind === "compaction_loading") {
-      return <CompactionLoadingIndicator />;
-    }
-    if (bubble.kind === "compaction") return <CompactionMarker />;
-    if (bubble.kind === "routing_decision") {
-      return (
-        <RoutingDecisionCard
-          model={bubble.model}
-          applied={bubble.applied}
-          rationale={bubble.rationale}
-          agent={bubble.agent}
-          routing={bubble.routing}
-        />
-      );
-    }
-    return (
-      <AssistantBubble
-        bubble={bubble}
-        isLastAssistant={isLastAssistant}
-        showsWorking={showsWorking}
-      />
-    );
-  },
-  (prev, next) =>
-    (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
-    (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
-    bubblesEqual(prev.bubble, next.bubble),
-);
-
-/**
- * Copy-to-clipboard handler for a message bubble's "Copy" action.
- *
- * Uses the shared {@link copyText} helper (async Clipboard API with an
- * `execCommand` fallback) rather than `navigator.clipboard.writeText`
- * directly — the latter is undefined in the iOS webview and on non-secure
- * origins, where a bare guard made the button silently no-op. Drives the
- * inline check-icon confirmation for 2s, and on mobile (where the desktop
- * hover affordance and tooltip aren't visible) also fires a toast so the
- * copy is confirmed.
- *
- * @param getText - Produces the text to copy at click time.
- * @returns `{ isCopied, handleCopy }` for the action button.
- */
-function useCopyMessage(getText: () => string): {
-  isCopied: boolean;
-  handleCopy: () => void;
-} {
-  const [isCopied, setIsCopied] = useState(false);
-  const timeoutRef = useRef<number>(0);
-  const isMobile = useIsMobileViewport();
-
-  useEffect(() => () => window.clearTimeout(timeoutRef.current), []);
-
-  const handleCopy = useCallback(() => {
-    if (isCopied) return;
-    const text = getText();
-    if (!text) return;
-    copyText(text).then(
-      () => {
-        setIsCopied(true);
-        window.clearTimeout(timeoutRef.current);
-        timeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
-        if (isMobile) {
-          showToast(<span className="text-ui">Copied to clipboard</span>, { duration: 1500 });
-        }
-      },
-      (error) => {
-        console.warn("Failed to copy message", error);
-      },
-    );
-  }, [getText, isCopied, isMobile]);
-
-  return { isCopied, handleCopy };
-}
-
-function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
-  const sessionId = useChatStore((s) => s.conversationId);
-  // Author labels only matter once the session is shared with someone else.
-  const isSessionShared = useContext(SessionSharedContext);
-  // Plain-text path is the common case.
-  // - input_image: render inline <img> when the file is uploaded (file_id
-  //   doesn't start with "pending:"); show a chip while the upload is
-  //   in-flight.
-  // - input_file: always render as a chip (non-image files can't be
-  //   previewed inline).
-  const text = extractUserText(bubble.content);
-  const images = bubble.content.filter(
-    (c): c is Extract<MessageContentBlock, { type: "input_image" }> => c.type === "input_image",
-  );
-  const fileChips = bubble.content.filter(
-    (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
-  );
-  // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
-  // markers (no input_file block), so surface them as chips — otherwise the
-  // marker is stripped and the user can't see what they attached.
-  const mentionedChips = extractAttachedPaths(bubble.content);
-  // Equality selector so Zustand only re-renders the matching bubble.
-  const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
-  const { isCopied, handleCopy } = useCopyMessage(() => text);
-  // Runtime-injected `[System: ...]` notifications (task completion,
-  // timer firings, terminal idle) ride in on role=user. When the content
-  // is a pure system marker — no attached images or files — swap the
-  // normal bubble for a muted centered indicator.
-  if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
-    const parsed = parseSystemMessage(text);
-    if (parsed) return <SystemMessageView message={parsed} />;
-  }
-  // Badge OTHER contributors' messages only (never your own) — an avatar
-  // circle + author-tinted bubble, not an email label.
-  const author = bubble.createdBy;
-  const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
-
-  return (
-    <Message
-      from="user"
-      data-testid="message-bubble"
-      data-role="user"
-      data-user-message-id={bubble.itemId}
-      className="max-w-[640px]"
-    >
-      {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
-          immediately left of the right-aligned bubble (the bubble's own
-          ml-auto has no free space to absorb inside a fit-width row). */}
-      <div className="ml-auto flex w-fit max-w-full items-center gap-1.5">
-        {showAuthorBadge && author && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Avatar
-                size="sm"
-                data-testid="message-author"
-                aria-label={author}
-                className="shrink-0"
-              >
-                <AvatarFallback
-                  className="font-medium text-white"
-                  style={{ backgroundColor: userColor(author) }}
-                >
-                  {userInitials(author)}
-                </AvatarFallback>
-              </Avatar>
-            </TooltipTrigger>
-            <TooltipContent>{author}</TooltipContent>
-          </Tooltip>
-        )}
-        <MessageContent
-          className={cn(flashing && "animate-user-msg-flash")}
-          // Another contributor's bubble takes their avatar color at low
-          // alpha instead of the default bg-muted, so authorship reads at
-          // a glance without any email text.
-          style={showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined}
-        >
-          {/* Inline image previews — one non-wrapping strip. Wrapping would
-              re-flow the row as each image's width resolves on load, changing
-              the bubble's height and shoving the transcript; scrolling keeps
-              the row exactly one preview tall no matter what lands. */}
-          {images.length > 0 && (
-            <div className="mb-1.5 flex gap-2 overflow-x-auto">
-              {images.map((img) =>
-                img.file_id.startsWith("pending:") ? (
-                  // Upload in-flight — show a chip placeholder
-                  <span
-                    key={img.file_id}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                  >
-                    <ImageIcon className="size-3 shrink-0" />
-                    <span className="max-w-[180px] truncate">
-                      {img.filename ?? img.file_id.replace("pending:", "")}
-                    </span>
-                  </span>
-                ) : (
-                  // Uploaded — render the actual image
-                  <SessionImage
-                    key={img.file_id}
-                    path={
-                      sessionId
-                        ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(img.file_id)}/content`
-                        : undefined
-                    }
-                    alt={img.filename ?? img.file_id}
-                    // Sizing lives in SessionImage, which reserves a matching
-                    // box so the bubble's height is settled before bytes land.
-                    className="rounded-md object-contain"
-                  />
-                ),
-              )}
-            </div>
-          )}
-          {/* Non-image file chips */}
-          {fileChips.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap gap-1.5">
-              {fileChips.map((att) => (
-                <span
-                  key={att.file_id}
-                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                >
-                  <FileTextIcon className="size-3 shrink-0" />
-                  <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
-                </span>
-              ))}
-            </div>
-          )}
-          {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
-          {mentionedChips.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap gap-1.5">
-              {mentionedChips.map((item) => (
-                <span
-                  key={mentionItemPath(item)}
-                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                >
-                  {item.isDir ? (
-                    <FolderIcon className="size-3 shrink-0" />
-                  ) : (
-                    <FileTextIcon className="size-3 shrink-0" />
-                  )}
-                  <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
-                    @{item.path}
-                    {item.isDir ? "/" : ""}
-                  </span>
-                  {item.lineRange && (
-                    <span className="shrink-0">
-                      :{item.lineRange.start}-{item.lineRange.end}
-                    </span>
-                  )}
-                </span>
-              ))}
-            </div>
-          )}
-          {/* Render user text as markdown, matching the assistant bubble
-            (headings, lists, code fences, file-path links). `breaks` keeps
-            single newlines as line breaks — users type multi-line messages
-            without blank-line paragraph separators and expect their line
-            breaks preserved. Empty text — e.g. an attachments-only message —
-            renders nothing rather than an empty markdown block. */}
-          {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
-        </MessageContent>
-      </div>
-      {text && (
-        <MessageActions className="ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-          <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-            {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-          </MessageAction>
-        </MessageActions>
-      )}
-    </Message>
-  );
-}
-
-function AssistantBubble({
-  bubble,
-  isLastAssistant = false,
-  showsWorking = false,
-}: {
-  bubble: Extract<Bubble, { kind: "assistant" }>;
-  isLastAssistant?: boolean;
-  showsWorking?: boolean;
-}) {
-  // The walker only emits an assistant bubble when at least one
-  // assistant-side block exists, so `items` is non-empty here in the
-  // common case. The "Working…" shimmer for the empty-items / streaming
-  // gap is rendered at the page level, not inside this component.
-  const sessionStatus = useChatStore((s) => s.sessionStatus);
-  // A pending elicitation means the turn is parked awaiting the user —
-  // still in flight even when its lifecycle or the session status reads
-  // settled (e.g. a reload while parked). Feeds the fold suppression.
-  const hasPendingElicitation = useChatStore((s) =>
-    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
-  );
-  // Getter computes the markdown lazily at click time — the hook must run
-  // before the early return below (rules of hooks), but `markdownText` is
-  // derived after it.
-  const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
-  // null outside AppShell's provider (isolated tests) → hide the action.
-  const forkDialog = useForkDialog();
-
-  if (bubble.items.length === 0) return null;
-
-  const markdownText = collectBubbleMarkdown(bubble.items);
-
-  // The bubble collapses to nothing but the "Worked for" row — its text
-  // all sits inside the fold, and its answer lands in a later bubble.
-  const foldOnly = rendersOnlyWorkedFold({
-    items: bubble.items,
-    sessionStatus,
-    turnLifecycle: bubble.lifecycle,
-    continued: bubble.continued,
-    isLastAssistant,
-    hasPendingElicitation,
-    showsWorking,
-  });
-
-  // Elicitation cards (e.g. AskUserQuestion form) want full chat-column
-  // width to match the composer, not the default w-fit shrink-to-content.
-  const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
-  const isWide =
-    hasElicitation || containsMarkdownTable(bubble.items) || containsDisplayMath(bubble.items);
-
-  return (
-    <>
-      <Message
-        from="assistant"
-        data-testid="message-bubble"
-        data-role="assistant"
-        className={isWide ? "max-w-full" : "max-w-3xl"}
-      >
-        {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap
-            rather than shrink-wrapping to the summary row's ~110px, which
-            collapsed the row's trailing hairline (a flex-1 span) to zero
-            and stopped its click target short of the column. Keeping the
-            cap lands the hairline where an answered turn's does. */}
-        <MessageContent className={isWide || foldOnly ? "w-full" : undefined}>
-          <BlockRenderer
-            items={bubble.items}
-            sessionStatus={sessionStatus}
-            turnLifecycle={bubble.lifecycle}
-            workedForS={bubble.workedForS}
-            continued={bubble.continued}
-            isLastAssistant={isLastAssistant}
-            hasPendingElicitation={hasPendingElicitation}
-            lastActivityAtS={bubble.lastActivityAtS}
-            showsWorking={showsWorking}
-          />
-        </MessageContent>
-        {bubble.lifecycle === "cancelled" && (
-          <p
-            className="mt-1 flex items-center gap-1 text-sm text-muted-foreground"
-            data-testid="assistant-interrupted-indicator"
-          >
-            <XIcon className="size-3" aria-hidden="true" />
-            <span>Interrupted</span>
-          </p>
-        )}
-        {/* Skipped on a fold-only bubble: the actions belong to content
-            the user can see, and hanging them off a collapsed row spaced
-            consecutive rows unevenly depending on hidden narration. */}
-        {markdownText && !foldOnly && (
-          <MessageActions className="opacity-40 transition-opacity md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
-            <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-              {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-            </MessageAction>
-            {/* Fork from this response: clone the session with history
-                truncated after this turn. Hidden while the response is
-                still streaming (its items aren't committed yet) and when
-                the session can't be forked (sub-agent / isolated mount). */}
-            {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-              <MessageAction
-                tooltip="Fork from here"
-                size="icon-xxs"
-                data-testid="fork-from-response"
-                onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
-              >
-                <GitForkIcon size={14} />
-              </MessageAction>
-            )}
-          </MessageActions>
-        )}
-      </Message>
-
-      {bubble.lifecycle === "failed" && (
-        <p className="text-destructive text-sm">Error: {bubble.error}</p>
-      )}
-    </>
   );
 }
 
@@ -3780,6 +1880,8 @@ interface ComposerProps {
   codexModelOptions: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  showClaudePermissionMode?: boolean;
+  showCodexApprovalMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -3787,10 +1889,9 @@ interface ComposerProps {
   /** Show Polly's Codex command-backed Goal control. */
   showPollyCodexGoalControl?: boolean;
   /**
-   * Terminal-first session (Chat/Terminal pill present). Presentation
-   * only: tightens the composer's bottom padding to `pb-1.5` so it sits
-   * closer to the pill beneath it; non-terminal-first chats use the
-   * roomier `pb-3`.
+   * Terminal-first session. Presentation only: tightens the composer's
+   * bottom padding to `pb-1.5` (the status line beneath already cushions
+   * the edge); non-terminal-first chats use the roomier `pb-3`.
    */
   isTerminalFirst?: boolean;
   /**
@@ -3800,21 +1901,6 @@ interface ComposerProps {
    * terminal) keep it.
    */
   isNativeWrapper?: boolean;
-  /**
-   * The session's runner is asleep but its host is online (`runner_asleep`):
-   * the composer stays enabled and the placeholder nudges the user to send a
-   * message, which relaunches the runner on the live host. Ignored while a
-   * turn is streaming (the follow-up placeholder wins).
-   */
-  reconnectHint?: boolean;
-  /**
-   * The session is host-bound to a dormant resumable managed host that is
-   * offline (`host_asleep`): the composer stays enabled, and the placeholder
-   * tells the user their next message will resume the sandbox host (which can
-   * take a few minutes) so the wake latency is expected, not surprising.
-   * Ignored once a turn is streaming.
-   */
-  sandboxAsleepHint?: boolean;
   /**
    * The session is unreachable (`host_offline` / `local_stranded`): a message
    * can't wake it. The composer is blocked (disabled) and the reconnect
@@ -3850,12 +1936,14 @@ interface ComposerProps {
    */
   wrapperLabel?: string | null;
   /**
-   * Reports how many pixels taller than its resting height the composer has
-   * grown. The composer keeps that growth out of the column's flex layout
-   * (see the negative top margin below); the transcript uses the number to
-   * lift its bottom-anchored overlays clear of the taller card.
+   * Synchronous pin: called in the same task as the composer's height
+   * change so the transcript stays bottom-locked before the browser
+   * paints the now-smaller viewport with the scroll offset stale — Gecko
+   * visibly paints that intermediate frame, bouncing the last visible
+   * message. A same-task write is the only ordering no engine paints past.
+   * The callback itself decides whether the reader is bottom-locked.
    */
-  onGrowthChange?: (px: number) => void;
+  onViewportShrinkPinScroll?: () => void;
 }
 
 /**
@@ -3974,9 +2062,10 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
  *
  * @param model - Model override or bound agent model id.
  * @param codexModelOptions - Native model metadata, when available.
- * @returns The advertised display label for known native models, a local Claude alias
- *   label for Claude native tiers, the raw model id otherwise, or ``null``
- *   when no model is known.
+ * @returns The advertised display label for known native models, a
+ *   version-agnostic friendly form for an alias-shaped id the catalog
+ *   doesn't list, the raw model id otherwise, or ``null`` when no model
+ *   is known.
  */
 export function formatStatusModelLabel(
   model: string | null,
@@ -3987,8 +2076,19 @@ export function formatStatusModelLabel(
   const lower = raw.toLowerCase();
   const codexOption = findNativeModelOption(codexModelOptions, raw);
   if (codexOption) return codexOption.displayName ?? codexOption.id;
-  const known = CLAUDE_NATIVE_MODELS.find((m) => m.id === lower);
-  if (known) return known.label;
+  // An alias-shaped id the session's catalog doesn't list (e.g. during
+  // the pre-catalog window): render it friendly mechanically — "sonnet"
+  // → "Sonnet", "sonnet_5" → "Sonnet 5", "sonnet[1m]" → "Sonnet
+  // (1M context)" — without claiming a version the client can't know.
+  // Which model an alias lands on is the harness's answer; the catalog's
+  // display name supersedes this wherever one has arrived.
+  const alias = /^([a-z]+)(?:_(\d+))?(\[1m\])?$/.exec(lower);
+  if (alias) {
+    let label = `${alias[1]!.charAt(0).toUpperCase()}${alias[1]!.slice(1)}`;
+    if (alias[2]) label += ` ${alias[2]}`;
+    if (alias[3]) label += " (1M context)";
+    return label;
+  }
   return raw;
 }
 
@@ -4092,6 +2192,13 @@ function ComposerStatusLine({
   const { session } = useSession(conversationId);
   const isHostBound = !!session?.hostId;
 
+  // PR link → opens the workspace rail's GitHub tab. Shares the info query's
+  // cache with the GitHub panel, so opening the tab is instant.
+  const github = useGithubInfo(conversationId ?? undefined);
+  const openGithubTab = useOpenGithubTab();
+  const prNumber = github.data?.pr?.number ?? null;
+  const showPr = !!conversationId && !isSubAgentSession && prNumber !== null && !!openGithubTab;
+
   const showBranch = !!conversationId && !!gitBranch;
   // Host indicator (green/red dot + host name), left of the worktree branch.
   // Hidden on sub-agent sessions — the header's child-session slot owns the
@@ -4111,7 +2218,8 @@ function ComposerStatusLine({
   // the badge is where it lives and an unreachable session often has no
   // branch/ring at all.
   const showHostBadge = showHost && isHostBound;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHostBadge) return null;
+  if (!showBranch && !showPr && !showPlanMode && !showGoal && !showRing && !showHostBadge)
+    return null;
 
   return (
     <div
@@ -4134,6 +2242,18 @@ function ComposerStatusLine({
               {gitBranch}
             </span>
           </span>
+        )}
+        {showPr && (
+          <button
+            type="button"
+            data-testid="composer-pr-link"
+            onClick={() => openGithubTab?.()}
+            title="View this PR in the GitHub tab"
+            className="flex shrink-0 items-center gap-1.5 rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            <GithubMono size={14} aria-hidden />
+            <span className="tabular-nums underline underline-offset-2">#{prNumber}</span>
+          </button>
         )}
       </div>
       {/* Right: model/effort and context ring, never shrinks. */}
@@ -4225,11 +2345,158 @@ function SubagentComposerTray({ label }: { label: string }) {
 }
 
 /**
+ * Pill above the composer tallying running background tasks (a dev server, a
+ * background shell, a sub-agent), shown independently of the "Working…" shimmer.
+ *
+ * The tally expands into a card listing each running shell by name: on hover
+ * for a mouse, on tap for touch (which focuses it, so a tap outside closes it
+ * via blur), and on focus for the keyboard. It morphs in place — the same
+ * element tweens width and height to the measured content size at a constant
+ * corner radius (CSS can't animate to an `auto` size), growing upward out of an
+ * absolute layer over a hidden spacer so the composer below never shifts. A
+ * count-only edge (older runner, no per-shell detail) stays a plain tally.
+ *
+ * The whole pill floats as an overlay pinned just above the composer (its form
+ * is `relative`, this is `bottom-full`) rather than taking a flow row — a
+ * reserved row would butt against the transcript's bottom overflow edge and
+ * clip the last line. Only the pill itself takes pointer events so the
+ * transcript underneath stays interactive.
+ */
+export function BackgroundTaskPill() {
+  const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const bgTasks = useChatStore((s) => s.backgroundTasks);
+  const [open, setOpen] = useState(false);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [box, setBox] = useState<{ width: number; height: number } | null>(null);
+  const canExpand = bgTasks.length > 0;
+
+  useEffect(() => {
+    if (bgCount <= 0 || !canExpand) setOpen(false);
+  }, [bgCount, canExpand]);
+
+  // Measure the current content so the container tweens to a concrete size in
+  // both dimensions. Re-measured whenever the state or the task list changes.
+  useLayoutEffect(() => {
+    const el = contentRef.current;
+    if (el) setBox({ width: el.offsetWidth, height: el.offsetHeight });
+  }, [open, canExpand, bgCount, bgTasks]);
+
+  if (bgCount <= 0) return null;
+
+  const showCard = open && canExpand;
+
+  return (
+    // Floats above the composer instead of taking a flow row: a reserved row
+    // would butt against the transcript's bottom overflow edge and clip its
+    // last line. Pinned to the composer's top (bottom-full) and re-applying the
+    // form's px-4/md:px-6 inset so the pill lines up with the composer card.
+    // pointer-events-none lets the transcript underneath stay scrollable /
+    // selectable — only the pill itself re-enables them.
+    <div className="pointer-events-none absolute inset-x-0 bottom-full px-4 md:px-6">
+      <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
+        <div className="pointer-events-auto relative">
+          {/* Reserves the collapsed footprint so the absolute, upward-growing
+            card never shoves the composer. */}
+          <div aria-hidden className="invisible px-3 py-1.5 text-sm">
+            <div className="flex items-center gap-1.5 whitespace-nowrap">
+              <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+              <span>
+                {bgCount} background task{bgCount === 1 ? "" : "s"}
+              </span>
+            </div>
+          </div>
+          <div
+            role="status"
+            data-testid="background-task-pill"
+            aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
+            tabIndex={canExpand ? 0 : undefined}
+            // Hover opens ONLY for a real mouse. On touch, opening on emulated
+            // hover triggers iOS's "first tap reveals hover, second tap clicks"
+            // heuristic — which swallows the first tap inconsistently. Touch opens
+            // via onClick instead, so the first tap always lands.
+            onPointerEnter={(e) => {
+              if (e.pointerType === "mouse" && canExpand) setOpen(true);
+            }}
+            onPointerLeave={(e) => {
+              if (e.pointerType === "mouse") setOpen(false);
+            }}
+            // Tap/click: open and focus the pill so onBlur can close it on
+            // tap-out (a gesture-driven focus() works even on iOS, where tapping a
+            // non-button element otherwise won't focus it).
+            onClick={(e) => {
+              if (!canExpand) return;
+              setOpen(true);
+              e.currentTarget.focus({ preventScroll: true });
+            }}
+            onFocus={() => canExpand && setOpen(true)}
+            onBlur={(e) => {
+              // Close when focus leaves the pill entirely (tap/click outside,
+              // Tab away); staying open if it moves to a child.
+              if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
+            }}
+            style={box ? { width: box.width, height: box.height } : undefined}
+            className={cn(
+              "absolute bottom-0 left-0 overflow-hidden rounded-2xl bg-card text-sm shadow-sm ring-1 ring-border transition-[width,height,box-shadow] duration-200 ease-out",
+              showCard && "z-10 shadow-menu",
+            )}
+          >
+            <div
+              ref={contentRef}
+              // Cap at Tailwind's `md` container (28rem/448px), but never wider
+              // than the viewport minus a margin so it can't overflow on a narrow
+              // screen. The margin exceeds the composer's own px-4/px-6 inset (this
+              // pill sits at px-1) so the card's right edge, ring included, stays
+              // inside the composer rather than overhanging it.
+              style={
+                showCard ? { maxWidth: "min(var(--container-md, 28rem), 100vw - 3rem)" } : undefined
+              }
+              className={cn("w-max text-left", showCard ? "px-3 py-2" : "px-3 py-1.5")}
+            >
+              {showCard ? (
+                <ul className="flex animate-in flex-col gap-1.5 fade-in-0 duration-200">
+                  {bgTasks.map((task, i) => {
+                    const label = task.description || task.command || "Background shell";
+                    const cmd = task.command && task.command !== label ? task.command : null;
+                    return (
+                      <li key={task.id ?? i} className="flex items-start gap-2">
+                        <SquareTerminalIcon
+                          className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+                          aria-hidden="true"
+                        />
+                        <div className="min-w-0">
+                          <div className="truncate text-foreground">{label}</div>
+                          {cmd ? (
+                            <div className="truncate font-mono text-xs text-muted-foreground">
+                              {cmd}
+                            </div>
+                          ) : null}
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
+                <div className="flex items-center gap-1.5 whitespace-nowrap text-muted-foreground">
+                  <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                  <span>
+                    {bgCount} background task{bgCount === 1 ? "" : "s"}
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
  * The message-input composer: textarea, attachments, slash-command
  * suggestions menu, and the send/stop controls. Exported for direct
  * unit testing of the slash-command keyboard behavior.
  */
-export function Composer({
+function ComposerImpl({
   status,
   isWorking,
   disabled,
@@ -4249,22 +2516,23 @@ export function Composer({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showClaudePermissionMode = false,
+  showCodexApprovalMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
   isTerminalFirst = false,
   isNativeWrapper = false,
-  reconnectHint = false,
-  sandboxAsleepHint = false,
   unreachable = false,
   onShowReconnectHelp,
   costRoutingEligible = false,
   subagentRoutingEligible = false,
   subAgentLabel = null,
   wrapperLabel = null,
-  onGrowthChange,
+  onViewportShrinkPinScroll,
 }: ComposerProps) {
   const [value, setValue] = useState("");
+  const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -4287,11 +2555,21 @@ export function Composer({
   // "Attach to agent" button). Drained into ``mentionedItems`` below, then
   // cleared from the store so they aren't re-applied.
   const pendingComposerAttachments = useChatStore((s) => s.pendingComposerAttachments);
+  // Text + attachments handed back by a send that failed before the server
+  // took ownership. Drained below so the message can be retried.
+  const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  // The conversation whose draft the composer's value/files currently hold.
+  // Trails `conversationId` by one commit across a session switch; see the
+  // draft-restore effect.
+  const [settledConversationId, setSettledConversationId] = useState<string | null>(null);
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
+  // Single send-telemetry point (see submit()). Emitting here rather than via
+  // the Button's componentId covers Enter-key sends too — a textarea Enter never
+  // submits the form, so it would otherwise bypass the Button entirely.
+  const { trackClick } = useOmnigentAnalytics();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const formRef = useRef<HTMLFormElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
@@ -4346,9 +2624,8 @@ export function Composer({
   );
 
   // Preserve unsent text + file attachments per session so switching
-  // tabs and coming back restores the draft. The drafts map lives at
-  // module scope (not useRef) because Composer unmounts during the
-  // loading gate between session switches.
+  // tabs and coming back restores the draft. The shared draft store also lets
+  // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
@@ -4408,37 +2685,39 @@ export function Composer({
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
-  const [isMobile, setIsMobile] = useState(
-    () => typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches,
-  );
+  const isMobile = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
+  const preventsKeyboardSubmit = isMobile || isCoarsePointer;
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
-  useEffect(() => {
-    const mq = window.matchMedia("(max-width: 767px)");
-    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
 
   useEffect(() => {
-    const restored = conversationId ? sessionDrafts.get(conversationId) : undefined;
+    const restored = conversationId ? getSessionDraft(conversationId) : undefined;
     setValue(restored?.text ?? "");
     setFiles(restored?.files ?? []);
     dirtyRef.current = false;
+    // Publish which conversation the composer's text now belongs to. The
+    // failed-send restore below reads value/files through refs, which still
+    // hold the OUTGOING conversation's text during this commit — it waits for
+    // this to settle rather than mistaking that for "the user is typing".
+    setSettledConversationId(conversationId ?? null);
     if (!isMobileRef.current) textareaRef.current?.focus();
 
     return () => {
       if (!conversationId || !dirtyRef.current) return;
-      const text = valueRef.current;
-      const draftFiles = filesRef.current;
-      if (text || draftFiles.length > 0) {
-        sessionDrafts.set(conversationId, { text, files: draftFiles });
-      } else {
-        sessionDrafts.delete(conversationId);
-      }
-      saveDraftsToStorage(sessionDrafts);
+      setSessionDraft(conversationId, {
+        text: valueRef.current,
+        files: filesRef.current,
+      });
     };
   }, [conversationId]);
+
+  // Publish edits as they happen so the open sidebar updates immediately,
+  // rather than only learning about a draft when this composer unmounts.
+  useEffect(() => {
+    if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
+    setSessionDraft(conversationId, { text: value, files });
+  }, [conversationId, settledConversationId, value, files]);
 
   // Adding a reply quote (via the floating "Reply" button) should drop the
   // caret straight into the composer so the user can type immediately. Only
@@ -4617,6 +2896,35 @@ export function Composer({
     // setMentionedItems is a stable useState setter (from useMentionBrowser).
   }, [pendingComposerAttachments, setMentionedItems]);
 
+  // Restore the text (and attachments) of a send that failed, so the user can
+  // fix and resend instead of retyping. The composer is empty in the normal
+  // case — `submit` clears it optimistically — so only fill it when the user
+  // hasn't already started something new; their in-progress text wins. Files
+  // are re-validated on the way in: when the upload itself was what failed
+  // (a 415 on an unsupported type), re-arming the same file would only fail
+  // again, so it's dropped with the same inline reason a fresh attach gives.
+  useEffect(() => {
+    if (failedSendDraft === null) return;
+    if (failedSendDraft.conversationId !== conversationId) return;
+    // Wait for the draft-restore effect to settle this conversation's text
+    // into value/files. Reading the refs mid-switch would see the PREVIOUS
+    // conversation's draft and wrongly conclude the user is mid-sentence,
+    // dropping the failed message on the way back to the session it failed in.
+    if (settledConversationId !== conversationId) return;
+    useChatStore.setState({ failedSendDraft: null });
+    // The user started something new while the send was in flight — their
+    // in-progress text wins over a clobbering restore.
+    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) return;
+    setValue(failedSendDraft.text);
+    dirtyRef.current = true;
+    if (failedSendDraft.files.length > 0) {
+      const { accepted, errors } = validateAttachments(failedSendDraft.files);
+      setFiles(accepted);
+      setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
+    }
+    if (!isMobileRef.current) textareaRef.current?.focus();
+  }, [failedSendDraft, conversationId, settledConversationId]);
+
   /**
    * Execute a slash command by name + optional argument string.
    * Clears the input and error state on success (or sets an error on
@@ -4681,9 +2989,14 @@ export function Composer({
         // Confirmation is a durable `[System: model changed to X]` note the
         // server appends to the transcript (see _persist_model_change_note) —
         // not a transient composer hint. Surface only failures inline here.
+        // Native reported-model sessions additionally show the pending
+        // indicator until the harness's own report settles the ask.
+        const harness = useChatStore.getState().sessionHarness;
         void useChatStore
           .getState()
-          .setModel(clear ? null : target)
+          .setModel(clear ? null : target, {
+            expectConfirmation: harness === "claude-native" || harness === "codex-native",
+          })
           .catch((err: unknown) => {
             setCommandError(err instanceof Error ? err.message : "Failed to set model");
           });
@@ -4750,20 +3063,24 @@ export function Composer({
   };
 
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
-  // The extra rows float over the transcript instead of shrinking it: a
-  // negative top margin holds the form's margin box at its resting height, so
-  // the transcript's scroll viewport — and with it the scrollbar's travel and
-  // the turn rail's centering — stays exactly where it was. Only the taller
-  // card overlaps, and it's opaque across the message column.
-  const applyGrowth = useCallback(
-    (px: number) => {
-      const form = formRef.current;
-      if (form) form.style.marginTop = px > 0 ? `${-px}px` : "";
-      onGrowthChange?.(px);
-    },
-    [onGrowthChange],
-  );
-  useAutoGrowTextarea(textareaRef, value, 10, applyGrowth);
+  // Growth stays in the flex column so the transcript viewport ends where the
+  // composer begins instead of letting the card cover visible output.
+  // The onGrowth pin re-locks the transcript bottom in the same task as the
+  // height change, before any paint — see the prop doc on ComposerProps.
+  const onGrowthRef = useRef(onViewportShrinkPinScroll);
+  useLayoutEffect(() => {
+    onGrowthRef.current = onViewportShrinkPinScroll;
+  });
+  // The hook measures on every keystroke, but growth only changes at line
+  // wraps: skip the spacer re-measure and transcript pin while the box rests
+  // at an unchanged height.
+  const lastGrowthPxRef = useRef<number | null>(null);
+  const onGrowth = useCallback((px: number) => {
+    if (lastGrowthPxRef.current === px) return;
+    lastGrowthPxRef.current = px;
+    onGrowthRef.current?.();
+  }, []);
+  useAutoGrowTextarea(textareaRef, value, 10, onGrowth);
 
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
@@ -4772,8 +3089,6 @@ export function Composer({
   // fires. Lets onChange distinguish "user typed" (reset cursor) from
   // "recall replaced the value" (keep cursor).
   const recallingRef = useRef(false);
-
-  const [isDragActive, setIsDragActive] = useState(false);
 
   const addFiles = (incoming: File[]) => {
     // Reject unsupported types (only images, PDF, and text/code) and
@@ -4790,33 +3105,14 @@ export function Composer({
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
 
-  const handleDrop = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(false);
-    const dropped = Array.from(e.dataTransfer.files);
-    if (dropped.length > 0) addFiles(dropped);
-  };
-
-  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(true);
-  };
-
-  const handleDragEnter = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(true);
-  };
-
-  const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    // Only clear the active state when the pointer leaves the container
-    // itself, not when it moves between child elements inside it.
-    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-    setIsDragActive(false);
-  };
+  // Files dropped anywhere in the chat column attach here, not just on the
+  // composer box. Scoped to the column so the sidebar and workspace rail keep
+  // their own drag behavior; with no such ancestor the card is the target.
+  const [dropTarget, setDropTarget] = useState<HTMLElement | null>(null);
+  const bindComposerCard = useCallback((el: HTMLDivElement | null) => {
+    setDropTarget(el?.closest<HTMLElement>("[data-chat-surface]") ?? el);
+  }, []);
+  const isDragActive = useFileDropTarget(dropTarget, addFiles);
 
   const removeFile = (index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
@@ -4833,6 +3129,11 @@ export function Composer({
       hasPendingElicitation
     )
       return;
+
+    // A send is actually happening: report it for both pointer clicks (which
+    // reach here via the form submit) and Enter-key sends. Placed after the
+    // guard so guarded no-ops don't emit, matching the disabled Send button.
+    trackClick("chat.composer.send", "button");
 
     // Slash command path: the first token must read as "/name" (the shared
     // isSlashCommandText guard — file paths like "/Users/foo/bar.txt" don't
@@ -4953,10 +3254,32 @@ export function Composer({
       return;
     }
 
+    // Touch-primary newline behavior outranks autocomplete and desktop submit
+    // preferences. Leave the event untouched so the textarea inserts it.
+    if (preventsKeyboardSubmit && e.key === "Enter") {
+      return;
+    }
+
+    const shouldSubmitFromKeyboard = isComposerSendKey(
+      {
+        key: e.key,
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+        isComposing: e.nativeEvent.isComposing,
+      },
+      submitWithModEnter,
+      preventsKeyboardSubmit,
+    );
+    // Plain Enter still completes an open suggestion. In Mod+Enter mode, the
+    // explicit send chord bypasses suggestions so the modifier has one meaning.
+    const shouldPreferSendOverCompletion = submitWithModEnter && shouldSubmitFromKeyboard;
+
     // "@"-mention menu navigation (shared useMentionBrowser) — mutually
     // exclusive with the slash menu below (a mention token can't also read as a
     // "/"-command). Takes priority over history recall and submission.
-    if (handleMentionKeyDown(e)) return;
+    if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
 
     // When the suggestions menu is open, ArrowUp/Down navigate it and
     // Enter/Tab complete the highlighted item. These take priority over
@@ -4972,7 +3295,11 @@ export function Composer({
         setMenuIndex((i) => (i <= 0 ? menuMatches.length - 1 : i - 1));
         return;
       }
-      if ((e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile)) && menuIndex >= 0) {
+      if (
+        !shouldPreferSendOverCompletion &&
+        (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile)) &&
+        menuIndex >= 0
+      ) {
         e.preventDefault();
         applyMenuSelection(menuMatches[menuIndex]!);
         return;
@@ -4986,9 +3313,9 @@ export function Composer({
       }
     }
 
-    // Enter sends; Shift+Enter inserts a newline. On mobile, Enter inserts a
-    // newline (no Shift available on-screen) and Send must be tapped instead.
-    if (e.key === "Enter" && !e.shiftKey && !isMobile && !e.nativeEvent.isComposing) {
+    // Mobile Enter behavior takes precedence over this desktop preference:
+    // software-keyboard Enter inserts a newline and Send remains an explicit tap.
+    if (shouldSubmitFromKeyboard) {
       e.preventDefault();
       // The mention menu is briefly closed while its listing loads (see
       // ``mentionListingPending``); swallow Enter so the in-progress "@dir/"
@@ -5053,13 +3380,10 @@ export function Composer({
 
   return (
     <form
-      ref={formRef}
       onSubmit={handleSubmit}
       className={cn(
-        // relative: the grown card overlaps the transcript above it, and a
-        // positioned box paints over that in-flow sibling.
         "chat-composer-form relative px-4 md:px-6",
-        isTerminalFirst ? "terminal-first-composer-form pb-1.5" : "pb-3",
+        isTerminalFirst ? "pb-1.5" : "pb-3",
       )}
     >
       {/* Hidden file input for the attach button */}
@@ -5077,6 +3401,11 @@ export function Composer({
           }
         }}
       />
+      {/* Background tasks that outlive the turn show as a pill, not the
+          "Working…" shimmer. Floats as an overlay above the composer (the form
+          is `relative`) rather than a flow row, so it never clips the
+          transcript's last line. Self-gates to null otherwise. */}
+      <BackgroundTaskPill />
       {/* Queued messages — peeks above the card like the sub-agent tray.
           Lists follow-ups held while the agent is busy; drains FIFO on idle.
           Scope to this conversation so a queue held elsewhere never leaks in. */}
@@ -5104,10 +3433,13 @@ export function Composer({
           Truthy (not just non-null) so an empty label never peeks a
           nameless tray. */}
       {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
+      {/* Drop cue, spanning the chat column this composer belongs to. */}
+      {isDragActive && dropTarget ? <FileDropOverlay container={dropTarget} /> : null}
       {/* Single rounded container — textarea + action row. No focus-within
           ring; drag-over still lifts an inset ring. dark:bg-card-solid so
           upper trays (queued / sub-agent) don't ghost through glass --card. */}
       <div
+        ref={bindComposerCard}
         // Opaque card edge for transcript clearance; status shelf below is translucent.
         data-composer-card
         className={cn(
@@ -5115,16 +3447,7 @@ export function Composer({
           CHAT_COLUMN_WIDTH,
           isDragActive && "ring-2 ring-ring ring-inset",
         )}
-        onDrop={handleDrop}
-        onDragOver={handleDragOver}
-        onDragEnter={handleDragEnter}
-        onDragLeave={handleDragLeave}
       >
-        {isDragActive && (
-          <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-            <span className="text-ui font-medium text-ring">Drop files here</span>
-          </div>
-        )}
         {/* Slash-command suggestions — floats above the composer box */}
         {menuOpen && (
           <SlashCommandMenu
@@ -5174,7 +3497,7 @@ export function Composer({
             (text-transparent, caret kept visible) and render an aligned mirror
             behind it. Same box/typography so wrapping matches the textarea
             exactly. Only mounted while the draft is a command. */}
-        <div className="relative">
+        <div className="relative overflow-hidden">
           {composerIsCommand && (
             <div
               ref={backdropRef}
@@ -5202,6 +3525,10 @@ export function Composer({
               setValue(e.target.value);
               dirtyRef.current = true;
               if (commandError !== null) setCommandError(null);
+              // A rejected attachment is never added, so there's no chip to
+              // remove and nothing else would ever clear this. Left sticky it
+              // reads as a blocker on a composer the user can actually submit.
+              if (attachmentError !== null) setAttachmentError(null);
               // Recompute the active "@"-mention from the caret on every
               // keystroke (native coding-agent sessions — ``mentionEnabled``).
               setMention(
@@ -5257,17 +3584,13 @@ export function Composer({
                         ? "Waiting for agents…"
                         : isStreaming
                           ? "Send a follow-up (queued) — Esc to stop"
-                          : sandboxAsleepHint
-                            ? "Current session's host is offline. Next message will resume the sandbox host which can take minutes"
-                            : reconnectHint
-                              ? "Send a message to reconnect this session"
-                              : "Ask the agent anything…"
+                          : "Send a message…"
             }
             rows={1}
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
             data-slash-command={composerIsCommand ? "true" : undefined}
             className={cn(
-              "relative w-full resize-none bg-transparent px-4 pt-3 pb-2 text-ui outline-none placeholder:text-muted-foreground disabled:opacity-60",
+              "relative w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 [&::-webkit-scrollbar]:hidden",
               // Hand glyph painting to the overlay while a command is drafted;
               // the caret stays visible via caret-foreground.
               composerIsCommand && "text-transparent caret-foreground",
@@ -5358,6 +3681,7 @@ export function Composer({
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
+              componentId="chat.composer.attach_files"
             >
               <PaperclipIcon className="size-4" data-icon-size="16" />
               <span className="sr-only">Attach files</span>
@@ -5408,6 +3732,7 @@ export function Composer({
                     data-testid="codex-plan-mode-toggle"
                     data-active={codexPlanMode ? "true" : undefined}
                     onClick={() => void toggleCodexPlanMode()}
+                    componentId="chat.composer.toggle_plan_mode"
                   >
                     {planModeBusy ? (
                       <Loader2Icon className="size-3.5 animate-spin" />
@@ -5450,18 +3775,26 @@ export function Composer({
               />
             )}
             <div className="flex min-h-9 min-w-0 items-center rounded-lg transition-colors empty:hidden md:min-h-8 has-[button:not([aria-disabled=true])]:hover:bg-muted dark:has-[button:not([aria-disabled=true])]:hover:bg-muted/50 [&>button]:bg-transparent!">
-              <ComposerModelEffortLabel
-                showModels={showModels}
-                showEffort={showEffort}
+              <ComposerModelSource
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
                 costRoutingEligible={costRoutingEligible}
-                harnessLabel={harnessLabel}
-              />
+              >
+                <ComposerModelEffortLabel
+                  showModels={showModels}
+                  showEffort={showEffort}
+                  modelPickerKind={modelPickerKind}
+                  codexModelOptions={codexModelOptions}
+                  costRoutingEligible={costRoutingEligible}
+                  harnessLabel={harnessLabel}
+                />
+              </ComposerModelSource>
               <ComposerConfigGear
                 harnessLabel={harnessLabel}
                 showModels={showModels}
                 showEffort={showEffort}
+                showClaudePermissionMode={showClaudePermissionMode}
+                showCodexApprovalMode={showCodexApprovalMode}
                 effortLevels={effortLevels}
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
@@ -5476,36 +3809,47 @@ export function Composer({
                 openNonce={pickerOpenNonce}
               />
             </div>
-            <Button
-              type="submit"
-              size="icon"
-              componentId="chat.composer.send"
-              variant={showInterruptButton ? "destructive" : "default"}
-              // Send button fades more decisively when there's no draft —
-              // overrides the base 50% disabled-opacity so the affordance
-              // reads as "waiting for input", not "almost active".
-              className={cn(
-                "size-9 shrink-0 rounded-lg md:size-8",
-                !showInterruptButton &&
-                  "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
-              )}
-              // Interrupt stays live during a pending elicitation —
-              // cancelling the turn is the other legitimate way out.
-              disabled={
-                showInterruptButton
-                  ? isReadOnly
-                  : !hasDraft || disabled || isReadOnly || hasPendingElicitation
-              }
-              title={showInterruptButton ? "Interrupt" : "Send"}
-              aria-label={showInterruptButton ? "Interrupt" : "Send"}
-            >
-              {showInterruptButton ? (
-                <SquareIcon className="size-4 fill-current" />
-              ) : (
-                <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
-              )}
-              <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
-            </Button>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="submit"
+                    size="icon"
+                    variant={showInterruptButton ? "destructive" : "default"}
+                    // Send button fades more decisively when there's no draft —
+                    // overrides the base 50% disabled-opacity so the affordance
+                    // reads as "waiting for input", not "almost active".
+                    className={cn(
+                      "size-9 shrink-0 rounded-lg md:size-8",
+                      !showInterruptButton &&
+                        "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
+                    )}
+                    // Interrupt stays live during a pending elicitation —
+                    // cancelling the turn is the other legitimate way out.
+                    disabled={
+                      showInterruptButton
+                        ? isReadOnly
+                        : !hasDraft || disabled || isReadOnly || hasPendingElicitation
+                    }
+                    title={showInterruptButton ? "Interrupt" : undefined}
+                    aria-label={showInterruptButton ? "Interrupt" : "Send"}
+                  >
+                    {showInterruptButton ? (
+                      <SquareIcon className="size-4 fill-current" />
+                    ) : (
+                      <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
+                    )}
+                    <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
+                  </Button>
+                </TooltipTrigger>
+                {!showInterruptButton && !preventsKeyboardSubmit && (
+                  <KeyboardShortcutTooltipContent
+                    label="Send"
+                    keys={composerSendShortcutKeys(submitWithModEnter)}
+                  />
+                )}
+              </Tooltip>
+            </TooltipProvider>
           </div>
         </div>
       </div>
@@ -5518,13 +3862,7 @@ export function Composer({
   );
 }
 
-// The "Working…" shimmer tracks the server-side session status 1:1 with the
-// status badge — no optimistic bridges. There is a brief gap after a send
-// before the server confirms `running` (exactly like the badge); that's the
-// intended behavior — the indicator reflects what the agent is actually doing.
-export function computeIsWorking(sessionStatus: SessionStatus): boolean {
-  return sessionStatus === "running" || sessionStatus === "waiting";
-}
+export const Composer = memo(ComposerImpl);
 
 /**
  * Whether the main chat's display-only "Working…" indicator should light up.
@@ -5541,10 +3879,17 @@ export function computeIsWorking(sessionStatus: SessionStatus): boolean {
  *   10s cadence and reads stale-offline during the runner's connect window on a
  *   fresh session's first turn (it would otherwise hide "Working…" for seconds).
  * @param options.backgroundTaskCount - Background shells still running after
- *   the turn ended. A claude-native turn settles to ``idle`` (the PTY-activity
- *   watcher's edge) even while shells run, so the bare status alone would hide
- *   the indicator; a positive count keeps it lit so "N background tasks still running"
+ *   the turn ended. A claude-native turn settles to ``idle`` (the status file's
+ *   edge) even while shells run, so the bare status alone would hide the
+ *   indicator; a positive count keeps it lit so "N background tasks still running"
  *   stays visible.
+ * @param options.localSendInFlight - This client's own send is in flight
+ *   (``chatStore.status === "streaming"``). Lights the indicator optimistically
+ *   the moment the user presses Enter, before any server edge confirms the turn
+ *   — the sidebar row already does this (see ``isStartingUp`` in Sidebar.tsx),
+ *   so without it the two disagree for the dispatch round-trip. Distinct from
+ *   ``sessionStatus``, which mirrors the server: this one means "we asked", not
+ *   "the agent is working".
  * @returns ``true`` when the main session's own status should render Working.
  */
 export function computeShowsWorking(
@@ -5553,6 +3898,7 @@ export function computeShowsWorking(
     hasPendingElicitation: boolean;
     runnerOnline: boolean | undefined;
     backgroundTaskCount?: number;
+    localSendInFlight?: boolean;
   },
 ): boolean {
   if (options.hasPendingElicitation) return false;
@@ -5560,9 +3906,10 @@ export function computeShowsWorking(
   // A running/waiting session is proof the runner is up, so a stale
   // poll-derived ``runnerOnline === false`` must not suppress it. Only gate on
   // known-offline for the not-actively-working case (e.g. a background-shell
-  // tally on an idle session).
-  if (options.runnerOnline === false && !isWorking) return false;
-  return isWorking || (options.backgroundTaskCount ?? 0) > 0;
+  // tally on an idle session). An in-flight local send is the same kind of
+  // proof — the user just dispatched — so it also survives the gate.
+  if (options.runnerOnline === false && !isWorking && !options.localSendInFlight) return false;
+  return isWorking || options.localSendInFlight === true || (options.backgroundTaskCount ?? 0) > 0;
 }
 
 /**
@@ -5692,10 +4039,50 @@ export function isUnboundCodingFork(params: {
   return params.forkSourceId !== null && !params.workspace;
 }
 
+// Import sources whose resume reconstructs conversation context from the
+// omnigent-stored transcript, so it carries onto any chosen host. Kimi has no
+// resume path (blank context regardless of host); kiro/qwen resume only from a
+// local recording file that exists on the original machine, so a different host
+// starts blank. The in-app resume picker is restricted to this portable set.
+const HOST_PORTABLE_IMPORT_SOURCES = new Set(["claude", "codex", "pi", "opencode"]);
+
+/**
+ * Whether an unbound session may be resumed in-app via the "Resume on a machine"
+ * picker. The picker calls `launch_runner`, which requires the caller to OWN the
+ * session, and — for imported sessions — only reconstructs context for
+ * host-portable harnesses. Non-owners (who would 404) and kimi/kiro/qwen imports
+ * (which would launch with no context) are excluded so they route to the
+ * terminal reconnect path instead of a picker that fails or starts blank.
+ *
+ * @param unbound - Session has no host and no runner.
+ * @param isOwner - Caller holds owner level on the session.
+ * @param importSource - `omnigent.import.source` label, or null for non-imports
+ *   (e.g. an unbound fork, which is host-portable and owned by its creator).
+ */
+export function unboundSessionResumableInApp(params: {
+  unbound: boolean;
+  isOwner: boolean;
+  importSource: string | null | undefined;
+}): boolean {
+  if (!params.unbound || !params.isOwner) return false;
+  return params.importSource == null || HOST_PORTABLE_IMPORT_SOURCES.has(params.importSource);
+}
+
 const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+
+/** Pi thinking ladder (matches PI_EFFORTS in reasoning_effort.py; ``ultra`` aliases to ``max`` on Pi so omitted). */
+const PI_NATIVE_EFFORT_LEVELS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
 
 type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi";
 
@@ -5729,8 +4116,25 @@ export function readOnlyReasonForSessionLabels(
   return null;
 }
 
+/**
+ * A custom (label-less) session resolved to the native Codex harness.
+ *
+ * Custom YAML agents get no `omnigent.wrapper` presentation label, so the
+ * resolved harness is the capability evidence. Any wrapper label — including
+ * sub-agent variants like `codex-native-ui-subagent`, which cannot honor
+ * mid-session overrides — keeps the label authoritative and skips the
+ * fallback.
+ */
+function isLabelLessCodexNative(
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+): boolean {
+  return conv?.labels?.["omnigent.wrapper"] == null && conv?.harness === "codex-native";
+}
+
 export function effortLevelsForConv(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
   codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
 ): readonly string[] {
@@ -5739,8 +4143,12 @@ export function effortLevelsForConv(
       return CLAUDE_NATIVE_EFFORT_LEVELS;
     case "codex-native-ui":
       return codexEffortLevelsForModel(codexModelOptions, currentModel);
+    case "pi-native-ui":
+      return PI_NATIVE_EFFORT_LEVELS;
     default:
-      return EFFORT_LEVELS;
+      return isLabelLessCodexNative(conv)
+        ? codexEffortLevelsForModel(codexModelOptions, currentModel)
+        : EFFORT_LEVELS;
   }
 }
 
@@ -5752,7 +4160,8 @@ export function effortLevelsForConv(
  * `TerminalFirstContext.tsx`).
  */
 export function modelPickerKindForConv(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
 ): NativeModelPickerKind | null {
   switch (conv?.labels?.["omnigent.wrapper"]) {
     case "claude-code-native-ui":
@@ -5778,12 +4187,13 @@ export function modelPickerKindForConv(
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
-      return null;
+      return isLabelLessCodexNative(conv) ? "codex" : null;
   }
 }
 
 export function shouldShowModelPicker(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
 ): boolean {
   return modelPickerKindForConv(conv) !== null;
 }
@@ -5796,12 +4206,45 @@ export function shouldShowModelPicker(
  * :returns: True only when the session supports Web UI effort controls.
  */
 export function shouldShowEffortPicker(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
 ): boolean {
   return supportsEffortControl(conv);
 }
 
 export function shouldShowCodexPlanModeControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isCodexNativeSession(conv);
+}
+
+/**
+ * True when the claude-native permission-mode picker should be visible.
+ *
+ * Claude-native sessions only: the switch drives Claude Code's own
+ * shift+tab cycle, which no other harness has.
+ *
+ * :param conv: Session-like object carrying `labels`; a missing session
+ *     or missing labels fails closed.
+ * :returns: True only for sessions running the claude-native wrapper.
+ */
+export function shouldShowClaudePermissionModeControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isClaudeNativeSession(conv);
+}
+
+/**
+ * True when the codex-native approval-mode picker should be visible.
+ *
+ * Codex-native sessions only: the switch drives Codex's own approval/sandbox
+ * presets (the ``/permissions`` popup), which no other harness has.
+ *
+ * :param conv: Session-like object carrying `labels`; a missing session or
+ *     missing labels fails closed.
+ * :returns: True only for sessions running the codex-native wrapper.
+ */
+export function shouldShowCodexApprovalModeControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return isCodexNativeSession(conv);
@@ -5843,25 +4286,6 @@ export function shouldShowPollyCodexGoalControl(
   );
 }
 
-/**
- * Highlight a model row when ``selectedModel`` is null by matching the
- * bound spec ``llmModel`` to its tier alias (e.g.
- * ``"anthropic/claude-opus-4-8"`` matches ``"opus"``).
- *
- * Sonnet 5 is special-cased both ways: its concrete id ("...-sonnet-5")
- * would otherwise substring-match the generic "sonnet" row (since "sonnet"
- * is itself a substring), and its own opt-in row id ("sonnet_5") never
- * literally appears in a hyphenated concrete id. The default "sonnet" row
- * stays bound to the older Sonnet (4.6), which collapses to it normally.
- */
-export function isModelImplicitlySelected(modelId: string, llmModel: string | null): boolean {
-  if (!llmModel) return false;
-  const isSonnet5 = llmModel.includes("sonnet-5") || llmModel.includes("sonnet_5");
-  if (modelId === "sonnet_5") return isSonnet5;
-  if (modelId === "sonnet" && isSonnet5) return false;
-  return llmModel === modelId || llmModel.endsWith(`/${modelId}`) || llmModel.includes(modelId);
-}
-
 /** Title-case an effort level for the status label (``"high"`` → ``"High"``). */
 function formatEffortLabel(effort: string): string {
   return effort.charAt(0).toUpperCase() + effort.slice(1);
@@ -5891,6 +4315,8 @@ function SessionConfigModal({
   harnessLabel,
   showModels,
   showEffort,
+  showClaudePermissionMode = false,
+  showCodexApprovalMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -5902,13 +4328,17 @@ function SessionConfigModal({
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
+  showClaudePermissionMode?: boolean;
+  showCodexApprovalMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
   subagentRoutingEligible: boolean;
 }) {
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedEffort = useSessionEffort();
+  const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
+  const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const conversationId = useChatStore((s) => s.conversationId);
@@ -5924,11 +4354,10 @@ function SessionConfigModal({
   // model shows without an explicit pick), else the catalog default. Falls back
   // to the "Default" sentinel when nothing resolves.
   const implicitModelId =
-    pickerSelectedModel === null
-      ? ((usesServerModelOptions
-          ? (findNativeModelOption(codexModelOptions, llmModel)?.id ??
-            codexModelOptions.find((option) => option.isDefault)?.id)
-          : modelOptions.find((m) => isModelImplicitlySelected(m.id, llmModel))?.id) ?? null)
+    pickerSelectedModel === null && usesServerModelOptions
+      ? (findNativeModelOption(codexModelOptions, llmModel)?.id ??
+        codexModelOptions.find((option) => option.isDefault)?.id ??
+        null)
       : null;
   const resolvedModelId = pickerSelectedModel ?? implicitModelId;
 
@@ -5939,6 +4368,13 @@ function SessionConfigModal({
   const [draftModelId, setDraftModelId] = useState<string | null>(resolvedModelId);
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
+  const [draftPermissionMode, setDraftPermissionMode] = useState(claudePermissionMode);
+  const [draftApprovalMode, setDraftApprovalMode] = useState(codexApprovalMode);
+  // Unlike the other drafts (snapshot-on-open), the approval picker must track
+  // live store changes while the modal stays open — a /permissions change in
+  // the TUI republishes the mode via SSE. This flags a user pick so the resync
+  // effect below stops mirroring once they've started editing.
+  const approvalTouchedRef = useRef(false);
   // The sub-agent row is stored as a PICK, not a pre-seeded draft:
   // `undefined` means "untouched", so the row mirrors the live stored value for
   // as long as the user hasn't chosen anything. A draft seeded once per open
@@ -5953,6 +4389,9 @@ function SessionConfigModal({
     setDraftModelId(resolvedModelId);
     setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
+    setDraftPermissionMode(claudePermissionMode);
+    setDraftApprovalMode(codexApprovalMode);
+    approvalTouchedRef.current = false;
     setPickedSubagentRouting(undefined);
     // Nothing pushes a routing-switch change to the client (no SSE event, and
     // the session query never goes stale), so re-read them here — otherwise the
@@ -5963,9 +4402,42 @@ function SessionConfigModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, conversationId]);
 
+  // Follow live approval-mode changes while the modal is open (a TUI
+  // /permissions switch republishes via SSE), until the user picks here.
+  useEffect(() => {
+    if (open && !approvalTouchedRef.current) setDraftApprovalMode(codexApprovalMode);
+  }, [open, codexApprovalMode]);
+
   // The Select value: the router sentinel when routing is drafted on, else the
   // drafted model, else the "Default" sentinel (no override).
   const modelValue = draftRoutingOn ? MODEL_SELECT_SMART : (draftModelId ?? MODEL_SELECT_DEFAULT);
+
+  // Codex advertises a per-model effort ladder, so the dropdown must follow the
+  // DRAFTED model, not the committed one the parent computed — else picking
+  // Luna still lists Sol's "ultra". "Default" (null) resolves to the catalog
+  // default; non-codex harnesses use a model-independent ladder, so keep the
+  // parent's list.
+  const draftEffortLevels = useMemo(() => {
+    if (modelPickerKind !== "codex") return effortLevels;
+    const modelForEffort =
+      draftModelId ?? codexModelOptions.find((o) => o.isDefault)?.id ?? llmModel;
+    const levels = codexEffortLevelsForModel(codexModelOptions, modelForEffort);
+    return levels.length > 0 ? levels : effortLevels;
+  }, [modelPickerKind, codexModelOptions, draftModelId, llmModel, effortLevels]);
+
+  // Drop a picked level the newly-drafted model doesn't offer (Sol's "ultra"
+  // when switching to Luna) so no stale rung shows and Save never submits a
+  // level the model rejects.
+  const clampDraftEffortToModel = (modelId: string | null) => {
+    if (modelPickerKind !== "codex") return;
+    setDraftEffort((prev) => {
+      if (prev === null) return null;
+      const modelForEffort = modelId ?? codexModelOptions.find((o) => o.isDefault)?.id ?? llmModel;
+      return codexEffortLevelsForModel(codexModelOptions, modelForEffort).includes(prev)
+        ? prev
+        : null;
+    });
+  };
 
   const onModelChange = (value: string) => {
     if (value === MODEL_SELECT_SMART) {
@@ -5977,10 +4449,12 @@ function SessionConfigModal({
     } else if (value === MODEL_SELECT_DEFAULT) {
       setDraftModelId(null);
       setDraftRoutingOn(false);
+      clampDraftEffortToModel(null);
     } else {
       // Pinning a model turns routing off (mutually exclusive).
       setDraftModelId(value);
       setDraftRoutingOn(false);
+      clampDraftEffortToModel(value);
     }
   };
 
@@ -6017,13 +4491,27 @@ function SessionConfigModal({
           // routing off just clears via setModel(null) below.
           const modelChanged = draftModelId !== resolvedModelId;
           const rePinAfterRouting = liveRoutingOn && showModels;
-          if (rePinAfterRouting || modelChanged) await store.setModel(draftModelId);
+          if (rePinAfterRouting || modelChanged)
+            await store.setModel(draftModelId, {
+              // Reported-model sessions confirm through the harness's own
+              // report — mark the ask pending until it (or the not-applied
+              // error) settles.
+              expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
+            });
           if (costRoutingEligible && liveRoutingOn) await store.setCostControlMode("off");
         }
         // Skip effort while routing is on: the router picks it per turn, and a
         // stray ``/effort`` injection would just be noise.
         if (showEffort && !draftRoutingOn && draftEffort !== selectedEffort)
           await store.setEffort(draftEffort);
+        // Same pane as /model + /effort, so this must stay in the awaited
+        // sequence rather than firing concurrently.
+        if (showClaudePermissionMode && draftPermissionMode !== claudePermissionMode)
+          await store.setClaudePermissionMode(draftPermissionMode);
+        // Codex approval switch drives Codex's own /permissions popup on the
+        // runner — same awaited sequence so it can't race the others.
+        if (showCodexApprovalMode && draftApprovalMode !== codexApprovalMode)
+          await store.setCodexApprovalMode(draftApprovalMode);
         // Sub-agent routing is independent of this session's own model — a
         // plain PATCH with no slash-command injection, so ordering is free.
         // Only an explicit pick is written, and only when it still differs from
@@ -6046,7 +4534,7 @@ function SessionConfigModal({
 
   const modelSelectOptions = useMemo(() => {
     const catalog = usesServerModelOptions
-      ? modelOptions.map((m) => ({ id: m.id, label: m.displayName ?? m.id }))
+      ? modelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) }))
       : modelOptions.map((m) => ({ id: m.id, label: m.label ?? m.id }));
     // Smart Routing pins the router's fully-qualified pick
     // (``databricks-claude-opus-4-8``), which the harness catalog carries only
@@ -6081,7 +4569,16 @@ function SessionConfigModal({
                 offerSmartRouting={costRoutingEligible}
                 testId="composer-config-model"
                 models={modelSelectOptions}
+                // Claude's and Codex's Default resolves to a model the
+                // spellings don't make obvious, so name it here exactly as
+                // the landing dialog does — one shared labeling.
+                defaultLabel={
+                  modelPickerKind === "codex" || modelPickerKind === "claude"
+                    ? defaultModelLabel(modelOptions)
+                    : undefined
+                }
                 activeModelId={draftModelId}
+                componentId="chat.composer.model"
               />
             </ConfigRow>
           )}
@@ -6094,6 +4591,8 @@ function SessionConfigModal({
                 value={draftRoutingOn ? "" : (draftEffort ?? EFFORT_SELECT_NONE)}
                 onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? null : v)}
                 disabled={draftRoutingOn}
+                componentId="chat.composer.effort"
+                valueHasNoPii
               >
                 <SelectTrigger
                   className="w-full"
@@ -6108,7 +4607,7 @@ function SessionConfigModal({
                   className="w-(--radix-select-trigger-width)"
                 >
                   <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                  {effortLevels.map((level) => (
+                  {draftEffortLevels.map((level) => (
                     <SelectItem
                       key={level}
                       value={level}
@@ -6118,6 +4617,77 @@ function SessionConfigModal({
                       className={modelPickerKind === "codex" ? undefined : "capitalize"}
                     >
                       {formatStatusEffortLabel(level, modelPickerKind === "codex") ?? level}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
+          {/* Hidden when the mode is unknown — Claude only renders its mode
+              footer in some pane states, and a guess would misreport it. */}
+          {showClaudePermissionMode && claudePermissionMode !== "" && (
+            <ConfigRow label="Permissions" description="How much Claude asks before acting">
+              <Select
+                value={draftPermissionMode}
+                onValueChange={setDraftPermissionMode}
+                componentId="chat.composer.permission_mode"
+                valueHasNoPii
+              >
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-permission-mode"
+                  aria-label="Permission mode"
+                >
+                  <SelectValue>{claudePermissionModeLabel(draftPermissionMode)}</SelectValue>
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  {CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES.map((mode) => (
+                    <SelectItem
+                      key={mode.value}
+                      value={mode.value}
+                      data-permission-mode={mode.value}
+                    >
+                      <span className="flex flex-col items-start">
+                        <span>{mode.label}</span>
+                        <span className="text-muted-foreground text-xs">{mode.description}</span>
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
+          {showCodexApprovalMode && (
+            <ConfigRow label="Approvals" description="How much Codex asks before acting">
+              {/* Drives Codex's own /permissions popup by keystroke injection,
+                  so the options mirror it exactly. An empty draft (no switch
+                  seen yet) reads as the placeholder rather than a guessed
+                  default. */}
+              <Select
+                value={draftApprovalMode}
+                onValueChange={(v) => {
+                  approvalTouchedRef.current = true;
+                  setDraftApprovalMode(v);
+                }}
+                componentId="chat.composer.codex_approval_mode"
+                valueHasNoPii
+              >
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-approval-mode"
+                  aria-label="Approval mode"
+                >
+                  <SelectValue placeholder="Set in Codex">
+                    {codexApprovalModeLabel(draftApprovalMode) || undefined}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  {CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS.map((mode) => (
+                    <SelectItem key={mode.value} value={mode.value} data-approval-mode={mode.value}>
+                      <span className="flex flex-col items-start">
+                        <span>{mode.label}</span>
+                        <span className="text-muted-foreground text-xs">{mode.description}</span>
+                      </span>
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -6137,6 +4707,8 @@ function SessionConfigModal({
               <Select
                 value={subagentRoutingValue}
                 onValueChange={(v) => setPickedSubagentRouting(v === "on" ? "on" : "off")}
+                componentId="chat.composer.subagent_routing"
+                valueHasNoPii
               >
                 <SelectTrigger
                   className="w-full"
@@ -6190,6 +4762,8 @@ function ComposerConfigGear({
   harnessLabel,
   showModels,
   showEffort,
+  showClaudePermissionMode = false,
+  showCodexApprovalMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -6201,6 +4775,8 @@ function ComposerConfigGear({
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
+  showClaudePermissionMode?: boolean;
+  showCodexApprovalMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
@@ -6229,7 +4805,15 @@ function ComposerConfigGear({
     costRoutingEligible,
   });
 
-  if (!showModels && !showEffort && !costRoutingEligible && !subagentRoutingEligible) return null;
+  if (
+    !showModels &&
+    !showEffort &&
+    !costRoutingEligible &&
+    !subagentRoutingEligible &&
+    !showClaudePermissionMode &&
+    !showCodexApprovalMode
+  )
+    return null;
 
   return (
     <>
@@ -6266,11 +4850,11 @@ function ComposerConfigGear({
           {summary.length > 0 && (
             <TooltipContent
               side="top"
-              className="flex-col items-start gap-0.5 px-3 py-2"
+              className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
               data-testid="composer-config-gear-tooltip"
             >
               {summary.map((row) => (
-                <span key={row.label} className="text-muted-foreground">
+                <span key={row.label} className="max-w-72 truncate text-muted-foreground">
                   {row.label}:{" "}
                   <span className="text-background dark:text-popover-foreground">{row.value}</span>
                 </span>
@@ -6285,6 +4869,8 @@ function ComposerConfigGear({
         harnessLabel={harnessLabel}
         showModels={showModels}
         showEffort={showEffort}
+        showClaudePermissionMode={showClaudePermissionMode}
+        showCodexApprovalMode={showCodexApprovalMode}
         effortLevels={effortLevels}
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
@@ -6298,7 +4884,7 @@ function ComposerConfigGear({
 /**
  * Label/value rows summarizing the session's live run-config, for the gear
  * icon's hover tooltip. Mirrors the new-session summary but with in-session
- * values and no Permissions row (permission mode is launch-time only).
+ * values. The Permissions row lives in the modal itself, not this summary.
  */
 function useSessionConfigSummary({
   harnessLabel,
@@ -6315,9 +4901,12 @@ function useSessionConfigSummary({
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
 }): { label: string; value: string }[] {
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
-  const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
+  const { effectiveModel, modelLabel } = useResolvedComposerModel(
+    modelPickerKind,
+    codexModelOptions,
+  );
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
 
   const rows: { label: string; value: string }[] = [];
@@ -6334,7 +4923,28 @@ function useSessionConfigSummary({
     const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
   }
+  if (!routingOn) {
+    const source =
+      findNativeModelOption(codexModelOptions, effectiveModel)?.source ??
+      codexModelOptions.find((option) => option.source)?.source;
+    rows.push(...modelConfigurationSourceRows(source));
+  }
   return rows;
+}
+
+/**
+ * The effort this conversation is actually at.
+ *
+ * `sessionReasoningEffort` is conversation-scoped, so two live conversations at
+ * different efforts each read their own; `selectedEffort` is the single
+ * app-global sticky pick, used only as the pre-hydration fallback. Reading the
+ * sticky pick alone would show a warm-switched conversation the last effort
+ * picked anywhere.
+ */
+function useSessionEffort(): string | null {
+  const sessionReasoningEffort = useChatStore((s) => s.sessionReasoningEffort);
+  const stickyEffort = useChatStore((s) => s.selectedEffort);
+  return sessionReasoningEffort ?? stickyEffort;
 }
 
 /**
@@ -6350,7 +4960,6 @@ function useResolvedComposerModel(
   modelPickerKind: NativeModelPickerKind | null,
   codexModelOptions: readonly NativeModelOption[],
 ) {
-  const selectedModel = useChatStore((s) => s.selectedModel);
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
   const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
@@ -6365,74 +4974,58 @@ function useResolvedComposerModel(
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode";
-  const modelOptions: readonly { id: string; label?: string; displayName?: string }[] =
-    usesServerModelOptions ? codexModelOptions : [];
+  const modelOptions: readonly {
+    id: string;
+    label?: string;
+    displayName?: string;
+    isDefault?: boolean;
+  }[] = usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
 
-  // qwen/goose/cursor/pi/opencode native wrappers pick their model inside
-  // the vendor TUI, so the bound `llmModel` is an unused default — don't
-  // surface it as if it were live; claude-/codex-native and SDK agents
-  // resolve to a real model.
-  // cursor-native is a vendor-owns-model wrapper, but unlike qwen/goose/pi/
-  // opencode it mirrors its live TUI model into the session override
-  // (`sessionModelOverride` / `model_override`), kept current both by the
-  // forwarder's terminal→web mirror and by web-side picks. Surface *that* as
-  // the live model — never the cross-session sticky `selectedModel` (a pick
-  // carried over from some other session) nor the meaningless `llmModel`
-  // default. The other vendor-owns wrappers have no Omnigent-visible model and
-  // stay null.
-  // kiro persists the pick as ``model_override`` (applied via ``--model`` at
-  // launch) and, mid-session, the runner types ``/model <id>`` into the live TUI.
-  // There is no terminal→web mirror, so the picker reflects the web-side
-  // ``sessionModelOverride`` (which stays correct since a web pick sets it), like
-  // cursor/opencode surface theirs.
-  // pi mirrors both ways into ``model_override`` (a web pick persists it before
-  // the live ``setModel``; a TUI ``/model`` pick posts external_model_change),
-  // so like cursor/kiro/opencode the live model is the session override, never
-  // the cross-session sticky ``selectedModel``.
-  // The sticky is this session's model only when the session itself advertises
-  // it. `switchTo` clears the session-scoped fields but deliberately keeps
-  // `selectedModel`, so until the incoming snapshot lands the catalog is empty
-  // and the sticky still holds the OUTGOING session's pick — surfacing it paints
-  // e.g. a Codex gpt-5.5 on a Claude session for the whole bind round trip.
-  // Gating on the session's own catalog mirrors the compatibility rule bindStream
-  // applies a moment later, so the label never advertises a model this session
-  // would reject. Post-bind this is a no-op: the store only ever leaves a
-  // catalog-compatible sticky (or the override) in `selectedModel`.
-  const sessionStickyModel =
-    findNativeModelOption(codexModelOptions, selectedModel) !== null ? selectedModel : null;
-  const pickerSelectedModel =
-    modelPickerKind === "cursor" ||
-    modelPickerKind === "kiro" ||
-    modelPickerKind === "opencode" ||
-    modelPickerKind === "pi"
-      ? sessionModelOverride
-      : (sessionModelOverride ?? sessionStickyModel);
-  // SDK/bundle agents (no native picker) never have the cross-session sticky
-  // applied to them, so their live model is the session's own — the applied
-  // override or the bound default — never `selectedModel` (a pick carried over
-  // from an unrelated session, e.g. a gpt-5.5 left from a Codex session showing
-  // on a Claude-SDK agent like Polly). claude-/codex-native keep the sticky —
-  // there it IS the applied model — but only once this session's catalog vouches
-  // for it (see `sessionStickyModel`).
-  const nonNativeModel =
-    modelPickerKind === null
-      ? (sessionModelOverride ?? llmModel)
-      : (sessionModelOverride ?? sessionStickyModel ?? llmModel);
+  // The harness's own report is the display authority for claude-/codex-
+  // native sessions: `llmModel` carries the verbatim reported model (the
+  // launch's own report, or an in-pane switch), and the chip, the gear
+  // highlight, and the hover summary all resolve from it alone. The user's
+  // request (`sessionModelOverride`) and the cross-session sticky
+  // (`selectedModel`) are inputs, never display state — rendering a request
+  // as if it were truth is exactly how a record/pane divergence hides.
+  const isReportedModelPicker = modelPickerKind === "claude" || modelPickerKind === "codex";
+  // The row the reported model maps to: its catalog row when one matches
+  // exactly (by id or wire model), else the raw reported value itself — the
+  // modal appends that as its own honest row rather than relabeling it onto
+  // a same-family row of a different generation.
+  const reportedRowId =
+    isReportedModelPicker && llmModel
+      ? (findNativeModelOption(codexModelOptions, llmModel)?.id ?? llmModel)
+      : null;
+  // Before the harness has reported anything (a routed session whose pane
+  // has not started, a reload of one), the gear seeds from the session's
+  // own REQUEST so the pick the user (or the router) made is what the row
+  // offers to edit — a request is never display truth, but it is the draft.
+  // The moment a report exists it wins, so a request the pane never took
+  // can't masquerade as the active model.
+  const requestedRowId =
+    isReportedModelPicker && sessionModelOverride
+      ? (findNativeModelOption(codexModelOptions, sessionModelOverride)?.id ?? sessionModelOverride)
+      : null;
+  // cursor mirrors its live TUI model into ``model_override``; kiro sets it
+  // on a web pick (which also drives a live ``/model`` switch); opencode/pi
+  // mirror both ways into ``model_override``. Those wrappers keep their
+  // override-derived surface until they adopt reported-model semantics.
+  // SDK/bundle agents (no native picker) resolve the session override or the
+  // bound default — never the cross-session sticky.
+  const pickerSelectedModel = isReportedModelPicker
+    ? (reportedRowId ?? requestedRowId)
+    : sessionModelOverride;
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
-      ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it
-        // on a web pick (which also drives a live ``/model`` switch). Either way
-        // the Omnigent-visible model is ``model_override``.
-        sessionModelOverride
+      ? sessionModelOverride
       : modelPickerKind === "opencode" || modelPickerKind === "pi"
-        ? // opencode/pi mirror their live TUI model into ``model_override``
-          // (set on a web pick, updated by the extension's model_select
-          // handler on a TUI switch); show that, falling back to the
-          // launch-resolved model before any switch.
-          (sessionModelOverride ?? llmModel)
+        ? (sessionModelOverride ?? llmModel)
         : null
-    : nonNativeModel;
+    : isReportedModelPicker
+      ? llmModel
+      : (sessionModelOverride ?? llmModel);
   const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
   return {
     llmModel,
@@ -6443,6 +5036,59 @@ function useResolvedComposerModel(
     effectiveModel,
     modelLabel,
   };
+}
+
+/** Compact, inspectable provenance beside the composer's model label. */
+function ComposerModelSource({
+  modelPickerKind,
+  codexModelOptions,
+  costRoutingEligible,
+  children,
+}: {
+  modelPickerKind: NativeModelPickerKind | null;
+  codexModelOptions: readonly NativeModelOption[];
+  costRoutingEligible: boolean;
+  children: ReactNode;
+}) {
+  const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const { effectiveModel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
+  const source =
+    findNativeModelOption(codexModelOptions, effectiveModel)?.source ??
+    codexModelOptions.find((option) => option.source)?.source;
+  const routingOn = costRoutingEligible && costControlModeOverride === "on";
+  if (routingOn || !source) return children;
+
+  const rows = modelConfigurationSourceRows(source);
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span
+            tabIndex={0}
+            data-testid="composer-model-source"
+            className="min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {children}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent
+          side="top"
+          className="flex max-w-80 flex-col items-start gap-1 px-3 py-2"
+          data-testid="composer-model-source-tooltip"
+        >
+          <span className="font-medium text-background dark:text-popover-foreground">
+            Model configuration
+          </span>
+          {rows.map((row) => (
+            <span key={row.label} className="max-w-72 truncate text-muted-foreground">
+              {row.label}:{" "}
+              <span className="text-background dark:text-popover-foreground">{row.value}</span>
+            </span>
+          ))}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
 }
 
 /**
@@ -6475,10 +5121,22 @@ function ComposerModelEffortLabel({
   costRoutingEligible: boolean;
   harnessLabel: string | null;
 }) {
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const pendingModelChange = useChatStore((s) => s.pendingModelChange);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
+  // An asked-but-unconfirmed switch on a reported-model session: the chip
+  // keeps the harness's model; this spinner is the honest "asked, not yet
+  // true" marker until the report (or the not-applied error) settles it.
+  const modelPending =
+    pendingModelChange !== null && (modelPickerKind === "claude" || modelPickerKind === "codex") ? (
+      <Loader2Icon
+        data-testid="composer-model-pending"
+        aria-label="Model change pending"
+        className="ml-1 inline size-3 shrink-0 animate-spin text-muted-foreground"
+      />
+    ) : null;
   // Routing picks the model + effort per turn, so the label reads
   // "Smart Routing" with no pinned model/effort — matching the tooltip.
   if (routingOn) {
@@ -6524,6 +5182,7 @@ function ComposerModelEffortLabel({
       {model && <span className="text-foreground">{model}</span>}
       {model && effortLabel && " "}
       {effortLabel && <span className="text-muted-foreground">{effortLabel}</span>}
+      {modelPending}
     </span>
   );
 }

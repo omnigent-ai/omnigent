@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import time
 import uuid
@@ -263,6 +264,103 @@ def test_host_connect_and_list(
     resp = http_client.get(f"/v1/hosts/{host_id}")
     if resp.status_code == 200:
         assert resp.json()["status"] == "offline", "Host should be offline after daemon is killed"
+
+
+def _wait_for_host_online_by_name(
+    client: httpx.Client,
+    host_name: str,
+    timeout: float = 30.0,
+) -> dict[str, object]:
+    """Poll GET /v1/hosts until a host with *host_name* is online.
+
+    Used when the host_id isn't known in advance (the daemon generates it),
+    so the test matches on the seeded name instead.
+
+    :param client: HTTP client pointed at the server.
+    :param host_name: Host name to wait for.
+    :param timeout: Max seconds to wait.
+    :returns: The matching host dict from the list response.
+    :raises AssertionError: If no such host appears online.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            resp = client.get("/v1/hosts")
+            if resp.status_code == 200:
+                for host in resp.json().get("hosts", []):
+                    if host["name"] == host_name and host["status"] == "online":
+                        return host
+        except httpx.ConnectError:
+            # The API may be temporarily unreachable during startup; retry until timeout.
+            pass
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"Host named {host_name!r} did not appear online within {timeout}s")
+
+
+def test_host_name_only_config_generates_host_id(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    mock_llm_server_url: str,
+) -> None:
+    """
+    A config.yaml that names the host but omits host_id must register
+    end-to-end under the provided name with a freshly generated id.
+
+    Regression for the name-only path: the daemon used to overwrite the
+    chosen name with the machine hostname and mint a fresh id, so the
+    host showed up under the wrong name. It should now keep the name and
+    generate + persist only the missing host_id.
+    """
+    omni_dir = tmp_path / ".omnigent"
+    omni_dir.mkdir(parents=True, exist_ok=True)
+    config_path = omni_dir / "config.yaml"
+    # Unique name so the (owner, name) host row doesn't collide with the
+    # session-scoped server's other host rows.
+    host_name = f"e2e-nameonly-{uuid.uuid4().hex[:12]}"
+    config_path.write_text(
+        yaml.safe_dump({"host": {"name": host_name}}, default_flow_style=False, sort_keys=True)
+    )
+
+    daemon_log = tmp_path / "host-daemon.log"
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
+        "OPENAI_API_KEY": "mock-key",
+        PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
+    }
+    with open(daemon_log, "w") as log_fh:
+        proc = subprocess.Popen(
+            [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", live_server],
+            env=apply_runner_env(env),
+            cwd=compat_runner_cwd(),
+            stdout=subprocess.DEVNULL,
+            stderr=log_fh,
+        )
+    try:
+        host = _wait_for_host_online_by_name(http_client, host_name, timeout=30.0)
+        # The provided name survived — not replaced by the machine hostname.
+        assert host["name"] == host_name
+        assert host["name"] != socket.gethostname()
+
+        # The daemon generated + persisted a bare 32-char hex host_id.
+        cfg = yaml.safe_load(config_path.read_text())
+        persisted_id = cfg["host"]["host_id"]
+        assert isinstance(persisted_id, str) and len(persisted_id) == 32
+        int(persisted_id, 16)  # raises ValueError if not valid hex
+        # The name is kept in the persisted config too.
+        assert cfg["host"]["name"] == host_name
+
+        # The registered host_id is exactly what was written to config.yaml.
+        assert host["host_id"] == persisted_id
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 
 def test_host_launch_runner_and_session_round_trip(
@@ -1004,3 +1102,141 @@ def test_host_native_session_round_trips_after_runner_death(
         except subprocess.TimeoutExpired:
             host_proc.kill()
             host_proc.wait()
+
+
+def test_host_retry_session_recovers_killed_runner(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    mock_llm_server_url: str,
+) -> None:
+    """``retry_session`` relaunches a host-bound runner without a user message.
+
+    The customer scenario: a host restart (or a killed runner) drops the runner
+    tunnel while the host stays up. The web UI reads that as ``runner_asleep``
+    and offers an Attach button that POSTs a ``retry_session`` event — no chat
+    message. This exercises the server primitive that button calls end to end
+    against a REAL host + server: with the runner dead and the host live,
+    ``retry_session`` relaunches the runner via the host
+    (``recovery: "runner_relaunched"``), and the recovered runner is usable.
+    """
+    marker_pre = "RETRY_PRE_KILL"
+    marker_post = "RETRY_POST_RECOVER"
+    configure_mock_llm(mock_llm_server_url, [{"text": marker_pre}, {"text": marker_post}])
+
+    daemon = _spawn_host_daemon(
+        tmp_path=tmp_path,
+        live_server=live_server,
+        mock_llm_server_url=mock_llm_server_url,
+    )
+    host_proc = daemon.proc
+    host_id = daemon.host_id
+
+    try:
+        _wait_for_host_online(http_client, host_id, timeout=30.0)
+
+        agent_name = upload_agent(http_client, _write_smoke_agent_yaml(tmp_path))
+        agent_id = lookup_agent_id(http_client, agent_name)
+        session_resp = http_client.post("/v1/sessions", json={"agent_id": agent_id})
+        session_resp.raise_for_status()
+        session_id = session_resp.json()["id"]
+
+        launch_resp = http_client.post(
+            f"/v1/hosts/{host_id}/runners",
+            json={"session_id": session_id, "workspace": str(tmp_path)},
+            timeout=60.0,
+        )
+        assert launch_resp.status_code == 200
+        runner_id = launch_resp.json()["runner_id"]
+
+        deadline = time.monotonic() + 30.0
+        runner_online = False
+        while time.monotonic() < deadline:
+            sr = http_client.get(f"/v1/runners/{runner_id}/status")
+            if sr.status_code == 200 and sr.json().get("online"):
+                runner_online = True
+                break
+            time.sleep(0.5)
+        assert runner_online, f"Runner {runner_id} never came online"
+        http_client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"runner_id": runner_id},
+        ).raise_for_status()
+
+        # Baseline: the host-bound session round-trips before the runner dies.
+        rid_pre = send_user_message_to_session(
+            http_client,
+            session_id=session_id,
+            content=f"Reply with exactly {marker_pre} and nothing else.",
+        )
+        body_pre = poll_session_until_terminal(
+            http_client,
+            session_id=session_id,
+            response_id=rid_pre,
+            timeout=120,
+        )
+        assert body_pre["status"] == "completed"
+        assert marker_pre in final_assistant_text(body_pre)
+
+        # Kill the RUNNER, not the host: the host stays online, so the session
+        # is now runner-down/host-up — the state the web's Attach button targets.
+        runner_pid = _runner_pid_from_daemon_log(daemon.daemon_log)
+        assert runner_pid is not None, (
+            "could not find the launched runner pid in the daemon log:\n"
+            f"{daemon.daemon_log.read_text()}"
+        )
+        os.kill(runner_pid, signal.SIGKILL)
+
+        # Wait until the server observes the runner tunnel gone, so retry_session
+        # exercises the relaunch path rather than the already-connected fast path.
+        deadline = time.monotonic() + 15.0
+        runner_offline = False
+        while time.monotonic() < deadline:
+            sr = http_client.get(f"/v1/runners/{runner_id}/status")
+            if sr.status_code == 200 and not sr.json().get("online"):
+                runner_offline = True
+                break
+            time.sleep(0.5)
+        assert runner_offline, f"Runner {runner_id} still online after SIGKILL"
+
+        # Precondition for host-relaunch: the host itself is still online.
+        hosts = http_client.get("/v1/hosts").json().get("hosts", [])
+        assert any(h["host_id"] == host_id and h["status"] == "online" for h in hosts), (
+            "host should stay online when only the runner is killed"
+        )
+
+        # retry_session: relaunch the runner via the host with NO user message.
+        retry_resp = http_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "retry_session", "data": {}},
+            timeout=120.0,
+        )
+        assert retry_resp.status_code in (200, 202), retry_resp.text
+        recovery = retry_resp.json()
+        assert recovery.get("recovered") is True, recovery
+        assert recovery.get("recovery") == "runner_relaunched", recovery
+
+        # The relaunched runner is usable: a follow-up turn round-trips without
+        # a manual reconnect, proving recovery attached the forwarder + runner.
+        rid_post = send_user_message_to_session(
+            http_client,
+            session_id=session_id,
+            content=f"Reply with exactly {marker_post} and nothing else.",
+        )
+        body_post = poll_session_until_terminal(
+            http_client,
+            session_id=session_id,
+            response_id=rid_post,
+            timeout=120,
+        )
+        assert body_post["status"] == "completed"
+        assert marker_post in final_assistant_text(body_post)
+
+    finally:
+        if host_proc.poll() is None:
+            host_proc.send_signal(signal.SIGTERM)
+            try:
+                host_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                host_proc.kill()
+                host_proc.wait()

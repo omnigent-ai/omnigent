@@ -48,7 +48,7 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright
 
-_COMPOSER_PLACEHOLDER = "Ask the agent anything…"
+_COMPOSER_PLACEHOLDER = "Send a message…"
 # Unique sentinels so each POST body is unambiguously identifiable.
 _MSG1 = "sentinel-xsess-msg1-3a7f first message into B"
 _MSG2 = "sentinel-xsess-msg2-9c2e second message into B"

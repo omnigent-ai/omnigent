@@ -28,7 +28,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import configure_mock_llm
+from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, seed_committed_turn
 
 # Unique marker so the copied-transcript assertion can't match
 # UI chrome or another test's message.
@@ -75,7 +75,7 @@ def test_clone_session_copies_transcript_and_navigates(
 
     # Seed the transcript with a uniquely-marked user turn and wait for
     # the assistant reply so the fork has BOTH roles to copy.
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill(f"Reply with one short word. Marker: {_MARKER}")
     page.get_by_role("button", name="Send", exact=True).click()
@@ -178,7 +178,7 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
 
     # One marked turn so the fork has content and an assistant bubble to
     # anchor the "Fork from here" action.
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill(f"Reply with one short word. Marker: {_XFAM_MARKER}")
     page.get_by_role("button", name="Send", exact=True).click()
@@ -196,6 +196,17 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
     option = page.get_by_test_id(f"fork-session-agent-option-{claude_native['id']}")
     expect(option).to_be_visible()
     option.click()
+
+    # Switching to claude-native reveals the run-config section (Model /
+    # Effort / Permissions). Pick a non-default permission mode so the fork
+    # carries the selector's ``--permission-mode`` launch args — the picker is
+    # seeded to the target harness's defaults on a cross-harness switch, so
+    # this is a deliberate change the fork body must transport.
+    perm = page.get_by_test_id("fork-session-config-permission")
+    expect(perm).to_be_visible()
+    perm.click()
+    page.get_by_role("option", name="Plan", exact=True).click()
+
     page.get_by_test_id("fork-session-submit").click()
 
     # The fork succeeds and navigates to a NEW session id.
@@ -222,6 +233,12 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
     )
     assert labels.get("omnigent.wrapper") == "claude-code-native-ui", (
         f"fork must present as the TARGET (claude-native) harness, got {labels!r}"
+    )
+    # The run-config section's permission pick rode the fork body as launch
+    # args and persisted on the clone (the whole point of the picker).
+    assert snap.json().get("terminal_launch_args") == ["--permission-mode", "plan"], (
+        f"fork must carry the picked permission mode as launch args, "
+        f"got {snap.json().get('terminal_launch_args')!r}"
     )
 
 
@@ -299,7 +316,7 @@ def test_clone_worktree_source_prefills_repo_and_validates_directory(
         if route.request.method != "GET":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         body = response.json()
         body["host_id"] = _WT_HOST_ID
         body["workspace"] = _WT_DIR
@@ -360,7 +377,7 @@ def test_clone_worktree_source_prefills_repo_and_validates_directory(
 
     # One marked turn so the fork has content and an assistant bubble to
     # anchor the "Fork from here" action.
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill(f"Reply with one short word. Marker: {_WT_MARKER}")
     page.get_by_role("button", name="Send", exact=True).click()
@@ -415,3 +432,86 @@ def test_clone_worktree_source_prefills_repo_and_validates_directory(
     assert "git" not in launch, (
         f"untouched worktree prefill must bind the existing worktree without git options: {launch}"
     )
+
+
+def test_clone_submit_spins_while_the_fork_is_in_flight(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The Clone button shows a spinner (not just a fade) until the fork returns.
+
+    A fork waits on the server round trip, so a button that only greys out
+    reads as a hang and users re-click or close the dialog. Guards the
+    in-flight affordance end-to-end: the real dialog, the real fetch, and
+    the real ``Button`` loading overlay.
+
+    Determinism comes from holding the fork response rather than racing it:
+    the route handler parks the request without resolving it, so the
+    in-flight state stays up for as long as the assertions need, then the
+    captured route is released and the flow completes as usual. Catching a
+    naturally-fast fork mid-flight would be a coin flip.
+
+    The transcript is seeded straight into the store (the per-message "Fork
+    from here" action needs a committed assistant response to anchor on),
+    so this neither drives the LLM nor waits on a turn.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` for a pre-created
+        runner-bound session.
+    """
+    base_url, session_id = seeded_session
+
+    seed_committed_turn(
+        session_id,
+        prompt="ping",
+        reply="pong",
+        response_id="resp_spinner",
+    )
+
+    parked: list[Route] = []
+
+    # Returning without resolving parks the request in the browser and
+    # leaves the test's thread free to assert. The route is released below.
+    # Must be a plain function, not ``parked.append``: Playwright stamps an
+    # attribute onto the handler it is given, which a builtin method rejects.
+    def park_fork(route: Route) -> None:
+        parked.append(route)
+
+    page.route(re.compile(r"/v1/sessions/[^/]+/fork"), park_fork)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
+    expect(assistant).to_be_visible(timeout=30_000)
+    assistant.hover()
+    page.get_by_test_id("fork-from-response").first.click()
+    expect(page.get_by_test_id("fork-session-dialog")).to_be_visible()
+
+    submit = page.get_by_test_id("fork-session-submit")
+    # Before the click: idle — enabled, no spinner. Without this the
+    # after-state below would also pass on a button that always spins.
+    expect(submit).to_be_enabled()
+    expect(submit).not_to_have_attribute("aria-busy", "true")
+    assert submit.locator("svg.animate-spin").count() == 0
+
+    submit.click()
+
+    # In flight: spinner up, button busy and click-proof so the fork can't
+    # be double-submitted.
+    expect(submit.locator("svg.animate-spin")).to_be_visible(timeout=10_000)
+    expect(submit).to_have_attribute("aria-busy", "true")
+    expect(submit).to_be_disabled()
+
+    # Releasing the fork completes the real flow — proving the spinner is a
+    # transient in-flight state and not a stuck button.
+    deadline = time.monotonic() + 10.0
+    while not parked and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert parked, "fork request never reached the route handler"
+    parked[0].continue_()
+
+    expect(page).to_have_url(
+        re.compile(rf"/c/(?!{re.escape(session_id)})(conv_)?[0-9a-f]+"),
+        timeout=30_000,
+    )
+    expect(page.get_by_test_id("fork-session-dialog")).not_to_be_visible()

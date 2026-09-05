@@ -39,6 +39,7 @@ from omnigent.repl._resume_picker import (
     _last_message_preview_from_entities,
     _Preview,
     pick_conversation,
+    pick_conversation_cross_agent_from_sdk,
     pick_conversation_from_store,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -144,7 +145,7 @@ def _pick_with_tty_input(
     import threading
     import time
 
-    result_queue: _queue.Queue[str | None | BaseException] = _queue.Queue()
+    result_queue: _queue.Queue[str | BaseException | None] = _queue.Queue()
     master_fd, slave_fd = _os.openpty()
     slave_check_fd = _os.dup(slave_fd)
     out = io.StringIO()
@@ -842,6 +843,13 @@ class _BadgeRow:
     title: str | None = "test"
     created_at: int = 0
     labels: Mapping[str, str] | None = None
+    # The owner filter in the cross-agent picker reads ``owner``; the
+    # badge tests ignore it. Defaulted so existing rows are unaffected.
+    owner: str | None = None
+    # Host the session's runner was launched on; the wrapper picker
+    # drops rows bound to a different host. ``None`` mirrors rows
+    # that were never bound (kept by the filter).
+    host_id: str | None = None
 
 
 def test_runtime_badge_claude_native() -> None:
@@ -983,6 +991,7 @@ async def test_cross_agent_picker_lists_without_agent_id_filter() -> None:
     assert client.sessions.last_kwargs == {
         "limit": 200,
         "agent_id": None,
+        "agent_name": None,
         "order": "desc",
     }
 
@@ -1062,6 +1071,7 @@ async def test_wrapper_label_picker_filters_and_lists_without_agent_filter(
     assert client.sessions.last_kwargs == {
         "limit": 200,
         "agent_id": None,
+        "agent_name": None,
         "order": "desc",
     }
     rendered = out.getvalue()
@@ -1282,3 +1292,264 @@ def test_workspace_metadata_omits_unrecorded_workspace_segment(
     assert selected == "eadade68b1f6e5f2f5e0c57a00d8d378"
     assert "Workspace" not in rendered
     assert "—" not in rendered
+
+
+# ── Cross-agent picker — owner filter ────────────────────
+#
+# ``omnigent resume`` (no id) lists the server's ACL-scoped sessions,
+# which include ones merely shared with the caller. Resume is
+# owner-only, so the picker drops rows the caller does not own. Reuses
+# the ``_FakeAPClient`` / ``_BadgeRow`` fakes above.
+
+
+def _owned_and_shared_rows() -> list[_BadgeRow]:
+    """A shared row (owned by someone else) then the caller's own row."""
+    return [
+        _BadgeRow(
+            id="5bcf1e3b9a1c4d2e8f0a1b2c3d4e5f60",
+            title="bob's shared chat",
+            owner="bob@example.com",
+            labels={},
+        ),
+        _BadgeRow(
+            id="a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+            title="my own chat",
+            owner="me@example.com",
+            labels={},
+        ),
+    ]
+
+
+async def test_cross_agent_picker_drops_sessions_not_owned_by_caller() -> None:
+    """
+    With ``owner_user_id`` set, sessions merely shared with the caller are
+    dropped — only their own sessions are listed and selectable. Resume is
+    owner-only, so a shared row would be a dead end.
+    """
+    client = _FakeAPClient(rows=_owned_and_shared_rows())
+    out = io.StringIO()
+
+    # After filtering to "me@example.com" only the owned row survives, so
+    # row 1 is that owned session.
+    selected = await pick_conversation_cross_agent_from_sdk(
+        client,
+        owner_user_id="me@example.com",
+        out=out,
+        in_=io.StringIO("1\n"),
+    )
+
+    assert selected == "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+    rendered = out.getvalue()
+    assert "my own chat" in rendered
+    # The shared row must not appear at all.
+    assert "bob's shared chat" not in rendered
+    assert "5bcf1e3b9a1c4d2e8f0a1b2c3d4e5f60" not in rendered
+
+
+async def test_cross_agent_picker_lists_everything_when_owner_unknown() -> None:
+    """
+    ``owner_user_id=None`` (identity unresolved, or a permissionless
+    single-user server) leaves the list unfiltered — the pre-existing
+    behavior. Both rows are listed, so resume never silently hides
+    sessions when it can't tell who the caller is.
+    """
+    client = _FakeAPClient(rows=_owned_and_shared_rows())
+    out = io.StringIO()
+
+    # No filter → row 1 is still the (shared) row the server returned first.
+    selected = await pick_conversation_cross_agent_from_sdk(
+        client,
+        owner_user_id=None,
+        out=out,
+        in_=io.StringIO("1\n"),
+    )
+
+    assert selected == "5bcf1e3b9a1c4d2e8f0a1b2c3d4e5f60"
+    rendered = out.getvalue()
+    assert "bob's shared chat" in rendered
+    assert "my own chat" in rendered
+
+
+# ── Host scoping and transient-429 retry ─────────────────────────────
+
+
+async def test_wrapper_label_picker_drops_rows_bound_to_other_hosts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With ``host_id`` set, rows bound to another host are hidden.
+
+    Native transcript/workspace state is host-local, so a wrapper
+    session bound to a different host is a dead end in this picker.
+    Rows with no recorded ``host_id`` (never bound, or a server that
+    predates the field) must stay visible.
+    """
+    import io
+
+    from omnigent.repl._resume_picker import pick_conversation_by_wrapper_label_from_sdk
+
+    monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
+    local_host = "aaaa1111aaaa1111aaaa1111aaaa1111"
+    other_host = "bbbb2222bbbb2222bbbb2222bbbb2222"
+    rows = [
+        _BadgeRow(
+            id="5f0f4a3f7b0c4c05a6c81e2b6d5c0a11",
+            title="local claude",
+            labels={"omnigent.wrapper": "claude-code-native-ui"},
+            host_id=local_host,
+        ),
+        _BadgeRow(
+            id="9f31de2ab8a04b52a3a6c0b40cf3ab22",
+            title="remote claude",
+            labels={"omnigent.wrapper": "claude-code-native-ui"},
+            host_id=other_host,
+        ),
+        _BadgeRow(
+            id="1c8be6dd41f544f584a17a7ce34ecd33",
+            title="unbound claude",
+            labels={"omnigent.wrapper": "claude-code-native-ui"},
+            host_id=None,
+        ),
+    ]
+    client = _FakeAPClient(rows=rows)
+    out = io.StringIO()
+    # Empty stdin → readline returns "" → picker cancels after rendering.
+    selected = await pick_conversation_by_wrapper_label_from_sdk(
+        client,
+        wrapper_value="claude-code-native-ui",
+        agent_name="claude-native-ui",
+        host_id=local_host,
+        out=out,
+        in_=io.StringIO(""),
+    )
+    assert selected is None
+    rendered = out.getvalue()
+    assert "5f0f4a3f7b0c4c05a6c81e2b6d5c0a11" in rendered
+    assert "1c8be6dd41f544f584a17a7ce34ecd33" in rendered
+    assert "9f31de2ab8a04b52a3a6c0b40cf3ab22" not in rendered
+
+
+async def test_wrapper_label_picker_without_host_id_keeps_all_hosts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``host_id=None`` disables host filtering (legacy behavior)."""
+    import io
+
+    from omnigent.repl._resume_picker import pick_conversation_by_wrapper_label_from_sdk
+
+    monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
+    rows = [
+        _BadgeRow(
+            id="5f0f4a3f7b0c4c05a6c81e2b6d5c0a11",
+            title="claude a",
+            labels={"omnigent.wrapper": "claude-code-native-ui"},
+            host_id="aaaa1111aaaa1111aaaa1111aaaa1111",
+        ),
+        _BadgeRow(
+            id="9f31de2ab8a04b52a3a6c0b40cf3ab22",
+            title="claude b",
+            labels={"omnigent.wrapper": "claude-code-native-ui"},
+            host_id="bbbb2222bbbb2222bbbb2222bbbb2222",
+        ),
+    ]
+    client = _FakeAPClient(rows=rows)
+    out = io.StringIO()
+    selected = await pick_conversation_by_wrapper_label_from_sdk(
+        client,
+        wrapper_value="claude-code-native-ui",
+        agent_name="claude-native-ui",
+        out=out,
+        in_=io.StringIO(""),
+    )
+    assert selected is None
+    rendered = out.getvalue()
+    assert "5f0f4a3f7b0c4c05a6c81e2b6d5c0a11" in rendered
+    assert "9f31de2ab8a04b52a3a6c0b40cf3ab22" in rendered
+
+
+class _RateLimitedThenOkSessionsNamespace(_FakeSessionsNamespace):
+    """Sessions stub whose first ``fail_times`` list calls raise 429."""
+
+    def __init__(self, rows: list[_BadgeRow], fail_times: int) -> None:
+        """:param fail_times: Number of leading calls that rate-limit."""
+        super().__init__(rows)
+        self.remaining_429 = fail_times
+        self.calls = 0
+
+    async def list(self, **kwargs: object) -> list[_BadgeRow]:
+        """Raise ``RateLimitedError`` until the budget is exhausted."""
+        from omnigent_client import RateLimitedError
+
+        self.calls += 1
+        if self.remaining_429 > 0:
+            self.remaining_429 -= 1
+            raise RateLimitedError("rate limited", 429, "rate_limited")
+        return await super().list(**kwargs)
+
+
+async def test_wrapper_label_picker_retries_transient_429(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A once-only 429 on the list call is absorbed by a bounded retry."""
+    import io
+
+    from omnigent.repl import _resume_picker
+    from omnigent.repl._resume_picker import pick_conversation_by_wrapper_label_from_sdk
+
+    monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
+    # No real sleeping in unit tests.
+    monkeypatch.setattr(_resume_picker, "_SESSION_LIST_RETRY_DELAYS_S", (0.0, 0.0))
+    rows = [
+        _BadgeRow(
+            id="5f0f4a3f7b0c4c05a6c81e2b6d5c0a11",
+            title="claude one",
+            labels={"omnigent.wrapper": "claude-code-native-ui"},
+        ),
+    ]
+    client = _FakeAPClient(rows=rows)
+    client.sessions = _RateLimitedThenOkSessionsNamespace(rows, fail_times=1)
+    out = io.StringIO()
+    selected = await pick_conversation_by_wrapper_label_from_sdk(
+        client,
+        wrapper_value="claude-code-native-ui",
+        agent_name="claude-native-ui",
+        out=out,
+        in_=io.StringIO("1\n"),
+    )
+    assert selected == "5f0f4a3f7b0c4c05a6c81e2b6d5c0a11"
+    assert client.sessions.calls == 2
+
+
+async def test_wrapper_label_picker_persistent_429_raises_typed_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A 429 that outlives the retry budget surfaces as the typed error.
+
+    The caller (the CLI resume path) turns it into a concise
+    ``ClickException`` — the picker itself must re-raise the typed
+    error after the last attempt, not loop forever or crash earlier.
+    """
+    import io
+
+    from omnigent_client import RateLimitedError
+
+    from omnigent.repl import _resume_picker
+    from omnigent.repl._resume_picker import pick_conversation_by_wrapper_label_from_sdk
+
+    monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(_resume_picker, "_SESSION_LIST_RETRY_DELAYS_S", (0.0, 0.0))
+    client = _FakeAPClient(rows=[])
+    client.sessions = _RateLimitedThenOkSessionsNamespace([], fail_times=10)
+    with pytest.raises(RateLimitedError):
+        await pick_conversation_by_wrapper_label_from_sdk(
+            client,
+            wrapper_value="claude-code-native-ui",
+            agent_name="claude-native-ui",
+            out=io.StringIO(),
+            in_=io.StringIO(""),
+        )
+    # Initial attempt + one retry per configured delay, then give up.
+    assert client.sessions.calls == 3

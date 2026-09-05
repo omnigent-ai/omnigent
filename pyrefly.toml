@@ -20,6 +20,8 @@ disable-search-path-heuristics = true
 ignore-missing-imports = [
     "boxlite",
     "boxlite.*",
+    "blaxel",
+    "blaxel.*",
     "copilot",
     "copilot.*",
     "cursor_sdk",
@@ -34,6 +36,8 @@ ignore-missing-imports = [
     "e2b.*",
     "google.auth",
     "google.auth.*",
+    "hvac",
+    "hvac.*",
     "islo",
     "islo.*",
     "kubernetes",

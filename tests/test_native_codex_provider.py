@@ -440,6 +440,74 @@ def test_resolve_native_codex_launch_undismissed_config_provider_routes_via_pin(
     assert launch.profile is None
 
 
+def test_config_provider_shadowed_by_nondefault_explicit_entry_still_pins(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A nondefault adopted entry cannot hide Codex's active config provider.
+
+    The explicit entry shadows ambient synthesis by name, but Codex itself
+    still selects the provider from config.toml. An empty launch would make a
+    synthesized resume rollout record OpenAI and lose this provider's auth.
+    """
+    monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
+    codex_dir = _isolated / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(_DISMISSIBLE_CODEX_CONFIG)
+    _seed(
+        _isolated,
+        {
+            "codex-databricks": {
+                "kind": "cli-config",
+                "cli": "codex",
+                "model_provider": "Databricks",
+                "display_name": "Databricks AI Gateway",
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model="test-model")
+
+    assert launch.config_overrides == ['model_provider="Databricks"']
+    assert launch.model == "test-model"
+    assert launch.profile is None
+
+
+def test_shadowed_config_detection_uses_active_profile_provider(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback pins the provider selected by Codex's active profile."""
+    monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
+    codex_dir = _isolated / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        'profile = "work"\n'
+        'model_provider = "UnusedTopLevel"\n'
+        "[profiles.work]\n"
+        'model_provider = "Databricks"\n'
+        "[model_providers.Databricks]\n"
+        'name = "Databricks AI Gateway"\n'
+        'base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"\n'
+        "[model_providers.Databricks.auth]\n"
+        'command = "jq"\n'
+    )
+    _seed(
+        _isolated,
+        {
+            "codex-databricks": {
+                "kind": "cli-config",
+                "cli": "codex",
+                "model_provider": "Databricks",
+                "display_name": "Databricks AI Gateway",
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.config_overrides == ['model_provider="Databricks"']
+    assert launch.profile is None
+
+
 # ── Spec-level credentials (issue #2744) ────────────────────────────────────
 
 
@@ -619,3 +687,151 @@ def test_spec_subscription_logged_in_uses_cli_login(
     assert launch.profile is None
     assert "codex-sub" in launch.summary
     assert "Codex is logged in" in launch.summary
+
+
+# ── login_required: headless fail-fast marker ──────────────────────────────
+
+
+def test_no_provider_and_no_codex_login_marks_login_required(_isolated: Path) -> None:
+    """No provider + no Codex login → the launch is marked ``login_required``.
+
+    This is the routing state in which a headless launch parks the TUI on the
+    sign-in screen forever; the flag lets the runner fail chat turns fast
+    instead of burning the thread-start timeout.
+    """
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.profile is None
+    assert "no provider configured" in launch.summary
+    assert launch.login_required is True
+
+
+def test_no_provider_but_codex_logged_in_is_not_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No provider but a live Codex login → the TUI starts fine, no fail-fast."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=True)))
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "Codex CLI login" in launch.summary
+    assert launch.login_required is False
+
+
+def test_routable_provider_is_not_login_required(_isolated: Path) -> None:
+    """A provider that routes Codex never sets ``login_required``."""
+    _seed(
+        _isolated,
+        {
+            "vendor": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://vendor.example.com/v1",
+                    "api_key": "sk-vendor",
+                },
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.config_overrides
+    assert launch.login_required is False
+
+
+def test_subscription_default_logged_out_no_fallback_marks_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A logged-out subscription default with nothing to fall through to is doomed headlessly."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=False)))
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}})
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "has no usable Codex login" in launch.summary
+    assert launch.login_required is True
+
+
+def test_subscription_default_logged_in_is_not_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A subscription default with a live Codex login starts fine — no fail-fast."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=True)))
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}})
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "Codex is logged in" in launch.summary
+    assert launch.login_required is False
+
+
+def test_spec_subscription_logged_out_marks_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec-named subscription on a logged-out Codex is doomed headlessly."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=False)))
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex"}})
+
+    launch = resolve_native_codex_launch(
+        model=None, spec=_spec(auth=ProviderAuth(name="codex-sub"))
+    )
+
+    assert launch.login_required is True
+
+
+def test_spec_subscription_logged_in_is_not_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec-named subscription with a live Codex login needs no fail-fast."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=True)))
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex"}})
+
+    launch = resolve_native_codex_launch(
+        model=None, spec=_spec(auth=ProviderAuth(name="codex-sub"))
+    )
+
+    assert launch.login_required is False
+
+
+def test_default_provider_without_credential_logged_out_marks_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A default provider with no usable openai credential falls to a doomed login."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=False)))
+    monkeypatch.delenv("MISSING_CODEX_TEST_KEY", raising=False)
+    _seed(
+        _isolated,
+        {
+            "broken": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://broken.example.com/v1",
+                    # A credential reference that cannot resolve in this
+                    # process: the provider parses but cannot route.
+                    "api_key_ref": "env:MISSING_CODEX_TEST_KEY",
+                },
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "no usable openai credential" in launch.summary
+    assert launch.login_required is True
+
+
+def test_global_auth_block_login_logged_out_marks_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-Databricks global auth block falling to Codex login is doomed headlessly."""
+    from omnigent.runtime import workflow
+
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=False)))
+    monkeypatch.setattr(workflow, "_load_global_auth", lambda: object())
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "global auth block" in launch.summary
+    assert launch.login_required is True

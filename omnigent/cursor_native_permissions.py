@@ -601,9 +601,9 @@ def _askquestion_payload(args: dict[str, object]) -> dict[str, object]:
 
     The web UI renders the multiple-choice form from a ``{"questions": [...]}``
     structure (see ``web`` ``askUserQuestion`` lib). cursor's field names
-    differ — its question text is ``prompt`` (vs ``question``) and it has no
-    ``multiSelect`` — so map them across, preserving each question ``id`` we'll
-    need to interpret the answer.
+    differ — its question text is ``prompt`` (vs ``question``) and its
+    multi-select flag is ``allowMultiple`` (vs ``multiSelect``) — so map them
+    across, preserving each question ``id`` we'll need to interpret the answer.
     """
     web_questions: list[dict[str, object]] = []
     for question in _iter_askquestion_questions(args):
@@ -621,7 +621,7 @@ def _askquestion_payload(args: dict[str, object]) -> dict[str, object]:
         web_question: dict[str, object] = {
             "question": prompt,
             "options": web_options,
-            "multiSelect": question.get("multiSelect") is True,
+            "multiSelect": question.get("allowMultiple") is True,
         }
         qid = question.get("id")
         if isinstance(qid, str) and qid:
@@ -862,9 +862,9 @@ async def supervise_cursor_transcript_elicitations(
     store_path: Path | None = None
     loop = asyncio.get_running_loop()
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
                 if store_path is None or not store_path.exists():

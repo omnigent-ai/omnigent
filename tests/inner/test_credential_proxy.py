@@ -123,6 +123,26 @@ def test_env_source_resolves_and_mints_synthetic() -> None:
     assert rule.scheme == "bearer"
 
 
+def test_shared_env_reuses_placeholder_across_hosts() -> None:
+    source = CredentialSourceSpec(kind="env", env="CURSOR_SECRET")
+    spec = CredentialProxySpec(
+        entries=[
+            _bearer_entry("api.cursor.com", env_var="CURSOR_API_KEY", source=source),
+            _bearer_entry("api2.cursor.sh", env_var="CURSOR_API_KEY", source=source),
+            _bearer_entry("agent.cursor.sh", env_var="CURSOR_API_KEY", source=source),
+        ]
+    )
+
+    runtime = prepare_credential_proxy_runtime(
+        spec, parent_env={"CURSOR_SECRET": "real-cursor-secret"}
+    )
+
+    synthetic = runtime.helper_env_updates["CURSOR_API_KEY"]
+    assert synthetic.startswith(SYNTHETIC_CREDENTIAL_PREFIX)
+    assert {rule.synthetic for rule in runtime.rewrites} == {synthetic}
+    assert {rule.real_secret for rule in runtime.rewrites} == {"real-cursor-secret"}
+
+
 def test_file_source_resolves_secret(tmp_path: Path) -> None:
     """A ``file`` source reads the secret from disk, stripped of whitespace.
 

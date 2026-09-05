@@ -174,7 +174,7 @@ def _control_response_request_id(event: dict[str, object]) -> str | None:
 def _read_new_control_events(events_file: Path, offset: int) -> tuple[list[_ControlEvent], int]:
     """Read NDJSON lines past *offset*, returning control events + the new offset.
 
-    Mirrors :func:`omnigent.qwen_native_forwarder._read_new_events`: detects a
+    Mirrors :func:`omnigent.qwen_native_forwarder._read_new_forward_events`: detects a
     truncated/recreated file (``size < offset`` → rewind to 0), consumes only
     fully terminated lines, and leaves a trailing partial line for the next poll.
     Only control-plane events (``control_request`` / ``control_response``) are
@@ -260,9 +260,9 @@ async def supervise_qwen_approval_mirror(
     # request_id -> {"elicitation_id": str, "task": asyncio.Task}
     pending: dict[str, _PendingApproval] = {}
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
                 events, offset = await asyncio.to_thread(

@@ -79,7 +79,7 @@ def test_browser_tab_is_last_and_opens_pane(
 
     page.add_init_script(_ELECTRON_SHELL_INIT_SCRIPT)
     page.goto(f"{base_url}/c/{session_id}")
-    expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
 
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
@@ -121,7 +121,7 @@ def test_no_browser_tab_in_plain_browser(
     base_url, session_id = seeded_session
 
     page.goto(f"{base_url}/c/{session_id}")
-    expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
 
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")

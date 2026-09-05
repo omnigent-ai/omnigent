@@ -1,0 +1,41 @@
+{
+  "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+  "status": "CORTEX_STEP_STATUS_DONE",
+  "metadata": {
+    "stepGenerationVersion": 1,
+    "createdAt": "2026-08-02T04:49:07.381592827Z",
+    "viewableAt": "2026-08-02T04:49:08.449485929Z",
+    "finishedGeneratingAt": "2026-08-02T04:49:08.464117479Z",
+    "startedAt": "2026-08-02T04:49:08.464117479Z",
+    "completedAt": "2026-08-02T04:49:08.464117479Z",
+    "source": "CORTEX_STEP_SOURCE_MODEL",
+    "modelUsage": {
+      "model": "MODEL_PLACEHOLDER_M71",
+      "inputTokens": "3649",
+      "outputTokens": "178",
+      "thinkingOutputTokens": "98",
+      "responseOutputTokens": "80",
+      "cacheReadTokens": "20366",
+      "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+      "responseHeader": {
+        "sessionID": "-3750763034362895579"
+      },
+      "responseId": "Q8xuarfOJrfN1e8PwJCh8QI"
+    },
+    "generatorModel": "MODEL_PLACEHOLDER_M71",
+    "requestedModel": {
+      "model": "MODEL_PLACEHOLDER_M71"
+    },
+    "executionId": "99875cd6-e73c-4e0f-8f1f-eb7505a88330",
+    "sourceTrajectoryStepInfo": {
+      "trajectoryId": "efb134b2-d69f-43de-bb54-c9ece346d8a3",
+      "stepIndex": 5,
+      "metadataIndex": 1,
+      "cascadeId": "2399249c-4a48-40f1-bf3b-4c6e5d3a5a0e"
+    }
+  },
+  "plannerResponse": {
+    "messageId": "bot-e5322d19-b728-4f43-bd94-6a0b4dae5a87",
+    "stopReason": "STOP_REASON_STOP_PATTERN"
+  }
+}

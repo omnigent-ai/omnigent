@@ -41,8 +41,11 @@ from typing import TypeAlias, cast
 
 from omnigent.entities.environment_filesystem import InvalidPath
 from omnigent.entities.pagination import paginate_in_memory
+from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.inner.os_env import _DEFAULT_READ_LIMIT
+from omnigent.runner import github_resource
 from omnigent.runner.environment_filesystem import (
+    _SEARCH_SCAN_BUDGET,
     _glob_to_regex,
     _validate_path,
     split_glob_list,
@@ -323,6 +326,8 @@ class WorkspaceReader:
         exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in split_glob_list(exclude)]
 
         results: list[_WorkspacePayload] = []
+        scanned = 0
+        truncated = False
         for dirpath, dirnames, filenames in os.walk(self._root):
             rel_dir = os.path.relpath(dirpath, self._root)
             # Prune excluded subtrees so a "**/node_modules" pattern
@@ -333,8 +338,17 @@ class WorkspaceReader:
                 if any(r.match(dp) for r in exc):
                     continue
                 kept.append(d)
+            # Spend the scan budget on the real tree first, as the runner does.
+            kept.sort(key=lambda d: d in _DEFAULT_DEPRIORITIZED_DIRS)
             dirnames[:] = kept
+            scanned += len(kept)
             for fname in sorted(filenames):
+                # Counted per entry: a per-directory check lets one huge
+                # directory overshoot the budget before `truncated` trips.
+                scanned += 1
+                if scanned >= _SEARCH_SCAN_BUDGET:
+                    truncated = True
+                    break
                 p = os.path.normpath(os.path.join("" if rel_dir == "." else rel_dir, fname))
                 if exc and any(r.match(p) for r in exc):
                     continue
@@ -362,10 +376,18 @@ class WorkspaceReader:
                 )
                 if len(results) >= limit:
                     break
-            if len(results) >= limit:
+            # A query matching little or nothing never fills the result cap,
+            # so the walk needs its own bound -- the same one the runner
+            # applies, so search behaves identically whether the agent is awake.
+            if truncated or len(results) >= limit:
                 break
         results.sort(key=lambda entry: cast(str, entry["path"]))
-        return {"object": "list", "data": results, "has_more": len(results) >= limit}
+        return {
+            "object": "list",
+            "data": results,
+            "has_more": len(results) >= limit,
+            "truncated": truncated,
+        }
 
     # ── Changed files / diff ───────────────────────────────────────
 
@@ -446,3 +468,31 @@ class WorkspaceReader:
             "before": before,
             "after": after,
         }
+
+    # ── GitHub integration (read-only) ────────────────────────────
+    # Serve the same read-only PR metadata + the PR's files / diff the runner's
+    # GitHub endpoints do, so the tab keeps working when the runner is offline
+    # but the host still holds the workspace. Delegates to the shared
+    # ``github_resource`` helpers against this reader's confined root; the list
+    # and patch come from ``gh`` (the developer's authenticated CLI) and only the
+    # per-file reader shells out to a read-only ``git show``.
+
+    def github_info(self) -> _WorkspacePayload:
+        """GitHub context (repo, branch, base ref, PR) for the workspace."""
+        return cast("_WorkspacePayload", github_resource.github_info(str(self._root)))
+
+    def github_changes(self) -> _WorkspacePayload:
+        """The PR's changed files (empty when the branch has no PR)."""
+        return cast("_WorkspacePayload", github_resource.github_changed_files(str(self._root)))
+
+    def github_file_diff(self, base: str | None, relative_path: str) -> _WorkspacePayload:
+        """Before/after content for one file, HEAD vs the base merge-base."""
+        resolved = github_resource.resolve_base_ref(str(self._root), base)
+        return cast(
+            "_WorkspacePayload",
+            github_resource.github_file_diff(str(self._root), resolved or "", relative_path),
+        )
+
+    def github_pr_diff(self) -> _WorkspacePayload:
+        """The whole PR as one unified diff patch (empty when there's no PR)."""
+        return cast("_WorkspacePayload", github_resource.github_pr_diff(str(self._root)))

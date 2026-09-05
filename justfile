@@ -14,7 +14,7 @@ _check-uv:
     uv run --no-sync pre-commit --version
 
 _ensure-uv:
-    uv sync --extra all --extra dev
+    uv sync --extra all --group dev
 
 # --- iOS Ruby dependencies ---
 
@@ -67,31 +67,45 @@ run-android:
 android-reverse:
     cd web/android && ./gradlew reverseProxy
 
-# --- Electron desktop app ---
+# --- Web ---
 
 _ensure-web:
     cd web && test -d node_modules || pnpm install
+
+[group('web')]
+storybook: _ensure-web
+    pnpm --filter web run storybook
+
+[group('web')]
+storybook-build: _ensure-web
+    pnpm --filter web run build:storybook
+
+[group('web')]
+generate-theme-palettes: _ensure-web
+    cd web && node --experimental-strip-types scripts/generate-theme-palettes.mjs
+
+# --- Electron desktop app ---
 
 _ensure-electron:
     cd web/electron && test -d node_modules || pnpm install
 
 [group('electron')]
 electron-dev: _ensure-web _ensure-electron
-    pnpm --filter web/electron run dev
+    pnpm --filter ./web/electron run dev
 
 [group('electron')]
 electron-build: _ensure-web _ensure-electron
-    pnpm --filter web/electron run build
+    pnpm --filter ./web/electron run build
 
 # --- Lint ---
 
 [group('lint')]
 lint: _ensure-uv
-    uv run pre-commit run
+    uv run --no-sync pre-commit run
 
 [group('lint')]
 lint-all: _ensure-uv
-    uv run pre-commit run --all-files
+    uv run --no-sync pre-commit run --all-files
 
 [group('lint')]
 typecheck-python: _ensure-uv
@@ -108,4 +122,4 @@ lint-ts:
 
 [group('lint')]
 normalize-locks: _ensure-uv
-    uv run scripts/normalize_uv_lock_registry.py uv.lock || true
+    uv run --no-sync scripts/normalize_uv_lock_registry.py uv.lock || true

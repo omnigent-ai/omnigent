@@ -21,6 +21,13 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   };
 });
 
+// ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
+// (default: no PR) so these tests don't need a QueryClientProvider, matching
+// the workspace-files stub above.
+vi.mock("@/hooks/useGithub", () => ({
+  useGithubInfo: () => ({ data: undefined }),
+}));
+
 // HostBadge now lives in the status-line tray (left of the worktree branch).
 // It reads the session's host binding via these hooks; stub them so the badge
 // renders deterministically without a QueryClient / RunnerHealth provider. The
@@ -432,6 +439,25 @@ describe("formatModelEffortStatusLabel", () => {
     expect(formatModelEffortStatusLabel("databricks-gpt-5-5", "xhigh")).toBe(
       "databricks-gpt-5-5 xHigh",
     );
+  });
+
+  it("prefers the catalog display name for a Claude [1m] alias", () => {
+    expect(
+      formatModelEffortStatusLabel("sonnet[1m]", "high", [
+        { id: "sonnet[1m]", model: "claude-sonnet-5[1m]", displayName: "Sonnet 5 (1M context)" },
+      ]),
+    ).toBe("Sonnet 5 (1M context) high");
+  });
+
+  it("renders a catalog-less Claude [1m] alias friendly without claiming a version", () => {
+    expect(formatModelEffortStatusLabel("sonnet[1m]", "high")).toBe("Sonnet (1M context) High");
+    expect(formatModelEffortStatusLabel("opus[1m]", null)).toBe("Opus (1M context)");
+  });
+
+  it("title-cases catalog-less alias-shaped ids mechanically", () => {
+    expect(formatModelEffortStatusLabel("sonnet", null)).toBe("Sonnet");
+    expect(formatModelEffortStatusLabel("sonnet_5", null)).toBe("Sonnet 5");
+    expect(formatModelEffortStatusLabel("fable", null)).toBe("Fable");
   });
 
   it("omits missing pieces", () => {

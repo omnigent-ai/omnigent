@@ -26,6 +26,9 @@ replaces the three-terminal local dev flow (`omnigent server`, `omnigent host`,
   gitignored files under `omnigent/` (e.g. the build-time `_build_info.py`) are
   skipped so generated churn doesn't reload; the frontend self-reloads through
   Vite HMR;
+- **prefills ten example conversations** after the OSS server first becomes
+  healthy, giving UI and API work realistic short, multi-turn, and tool-call
+  transcripts;
 - gives you **per-process log panes** plus a combined view, each a `less`-style
   pager with wrap and search (see [Keys](#keys)).
 
@@ -50,14 +53,16 @@ Run it from anywhere inside the checkout — it walks up to the repo root
 |---|---|---|
 | server | `uv run omnigent --log-to-stderr server --host 127.0.0.1 --port <p> --database-uri … --artifact-location …` | Waited on via `GET /health`. |
 | host   | `uv run omnigent --log-to-stderr host --server http://127.0.0.1:<p>` | Started once the server is healthy. |
-| vite   | `pnpm run dev -- --host <host> --port <p> --strictPort` (cwd `web/`) | `OMNIGENT_URL` points its proxy at the pod's server. |
+| vite   | `pnpm run dev --host <host> --port <p> --strictPort` (cwd `web/`) | `OMNIGENT_URL` points its proxy at the pod's server. |
 
 Before Vite starts (and on a manual Vite restart), omnidev runs `pnpm install`
 in `web/` when needed — `node_modules/` is missing, or `package.json` /
-`package-lock.json` is newer than it — so a fresh checkout or a new dependency
+`pnpm-lock.yaml` is newer than it — so a fresh checkout or a new dependency
 doesn't make Vite fail its dependency scan. Output streams into the `vite` pane.
 
-Open the UI at the `ui` URL shown in the header (the Vite dev server).
+Once Vite begins serving, omnidev opens the `ui` URL shown in the header in
+your default browser. If the platform browser launcher is unavailable, startup
+continues and the combined log tells you to open that URL manually.
 
 ## Isolation
 
@@ -74,7 +79,16 @@ Each pod gets its own `config.yaml` under `<pod>/config/`, pointed to by
 `~/.omnigent/config.yaml` (if present) so the pod works out of the box — it
 keeps your providers — after which the two are independent: server-config edits
 inside a pod (via the UI or `omnigent config`) don't touch your real config.
-`--clean` wipes the pod dir, so the next run re-seeds from your real config.
+
+The OSS pod also imports the curated JSONL transcripts under
+`dev/omnidev/fixtures/conversations/` through `omnigent session import` once the
+server is healthy. Versioned per-fixture markers in the pod make normal starts
+and backend reloads idempotent. The imported rows remain ordinary conversations:
+you can edit, archive, or delete them without omnidev recreating them on the next
+start. External process profiles are not seeded.
+
+`--clean` wipes the pod dir, so the next run re-seeds both config and example
+conversations.
 
 The pod dir defaults to
 `${XDG_CACHE_HOME:-~/.cache}/omnidev/<repo-name>-<hash>/`, keyed to the
@@ -219,3 +233,18 @@ and, on a terminal, prompts `Update omnigent now? [y/N]`; on yes it runs
 `omnidev update` in the foreground. Declining suppresses that same commit until
 a newer one lands. Set `OMNIGENT_NO_UPDATE_CHECK` in your environment if you want
 to silence omnigent's own separate notice.
+
+# External process profiles
+
+Integrations that embed the Omnigent server in another repository can reuse
+the supervisor without copying it:
+
+```bash
+omnidev --profile path/to/omnidev.toml
+```
+
+The profile supplies the server, optional host, Vite, and optional dependency
+preparation commands plus the backend and web directories. Command arguments
+may contain `{server_port}`, `{vite_port}`, `{vite_host}`, `{pod_dir}`, and
+`{repo_root}`. Environment variables from the launching integration are
+inherited; `OMNIGENT_URL` is set to the isolated backend as usual.

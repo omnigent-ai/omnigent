@@ -91,8 +91,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 USER 0
 
-# curl-minimal and ca-certificates are preinstalled in UBI9.
-RUN dnf install -y --nodocs git tmux unzip \
+# curl-minimal and ca-certificates are preinstalled in UBI9. bzip2 ships on
+# every host so the goose EXTRA_HARNESS_CLIS row works without another
+# package-list edit (goose's release archive is .tar.bz2).
+RUN dnf install -y --nodocs git tmux unzip bzip2 \
  && dnf clean all
 
 RUN git config --system credential.helper \
@@ -140,10 +142,58 @@ RUN set -eu; \
       echo "ERROR: kiro-cli reports '${installed:-<none>}', expected '$KIRO_CLI_VERSION'." >&2; exit 1; }; \
     echo "kiro-cli ${KIRO_CLI_VERSION} pinned (sha256 verified)"
 
+# agy is not baked into UBI by default — install it via EXTRA_HARNESS_CLIS=agy,
+# which pins the same immutable per-arch release asset + sha256 as the default
+# image. Keep AGY_VERSION and both SHA256s in sync with deploy/docker/Dockerfile.
+ARG AGY_VERSION=1.1.16
+ARG AGY_SHA256_AMD64=7742953b7835b457e9102f1357a493913657dfd147435584f609d58356ec085a
+ARG AGY_SHA256_ARM64=c71599bb548cf72dfe7a8f6c411b3c7a3623cd4b0f6276bae89c69f769d6c92d
+ENV AGY_VERSION=${AGY_VERSION} \
+    AGY_SHA256_AMD64=${AGY_SHA256_AMD64} \
+    AGY_SHA256_ARM64=${AGY_SHA256_ARM64}
+
+# GitHub CLI (`gh`) — the read-only "GitHub" side panel shells out to it (and
+# agents reach for it), authenticated per-user from the credential broker (see
+# omnigent/runner/github_resource.py). Not an npm package, so fetch the immutable
+# per-arch tarball from the versioned GitHub release, verify sha256, install the
+# binary on the shared PATH, and assert the version. Mirrors the block in
+# deploy/docker/Dockerfile — keep GH_VERSION + both SHA256s in sync with it.
+ARG GH_VERSION=2.100.0
+ARG GH_SHA256_AMD64=e4d4bb4498e8d007abe545b6568926793ace1b6447da598294a610018cb164be
+ARG GH_SHA256_ARM64=ea4e7a581a32ccad6cc7923cb1576ac5859ba4b9a16ab22eb8f8a96e78e2e961
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64)  arch="amd64"; sha="$GH_SHA256_AMD64" ;; \
+      aarch64) arch="arm64"; sha="$GH_SHA256_ARM64" ;; \
+      *) echo "ERROR: unsupported arch '$(uname -m)' for gh" >&2; exit 1 ;; \
+    esac; \
+    asset="gh_${GH_VERSION}_linux_${arch}.tar.gz"; \
+    curl -fsSL -o /tmp/gh.tar.gz "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${asset}"; \
+    echo "${sha}  /tmp/gh.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/gh.tar.gz -C /tmp "gh_${GH_VERSION}_linux_${arch}/bin/gh"; \
+    install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${arch}/bin/gh" /usr/local/bin/gh; \
+    rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_${arch}"; \
+    installed="$(/usr/local/bin/gh --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
+    [ "$installed" = "$GH_VERSION" ] || { \
+      echo "ERROR: gh reports '${installed:-<none>}', expected '$GH_VERSION'." >&2; exit 1; }; \
+    echo "gh ${GH_VERSION} pinned (sha256 verified)"
+
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build /build
 
 RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
+
+# Optional extra harness CLIs, off by default — see install-harness-cli.sh and
+# deploy/docker/README.md for names, pins, and the npm: escape hatch. Kept at
+# the end of the stage so script churn doesn't bust the layers above; removed
+# after use.
+ARG EXTRA_HARNESS_CLIS=
+COPY deploy/docker/install-harness-cli.sh /tmp/install-harness-cli.sh
+RUN if [ -n "${EXTRA_HARNESS_CLIS}" ]; then \
+        set -f; \
+        bash /tmp/install-harness-cli.sh ${EXTRA_HARNESS_CLIS}; \
+    fi; \
+    rm -f /tmp/install-harness-cli.sh
 
 WORKDIR /root
 CMD ["sleep", "infinity"]
