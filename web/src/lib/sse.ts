@@ -51,6 +51,7 @@ import type {
   SessionTitleEvent,
   SessionCollaborationModeEvent,
   SessionPermissionModeEvent,
+  SessionCodexApprovalModeEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
@@ -686,6 +687,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       permissionMode,
     } satisfies SessionPermissionModeEvent;
   }
+  if (eventType === "session.codex_approval_mode") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const approvalMode = data.approval_mode;
+    if (typeof approvalMode !== "string" || !approvalMode) return null;
+    return {
+      type: "session_codex_approval_mode",
+      conversationId,
+      approvalMode,
+    } satisfies SessionCodexApprovalModeEvent;
+  }
   if (eventType === "session.agent_changed") {
     const conversationId = data.conversation_id;
     if (typeof conversationId !== "string" || !conversationId) return null;
@@ -1184,6 +1196,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       error: {
         code: String(rec.code ?? ""),
         message: String(rec.message ?? ""),
+        ...(rec.level === "info" ? { level: "info" as const } : {}),
       },
       itemId,
       responseId,
@@ -1324,6 +1337,7 @@ function parseErrorInfo(raw: unknown): ErrorInfo {
     if (typeof r.title === "string" && r.title) info.title = r.title;
     if (typeof r.cause === "string" && r.cause) info.cause = r.cause;
     if (typeof r.remediation === "string" && r.remediation) info.remediation = r.remediation;
+    if (r.level === "info") info.level = "info";
     return info;
   }
   return { code: "", message: String(raw ?? "") };

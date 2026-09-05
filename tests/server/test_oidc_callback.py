@@ -480,6 +480,118 @@ def test_callback_accepts_boolean_and_string_true(
     assert resp.cookies.get("ap_session") is not None
 
 
+# ── Forced re-auth: callback verifies id_token auth_time ───────────
+
+
+def _do_callback_reauth(client: TestClient, id_token: str, *, reauth_at: int) -> httpx.Response:
+    """Drive ``/auth/callback`` with a state cookie that demanded re-auth.
+
+    Mirrors :func:`_do_callback` but stamps ``reauth_at`` into the signed
+    state — the marker ``/auth/login?reauth=1`` writes when it forwards
+    ``prompt=login``/``max_age=0`` to the IdP. The callback must then
+    verify the id_token's ``auth_time`` proves a real re-authentication.
+    """
+    client.app.state.pending_id_token[0] = id_token
+    state = "state-token-reauth"
+    state_jwt = jwt.encode(
+        {
+            "state": state,
+            "code_verifier": "verifier",
+            "return_to": "/",
+            "exp": int(time.time()) + 300,
+            "reauth_at": reauth_at,
+        },
+        _TEST_SECRET,
+        algorithm="HS256",
+    )
+    client.cookies.set(_AUTH_STATE_COOKIE_PLAIN, state_jwt)
+    return client.get(
+        f"/auth/callback?code=auth-code&state={state}",
+        follow_redirects=False,
+    )
+
+
+def test_reauth_callback_accepts_fresh_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A reauth login whose auth_time is at/after the demand mints a session.
+
+    Conformant IdP honoring prompt=login: it re-authenticated the user
+    now, so auth_time >= reauth_at and the freshness demand is satisfied.
+    """
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at + 1}
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+def test_reauth_callback_rejects_stale_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A reauth login whose auth_time predates the demand is refused.
+
+    This is the residual bypass the auth_time check closes: the IdP
+    silently reused its session (auth_time is the original login, before
+    we demanded prompt=login). Trusting it would mint a fresh-iat session
+    that sails past the device-consent freshness gate — a reflex-approve.
+    """
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at - 3600}
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 403, resp.text
+    assert "did not re-authenticate" in resp.json()["error"]
+    assert resp.cookies.get("ap_session") is None
+
+
+def test_reauth_callback_rejects_missing_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A reauth login with no auth_time claim is refused.
+
+    max_age makes auth_time REQUIRED in the id_token (OIDC Core §3.1.3.7);
+    an IdP that omits it leaves the re-auth unverifiable, so we refuse
+    rather than trust an unprovable claim.
+    """
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 403, resp.text
+    assert "did not confirm re-authentication" in resp.json()["error"]
+    assert resp.cookies.get("ap_session") is None
+
+
+def test_non_reauth_callback_ignores_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A plain login (no reauth_at) never consults auth_time.
+
+    Baseline: the new check must not affect the ordinary login path — a
+    token with no auth_time still mints a session when reauth was not
+    demanded.
+    """
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
 # ── CLI login tickets + login-issued refresh grants ───────────────
 
 

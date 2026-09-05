@@ -424,7 +424,7 @@ def test_pre_tool_use_fails_closed_when_verdict_unavailable(
     captured = capsys.readouterr()
     assert exit_code == 0
     result = json.loads(captured.out)
-    assert result["hookSpecificOutput"]["permissionDecision"] == "deny", result
+    assert result["hookSpecificOutput"]["permissionDecision"] == "ask", result
     assert result["hookSpecificOutput"]["permissionDecisionReason"]
 
 

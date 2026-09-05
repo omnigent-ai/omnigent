@@ -50,7 +50,9 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             _codex_home_config_source_from_env(),
             minimal_config=True,
         )
-        native_server = build_codex_native_server(
+        # Profile/model discovery can block in SDK initialization; keep the runner responsive.
+        native_server = await asyncio.to_thread(
+            build_codex_native_server,
             socket_path=temp_root / "unused.sock",
             codex_home=codex_home,
             cwd=title_workdir,

@@ -439,7 +439,7 @@ _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     # NB: no ``antigravity`` — it has no Databricks/gateway path (Gemini-native).
     # NB: no ``kimi`` — upstream kimi has no per-spawn provider override flag,
     # so Omnigent cannot thread a Databricks gateway through. Users configure
-    # providers via ``kimi provider add`` in ``~/.kimi/config.toml``
+    # providers via ``kimi provider add`` in ``~/.kimi-code/config.toml``
     # (Omnigent-side provider injection is a deferred follow-up).
 }
 
@@ -1998,7 +1998,7 @@ def _build_kimi_spawn_env(
     The upstream Kimi Code CLI has no per-spawn provider override flag
     (no ``--config-file`` / ``--mcp-config-file``), so this builder
     only threads the model, working directory, and ``os_env`` sandbox
-    spec. Provider routing for kimi lives in ``~/.kimi/config.toml``
+    spec. Provider routing for kimi lives in ``~/.kimi-code/config.toml``
     and is managed out-of-band via ``kimi provider add``. Unlike the
     sibling builders, ``_build_kimi_spawn_env`` never calls
     :func:`configure_agent_harness_with_provider` (there is no env-var
@@ -2028,7 +2028,8 @@ def _build_kimi_spawn_env(
             "auth injection: upstream kimi has no per-spawn config override "
             "(no ``--config-file`` / ``--mcp-config-file``). Remove "
             "``executor.auth`` from the spec and configure the provider once "
-            "via `kimi provider add` in ~/.kimi/config.toml, then pin the "
+            "via `kimi provider add` in $KIMI_CODE_HOME/config.toml (default "
+            "~/.kimi-code/config.toml), then pin the "
             "resulting model id in the agent spec. Omnigent-side provider "
             "injection is a deferred follow-up.",
             code=ErrorCode.INVALID_INPUT,

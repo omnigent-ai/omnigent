@@ -1423,7 +1423,7 @@ def test_kimi_spawn_env_threads_spec_model_only(config_home: Path) -> None:
     """The kimi builder only emits ``HARNESS_KIMI_MODEL`` (when set) and
     ``HARNESS_KIMI_CWD`` (when workdir given). Upstream kimi has no per-spawn
     provider override, so no HARNESS_KIMI_GATEWAY_* / _DATABRICKS_PROFILE
-    env vars are emitted — provider routing lives in ``~/.kimi/config.toml``."""
+    env vars are emitted — provider routing lives in ``~/.kimi-code/config.toml``."""
     _write_config(config_home, {"providers": {}})
     spec = _make_spec(harness="kimi", model="kimi-k2-turbo")
 
@@ -1453,7 +1453,7 @@ def test_kimi_no_provider_emits_no_gateway_vars(config_home: Path) -> None:
 
     A regression here would either steal an ambient OPENAI_API_KEY (mis-billing)
     or point at a stale URL the user never configured. Upstream kimi reads its
-    provider config from ``~/.kimi/config.toml``; Omnigent never injects."""
+    provider config from ``~/.kimi-code/config.toml``; Omnigent never injects."""
     _write_config(config_home, {"providers": {}})
     spec = _make_spec(harness="kimi")
 
@@ -1473,7 +1473,7 @@ def test_kimi_ignores_global_default_provider(config_home: Path) -> None:
     global default. For kimi we DO NOT — upstream has no per-spawn provider
     override flag, so silently injecting a key the executor can't pass to the
     subprocess would be misleading (and would mis-bill the user against an
-    OpenAI key when their ``~/.kimi/config.toml`` actually points at
+    OpenAI key when their ``~/.kimi-code/config.toml`` actually points at
     Moonshot). The builder emits no gateway vars regardless of what's
     configured."""
     _write_config(config_home, _openai_default_config())
@@ -1501,7 +1501,7 @@ def test_kimi_declared_auth_raises(
 
     Upstream kimi has no per-spawn provider override (no ``--config-file`` /
     ``--mcp-config-file``), so declared auth can't be threaded. Silently
-    launching against whatever ambient ``~/.kimi/config.toml`` resolves to
+    launching against whatever ambient ``~/.kimi-code/config.toml`` resolves to
     would be a confused-deputy / mis-attribution risk, so the builder raises
     instead. Regression guard for the originally-dead ``OmnigentError``."""
     from omnigent.errors import OmnigentError

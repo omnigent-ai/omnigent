@@ -803,6 +803,40 @@ async def test_managed_token_authenticates_as_record_owner(
     assert host.sandbox_id == "sb-tunnel-1"
 
 
+async def test_managed_token_is_revalidated_after_websocket_accept(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """Detaching after handshake auth still blocks final host registration."""
+    app, registry, store = host_app
+    _register_managed(store, host_id=_HOST_ID, token="tunnel-token-race")
+    registered = store.get_host(_HOST_ID)
+    assert registered is not None
+
+    communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, "tunnel-token-race"))
+    await communicator.send_input({"type": "websocket.connect"})
+    accepted = await communicator.receive_output(timeout=1.0)
+    assert accepted["type"] == "websocket.accept"
+
+    assert store.detach_stale_managed_sandbox(
+        _HOST_ID,
+        sandbox_id="sb-tunnel-1",
+        expected_updated_at=registered.updated_at,
+    )
+    await communicator.send_input(
+        {"type": "websocket.receive", "text": _make_hello(name=f"managed-{_HOST_ID}")},
+    )
+    response = await communicator.receive_output(timeout=1.0)
+    if response["type"] == "websocket.send":
+        response = await communicator.receive_output(timeout=1.0)
+    assert response["type"] == "websocket.close"
+    assert registry.get(_HOST_ID) is None
+    detached = store.get_host(_HOST_ID)
+    assert detached is not None
+    assert detached.status == "offline"
+    assert detached.sandbox_id is None
+    assert detached.terminating_sandbox_id == "sb-tunnel-1"
+
+
 @pytest.mark.parametrize(
     ("record_host_id", "token", "presented_token", "expires_in_s"),
     [

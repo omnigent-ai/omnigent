@@ -40,8 +40,16 @@ export function SkillPills({
               /{skill.name}
             </button>
           </TooltipTrigger>
-          <TooltipContent side="top" align="start" className="block max-w-80 p-3">
-            <p className="text-ui font-semibold text-foreground">/{skill.name}</p>
+          {/* Card surface, not the default tooltip chip: that chip is an
+              inverted near-black box in light mode, which left this bubble's
+              title/description tokens as dark text on dark. Mirrors the
+              sidebar session tooltip, the app's other multi-line bubble. */}
+          <TooltipContent
+            side="top"
+            align="start"
+            className="block max-w-80 rounded-lg bg-popover p-3 text-popover-foreground shadow-menu ring-1 ring-foreground/10"
+          >
+            <p className="text-ui font-semibold">/{skill.name}</p>
             <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
               {skill.description}
             </p>

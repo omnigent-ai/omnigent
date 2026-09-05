@@ -347,3 +347,11 @@ def test_stale_entries_evicted_after_ttl(monkeypatch: pytest.MonkeyPatch) -> Non
     # Past the TTL: the lazy sweep on the next access evicts the ghost.
     clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
     assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_has_pending_tracks_parked_messages() -> None:
+    assert pending_inputs.has_pending("conv_hp") is False
+    pending_id = pending_inputs.record("conv_hp", [_text_block("hello")])
+    assert pending_inputs.has_pending("conv_hp") is True
+    pending_inputs.resolve("conv_hp", pending_id)
+    assert pending_inputs.has_pending("conv_hp") is False

@@ -71,7 +71,8 @@ async def read_workspace_from_host(
     :param host_registry: Registry used to enqueue the outbound frame.
     :param host_conn: Live host connection for the session's host.
     :param op: Operation name — ``"list_or_read"`` / ``"changes"`` /
-        ``"diff"`` / ``"search"``.
+        ``"diff"`` / ``"search"`` / ``"github_info"`` / ``"github_changes"`` /
+        ``"github_diff"`` / ``"github_pr_diff"``.
     :param workspace: Absolute workspace path on the host.
     :param session_id: Session id, forwarded to the change registry.
     :param params: Operation-specific arguments.

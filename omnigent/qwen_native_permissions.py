@@ -174,7 +174,7 @@ def _control_response_request_id(event: dict[str, object]) -> str | None:
 def _read_new_control_events(events_file: Path, offset: int) -> tuple[list[_ControlEvent], int]:
     """Read NDJSON lines past *offset*, returning control events + the new offset.
 
-    Mirrors :func:`omnigent.qwen_native_forwarder._read_new_events`: detects a
+    Mirrors :func:`omnigent.qwen_native_forwarder._read_new_forward_events`: detects a
     truncated/recreated file (``size < offset`` → rewind to 0), consumes only
     fully terminated lines, and leaves a trailing partial line for the next poll.
     Only control-plane events (``control_request`` / ``control_response``) are

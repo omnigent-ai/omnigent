@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  getServerPicker,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
@@ -14,7 +15,9 @@ import {
   setBadgeCount as bridgeSetBadge,
   setNativeServerSwitcherHidden,
   setThemeSource,
+  supportsNativeServerPicker,
   supportsBrowser,
+  switchServer,
 } from "./nativeBridge";
 
 // The Electron preload bridge mock, installed on window.omnigentDesktop.
@@ -33,6 +36,8 @@ const iosOnSidebarDragUnsubscribe = vi.fn();
 const iosOnSidebarDrag = vi.fn().mockReturnValue(iosOnSidebarDragUnsubscribe);
 const iosSetServerSwitcherHidden = vi.fn();
 const iosSetSidebarOpen = vi.fn();
+const iosGetServerPicker = vi.fn();
+const iosSwitchServer = vi.fn().mockResolvedValue(undefined);
 
 // The Android WebView bridge mock, installed on window.omnigentNative. The MVP
 // Android shell exposes the shell-agnostic subset (notifications + badge); the
@@ -71,8 +76,13 @@ function setElectron(on: boolean, withClickRouting = true, withBrowser = false):
   }
 }
 
-/** Simulate running inside / outside the iOS shell via the WKWebView bridge. */
-function setIOS(on: boolean, withClickRouting = true): void {
+/**
+ * Simulate running inside / outside the iOS shell via the WKWebView bridge.
+ * `withServerPicker` toggles the optional server-picker trio so tests can also
+ * exercise a shell too old to host the sidebar picker (which then keeps its
+ * own floating pill).
+ */
+function setIOS(on: boolean, withClickRouting = true, withServerPicker = false): void {
   if (on) {
     (window as unknown as Record<string, unknown>).omnigentNative = {
       kind: "ios",
@@ -84,6 +94,13 @@ function setIOS(on: boolean, withClickRouting = true): void {
       ...(withClickRouting
         ? {
             onNotificationActivated: (...args: unknown[]) => iosOnNotificationActivated(...args),
+          }
+        : {}),
+      ...(withServerPicker
+        ? {
+            getServerPicker: (...args: unknown[]) => iosGetServerPicker(...args),
+            switchServer: (...args: unknown[]) => iosSwitchServer(...args),
+            openServerSetup: () => {},
           }
         : {}),
     };
@@ -519,5 +536,60 @@ describe("setNativeServerSwitcherHidden", () => {
       throw new Error("bridge down");
     });
     expect(() => setNativeServerSwitcherHidden(true)).not.toThrow();
+  });
+});
+
+describe("supportsNativeServerPicker", () => {
+  it("is false in a plain browser", () => {
+    expect(supportsNativeServerPicker()).toBe(false);
+  });
+
+  it("is false on an iOS shell without the picker bridge (floating-pill era)", () => {
+    setIOS(true);
+    expect(supportsNativeServerPicker()).toBe(false);
+  });
+
+  it("is true on an iOS shell exposing the picker bridge", () => {
+    setIOS(true, true, true);
+    expect(supportsNativeServerPicker()).toBe(true);
+  });
+
+  it("is false when a version-skewed shell exposes only part of the trio", () => {
+    setIOS(true, true, true);
+    delete (window as unknown as { omnigentNative: Record<string, unknown> }).omnigentNative
+      .openServerSetup;
+    expect(supportsNativeServerPicker()).toBe(false);
+  });
+});
+
+describe("getServerPicker / switchServer over the iOS bridge", () => {
+  it("resolves the iOS shell's picker payload", async () => {
+    setIOS(true, true, true);
+    const info = {
+      currentOrigin: "https://ios.example.test",
+      managedServers: [],
+      recentServers: ["https://ios.example.test/", "https://other.example.test/"],
+    };
+    iosGetServerPicker.mockResolvedValue(info);
+
+    await expect(getServerPicker()).resolves.toEqual(info);
+  });
+
+  it("resolves null on an iOS shell without the picker bridge", async () => {
+    setIOS(true);
+    await expect(getServerPicker()).resolves.toBeNull();
+    expect(iosGetServerPicker).not.toHaveBeenCalled();
+  });
+
+  it("routes a switch request through the iOS bridge", async () => {
+    setIOS(true, true, true);
+    await switchServer("https://other.example.test/");
+    expect(iosSwitchServer).toHaveBeenCalledWith("https://other.example.test/");
+  });
+
+  it("resolves null when the iOS picker bridge rejects", async () => {
+    setIOS(true, true, true);
+    iosGetServerPicker.mockRejectedValueOnce(new Error("bridge down"));
+    await expect(getServerPicker()).resolves.toBeNull();
   });
 });

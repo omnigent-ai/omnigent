@@ -293,6 +293,10 @@ config (`omnigent server -c config.yaml`, or `<data_dir>/config.yaml`):
 sandbox:
   provider: modal
   server_url: https://your-host        # public URL sandboxes dial back to
+  reaper:                              # optional, disabled by default
+    enabled: true
+    terminate_after_offline_days: 30   # default: 30 days
+    sweep_interval_s: 86400            # default: 1 day
 ```
 
 Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
@@ -300,6 +304,14 @@ Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
 Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`. Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY` from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
+
+The optional reaper runs once for the whole `sandbox:` deployment, including
+multi-provider configurations. It queries managed host rows directly and
+detaches a sandbox generation only after its host has stayed offline past
+`terminate_after_offline_days`. Provider termination failures remain recorded
+for a later sweep, while the session history and durable host binding stay
+available for a fresh sandbox generation. Both
+`terminate_after_offline_days` and `sweep_interval_s` must be positive integers.
 
 **The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. To use a custom image instead, build the same `host` target and point the provider config at it:
 

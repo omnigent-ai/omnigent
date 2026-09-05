@@ -208,9 +208,13 @@ async def _drive_prefill(base_url: str, session_id: str) -> None:
 
             await _wait_until(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
-            assert body["agent_id"] == "ag_pinned_e2e", body
             assert body["host_id"] == _HOST_ID, body
-            assert body["workspace"] == _CONFIG_WORKSPACE, body
+            # The create names its project and OMITS the fields still holding
+            # their untouched config seed, so the server default-fills them
+            # from that same config (one source of truth instead of a copy).
+            assert body["project_id"] == _PROJECT_ID, body
+            assert "agent_id" not in body, body
+            assert "workspace" not in body, body
         finally:
             await browser.close()
 
@@ -438,11 +442,12 @@ async def _drive_born_filed(base_url: str, session_id: str) -> None:
             await _wait_until(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
-            # Born filed: the create carries the legacy omni_project label so the
-            # sidebar files the new row under its project immediately, rather than
-            # flashing under "Sessions" until the follow-up project_id move lands.
-            labels = body.get("labels") or {}
-            assert labels.get("omni_project") == _PROJECT_NAME, body
+            # Born filed, first-class: the create names the project so the
+            # server files it at insert. No legacy omni_project label and no
+            # follow-up move — the row is a member from its first appearance,
+            # with no window where it exists unfiled.
+            assert body["project_id"] == _PROJECT_ID, body
+            assert (body.get("labels") or {}).get("omni_project") is None, body
         finally:
             await browser.close()
 
@@ -763,7 +768,11 @@ async def _drive_global_worktree(base_url: str, session_id: str, *, config_body:
 
             await _wait_until(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
-            assert body["workspace"] == _GIT_REPO, body
+            # Workspace is still the untouched config seed, so it is omitted
+            # for the server to default-fill; the branch name is generated
+            # client-side and therefore always explicit.
+            assert body["project_id"] == _PROJECT_ID, body
+            assert "workspace" not in body, body
             git = body.get("git") or {}
             assert re.fullmatch(r"worktree-[0-9a-f]{8}", git.get("branch_name", "")), body
         finally:
@@ -818,8 +827,9 @@ async def _drive_project_opt_out(base_url: str, session_id: str) -> None:
 
             await _wait_until(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
-            assert body["workspace"] == _GIT_REPO, body
-            # Explicit opt-out → a plain launch, no worktree.
+            assert body["project_id"] == _PROJECT_ID, body
+            assert "workspace" not in body, body
+            # Explicit opt-out -> a plain launch, no worktree.
             assert body.get("git") is None, body
         finally:
             await browser.close()

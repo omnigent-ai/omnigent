@@ -94,11 +94,21 @@ def configure(
     _last_pending.clear()
 
 
-def _submit(description: str, fn, *args, on_failure=None) -> None:  # type: ignore[no-untyped-def]
+def conversation_store() -> ConversationStore | None:
     """
-    Run one store write on the ordered background worker.
+    Return the conversation store wired by :func:`configure`.
 
-    The write runs inside a snapshot of the *caller's* ``contextvars``
+    :returns: The server's conversation store, or ``None`` when live-state
+        persistence is disabled (tests / non-server processes).
+    """
+    return _store
+
+
+def submit(description: str, fn, *args, on_failure=None) -> None:  # type: ignore[no-untyped-def]
+    """
+    Run one store-backed task on the ordered background worker.
+
+    The task runs inside a snapshot of the *caller's* ``contextvars``
     (``copy_context().run``). The store filters every query on
     ``current_workspace_id()``, a ``ContextVar`` the multi-tenant request
     middleware binds per request via ``workspace_scope``; a bare
@@ -173,7 +183,7 @@ def persist_live_status(session_id: str, status: str) -> None:
         if _last_status.get(session_id) == status:
             _last_status.pop(session_id, None)
 
-    _submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
+    submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
 
 
 def persist_scheduled_run_completion(
@@ -234,7 +244,7 @@ def persist_scheduled_run_completion(
             error_code=error_code,
         )
 
-    _submit("scheduled_run_completion", _transition)
+    submit("scheduled_run_completion", _transition)
 
 
 def persist_pending_count(conversation_id: str, count: int) -> None:
@@ -257,7 +267,7 @@ def persist_pending_count(conversation_id: str, count: int) -> None:
         if _last_pending.get(conversation_id) == count:
             _last_pending.pop(conversation_id, None)
 
-    _submit(
+    submit(
         "pending_count",
         _store.set_pending_elicitation_count,
         conversation_id,
@@ -283,7 +293,7 @@ def touch_runner_liveness(runner_ids: list[str]) -> None:
     """
     if _store is None or not runner_ids:
         return
-    _submit("runner_liveness", _store.touch_runner_liveness, list(runner_ids), int(time.time()))
+    submit("runner_liveness", _store.touch_runner_liveness, list(runner_ids), int(time.time()))
 
 
 def clear_runner_liveness(runner_id: str) -> None:
@@ -298,4 +308,4 @@ def clear_runner_liveness(runner_id: str) -> None:
     """
     if _store is None:
         return
-    _submit("runner_liveness_clear", _store.clear_runner_liveness, runner_id)
+    submit("runner_liveness_clear", _store.clear_runner_liveness, runner_id)

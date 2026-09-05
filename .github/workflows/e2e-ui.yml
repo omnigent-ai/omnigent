@@ -62,10 +62,6 @@ jobs:
   # (security-gate.yml); trusted authors and non-PR events pass instantly.
   gate:
     uses: ./.github/workflows/security-gate.yml
-    # Larger runner: the gate blocks setup, build-sidecar, and the shards below
-    # it, so keeping it on the saturated standard pool throttled the workflow.
-    with:
-      runner: ubuntu-latest-m
 
   # Compute the shard matrix once. A skipped run (draft / fork pull_request)
   # yields an EMPTY matrix -> zero shard jobs -> no skipped placeholder check.
@@ -73,9 +69,7 @@ jobs:
   setup:
     name: setup
     needs: gate
-    # Larger runner: setup + build-sidecar sit upstream of the e2e-ui shards, so
-    # on the saturated standard pool they throttled the shards before they began.
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -107,9 +101,7 @@ jobs:
     name: build codex-parity sidecar
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}'
-    # Larger runner: on the critical path to the e2e-ui shards (they `needs`
-    # this), and the cold Rust build is CPU-parallel, so more cores help too.
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -155,12 +147,7 @@ jobs:
     # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
     # `ready_for_review` re-fires when a draft is converted.
     needs: [setup, build-sidecar]
-    # Larger runner: this 4-shard suite is a top consumer of standard-runner
-    # slots, so moving it to the separate larger-runner pool cuts its queue
-    # wait and frees standard slots for other workflows. The 16 GB RAM also
-    # eases the native-CLI render-parity tests (browser + Claude/Codex CLIs +
-    # tmux panes + mock server) that press hard on the 7 GB standard runner.
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
@@ -248,19 +235,17 @@ jobs:
       # native render-parity tests boot a real Claude Code / Codex CLI. The
       # rest of the e2e-ui suite (openai-agents) ignores them.
       - name: Install Claude Code CLI
-        # claude-code 2.1.170, NOT the 2.1.124 in .github/ci-deps: 2.1.124
-        # doesn't recognise the hook events the native bridge configures and
-        # shows a blocking startup modal that swallows the first message.
-        # Runs the package's install script so the platform-specific binary is
-        # linked into the temporary CLI directory and put on PATH.
-        # (The install.cjs script was removed in the same version the upstream
-        # npm package no longer ships it, so lifecycle scripts are required.)
+        # Same claude-code pin as .github/ci-deps. The native bridge needs a
+        # release that recognises its hook events (older ones show a blocking
+        # startup modal that swallows the first message). Runs the package's
+        # install script so the platform-specific binary is linked into the
+        # temporary CLI directory and put on PATH.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
           mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --no-audit --no-fund @anthropic-ai/claude-code@2.1.212
+          npm install --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
           echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Install Codex CLI

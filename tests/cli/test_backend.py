@@ -13,8 +13,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import re
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -88,6 +90,30 @@ def _patch_daemon_spawn(
         return proc
 
     monkeypatch.setattr(cli.subprocess, "Popen", _popen)
+
+    def _claim(
+        target: str,
+        spawned: cli._SpawnedDaemonProcess,
+        **_kwargs: object,
+    ) -> cli._HostDaemonRecord | None:
+        env = captured["env"]
+        assert isinstance(env, dict)
+        mode = "local" if target == "local" else "server"
+        cli._write_daemon_record(
+            cli._HostDaemonRecord(
+                pid=spawned.pid,
+                target=target,
+                mode=mode,
+                server_url=None if mode == "local" else target,
+                log_path=spawned.log_path,
+                started_at=int(cli.time.time()),
+                config_sig=str(env[cli.DAEMON_CONFIG_SIG_ENV_VAR]),
+            )
+        )
+        cli._HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n")
+        return cli._find_daemon_record(target)
+
+    monkeypatch.setattr(cli, "_wait_for_daemon_claim", _claim)
 
 
 def _write_daemon_registry_record(
@@ -544,6 +570,95 @@ def test_ensure_host_daemon_young_offline_daemon_not_torn_down(
     assert "args" not in captured  # reused despite being offline (still connecting)
 
 
+def test_concurrent_ensure_host_daemon_elects_one_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Concurrent launchers may spawn, but only one daemon claims the target."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_build_host_daemon_env", lambda **_kw: {})
+    monkeypatch.setattr(cli, "server_config_signature", lambda **_kw: "sig")
+    live_pids: set[int] = set()
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid in live_pids)
+
+    both_spawned = threading.Barrier(2)
+    spawn_count = 0
+    count_lock = threading.Lock()
+
+    def _spawn(**_kw: object) -> cli._SpawnedDaemonProcess:
+        nonlocal spawn_count
+        with count_lock:
+            spawn_count += 1
+            count = spawn_count
+        pid = 4241 + count
+        both_spawned.wait(timeout=5)
+        if count == 1:
+            live_pids.add(pid)
+            target = "https://server.example.com"
+            cli._write_daemon_record(
+                cli._HostDaemonRecord(
+                    pid=pid,
+                    target=target,
+                    mode="server",
+                    server_url=target,
+                    log_path=str(tmp_path / "host.log"),
+                    started_at=int(cli.time.time()),
+                    config_sig="sig",
+                )
+            )
+        return cli._SpawnedDaemonProcess(pid=pid, log_path=str(tmp_path / "host.log"))
+
+    monkeypatch.setattr(cli, "_spawn_host_daemon_process", _spawn)
+    errors: list[Exception] = []
+
+    def _ensure() -> None:
+        try:
+            _ensure_host_daemon("https://server.example.com")
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first = threading.Thread(target=_ensure)
+    second = threading.Thread(target=_ensure)
+    first.start()
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert spawn_count == 2
+    record = cli._find_daemon_record("https://server.example.com")
+    assert record is not None
+    assert record.pid == 4242
+
+
+def test_ensure_host_daemon_warns_when_spawned_daemon_never_claims(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A spawned daemon that never writes its record is surfaced, not silent."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_build_host_daemon_env", lambda **_kw: {})
+    monkeypatch.setattr(cli, "server_config_signature", lambda **_kw: "sig")
+    log_path = tmp_path / "host.log"
+    monkeypatch.setattr(
+        cli,
+        "_spawn_host_daemon_process",
+        lambda **_kw: cli._SpawnedDaemonProcess(pid=4242, log_path=str(log_path)),
+    )
+    # The daemon crashes before claiming: no record ever appears.
+    monkeypatch.setattr(cli, "_wait_for_daemon_claim", lambda *_a, **_kw: None)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli"):
+        _ensure_host_daemon("https://server.example.com")
+
+    assert any(
+        "did not claim its registry record" in message and str(log_path) in message
+        for message in caplog.messages
+    )
+
+
 def _online_record() -> cli._HostDaemonRecord:
     """Build a local daemon record suitable for host-online probing.
 
@@ -945,6 +1060,74 @@ def test_foreground_connect_local_prompt_aborted_leaves_server(
     # Exit 0 (Abort swallowed, no traceback) and the server is left running.
     assert result.exit_code == 0, result.output
     assert "Left the local server running at http://127.0.0.1:8000." in result.output
+
+
+def test_host_reset_id_mints_fresh_id_when_no_daemon_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`host reset-id --yes` replaces the persisted host id.
+
+    The recovery path for the 409 "already registered to a different
+    account" refusal: the machine must be able to mint a fresh id and
+    re-register under the signed-in identity without an administrator.
+    """
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}}))
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [])
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Host id reset:" in result.output
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] != "a" * 32
+    assert cfg["host"]["name"] == "my-laptop"
+
+
+def test_host_reset_id_refuses_while_a_daemon_is_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A live daemon still holds the old id — the reset must ask for a stop first.
+
+    Resetting under a running daemon would desync the persisted identity
+    from the registered tunnel; failing loud with the stop command is the
+    actionable path.
+    """
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}}))
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [_online_record()])
+    monkeypatch.setattr(cli, "_pid_alive", lambda _pid: True)
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id", "--yes"])
+
+    assert result.exit_code != 0
+    assert "host stop" in result.output
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] == "a" * 32, "a refused reset must not touch the id"
+
+
+def test_host_reset_id_declined_prompt_leaves_id_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Answering no at the confirmation keeps the persisted id."""
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}}))
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [])
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id"], input="n\n")
+
+    assert result.exit_code != 0  # click.Abort
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] == "a" * 32
 
 
 def test_foreground_connect_local_prompts_after_keyboard_interrupt(

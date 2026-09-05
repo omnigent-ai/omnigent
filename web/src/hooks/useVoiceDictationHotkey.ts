@@ -11,14 +11,20 @@
 
 import { useEffect, useRef } from "react";
 
+import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+
 /** Selector for surfaces that own their keystrokes (terminals, code editor). */
 const HOTKEY_OWNING_SURFACES = ".xterm, .monaco-editor";
 
-/** True when the event is the voice-dictation chord: Cmd/Ctrl+Alt+V, no Shift. */
-export function isVoiceDictationHotkey(e: globalThis.KeyboardEvent): boolean {
-  // Require Cmd/Ctrl AND Alt (the browser-safe ⌘⌥ chord) and reject Shift, so
-  // ⌘⌥⇧ combos stay free for future bindings.
-  if (!(e.metaKey || e.ctrlKey) || !e.altKey || e.shiftKey) return false;
+/** True when the event is the voice-dictation chord: the platform command
+ *  modifier + Alt + V, no Shift. */
+export function isVoiceDictationHotkey(
+  e: globalThis.KeyboardEvent,
+  isMac: boolean = isMacPlatform(),
+): boolean {
+  // Require the platform command modifier AND Alt (the browser-safe ⌘⌥ chord)
+  // and reject Shift, so ⌘⌥⇧ combos stay free for future bindings.
+  if (!hasCommandModifier(e, isMac) || !e.altKey || e.shiftKey) return false;
   // AltGr often reports as Ctrl+Alt; ignore it so intl-layout typing doesn't
   // trigger dictation. Guard the call: not every environment implements
   // getModifierState, and an unguarded call there would throw.
@@ -41,7 +47,11 @@ function focusOwnsHotkey(): boolean {
  * @param enabled  Pass `false` to skip binding (e.g. the secondary composer in
  *   the New Chat dialog, so two mics don't fight for the device). Defaults on.
  */
-export function useVoiceDictationHotkey(onToggle: () => void, enabled = true): void {
+export function useVoiceDictationHotkey(
+  onToggle: () => void,
+  enabled = true,
+  isMac = isMacPlatform(),
+): void {
   // Held in a ref so the bound handler always calls the latest closure without
   // re-registering on every render (onToggle changes as listening state flips).
   const latest = useRef(onToggle);
@@ -52,7 +62,7 @@ export function useVoiceDictationHotkey(onToggle: () => void, enabled = true): v
     const handler = (e: globalThis.KeyboardEvent): void => {
       // Ignore auto-repeat: holding the chord would flap dictation on/off.
       if (e.repeat) return;
-      if (!isVoiceDictationHotkey(e)) return;
+      if (!isVoiceDictationHotkey(e, isMac)) return;
       if (focusOwnsHotkey()) return;
       e.preventDefault();
       e.stopPropagation();
@@ -60,5 +70,5 @@ export function useVoiceDictationHotkey(onToggle: () => void, enabled = true): v
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [enabled]);
+  }, [enabled, isMac]);
 }

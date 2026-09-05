@@ -10,32 +10,51 @@ fed by two server-side sources, both exercised here against a real LLM:
   the recursive tree poll reads for deeper levels.
 
 If the server stops emitting either, the CLI panel goes blank even while
-sub-agents are running. A terminal UI can't be driven from e2e, so this test
-asserts the data the panel consumes, not the rendering (covered by the
-``tests/frontends/sdk`` unit tests).
+sub-agents are running. The first test asserts that data contract against a
+real LLM. The second drives the real CLI under a PTY against the mock LLM and
+reads the rendered toolbar, for the case the runner's own fan-out cannot
+cover: a child whose status changes without its parent's runner knowing.
 
 Excluded from default ``pytest`` runs via ``--ignore=tests/e2e``. Invoke::
 
     pytest tests/e2e/test_repl_subagent_panel_events_e2e.py \\
         --llm-api-key "$(cat /tmp/mykey)" -v
+    pytest tests/e2e/test_repl_subagent_panel_events_e2e.py -k toolbar -v
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
+import re
+import sys
 import threading
+import time
+import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from omnigent_client._sessions import SessionsNamespace
 
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
+    lookup_agent_id,
     poll_session_until_terminal,
+    release_mock_gate,
+    reset_mock_llm,
     send_user_message_to_session,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+# Wide enough that the right-aligned ``state:`` badge fits after the hint
+# row; at 120 columns it falls off the edge and never reaches the PTY.
+_REPL_DIMENSIONS = (40, 200)
 
 
 def _iter_sse(response: httpx.Response):
@@ -205,3 +224,172 @@ def test_parent_stream_and_child_sessions_expose_subagents(
         "child updates carried no current_task_status — the menu's per-agent "
         "status word would be blank."
     )
+
+
+def _attach_repl_env(tmp_home: Path) -> dict[str, str]:
+    """Build the env for spawning ``omnigent attach`` under a PTY.
+
+    An isolated ``HOME`` / config home keeps the developer's real config out
+    of the run, and the persisted theme skips the interactive theme picker
+    that would otherwise stand in for the prompt.
+
+    :param tmp_home: Per-test directory to use as ``HOME``.
+    :returns: The subprocess environment.
+    """
+    from tests.e2e.omnigent._pexpect_harness import ensure_repl_test_theme_env
+
+    config_home = tmp_home / ".omnigent"
+    config_home.mkdir(parents=True, exist_ok=True)
+    (config_home / "config.yaml").write_text(
+        "auto_open_conversation: false\ntui:\n  theme: dark\n",
+    )
+    sdk_paths = [
+        str(_REPO_ROOT / "sdks" / "python-client"),
+        str(_REPO_ROOT / "sdks" / "ui"),
+    ]
+    existing_pp = os.environ.get("PYTHONPATH", "")
+    env = {
+        **os.environ,
+        "HOME": str(tmp_home),
+        "OMNIGENT_CONFIG_HOME": str(config_home),
+        "OMNIGENT_SKIP_ONBOARD": "1",
+        "OMNIGENT_NO_UPDATE_CHECK": "1",
+        "PYTHONPATH": os.pathsep.join([*sdk_paths, existing_pp] if existing_pp else sdk_paths),
+        "TERM": "xterm-256color",
+        "LINES": str(_REPL_DIMENSIONS[0]),
+        "COLUMNS": str(_REPL_DIMENSIONS[1]),
+        "PROMPT_TOOLKIT_NO_CPR": "1",
+    }
+    return ensure_repl_test_theme_env(env)
+
+
+# The settled frame lists the seeded child (``↓ agents``) with the badge
+# asleep on the same toolbar line; the lit frame is the running badge.
+_SETTLED_TOOLBAR = re.compile(r"↓ agents.*state: sleeping")
+_RUNNING_TOOLBAR = re.compile(r"state: 1 agent running")
+
+
+def _wait_for_toolbar(repl: Any, pattern: re.Pattern[str], timeout: float) -> str:
+    """Repaint the REPL until its toolbar matches *pattern* or *timeout* elapses.
+
+    prompt-toolkit repaints only the cells that changed, so a badge flip
+    reaches the PTY as scattered fragments. Ctrl+L forces a full frame each
+    poll so the toolbar can be matched as one contiguous line.
+
+    :param repl: Live ``pexpect.spawn`` REPL sitting at its prompt.
+    :param pattern: Toolbar text to wait for, e.g. :data:`_RUNNING_TOOLBAR`.
+    :param timeout: Seconds to keep polling.
+    :returns: The last full frame, ANSI-stripped, whether or not it matched;
+        callers assert on it so a miss shows the real screen.
+    """
+    from tests.e2e.omnigent._pexpect_harness import strip_ansi
+    from tests.e2e.omnigent._repl_test_helpers import drain_for
+
+    frame = ""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        repl.sendcontrol("l")
+        frame = strip_ansi(drain_for(repl, 1.0))
+        if pattern.search(frame):
+            break
+    return frame
+
+
+@pytest.mark.posix_only
+def test_repl_toolbar_shows_child_driven_outside_parent_runner(
+    live_server: str,
+    http_client: httpx.Client,
+    coder_agent: str,
+    live_runner_id: str,
+    mock_llm_server_url: str,
+    using_mock_llm: bool,
+    tmp_path: Path,
+) -> None:
+    """The real CLI toolbar lights up for a child the parent's runner never
+    registered.
+
+    Reproduces the shape behind a reused or directly-driven sub-agent: the
+    child exists before the REPL attaches, so the REPL seeds it idle and
+    parks its tree poll; then a turn is posted to the child directly. The
+    runner's in-process child→parent fan-out knows nothing about this child,
+    so the parent's stream only learns the child went busy if the server
+    mirrors the status edge. Without that the badge sits on
+    ``state: sleeping`` while the child works.
+
+    :param live_server: Base URL of the live server the REPL attaches to.
+    :param http_client: HTTP client pointed at the live server.
+    :param coder_agent: Uploaded agent both sessions bind to.
+    :param live_runner_id: Registered runner the parent binds to; the child
+        inherits it.
+    :param mock_llm_server_url: Mock LLM whose gate holds the child's turn
+        open while the toolbar is read.
+    :param using_mock_llm: True when no ``--llm-api-key`` was passed.
+    :param tmp_path: Per-test directory for the REPL's isolated ``HOME``.
+    """
+    pexpect = pytest.importorskip("pexpect")
+    if not using_mock_llm:
+        pytest.skip(
+            "relies on the mock LLM's gate to hold the child's turn open while "
+            "the toolbar is read."
+        )
+
+    token = f"child-turn-{uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "child done", "block": True}],
+        match=token,
+    )
+    parent_id = create_runner_bound_session(
+        http_client, agent_name=coder_agent, runner_id=live_runner_id
+    )
+    resp = http_client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": lookup_agent_id(http_client, coder_agent),
+            "parent_session_id": parent_id,
+            "title": "probe:worker",
+        },
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    )
+    resp.raise_for_status()
+    child_id = str(resp.json()["id"])
+
+    repl = pexpect.spawn(
+        sys.executable,
+        ["-m", "omnigent", "attach", parent_id, "--server", live_server],
+        env=_attach_repl_env(tmp_path / "home"),
+        cwd=str(_REPO_ROOT),
+        encoding="utf-8",
+        codec_errors="replace",
+        timeout=120,
+        dimensions=_REPL_DIMENSIONS,
+    )
+    response_id: str | None = None
+    try:
+        repl.expect("❯", timeout=90)
+        # The REPL discovered the pre-existing child and, seeing it idle,
+        # parked its tree poll: the ↓ menu is offered but nothing is running.
+        settled = _wait_for_toolbar(repl, _SETTLED_TOOLBAR, timeout=20.0)
+        assert _SETTLED_TOOLBAR.search(settled), (
+            f"REPL never listed the seeded child with the badge asleep; saw:\n{settled}"
+        )
+
+        response_id = send_user_message_to_session(http_client, session_id=child_id, content=token)
+        lit = _wait_for_toolbar(repl, _RUNNING_TOOLBAR, timeout=25.0)
+        assert _RUNNING_TOOLBAR.search(lit), (
+            "toolbar stayed asleep while the child ran: the parent stream never "
+            f"carried the child's busy edge; saw:\n{lit}"
+        )
+    finally:
+        with contextlib.suppress(httpx.HTTPError):
+            release_mock_gate(mock_llm_server_url)
+        with contextlib.suppress(pexpect.ExceptionPexpect):
+            repl.sendcontrol("d")
+            repl.expect(pexpect.EOF, timeout=15)
+        if repl.isalive():
+            repl.terminate(force=True)
+        reset_mock_llm(mock_llm_server_url)
+    if response_id is not None:
+        poll_session_until_terminal(
+            http_client, session_id=child_id, response_id=response_id, timeout=60
+        )

@@ -18,6 +18,7 @@ conversation row's ``agent_id`` column.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import tarfile
@@ -659,6 +660,62 @@ async def test_child_sessions_current_task_status_reflects_relay_status_cache(
         assert row["current_task_status"] == expected_task_status
     finally:
         sessions_module._session_status_cache.pop(child.id, None)
+
+
+async def test_child_status_edge_fans_out_to_parent_stream(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A child's status transition reaches the parent's stream from the server.
+
+    The runner only fans out ``session.child_session.updated`` for children
+    it registered in-process, so a child driven outside its parent's runner
+    (or after a runner restart) used to change status with no parent-stream
+    event at all, leaving the REPL badge and the web rail on ``Idle``. The
+    server sees every transition in the status cache, so it publishes the
+    child's current summary to the parent: ``running`` → busy /
+    ``in_progress``, ``idle`` → ``completed``, and a repeated identical edge
+    stays quiet.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    from omnigent.runtime import session_stream
+    from tests.server.helpers import start_session_stream_collector
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:auth",
+        agent_id=session["agent_id"],
+    )
+    collector = await start_session_stream_collector(session["id"])
+    try:
+        sessions_module._publish_status(child.id, "running")
+        sessions_module._publish_status(child.id, "running")
+        sessions_module._publish_status(child.id, "idle")
+
+        updates: list[dict[str, Any]] = []
+        while len(updates) < 2:
+            event = await asyncio.wait_for(collector.queue.get(), timeout=5.0)
+            if event.get("type") == "session.child_session.updated":
+                updates.append(event)
+        assert [u["child_session_id"] for u in updates] == [child.id, child.id]
+        assert [u["conversation_id"] for u in updates] == [session["id"]] * 2
+        assert updates[0]["child"]["busy"] is True
+        assert updates[0]["child"]["current_task_status"] == "in_progress"
+        assert updates[1]["child"]["busy"] is False
+        assert updates[1]["child"]["current_task_status"] == "completed"
+        assert updates[1]["child"]["title"] == "researcher:auth"
+        await asyncio.sleep(0.2)
+        assert collector.queue.empty(), "a repeated identical edge must not fan out"
+    finally:
+        await collector.stop()
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_stream.close(session["id"])
 
 
 async def test_child_sessions_truncates_long_message_preview(
@@ -1661,6 +1718,47 @@ async def test_multipart_create_with_parent_links_child(
     # kind="sub_agent" is what the child_sessions listing filters on —
     # absence here means the multipart path created a top-level row.
     assert child_id in listed_ids
+
+
+@pytest.mark.parametrize(
+    "harness,config,expected_args",
+    [
+        (
+            "codex-native",
+            {"yolo": True},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+        ),
+        (
+            "claude-native",
+            {"permission_mode": "bypassPermissions"},
+            ["--permission-mode", "bypassPermissions"],
+        ),
+    ],
+)
+async def test_multipart_child_derives_native_bypass_args_from_uploaded_spec(
+    client: httpx.AsyncClient,
+    harness: str,
+    config: dict[str, Any],
+    expected_args: list[str],
+) -> None:
+    """A config-path child persists the uploaded agent's bypass stance."""
+    parent = await _create_parent_session(client, agent_name=f"bundle-yolo-parent-{harness}")
+    child_bundle = build_agent_bundle(
+        name=f"bundle-yolo-child-{harness}",
+        executor={"type": "omnigent", "config": {"harness": harness, **config}},
+        include_llm=False,
+    )
+
+    resp = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"parent_session_id": parent["id"]})},
+        files={"bundle": ("agent.tar.gz", child_bundle, "application/gzip")},
+    )
+
+    assert resp.status_code == 201, resp.text
+    child = await client.get(f"/v1/sessions/{resp.json()['session_id']}")
+    assert child.status_code == 200, child.text
+    assert child.json()["terminal_launch_args"] == expected_args
 
 
 async def test_multipart_create_with_unknown_parent_404s(

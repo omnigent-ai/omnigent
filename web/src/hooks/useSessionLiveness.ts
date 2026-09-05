@@ -216,6 +216,29 @@ export function useSessionLiveness(
   conv: LivenessRow | null | undefined,
   opts?: { turnActive?: boolean; launchedAt?: number | null },
 ): SessionLiveness {
+  const raw = useSessionLivenessRaw(sessionId, conv, opts);
+  // Identity-stabilize: the raw computation returns a fresh object literal
+  // every render, so consumers (ChatPage, Composer, WorkspacePanel, ...) would
+  // re-render on every unrelated store/poll tick even when the value is
+  // unchanged. Keep the previous object when the value is structurally equal.
+  const prev = useRef<SessionLiveness | null>(null);
+  if (prev.current !== null && livenessEqual(prev.current, raw)) return prev.current;
+  prev.current = raw;
+  return raw;
+}
+
+/** Structural equality for the small `SessionLiveness` union. */
+function livenessEqual(a: SessionLiveness, b: SessionLiveness): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "host_offline" && b.kind === "host_offline") return a.isOwner === b.isOwner;
+  return true;
+}
+
+function useSessionLivenessRaw(
+  sessionId: string | undefined,
+  conv: LivenessRow | null | undefined,
+  opts?: { turnActive?: boolean; launchedAt?: number | null },
+): SessionLiveness {
   const runnerOnline = useSessionRunnerOnline(sessionId);
   const hostOnline = useSessionHostOnline(sessionId);
 

@@ -520,6 +520,56 @@ def fail_closed_hook_output(
     return None
 
 
+_EVAL_UNAVAILABLE_ASK_REASON = (
+    "Omnigent policy evaluation unavailable (could not reach or authenticate to the "
+    "Omnigent server); please approve or deny this tool call manually."
+)
+
+
+def fail_ask_hook_output(hook_event: str, detail: str | None = None) -> dict[str, object] | None:
+    """
+    Build the fail-ask hook output for an unobtainable policy verdict.
+
+    Like :func:`fail_closed_hook_output` but for ``PreToolUse``: instead of
+    auto-denying the tool call, returns ``permissionDecision: "ask"`` so the
+    harness explicitly prompts the user for approval. This preserves human
+    oversight when the policy server is transiently unreachable — the user
+    still decides — rather than blocking all tool calls until the server
+    recovers. Unlike returning ``None`` (which fails open in
+    ``bypassPermissions`` / ``acceptEdits`` modes), ``"ask"`` forces the
+    approval dialog regardless of the current permission mode.
+
+    ``UserPromptSubmit`` still blocks (fail-closed) because it is the sole
+    pre-turn enforcement gate for native sessions; a server hiccup must not
+    let an over-budget or otherwise-blocked request proceed silently.
+
+    Use this for harnesses whose native TUI has an interactive approval UI
+    (claude-native, codex-native). For headless harnesses where no approval
+    UI is available, prefer :func:`fail_closed_hook_output`.
+
+    :param hook_event: Hook event name, e.g. ``"PreToolUse"``.
+    :param detail: Optional diagnostic string appended to the ask reason
+        shown in the UI. Forwarded to :func:`fail_closed_hook_output` for
+        non-PreToolUse events.
+    :returns: ``permissionDecision: "ask"`` hook output for ``PreToolUse``;
+        delegates to :func:`fail_closed_hook_output` for all other events.
+    """
+    if hook_event == _PRE_TOOL_USE:
+        ask_reason = (
+            f"{_EVAL_UNAVAILABLE_ASK_REASON} Detail: {detail}"
+            if detail
+            else _EVAL_UNAVAILABLE_ASK_REASON
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": _PRE_TOOL_USE,
+                "permissionDecision": "ask",
+                "permissionDecisionReason": ask_reason,
+            },
+        }
+    return fail_closed_hook_output(hook_event, detail)
+
+
 def post_evaluate_with_retry(
     url: str,
     headers: dict[str, str],

@@ -185,6 +185,44 @@ def load_or_create_host_identity(
     return identity
 
 
+def reset_host_id(path: Path = CONFIG_PATH) -> tuple[str | None, str]:
+    """Replace this machine's persisted ``host_id`` with a fresh one.
+
+    The recovery path for a host registration owned by another identity:
+    the server keys hosts by ``host_id``, so once that id is claimed by a
+    different account (e.g. a service principal), re-registering under the
+    signed-in user is refused with HTTP 409. Minting a fresh id lets the
+    machine register as a brand-new host under the current identity.
+
+    The host ``name`` (and every other config key) is preserved; only
+    ``host_id`` changes. A missing config or host section is created, same
+    as :func:`load_or_create_host_identity`.
+
+    :param path: Path to the config YAML file. Defaults to :data:`CONFIG_PATH`.
+    :returns: ``(old_host_id, new_host_id)`` — ``old_host_id`` is ``None``
+        when no identity was persisted before.
+    """
+    cfg: dict[str, object] = {}
+    if path.exists():
+        with open(path) as f:
+            cfg = yaml.safe_load(f) or {}
+
+    host_section = cfg.get("host")
+    if not isinstance(host_section, dict):
+        host_section = {}
+
+    old_host_id = host_section.get("host_id")
+    new_host_id = uuid.uuid4().hex
+    host_section["host_id"] = new_host_id
+    host_section.setdefault("name", socket.gethostname())
+    cfg["host"] = host_section
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
+
+    return (old_host_id if isinstance(old_host_id, str) else None), new_host_id
+
+
 def load_host_identity_if_present(
     path: Path = CONFIG_PATH,
 ) -> HostIdentity | None:

@@ -7,7 +7,10 @@ from typing import cast
 import pytest
 
 from omnigent.entities import ConversationItem, FunctionCallOutputData
+from omnigent.runner.app import _format_subagent_wake_notice
 from omnigent.runtime.prompt import (
+    SUBAGENT_WAKE_NOTICE_INSTRUCTION,
+    SUBAGENT_WAKE_NOTICE_SHAPE,
     append_framework_instructions,
     build_instructions,
     build_instructions_nullable,
@@ -17,6 +20,30 @@ from omnigent.runtime.prompt import (
 from omnigent.spec import AgentSpec
 
 _SAMPLE_FRAMEWORK_INSTRUCTION = "Framework instruction for testing build_instructions_nullable."
+
+
+def _spec(
+    instructions: str | None,
+    *,
+    agents: tuple[str, ...] = (),
+    spawn: bool = False,
+    builtins: tuple[str, ...] = (),
+) -> AgentSpec:
+    """
+    Stub only the AgentSpec fields the instruction builders read.
+    """
+    return cast(
+        AgentSpec,
+        SimpleNamespace(
+            instructions=instructions,
+            skills=[],
+            tools=SimpleNamespace(
+                agents=list(agents),
+                builtins=[SimpleNamespace(name=name) for name in builtins],
+            ),
+            spawn=spawn,
+        ),
+    )
 
 
 def _output_item(output: str) -> ConversationItem:
@@ -100,7 +127,7 @@ def test_history_replay_leaves_non_image_json_output_unchanged() -> None:
 
 
 def test_framework_instructions_append_after_custom_prompts() -> None:
-    spec = cast(AgentSpec, SimpleNamespace(instructions="Agent prompt", skills=[]))
+    spec = _spec("Agent prompt")
 
     result = build_instructions(
         spec,
@@ -113,7 +140,7 @@ def test_framework_instructions_append_after_custom_prompts() -> None:
 
 
 def test_empty_framework_instructions_do_not_change_default() -> None:
-    spec = cast(AgentSpec, SimpleNamespace(instructions=None, skills=[]))
+    spec = _spec(None)
 
     assert build_instructions(spec, None, [], framework_instructions=("", "   ")) == (
         "You are a helpful assistant."
@@ -126,7 +153,7 @@ def test_framework_only_instructions_use_shared_composer() -> None:
 
 def test_build_instructions_nullable_neither_authored_nor_framework() -> None:
     """No author text, no framework text → None, not the fabricated fallback."""
-    spec = cast(AgentSpec, SimpleNamespace(instructions=None, skills=[]))
+    spec = _spec(None)
     assert build_instructions_nullable(spec, None, []) is None
 
 
@@ -134,7 +161,7 @@ def test_build_instructions_nullable_whitespace_only_treated_as_absent() -> None
     """Whitespace-only spec.instructions is not real content — matches
     raw_author_instructions' non-empty/non-whitespace gate, so authored_present
     and composed agree on what counts as "authored"."""
-    spec = cast(AgentSpec, SimpleNamespace(instructions="   \n  ", skills=[]))
+    spec = _spec("   \n  ")
     assert build_instructions_nullable(spec, None, []) is None
     result = build_instructions_nullable(
         spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
@@ -146,7 +173,7 @@ def test_build_instructions_nullable_whitespace_only_per_request_treated_as_abse
     """Whitespace-only per_request_instructions is not real content either —
     the same non-empty/non-whitespace gate applies to both instruction
     sources, not just spec.instructions."""
-    spec = cast(AgentSpec, SimpleNamespace(instructions=None, skills=[]))
+    spec = _spec(None)
     assert build_instructions_nullable(spec, "   \n  ", []) is None
     result = build_instructions_nullable(
         spec, "   \n  ", [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
@@ -156,7 +183,7 @@ def test_build_instructions_nullable_whitespace_only_per_request_treated_as_abse
 
 def test_build_instructions_nullable_authored_present() -> None:
     """Author text present → fully composed authored + framework string."""
-    spec = cast(AgentSpec, SimpleNamespace(instructions="Agent prompt", skills=[]))
+    spec = _spec("Agent prompt")
     result = build_instructions_nullable(
         spec, "Request prompt", [], framework_instructions=("Framework prompt",)
     )
@@ -173,7 +200,7 @@ def test_build_instructions_nullable_framework_only_omits_fallback() -> None:
     was empty — producing a mixed string that is neither the bare literal
     nor framework-text-alone.
     """
-    spec = cast(AgentSpec, SimpleNamespace(instructions=None, skills=[]))
+    spec = _spec(None)
     result = build_instructions_nullable(
         spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
     )
@@ -188,6 +215,45 @@ def test_build_instructions_nullable_framework_only_omits_fallback() -> None:
     )
     assert fused.startswith("You are a helpful assistant.")
     assert _SAMPLE_FRAMEWORK_INSTRUCTION in fused
+
+
+@pytest.mark.parametrize(
+    ("agents", "spawn", "builtins"),
+    [(("researcher",), False, ()), ((), True, ()), ((), False, ("web_fetch",))],
+)
+def test_subagent_wake_instruction_added_for_dispatching_agents(
+    agents: tuple[str, ...], spawn: bool, builtins: tuple[str, ...]
+) -> None:
+    """
+    An agent that can dispatch sub-agents is told what a wake notice is.
+
+    The gate mirrors ``sys_session_send`` registration (declared sub-agents or
+    ``spawn: true``) plus the ``web_fetch`` builtin, whose researcher dispatch
+    wakes the parent the same way. The announcement lands after the authored
+    text and before per-turn framework instructions, and on its own it never
+    drags in the fabricated fallback.
+    """
+    dispatching = _spec("Agent prompt", agents=agents, spawn=spawn, builtins=builtins)
+    result = build_instructions(dispatching, None, [], framework_instructions=("Turn note",))
+    assert result == f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\nTurn note"
+
+    unauthored = _spec(None, agents=agents, spawn=spawn, builtins=builtins)
+    assert build_instructions_nullable(unauthored, None, []) == SUBAGENT_WAKE_NOTICE_INSTRUCTION
+
+
+def test_subagent_wake_notice_shape_matches_runner_notice() -> None:
+    """
+    The announced shape must track the notice the runner actually posts.
+    """
+    expected = (
+        SUBAGENT_WAKE_NOTICE_SHAPE.replace("<agent>/<title>", "researcher/auth")
+        .replace("<status>", "completed")
+        .replace("<N>", "2")
+    )
+    notice = _format_subagent_wake_notice(
+        agent="researcher", title="auth", status="completed", pending=2
+    )
+    assert notice == expected
 
 
 def test_raw_author_instructions_verbatim_and_none() -> None:

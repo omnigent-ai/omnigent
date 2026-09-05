@@ -18,14 +18,46 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
 
+/** True for Windows drive-letter paths such as `C:/Users/me` or `C:\\Users\\me`. */
+export function isWindowsDrivePath(path: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(path);
+}
+
+function sameHostDirectory(a: string, b: string): boolean {
+  if (isWindowsDrivePath(a) && isWindowsDrivePath(b)) {
+    return a.replace(/\\/g, "/").toLowerCase() === b.replace(/\\/g, "/").toLowerCase();
+  }
+  return a === b;
+}
+
+/**
+ * True when the path is already an absolute host path: POSIX ``/…``
+ * or a Windows drive path (``C:\…`` / ``C:/…``).
+ */
+export function isHostAbsolutePath(path: string): boolean {
+  return path.startsWith("/") || isWindowsDrivePath(path);
+}
+
+function lastSeparatorIndex(path: string): number {
+  if (isWindowsDrivePath(path)) {
+    return Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  }
+  return path.lastIndexOf("/");
+}
+
+function separatorOf(path: string): "/" | "\\" {
+  return path.includes("\\") && !path.slice(path.indexOf(":") + 1).includes("/") ? "\\" : "/";
+}
+
 /**
  * Join a directory path and a new child name into an absolute path.
  *
  * Handles the filesystem root (``"/"`` + ``"foo"`` → ``"/foo"`` rather
  * than ``"//foo"``) and trims a trailing slash off the parent so a
- * typed ``"/Users/me/"`` still produces ``"/Users/me/foo"``. The child
- * name is trimmed; surrounding/duplicate slashes in it are left to the
- * host to resolve.
+ * typed ``"/Users/me/"`` still produces ``"/Users/me/foo"``. Windows
+ * drive roots (``C:\``) join with a backslash. The child name is
+ * trimmed; surrounding/duplicate slashes in it are left to the host
+ * to resolve.
  *
  * @param dir Absolute parent directory, e.g. ``"/Users/me"`` or ``"/"``.
  * @param name New child name, e.g. ``"new-app"``.
@@ -36,8 +68,15 @@ export function joinPath(dir: string, name: string): string {
   if (dir === "/") {
     return `/${trimmedName}`;
   }
-  const base = dir.endsWith("/") ? dir.slice(0, -1) : dir;
-  return `${base}/${trimmedName}`;
+  if (/^[A-Za-z]:[\\/]?$/.test(dir)) {
+    const sep = dir.includes("\\") || dir.endsWith("\\") ? "\\" : "/";
+    const root = dir.length === 2 ? `${dir}${sep}` : dir.endsWith(sep) ? dir : `${dir}${sep}`;
+    return `${root}${trimmedName}`;
+  }
+  const sep = separatorOf(dir);
+  const base =
+    dir.endsWith("/") || (isWindowsDrivePath(dir) && dir.endsWith("\\")) ? dir.slice(0, -1) : dir;
+  return `${base}${sep}${trimmedName}`;
 }
 
 /**
@@ -45,7 +84,7 @@ export function joinPath(dir: string, name: string): string {
  *
  * Returns ``null`` when the input is empty (host's home view —
  * has no parent in the picker's UX) or already at the root
- * ``"/"``. Otherwise drops the last segment.
+ * ``"/"`` / ``C:\``. Otherwise drops the last segment.
  *
  * @param absolutePath Absolute path or empty string.
  * @returns Parent path, or ``null`` if there is no further parent.
@@ -54,9 +93,25 @@ export function parentOf(absolutePath: string): string | null {
   if (absolutePath === "" || absolutePath === "/") {
     return null;
   }
-  const stripped = absolutePath.endsWith("/") ? absolutePath.slice(0, -1) : absolutePath;
-  const idx = stripped.lastIndexOf("/");
-  if (idx <= 0) {
+  if (/^[A-Za-z]:[\\/]?$/.test(absolutePath)) {
+    return null;
+  }
+  const stripped =
+    absolutePath.endsWith("/") || (isWindowsDrivePath(absolutePath) && absolutePath.endsWith("\\"))
+      ? absolutePath.slice(0, -1)
+      : absolutePath;
+  if (/^[A-Za-z]:$/.test(stripped)) {
+    return null;
+  }
+  const idx = lastSeparatorIndex(stripped);
+  if (idx < 0) {
+    return null;
+  }
+  // ``C:\Users`` → ``C:\`` (keep the drive root, never POSIX ``/``).
+  if (isWindowsDrivePath(stripped) && idx === 2) {
+    return stripped.slice(0, 3);
+  }
+  if (idx === 0) {
     return "/";
   }
   return stripped.slice(0, idx);
@@ -67,17 +122,10 @@ export function parentOf(absolutePath: string): string | null {
  *
  * Trims whitespace, expands a leading ``~`` against the resolved
  * home directory, collapses runs of slashes, and drops a trailing
- * slash (except on the root ``"/"``). Returns ``null`` for empty
- * or invalid inputs (which the caller treats as "ignore — keep
- * the current path"). The picker never turns a typed path into
- * the empty string; "go home" is its own gesture (clicking the
- * Home breadcrumb).
- *
- * Tilde-only (``"~"``) and ``"~/foo"`` are expanded to
- * ``home`` and ``home + "/foo"`` respectively. If ``home`` is
- * ``null`` (we haven't resolved it yet from the first listing),
- * tilde input is rejected so the user isn't sent to the wrong
- * place. Bare ``~user`` form is not supported.
+ * slash (except on the root ``"/"`` / ``C:\``). Returns ``null`` for
+ * empty or invalid inputs (which the caller treats as "ignore —
+ * keep the current path"). Windows drive-letter paths are accepted
+ * as already-absolute.
  *
  * @param input Whatever the user typed, e.g.
  *   ``"  /Users//corey/  "`` or ``"~/projects"``.
@@ -93,27 +141,28 @@ export function normalizeTypedPath(input: string, home: string | null = null): s
   }
   let absolute: string;
   if (trimmed === "~") {
-    // Bare tilde — go home if we know where that is.
     if (home === null) return null;
     absolute = home;
-  } else if (trimmed.startsWith("~/")) {
-    // ~/foo → <home>/foo. Reject when home isn't resolved yet.
+  } else if (trimmed.startsWith("~/") || (home !== null && trimmed.startsWith("~\\"))) {
     if (home === null) return null;
-    absolute = `${home}/${trimmed.slice(2)}`;
-  } else if (trimmed.startsWith("/")) {
+    absolute = joinPath(home, trimmed.slice(2));
+  } else if (isHostAbsolutePath(trimmed)) {
     absolute = trimmed;
   } else {
-    // Relative paths and ~user forms are not supported — the host
-    // endpoint requires absolute paths.
     return null;
   }
-  // Collapse runs of slashes ("//" → "/") so a typo doesn't
-  // produce a path the host can't list.
+  if (isWindowsDrivePath(absolute) || absolute.startsWith("\\\\")) {
+    const sep = separatorOf(absolute);
+    const collapsed = absolute.replace(/[\\/]+/g, sep);
+    if (/^[A-Za-z]:[\\/]$/.test(collapsed)) {
+      return collapsed;
+    }
+    return collapsed.endsWith(sep) ? collapsed.slice(0, -1) : collapsed;
+  }
   const collapsed = absolute.replace(/\/+/g, "/");
   if (collapsed === "/") {
     return "/";
   }
-  // Drop trailing slash so parent calc stays stable.
   return collapsed.endsWith("/") ? collapsed.slice(0, -1) : collapsed;
 }
 
@@ -133,8 +182,18 @@ export function basename(absolutePath: string): string {
   if (absolutePath === "/") {
     return "/";
   }
-  const parts = absolutePath.split("/").filter((p) => p.length > 0);
-  return parts[parts.length - 1] ?? absolutePath;
+  if (/^[A-Za-z]:[\\/]?$/.test(absolutePath)) {
+    return absolutePath.length >= 3 ? absolutePath.slice(0, 3) : `${absolutePath}\\`;
+  }
+  const stripped =
+    absolutePath.endsWith("/") || (isWindowsDrivePath(absolutePath) && absolutePath.endsWith("\\"))
+      ? absolutePath.slice(0, -1)
+      : absolutePath;
+  const sepIdx = lastSeparatorIndex(stripped);
+  if (sepIdx < 0) {
+    return stripped;
+  }
+  return stripped.slice(sepIdx + 1);
 }
 
 /**
@@ -148,25 +207,14 @@ export function basename(absolutePath: string): string {
  */
 export function isNavigablePath(path: string): boolean {
   const trimmed = path.trim();
-  return trimmed.startsWith("/") || trimmed === "~" || trimmed.startsWith("~/");
+  return (
+    isHostAbsolutePath(trimmed) ||
+    trimmed === "~" ||
+    trimmed.startsWith("~/") ||
+    trimmed.startsWith("~\\")
+  );
 }
 
-/**
- * Live filter for the listing, derived from the path-bar text.
- *
- * Returns the fragment to match the current directory's entries against
- * (case-insensitive prefix), or ``null`` when the text isn't filtering the
- * current directory — it's blank, it's exactly the current path, or it's a
- * path into a *different* directory the user is navigating to (Enter jumps
- * there). Mirrors shell tab-completion: a bare fragment (``"pro"``) or a
- * trailing segment under the current dir (``"/Users/me/pro"``) narrows the
- * list; anything else leaves it whole.
- *
- * @param pathInput Raw path-bar text, e.g. ``"pro"`` or ``"/Users/me/pro"``.
- * @param currentAbsolute Absolute path of the directory currently shown.
- * @param home Resolved home dir (for ``~`` expansion), or ``null``.
- * @returns The fragment to filter by, or ``null`` for no filter.
- */
 export function listingFilter(
   pathInput: string,
   currentAbsolute: string,
@@ -174,7 +222,7 @@ export function listingFilter(
 ): string | null {
   const trimmed = pathInput.trim();
   if (trimmed === "") return null;
-  const slash = trimmed.lastIndexOf("/");
+  const slash = lastSeparatorIndex(trimmed);
   if (slash === -1) {
     // Bare fragment, no directory part → filter the current dir by it.
     return trimmed;
@@ -183,8 +231,11 @@ export function listingFilter(
   if (partial === "") return null; // "<dir>/" — nothing typed past the slash.
   // A fragment only filters when its directory part IS the current directory;
   // otherwise the user is typing a path elsewhere (navigation, not a filter).
-  const dirText = trimmed.slice(0, slash) || "/";
-  return normalizeTypedPath(dirText, home) === currentAbsolute ? partial : null;
+  const dirText =
+    trimmed.slice(0, slash) || (isWindowsDrivePath(trimmed) ? trimmed.slice(0, 3) : "/");
+  const normalizedDir = normalizeTypedPath(dirText, home);
+  if (normalizedDir === null) return null;
+  return sameHostDirectory(normalizedDir, currentAbsolute) ? partial : null;
 }
 
 /**
@@ -388,13 +439,9 @@ export function WorkspacePicker({
     if (resolvedHome !== null || homeIsPlaceholder || !homeData || homeData.entries.length === 0) {
       return;
     }
-    const first = homeData.entries[0];
-    // first.path is "/Users/corey/x" → parent is "/Users/corey".
-    const idx = first.path.lastIndexOf("/");
-    if (idx > 0) {
-      setResolvedHome(first.path.slice(0, idx));
-    } else if (idx === 0) {
-      setResolvedHome("/");
+    const parent = parentOf(homeData.entries[0].path);
+    if (parent !== null) {
+      setResolvedHome(parent);
     }
   }, [resolvedHome, homeData, homeIsPlaceholder]);
 
@@ -411,13 +458,13 @@ export function WorkspacePicker({
   // as-is; "" (home) or a "~"-relative path uses the absolute the host
   // resolved it to, falling back to the raw path until the listing
   // arrives (so the breadcrumb stays put rather than flashing empty).
-  const currentAbsolute = path.startsWith("/") ? path : (listedAbsolute ?? path);
+  const currentAbsolute = isHostAbsolutePath(path) ? path : (listedAbsolute ?? path);
 
   // Other live agents working in the directory currently shown. Only a
   // resolved absolute path can match a stored workspace; the home view ("")
   // and unresolved paths report no conflict.
   const occupiedCount =
-    occupancyForPath && currentAbsolute.startsWith("/") ? occupancyForPath(currentAbsolute) : 0;
+    occupancyForPath && isHostAbsolutePath(currentAbsolute) ? occupancyForPath(currentAbsolute) : 0;
 
   // Mirror navigation into the path input so it reflects where the
   // listing came from (the user can still overwrite it). Skip while
@@ -434,7 +481,7 @@ export function WorkspacePicker({
   const onNavigateRef = useRef(onNavigate);
   onNavigateRef.current = onNavigate;
   useEffect(() => {
-    if (currentAbsolute.startsWith("/")) {
+    if (isHostAbsolutePath(currentAbsolute)) {
       onNavigateRef.current?.(currentAbsolute);
     }
   }, [currentAbsolute]);
@@ -499,7 +546,7 @@ export function WorkspacePicker({
   // listing has loaded, otherwise creating the first folder in an empty
   // home would be impossible. Stays null while loading so the button is
   // disabled until we know what home resolves to.
-  const createBaseDir = currentAbsolute.startsWith("/")
+  const createBaseDir = isHostAbsolutePath(currentAbsolute)
     ? currentAbsolute
     : path === "" && !isLoading && !isPlaceholderData
       ? "~"

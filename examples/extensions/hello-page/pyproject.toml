@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnigent-hello-extension"
+version = "0.1.0"
+description = "Reference browser-page extension for Omnigent"
+requires-python = ">=3.12"
+dependencies = ["omnigent>=0.11.0.dev0,<1"]
+
+[project.entry-points."omnigent.extensions"]
+hello-page = "omnigent_hello_extension.plugin:get_manifest"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+omnigent_hello_extension = ["dist/extension.js", "dist/extension.css"]

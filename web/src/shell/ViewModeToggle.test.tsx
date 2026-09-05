@@ -1,18 +1,11 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ViewModeToggle } from "./ViewModeToggle";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
 } from "./TerminalFirstContext";
-
-// The header toggle is suppressed in the iOS shell (the switcher is the native
-// Liquid Glass bar there); default the mock to "not iOS" for the web cases.
-const isIOSShellMock = vi.fn(() => false);
-vi.mock("@/lib/nativeBridge", () => ({
-  isIOSShell: () => isIOSShellMock(),
-}));
 
 function makeCtx(overrides: Partial<TerminalFirstContextValue> = {}): TerminalFirstContextValue {
   return {
@@ -53,10 +46,6 @@ function terminalSegment() {
   return screen.getByRole("button", { name: /^terminal (view|is starting up…)$/i });
 }
 
-beforeEach(() => {
-  isIOSShellMock.mockReturnValue(false);
-});
-
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -85,10 +74,16 @@ describe("ViewModeToggle", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("renders nothing in the iOS shell (native bar owns the switcher)", () => {
-    isIOSShellMock.mockReturnValue(true);
-    const { container } = renderToggle(makeCtx());
-    expect(container).toBeEmptyDOMElement();
+  it("renders in the iOS shell — the header is the switcher's one placement", () => {
+    // The native bottom pill below the composer is retired; iOS gets the same
+    // header toggle as the web UI.
+    (window as unknown as Record<string, unknown>).omnigentNative = { kind: "ios" };
+    try {
+      renderToggle(makeCtx());
+      expect(screen.getByTestId("view-mode-toggle")).toBeVisible();
+    } finally {
+      delete (window as unknown as Record<string, unknown>).omnigentNative;
+    }
   });
 
   it("presses only the active segment in the chat view", () => {

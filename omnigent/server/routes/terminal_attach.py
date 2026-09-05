@@ -75,6 +75,7 @@ from typing import Final
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
 
+from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
 from omnigent.runtime import (
     get_runner_ws_factory,
@@ -159,6 +160,18 @@ def create_terminal_attach_router(
             conversation_store=conversation_store,
         )
         await websocket.accept()
+        _logger.info(
+            "terminal attach connected for session %s terminal %s",
+            session_id,
+            terminal_id,
+            extra=debug_event(
+                "attach_terminal_by_resource_id",
+                session_id=session_id,
+                phase="connected",
+                terminal_id=terminal_id,
+                read_only=read_only,
+            ),
+        )
 
         ws_factory = get_runner_ws_factory()
         if ws_factory is not None:
@@ -333,6 +346,9 @@ async def _authorize_terminal_attach(
             session_id,
             user_id,
             exc,
+            extra=debug_event(
+                "attach_terminal_by_resource_id", session_id=session_id, phase="rejected"
+            ),
         )
         raise WebSocketException(
             code=status.WS_1008_POLICY_VIOLATION,

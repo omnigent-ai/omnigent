@@ -334,6 +334,21 @@ def resolve_matching_text(conversation_id: str, text: str) -> MatchedDrain:
         )
 
 
+def has_pending(conversation_id: str) -> bool:
+    """
+    Report whether a session still holds an un-consumed message.
+
+    Cheap check for the session list: while a message waits for its runner
+    to boot, the session is working even though no turn has started yet.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :returns: ``True`` iff at least one non-stale pending entry exists.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        return bool(_pending.get(conversation_id))
+
+
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
     """
     Return un-consumed messages for one session, for snapshot replay.

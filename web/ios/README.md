@@ -1,12 +1,13 @@
 # Omnigent iOS
 
-Thin SwiftUI/WKWebView shell for Omnigent. Like the Electron app, this target
-loads the server-served web UI instead of shipping a duplicate copy of the SPA.
+Thin SwiftUI/WKWebView shell for Omnigent on iPhone and iPad. Like the Electron
+app, this target loads the server-served web UI instead of shipping a duplicate
+copy of the SPA.
 
 ## Development
 
 Open `Omnigent.xcodeproj` in Xcode 26 or newer and run the `Omnigent` scheme on
-an iOS 26 simulator.
+an iOS 26 iPhone or iPad simulator.
 
 Debug builds allow `http://` web content for local development by enabling
 `NSAllowsArbitraryLoadsInWebContent`. Release builds keep App Transport

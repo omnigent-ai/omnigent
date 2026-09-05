@@ -37,7 +37,8 @@ function originOf(url: string): string | null {
 }
 
 /**
- * Server picker for the Electron desktop shell, pinned to the sidebar's bottom.
+ * Server picker for the native shells (Electron desktop and iOS), pinned to
+ * the sidebar's bottom.
  *
  * A sidebar row (server glyph + current host + an upward chevron) that opens a
  * menu of organization-provided and recently-connected servers — selecting one
@@ -45,22 +46,20 @@ function originOf(url: string): string | null {
  * which returns the window to the shell's setup page.
  *
  * This deliberately lives at the bottom of the sidebar rather than in the
- * window's title bar. The macOS shell hides the native title bar (titleBarStyle
- * "hiddenInset"), and the previous picker filled that freed strip with a
- * centered "<thread> — <host>" label. But the chat header occupies the same
- * strip (`absolute top-0`, and taller at h-14), so on a narrow window the
- * centered label ran into the header's action cluster. Docking the picker here
- * takes it out of that contested space; the drag strip and the sidebar's
- * traffic-light top margin stay exactly as they were, since those are what keep
- * the OS window controls off the sidebar card.
+ * chat surface's top strip. The macOS shell hides the native title bar
+ * (titleBarStyle "hiddenInset"), and the previous picker filled that freed
+ * strip with a centered "<thread> — <host>" label. But the chat header
+ * occupies the same strip (`absolute top-0`, and taller at h-14), so on a
+ * narrow window the centered label ran into the header's action cluster. The
+ * iOS shell repeated the same mistake with its floating pill, which crowded
+ * the chat header's title and floating controls on a notched iPhone. Docking
+ * the picker here takes it out of that contested space on both shells.
  *
  * Renders nothing until the shell confirms this page is a connected server
  * (getServerPicker resolves non-null) — so it's absent in plain browsers, under
- * shells too old for the picker IPC, and on foreign pages. That single check is
- * the whole gate: no platform sniffing, matching how the rest of nativeBridge
- * degrades (one bundle, many runtimes, decided at runtime). Note this reaches
- * every Electron platform, where the old title-bar picker was macOS-only —
- * Windows and Linux desktop users previously had no in-app picker at all.
+ * shells too old for the picker bridge, and on foreign pages. That single check
+ * is the whole gate: no platform sniffing, matching how the rest of
+ * nativeBridge degrades (one bundle, many runtimes, decided at runtime).
  */
 export function SidebarServerPicker() {
   const [info, setInfo] = useState<ServerPickerInfo | null>(null);

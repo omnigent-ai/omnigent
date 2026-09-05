@@ -2,9 +2,10 @@
 //
 // The preference is stored as a discrete px choice and exposed to CSS through
 // `--desktop-ui-font-size`. index.css maps that value into Tailwind's typography
-// tokens at desktop widths while keeping the root rem grid fixed at 16px, so
-// text changes without resizing icons, controls, or spacing. Mobile keeps its
-// independent responsive root size and typography.
+// tokens while keeping the root rem grid fixed at 16px, so text changes without
+// resizing icons, controls, or spacing. Desktop consumes the value directly;
+// mobile scales its own touch-friendly base off it (see the width < 48rem
+// mapping in index.css), so the setting applies on both surfaces.
 //
 // Font family works the analogous way with `--ui-font-family`. Note it can't
 // reuse `--font-sans`: Tailwind v4's `@theme inline` block inlines the literal
@@ -74,8 +75,9 @@ export function writeUiFontSizePx(px: number): void {
 /**
  * Apply the given discrete px size to the DOM by setting the
  * `--desktop-ui-font-size` variable on the document root. index.css reads this
- * into desktop typography tokens only, so layout geometry and mobile remain
- * independent. This is the single source of the DOM side-effect.
+ * into the typography tokens on every viewport (mobile derives its base from
+ * it), so layout geometry stays fixed while text scales. This is the single
+ * source of the DOM side-effect.
  */
 export function applyDesktopUiFontSize(px: number): void {
   const root = getStyleRoot();

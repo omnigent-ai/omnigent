@@ -26,6 +26,7 @@ const lockValue = { stopScroll: lockStopScroll, state: lockState };
 
 const FILE_VIEWER_NOOP = {
   openFile: () => {},
+  openGithubTab: () => {},
   isChangedPath: () => false,
   conversationId: undefined,
   workspaceRoot: null,
@@ -1586,6 +1587,7 @@ const NOT_FOUND_RESPONSE = {
 
 interface TestFileViewerContext {
   openFile: (path: string) => void;
+  openGithubTab: () => void;
   isChangedPath: (path: string) => boolean;
   conversationId: string | undefined;
   workspaceRoot: string | null;
@@ -1619,6 +1621,7 @@ function renderMessage(
   },
 ) {
   const fullCtx: TestFileViewerContext = {
+    openGithubTab: () => {},
     workspaceRoot: null,
     workspaceHome: null,
     ...ctx,

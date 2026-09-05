@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import type {
   ElicitationRequest,
   SessionAgentChangedEvent,
+  SessionCodexApprovalModeEvent,
   SessionCollaborationModeEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
@@ -1473,6 +1474,28 @@ describe("session.permission_mode (FLAT envelope)", () => {
 
   it("rejects missing conversation_id", () => {
     expect(parse("session.permission_mode", { permission_mode: "auto" })).toEqual([]);
+  });
+});
+
+describe("session.codex_approval_mode (FLAT envelope)", () => {
+  it("lifts conversation_id and approval_mode string", () => {
+    const events = parse("session.codex_approval_mode", {
+      conversation_id: "conv_abc",
+      approval_mode: "approve-for-me",
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionCodexApprovalModeEvent;
+    expect(ev.type).toBe("session_codex_approval_mode");
+    expect(ev.conversationId).toBe("conv_abc");
+    expect(ev.approvalMode).toBe("approve-for-me");
+  });
+
+  it("rejects missing approval_mode", () => {
+    expect(parse("session.codex_approval_mode", { conversation_id: "conv_abc" })).toEqual([]);
+  });
+
+  it("rejects missing conversation_id", () => {
+    expect(parse("session.codex_approval_mode", { approval_mode: "approve-for-me" })).toEqual([]);
   });
 });
 

@@ -728,6 +728,128 @@ def test_row18_cold_resume_honors_the_persisted_model_override(
         )
 
 
+@pytest.mark.timeout(900)
+def test_row18b_codex_cold_resume_honors_a_gateway_spelled_override(
+    rig: ModelFlowsRig,
+    shaped_host: Callable[[str], str],
+    tmp_path: Path,
+) -> None:
+    """
+    A codex resume honors an override stored in the gateway spelling.
+
+    The realistic bite is a databricks-profile session whose persisted
+    ``/model`` is a gateway id (``databricks-gpt-5-6-sol``) while the catalog
+    lists codex's own slug (``gpt-5.6-sol``). The launch translates between the
+    two, so the relaunch must fold the spellings rather than refuse the model
+    as "not in this host's current model list" (a raw string-equality check
+    did, failing the whole cold resume).
+    """
+    from omnigent.codex_model_vocabulary import codex_reachable_model_slug, comparable_model_id
+    from omnigent.model_catalog_store import catalog_contains
+
+    harness = "codex-native"
+    ready = _COLD_RESUME_HARNESSES[harness][2]
+    require_clis("codex")
+    host_id = shaped_host("codex-databricks")
+
+    def _rows() -> list[dict[str, Any]] | None:
+        try:
+            payload = host_model_options(rig.base_url, host_id, harness)
+        except httpx.HTTPError:
+            return None
+        return payload.get("models") or None
+
+    rows = wait_for(_rows, timeout=180.0, what="the boot-warmed codex-databricks catalog")
+    # A non-default codex-slug row, respelled the gateway way. Only meaningful
+    # when the catalog spells it as a codex slug and the raw check misses it.
+    slug = next(
+        (
+            str(r["id"])
+            for r in rows
+            if r.get("id") and not r.get("isDefault") and not r.get("hidden")
+        ),
+        None,
+    )
+    if slug is None:
+        pytest.skip(f"this catalog offers no non-default row to respell: {rows}")
+    override = "databricks-" + slug.replace(".", "-")
+    if catalog_contains(rows, override) or codex_reachable_model_slug(override, rows) is None:
+        pytest.skip(
+            f"the gateway respelling {override!r} does not exercise the fold "
+            f"against this catalog: {rows}"
+        )
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# gateway-spelled cold resume\n")
+    pane = PaneWatcher()
+    pane.arm()
+    session_id = rest_create_session(
+        rig.base_url,
+        agent_name=CODEX_NATIVE_AGENT_NAME,
+        host_id=host_id,
+        workspace=workspace,
+        terminal_launch_args=bypass_args(harness),
+    )
+    rest_post_user_message(rig.base_url, session_id, "Reply with exactly: ok. Nothing else.")
+    pane.wait_for_pane()
+    pane.wait_for_text(ready)
+    dismiss_blocking_dialogs(pane)
+
+    def _replies(at_least: int) -> Callable[[], int | None]:
+        def _count() -> int | None:
+            snapshot = session_snapshot(rig.base_url, session_id)
+            assert snapshot.get("status") != "failed", (
+                f"session {session_id} failed: "
+                f"{snapshot.get('last_task_error') or snapshot.get('error')}"
+            )
+            count = assistant_message_count(snapshot)
+            return count if count >= at_least else None
+
+        return _count
+
+    def _folds_to_override() -> str | None:
+        reported = session_snapshot(rig.base_url, session_id).get("llm_model")
+        if isinstance(reported, str) and comparable_model_id(reported) == comparable_model_id(
+            override
+        ):
+            return reported
+        return None
+
+    wait_for(_replies(1), timeout=150.0, what="the first reply")
+
+    # Persist the GATEWAY spelling, the way a databricks route / API client
+    # does; the live switch folds it to codex's slug and the pane reports that.
+    rest_patch_session(rig.base_url, session_id, model_override=override)
+    rest_post_user_message(rig.base_url, session_id, "Reply with exactly: switched. Nothing else.")
+    wait_for(_replies(2), timeout=150.0, what="the reply on the switched model")
+    wait_for(_folds_to_override, timeout=60.0, what=f"the pane to fold to {override!r}")
+
+    # The pane exits; the next message is the resume. Pre-fix, the relaunch's
+    # raw catalog check refused the gateway-spelled override and the session
+    # failed here.
+    kill_pane(pane)
+    resumed = PaneWatcher()
+    resumed.arm()
+    rest_post_user_message(rig.base_url, session_id, "Reply with exactly: back. Nothing else.")
+    wait_for(_replies(3), timeout=240.0, what="the reply after the cold resume")
+
+    snapshot = session_snapshot(rig.base_url, session_id)
+    assert snapshot.get("model_override") == override, (
+        f"the resume rewrote the persisted pick: {snapshot.get('model_override')!r}"
+    )
+    reported = snapshot.get("llm_model")
+    assert isinstance(reported, str) and comparable_model_id(reported) == comparable_model_id(
+        override
+    ), f"the resumed pane runs {reported!r}, not the folded {override!r} (session {session_id})"
+    resumed.wait_for_pane()
+    resumed.wait_for_text(ready)
+    pinned = codex_config_copy_model(session_id)
+    assert pinned is not None and comparable_model_id(pinned) == comparable_model_id(override), (
+        f"the relaunch pinned {pinned!r} in the config copy, not a fold of {override!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Stale catalog: a Default launch must not run yesterday's default
 # ---------------------------------------------------------------------------

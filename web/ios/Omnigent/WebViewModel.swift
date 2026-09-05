@@ -87,6 +87,28 @@ final class WebViewModel: ObservableObject {
     webView?.evaluateJavaScript(script)
   }
 
+  /// Push the server-picker payload (current origin plus the selectable
+  /// managed/recent servers) to the SPA, which surfaces server selection in
+  /// its sidebar instead of the floating pill. The JS bridge caches the value
+  /// so a later-mounting subscriber still receives it.
+  func emitServerPicker(currentOrigin: String?, managedServers: [String], recentServers: [String]) {
+    guard let currentOrigin else { return }
+    struct Payload: Encodable {
+      let currentOrigin: String
+      let managedServers: [String]
+      let recentServers: [String]
+    }
+    let payload = Payload(
+      currentOrigin: currentOrigin,
+      managedServers: managedServers,
+      recentServers: recentServers
+    )
+    guard let data = try? JSONEncoder().encode(payload),
+      let json = String(data: data, encoding: .utf8)
+    else { return }
+    webView?.evaluateJavaScript("window.__omnigentNativeEmitServerPicker?.(\(json));")
+  }
+
   /// Tell the web app the user tapped a segment in the native switcher.
   func emitViewModeChanged(_ mode: WebViewMode) {
     let script =

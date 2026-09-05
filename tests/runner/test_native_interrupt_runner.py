@@ -77,6 +77,27 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
     return NativeInterruptRunner(**kwargs), captured
 
 
+def test_native_cancel_capability_follows_stop_registry() -> None:
+    """Parent cancel capability must track ``_UNIFORM_STOP`` plus Claude."""
+    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.runner.native.interrupt import (
+        _UNIFORM_STOP,
+        native_cancel_capability,
+    )
+
+    for agent in NATIVE_CODING_AGENTS:
+        capability = native_cancel_capability(agent.wrapper_label)
+        if agent.key == "claude" or agent.key in _UNIFORM_STOP:
+            assert capability == "stop", agent.key
+        else:
+            assert capability == "best_effort", agent.key
+        if agent.subagent_wrapper_label:
+            assert native_cancel_capability(agent.subagent_wrapper_label) == capability
+
+    assert native_cancel_capability(None) == "inprocess"
+    assert native_cancel_capability("not-a-native-wrapper") == "inprocess"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("harness", ["antigravity-native", "opencode-native", "claude-sdk", None])
 async def test_no_handler_harnesses_return_none(harness: str | None) -> None:
@@ -257,6 +278,37 @@ async def test_claude_stop_is_idempotent_without_advertised_tmux(
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert captured["wakes"] == [("conv_cn", "cancelled", "[System: sub-agent stopped]")]
+
+
+@pytest.mark.asyncio
+async def test_claude_stop_kill_failure_returns_503_without_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Claude kill ``RuntimeError`` is 503; only ``TmuxSessionNotAdvertised`` is 204."""
+    import json
+
+    import omnigent.claude_native_bridge as claude_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    async def _fake_bridge_id(*, server_client: Any, session_id: str) -> str:
+        del server_client, session_id
+        return "bridge123"
+
+    def _boom(bridge_dir: Any, *, timeout_s: float) -> None:
+        del bridge_dir, timeout_s
+        raise RuntimeError("tmux kill-session failed: connection refused")
+
+    monkeypatch.setattr(interrupt_mod, "_claude_native_bridge_id_for_session", _fake_bridge_id)
+    monkeypatch.setattr(claude_bridge, "bridge_dir_for_bridge_id", lambda bridge_id: bridge_id)
+    monkeypatch.setattr(claude_bridge, "kill_session", _boom)
+
+    runner, captured = _make_runner()
+    resp = await runner.stop("claude-native", "conv_cn")
+
+    assert resp is not None and resp.status_code == 503
+    assert json.loads(bytes(resp.body))["error"] == "claude_native_stop_failed"
+    assert captured["wakes"] == []
+    assert [e for _, e in captured["published"] if e.get("status") == "idle"] == []
 
 
 @pytest.mark.asyncio

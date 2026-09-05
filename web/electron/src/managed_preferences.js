@@ -3,6 +3,12 @@
 /** Public macOS Managed Preferences key in the ai.omnigent.desktop domain. */
 const SERVER_URLS_KEY = "serverUrls";
 
+/**
+ * Managed Preferences key gating Databricks-internal features (e.g. the Arca
+ * host option). Boolean; anything but an explicit true reads as disabled.
+ */
+const DATABRICKS_INTERNAL_FEATURES_KEY = "databricksInternalFeaturesEnabled";
+
 /** Keep organization-provided choices bounded on the connect screen. */
 const MAX_SERVER_URLS = 10;
 
@@ -79,6 +85,30 @@ function getManagedServerUrls({ platform = process.platform, getUserDefault } = 
 }
 
 /**
+ * Read the Databricks-internal-features flag from effective macOS preferences.
+ * Fails closed: any missing value, wrong type, non-darwin platform, or read
+ * error reads as disabled. Like the managed server list, the value is read on
+ * demand and never persisted, so removing the profile disables it immediately.
+ *
+ * @param {{
+ *   platform?: NodeJS.Platform,
+ *   getUserDefault?: (key: string, type: string) => unknown,
+ * }} [options]
+ * @returns {boolean}
+ */
+function getDatabricksInternalFeaturesEnabled({
+  platform = process.platform,
+  getUserDefault,
+} = {}) {
+  if (platform !== "darwin" || typeof getUserDefault !== "function") return false;
+  try {
+    return getUserDefault(DATABRICKS_INTERNAL_FEATURES_KEY, "boolean") === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Remove user recents whose origin is already supplied by the organization.
  *
  * @param {unknown} candidates
@@ -99,9 +129,11 @@ function excludingManagedServers(candidates, managedServers) {
 }
 
 module.exports = {
+  DATABRICKS_INTERNAL_FEATURES_KEY,
   MAX_SERVER_URLS,
   SERVER_URLS_KEY,
   excludingManagedServers,
+  getDatabricksInternalFeaturesEnabled,
   getManagedServerUrls,
   normalizeManagedServerUrl,
   parseManagedServerUrls,

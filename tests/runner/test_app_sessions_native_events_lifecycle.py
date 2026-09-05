@@ -625,7 +625,18 @@ async def test_cursor_native_model_options_use_cli_catalog(
         )
 
     assert response.status_code == 200
-    assert response.json() == {"models": expected}
+    assert response.json() == {
+        "models": [
+            {
+                **expected[0],
+                "source": {
+                    "kind": "subscription",
+                    "label": "Subscription",
+                    "name": "cursor-agent",
+                },
+            }
+        ]
+    }
     assert event_response.status_code == 204
     assert injected == [("provider-latest", "Provider Latest")]
 
@@ -1179,8 +1190,12 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     )
     release = asyncio.Event()
 
+    probe_calls = 0
+
     async def _slow_probe(claude_config: object) -> object:
         del claude_config
+        nonlocal probe_calls
+        probe_calls += 1
         await release.wait()
         from omnigent.claude_native import ClaudeModelProbe
 
@@ -1232,6 +1247,10 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
         assert pending.status_code == 503
         assert pending.json()["error"] == "claude_native_model_options_pending"
         release.set()
+        # The 0.01s wait above exists only to make the first read time out.
+        # Keep it that tight here and a loaded machine answers 503 again
+        # before the woken probe is even scheduled.
+        monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 5.0)
         resolved = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
         cached = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
 
@@ -1252,6 +1271,9 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
         ]
     }
     assert cached.json() == resolved.json()
+    # Single-flight: the read that timed out joined the in-flight probe
+    # instead of starting a second one, and the cached read probed nothing.
+    assert probe_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1321,6 +1343,205 @@ async def test_claude_native_model_options_config_error_is_not_retryable(
     body = resp.json()
     assert body["error"] == "claude_native_model_options_config"
     assert "exposes no Claude model services" in body["detail"]
+
+
+@pytest.mark.asyncio
+async def test_claude_native_model_options_expire_and_reread_the_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The session listing follows the store once its cache TTL passes.
+
+    A store refresh (the background re-probe) must reach the picker without
+    a runner restart: an expired entry re-reads the store instead of serving
+    the rows it cached at first read, and a warm store costs no new probe.
+    """
+    from omnigent import model_catalog_store
+    from omnigent.claude_native import (
+        ClaudeModelProbe,
+        ClaudeNativeUcodeConfig,
+        claude_catalog_fingerprint,
+    )
+    from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
+
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    monkeypatch.setattr("omnigent.runner.app._CLAUDE_MODEL_OPTIONS_CACHE_TTL_S", 0.0)
+    conv_id = "8c1f2e3d4a5b46c7d8e9f0a1b2c3d4e5"
+    claude_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return claude_spec
+
+    config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-10"},
+        api_key_helper="printf token",
+        model="system.ai.claude-opus-4-10",
+    )
+
+    def _resolve(*, spec: AgentSpec | None) -> ClaudeNativeUcodeConfig:
+        del spec
+        return config
+
+    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+    probe_calls: list[int] = []
+
+    async def _probe(claude_config: object) -> ClaudeModelProbe:
+        del claude_config
+        probe_calls.append(1)
+        return ClaudeModelProbe(
+            alias_rows=[
+                {"id": "opus", "model": "system.ai.claude-opus-4-10", "displayName": "Opus 4.10"}
+            ],
+            default_model="system.ai.claude-opus-4-10",
+            default_label="Opus 4.10",
+        )
+
+    monkeypatch.setattr("omnigent.claude_native.probe_claude_model_options", _probe)
+
+    async def _fake_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event, kwargs
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    refreshed = [
+        {
+            "id": "opus",
+            "model": "system.ai.claude-opus-5",
+            "displayName": "Opus 5",
+            "isDefault": True,
+        }
+    ]
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        first = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        # The store converges on its own (a background re-probe); the
+        # expired entry must pick that up on the next read.
+        model_catalog_store.write_catalog(
+            "claude-native", claude_catalog_fingerprint(config), refreshed
+        )
+        second = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+
+    assert first.status_code == 200
+    assert [row["model"] for row in first.json()["models"]] == ["system.ai.claude-opus-4-10"]
+    assert second.status_code == 200
+    assert [row["model"] for row in second.json()["models"]] == ["system.ai.claude-opus-5"]
+    # A warm store re-read costs no new harness probe.
+    assert probe_calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_claude_native_model_options_retire_when_a_launch_records_its_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relaunch under another provider lists that provider's rows at once.
+
+    The rows cache is keyed by session, not by launch config, so recording
+    the config a launch resolved must retire rows listed under the previous
+    one rather than serving them until the cache TTL passes.
+    """
+    from omnigent.claude_native import ClaudeModelProbe, ClaudeNativeUcodeConfig
+    from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
+
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    conv_id = "9d2e3f4a5b6c47d8e9f0a1b2c3d4e5f6"
+    claude_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return claude_spec
+
+    def _config(model: str) -> ClaudeNativeUcodeConfig:
+        return ClaudeNativeUcodeConfig(
+            env={"ANTHROPIC_DEFAULT_OPUS_MODEL": model},
+            api_key_helper="printf token",
+            model=model,
+        )
+
+    def _resolve(*, spec: AgentSpec | None) -> ClaudeNativeUcodeConfig:
+        del spec
+        return _config("system.ai.claude-opus-4-10")
+
+    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+
+    async def _probe(claude_config: ClaudeNativeUcodeConfig) -> ClaudeModelProbe:
+        return ClaudeModelProbe(
+            alias_rows=[{"id": "opus", "model": claude_config.model, "displayName": "Opus"}],
+            default_model=claude_config.model,
+            default_label="Opus",
+        )
+
+    monkeypatch.setattr("omnigent.claude_native.probe_claude_model_options", _probe)
+    recorders: list[Any] = []
+
+    async def _fake_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event
+        recorders.append(kwargs["record_launch_config"])
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        before = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        # The next launch resolves another provider (a re-pointed default).
+        recorders[-1](conv_id, _config("system.ai.claude-opus-5"))
+        after = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+
+    assert [row["model"] for row in before.json()["models"]] == ["system.ai.claude-opus-4-10"]
+    assert [row["model"] for row in after.json()["models"]] == ["system.ai.claude-opus-5"]
 
 
 @pytest.mark.asyncio

@@ -103,6 +103,22 @@ def test_filtered_server_env_sets_xdg_and_password(
     assert "RANDOM_UNRELATED" not in env  # unrelated env filtered out
 
 
+def test_filtered_server_env_honors_runner_passthrough(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "GH_TOKEN, GH_CONFIG_DIR, MISSING")
+    monkeypatch.setenv("GH_TOKEN", "ghp_example")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/home/user/.config/gh")
+    monkeypatch.setenv("UNLISTED_SECRET", "nope")
+
+    env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
+
+    assert env["GH_TOKEN"] == "ghp_example"
+    assert env["GH_CONFIG_DIR"] == "/home/user/.config/gh"
+    assert "MISSING" not in env
+    assert "UNLISTED_SECRET" not in env
+
+
 def test_filtered_server_env_drops_global_opencode_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -117,6 +133,9 @@ def test_filtered_server_env_drops_global_opencode_config(
     monkeypatch.setenv("OPENCODE_CONFIG", "/home/user/.config/opencode/opencode.json")
     monkeypatch.setenv("OPENCODE_CONFIG_CONTENT", '{"model": "evil/model"}')
     monkeypatch.setenv("OPENCODE_DISABLE_AUTOUPDATE", "1")
+    monkeypatch.setenv(
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH", "OPENCODE_CONFIG,OPENCODE_CONFIG_CONTENT"
+    )
     env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
     assert "OPENCODE_CONFIG" not in env
     assert "OPENCODE_CONFIG_CONTENT" not in env

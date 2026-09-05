@@ -700,3 +700,40 @@ async def test_list_filesystem_limit_above_max_rejected(
         )
     # FastAPI returns 422 for failed Query validation.
     assert resp.status_code == 422
+
+
+async def test_list_filesystem_windows_drive_path_is_not_posixified(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """Windows drive paths must reach the host without a leading slash.
+
+    FastAPI strips the URL leading slash; the handler used to always
+    prepend ``/``, turning ``C:/Users/me/work`` into ``/C:/Users/me/work``
+    which does not exist. The picker then fell through to the drive root.
+    """
+    from omnigent.host.frames import HostListDirEntry
+
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["C:/Users/alice/work"] = {
+        "entries": [
+            HostListDirEntry(
+                name="src",
+                path=r"C:\Users\alice\work\src",
+                type="directory",
+                bytes=None,
+                modified_at=1779980000,
+            ),
+        ],
+        "has_more": False,
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/C:/Users/alice/work")
+    assert resp.status_code == 200, resp.text
+    names = [entry["name"] for entry in resp.json()["data"]]
+    assert names == ["src"]

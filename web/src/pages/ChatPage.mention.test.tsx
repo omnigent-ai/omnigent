@@ -53,6 +53,12 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
     }),
   };
 });
+
+// ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
+// (default: no PR) so bare Composer renders don't need a QueryClientProvider.
+vi.mock("@/hooks/useGithub", () => ({
+  useGithubInfo: () => ({ data: undefined }),
+}));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.

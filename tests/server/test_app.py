@@ -8,6 +8,7 @@ they live here following the source ↔ test directory mirroring rule.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from dataclasses import dataclass
 from io import BytesIO
@@ -15,7 +16,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from PIL import Image
 
 from omnigent.native_coding_agents import (
@@ -828,6 +829,52 @@ async def test_health_unbound_fork_of_coding_session_reads_offline(
     assert sessions[chat_fork.id]["runner_online"] is True
 
 
+def test_generic_credentials_route_does_not_shadow_detected(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """The generic ``/hosts/{id}/credentials/{provider}`` route must not shadow
+    the literal ``/hosts/{id}/credentials/detected`` owned by ``create_hosts_router``.
+
+    Regression guard for the mount order: the credentials router carries a
+    ``{provider}`` path param, and Starlette matches routes in registration order
+    with no literal-over-parameter priority. If the credentials router is
+    registered before the hosts router, ``…/credentials/detected`` resolves to the
+    generic handler and the credential-adoption endpoint breaks.
+    """
+    from starlette.routing import Match
+
+    from omnigent.server.app import create_app
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        host_store=HostStore(db_uri),
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+
+    def endpoint_for(path: str) -> str | None:
+        scope = {"type": "http", "method": "GET", "path": path}
+        for route in app.router.routes:
+            match, _ = route.matches(scope)
+            if match == Match.FULL:
+                return getattr(getattr(route, "endpoint", None), "__name__", None)
+        return None
+
+    # The literal wins over the generic {provider} param, and github still routes
+    # to the generic broker handler.
+    assert endpoint_for("/v1/hosts/h1/credentials/detected") == "detect_host_credentials"
+    assert endpoint_for("/v1/hosts/h1/credentials/github") == "host_credential"
+
+
 @pytest.mark.asyncio
 async def test_health_unbound_imported_session_reads_offline(
     db_uri: str,
@@ -1103,17 +1150,26 @@ def test_ensure_default_acp_agents_seeds_configured_agent(
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
-def test_ensure_default_acp_agents_seeds_installed_builtin_cli(
+def test_ensure_default_acp_agents_seeds_builtin_cli_rows_without_a_local_binary(
     seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A builtin ACP CLI harness whose binary is on PATH seeds a picker built-in."""
+    """Every builtin ACP CLI row seeds even when no vendor CLI is on this host.
+
+    The vendor CLI runs on the *executing* host (the attached runner), not on the
+    server, so the server's own PATH says nothing about launchability. The picker
+    hides a row the selected host can't run via that host's ``configured_harnesses``
+    readiness map — the same way natives are seeded unconditionally and filtered.
+
+    **What breaks if this fails**: on a remote server (no vendor CLI in its
+    container) Devin and Grok vanish from the New Chat picker even though the Mac
+    runner attached to it has them installed — the row is never seeded, so no
+    per-host filter can bring it back.
+    """
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
-    # Every builtin ACP CLI resolves on PATH in this test.
-    monkeypatch.setattr(
-        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/local/bin/x"
-    )
+    # No vendor CLI resolves here — the remote-server / app-container shape.
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
 
     server_app._ensure_default_acp_agents(
         seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
@@ -1121,7 +1177,7 @@ def test_ensure_default_acp_agents_seeds_installed_builtin_cli(
     # Keyed by the catalog id (a valid slug), not the display label.
     for key in ACP_CLI_HARNESSES:
         assert seed_stores.agent_store.get_by_name(key) is not None, (
-            f"installed builtin ACP CLI {key!r} was not seeded"
+            f"builtin ACP CLI {key!r} was not seeded"
         )
 
 
@@ -1174,13 +1230,17 @@ def test_ensure_default_acp_agents_configured_agent_beats_same_slug_builtin(
     assert load(dest).executor.config["harness"] == "acp:devin"
 
 
-def test_ensure_default_acp_agents_noop_when_nothing_set_up(
+def test_ensure_default_acp_agents_seeds_no_slug_rows_without_acp_config(
     seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No configured agents + no installed builtin CLI → nothing seeded.
+    """An empty ``acp:`` block seeds no ``acp:<slug>`` row — only catalog rows.
 
-    **What breaks if this fails**: a remote server (no ``acp:`` config, ACP CLIs
-    absent) shows phantom ACP picker rows that can't launch there.
+    Unlike a builtin row, a configured agent's launch command is resolved from the
+    host's own ``acp:`` block at spawn time, so a slug this host never defined could
+    not launch anywhere. Only the fixed catalog rows are host-independent.
+
+    **What breaks if this fails**: the picker grows a row for a slug no config
+    defines, and choosing it fails at spawn with an unresolvable ACP command.
     """
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 
@@ -1190,9 +1250,13 @@ def test_ensure_default_acp_agents_noop_when_nothing_set_up(
     server_app._ensure_default_acp_agents(
         seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
     )
-    assert seed_stores.agent_store.get_by_name("devin") is None
-    for key in ACP_CLI_HARNESSES:
-        assert seed_stores.agent_store.get_by_name(key) is None
+    assert seed_stores.agent_store.get_by_name("kilocode") is None, (
+        "a slug absent from config must not be seeded"
+    )
+    seeded = {
+        key for key in ACP_CLI_HARNESSES if seed_stores.agent_store.get_by_name(key) is not None
+    }
+    assert seeded == set(ACP_CLI_HARNESSES), "catalog rows are host-independent and always seed"
 
 
 def test_ensure_default_acp_agents_survives_unreadable_config(
@@ -1909,3 +1973,58 @@ def test_session_id_from_request_parses_session_path() -> None:
     assert parse(_req("/v1/sessions/conv_abc")) == "conv_abc"  # type: ignore[arg-type]
     assert parse(_req("/health")) is None  # type: ignore[arg-type]
     assert parse(_req("/v1/sessions")) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
+    app: FastAPI,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    ``RUNNER_UNAVAILABLE`` logs a stateful WARN; other 5xx keep ERROR.
+
+    Both arms are asserted together because the point is the contrast:
+    downgrading every 5xx would hide genuine faults just as effectively
+    as an offline session's polling buried them.
+
+    :param app: The real application, for its registered handlers.
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    handler = app.exception_handlers[OmnigentError]
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+            "raw_path": b"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+        offline = await handler(
+            request,
+            OmnigentError(
+                "runner 'runner_token_x' is offline",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ),
+        )
+        fault = await handler(request, OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR))
+
+    # The wire contract is untouched: only the log level moves.
+    assert offline.status_code == 503
+    assert fault.status_code == 500
+
+    records = [r for r in caplog.records if r.name == "omnigent.server.app"]
+    assert len(records) == 2, f"expected one record per error, got {records}"
+    unavailable, internal = records
+    assert unavailable.levelno == logging.WARNING
+    # Raised deliberately from a known site, so a stack adds no information.
+    assert unavailable.exc_info is None
+    assert "Internal error" not in unavailable.getMessage()
+    assert internal.levelno == logging.ERROR
+    assert internal.exc_info is not None

@@ -185,7 +185,7 @@ _HARNESS_FAMILY: dict[str, str] = {
     "agy": OPENAI_FAMILY,
     # NB: ``kimi`` is intentionally absent. Upstream Kimi Code CLI has no
     # per-spawn provider override flag, so Omnigent cannot thread a generic
-    # provider through. Provider routing for kimi lives in ``~/.kimi/config.toml``
+    # provider through. Provider routing for kimi lives in ``~/.kimi-code/config.toml``
     # and is managed out-of-band via ``kimi provider add``.
     # Qwen Code is OpenAI-compatible; the native TUI keys both spellings (mirroring
     # codex-native) so a same-agent qwen→qwen fork/switch reads as same-family.

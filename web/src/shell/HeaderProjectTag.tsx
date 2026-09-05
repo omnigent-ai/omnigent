@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { FolderIcon, FolderPlusIcon } from "lucide-react";
+import { FolderPlusIcon } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -8,7 +8,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useMoveToProject } from "@/hooks/useConversations";
 import { cn } from "@/lib/utils";
-import { ProjectPicker } from "./ProjectPicker";
+import { ProjectPicker, ProjectRowIcon } from "./ProjectPicker";
 
 /**
  * The breadcrumb's leading folder segment, as a Slack-style "Move
@@ -26,9 +26,12 @@ import { ProjectPicker } from "./ProjectPicker";
 export function HeaderProjectTag({
   conversationId,
   projectName,
+  projectIcon,
 }: {
   conversationId: string;
   projectName: string | null;
+  /** The filed project's emoji icon, or `null`/absent for the folder glyph. */
+  projectIcon?: string | null;
 }) {
   const moveToProject = useMoveToProject();
   const [open, setOpen] = useState(false);
@@ -54,11 +57,13 @@ export function HeaderProjectTag({
                   aria-label={projectName ? `Project: ${projectName}` : "Add to project"}
                   className={cn(
                     "breadcrumb-folder flex shrink-0 cursor-pointer items-center rounded text-muted-foreground transition-opacity hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 focus-visible:outline-none",
-                    projectName ? "opacity-40" : "opacity-30",
+                    // A full-color emoji reads as washed-out when faded, so only
+                    // dim the monochrome folder glyphs.
+                    projectIcon ? "opacity-100" : projectName ? "opacity-40" : "opacity-30",
                   )}
                 >
                   {projectName ? (
-                    <FolderIcon className="size-4" />
+                    <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
                   ) : (
                     <FolderPlusIcon className="size-4" />
                   )}

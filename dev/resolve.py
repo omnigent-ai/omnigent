@@ -32,6 +32,11 @@ Usage (from the repo root):
   python dev/resolve.py http://localhost:6767/c/dc59e331-...   # local session link
   python dev/resolve.py dc59e331-...                           # bare session id
   python dev/resolve.py --ci-link https://github.com/omnigent-ai/omnigent-internal/actions/runs/30974269184
+
+  # Ticket-only mode: no reproduction run, the ticket itself is the brief.
+  # --target-root points at the checkout the fix belongs in (default: this one).
+  python dev/resolve.py --bug-url https://linear.app/omnigent/issue/OMNI-6145 \
+      --target-root ../omnigent-internal
   python dev/resolve.py <session> --yes                        # skip the confirm
   python dev/resolve.py <session> --skip-push                  # author: commit locally, no push/PR
 """
@@ -110,33 +115,43 @@ def build_payload(
     bug_url: str | None = None,
     skip_push: bool = False,
     public: bool = False,
+    target_repo: str | None = None,
 ) -> str:
     """Normalize the input modes into the agent's ``-p`` JSON payload.
 
-    Exactly one of ``session`` / ``ci_link`` must be provided. ``session`` is
+    At most one of ``session`` / ``ci_link`` may be provided. ``session`` is
     normalized to a bare id; ``ci_link`` is passed through verbatim (the agent
-    parses the run itself). ``bug_url`` is *optional and additive*: when given it
-    is the **authoritative** bug the agent must resolve — the ``session`` /
-    ``ci_link`` run is then used only to recover the reproduction test + verdict,
-    and the agent must not resolve a different bug it happens to find on a shared
-    server. ``skip_push`` is only added to the payload when true (author mode
-    then commits locally but neither pushes nor opens a PR). ``public`` is added
-    when true (the agent shares the session public-read at start). Raises
-    ``ValueError`` if neither or both of session/ci_link are given, or one is
-    unparseable.
+    parses the run itself). ``bug_url`` is *optional and additive* alongside
+    either: when given it is the **authoritative** bug the agent must resolve —
+    the ``session`` / ``ci_link`` run is then used only to recover the
+    reproduction test + verdict, and the agent must not resolve a different bug
+    it happens to find on a shared server. Given **alone**, ``bug_url`` selects
+    ticket-only mode: there is no reproduction to recover and the ticket itself
+    is the brief. ``target_repo`` (``owner/name``) names the repository the fix
+    worktree belongs to when it is not this one. ``skip_push`` is only added to
+    the payload when true (author mode then commits locally but neither pushes
+    nor opens a PR). ``public`` is added when true (the agent shares the session
+    public-read at start). Raises ``ValueError`` if both session and ci_link are
+    given, if none of the three pointers is given, or if one is unparseable.
     """
-    if bool(session) == bool(ci_link):
-        raise ValueError("provide exactly one of a session reference or --ci-link")
-    payload: dict[str, object]
+    if session and ci_link:
+        raise ValueError("provide only one of a session reference or --ci-link")
+    ticket = (bug_url or "").strip()
+    if not session and not ci_link and not ticket:
+        raise ValueError(
+            "provide a session reference, --ci-link, or --bug-url alone (ticket-only mode)"
+        )
+    payload: dict[str, object] = {}
     if session:
-        payload = {"session": parse_session_ref(session)}
-    else:
-        assert ci_link is not None
+        payload["session"] = parse_session_ref(session)
+    elif ci_link:
         if parse_ci_run_url(ci_link) is None:
             raise ValueError(f"not a GitHub Actions run URL: {ci_link!r}")
-        payload = {"ci_link": ci_link.strip()}
-    if bug_url and bug_url.strip():
-        payload["bug_url"] = bug_url.strip()
+        payload["ci_link"] = ci_link.strip()
+    if ticket:
+        payload["bug_url"] = ticket
+    if target_repo and target_repo.strip():
+        payload["target_repo"] = target_repo.strip()
     if skip_push:
         payload["skip_push"] = True
     if public:
@@ -144,7 +159,18 @@ def build_payload(
     return json.dumps(payload)
 
 
-def branch_slug(*, session: str | None, ci_link: str | None) -> str:
+def ticket_slug(bug_url: str) -> str:
+    """``omni-6145`` for a Linear ticket, ``issue-1234`` for a GitHub issue, else ``bug``."""
+    linear = re.search(r"/issue/([A-Za-z][A-Za-z0-9]*-\d+)", bug_url)
+    if linear:
+        return linear.group(1).lower()
+    github = re.search(r"/issues/(\d+)", bug_url)
+    if github:
+        return f"issue-{github.group(1)}"
+    return "bug"
+
+
+def branch_slug(*, session: str | None, ci_link: str | None, bug_url: str | None = None) -> str:
     """Derive a branch-safe slug from the pointer the caller actually passed.
 
     The fix branch is ``fix/<slug>``, and the slug comes from the *input*, not
@@ -157,6 +183,8 @@ def branch_slug(*, session: str | None, ci_link: str | None) -> str:
     if ci_link:
         parsed = parse_ci_run_url(ci_link)
         return parsed["run_id"] if parsed else "bug"
+    if not session and bug_url and bug_url.strip():
+        return ticket_slug(bug_url)
     if session:
         sid = parse_session_ref(session)
         safe = re.sub(r"[^A-Za-z0-9._-]", "-", sid).strip("-")
@@ -182,7 +210,19 @@ def _git(*args: str, cwd: Path | None = None) -> str:
     return result.stdout
 
 
-def _resolve_base_ref() -> str:
+def _origin_repo(root: Path) -> str | None:
+    """``owner/name`` of ``root``'s origin remote, or None when it cannot be read."""
+    result = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    match = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$", result.stdout.strip())
+    return match.group(1) if match else None
+
+
+def _resolve_base_ref(root: Path = _REPO_ROOT) -> str:
     """Resolve the commit to base the fix worktree on: latest ``origin/main``.
 
     Fetches ``origin main`` (best-effort) and resolves ``origin/main`` to a
@@ -191,7 +231,7 @@ def _resolve_base_ref() -> str:
     finally to ``HEAD``, when the remote isn't reachable (offline runs).
     """
     subprocess.run(
-        ["git", "-C", str(_REPO_ROOT), "fetch", "--quiet", "origin", "main"],
+        ["git", "-C", str(root), "fetch", "--quiet", "origin", "main"],
         capture_output=True,
         text=True,
         check=False,
@@ -201,7 +241,7 @@ def _resolve_base_ref() -> str:
             [
                 "git",
                 "-C",
-                str(_REPO_ROOT),
+                str(root),
                 "rev-parse",
                 "--verify",
                 "--quiet",
@@ -217,9 +257,9 @@ def _resolve_base_ref() -> str:
     _die(f"could not resolve a base ref (origin/main, main, HEAD) in {_REPO_ROOT}")
 
 
-def _unique_branch(slug: str) -> str:
+def _unique_branch(slug: str, root: Path = _REPO_ROOT) -> str:
     """Return ``fix/<slug>`` (or ``fix/<slug>-2``, …) not yet used locally."""
-    existing = set(_git("branch", "--format=%(refname:short)").split())
+    existing = set(_git("branch", "--format=%(refname:short)", cwd=root).split())
     base = f"fix/{slug}"
     if base not in existing:
         return base
@@ -245,6 +285,21 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="A GitHub Actions run URL for a CI repro run (the CI path). The "
         "agent recovers the verdict and test from the run's artifacts.",
+    )
+    p.add_argument(
+        "--target-root",
+        dest="target_root",
+        default=None,
+        help="Checkout the fix belongs in, when it is not this repository (for "
+        "example ../omnigent-internal). The fix worktree is created off that "
+        "checkout's origin/main; the agent still runs from this repository.",
+    )
+    p.add_argument(
+        "--target-repo",
+        dest="target_repo",
+        default=None,
+        help="owner/name of the --target-root repository. Derived from its origin "
+        "remote when omitted.",
     )
     p.add_argument(
         "--bug-url",
@@ -323,6 +378,12 @@ def main() -> None:
             "Run this from an omnigent-ai/omnigent source checkout."
         )
 
+    target_root = Path(args.target_root).resolve() if args.target_root else _REPO_ROOT
+    if not (target_root / ".git").exists():
+        _die(f"--target-root {target_root} is not a git checkout")
+    target_repo = args.target_repo or (
+        _origin_repo(target_root) if target_root != _REPO_ROOT else None
+    )
     try:
         payload = build_payload(
             session=args.session,
@@ -330,6 +391,7 @@ def main() -> None:
             bug_url=args.bug_url,
             skip_push=args.skip_push,
             public=args.public,
+            target_repo=target_repo,
         )
     except ValueError as exc:
         _die(str(exc))
@@ -349,20 +411,22 @@ def main() -> None:
     # of truth); for --ci-link it recovers the test from the run's artifacts. The
     # branch is named from the pointer you actually passed (the session id or the
     # CI run id), so it never shows a phantom slug.
-    slug = branch_slug(session=args.session, ci_link=args.ci_link)
-    base = _resolve_base_ref()
-    branch = _unique_branch(slug)
+    slug = branch_slug(session=args.session, ci_link=args.ci_link, bug_url=args.bug_url)
+    base = _resolve_base_ref(target_root)
+    branch = _unique_branch(slug, target_root)
 
     # Confirm BEFORE creating the worktree, so answering "no" doesn't leave an
     # orphaned fix/<slug> worktree + branch on disk.
     _confirm_launch(payload, branch, base, skip_push=args.skip_push, assume_yes=args.yes)
 
     try:
-        created = create_worktree(repo_path=str(_REPO_ROOT), branch_name=branch, base_branch=base)
+        created = create_worktree(repo_path=str(target_root), branch_name=branch, base_branch=base)
     except WorktreeError as exc:
         _die(f"could not create worktree: {exc}")
     worktree = Path(created.worktree_path)
     print(f"→ worktree: {worktree}  (branch {created.branch})")
+    if target_repo:
+        print(f"→ target:   {target_repo}  (fix worktree off {target_root})")
 
     # Pass the agent by ABSOLUTE path from this (main) checkout. `omnigent run`
     # resolves a relative agent path against its cwd — which we set to the fresh

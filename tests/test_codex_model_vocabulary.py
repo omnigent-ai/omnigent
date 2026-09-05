@@ -9,7 +9,6 @@ from omnigent.codex_model_vocabulary import (
     EXTENDED_MODEL_DEFAULT_EFFORT,
     EXTENDED_MODEL_EFFORTS,
     clamp_spawn_effort,
-    codex_catalog_launch_slug,
     codex_reachable_model_slug,
     codex_spawn_model,
     comparable_model_id,
@@ -113,24 +112,6 @@ def test_catalog_id_translates_to_the_codex_slug() -> None:
 
 def test_a_codex_slug_translates_to_itself() -> None:
     assert codex_reachable_model_slug("gpt-5.6-luna", _CATALOG) == "gpt-5.6-luna"
-
-
-def test_launch_slug_folds_a_catalog_namespace_pin() -> None:
-    """The launch-gate fold: a gateway spelling lands on codex's own slug."""
-    assert codex_catalog_launch_slug("databricks-gpt-5-5", _CATALOG) == "gpt-5.5"
-    assert codex_catalog_launch_slug("gpt-5.5", _CATALOG) == "gpt-5.5"
-    assert codex_catalog_launch_slug("system.ai.glm-5-2", _CATALOG) == "system.ai.glm-5-2"
-    assert codex_catalog_launch_slug("databricks-gpt-9-9", _CATALOG) is None
-    assert codex_catalog_launch_slug("", _CATALOG) is None
-
-
-def test_launch_slug_refuses_an_ambiguous_fold() -> None:
-    """Two rows with different slugs folding onto one model cannot pick either."""
-    rows = [
-        {"id": "gpt-5.5", "model": "gpt-5.5"},
-        {"id": "databricks-gpt-5-5", "model": "databricks-gpt-5-5"},
-    ]
-    assert codex_catalog_launch_slug("system.ai.gpt-5-5", rows) is None
 
 
 def test_an_extended_catalog_id_is_already_the_slug() -> None:

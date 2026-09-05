@@ -646,3 +646,42 @@ def test_block_skills_native_skill_tool_with_args() -> None:
     policy = block_skills(blocked=["deploy"])
     result = policy(tc("Skill", {"skill": "deploy", "args": "--force"}))
     assert result["result"] == "DENY"
+
+
+# ── block_skills: namespace aliases ──────────────────────────────────────
+
+
+def test_block_skills_denies_namespaced_alias_of_blocked_bare_name() -> None:
+    """Blocking the bare name also blocks its ``plugin:skill`` spelling.
+
+    The skill resolver accepts ``plugin:skill`` as an alias for the bare
+    skill, so allowing the namespaced spelling through would bypass the
+    blocklist entirely.
+    """
+    policy = block_skills(blocked=["deploy"])
+    assert policy(tc("load_skill", {"name": "myplugin:deploy"}))["result"] == "DENY"
+    assert policy(tc("Skill", {"skill": "myplugin:deploy"}))["result"] == "DENY"
+    assert policy(_request_event("/myplugin:deploy now"))["result"] == "DENY"
+
+
+def test_block_skills_denies_bare_alias_of_blocked_namespaced_name() -> None:
+    """Blocking ``plugin:skill`` also blocks the bare ``skill`` spelling.
+
+    On codex-family surfaces the blocked plugin skill is exposed under
+    exactly the bare name, so allowing it through would bypass the block.
+    """
+    policy = block_skills(blocked=["myplugin:deploy"])
+    assert policy(tc("load_skill", {"name": "deploy"}))["result"] == "DENY"
+    assert policy(_request_event("/deploy"))["result"] == "DENY"
+
+
+def test_block_skills_alias_matching_does_not_over_block() -> None:
+    """Alias-aware matching still allows genuinely different skills.
+
+    A namespaced block entry must not deny a *different* exact namespace:
+    ``otherplugin:deploy`` is a distinct skill from ``myplugin:deploy``.
+    """
+    policy = block_skills(blocked=["myplugin:deploy"])
+    assert policy(tc("load_skill", {"name": "deployer"}))["result"] == "ALLOW"
+    assert policy(tc("load_skill", {"name": "myplugin:other"}))["result"] == "ALLOW"
+    assert policy(tc("load_skill", {"name": "otherplugin:deploy"}))["result"] == "ALLOW"

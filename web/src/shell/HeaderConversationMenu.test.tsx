@@ -435,6 +435,27 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getAllByRole("separator")).toHaveLength(baseSeparators + 1);
   });
 
+  it("keeps the page touchable while the mobile menu is open (non-modal)", () => {
+    // Modal mode sets pointer-events:none on <body>, leaving the menu as the
+    // only touch target; browser touch-target adjustment then snaps outside
+    // taps onto the menu, so on a phone it can never be dismissed. Mobile must
+    // run non-modal so an outside tap lands on real content and closes it.
+    mocks.isMobile = true;
+    renderMenu();
+    openMenu();
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(document.body.style.pointerEvents).not.toBe("none");
+  });
+
+  it("stays modal on desktop, where outside clicks are precise", () => {
+    renderMenu();
+    openMenu();
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(document.body.style.pointerEvents).toBe("none");
+  });
+
   it("wears the mobile glass surface and a round trigger", () => {
     // The trigger sits inside the header's round floating pill; a rounded-lg
     // open-state background showed through it as a square.

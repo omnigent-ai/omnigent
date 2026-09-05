@@ -54,7 +54,7 @@ repos:
         name: web prettier
         language: system
         entry: bash -c 'test -x web/node_modules/.bin/prettier && web/node_modules/.bin/prettier --write "$@"' --
-        files: ^web/.*\.(css|html|js|jsx|json|md|mdx|ts|tsx|yaml|yml)$
+        files: ^(web/|extensions/canvas/web/).*\.(css|html|js|jsx|json|md|mdx|ts|tsx|yaml|yml)$
         # Exclude generated assets: web-ui build output, Xcode asset catalogs,
         # and Apple Icon Composer `.icon` bundles (machine-formatted; prettier
         # fights the tooling).
@@ -86,6 +86,41 @@ repos:
         language: system
         entry: bash -c 'test -x editors/vscode/node_modules/.bin/tsc && cd editors/vscode && node_modules/.bin/tsc --noEmit'
         files: ^(editors/vscode/.*\.[cm]?[jt]sx?|editors/vscode/tsconfig\.json|editors/vscode/package\.json|pnpm-(?:lock|workspace)\.yaml)$
+        pass_filenames: false
+
+      - id: web-extension-sdk-tsc
+        name: Web extension SDK TypeScript type check
+        language: system
+        entry: bash -c 'test -x web/node_modules/.bin/tsc && web/node_modules/.bin/tsc -p sdks/web-extension/tsconfig.json --noEmit'
+        files: ^(sdks/web-extension/.*\.[cm]?[jt]sx?|sdks/web-extension/tsconfig\.json|sdks/web-extension/package\.json|pnpm-(?:lock|workspace)\.yaml)$
+        pass_filenames: false
+
+      - id: hello-extension-tsc
+        name: Hello extension TypeScript type check
+        language: system
+        entry: bash -c 'test -x web/node_modules/.bin/tsc && web/node_modules/.bin/tsc -p examples/extensions/hello-page/web/tsconfig.json --noEmit'
+        files: ^(examples/extensions/hello-page/web/.*|sdks/web-extension/.*|pnpm-(?:lock|workspace)\.yaml)$
+        pass_filenames: false
+
+      - id: hello-extension-bundle
+        name: Hello extension bundle is up to date
+        language: system
+        entry: bash -c 'test -x web/node_modules/.bin/vite && web/node_modules/.bin/vite build --config examples/extensions/hello-page/web/vite.config.ts && node examples/extensions/hello-page/web/scripts/ensure-newline.mjs && git diff --exit-code -- examples/extensions/hello-page/src/omnigent_hello_extension/dist'
+        files: ^(examples/extensions/hello-page/web/.*|sdks/web-extension/.*|pnpm-(?:lock|workspace)\.yaml)$
+        pass_filenames: false
+
+      - id: canvas-tsc
+        name: Canvas TypeScript type check
+        language: system
+        entry: bash -c 'test -x web/node_modules/.bin/tsc && web/node_modules/.bin/tsc -p extensions/canvas/web/tsconfig.json --noEmit'
+        files: ^(extensions/canvas/web/.*|sdks/web-extension/.*|pnpm-(?:lock|workspace)\.yaml)$
+        pass_filenames: false
+
+      - id: canvas-bundle
+        name: Canvas bundle is up to date
+        language: system
+        entry: bash -c 'test -x web/node_modules/.bin/vite && web/node_modules/.bin/vite build --config extensions/canvas/web/vite.config.ts && node extensions/canvas/web/scripts/ensure-newline.mjs && git diff --exit-code -- extensions/canvas/src/omnigent_canvas/dist'
+        files: ^(extensions/canvas/web/.*|sdks/web-extension/.*|pnpm-(?:lock|workspace)\.yaml)$
         pass_filenames: false
 
       # Android Kotlin formatting + linting via ktlint (config:

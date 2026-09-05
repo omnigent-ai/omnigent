@@ -25,7 +25,7 @@ from omnigent.runner.resource_registry import (
     _sanitize_session_id,
     _session_workspace,
     _terminal_exit_diagnostics,
-    _trim_terminal_exit_output,
+    trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
@@ -757,13 +757,13 @@ async def test_required_terminal_exit_while_running_is_failure(tmp_path: Path) -
     assert exits[0].session_was_idle is False
 
 
-def test_trim_terminal_exit_output_drops_whole_leading_lines() -> None:
+def test_trim_terminal_output_drops_whole_leading_lines() -> None:
     # Over the char budget: the first surviving line must be a WHOLE line, never
     # a mid-word fragment (the "rity reasons" cut). The final line — the one that
     # matters — stays intact.
     filler = "\n".join(f"line {i} " + "x" * 80 for i in range(200))
     text = filler + "\n--dangerously-skip-permissions cannot be run for security reasons"
-    trimmed = _trim_terminal_exit_output(text)
+    trimmed = trim_terminal_output(text)
     assert trimmed is not None
     assert len(trimmed) <= _TERMINAL_EXIT_OUTPUT_MAX_CHARS + 60  # + the omitted-lines marker
     assert trimmed.startswith("... omitted ")
@@ -774,11 +774,11 @@ def test_trim_terminal_exit_output_drops_whole_leading_lines() -> None:
     assert first_content.startswith("line ")
 
 
-def test_trim_terminal_exit_output_hard_clips_single_overlong_line() -> None:
+def test_trim_terminal_output_hard_clips_single_overlong_line() -> None:
     # A single line longer than the budget has no line boundary to snap to, so
     # it's clipped from the tail as a last resort.
     line = "y" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 500)
-    trimmed = _trim_terminal_exit_output(line)
+    trimmed = trim_terminal_output(line)
     assert trimmed is not None
     assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
 
@@ -1524,3 +1524,45 @@ def test_sanitize_session_id_keeps_traversal_out_of_the_workspace_path(
     resolved = Path(_session_workspace("../../../../etc")).resolve()
 
     assert resolved.is_relative_to(tmp_path.resolve()), f"escaped the root: {resolved}"
+
+
+# ── native bridge-dir reaping: live-session regression ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_preserves_live_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cleanup_session must NOT delete a live session's native bridge dir.
+
+    Bridge-dir deletion is deliberately kept OUT of cleanup_session because
+    the in-place agent-switch reset (reset_session_state) reuses
+    cleanup_session while the session — and its bridge — lives on. Wiring a
+    reap in here would rmtree a live session's ``bridge.json`` +
+    ``permission_hook.json`` and break approval routing until cold launch.
+    This guard fails if any such deletion is ever wired back in.
+
+    :param tmp_path: Pytest temp dir.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.claude_native_bridge as claude_bridge
+
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+
+    # A live session's bridge dir: current-process owner.pid + the token and
+    # permission-hook files that must survive an agent-switch reset.
+    bridge_dir = claude_bridge.prepare_bridge_dir("conv_live", workspace=tmp_path)
+    permission_hook = bridge_dir / "permission_hook.json"
+    permission_hook.write_text("{}", encoding="utf-8")
+    assert (bridge_dir / "bridge.json").exists()
+    assert (bridge_dir / "owner.pid").exists()
+
+    registry = SessionResourceRegistry()
+    await registry.cleanup_session("conv_live")
+
+    assert bridge_dir.exists()
+    assert (bridge_dir / "bridge.json").exists()
+    assert permission_hook.exists()

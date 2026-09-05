@@ -169,6 +169,11 @@ describe("ErrorBanner", () => {
     expect(screen.queryByTestId("error-headline")).toBeNull();
     expect(reconnecting).toHaveClass("justify-center", "min-h-14");
     expect(status).toHaveTextContent(/^Reconnecting$/);
+    // The badge pairs the label with an animated spinner so the in-flight
+    // attempt reads as active work; the text stays the accessible label.
+    const spinner = reconnecting.querySelector(".animate-spin");
+    expect(spinner).not.toBeNull();
+    expect(spinner).toHaveAttribute("aria-hidden", "true");
     expect(status).toHaveAttribute("aria-live", "polite");
     expect(status).toHaveAttribute("aria-atomic", "true");
     expect(status).toHaveClass("rounded-xl", "border-border", "bg-background");
@@ -740,5 +745,34 @@ describe("routing decision — harness / scope / raw pick", () => {
     expect(screen.queryByTestId(AIGW_MARK)).toBeNull();
     fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
     expect(screen.queryByText(/"router_source"/)).toBeNull();
+  });
+});
+
+describe("ErrorBanner — info level", () => {
+  it("renders a neutral notice pill with the code's headline and an info icon", () => {
+    render(
+      <ErrorBanner
+        message="Codex could not load this session's saved transcript."
+        source="harness"
+        code="codex_thread_reset"
+        level="info"
+      />,
+    );
+    const pill = screen.getByTestId("error-pill");
+    expect(pill).toHaveAttribute("data-level", "info");
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
+    );
+    expect(screen.getByTestId("error-headline")).not.toHaveClass("text-destructive");
+    const icon = screen.getByTestId("error-status-icon");
+    expect(icon).toHaveClass("lucide-info");
+    expect(icon).not.toHaveClass("text-destructive");
+    expect(screen.getByRole("button", { name: "Dismiss notice" })).toBeInTheDocument();
+  });
+
+  it("keeps the destructive pill as the default level", () => {
+    render(<ErrorBanner message="boom" source="execution" code="runner_error" />);
+    expect(screen.getByTestId("error-pill")).toHaveAttribute("data-level", "error");
+    expect(screen.getByTestId("error-status-icon")).toHaveClass("text-destructive");
   });
 });

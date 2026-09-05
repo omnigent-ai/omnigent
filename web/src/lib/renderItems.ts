@@ -99,6 +99,7 @@ export type RenderItem =
       message: string;
       source: string;
       code: string;
+      level?: "error" | "info";
       title?: string;
       cause?: string;
       remediation?: string;
@@ -1485,6 +1486,7 @@ function buildAssistantItems(
         message: b.message,
         source: b.source,
         code: b.code,
+        ...(b.level ? { level: b.level } : {}),
         ...(b.title ? { title: b.title } : {}),
         ...(b.cause ? { cause: b.cause } : {}),
         ...(b.remediation ? { remediation: b.remediation } : {}),

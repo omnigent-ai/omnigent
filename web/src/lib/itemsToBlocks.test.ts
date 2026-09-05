@@ -222,6 +222,24 @@ describe("itemsToBlocks — flat shape", () => {
     expect(td?.interrupted).toBe(true);
   });
 
+  it("error items carry an info level through to the block only when set", () => {
+    const base = {
+      response_id: "resp_notice",
+      type: "error" as const,
+      status: "completed" as const,
+      source: "harness",
+      code: "codex_thread_reset",
+      message: "Codex started a fresh thread.",
+    };
+    const items: ConversationItem[] = [
+      { ...base, id: "err_info", level: "info" },
+      { ...base, id: "err_plain" },
+    ];
+    const [info, plain] = itemsToBlocks(items) as ErrorBlock[];
+    expect(info?.level).toBe("info");
+    expect(plain).not.toHaveProperty("level");
+  });
+
   it("error items produce ErrorBlock banners on reload", () => {
     const items: ConversationItem[] = [
       {

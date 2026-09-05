@@ -601,9 +601,9 @@ def _askquestion_payload(args: dict[str, object]) -> dict[str, object]:
 
     The web UI renders the multiple-choice form from a ``{"questions": [...]}``
     structure (see ``web`` ``askUserQuestion`` lib). cursor's field names
-    differ — its question text is ``prompt`` (vs ``question``) and it has no
-    ``multiSelect`` — so map them across, preserving each question ``id`` we'll
-    need to interpret the answer.
+    differ — its question text is ``prompt`` (vs ``question``) and its
+    multi-select flag is ``allowMultiple`` (vs ``multiSelect``) — so map them
+    across, preserving each question ``id`` we'll need to interpret the answer.
     """
     web_questions: list[dict[str, object]] = []
     for question in _iter_askquestion_questions(args):
@@ -621,7 +621,7 @@ def _askquestion_payload(args: dict[str, object]) -> dict[str, object]:
         web_question: dict[str, object] = {
             "question": prompt,
             "options": web_options,
-            "multiSelect": question.get("multiSelect") is True,
+            "multiSelect": question.get("allowMultiple") is True,
         }
         qid = question.get("id")
         if isinstance(qid, str) and qid:

@@ -154,46 +154,6 @@ def clamp_spawn_effort(effort: str | None, model: str | None) -> str | None:
     return EXTENDED_MODEL_DEFAULT_EFFORT.get(bare, effort)
 
 
-def codex_catalog_launch_slug(
-    model: str,
-    options: Iterable[Mapping[str, Any]],  # type: ignore[explicit-any]  # raw model/list rows
-) -> str | None:
-    """The catalog's own launch slug for *model*, when exactly one row serves it.
-
-    The launch-gate variant of :func:`codex_reachable_model_slug`: a pinned
-    model spelled in the catalog namespace (``databricks-gpt-5-5``) folds onto
-    the row codex itself lists (``gpt-5.5``) so the launch pins a spelling the
-    CLI's client-side validation accepts. Unlike the turn-routing translation,
-    a fold that matches rows with *different* slugs is refused — the gate has
-    no authority to pick between them.
-
-    Folding reuses :func:`comparable_model_id`, whose ``.``→``-`` fold applies
-    to any id, not just gpt-style versions; that breadth is deliberate — it is
-    the same equivalence the live turn-routing path already trusts for this
-    catalog, and the single-slug guard refuses any collision.
-
-    :param model: A pinned model id, e.g. ``"databricks-gpt-5-5"``.
-    :param options: Catalog rows, e.g. ``[{"id": "gpt-5.5", "model": "gpt-5.5"}]``.
-    :returns: The single matching row's ``id``, or ``None`` when no row (or
-        more than one distinct slug) folds onto the same model.
-    """
-    if not isinstance(model, str) or not model.strip():
-        return None
-    target = comparable_model_id(model)
-    slugs: set[str] = set()
-    for option in options:
-        if not isinstance(option, Mapping):
-            continue
-        slug = option.get("id")
-        if not isinstance(slug, str) or not slug.strip():
-            continue
-        for spelling in (slug, option.get("model")):
-            if isinstance(spelling, str) and comparable_model_id(spelling) == target:
-                slugs.add(slug.strip())
-                break
-    return next(iter(slugs)) if len(slugs) == 1 else None
-
-
 def codex_reachable_model_slug(
     model: str,
     options: Iterable[Mapping[str, Any]],  # type: ignore[explicit-any]  # raw model/list rows

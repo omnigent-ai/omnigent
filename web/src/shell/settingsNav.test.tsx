@@ -137,6 +137,17 @@ describe("settingsNavGroups", () => {
     );
     expect(singleUserAdmin?.items.map((i) => i.id)).toEqual(["policies"]);
   });
+
+  it("includes the Sandbox Integrations item only when a connection is enabled", () => {
+    // 5th arg is integrationsEnabled (enabled_connections non-empty). Absent when
+    // the server has no GitHub App configured, so the nav item must not appear.
+    const item = (integrationsEnabled: boolean) =>
+      settingsNavGroups(false, false, false, false, integrationsEnabled)
+        .flatMap((g) => g.items)
+        .find((i) => i.id === "integrations");
+    expect(item(false)).toBeUndefined();
+    expect(item(true)).toMatchObject({ id: "integrations", label: "Sandbox Integrations" });
+  });
 });
 
 describe("SettingsSidebarBody", () => {

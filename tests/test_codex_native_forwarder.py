@@ -304,6 +304,56 @@ def test_thread_settings_updated_records_effort_and_collaboration_mode() -> None
     assert state.collaboration_mode == "plan"
 
 
+def test_thread_settings_updated_records_approval_preset() -> None:
+    """
+    ``thread/settings/updated`` resolves the live ``/permissions`` preset.
+
+    A TUI approval change arrives here; the forwarder must map the approval
+    fields to a preset value so the sync helper can mirror it to the web
+    read-back label. If this regresses, a TUI-side switch never reaches the UI.
+    """
+    state = fwd._CodexForwarderState()
+
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+                "activePermissionProfile": {"id": ":danger-full-access", "extends": None},
+            }
+        }
+    )
+
+    assert state.approval_preset == "full-access"
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_approval_mode_change_posts_preset_and_dedupes() -> None:
+    """
+    Codex ``/permissions`` changes mirror the runtime preset to Omnigent once.
+
+    The post must carry ``approval_mode`` so the server stamps the read-back
+    label + publishes; a second sync with the same preset must not re-post.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(approval_preset="read-only")
+
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {"approval_mode": "read-only"},
+            },
+        )
+    ]
+    assert state.posted_approval_preset == "read-only"
+
+
 @pytest.mark.asyncio
 async def test_sync_reasoning_effort_change_posts_and_dedupes() -> None:
     """
@@ -453,7 +503,10 @@ async def test_sync_codex_approval_mode_change_posts_and_dedupes() -> None:
                         'approval_policy="never"',
                         "-c",
                         'approvals_reviewer="auto_review"',
-                    ]
+                    ],
+                    # Same event now also carries the runtime preset (danger sandbox
+                    # → full-access) for the web read-back label.
+                    "approval_mode": "full-access",
                 },
             },
         )
@@ -466,6 +519,7 @@ async def test_sync_codex_approval_mode_change_posts_and_dedupes() -> None:
         "-c",
         'approvals_reviewer="auto_review"',
     ]
+    assert state.posted_approval_preset == "full-access"
 
 
 def test_codex_permission_settings_fall_back_to_legacy_policy_args() -> None:

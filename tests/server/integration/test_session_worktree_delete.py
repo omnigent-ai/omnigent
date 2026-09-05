@@ -16,6 +16,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
     HostRemoveWorktreeFrame,
@@ -351,3 +352,243 @@ async def test_delete_non_worktree_session_ignores_flag(
     resp = await client.delete(f"/v1/sessions/{conv.id}?delete_branch=true")
     assert resp.status_code == 200
     assert captured == []
+
+
+def _upsert_host_row(db_uri: str) -> None:
+    """Insert the host row without registering a live tunnel.
+
+    :param db_uri: DB URI so the conversation's host_id FK resolves.
+    """
+    HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
+
+
+class _OfflineRunnerRouter:
+    """Runner router that reports every bound session's runner as offline."""
+
+    def client_for_session_resources(self, session_id: str, **kwargs: object) -> object:
+        del session_id, kwargs
+        raise OmnigentError(
+            "runner 'runner_token_offline' is offline",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+
+
+def _assert_worktree_offline_conflict(resp: httpx.Response) -> None:
+    """Assert the Option B 409 body for offline worktree cleanup.
+
+    :param resp: DELETE response that should refuse the cleanup.
+    """
+    assert resp.status_code == 409, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "conflict"
+    assert "runner offline" in error["message"]
+    assert "delete_branch=false" in error["message"]
+
+
+def _assert_session_still_exists(db_uri: str, conv_id: str) -> None:
+    """The conversation row must still be in the store.
+
+    These fixture sessions have no agent binding, so ``GET /v1/sessions/{id}``
+    500s on snapshot build. The store read is the existence check.
+
+    :param db_uri: DB URI for the conversation store.
+    :param conv_id: Session id that must still exist.
+    """
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(conv_id)
+    assert conv is not None, (
+        f"session {conv_id} was deleted; it must remain after a refused worktree cleanup"
+    )
+
+
+async def test_delete_with_flag_when_host_offline_returns_conflict(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    ``?delete_branch=true`` on a worktree session whose host is not
+    connected must 409 with an actionable message — not 404, and not
+    a silent skip that leaves the caller thinking the session is gone.
+
+    The git worktree lives on the host; an offline host cannot run
+    ``git worktree remove``. The session must remain so the user can
+    retry with ``delete_branch=false``.
+    """
+    _upsert_host_row(db_uri)
+    conv_id = _make_worktree_conversation(db_uri)
+
+    resp = await client.delete(f"/v1/sessions/{conv_id}?delete_branch=true")
+    _assert_worktree_offline_conflict(resp)
+    _assert_session_still_exists(db_uri, conv_id)
+
+
+async def test_refused_delete_keeps_session_files(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A 409-refused delete must be non-destructive end to end: the
+    session's files must survive alongside the row, so a later retry
+    (runner back online, or without the flag) deletes a fully intact
+    session rather than one whose files were already destroyed.
+    """
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    _upsert_host_row(db_uri)
+    conv_id = _make_worktree_conversation(db_uri)
+    file_store = SqlAlchemyFileStore(db_uri)
+    stored = file_store.create("notes.txt", 4, "text/plain", session_id=conv_id)
+
+    resp = await client.delete(f"/v1/sessions/{conv_id}?delete_branch=true")
+    _assert_worktree_offline_conflict(resp)
+    _assert_session_still_exists(db_uri, conv_id)
+    assert file_store.get(stored.id, session_id=conv_id) is not None, (
+        "the refused delete must not have destroyed the session's files"
+    )
+
+
+async def test_delete_without_flag_when_host_offline_still_deletes(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Without ``delete_branch``, an offline host must not block delete."""
+    _upsert_host_row(db_uri)
+    conv_id = _make_worktree_conversation(db_uri)
+
+    resp = await client.delete(f"/v1/sessions/{conv_id}")
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] is True
+
+    get_resp = await client.get(f"/v1/sessions/{conv_id}")
+    assert get_resp.status_code == 404
+
+
+async def test_delete_with_flag_when_runner_offline_and_host_offline_returns_conflict(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Worktree session, runner unreachable, delete_branch set. Must not
+    map to 404 (session-not-found); the session exists and
+    the user owns it — cleanup cannot proceed because the host/runner
+    tunnel is down.
+    """
+    from omnigent.runtime import _globals, set_runner_router
+
+    _upsert_host_row(db_uri)
+    conv_id = _make_worktree_conversation(db_uri)
+
+    prior = _globals._runner_router
+    set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+    try:
+        resp = await client.delete(f"/v1/sessions/{conv_id}?delete_branch=true")
+    finally:
+        set_runner_router(prior)
+
+    _assert_worktree_offline_conflict(resp)
+    _assert_session_still_exists(db_uri, conv_id)
+
+
+async def test_delete_with_flag_when_runner_offline_but_host_online_cleans_up(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Git cleanup rides the host tunnel, not the runner. A dead runner on
+    a still-connected host must still send ``host.remove_worktree`` and
+    delete the session — failing this would block cleanup that can proceed.
+    """
+    from omnigent.runtime import _globals, set_runner_router
+
+    captured = await _register_fake_host(app, db_uri)
+    conv_id = _make_worktree_conversation(db_uri)
+
+    prior = _globals._runner_router
+    set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+    try:
+        resp = await client.delete(f"/v1/sessions/{conv_id}?delete_branch=true")
+    finally:
+        set_runner_router(prior)
+
+    assert resp.status_code == 200, resp.text
+    assert len(captured) == 1
+    assert captured[0].delete_branch is True
+
+    get_resp = await client.get(f"/v1/sessions/{conv_id}")
+    assert get_resp.status_code == 404
+
+
+async def test_delete_shared_worktree_when_host_offline_still_deletes_non_last(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    An offline host must not 409 deleting a session that shares its
+    worktree — that delete would not have removed the directory.
+    """
+    _upsert_host_row(db_uri)
+    first = _make_worktree_conversation(db_uri)
+    second = _make_worktree_conversation(db_uri)
+
+    resp = await client.delete(f"/v1/sessions/{first}?delete_branch=true")
+    assert resp.status_code == 200, resp.text
+
+    # Last remaining session still needs the host to clean up.
+    resp = await client.delete(f"/v1/sessions/{second}?delete_branch=true")
+    _assert_worktree_offline_conflict(resp)
+    _assert_session_still_exists(db_uri, second)
+
+
+async def test_delete_with_flag_when_host_drops_during_remove_returns_conflict(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that drops mid-remove is the same as offline: 409, session stays."""
+    from omnigent.server.routes._host_worktree import WorktreeHostUnavailableError
+
+    await _register_fake_host(app, db_uri)
+    conv_id = _make_worktree_conversation(db_uri)
+
+    async def _unavailable(**_kwargs: object) -> None:
+        raise WorktreeHostUnavailableError("host connection lost during worktree removal")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._host_worktree.remove_worktree_on_host",
+        _unavailable,
+    )
+
+    resp = await client.delete(f"/v1/sessions/{conv_id}?delete_branch=true")
+    _assert_worktree_offline_conflict(resp)
+    _assert_session_still_exists(db_uri, conv_id)
+
+
+async def test_delete_with_flag_still_succeeds_on_host_git_failure(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reachable host that reports a git error must not block the delete.
+
+    Unavailability is the caller's problem (retry without the flag).
+    A git failure after we reached the host is still best-effort.
+    """
+    from omnigent.server.routes._host_worktree import WorktreeProxyError
+
+    await _register_fake_host(app, db_uri)
+    conv_id = _make_worktree_conversation(db_uri)
+
+    async def _git_failed(**_kwargs: object) -> None:
+        raise WorktreeProxyError("worktree removal failed: not a git repo")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._host_worktree.remove_worktree_on_host",
+        _git_failed,
+    )
+
+    resp = await client.delete(f"/v1/sessions/{conv_id}?delete_branch=true")
+    assert resp.status_code == 200, resp.text
+    get_resp = await client.get(f"/v1/sessions/{conv_id}")
+    assert get_resp.status_code == 404

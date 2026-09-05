@@ -25,7 +25,7 @@ from omnigent.codex_native_bridge import (
 )
 from omnigent.native_policy_hook import (
     evaluation_response_to_hook_output,
-    fail_closed_hook_output,
+    fail_ask_hook_output,
     hook_payload_to_evaluation_request,
     policy_hook_reauth,
     post_evaluate_with_retry,
@@ -137,7 +137,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         context["model"] = model
 
     def _fail_closed(detail: str | None = None) -> int:
-        out = fail_closed_hook_output(hook_event, detail)
+        out = fail_ask_hook_output(hook_event, detail)
         if out is not None:
             sys.stdout.write(json.dumps(out))
         return 0

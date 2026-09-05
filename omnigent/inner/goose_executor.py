@@ -41,6 +41,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent.inner import _proc
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -306,6 +307,9 @@ class GooseExecutor(Executor):
             env=env,
             cwd=self._cwd,
             limit=_STREAM_LIMIT,
+            # Own session/group: the sandbox launcher forks the real agent,
+            # and without a group boundary teardown reaches only the wrapper.
+            **_proc.spawn_kwargs(),
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
@@ -1283,10 +1287,12 @@ class GooseExecutor(Executor):
             with contextlib.suppress(Exception):
                 self._proc.stdin.close()  # type: ignore[union-attr]
             try:
-                self._proc.terminate()
+                # Tree-aware: the handle is the sandbox launcher, not the
+                # agent it forked. A bare terminate() orphans the agent.
+                _proc.terminate_tree(self._proc)
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except Exception:  # noqa: BLE001
                 with contextlib.suppress(Exception):
-                    self._proc.kill()
+                    _proc.kill_tree(self._proc)
             finally:
                 self._proc = None

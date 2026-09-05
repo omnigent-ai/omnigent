@@ -239,6 +239,6 @@ describe("mobile sidebar drawer", () => {
     // hiding its title and state badge and blocking the tap target.
     renderSidebar();
 
-    expect(screen.getByRole("navigation")).toHaveClass("max-md:pb-14");
+    expect(screen.getByRole("navigation")).toHaveClass("max-md:pb-16");
   });
 });

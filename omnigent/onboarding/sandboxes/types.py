@@ -83,6 +83,10 @@ class SandboxCapabilities:
         ``omnigent.ai/agent`` label). When set, the managed launch path
         threads ``agent_name`` into ``start_host``; providers that leave
         it ``False`` never receive the keyword.
+    :param snapshot_restore: Resuming a stopped sandbox restores a
+        suspend-time snapshot (dependencies installed, caches warm)
+        rather than cold-starting it. Only meaningful alongside
+        ``resume_stopped``.
     """
 
     cli_bootstrap: bool = False
@@ -94,6 +98,9 @@ class SandboxCapabilities:
     streaming_exec: bool = False
     foreground_exec: bool = False
     classifies_runner_by_agent: bool = False
+    # New fields append at the end to preserve positional-constructor
+    # compatibility for out-of-tree providers.
+    snapshot_restore: bool = False
 
 
 @dataclass(frozen=True)
