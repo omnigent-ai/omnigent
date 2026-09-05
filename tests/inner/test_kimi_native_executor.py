@@ -122,7 +122,8 @@ class TestBridge:
 
 class TestApprovalKeystroke:
     """`inject_approval_keystroke` types the option digit + Enter, guarded by
-    the permission-menu marker so a stray verdict can't leak a keystroke."""
+    the permission-menu marker so a stray verdict can't leak a keystroke.
+    The shared tmux stub also covers user-message key sequencing."""
 
     def _stub_tmux(
         self, monkeypatch: pytest.MonkeyPatch, *, pane: str, alive: bool = True
@@ -158,6 +159,52 @@ class TestApprovalKeystroke:
         sent = self._stub_tmux(monkeypatch, pane="▶ 1. Approve once\n  3. Reject")
         assert inject_approval_keystroke(tmp_path, key=DENY_KEY) is True
         assert sent[0] == ("send-keys", "-t", "main", DENY_KEY)
+
+    def test_message_submit_sends_enter_then_ctrl_s(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sent = self._stub_tmux(monkeypatch, pane="context: 1%\nsteer now")
+        kimi_native_bridge.inject_user_message(tmp_path, content="steer now")
+        assert [args for args in sent if args[0] == "send-keys"] == [
+            ("send-keys", "-t", "main", "C-a"),
+            ("send-keys", "-t", "main", "C-k"),
+            ("send-keys", "-t", "main", "Enter"),
+            ("send-keys", "-t", "main", "C-s"),
+        ]
+        enter_call = ("send-keys", "-t", "main", "Enter")
+        assert enter_call in sent, f"message-submit Enter missing from tmux calls: {sent!r}"
+        enter_index = sent.index(enter_call)
+        assert sent[enter_index + 1 : enter_index + 2] == [("send-keys", "-t", "main", "C-s")]
+
+    @pytest.mark.parametrize(
+        "injected_error",
+        [
+            pytest.param(RuntimeError("tmux socket disappeared"), id="runtime-error"),
+            pytest.param(OSError("tmux socket disappeared"), id="os-error"),
+        ],
+    )
+    def test_ctrl_s_failure_keeps_submitted_message_delivered(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        injected_error: RuntimeError | OSError,
+    ) -> None:
+        sent = self._stub_tmux(monkeypatch, pane="context: 1%\nsteer now")
+        stub_run_tmux = kimi_native_bridge._run_tmux
+
+        def _run_tmux(_socket_path: str, *args: str) -> None:
+            stub_run_tmux(_socket_path, *args)
+            if args == ("send-keys", "-t", "main", "C-s"):
+                raise injected_error
+
+        monkeypatch.setattr(kimi_native_bridge, "_run_tmux", _run_tmux)
+        kimi_native_bridge.inject_user_message(tmp_path, content="steer now")
+        assert sent[-2:] == [
+            ("send-keys", "-t", "main", "Enter"),
+            ("send-keys", "-t", "main", "C-s"),
+        ]
+        assert "the message may remain queued until the turn ends" in caplog.text
 
     def test_skips_when_menu_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # Prompt already answered in the terminal → marker gone → no keystroke.

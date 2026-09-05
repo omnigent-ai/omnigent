@@ -3,7 +3,7 @@
 The runner launches the ``kimi`` TUI in a private tmux pane and records
 that pane's socket + target here via :func:`write_tmux_target`. The harness
 executor then delivers Omnigent web-UI messages into the *same* pane via
-:func:`inject_user_message` (tmux bracketed paste + Enter) — the kimi analog
+:func:`inject_user_message` (tmux bracketed paste + Enter + C-s steer) — the kimi analog
 of claude-native's tmux send-keys bridge. This is what wires the web-UI chat box
 to the running Kimi TUI (and, since the web UI embeds that pane, the message
 shows in both surfaces).
@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -22,6 +23,8 @@ from pathlib import Path
 
 from omnigent._platform import stable_user_id
 from omnigent.json_types import JsonObject as _JsonObject
+
+_logger = logging.getLogger(__name__)
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_KIMI_NATIVE_BRIDGE_DIR"
@@ -201,7 +204,7 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
 
 
 def _run_tmux(socket_path: str, *args: str) -> None:
-    """Invoke ``tmux -S <socket> <args...>`` and raise on failure."""
+    """Invoke tmux, normalizing nonzero exits and timeouts to ``RuntimeError``."""
     try:
         proc = subprocess.run(
             ["tmux", "-S", socket_path, *args],
@@ -308,13 +311,14 @@ def inject_user_message(
 
     Clears any leftover draft, pastes *content* (multi-line safe via
     ``load-buffer``/``paste-buffer -p`` so interior newlines stay data, not
-    submits), settles, then submits with Enter.
+    submits), settles, then submits with Enter and steers the draft into a running turn with C-s.
 
     :param bridge_dir: The kimi-native bridge dir holding ``tmux.json``.
     :param content: User text (non-empty).
     :param timeout_s: Per-readiness-gate timeout.
     :raises RuntimeError: If the tmux target is never advertised or a tmux
-        command fails.
+        command fails before submit Enter; a failed C-s steer is logged instead.
+    :raises OSError: If an OS-level tmux failure occurs before submit Enter.
     """
     if not content:
         raise RuntimeError("kimi-native injection requires non-empty content")
@@ -366,6 +370,16 @@ def inject_user_message(
             time.sleep(_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    # Enter queues the draft mid-turn; C-s steers it into the running turn
+    # and no-ops while idle. Relies on Kimi >= 0.41.0 Ctrl-S steer semantics.
+    try:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
+    except (RuntimeError, OSError) as exc:
+        _logger.warning(
+            "Kimi Ctrl-S steer failed after Enter was sent; "
+            "the message may remain queued until the turn ends: %s",
+            exc,
+        )
 
 
 def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
