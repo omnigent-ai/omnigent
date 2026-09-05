@@ -538,7 +538,9 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     ``claude`` alias, and ``pi``. SDK and unknown harnesses map to
     ``True`` (never gated); CLI-wrapping harnesses map to whether their
     binary is on ``PATH``. Codex entries use a structured string reason when
-    unavailable: ``"binary-missing"`` or ``"needs-auth"``.
+    unavailable: ``"binary-missing"`` or ``"needs-auth"``. User-configured
+    ACP agents add one ``acp:<slug>`` key each, advertising to a remote
+    server which slugs this machine's ``acp:`` config defines.
 
     :returns: Mapping of harness spelling to readiness, e.g.
         ``{"claude-native": False, "codex-native": "needs-auth",
@@ -570,4 +572,18 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
         if cache_key not in availability_cache:
             availability_cache[cache_key] = _harness_availability(canonical)
         result[spelling] = availability_cache[cache_key]
+    # User-configured acp:<slug> agents: one key per slug so a remote server can
+    # both seed a matching picker row and gate its per-host visibility. The
+    # slug->command mapping lives only in THIS machine's ``acp:`` config, so the
+    # map is the sole channel that tells the server the slug exists here. "In
+    # config" is the readiness (matching the base ``acp`` gate above); each
+    # agent's binary stays a soft PATH hint, never a hard gate. A malformed
+    # block adds no keys rather than breaking the whole map.
+    try:
+        from omnigent.onboarding.acp_auth import acp_agents
+
+        for agent in acp_agents():
+            result[f"acp:{agent.slug}"] = True
+    except Exception:
+        _logger.debug("acp:<slug> readiness keys skipped (config unreadable)", exc_info=True)
     return result

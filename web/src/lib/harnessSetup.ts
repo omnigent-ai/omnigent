@@ -59,6 +59,14 @@ export function harnessUnavailableReasonOnHost(
 ): string | null {
   if (!harness || !host?.configured_harnesses) return null;
   const availability = host.configured_harnesses[harness];
+  // Host-advertised ACP agents (`acp:<slug>`): the readiness map is the only
+  // channel that says this host's `acp:` config defines the slug, so an absent
+  // key on a *reporting* host means "not configured here" — unlike every other
+  // harness, where an absent key means unknown and fails open. Without this, a
+  // row advertised by one host renders unbadged on hosts that cannot launch it.
+  if (availability === undefined && harness.startsWith("acp:")) {
+    return "unconfigured";
+  }
   if (availability === false) {
     if (isCodexHarness(harness)) return "binary-missing";
     return "unconfigured";

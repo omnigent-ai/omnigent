@@ -1552,6 +1552,23 @@ def _build_acp_cli_spawn_env(
         config_harness_path_override,
         resolve_harness_path,
     )
+    from omnigent.onboarding.acp_auth import resolve_acp_agent
+
+    # A user-configured agent with this same slug wins over the fixed catalog
+    # argv — the spawn-time mirror of the seeding rule
+    # (``shadowed_builtin_acp_rows``). A local server never seeds a shadowed
+    # row, but a remote server seeds the catalog row without seeing this
+    # host's ``acp:`` config, so honor the user's exact command (often
+    # carrying a ``--model`` the fixed argv cannot) here, where the config
+    # actually lives. Fail-soft to "no shadow": a malformed ``acp:`` block
+    # must not break an otherwise-independent catalog launch.
+    try:
+        shadowed = resolve_acp_agent(harness) is not None
+    except Exception:
+        _logger.debug("acp shadow lookup skipped (config unreadable)", exc_info=True)
+        shadowed = False
+    if shadowed:
+        return _build_acp_spawn_env(spec, cwd=cwd, workdir=workdir, slug=harness)
 
     row = ACP_CLI_HARNESSES[harness]
     executable = (
@@ -1585,6 +1602,7 @@ def _build_acp_spawn_env(
     *,
     cwd: Path | None = None,
     workdir: Path | None = None,
+    slug: str | None = None,
 ) -> dict[str, str]:
     """Build the env-var dict the generic ACP harness wrap reads.
 
@@ -1596,12 +1614,17 @@ def _build_acp_spawn_env(
     Like Goose, a generic ACP agent owns its own auth, so this wires **no**
     provider/gateway credential. A ``databricks-*`` model is dropped (not a valid
     third-party model id); the agent's own configured model (or a flag in its
-    command) then applies. When the slug is missing/unknown, falls back to the
-    first configured agent so a bare ``acp`` id still launches something.
+    command) then applies. A bare ``acp`` id (slug lost) falls back to the first
+    configured agent so it still launches something; an explicit slug this host
+    does not define leaves the command unset so the wrap raises a clear
+    request-time error rather than silently launching a different agent.
 
     :param spec: The agent spec.
     :param workdir: Accepted for signature parity with the other builders; the
         ACP wrap consumes no bundle dir.
+    :param slug: Explicit configured-agent slug, overriding the one parsed
+        from the spec's harness id — used when a builtin catalog row is
+        shadowed by a same-slug configured agent.
     :returns: A dict of ``HARNESS_ACP_*`` env-var overrides for the spawn.
     """
     env: dict[str, str] = {}
@@ -1609,7 +1632,8 @@ def _build_acp_spawn_env(
     cfg = getattr(spec.executor, "config", None)
     if isinstance(cfg, dict):
         raw_harness = str(cfg.get("harness") or "")
-    slug = raw_harness.split(":", 1)[1] if raw_harness.startswith("acp:") else ""
+    if slug is None:
+        slug = raw_harness.split(":", 1)[1] if raw_harness.startswith("acp:") else ""
 
     # Lazily import the config reader — the hot spawn-env path shouldn't pull in
     # the onboarding/config stack eagerly (mirrors the cursor builder).
@@ -1663,7 +1687,13 @@ def _build_acp_spawn_env(
         )
     else:
         agent = resolve_acp_agent(slug) if slug else None
-        if agent is None:
+        if agent is None and not slug:
+            # Only a bare ``acp`` id (slug lost) falls back to the first
+            # configured agent. An explicit slug this host does not define must
+            # NOT silently launch a different agent — picker rows for
+            # host-advertised slugs are global, so another host's row can name
+            # a slug this host never configured; leaving the command unset
+            # surfaces the wrap's clear request-time error instead.
             agents = acp_agents()
             agent = agents[0] if agents else None
 

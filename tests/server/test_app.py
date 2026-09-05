@@ -1297,6 +1297,138 @@ def test_build_acp_bundle_carries_the_harness_id(tmp_path: Path) -> None:
     assert spec.executor.config["harness"] == "acp:devin"
 
 
+def test_host_advertised_acp_agents_seed_picker_rows(
+    seed_stores: _SeedStores, tmp_path: Path
+) -> None:
+    """An ``acp:<slug>`` key a host advertises seeds a matching picker row.
+
+    A user-configured ACP agent's slug→command mapping lives in the executing
+    host's own ``acp:`` config, so the server-config seeding can never surface
+    it on a remote server. The host's readiness map is the channel that
+    advertises the slug; seeding from it is what puts the row in the picker.
+
+    **What breaks if this fails**: on a remote server, a host-configured ACP
+    agent (e.g. Kilocode) never appears in the New Chat picker even though the
+    attached host can launch it — and ``/v1/agents`` is GET-only, so there is
+    no client-side workaround.
+    """
+    import io
+    import tarfile
+
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.spec import load
+
+    server_app._ensure_host_advertised_acp_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+        {"claude-native": True, "acp": True, "acp:kilocode": True},
+    )
+
+    seeded = seed_stores.agent_store.get_by_name("kilocode")
+    assert seeded is not None, "advertised acp:<slug> agent was not seeded into the picker"
+    assert seeded.id == builtin_agent_id("kilocode")
+    # The row must launch the advertised harness — the command resolves from
+    # the executing host's own acp: config at spawn time.
+    bundle = seed_stores.artifact_store.get(seeded.bundle_location)
+    assert bundle is not None
+    dest = tmp_path / "seeded"
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tf:
+        tf.extractall(dest, filter="data")
+    assert load(dest).executor.config["harness"] == "acp:kilocode"
+
+
+def test_host_advertised_acp_agents_never_overwrite_existing_rows(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Host-advertised seeding is additive: it must not replace existing rows.
+
+    The readiness map is host-supplied input over the tunnel. A host must not
+    be able to replace polly/debby/native rows (or another host's agent) by
+    advertising their name, and a builtin ACP CLI catalog id is already
+    covered by its catalog row.
+    """
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+
+    # Seed a configured agent first (the server's own config path).
+    entry = AcpAgentEntry(slug="kilocode", name="Kilocode", command="kilocode-acp --custom")
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+    existing = seed_stores.agent_store.get_by_name("kilocode")
+    assert existing is not None
+
+    devin_before = seed_stores.agent_store.get_by_name("devin")
+    assert devin_before is not None, "catalog row seeds with the config pass"
+
+    server_app._ensure_host_advertised_acp_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+        {"acp:kilocode": True, "acp:devin": True},
+    )
+
+    # The pre-existing configured row is untouched (same bundle_location).
+    after = seed_stores.agent_store.get_by_name("kilocode")
+    assert after is not None
+    assert after.bundle_location == existing.bundle_location, (
+        "a host advertisement must never overwrite an existing row"
+    )
+    # An advertised slug matching a builtin catalog id is skipped outright —
+    # the catalog row already covers that harness.
+    devin_after = seed_stores.agent_store.get_by_name("devin")
+    assert devin_after is not None
+    assert devin_after.bundle_location == devin_before.bundle_location
+
+
+def test_host_advertised_acp_agents_ignore_invalid_and_not_ready_slugs(
+    seed_stores: _SeedStores,
+) -> None:
+    """Malformed or not-ready advertised keys seed nothing (and never raise).
+
+    The slug lands in an agent name and a harness id, so anything failing the
+    spec-name pattern is rejected; a non-``True`` readiness means the host
+    itself says the agent can't launch there.
+    """
+    server_app._ensure_host_advertised_acp_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+        {
+            "acp:bad slug": True,  # space fails the name pattern
+            "acp:": True,  # empty slug
+            "acp:../evil": True,  # path-shaped
+            "acp:" + "x" * 65: True,  # over the length bound
+            "acp:notready": False,  # host says not launchable
+            "acp:alsonotready": "needs-auth",
+            "claude-native": True,  # not an acp key
+        },
+    )
+    for name in ("bad slug", "notready", "alsonotready", "evil", "../evil", "x" * 65):
+        assert seed_stores.agent_store.get_by_name(name) is None
+
+
+def test_host_advertised_acp_agents_are_capped_per_map(
+    seed_stores: _SeedStores,
+) -> None:
+    """One readiness map seeds at most the cap — a hostile host can't grow storage."""
+    cap = server_app._MAX_ADVERTISED_ACP_AGENTS
+    advertised = {f"acp:agent-{i:03d}": True for i in range(cap + 10)}
+    server_app._ensure_host_advertised_acp_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+        advertised,
+    )
+    seeded = sum(
+        1
+        for i in range(cap + 10)
+        if seed_stores.agent_store.get_by_name(f"agent-{i:03d}") is not None
+    )
+    assert seeded == cap
+
+
 def test_ensure_default_native_agents_raises_when_provider_missing(
     seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
 ) -> None:

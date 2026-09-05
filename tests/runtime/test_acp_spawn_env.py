@@ -93,10 +93,18 @@ def test_bare_acp_falls_back_to_first_agent(_isolate_config: Path) -> None:
     assert env["HARNESS_ACP_COMMAND"] == "gemini --experimental-acp"
 
 
-def test_unknown_slug_falls_back_to_first_agent(_isolate_config: Path) -> None:
+def test_unknown_slug_omits_command(_isolate_config: Path) -> None:
+    """An explicit slug this host doesn't define must not launch a different agent.
+
+    Picker rows for host-advertised ``acp:<slug>`` agents are global, so a row
+    seeded for one host can be selected while another host executes the
+    session. Falling back to the first configured agent would silently run the
+    wrong vendor CLI under the selected agent's name; leaving the command unset
+    surfaces the wrap's clear request-time error instead.
+    """
     _write_acp_config(_isolate_config)
     env = _build_acp_spawn_env(_make_spec(harness="acp:nonexistent"))
-    assert env["HARNESS_ACP_COMMAND"] == "gemini --experimental-acp"
+    assert "HARNESS_ACP_COMMAND" not in env
 
 
 def test_no_agents_omits_command(_isolate_config: Path) -> None:
@@ -340,3 +348,65 @@ def test_no_permission_mode_omits_env_var(_isolate_config: Path) -> None:
     assert "HARNESS_ACP_PERMISSION_MODE" not in _build_acp_spawn_env(
         _make_spec(harness="acp:goose")
     )
+
+
+def test_catalog_row_shadowed_by_configured_agent_runs_the_configured_command(
+    _isolate_config: Path,
+) -> None:
+    """A configured agent whose slug is a catalog row id wins at spawn time.
+
+    A remote server seeds the fixed catalog row (it cannot see this host's
+    ``acp:`` config), so the seeded spec's harness is the bare row id (e.g.
+    ``devin``). The user's configured entry carries their exact command —
+    often a ``--model`` the fixed argv cannot — so the spawn on the host that
+    holds the config must honor it, mirroring ``shadowed_builtin_acp_rows``.
+    """
+    from omnigent.runtime.workflow import _build_acp_cli_spawn_env
+
+    _write_acp_config(
+        _isolate_config,
+        agents=[{"name": "Devin", "command": "devin acp --model swe-1-7-medium"}],
+    )
+    env = _build_acp_cli_spawn_env(_make_spec(harness="devin"), harness="devin")
+    assert env["HARNESS_ACP_COMMAND"] == "devin acp --model swe-1-7-medium"
+
+
+def test_catalog_row_without_configured_shadow_runs_the_fixed_argv(
+    _isolate_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no same-slug configured agent, the catalog row's argv is used."""
+    from omnigent.runtime.workflow import _build_acp_cli_spawn_env
+
+    _write_acp_config(_isolate_config, agents=[])
+    monkeypatch.delenv("OMNIGENT_DEVIN_PATH", raising=False)
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary",
+        lambda name, **k: "/usr/local/bin/devin" if name == "devin" else None,
+    )
+    env = _build_acp_cli_spawn_env(_make_spec(harness="devin"), harness="devin")
+    assert env["HARNESS_ACP_COMMAND"] == "/usr/local/bin/devin acp"
+
+
+def test_catalog_row_survives_malformed_acp_config(
+    _isolate_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed ``acp:`` block must not break a catalog row's launch.
+
+    The shadow lookup parses the config; an unrelated invalid entry (e.g. a
+    non-boolean ``omnigent_mcp``) raises there. The lookup fails soft to
+    "no shadow" so Devin/Grok still launch on their fixed argv — matching the
+    server seeding's fail-soft treatment of a malformed block.
+    """
+    from omnigent.runtime.workflow import _build_acp_cli_spawn_env
+
+    _write_acp_config(
+        _isolate_config,
+        agents=[{"name": "Bad", "command": "bad-acp", "omnigent_mcp": "yes"}],
+    )
+    monkeypatch.delenv("OMNIGENT_DEVIN_PATH", raising=False)
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary",
+        lambda name, **k: "/usr/local/bin/devin" if name == "devin" else None,
+    )
+    env = _build_acp_cli_spawn_env(_make_spec(harness="devin"), harness="devin")
+    assert env["HARNESS_ACP_COMMAND"] == "/usr/local/bin/devin acp"

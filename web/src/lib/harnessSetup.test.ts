@@ -123,6 +123,21 @@ describe("harnessUnavailableReasonOnHost", () => {
     expect(harnessUnavailableReasonOnHost("codex", hostWith(null))).toBe(null);
     expect(harnessUnavailableReasonOnHost(null, hostWith({ codex: false }))).toBe(null);
   });
+
+  it("treats an absent acp:<slug> key as unconfigured on a reporting host", () => {
+    // Host-advertised ACP rows are global: a row seeded for one host can be
+    // rendered while another host is selected. The readiness map is the only
+    // signal that this host's acp: config defines the slug, so an absent key
+    // on a reporting host must badge the row instead of failing open.
+    expect(
+      harnessUnavailableReasonOnHost("acp:kilocode", hostWith({ "claude-native": true })),
+    ).toBe("unconfigured");
+    expect(harnessUnavailableReasonOnHost("acp:kilocode", hostWith({ "acp:kilocode": true }))).toBe(
+      null,
+    );
+    // No readiness map at all (older host) stays unknown — fail open.
+    expect(harnessUnavailableReasonOnHost("acp:kilocode", hostWith(null))).toBe(null);
+  });
 });
 
 describe("harnessUnconfiguredOnHost", () => {

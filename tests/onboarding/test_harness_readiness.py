@@ -715,3 +715,44 @@ def test_claude_needs_auth_without_gateway_provider_or_login(
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (tmp_path / "absent.json",))
 
     assert configured_harness_map()["claude-native"] == "needs-auth"
+
+
+def test_configured_harness_map_advertises_configured_acp_slugs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each configured ``acp:`` agent adds an ``acp:<slug>`` key to the map.
+
+    The slug→command mapping lives only in THIS machine's ``acp:`` config, so
+    the readiness map is the one channel that tells a remote server which
+    ``acp:<slug>`` harnesses exist here. Without the per-slug keys the server
+    cannot seed a picker row for them, and the agent never appears in the New
+    Chat picker against a remote server.
+    """
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+
+    _no_clis_installed(monkeypatch)
+    entry = AcpAgentEntry(slug="kilocode", name="Kilocode", command="kilocode-acp")
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda config=None: [entry])
+
+    result = configured_harness_map()
+    assert result["acp:kilocode"] is True
+    # The base gate follows the same "in config" readiness.
+    assert result["acp"] is True
+
+
+def test_configured_harness_map_no_acp_slug_keys_without_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No configured ``acp:`` agents → no ``acp:<slug>`` keys (and never a crash)."""
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda config=None: [])
+    assert not [k for k in configured_harness_map() if k.startswith("acp:")]
+
+    # A malformed acp: block skips the keys instead of breaking the whole map.
+    def _boom(config: object = None) -> list[object]:
+        raise ValueError("bad acp: block")
+
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", _boom)
+    result = configured_harness_map()
+    assert not [k for k in result if k.startswith("acp:")]
+    assert result["claude-sdk"] is True, "the rest of the map must survive"

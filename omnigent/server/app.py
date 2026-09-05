@@ -945,6 +945,85 @@ def _ensure_default_acp_agents(
         )
 
 
+# Agent names must satisfy the spec validator (``[a-zA-Z0-9_-]+``); a host
+# advertises slugs over the tunnel, so validate before using one as a name.
+# Length-bounded well under the agents.name column (256) so a hostile map
+# can't produce rows that fail to persist.
+_ACP_SLUG_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+# Ceiling on advertised slugs processed per readiness map. Each seed costs a
+# bundle build + artifact write + DB row, all durable — a compromised host
+# must not be able to grow storage unboundedly through one frame.
+_MAX_ADVERTISED_ACP_AGENTS = 32
+
+
+def _ensure_host_advertised_acp_agents(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+    configured_harnesses: dict[str, Any],
+) -> None:
+    """
+    Seed a picker agent per ``acp:<slug>`` a host's readiness map advertises.
+
+    A user-configured ACP agent's slug→command mapping lives in the *executing
+    host's* ``acp:`` config and resolves at spawn time, so
+    :func:`_ensure_default_acp_agents` (which reads the server's own config)
+    cannot seed it on a remote server — the picker showed no row even though
+    the attached host could launch it. The host's ``configured_harnesses`` map
+    (hello + readiness-refresh frames) now carries one ``acp:<slug>`` key per
+    configured agent; this seeds the matching row so the picker can offer it,
+    with the same per-host readiness filtering as every other harness row.
+
+    Deliberately conservative with host-supplied input:
+
+    - a slug failing the agent-name pattern (or over-long) is skipped;
+    - a slug naming a builtin ACP CLI catalog row (``devin``/``grok``) is
+      skipped — the catalog row already covers that harness, and the host's
+      own command still wins at spawn time on that host (see
+      ``_build_acp_cli_spawn_env``);
+    - an **existing row is never overwritten** — a host must not be able to
+      replace polly/debby/native rows (or another user's agent) by
+      advertising their name. The acp bundle for a slug is deterministic, so
+      an already-seeded identical row needs no refresh;
+    - at most :data:`_MAX_ADVERTISED_ACP_AGENTS` slugs seed per map, so one
+      frame cannot grow storage unboundedly.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    :param configured_harnesses: The host's readiness map, e.g.
+        ``{"claude-native": True, "acp:kilocode": True}``.
+    """
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    slugs = sorted(
+        key.split(":", 1)[1]
+        for key, ready in configured_harnesses.items()
+        if ready is True and key.startswith("acp:")
+    )
+    valid = [s for s in slugs if _ACP_SLUG_PATTERN.match(s) and s not in ACP_CLI_HARNESSES]
+    created = 0
+    for slug in valid:
+        if agent_store.get_by_name(slug) is not None:
+            continue  # already-seeded rows don't consume the creation budget
+        if created >= _MAX_ADVERTISED_ACP_AGENTS:
+            _logger.warning(
+                "Host advertised %d acp agents; created only %d new rows",
+                len(valid),
+                _MAX_ADVERTISED_ACP_AGENTS,
+            )
+            break
+        _ensure_builtin_agent(
+            agent_store,
+            artifact_store,
+            agent_cache,
+            name=slug,
+            bundle_bytes=_build_acp_bundle(harness=f"acp:{slug}", name=slug),
+        )
+        created += 1
+
+
 def _build_debby_bundle() -> bytes:
     """
     Build a gzipped tarball of the ``examples/debby`` agent bundle.
@@ -3077,7 +3156,27 @@ def create_app(
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
 
-        async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
+        async def _on_hosts_changed(host_id: str, owner: str | None) -> None:
+            # Seed picker rows for the acp:<slug> agents this host advertises
+            # BEFORE announcing, so a picker refreshed by the announcement
+            # already sees the new rows. Reads the just-persisted readiness map
+            # (the tunnel persists it before firing these callbacks). Never
+            # fatal: a seeding failure must not take the host tunnel down.
+            try:
+
+                def _seed_advertised() -> None:
+                    host = host_store.get_host(host_id)
+                    if host is not None and host.configured_harnesses:
+                        _ensure_host_advertised_acp_agents(
+                            agent_store,
+                            artifact_store,
+                            agent_cache,
+                            host.configured_harnesses,
+                        )
+
+                await asyncio.to_thread(_seed_advertised)
+            except Exception:  # announcement must still go out
+                _logger.exception("Seeding host-advertised acp agents failed for %s", host_id)
             announce_hosts_changed(owner)
 
         app.include_router(
