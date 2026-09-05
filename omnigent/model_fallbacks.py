@@ -121,11 +121,14 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
     "current_generation_gpt": StaticModelFallback(
         model_ids=(
             "databricks-glm-5-2",
-            "databricks-gpt-5-6-luna",
             "databricks-gpt-5-6-sol",
         ),
         owner="Smart Routing (omnigent.server.smart_routing)",
-        provenance="the external router's own current arms, offered so a pick keeps its endpoint",
+        provenance=(
+            "the external router's own current arms, offered so a pick keeps its "
+            "endpoint; databricks-gpt-5-6-luna is decommissioned on some "
+            "workspaces, so a routed luna arm substitutes to sol instead"
+        ),
         discovery_gap=(
             "the router picks before a session's live model catalog is reachable, "
             "and a gateway listing ranks models by neither cost nor capability"
@@ -144,9 +147,13 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
         discovery_gap="the router's arm menu is part of its request contract, not a catalog",
     ),
     "family_fallbacks": StaticModelFallback(
-        model_ids=("claude-sonnet-5", "gpt-5-6-luna"),
+        model_ids=("claude-sonnet-5", "gpt-5-6-sol"),
         owner="Smart Routing (omnigent.server.smart_routing)",
-        provenance="one arm per family (claude, gpt), both frozen members of the task_v1 menus",
+        provenance=(
+            "one arm per family (claude, gpt), both frozen members of the task_v1 "
+            "menus; sol rather than luna, whose serving endpoint is decommissioned "
+            "on some workspaces"
+        ),
         discovery_gap="a workspace that serves no endpoint for the picked arm needs a pinned one",
     ),
     "pi_excluded": StaticModelFallback(

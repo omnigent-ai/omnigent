@@ -88,7 +88,7 @@ MODEL_LISTS: dict[str, list[str]] = {
 #
 # ``glm-5-2`` is an arm too, and no discovery listing carries it (see
 # :data:`_SERVABLE_ALIASES`), so this table is the only place a glm pick can be
-# offered from — without it a routed glm substitutes down to the luna fallback.
+# offered from — without it a routed glm substitutes down to the sol fallback.
 # It resolves through :func:`apply_servable_alias` to ``system.ai.glm-5-2``.
 #
 # A workspace-probed fact, so ``routing.current_generation_models`` overrides it
@@ -828,9 +828,10 @@ TASK_V1_MENUS: Mapping[str, tuple[str, ...]] = MappingProxyType(
 # One fixed fallback per family, used only when the workspace serves no endpoint
 # for the picked arm (or the session's harness bars it). Bare ids. The claude
 # fallback is the sonnet arm from _TASK_V1_CLAUDE_ARMS (the sonnet pin), never a
-# hardcoded id; gpt and glm both land on luna, itself a frozen arm that serves
-# codex-side, so a glm fallback never leaves its harness. glm resolves to the
-# "gpt" family (model_family_token), so one gpt entry covers it.
+# hardcoded id; gpt and glm both land on sol, itself a frozen arm that serves
+# codex-side (luna's serving endpoint is decommissioned on some workspaces), so
+# a glm fallback never leaves its harness. glm resolves to the "gpt" family
+# (model_family_token), so one gpt entry covers it.
 _CLAUDE_FAMILY_FALLBACK, _GPT_FAMILY_FALLBACK = SMART_ROUTING_FAMILY_FALLBACKS
 _FAMILY_FALLBACK: Mapping[str, str] = MappingProxyType(
     {
