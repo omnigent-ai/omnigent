@@ -45,5 +45,24 @@ describe("ExtensionProvider", () => {
 
     expect(failingFetcher).toHaveBeenCalledOnce();
     expect(warning).toHaveBeenCalledOnce();
+    warning.mockRestore();
+  });
+
+  it("preserves query cancellation so a remount can retry", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const controller = new AbortController();
+    const abortError = new DOMException("aborted", "AbortError");
+    const cancelledFetcher = vi.fn(async () => {
+      throw abortError;
+    });
+    controller.abort();
+
+    await expect(loadExtensionCatalog(controller.signal, cancelledFetcher)).rejects.toBe(
+      abortError,
+    );
+
+    expect(cancelledFetcher).toHaveBeenCalledOnce();
+    expect(warning).not.toHaveBeenCalled();
+    warning.mockRestore();
   });
 });

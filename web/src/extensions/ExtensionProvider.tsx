@@ -20,7 +20,8 @@ export async function loadExtensionCatalog(
 ): Promise<ExtensionCatalogItem[]> {
   try {
     return await fetcher(signal);
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     console.warn("Extension catalog is unavailable");
     return EMPTY_EXTENSIONS;
   }
