@@ -244,7 +244,7 @@ def _build_session_home(
     bridge_dir.mkdir()
     session_home = tmp_path / "session-kimi-home"
 
-    # Keyword args avoid exfil-scan.py's environment-dump token rule (#6494).
+    # Keyword args avoid exfil-scan.py's environment-dump token rule.
     with patch.dict(in_dict=os.environ, values={"KIMI_CODE_HOME": str(user_home)}):
         home_env = build_kimi_session_home(
             session_home,
