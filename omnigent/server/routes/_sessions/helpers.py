@@ -167,8 +167,10 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CURSOR_NATIVE_HARNESS,
     _DENY_SENTINEL_PREFIX,
     _ELICITATION_MODE,
+    _EXTERNAL_GOAL_STATE_VALUES,
     _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT,
     _FORK_HISTORY_NATIVE_HARNESSES,
+    _GOAL_STATE_LABEL_KEY,
     _HOOK_ELICITATION_ID_RE,
     _HOST_LAUNCH_RESULT_TIMEOUT_S,
     _KIMI_NATIVE_HARNESS,
@@ -2743,6 +2745,39 @@ def _handle_external_session_todos(
         todos=validated,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+async def _persist_external_goal_state(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """Persist a provider-neutral Goal marker from a native harness."""
+    raw_state = body.data.get("state")
+    if "state" not in body.data or (
+        raw_state is not None
+        and (not isinstance(raw_state, str) or raw_state not in _EXTERNAL_GOAL_STATE_VALUES)
+    ):
+        raise OmnigentError(
+            "external_goal_state requires data.state to be active, paused, or null",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    current = conv.labels.get(_GOAL_STATE_LABEL_KEY)
+    if current == raw_state:
+        return
+    if raw_state is None:
+        await asyncio.to_thread(
+            conversation_store.delete_label,
+            session_id,
+            _GOAL_STATE_LABEL_KEY,
+        )
+        return
+    await asyncio.to_thread(
+        conversation_store.set_labels,
+        session_id,
+        {_GOAL_STATE_LABEL_KEY: raw_state},
+    )
 
 
 def _publish_external_conversation_item(
@@ -10502,6 +10537,7 @@ __all__ = [
     "_persist_external_assistant_message",
     "_persist_external_codex_approval_mode_change",
     "_persist_external_codex_collaboration_mode_change",
+    "_persist_external_goal_state",
     "_persist_external_model_change",
     "_persist_external_model_options",
     "_persist_external_permission_mode_change",

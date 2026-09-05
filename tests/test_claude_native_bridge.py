@@ -9189,3 +9189,60 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+def test_read_transcript_items_surfaces_structured_active_goal_and_clear(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "active_goal",
+                "value": {"objective": "Finish the migration"},
+                "session_id": "s1",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    active = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    assert active.goal_state_observed is True
+    assert active.latest_goal_state == "active"
+    assert active.items == []
+
+    first_line_size = len(transcript_path.read_bytes())
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "active_goal", "value": None, "session_id": "s1"}))
+        handle.write("\n")
+    cleared = read_transcript_items_from_offset(
+        transcript_path,
+        first_line_size,
+        start_line=1,
+        agent_name="claude-native-ui",
+    )
+    assert cleared.goal_state_observed is True
+    assert cleared.latest_goal_state is None
+
+
+def test_read_transcript_items_ignores_goal_like_prose(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Goal active"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    assert result.goal_state_observed is False
+    assert result.latest_goal_state is None

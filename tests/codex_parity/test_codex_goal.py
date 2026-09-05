@@ -69,6 +69,14 @@ class _CodexGoalConversationStore:
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         return self._conversations.get(conversation_id)
 
+    def set_labels(self, conversation_id: str, labels: dict[str, str]) -> None:
+        conversation = self._conversations[conversation_id]
+        conversation.labels.update(labels)
+
+    def delete_label(self, conversation_id: str, key: str) -> None:
+        conversation = self._conversations[conversation_id]
+        conversation.labels.pop(key, None)
+
 
 class _CodexGoalAgentStore:
     def get(self, agent_id: str) -> None:
@@ -110,6 +118,12 @@ class _CodexGoalRunnerClient:
                 json=self.response_body,
                 request=httpx.Request("POST", url),
             )
+        if isinstance(json, dict) and json.get("type") == "goal_clear":
+            return httpx.Response(
+                status_code=200,
+                json={"cleared": True},
+                request=httpx.Request("POST", url),
+            )
         requested_status = json.get("status") if isinstance(json, dict) else None
         status = self.response_status or (
             requested_status if isinstance(requested_status, str) else "active"
@@ -146,8 +160,12 @@ class _CodexGoalRunnerRouter:
         return _CodexGoalRoutedRunner(self.client)
 
 
-def _codex_goal_api_app(runner_client: _CodexGoalRunnerClient | None) -> FastAPI:
+def _codex_goal_api_app(
+    runner_client: _CodexGoalRunnerClient | None,
+    conversation_store: _CodexGoalConversationStore | None = None,
+) -> FastAPI:
     app = FastAPI()
+    store = conversation_store or _CodexGoalConversationStore()
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -162,7 +180,7 @@ def _codex_goal_api_app(runner_client: _CodexGoalRunnerClient | None) -> FastAPI
 
     app.include_router(
         create_sessions_router(
-            _CodexGoalConversationStore(),  # type: ignore[arg-type]
+            store,  # type: ignore[arg-type]
             _CodexGoalAgentStore(),  # type: ignore[arg-type]
             runner_router=_CodexGoalRunnerRouter(runner_client),  # type: ignore[arg-type]
         ),
@@ -398,7 +416,8 @@ async def test_omnigent_codex_goal_api_maps_partial_goal_to_502() -> None:
 @pytest.mark.asyncio
 async def test_omnigent_codex_goal_status_api_forwards_pause_resume() -> None:
     runner_client = _CodexGoalRunnerClient()
-    app = _codex_goal_api_app(runner_client)
+    conversation_store = _CodexGoalConversationStore()
+    app = _codex_goal_api_app(runner_client, conversation_store)
     transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -406,19 +425,47 @@ async def test_omnigent_codex_goal_status_api_forwards_pause_resume() -> None:
             "/v1/sessions/conv_codex/codex_goal/status",
             json={"status": "paused"},
         )
+        assert pause.status_code == 200
+        assert pause.json()["goal"]["status"] == "paused"
+        assert (
+            conversation_store.get_conversation("conv_codex").labels["omnigent.goal_state"]
+            == "paused"
+        )
         resume = await client.patch(
             "/v1/sessions/conv_codex/codex_goal/status",
             json={"status": "active"},
         )
 
-    assert pause.status_code == 200
-    assert pause.json()["goal"]["status"] == "paused"
+    assert (
+        conversation_store.get_conversation("conv_codex").labels["omnigent.goal_state"] == "active"
+    )
     assert resume.status_code == 200
     assert resume.json()["goal"]["status"] == "active"
     assert runner_client.post_json_calls == [
         ("/v1/sessions/conv_codex/events", {"type": "goal_status", "status": "paused"}),
         ("/v1/sessions/conv_codex/events", {"type": "goal_status", "status": "active"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_omnigent_codex_goal_get_and_clear_sync_session_marker() -> None:
+    runner_client = _CodexGoalRunnerClient(response_status="budgetLimited")
+    conversation_store = _CodexGoalConversationStore()
+    app = _codex_goal_api_app(runner_client, conversation_store)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        read = await client.get("/v1/sessions/conv_codex/codex_goal")
+        assert read.status_code == 200
+        assert (
+            conversation_store.get_conversation("conv_codex").labels["omnigent.goal_state"]
+            == "paused"
+        )
+
+        cleared = await client.delete("/v1/sessions/conv_codex/codex_goal")
+
+    assert cleared.status_code == 200
+    assert "omnigent.goal_state" not in conversation_store.get_conversation("conv_codex").labels
 
 
 @pytest.mark.asyncio

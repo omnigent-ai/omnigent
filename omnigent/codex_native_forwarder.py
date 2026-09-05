@@ -163,6 +163,9 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE = "external_elicitation_resolved"
 # Sessions event carrying a Codex plan mapped to the todo-list schema so the
 # web TodoPanel renders it like Claude's TodoWrite output.
 _EXTERNAL_SESSION_TODOS_TYPE = "external_session_todos"
+_EXTERNAL_GOAL_STATE_TYPE = "external_goal_state"
+_CODEX_GOAL_UPDATED_METHOD = "thread/goal/updated"
+_CODEX_GOAL_CLEARED_METHOD = "thread/goal/cleared"
 # Codex AgentControl child-spawn event fields.
 _CODEX_COLLAB_AGENT_ITEM_TYPE = "collabAgentToolCall"
 _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE = "subAgentActivity"
@@ -447,6 +450,8 @@ class _CodexForwarderState:
     # thread rotation), so a settled round stays settled and later items
     # can skip re-reading the bridge file for the life of the session.
     mcp_startup_settled: bool = False
+    posted_goal_state: str | None = None
+    posted_goal_state_known: bool = False
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -574,6 +579,8 @@ class _CodexForwarderState:
         """
         self.parent_session_id = session_id
         self.pending_child_threads.clear()
+        self.posted_goal_state = None
+        self.posted_goal_state_known = False
 
     def note_pending_child_thread(
         self,
@@ -1902,6 +1909,16 @@ async def supervise_forwarder(
             parent_session_id=session_id,
             codex_client=client,
         )
+        try:
+            await _reconcile_codex_goal_state(
+                client,
+                ap_client,
+                session_id=session_id,
+                thread_id=thread_id,
+                forwarder_state=forwarder_state,
+            )
+        except Exception:  # noqa: BLE001 - live notifications can still recover it.
+            _logger.warning("Codex Goal startup reconciliation failed", exc_info=True)
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
         # subscribe task park instead of blind-polling ``thread/resume``
@@ -1925,6 +1942,7 @@ async def supervise_forwarder(
         try:
             async for event in client.iter_events():
                 try:
+                    previous_session_id = target.session_id
                     rotated = await _maybe_rotate_session_on_thread_started(
                         ap_client=ap_client,
                         target=target,
@@ -1933,6 +1951,16 @@ async def supervise_forwarder(
                         event=event,
                     )
                     if rotated:
+                        if (
+                            forwarder_state.posted_goal_state_known
+                            and forwarder_state.posted_goal_state is not None
+                        ):
+                            await _post_codex_goal_state_if_changed(
+                                ap_client,
+                                session_id=previous_session_id,
+                                goal=None,
+                                forwarder_state=forwarder_state,
+                            )
                         forwarder_state.note_parent_rotation(target.session_id)
                         subscribe_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
@@ -1955,6 +1983,19 @@ async def supervise_forwarder(
                             ),
                             name="codex-native-forwarder-subscribe",
                         )
+                        try:
+                            await _reconcile_codex_goal_state(
+                                client,
+                                ap_client,
+                                session_id=target.session_id,
+                                thread_id=target.thread_id,
+                                forwarder_state=forwarder_state,
+                            )
+                        except Exception:  # noqa: BLE001 - notifications can recover it.
+                            _logger.warning(
+                                "Codex Goal rotation reconciliation failed",
+                                exc_info=True,
+                            )
                         continue
                     # Release the subscribe task as soon as the thread shows
                     # activity (rollout now exists), so it resumes instead of
@@ -2519,6 +2560,68 @@ def _omnigent_status_from_resume_turn(turn: _JsonObject) -> str | None:
     return None
 
 
+def _normalized_codex_goal_state(goal: object) -> tuple[bool, str | None]:
+    """Map a Codex goal object to the two sidebar marker states."""
+    if goal is None:
+        return True, None
+    if not isinstance(goal, dict):
+        return False, None
+    status = goal.get("status")
+    if not isinstance(status, str):
+        return False, None
+    if status == "active":
+        return True, "active"
+    if status in {"paused", "blocked", "usageLimited", "budgetLimited"}:
+        return True, "paused"
+    if status == "complete":
+        return True, None
+    return False, None
+
+
+async def _post_codex_goal_state_if_changed(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    goal: object,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    observed, state = _normalized_codex_goal_state(goal)
+    if not observed or (
+        forwarder_state.posted_goal_state_known and state == forwarder_state.posted_goal_state
+    ):
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_GOAL_STATE_TYPE,
+        data={"state": state},
+    )
+    if response is not None and response.status_code < 400:
+        forwarder_state.posted_goal_state = state
+        forwarder_state.posted_goal_state_known = True
+
+
+async def _reconcile_codex_goal_state(
+    codex_client: CodexAppServerClient,
+    ap_client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    thread_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """Read the current goal once so resume works without waiting for a change."""
+    response = await codex_client.request("thread/goal/get", {"threadId": thread_id})
+    result = response.get("result")
+    if not isinstance(result, dict) or "goal" not in result:
+        return
+    await _post_codex_goal_state_if_changed(
+        ap_client,
+        session_id=session_id,
+        goal=result.get("goal"),
+        forwarder_state=forwarder_state,
+    )
+
+
 async def _handle_event(
     client: httpx.AsyncClient,
     *,
@@ -2604,6 +2707,23 @@ async def _handle_event(
     )
     if route_session_id is None:
         return
+    if not is_child and forwarder_state is not None:
+        if method == _CODEX_GOAL_UPDATED_METHOD and "goal" in params:
+            await _post_codex_goal_state_if_changed(
+                client,
+                session_id=route_session_id,
+                goal=params.get("goal"),
+                forwarder_state=forwarder_state,
+            )
+            return
+        if method == _CODEX_GOAL_CLEARED_METHOD:
+            await _post_codex_goal_state_if_changed(
+                client,
+                session_id=route_session_id,
+                goal=None,
+                forwarder_state=forwarder_state,
+            )
+            return
     # First model-produced item settles the synthesized MCP startup round
     # mid-turn — codex defers turn execution until the round ends, so
     # assistant-side output proves startup is over before the idle edge.

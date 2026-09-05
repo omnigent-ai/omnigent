@@ -155,6 +155,8 @@ export interface Conversation {
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
   pending_elicitations_count?: number;
   status?: "idle" | "running" | "failed";
+  /** Observed native Goal state, independent of session execution status. */
+  goal_state?: "active" | "paused" | null;
   /**
    * Whether the session's runner is reachable, matching `GET /health`.
    * `GET /v1/sessions` and the `WS /v1/sessions/updates` stream include

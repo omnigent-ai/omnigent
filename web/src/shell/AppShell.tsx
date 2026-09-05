@@ -445,6 +445,7 @@ export function AppShell() {
   // is the only path through which the UI learns the user's permission
   // level. ``derivePermissionLevel`` prefers this over ``activeConv``.
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
+  const goalFrameState = activeConv?.goal_state ?? null;
   // Same liveness the chat surface switches on (see ChatPage / useSessionLiveness).
   // AppShell reads it only to drive the Terminal pill's "loading" state: a session
   // in `starting` (a relaunch the moment a message is sent — `turnActive`) is
@@ -2087,6 +2088,19 @@ export function AppShell() {
                     liveness={liveness}
                     onShellCreateStart={markShellCreateStarted}
                     onShellCreateFailed={clearShellCreatePending}
+                  />
+                )}
+                {(goalFrameState === "active" || goalFrameState === "paused") && (
+                  <div
+                    aria-hidden="true"
+                    data-testid="session-goal-frame"
+                    data-goal-state={goalFrameState}
+                    className={cn(
+                      "pointer-events-none absolute inset-y-0 left-0 z-50 ring-2 ring-inset",
+                      goalFrameState === "active" && "ring-status-green/80",
+                      goalFrameState === "paused" && "ring-status-yellow/80",
+                    )}
+                    style={{ right: "var(--workspace-panel-offset)" }}
                   />
                 )}
               </div>

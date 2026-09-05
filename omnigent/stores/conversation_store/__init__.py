@@ -176,6 +176,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.codex_native.bridge_id",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
+        "omnigent.goal_state",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )

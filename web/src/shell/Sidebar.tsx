@@ -143,6 +143,7 @@ import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
+import { GoalActivityBadge } from "@/components/GoalActivityBadge";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
@@ -3854,6 +3855,9 @@ function ConversationRowImpl({
       {/* Row 1: the session name. Working, needs-approval, unseen, and draft
           markers render in the shared trailing indicator slot below. */}
       <div className="flex w-full items-center gap-1.5">
+        {(conversation.goal_state === "active" || conversation.goal_state === "paused") && (
+          <GoalActivityBadge state={conversation.goal_state} />
+        )}
         <span
           className={cn(
             "relative min-w-0 truncate",
