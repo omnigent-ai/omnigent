@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import random
 import threading
 import time
 import uuid
@@ -13,14 +14,22 @@ from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
 if TYPE_CHECKING:
     from alembic.config import Config
 from sqlalchemy.orm import Session, sessionmaker
 
+from omnigent.db.cockroachdb import (
+    _crdb_server_version,
+    _initialize_or_verify_crdb_schema,
+    _prepare_crdb_schema_transaction,
+    _verify_crdb_read_committed,
+)
+from omnigent.db.metrics import record_transaction_retry
 from omnigent.db.query_context import query_name_scope
 from omnigent.entities import NewConversationItem
 
@@ -29,12 +38,20 @@ _logger = logging.getLogger(__name__)
 # A callable that returns a context manager yielding a Session.
 ManagedSessionMaker = Callable[[], AbstractContextManager[Session]]
 
-# A callable that requires a semantic query-name suffix for each transaction.
-NamedManagedSessionMaker = Callable[[str], AbstractContextManager[Session]]
+
+class NamedManagedSessionMaker(Protocol):
+    """Managed session factory carrying its engine and semantic namespace."""
+
+    engine: Engine
+    query_name_prefix: str
+
+    def __call__(self, query_name: str) -> AbstractContextManager[Session]: ...
+
 
 # A zero-argument callable returning a fresh database password (e.g. a
 # short-lived Lakebase OAuth token). Invoked once per *new* DBAPI connection.
 LakebaseTokenProvider = Callable[[], str]
+_T = TypeVar("_T")
 
 
 # ── Lakebase token-aware connections ───────────────────
@@ -191,7 +208,47 @@ def normalize_database_url(url: str) -> str:
     for prefix in ("postgres://", "postgresql://"):
         if url.startswith(prefix):
             return "postgresql+psycopg://" + url[len(prefix) :]
+    if url.startswith("cockroachdb://"):
+        return "cockroachdb+psycopg://" + url[len("cockroachdb://") :]
     return url
+
+
+def is_cockroachdb(dialect_name: str) -> bool:
+    """Return whether *dialect_name* is the CockroachDB dialect."""
+    return dialect_name == "cockroachdb"
+
+
+def is_postgresql_family(dialect_name: str) -> bool:
+    """Return whether a dialect accepts PostgreSQL-family DML."""
+    return dialect_name in {"postgresql", "cockroachdb"}
+
+
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    """Read an integer environment setting, treating blank as unset."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}.") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be at least {minimum}, got {raw!r}.")
+    return value
+
+
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    """Read a floating-point environment setting, treating blank as unset."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number, got {raw!r}.") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be at least {minimum}, got {raw!r}.")
+    return value
 
 
 # ── Engine caching ─────────────────────────────────────
@@ -226,7 +283,9 @@ def _create_engine(db_uri: str) -> Engine:
         ``"postgresql://<user>:<password>@host/dbname"``.
     :returns: A configured :class:`~sqlalchemy.engine.Engine`.
     """
+    db_uri = normalize_database_url(db_uri)
     is_sqlite = db_uri.startswith("sqlite")
+    is_crdb = db_uri.startswith("cockroachdb+")
     if is_sqlite:
         # ``check_same_thread=False`` lets SQLAlchemy's pool hand a
         # connection to whichever worker thread asks for it (FastAPI,
@@ -278,29 +337,38 @@ def _create_engine(db_uri: str) -> Engine:
     pool_recycle = (
         _LAKEBASE_POOL_RECYCLE_SECONDS if token_provider else _SERVER_POOL_RECYCLE_SECONDS
     )
-    engine = create_engine(
-        db_uri,
+    engine_kwargs: dict[str, Any] = {
         # Verify connections are alive before checking them out
         # from the pool. Prevents "server has gone away" errors
         # after idle periods.
-        pool_pre_ping=True,
+        "pool_pre_ping": True,
         # Recycle connections older than this window. Prevents stale
         # connections when the database server restarts or closes idle
         # connections; in Lakebase token mode the shorter window also keeps
         # each connection's OAuth token refreshed ahead of its ~1h expiry.
-        pool_recycle=pool_recycle,
-        # Aligned with the AnyIO thread limiter in
-        # ``server/app.py:_lifespan``. Every DB call runs via
-        # ``asyncio.to_thread``, so connections beyond the thread
-        # token count just sit idle. Overflow covers boot-time
-        # bursts (e.g. migrations). Lakebase per-instance cap: 1000.
-        pool_size=200,
-        max_overflow=20,
+        "pool_recycle": pool_recycle,
+        # The defaults align the base pool with the server's 200-token AnyIO
+        # thread limiter. The environment overrides are global for every
+        # non-SQLite backend. SQLAlchemy permits a zero-sized base pool and
+        # max_overflow=-1 for unlimited overflow.
+        "pool_size": _env_int("OMNIGENT_DB_POOL_SIZE", 200, minimum=0),
+        "max_overflow": _env_int("OMNIGENT_DB_MAX_OVERFLOW", 20, minimum=-1),
         # Bound the wait when the pool is exhausted instead of
         # blocking indefinitely; surfaces real saturation as an
         # error rather than a hang.
-        pool_timeout=10,
-    )
+        "pool_timeout": _env_float("OMNIGENT_DB_POOL_TIMEOUT", 10.0, minimum=0.0),
+    }
+    if is_crdb:
+        engine_kwargs["isolation_level"] = "READ COMMITTED"
+    try:
+        engine = create_engine(db_uri, **engine_kwargs)
+    except (ImportError, NoSuchModuleError) as exc:
+        if is_crdb:
+            raise RuntimeError(
+                "CockroachDB support requires the optional dependencies. "
+                "Install them with `pip install 'omnigent[cockroachdb]'`."
+            ) from exc
+        raise
     if token_provider:
         _install_lakebase_token_refresh(engine, token_provider)
     return engine
@@ -320,6 +388,7 @@ def get_or_create_engine(db_uri: str) -> Engine:
     :returns: A :class:`~sqlalchemy.engine.Engine` for the given URI.
     :raises RuntimeError: If automatic schema migration fails.
     """
+    db_uri = normalize_database_url(db_uri)
     if db_uri not in _engine_cache:
         with _engine_lock:
             if db_uri not in _engine_cache:
@@ -345,6 +414,7 @@ def get_or_create_conversation_engine(conv_uri: str) -> Engine:
     :param conv_uri: SQLAlchemy database URI for the AP DB.
     :returns: A :class:`~sqlalchemy.engine.Engine` for the given URI.
     """
+    conv_uri = normalize_database_url(conv_uri)
     if conv_uri not in _engine_cache:
         with _engine_lock:
             if conv_uri not in _engine_cache:
@@ -362,7 +432,15 @@ def _ensure_conversation_tables(engine: Engine) -> None:
     from omnigent.db.db_models import ConversationBase
 
     with query_name_scope("omnigent.database.ensure_conversation_schema"):
-        ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
+        if is_cockroachdb(engine.dialect.name):
+            version = _crdb_server_version(engine)
+            _verify_crdb_read_committed(engine, version)
+            with engine.connect() as connection:
+                _prepare_crdb_schema_transaction(connection, version)
+                ConversationBase.metadata.create_all(bind=connection, checkfirst=True)
+                connection.commit()
+        else:
+            ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
         ensure_fts_table(engine)
 
 
@@ -428,25 +506,31 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
 
     _logger.info("Running database migrations...")
     config = _build_alembic_config(db_uri)
-    # Pass a shared connection so Alembic operates within the same
-    # engine (required for SQLite in-memory databases, and avoids
-    # creating a second connection pool). The connection is handed over
-    # outside any transaction so Alembic owns transaction demarcation:
-    # a migration with an autocommit_block (CREATE INDEX CONCURRENTLY)
-    # cannot suspend an externally-begun transaction.
+    # Pass a shared connection so Alembic operates within the same engine.
+    # Most dialects let Alembic own transaction demarcation. CRDB needs an
+    # externally started SERIALIZABLE transaction for schema changes; on
+    # versions that provide it, autocommit_before_ddl is also enabled.
     with query_name_scope("omnigent.database.run_migrations"):
+        crdb_version = (
+            _crdb_server_version(engine) if is_cockroachdb(engine.dialect.name) else None
+        )
         with engine.connect() as connection:
+            if crdb_version is not None:
+                _prepare_crdb_schema_transaction(connection, crdb_version)
             config.attributes["connection"] = connection
             command.upgrade(config, "head")
-        # Belt-and-suspenders: if a future migration is added but a
-        # caller forgets to wire it into the chain, ``create_all`` will
-        # at least create any missing tables from ORM metadata so the
-        # server still boots. Cannot rescue missing COLUMNS on existing
-        # tables — those need a real migration, which is why the
-        # short-circuit above was removed. Both bases are created because
-        # in single-DB mode this engine hosts the AP tables too.
-        for base in (OmnigentBase, ConversationBase):
-            base.metadata.create_all(bind=engine, checkfirst=True)
+            if crdb_version is not None:
+                if connection.in_transaction():
+                    connection.commit()
+                _prepare_crdb_schema_transaction(connection, crdb_version)
+                for base in (OmnigentBase, ConversationBase):
+                    base.metadata.create_all(bind=connection, checkfirst=True)
+                connection.commit()
+            else:
+                # If a future migration is added but a caller forgets to wire
+                # it into the chain, create_all still creates missing tables.
+                for base in (OmnigentBase, ConversationBase):
+                    base.metadata.create_all(bind=engine, checkfirst=True)
 
 
 def run_migrations_with_retry(
@@ -620,6 +704,10 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     :raises RuntimeError: If automatic schema migration fails or does
         not bring the database to head.
     """
+    if is_cockroachdb(engine.dialect.name):
+        _initialize_or_verify_crdb_schema(engine, db_uri)
+        return
+
     head = _get_head_db_revision(db_uri)
     current = _get_current_db_revision(engine)
     _verify_db_revision_is_supported(db_uri, current, head)
@@ -830,14 +918,80 @@ def make_named_managed_session_maker(
 
     managed_session = make_managed_session_maker(engine, immediate=immediate)
 
-    @contextmanager
-    def named_managed_session(query_name: str) -> Iterator[Session]:
-        if not query_name.strip():
-            raise ValueError("query_name must not be empty")
-        with query_name_scope(f"{prefix}.{query_name}"), managed_session() as session:
-            yield session
+    class _NamedManagedSessionMaker:
+        """Bind transaction naming metadata to the managed session callable."""
 
-    return named_managed_session
+        def __init__(self) -> None:
+            self.engine = engine
+            self.query_name_prefix = prefix
+
+        @contextmanager
+        def __call__(self, query_name: str) -> Iterator[Session]:
+            if not query_name.strip():
+                raise ValueError("query_name must not be empty")
+            with query_name_scope(f"{prefix}.{query_name}"), managed_session() as session:
+                yield session
+
+    return _NamedManagedSessionMaker()
+
+
+def _is_serialization_failure(exc: DBAPIError) -> bool:
+    """Return whether a DBAPI error carries SQLSTATE 40001."""
+    original = exc.orig
+    return (
+        getattr(original, "sqlstate", None) == "40001"
+        or getattr(original, "pgcode", None) == "40001"
+    )
+
+
+def run_write_transaction(
+    session_maker: NamedManagedSessionMaker,
+    operation_name: str,
+    callback: Callable[[Session], _T],
+    *,
+    max_retries: int = 3,
+    sleep: Callable[[float], None] = time.sleep,
+    random_value: Callable[[], float] = random.random,
+) -> _T:
+    """Run a named managed transaction, replaying CRDB serialization failures.
+
+    The callback must contain database work only. Callers must perform cache
+    invalidation and external side effects after this function returns. The
+    supplied maker remains responsible for query naming, commit, rollback,
+    SQLite write isolation, and session cleanup on every attempt.
+    """
+    if max_retries < 0:
+        raise ValueError("max_retries must be >= 0")
+    retryable = is_cockroachdb(session_maker.engine.dialect.name)
+    qualified_name = f"{session_maker.query_name_prefix}.{operation_name}"
+
+    for attempt in range(max_retries + 1):
+        try:
+            with session_maker(operation_name) as session:
+                return callback(session)
+        except DBAPIError as exc:
+            if not retryable or not _is_serialization_failure(exc):
+                raise
+            if attempt == max_retries:
+                record_transaction_retry(qualified_name, "exhausted")
+                _logger.error(
+                    "CockroachDB transaction retries exhausted",
+                    extra={"db_operation": qualified_name, "retry_count": attempt},
+                )
+                raise
+            ceiling = min(0.025 * (2**attempt), 0.1)
+            delay = ceiling * random_value()
+            record_transaction_retry(qualified_name, "scheduled")
+            _logger.warning(
+                "Retrying CockroachDB transaction after serialization failure",
+                extra={
+                    "db_operation": qualified_name,
+                    "retry_count": attempt + 1,
+                    "retry_delay_seconds": delay,
+                },
+            )
+            sleep(delay)
+    raise AssertionError("transaction retry loop exited unexpectedly")
 
 
 # ── ID generation ──────────────────────────────────────

@@ -95,19 +95,23 @@ class _BuiltApp:
 
 
 def run_migrations(database_url: str) -> None:
-    """Run the Alembic upgrade against ``database_url``.
+    """Initialize or upgrade the schema at ``database_url``.
 
     The SQLAlchemy stores refuse to start on a stale schema, so this
-    runs before any store boots. Creates a throwaway engine, upgrades,
-    and disposes it.
+    runs before any store boots. The central initializer preserves the
+    normal Alembic path for existing backends and uses the safe fresh-schema
+    bootstrap for CockroachDB.
     """
-    import sqlalchemy
+    from omnigent.db.utils import (
+        _create_engine,
+        _initialize_or_verify_schema,
+        normalize_database_url,
+    )
 
-    from omnigent.db.utils import _run_migrations as _run_alembic_upgrade
-
-    migration_engine = sqlalchemy.create_engine(database_url)
+    database_url = normalize_database_url(database_url)
+    migration_engine = _create_engine(database_url)
     try:
-        _run_alembic_upgrade(migration_engine, database_url)
+        _initialize_or_verify_schema(migration_engine, database_url)
     finally:
         migration_engine.dispose()
 

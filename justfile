@@ -53,6 +53,24 @@ dev: _ensure-omnidev
 dev-mobile: _ensure-omnidev
     omnidev --vite-host 0.0.0.0 --trust-lan-origins
 
+[group('dev')]
+crdb-up:
+    docker compose -f deploy/cockroachdb/docker-compose.yml up -d --wait --wait-timeout 90
+    docker compose -f deploy/cockroachdb/docker-compose.yml exec -T crdb-23-2-28 cockroach sql --insecure --execute="SET CLUSTER SETTING sql.txn.read_committed_isolation.enabled = true"
+
+[group('dev')]
+crdb-stop:
+    docker compose -f deploy/cockroachdb/docker-compose.yml stop
+
+[group('dev')]
+crdb-test: crdb-up
+    ./scripts/test_crdb_matrix.sh
+
+# Destructive: stops CRDB and deletes all four persistent development volumes.
+[group('dev')]
+crdb-reset:
+    docker compose -f deploy/cockroachdb/docker-compose.yml down --volumes
+
 # --- Mobile builds ---
 
 [group('mobile')]

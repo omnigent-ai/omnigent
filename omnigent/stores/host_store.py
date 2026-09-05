@@ -34,6 +34,7 @@ from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
     now_epoch,
+    run_write_transaction,
 )
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
@@ -202,6 +203,11 @@ class HostStore:
             self._engine,
             query_name_prefix="omnigent.host_store",
         )
+        self._session_immediate = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.host_store",
+            immediate=True,
+        )
 
     def upsert_on_connect(
         self,
@@ -260,7 +266,8 @@ class HostStore:
         harnesses_json = (
             json.dumps(configured_harnesses) if configured_harnesses is not None else None
         )
-        with self._session("upsert_host_on_connect") as session:
+
+        def write(session: Session) -> Host:
             if managed_token is not None:
                 result = cast(
                     CursorResult[tuple[object]],
@@ -322,6 +329,7 @@ class HostStore:
                     host_id=host_id,
                     name=name,
                     user_id=user_id,
+                    now=now,
                     configured_harnesses_json=harnesses_json,
                 )
                 if reowned is not None:
@@ -360,6 +368,8 @@ class HostStore:
             )
             session.add(row)
             return _row_to_host(row)
+
+        return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
 
     @staticmethod
     def _rotate_host_id(
@@ -467,6 +477,7 @@ class HostStore:
         host_id: str,
         name: str,
         user_id: str,
+        now: int,
         configured_harnesses_json: str | None = None,
     ) -> Host | None:
         """Re-own an existing host_id row under a new ``(user_id, name)``.
@@ -503,7 +514,6 @@ class HostStore:
         if existing is None:
             return None
         created_at = existing.created_at
-        now = now_epoch()
         session.execute(
             update(SqlHost)
             .where(
@@ -540,7 +550,9 @@ class HostStore:
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
         """
-        with self._session("set_host_offline") as session:
+        updated_at = now_epoch()
+
+        def write(session: Session) -> None:
             row = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
@@ -548,7 +560,9 @@ class HostStore:
             ).scalar_one_or_none()
             if row is not None:
                 row.status = encode_host_status("offline")
-                row.updated_at = now_epoch()
+                row.updated_at = updated_at
+
+        run_write_transaction(self._session_immediate, "set_host_offline", write)
 
     def update_harness_readiness(
         self,
@@ -560,7 +574,10 @@ class HostStore:
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param configured_harnesses: Current readiness keyed by harness spelling.
         """
-        with self._session("update_harness_readiness") as session:
+        harnesses_json = json.dumps(configured_harnesses)
+        updated_at = now_epoch()
+
+        def write(session: Session) -> None:
             session.execute(
                 update(SqlHost)
                 .where(
@@ -568,10 +585,12 @@ class HostStore:
                     SqlHost.host_id == host_id,
                 )
                 .values(
-                    configured_harnesses=json.dumps(configured_harnesses),
-                    updated_at=now_epoch(),
+                    configured_harnesses=harnesses_json,
+                    updated_at=updated_at,
                 )
             )
+
+        run_write_transaction(self._session_immediate, "update_harness_readiness", write)
 
     def heartbeat(self, host_id: str) -> None:
         """
@@ -591,15 +610,19 @@ class HostStore:
         # Single UPDATE rather than SELECT-then-mutate: this runs every
         # ping interval for every connected host, so the extra read is
         # pure overhead. A missing host simply matches no rows (a no-op).
-        with self._session("update_host_heartbeat") as session:
+        updated_at = now_epoch()
+
+        def write(session: Session) -> None:
             session.execute(
                 update(SqlHost)
                 .where(
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
                 )
-                .values(updated_at=now_epoch())
+                .values(updated_at=updated_at)
             )
+
+        run_write_transaction(self._session_immediate, "update_host_heartbeat", write)
 
     def is_online(self, host_id: str) -> bool:
         """
@@ -798,7 +821,8 @@ class HostStore:
         """
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
-        with self._session("register_managed_host") as session:
+
+        def write(session: Session) -> Host:
             existing = session.execute(
                 select(SqlHost)
                 .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
@@ -848,6 +872,8 @@ class HostStore:
             )
             session.add(row)
             return _row_to_host(row)
+
+        return run_write_transaction(self._session_immediate, "register_managed_host", write)
 
     def rearm_managed_host(
         self,
@@ -948,7 +974,8 @@ class HostStore:
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         """
-        with self._session("delete_host") as session:
+
+        def write(session: Session) -> None:
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -963,6 +990,8 @@ class HostStore:
                     SqlHost.host_id == host_id,
                 )
             )
+
+        run_write_transaction(self._session_immediate, "delete_host", write)
 
     def detach_stale_managed_sandbox(
         self,
@@ -1047,7 +1076,9 @@ class HostStore:
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         """
-        with self._session("revoke_launch_token") as session:
+        updated_at = now_epoch()
+
+        def write(session: Session) -> None:
             row = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
@@ -1057,4 +1088,6 @@ class HostStore:
                 return
             row.token_hash = None
             row.token_expires_at = None
-            row.updated_at = now_epoch()
+            row.updated_at = updated_at
+
+        run_write_transaction(self._session_immediate, "revoke_launch_token", write)

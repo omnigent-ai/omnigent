@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 
 from sqlalchemy import and_, asc, desc, or_, select
+from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlFile, current_workspace_id, normalize_uuid
 from omnigent.db.query_context import query_name_scope
@@ -13,6 +14,7 @@ from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
     now_epoch,
+    run_write_transaction,
 )
 from omnigent.entities import PagedList, StoredFile
 from omnigent.stores.file_store import FileStore
@@ -56,6 +58,11 @@ class SqlAlchemyFileStore(FileStore):
             self._engine,
             query_name_prefix="omnigent.file_store",
         )
+        self._session_immediate = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.file_store",
+            immediate=True,
+        )
 
     def create(
         self,
@@ -74,17 +81,22 @@ class SqlAlchemyFileStore(FileStore):
             global files.
         :returns: The newly created :class:`StoredFile`.
         """
-        row = SqlFile(
-            id=generate_file_id(),
-            created_at=now_epoch(),
-            filename=filename,
-            bytes=bytes,
-            content_type=content_type,
-            session_id=session_id,
-        )
-        with self._session("insert_file") as session:
+        file_id = generate_file_id()
+        created_at = now_epoch()
+
+        def write(session: Session) -> StoredFile:
+            row = SqlFile(
+                id=file_id,
+                created_at=created_at,
+                filename=filename,
+                bytes=bytes,
+                content_type=content_type,
+                session_id=session_id,
+            )
             session.add(row)
             return _to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "insert_file", write)
 
     def get(
         self,
@@ -199,7 +211,8 @@ class SqlAlchemyFileStore(FileStore):
         :param session_id: If set, verify ownership.
         :returns: ``True`` if deleted, ``False`` otherwise.
         """
-        with self._session("delete_file") as session:
+
+        def write(session: Session) -> bool:
             with query_name_scope("omnigent.file_store.select_file_by_id"):
                 row = session.get(SqlFile, (current_workspace_id(), file_id))
             if not row:
@@ -209,6 +222,8 @@ class SqlAlchemyFileStore(FileStore):
             session.delete(row)
             return True
 
+        return run_write_transaction(self._session_immediate, "delete_file", write)
+
     def delete_all_for_session(self, session_id: str) -> builtins.list[str]:
         """
         Delete all file metadata for a session.
@@ -216,7 +231,8 @@ class SqlAlchemyFileStore(FileStore):
         :param session_id: Owning session/conversation id.
         :returns: List of deleted file ids for artifact cleanup.
         """
-        with self._session("delete_session_files") as session:
+
+        def write(session: Session) -> builtins.list[str]:
             stmt = select(SqlFile).where(
                 SqlFile.workspace_id == current_workspace_id(),
                 SqlFile.session_id == session_id,
@@ -227,3 +243,5 @@ class SqlAlchemyFileStore(FileStore):
             for row in rows:
                 session.delete(row)
             return ids
+
+        return run_write_transaction(self._session_immediate, "delete_session_files", write)
