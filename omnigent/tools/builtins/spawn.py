@@ -16,6 +16,7 @@ from omnigent.entities import (
     Conversation,
     ConversationItem,
 )
+from omnigent.native_coding_agents import public_agent_name
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.session_lifecycle import (
@@ -23,6 +24,7 @@ from omnigent.session_lifecycle import (
     CLOSED_LABEL_VALUE,
     CLOSED_TITLE_INFIX,
     is_session_closed,
+    title_without_closed_marker,
 )
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
@@ -504,10 +506,12 @@ class SysSessionListTool(Tool):
       ``sys_session_get_info`` / ``sys_session_close``.
     - ``sessions`` — a **global** view of every session the caller can
       access (bounded by the server's per-user permission model), each
-      with its status and runner connectivity. An optional
-      ``agent_name`` filter narrows this list. This powers
-      orchestration: discovering sessions to inspect
-      (``sys_agent_get`` / ``sys_session_get_info``) or drive
+      with its status and runner connectivity. Sub-agent sessions are
+      included alongside top-level ones and are marked by a non-null
+      ``parent_session_id``, so a child whose ``conversation_id`` was
+      lost stays recoverable. An optional ``agent_name`` filter narrows
+      this list. This powers orchestration: discovering sessions to
+      inspect (``sys_agent_get`` / ``sys_session_get_info``) or drive
       (``sys_session_send`` by ``session_id``).
 
     The global ``sessions`` view is populated only on the runner
@@ -528,8 +532,9 @@ class SysSessionListTool(Tool):
             "(agent, title) children under this conversation (and your "
             "parent/siblings) — use their conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
-            "every session "
-            "you can access, each with status + runner connectivity, "
+            "every session you can access — top-level and sub-agent "
+            "alike, the latter marked by a non-null parent_session_id — "
+            "each with status + runner connectivity, "
             "for orchestration (inspect via sys_agent_get / "
             "sys_session_get_info, or drive via sys_session_send by "
             "session_id). Pass agent_name to filter the global list to "
@@ -591,7 +596,11 @@ class SysSessionListTool(Tool):
 
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
-        Return the named sub-agents under the caller's conversation.
+        Return the open sub-agent sessions under the caller's conversation.
+
+        Covers both framework-named children (``"<agent>:<title>"``) and
+        ``sys_session_create`` children, whose title is the caller's
+        verbatim string and whose agent comes from the durable binding.
 
         In-process path: returns the ``sub_agents`` children view with an
         empty ``sessions`` list — the global, permission-bounded session
@@ -619,24 +628,26 @@ class SysSessionListTool(Tool):
             # would lose track regardless.
             limit=100,
         )
-        result: list[dict[str, str]] = []
-        for child in children.data:
-            # Title is "<agent>:<title>" — split into the LLM-
-            # friendly fields. Skip rows whose title doesn't
-            # match the convention (defensive — Phase-3
-            # anonymous spawns left None titles, but those have
-            # NULL parent_conversation_id and won't appear in
-            # this query at all). Also skip closed rows so they
-            # never re-surface to the LLM.
-            if child.title is None or ":" not in child.title:
-                continue
-            if is_session_closed(child.labels, child.title):
-                continue
-            sa_agent, _, sa_title = child.title.partition(":")
+        open_children = [
+            child
+            for child in children.data
+            # Closed rows must never re-surface to the LLM.
+            if not is_session_closed(child.labels, child.title)
+        ]
+        # Children created by ``sys_session_create`` store the caller's
+        # title verbatim, with no agent to recover from it; resolve
+        # those names from the durable agent binding in one query.
+        agent_names = _agent_names_for_untyped(open_children)
+        result: list[dict[str, str | None]] = []
+        for child in open_children:
+            labelled = _agent_title_from_conversation(child)
+            agent = labelled.agent
+            if agent is None:
+                agent = agent_names.get(child.agent_id or "")
             result.append(
                 {
-                    "agent": sa_agent,
-                    "title": sa_title,
+                    "agent": public_agent_name(agent),
+                    "title": labelled.title,
                     "conversation_id": child.id,
                 }
             )
@@ -1174,13 +1185,14 @@ class _AgentTitle:
     Decomposed sub-agent identity recovered from a conversation title.
 
     :param agent: Sub-agent name (the part before the first ``":"`` in
-        the stored title), e.g. ``"researcher"``.
+        the stored title), e.g. ``"researcher"``. ``None`` for a child
+        whose title was stored verbatim, with no agent prefix.
     :param title: LLM-facing session title with any tombstone marker
-        stripped, e.g. ``"draft-1"``.
+        stripped, e.g. ``"draft-1"``. ``None`` for an untitled child.
     """
 
-    agent: str
-    title: str
+    agent: str | None
+    title: str | None
 
 
 @dataclass(frozen=True)
@@ -1204,28 +1216,43 @@ def _agent_title_from_conversation(child: Conversation) -> _AgentTitle:
 
     Named sub-agents persist ``"<agent>:<title>"`` in
     ``Conversation.title`` (and internally rewrite to
-    ``"<agent>:<title>:closed:<conv_id>"`` when closed). Both forms
-    split on the first ``":"`` to recover the LLM-facing components.
+    ``"<agent>:<title>:closed:<conv_id>"`` when closed); both forms
+    split on the first ``":"``. ``sys_session_create`` instead stores
+    the caller's title verbatim — possibly colonless, possibly absent —
+    so those yield ``agent=None`` with the display title.
 
-    :param child: The child :class:`Conversation`. Must have a
-        non-empty title containing at least one ``":"``.
+    :param child: The child :class:`Conversation`.
     :returns: An :class:`_AgentTitle` with the closed marker stripped
         from the title side when present.
-    :raises RuntimeError: If the title is missing or doesn't contain
-        a ``":"`` separator — both indicate a framework invariant
-        broken upstream (sub-agent conversations are always created
-        with ``"<agent>:<title>"``). Failing loud here surfaces the
-        bug at its source instead of letting empty fields propagate
-        into JSON results and rebuilt tombstone titles.
     """
-    if not child.title or ":" not in child.title:
-        raise RuntimeError(
-            f"sub-agent conversation {child.id!r} has malformed title "
-            f"{child.title!r} — expected '<agent>:<title>' format"
-        )
-    sa_agent, _, remainder = child.title.partition(":")
-    sa_title, _, _closed_marker = remainder.partition(_CLOSED_TITLE_INFIX)
+    display_title = title_without_closed_marker(child.title)
+    if not display_title or ":" not in display_title:
+        return _AgentTitle(agent=None, title=display_title)
+    sa_agent, _, sa_title = display_title.partition(":")
     return _AgentTitle(agent=sa_agent, title=sa_title)
+
+
+def _agent_names_for_untyped(children: list[Conversation]) -> dict[str, str]:
+    """
+    Batch-resolve agent names for children with no agent in their title.
+
+    Only ``sys_session_create`` children need this — framework-named
+    children carry the agent in ``"<agent>:<title>"``. Returns empty
+    without touching the agent store when none do.
+
+    :param children: Candidate child conversations.
+    :returns: Mapping of ``{agent_id: agent_name}``.
+    """
+    from omnigent.runtime import get_agent_store
+
+    agent_ids = [
+        child.agent_id
+        for child in children
+        if child.agent_id and _agent_title_from_conversation(child).agent is None
+    ]
+    if not agent_ids:
+        return {}
+    return get_agent_store().get_names(agent_ids)
 
 
 def _resolve_caller_tree(ctx: ToolContext) -> _CallerTree:
@@ -1323,11 +1350,10 @@ def _resolve_session_call(
             }
         )
     if target.parent_conversation_id is None:
-        # Top-level conversations don't carry the
-        # ``<agent>:<title>`` invariant on ``title`` that
-        # downstream :func:`_agent_title_from_conversation`
-        # depends on. Refuse here with a typed error rather
-        # than letting the title parse blow up.
+        # Peek/close only operate on sub-agents, and a missing
+        # parent is what proves a row is not one. Refuse with a
+        # typed error rather than tombstoning a user's own
+        # top-level conversation.
         return json.dumps(
             {
                 "error": "session_not_a_sub_agent",
@@ -1700,8 +1726,14 @@ class SysSessionCloseTool(Tool):
         labelled = _agent_title_from_conversation(resolution.child)
         # Re-build the tombstoned title from the parsed components so
         # the marker lands in the canonical position even if the
-        # original title used uncommon characters around the colon.
-        new_title = f"{labelled.agent}:{labelled.title}{_CLOSED_TITLE_INFIX}{resolution.child.id}"
+        # original title used uncommon characters around the colon. A
+        # verbatim-titled child has no agent prefix to restore.
+        prefix = (
+            f"{labelled.agent}:{labelled.title}"
+            if labelled.agent is not None
+            else (labelled.title or "")
+        )
+        new_title = f"{prefix}{_CLOSED_TITLE_INFIX}{resolution.child.id}"
         resolution.conv_store.update_conversation(resolution.child.id, title=new_title)
         resolution.conv_store.set_labels(
             resolution.child.id,

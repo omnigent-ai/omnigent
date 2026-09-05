@@ -9533,6 +9533,7 @@ def _child_session_summary_from_conversation(
     conv: Conversation,
     parent_session_id: str,
     last_message_preview: str | None,
+    agent_name: str | None = None,
     *,
     cached_status: str | None = None,
 ) -> ChildSessionSummary:
@@ -9550,8 +9551,9 @@ def _child_session_summary_from_conversation(
     surfaced so debug views can investigate.
 
     ``busy`` is derived from the relay-fed ``_session_status_cache``
-    (the tasks table has been removed). ``agent_id`` and ``agent_name``
-    are read from the conversation row directly.
+    (the tasks table has been removed). ``agent_id`` is read from the
+    conversation row directly; ``agent_name`` is passed in because
+    resolving it needs an agent-store read best done once per batch.
 
     :param conv: A child :class:`Conversation` row
         (``kind="sub_agent"``) from
@@ -9563,6 +9565,9 @@ def _child_session_summary_from_conversation(
         be missing.
     :param last_message_preview: Preview text derived from a batched
         child-message lookup, or ``None`` when no visible message exists.
+    :param agent_name: Name of the agent bound to ``conv.agent_id``,
+        resolved by the batched caller. ``None`` when the child has no
+        agent binding or the agent no longer exists.
     :param cached_status: Session status to derive ``busy`` /
         ``current_task_status`` from, e.g. ``"running"``. ``None`` reads the
         live ``_session_status_cache``; a status-edge publisher passes the
@@ -9590,8 +9595,8 @@ def _child_session_summary_from_conversation(
             # User-added agent: "ui:<agent_name>:<user_label>". Surface the
             # bound agent as ``tool`` and the user's label as ``session_name``
             # so the Agents rail renders it like any other child row.
-            agent_name, _, user_label = tail.partition(":")
-            tool = agent_name
+            title_agent_name, _, user_label = tail.partition(":")
+            tool = title_agent_name
             session_name = user_label
         else:
             tool = head
@@ -9631,10 +9636,10 @@ def _child_session_summary_from_conversation(
         session_name=session_name,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
-        # agent_id comes from the conversation row; agent_name and task_id
-        # are no longer available from the (removed) tasks table.
+        # agent_id comes from the conversation row; agent_name is resolved
+        # from it by the batch caller. task_id has no source (tasks removed).
         agent_id=conv.agent_id,
-        agent_name=None,
+        agent_name=agent_name,
         current_task_id=None,
         current_task_status=current_task_status,
         busy=busy,

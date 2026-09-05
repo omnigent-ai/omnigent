@@ -9020,31 +9020,39 @@ async def _child_session_summaries_from_conversations(
     children: list[Conversation],
     parent_session_id: str,
     conv_store: ConversationStore,
+    agent_store: AgentStore,
 ) -> list[ChildSessionSummary]:
     """
-    Build child summaries with one batched message-preview lookup.
+    Build child summaries with batched preview and agent-name lookups.
 
     ``ChildSessionSummary.last_message_preview`` needs the latest visible
-    message per child. Loading those by calling ``list_items`` once per
-    child blocks the event loop and creates N+1 database traffic. This
-    helper reads newest message items for all child ids in a worker
-    thread, computes previews in memory, then builds summaries without
-    further store access.
+    message per child, and ``agent_name`` needs the bound agent's name.
+    Loading those per child blocks the event loop and creates N+1
+    database traffic. This helper reads newest message items for all
+    child ids and the names for all distinct bound agents in worker
+    threads, then builds summaries without further store access.
 
     :param children: Child conversation rows from
         ``list_conversations(kind="sub_agent")``.
     :param parent_session_id: Parent session id, e.g. ``"conv_parent987"``.
     :param conv_store: Conversation store used for the batched message read.
+    :param agent_store: Agent store used for the batched name lookup.
     :returns: One :class:`ChildSessionSummary` per input child, preserving
         input order.
     """
     if not children:
         return []
     child_ids = [child.id for child in children]
-    message_items_by_child = await asyncio.to_thread(
-        conv_store.list_latest_message_items_for_conversations,
-        child_ids,
-        10,
+    # Legacy/unbound children carry agent_id=None; drop those before the
+    # lookup so a null never reaches the store's id filter.
+    unique_agent_ids = list({child.agent_id for child in children if child.agent_id is not None})
+    message_items_by_child, agent_names_by_id = await asyncio.gather(
+        asyncio.to_thread(
+            conv_store.list_latest_message_items_for_conversations,
+            child_ids,
+            10,
+        ),
+        asyncio.to_thread(agent_store.get_names, unique_agent_ids),
     )
     previews = {
         child_id: _latest_message_preview(message_items)
@@ -9055,6 +9063,9 @@ async def _child_session_summaries_from_conversations(
             child,
             parent_session_id,
             previews.get(child.id),
+            agent_name=(
+                agent_names_by_id.get(child.agent_id) if child.agent_id is not None else None
+            ),
         )
         for child in children
     ]

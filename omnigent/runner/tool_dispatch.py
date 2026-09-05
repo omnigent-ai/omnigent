@@ -3033,6 +3033,30 @@ def _finalize_created_session(
     )
 
 
+def _reserved_title_error(title: object) -> str | None:
+    """
+    Reject a caller title that carries the closed lifecycle marker.
+
+    ``:closed:`` is how a tombstoned title is written and recognized, so
+    a session created with it in its title would read as already closed
+    everywhere and vanish from ``sys_session_list``.
+
+    :param title: The caller-supplied ``title`` argument, any type.
+    :returns: A JSON tool-error string when the title is reserved, else
+        ``None``.
+    """
+    if not isinstance(title, str) or _CLOSED_TITLE_INFIX not in title:
+        return None
+    return json.dumps(
+        {
+            "error": (
+                f"sys_session_create 'title' may not contain {_CLOSED_TITLE_INFIX!r} — "
+                "it is a reserved session-lifecycle marker. Choose another title."
+            )
+        }
+    )
+
+
 async def _execute_session_create(
     args: _JsonObject,
     *,
@@ -3098,6 +3122,10 @@ async def _execute_session_create(
                 )
             }
         )
+    # Guards both modes: the config-path create is dispatched from here.
+    reserved_title = _reserved_title_error(args.get("title"))
+    if reserved_title is not None:
+        return reserved_title
     if has_config_path:
         # The multipart create carries only the config bundle, so an effort
         # passed here would never reach the child. Refuse instead of dropping it.
@@ -4978,6 +5006,7 @@ async def _agent_list_fetch(
     *,
     after: str | None,
     limit: int,
+    params_extra: dict[str, str] | None = None,
 ) -> _DiscoveryPage:
     """
     Fetch one cursor page of a paginated list endpoint.
@@ -4991,10 +5020,13 @@ async def _agent_list_fetch(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
+    :param params_extra: Endpoint-specific query params merged into every
+        page request, e.g. the session listing's ``kind`` scope.
     :returns: Rows and server continuation metadata.
     """
     try:
         params: dict[str, str | int] = {"limit": limit, "order": "desc"}
+        params.update(params_extra or {})
         if after is not None:
             params["after"] = after
         resp = await server_client.get(path, params=params, timeout=30.0)
@@ -5180,7 +5212,8 @@ async def _agent_list_via_rest(
 
     - ``builtins``: ``GET /v1/agents`` (template agents), projected to
       ``{agent_id, name, description, harness}``.
-    - ``session_agents``: ``GET /v1/sessions``, projected to
+    - ``session_agents``: ``GET /v1/sessions`` over both top-level and
+      sub-agent sessions, projected to
       ``{session_id, agent_id, agent_name, status}`` so the caller can
       launch the agent directly (``sys_session_create`` by
       ``agent_id``) or ``sys_agent_get`` / ``sys_agent_download`` a
@@ -5225,6 +5258,9 @@ async def _agent_list_via_rest(
             server_client,
             after=cursor_state["session_agents"][1],
             limit=source_limit,
+            # The server lists only top-level sessions by default, which
+            # would hide the agents bound solely to a sub-agent session.
+            params_extra={"kind": "any"},
         )
     )
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
@@ -5467,11 +5503,11 @@ async def _collect_sub_agents(
     Collect the caller's named-sub-agent view via ``GET .../child_sessions``.
 
     Returns ``[{"agent", "title", "conversation_id"}, ...]``, skipping
-    closed and titleless/colonless rows so they never re-surface to the
-    LLM. Includes the caller's own children and, when the caller is
-    itself a child (e.g. a user-added agent), its parent (surfaced as
-    ``agent="main"``) and its siblings — so an added agent can still
-    discover ``main`` and its session-mates. Best-effort: a failed
+    closed rows so they never re-surface to the LLM. Includes the
+    caller's own children and, when the caller is itself a child (e.g.
+    a user-added agent), its parent (surfaced as ``agent="main"``) and
+    its siblings — so an added agent can still discover ``main`` and
+    its session-mates. Best-effort: a failed
     lookup yields ``[]`` (or own-children-only) rather than raising.
 
     :param conversation_id: The caller session id.
@@ -5558,7 +5594,9 @@ async def _collect_global_sessions(
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
 
     Projects each accessible session to ``{session_id, agent_name, title,
-    status, runner_id, runner_online, parent_session_id}``.
+    status, runner_id, runner_online, parent_session_id}``. Both
+    top-level and sub-agent sessions are listed; a non-null
+    ``parent_session_id`` marks a child.
     ``runner_online`` is resolved once per unique bound runner (see
     :func:`_resolve_runner_online_map`). An optional ``agent_name``
     filters the list server-side. Permission-bounded by the server (the
@@ -5572,7 +5610,11 @@ async def _collect_global_sessions(
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
     """
-    params: dict[str, str | int] = {"limit": limit, "order": "desc"}
+    # ``kind=any``: the server lists only top-level sessions by default,
+    # which would strand every child created by ``sys_session_create``
+    # once its conversation_id is lost. Their ``parent_session_id`` marks
+    # them apart from the top-level rows.
+    params: dict[str, str | int] = {"limit": limit, "order": "desc", "kind": "any"}
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if after is not None:
@@ -5620,24 +5662,38 @@ def _child_rows_to_entries(
     """
     Map ``child_sessions`` rows to ``sys_session_list`` entries.
 
-    Skips closed and titleless/colonless rows. The server already
-    parses ``tool``/``session_name`` from the title (including the
-    ``"ui:<agent>:<label>"`` form), so those are reused.
+    Skips only closed and id-less rows. Framework-named children carry
+    a ``session_name`` the server parsed off the ``"<agent>:<title>"``
+    title (including the ``"ui:<agent>:<label>"`` form), and keep that
+    title-derived agent so ``sys_session_send`` named mode still
+    resolves them. ``sys_session_create`` children instead store the
+    caller's title verbatim (or none), so they are named from the
+    durable ``agent_name`` binding.
 
     :param rows: ``data`` rows from ``GET .../child_sessions``.
     :returns: ``[{"agent", "title", "conversation_id"}, ...]``.
     """
     entries: list[dict[str, str | None]] = []
     for row in rows:
+        conversation_id = _optional_string(row.get("id"))
         title = _optional_string(row.get("title"))
         labels = _string_mapping(row.get("labels"))
-        if not title or ":" not in title or is_session_closed(labels, title):
+        if conversation_id is None or is_session_closed(labels, title):
             continue
+        session_name = _optional_string(row.get("session_name"))
+        if session_name is not None:
+            agent = _optional_string(row.get("tool"))
+            entry_title: str | None = session_name
+        else:
+            agent = _optional_string(row.get("agent_name")) or _optional_string(row.get("tool"))
+            entry_title = title
         entries.append(
             {
-                "agent": _optional_string(row.get("tool")),
-                "title": _optional_string(row.get("session_name")),
-                "conversation_id": _optional_string(row.get("id")),
+                # Hide the internal ``-native-ui`` wrapper name, matching
+                # the global listing and ``sys_session_get_info``.
+                "agent": public_agent_name(agent),
+                "title": entry_title,
+                "conversation_id": conversation_id,
             }
         )
     return entries
@@ -5846,7 +5902,9 @@ async def _session_close_via_rest(
     On success marks the child with ``omnigent.closed=true`` and
     rewrites its internal title to ``"<agent>:<title>:closed:<id>"`` so
     future ``sys_session_send`` calls with the same ``(agent, title)``
-    create a fresh child.
+    create a fresh child. Children created by ``sys_session_create``
+    store the caller's title verbatim, with no agent prefix to
+    recover; those tombstone as ``"<title>:closed:<id>"``.
 
     :param args: Parsed tool arguments; requires ``conversation_id``.
     :param conversation_id: The calling session's own id, e.g.
@@ -5872,10 +5930,18 @@ async def _session_close_via_rest(
     )
     if scope_error is not None:
         return scope_error
-    parsed = _parse_session_title(_optional_string(target_snap.get("title")))
-    if parsed.agent is None or parsed.title is None:
-        return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
-    new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
+    raw_title = _optional_string(target_snap.get("title"))
+    parsed = _parse_session_title(raw_title)
+    # A colonless title only means the child was created with a
+    # verbatim title; the parent check above already proved it is a
+    # sub-agent. Tombstone the display title as-is in that case.
+    if parsed.agent is not None:
+        display_title = parsed.title
+        prefix = f"{parsed.agent}:{display_title}"
+    else:
+        display_title = title_without_closed_marker(raw_title)
+        prefix = display_title or ""
+    new_title = f"{prefix}{_CLOSED_TITLE_INFIX}{target_id}"
     try:
         patch = await server_client.patch(
             f"/v1/sessions/{target_id}",
@@ -5898,7 +5964,7 @@ async def _session_close_via_rest(
             "closed": True,
             "conversation_id": target_id,
             "agent": parsed.agent,
-            "title": parsed.title,
+            "title": display_title,
         }
     )
 

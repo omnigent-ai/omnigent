@@ -6093,8 +6093,8 @@ def _session_query_client(
 async def test_session_list_maps_children_and_skips_closed() -> None:
     """
     ``sys_session_list`` maps ``child_sessions`` rows to
-    ``{agent, title, conversation_id}`` and drops closed and
-    colonless rows, matching ``SysSessionListTool``.
+    ``{agent, title, conversation_id}`` and drops only closed rows,
+    matching ``SysSessionListTool``.
     """
     from omnigent.runner.tool_dispatch import _execute_session_query_tool
 
@@ -6153,13 +6153,79 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                 "sys_session_list", "{}", conversation_id="conv_parent", server_client=client
             )
         )
-    # c3 (explicitly closed despite its mixed-type label map), c5
-    # (legacy title tombstone), and c4
-    # (no colon) dropped; the ui:-added child surfaces under its bound
-    # agent + label.
+    # Only c3 (explicitly closed despite its mixed-type label map) and
+    # c5 (legacy title tombstone) are dropped. The ui:-added child
+    # surfaces under its public agent name + label, and the colonless
+    # c4 keeps its verbatim title with the server's ``tool`` fallback
+    # as its agent handle.
     assert out["sub_agents"] == [
         {"agent": "researcher", "title": "auth", "conversation_id": "c1"},
-        {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2"},
+        {"agent": "Claude", "title": "1", "conversation_id": "c2"},
+        {"agent": "legacy-untyped", "title": "legacy-untyped", "conversation_id": "c4"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_list_surfaces_verbatim_titled_children() -> None:
+    """
+    Children created by ``sys_session_create`` carry the caller's title
+    verbatim (or none at all) instead of the framework's
+    ``"<agent>:<title>"`` convention. They must still appear in
+    ``sub_agents`` — it is the orchestrator's only handle on them — with
+    the agent taken from the durable ``agent_name`` binding rather than
+    a title parse.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_parent":
+            return httpx.Response(200, json={"id": "conv_parent", "parent_session_id": None})
+        assert request.url.path == "/v1/sessions/conv_parent/child_sessions"
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {
+                        "id": "c_verbatim",
+                        "title": "probe run",
+                        # Server falls back to the raw title for ``tool``
+                        # when the title has no colon; ``agent_name`` is
+                        # the durable binding and must win.
+                        "tool": "probe run",
+                        "session_name": None,
+                        "agent_name": "researcher",
+                    },
+                    {
+                        "id": "c_untitled",
+                        "title": None,
+                        "tool": None,
+                        "session_name": None,
+                        "agent_name": "helper",
+                    },
+                    {
+                        "id": "c_named",
+                        "title": "researcher:auth",
+                        "tool": "researcher",
+                        "session_name": "auth",
+                        # A named spawn keeps its title-derived agent so
+                        # ``sys_session_send`` named mode still resolves.
+                        "agent_name": "some-bound-agent",
+                    },
+                ],
+            },
+        )
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_list", "{}", conversation_id="conv_parent", server_client=client
+            )
+        )
+    assert out["sub_agents"] == [
+        {"agent": "researcher", "title": "probe run", "conversation_id": "c_verbatim"},
+        {"agent": "helper", "title": None, "conversation_id": "c_untitled"},
+        {"agent": "researcher", "title": "auth", "conversation_id": "c_named"},
     ]
 
 
@@ -6200,6 +6266,15 @@ async def test_session_list_adds_main_and_siblings_for_child_caller() -> None:
                             "tool": "researcher",
                             "session_name": "auth",
                         },
+                        # A sibling created by sys_session_create: title
+                        # written verbatim, no colon convention.
+                        {
+                            "id": "conv_sib_verbatim",
+                            "title": "probe run",
+                            "tool": "probe run",
+                            "session_name": None,
+                            "agent_name": "prober",
+                        },
                     ],
                 },
             )
@@ -6216,6 +6291,7 @@ async def test_session_list_adds_main_and_siblings_for_child_caller() -> None:
     assert out["sub_agents"] == [
         {"agent": "main", "title": None, "conversation_id": "conv_main"},
         {"agent": "researcher", "title": "auth", "conversation_id": "conv_sib"},
+        {"agent": "prober", "title": "probe run", "conversation_id": "conv_sib_verbatim"},
     ]
 
 
@@ -6507,6 +6583,60 @@ async def test_session_close_patches_tombstoned_title() -> None:
         "conversation_id": "conv_target",
         "agent": "researcher",
         "title": "auth",
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_close_tombstones_verbatim_titled_child() -> None:
+    """
+    ``sys_session_close`` closes a child whose title has no
+    ``"<agent>:<title>"`` colon — the shape ``sys_session_create``
+    writes. Sub-agent-ness is already proven by the parent check, so a
+    colonless title must not read as ``session_not_a_sub_agent``:
+    otherwise a session the orchestrator can see is one it can never
+    close.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    patched: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "probe run",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": "conv_caller",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(
+                200,
+                json={"id": "conv_caller", "root_conversation_id": "conv_root"},
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_target":
+            patched.update(json.loads(request.content))
+            return httpx.Response(200, json={"id": "conv_target"})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert patched["title"] == "probe run:closed:conv_target"
+    assert patched["labels"] == {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
+    assert out == {
+        "closed": True,
+        "conversation_id": "conv_target",
+        "agent": None,
+        "title": "probe run",
     }
 
 
@@ -6911,6 +7041,9 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
 
     # agent_name forwarded to the server-side filter.
     assert sessions_params.get("agent_name") == "researcher"
+    # kind=any: the server's default hides sub-agent sessions, which would
+    # strand every child created by sys_session_create.
+    assert sessions_params.get("kind") == "any"
     # Both sessions projected with status + connectivity from the single
     # shared-runner status lookup.
     assert out["sessions"] == [
@@ -6937,6 +7070,61 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
     # r1, so exactly one status call (not one per session). A count of 2
     # would mean the dedup regressed into a per-session fan-out.
     assert runner_status_calls == ["r1"]
+
+
+@pytest.mark.asyncio
+async def test_session_list_global_view_includes_sub_agent_sessions() -> None:
+    """
+    The global ``sessions`` view lists sub-agent sessions alongside
+    top-level ones, each marked by a non-null ``parent_session_id``. A
+    child uploaded via ``sys_session_create`` is otherwise unreachable
+    once its conversation_id is lost — nothing else lists it globally.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v1/sessions/conv_x/child_sessions":
+            return httpx.Response(200, json={"object": "list", "data": []})
+        if path == "/v1/sessions/conv_x":
+            return httpx.Response(200, json={"id": "conv_x", "parent_session_id": None})
+        if path == "/v1/sessions":
+            # The mock server honors the kind filter the way the real one
+            # does: children are withheld unless kind=any is requested.
+            rows: list[dict[str, object]] = [
+                {
+                    "id": "s_top",
+                    "agent_name": "researcher",
+                    "title": "auth",
+                    "status": "idle",
+                    "runner_id": None,
+                    "parent_session_id": None,
+                }
+            ]
+            if request.url.params.get("kind") == "any":
+                rows.append(
+                    {
+                        "id": "s_child",
+                        "agent_name": "prober",
+                        "title": "probe run",
+                        "status": "idle",
+                        "runner_id": None,
+                        "parent_session_id": "s_top",
+                    }
+                )
+            return httpx.Response(200, json={"object": "list", "data": rows})
+        raise AssertionError(f"unexpected path {path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_list", "{}", conversation_id="conv_x", server_client=client
+            )
+        )
+
+    assert [row["session_id"] for row in out["sessions"]] == ["s_top", "s_child"]
+    assert out["sessions"][1]["parent_session_id"] == "s_top"
+    assert out["sessions"][1]["agent_name"] == "prober"
 
 
 @pytest.mark.asyncio
@@ -7185,7 +7373,10 @@ async def test_sys_agent_list_merges_three_sources(tmp_path: Path) -> None:
         "name: my-agent\ndescription: a local one\nprompt: hi\n", encoding="utf-8"
     )
 
+    kinds: dict[str, str | None] = {}
+
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        kinds[request.url.path] = request.url.params.get("kind")
         if request.url.path == "/v1/agents":
             return httpx.Response(
                 200,
@@ -7229,6 +7420,10 @@ async def test_sys_agent_list_merges_three_sources(tmp_path: Path) -> None:
     assert info["session_agents"] == [
         {"session_id": "conv_1", "agent_id": "ag_s", "agent_name": "nessie", "status": "idle"}
     ]
+    # Only the session listing widens to sub-agent sessions; the template
+    # agent catalog has no kind dimension and must stay unparameterized.
+    assert kinds["/v1/sessions"] == "any"
+    assert kinds["/v1/agents"] is None
     # Local config discovered by the on-disk scan, with its parsed name.
     assert len(info["local_configs"]) == 1
     assert info["local_configs"][0]["name"] == "my-agent"
@@ -7354,6 +7549,47 @@ async def test_sys_session_create_requires_exactly_one_mode(
 
     info = json.loads(output)
     assert "exactly one of 'agent_id'" in info["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"agent_id": "ag_x", "title": "x:closed:y"},
+        {"config_path": "helper.yaml", "title": "x:closed:y"},
+    ],
+)
+async def test_sys_session_create_rejects_reserved_closed_marker_title(
+    arguments: dict[str, Any],
+) -> None:
+    """
+    ``sys_session_create`` refuses a title containing ``":closed:"``
+    without touching the server.
+
+    That infix is the lifecycle tombstone marker every reader strips or
+    treats as closed, so a caller title carrying it would create a
+    session that reads as already closed and disappears from
+    ``sys_session_list``.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server must not be reached on a reserved title: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(arguments),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert ":closed:" in info["error"]
+    assert "reserved" in info["error"]
 
 
 def _parse_multipart_create(request: httpx.Request) -> dict[str, Any]:

@@ -984,6 +984,140 @@ def test_session_list_skips_label_closed_child_with_original_title(
     assert payload["sub_agents"] == []
 
 
+# Conversation.agent_id is a 32-char hex uuid column; a readable
+# placeholder like "ag_probe" is rejected at insert time.
+_PROBE_AGENT_ID = "3a1f9c2d4b5e6f708192a3b4c5d6e7f8"
+
+
+class _NamesOnlyAgentStore:
+    """
+    Minimal agent-store stand-in exposing only ``get_names``.
+
+    ``SysSessionListTool`` resolves the durable agent binding for
+    children whose title doesn't carry the ``"<agent>:<title>"``
+    convention; only that one call is needed here.
+
+    :param names: Mapping of ``{agent_id: agent_name}`` to serve.
+    """
+
+    def __init__(self, names: dict[str, str]) -> None:
+        self._names = names
+
+    def get_names(self, agent_ids: list[str]) -> dict[str, str]:
+        """
+        Batch-resolve the configured names.
+
+        :param agent_ids: Agent ids to look up.
+        :returns: The subset of ``names`` matching *agent_ids*.
+        """
+        return {
+            agent_id: self._names[agent_id] for agent_id in agent_ids if agent_id in self._names
+        }
+
+
+def _add_verbatim_titled_child(
+    session_fixture: _Fixture,
+    *,
+    title: str | None = "probe run",
+    agent_id: str = _PROBE_AGENT_ID,
+) -> str:
+    """
+    Add a child whose title has no ``"<agent>:<title>"`` colon.
+
+    This is the shape ``sys_session_create`` persists — the caller's
+    title verbatim, or none at all.
+
+    :param session_fixture: Per-test fixture providing the store.
+    :param title: Title to persist verbatim.
+    :param agent_id: Agent binding the reader resolves the name from.
+    :returns: The new child conversation id.
+    """
+    return session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title=title,
+        parent_conversation_id=session_fixture.parent_conv_id,
+        agent_id=agent_id,
+    ).id
+
+
+def test_session_list_surfaces_verbatim_titled_child(
+    session_fixture: _Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``sys_session_list`` surfaces a child created by
+    ``sys_session_create`` — whose title is the caller's verbatim
+    string, not ``"<agent>:<title>"`` — and names it from its durable
+    agent binding rather than a title parse. Dropping these rows would
+    leave the orchestrator with no handle on a session it just created.
+    """
+    child_id = _add_verbatim_titled_child(session_fixture)
+    monkeypatch.setattr(
+        "omnigent.runtime.get_agent_store",
+        lambda: _NamesOnlyAgentStore({_PROBE_AGENT_ID: "prober"}),
+    )
+
+    payload = json.loads(SysSessionListTool().invoke("{}", session_fixture.ctx))
+
+    assert {
+        "agent": "prober",
+        "title": "probe run",
+        "conversation_id": child_id,
+    } in payload["sub_agents"]
+    # The framework-named child still splits on the colon convention.
+    assert {
+        "agent": "researcher",
+        "title": "auth",
+        "conversation_id": session_fixture.child_conv_id,
+    } in payload["sub_agents"]
+
+
+def test_session_list_skips_closed_verbatim_titled_child(
+    session_fixture: _Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The closed label stays authoritative for verbatim-titled children
+    too — relaxing the colon gate must not resurrect closed rows.
+    """
+    child_id = _add_verbatim_titled_child(session_fixture)
+    session_fixture.conv_store.set_labels(child_id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+    monkeypatch.setattr(
+        "omnigent.runtime.get_agent_store",
+        lambda: _NamesOnlyAgentStore({_PROBE_AGENT_ID: "prober"}),
+    )
+
+    payload = json.loads(SysSessionListTool().invoke("{}", session_fixture.ctx))
+
+    assert [entry["conversation_id"] for entry in payload["sub_agents"]] == [
+        session_fixture.child_conv_id
+    ]
+
+
+def test_close_tombstones_verbatim_titled_child(session_fixture: _Fixture) -> None:
+    """
+    ``sys_session_close`` closes a verbatim-titled child instead of
+    raising on the missing colon. The tombstone keeps the display title
+    and appends the marker so the parent's title slot is freed.
+    """
+    child_id = _add_verbatim_titled_child(session_fixture)
+
+    payload = json.loads(
+        SysSessionCloseTool().invoke(
+            json.dumps({"conversation_id": child_id}),
+            session_fixture.ctx,
+        )
+    )
+
+    assert payload["closed"] is True
+    assert payload["agent"] is None
+    assert payload["title"] == "probe run"
+    closed_child = session_fixture.conv_store.get_conversation(child_id)
+    assert closed_child is not None
+    assert closed_child.title == f"probe run{_CLOSED_TITLE_INFIX}{child_id}"
+    assert closed_child.labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+
+
 def test_session_list_schema_exposes_bounded_pagination() -> None:
     """The harness can discover the same pagination inputs the runner accepts."""
 
