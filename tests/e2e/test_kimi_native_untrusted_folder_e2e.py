@@ -22,12 +22,13 @@ Usage::
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -86,16 +87,25 @@ def _resolve_kimi_payload(launcher: Path) -> Path:
 def _probe_kimi() -> _KimiProbe:
     launcher = Path(resolve_kimi_executable())
     payload = _resolve_kimi_payload(launcher)
-    try:
-        proc = subprocess.run(
-            [str(payload), "--version"],
-            capture_output=True,
-            text=True,
-            timeout=_SUBPROCESS_TIMEOUT_S,
-            env={"HOME": str(Path.home()), "PATH": os.defpath},
+    with tempfile.TemporaryDirectory(prefix="omnigent-kimi-version-") as temp_dir:
+        probe_root = Path(temp_dir)
+        isolated_home = probe_root / "home"
+        kimi_home = probe_root / "kimi-code-home"
+        isolated_home.mkdir()
+        kimi_home.mkdir()
+        probe_env = _isolated_launch_env(
+            probe_root, isolated_home=isolated_home, kimi_home=kimi_home
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"could not run {payload} --version: {exc}") from exc
+        try:
+            proc = subprocess.run(
+                [str(payload), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=_SUBPROCESS_TIMEOUT_S,
+                env=probe_env,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"could not run {payload} --version: {exc}") from exc
 
     output = "\n".join(part.strip() for part in (proc.stdout, proc.stderr) if part.strip())
     if proc.returncode != 0:
@@ -132,13 +142,6 @@ def _kimi_native_e2e_reason() -> str | None:
             f"observed {probe.version_output!r}."
         )
     return None
-
-
-_SKIP_REASON = _kimi_native_e2e_reason()
-pytestmark = pytest.mark.skipif(
-    _SKIP_REASON is not None,
-    reason=_SKIP_REASON or "",
-)
 
 
 def _capture_pane(socket_path: Path, target: str, *, phase: str, version: str) -> str:
@@ -288,6 +291,13 @@ def _isolated_launch_env(
     }
 
 
+_SKIP_REASON = _kimi_native_e2e_reason()
+pytestmark = pytest.mark.skipif(
+    _SKIP_REASON is not None,
+    reason=_SKIP_REASON or "",
+)
+
+
 def _launch_kimi(
     tmp_path: Path,
     *,
@@ -349,12 +359,35 @@ def _launch_kimi(
 
 
 def _kill_tmux(socket_path: Path) -> None:
-    """Best-effort bounded cleanup for the test-owned tmux server."""
-    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-        subprocess.run(
+    """Stop the test-owned tmux server and confirm it exited."""
+    if not socket_path.exists():
+        return
+
+    try:
+        kill_proc = subprocess.run(
             ["tmux", "-S", str(socket_path), "kill-server"],
             capture_output=True,
+            text=True,
             timeout=_CLEANUP_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AssertionError(f"tmux kill-server failed: {exc}") from exc
+    if kill_proc.returncode != 0:
+        detail = kill_proc.stderr.strip() or kill_proc.stdout.strip() or "no tmux output"
+        raise AssertionError(f"tmux kill-server exited {kill_proc.returncode}: {detail}")
+
+    try:
+        probe = subprocess.run(
+            ["tmux", "-S", str(socket_path), "list-sessions"],
+            capture_output=True,
+            text=True,
+            timeout=_CLEANUP_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AssertionError(f"could not confirm tmux cleanup: {exc}") from exc
+    if probe.returncode == 0:
+        raise AssertionError(
+            f"tmux cleanup left the test server running; socket retained at {socket_path}"
         )
     socket_path.unlink(missing_ok=True)
 
@@ -382,12 +415,13 @@ def test_kimi_native_first_turn_in_untrusted_folder_delivers(tmp_path: Path) -> 
             payload=probe.payload,
             version=probe.version_output,
         )
-        _wait_for_seeded_input(
+        startup_pane = _wait_for_seeded_input(
             socket_path,
             target,
             timeout_s=_STARTUP_TIMEOUT_S,
             version=probe.version_output,
         )
+        consumed_marker_before_turn = _CONSUMED_WITHOUT_ECHO_TEXT in startup_pane
 
         token = f"NATIVEDELIVERYPROBE{uuid.uuid4().hex[:8]}".upper()
         started = time.monotonic()
@@ -403,7 +437,9 @@ def test_kimi_native_first_turn_in_untrusted_folder_delivers(tmp_path: Path) -> 
                 phase="first-turn delivery",
                 version=probe.version_output,
             )
-            if token in pane or _CONSUMED_WITHOUT_ECHO_TEXT in pane:
+            if token in pane or (
+                not consumed_marker_before_turn and _CONSUMED_WITHOUT_ECHO_TEXT in pane
+            ):
                 delivered = True
                 break
             time.sleep(0.5)
@@ -422,7 +458,13 @@ def test_kimi_native_first_turn_in_untrusted_folder_delivers(tmp_path: Path) -> 
             f"errors: {[error.message for error in errors]}).\nPane:\n{final_pane}"
         )
     finally:
-        _kill_tmux(socket_path)
+        body_error = sys.exception()
+        try:
+            _kill_tmux(socket_path)
+        except Exception as cleanup_error:
+            if body_error is None:
+                raise
+            body_error.add_note(f"Additional tmux cleanup failure: {cleanup_error}")
 
 
 def test_kimi_native_without_trust_seed_parks_on_modal(tmp_path: Path) -> None:
@@ -467,4 +509,10 @@ def test_kimi_native_without_trust_seed_parks_on_modal(tmp_path: Path) -> None:
             f"Pane:\n{parked_pane}"
         )
     finally:
-        _kill_tmux(socket_path)
+        body_error = sys.exception()
+        try:
+            _kill_tmux(socket_path)
+        except Exception as cleanup_error:
+            if body_error is None:
+                raise
+            body_error.add_note(f"Additional tmux cleanup failure: {cleanup_error}")
