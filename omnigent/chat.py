@@ -721,10 +721,13 @@ def _remote_headers(
         # 1. Explicit env-var token.
         headers["Authorization"] = f"Bearer {token}"
     elif server_url:
-        from omnigent.cli_auth import load_token
+        from omnigent.cli_auth import load_or_refresh_token
 
-        # 2. Stored OIDC session token from `omnigent login`.
-        oidc_token = load_token(server_url)
+        # 2. Stored OIDC session token from `omnigent login` — renewed from
+        # the login-issued refresh grant when it lapsed while the CLI idled,
+        # so the next command refreshes instead of going out expired and
+        # 401-ing the user into a needless re-login.
+        oidc_token = load_or_refresh_token(server_url)
         if oidc_token:
             headers["Authorization"] = f"Bearer {oidc_token}"
         else:
@@ -916,13 +919,14 @@ class _DatabricksTokenAuth(httpx.Auth):
         if self._static_token:
             request.headers["Authorization"] = f"Bearer {self._static_token}"
         else:
-            # Check stored OIDC token from `omnigent login`, then fall back to
+            # Check stored OIDC token from `omnigent login` (renewing an
+            # idle-expired one from its refresh grant), then fall back to
             # the reused Databricks SDK auth.
             oidc_token = None
             if self._server_url:
-                from omnigent.cli_auth import load_token
+                from omnigent.cli_auth import load_or_refresh_token
 
-                oidc_token = load_token(self._server_url)
+                oidc_token = load_or_refresh_token(self._server_url)
             if oidc_token:
                 request.headers["Authorization"] = f"Bearer {oidc_token}"
             else:
@@ -983,12 +987,16 @@ def _server_auth(
     raw = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
     if raw and raw.strip():
         return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
-    # Check stored `omnigent login` records: a session JWT or a
+    # Check stored `omnigent login` records: a session JWT (even an expired
+    # one — auth_flow renews it from the stored refresh grant per request,
+    # so an idle-lapsed login is still a live credential source) or a
     # Databricks Apps pointer record.
     if server_url:
-        from omnigent.cli_auth import load_databricks_workspace_host, load_token
+        from omnigent.cli_auth import load_databricks_workspace_host, stored_token_status
 
-        if load_token(server_url) or load_databricks_workspace_host(server_url):
+        if stored_token_status(server_url) != "absent" or load_databricks_workspace_host(
+            server_url
+        ):
             return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
     creds = _read_databrickscfg(None)
     if creds is not None and creds.token:
