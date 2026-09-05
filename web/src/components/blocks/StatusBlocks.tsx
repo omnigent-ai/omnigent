@@ -1,7 +1,8 @@
 // Inline status indicators for non-tool, non-text, non-reasoning blocks.
 // Each is small enough to live in one file.
 //
-// - ErrorBanner: centered destructive pill with an expandable message body.
+// - ErrorBanner: centered destructive pill with an expandable message body;
+//   `level="info"` renders it as a neutral notice instead.
 // - RetryIndicator: muted one-liner about an in-flight retry.
 // - CompactionMarker: permanent marker shown after compaction completes.
 //   The in-progress state renders as a Shimmer in ChatPage, mirroring
@@ -13,6 +14,8 @@ import {
   CheckIcon,
   ChevronRightIcon,
   CopyIcon,
+  InfoIcon,
+  Loader2Icon,
   RotateCcwIcon,
   RotateCwIcon,
   ShieldXIcon,
@@ -47,6 +50,8 @@ interface ErrorBannerProps {
   cause?: string;
   /** Concrete next step to fix it, e.g. a command to run. */
   remediation?: string;
+  /** `"info"` renders a neutral notice (no failure tone) instead of a destructive error. */
+  level?: "error" | "info";
   /** Reconnect the existing session without replaying or duplicating user input. */
   onRetry?: () => Promise<void>;
 }
@@ -68,6 +73,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   context_length_exceeded: "The conversation grew past the model's context window.",
   executor_error: "The agent runtime hit an error while running the turn.",
   workspace_missing: "The session workspace no longer exists on the host.",
+  codex_thread_reset:
+    "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([
@@ -144,9 +151,14 @@ export function ErrorBanner({
   title,
   cause,
   remediation,
+  level,
   onRetry,
 }: ErrorBannerProps) {
-  const headline = title || FAILURE_CODE_DESCRIPTIONS[code] || "Something went wrong";
+  const notice = level === "info";
+  const tone = notice ? "var(--muted-foreground)" : "var(--destructive)";
+  const StatusIcon = notice ? InfoIcon : AlertCircleIcon;
+  const headline =
+    title || FAILURE_CODE_DESCRIPTIONS[code] || (notice ? "Notice" : "Something went wrong");
   const parsed = useMemo(() => parseErrorMessage(message), [message]);
   const messageText = useMemo(() => {
     const parts: string[] = [];
@@ -216,6 +228,7 @@ export function ErrorBanner({
           aria-atomic="true"
           className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
         >
+          <Loader2Icon aria-hidden="true" className="animate-spin" />
           Reconnecting
         </Badge>
       </div>
@@ -250,12 +263,12 @@ export function ErrorBanner({
         aria-hidden="true"
         className="pointer-events-none absolute top-[20px] right-0 left-0 h-px"
         style={{
-          background:
-            "repeating-linear-gradient(to right, color-mix(in srgb, var(--destructive) 32%, transparent) 0 2px, transparent 2px 6px)",
+          background: `repeating-linear-gradient(to right, color-mix(in srgb, ${tone} 32%, transparent) 0 2px, transparent 2px 6px)`,
         }}
       />
       <div
         data-testid="error-pill"
+        data-level={notice ? "info" : "error"}
         onClick={() => setExpanded((value) => !value)}
         onMouseEnter={() => setHeaderHovered(true)}
         onMouseLeave={() => setHeaderHovered(false)}
@@ -271,9 +284,8 @@ export function ErrorBanner({
         }}
         className="group/error relative z-10 w-[560px] max-w-full cursor-pointer rounded-[12px] p-[8px] text-foreground"
         style={{
-          background:
-            "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
-          border: "1px solid color-mix(in srgb, var(--destructive) 32%, transparent)",
+          background: `color-mix(in srgb, ${tone} 4%, var(--app-shell-bg, var(--background)))`,
+          border: `1px solid color-mix(in srgb, ${tone} 32%, transparent)`,
         }}
       >
         <div className="flex w-full min-w-0 items-start gap-[4px]">
@@ -313,9 +325,12 @@ export function ErrorBanner({
                   aria-hidden="true"
                 />
               ) : (
-                <AlertCircleIcon
+                <StatusIcon
                   data-testid="error-status-icon"
-                  className="size-[18px] text-destructive duration-150 animate-in fade-in"
+                  className={cn(
+                    "size-[18px] duration-150 animate-in fade-in",
+                    notice ? "text-muted-foreground" : "text-destructive",
+                  )}
                   aria-hidden="true"
                 />
               )}
@@ -323,7 +338,10 @@ export function ErrorBanner({
             <span
               data-testid="error-headline"
               title={headline}
-              className="mr-[4px] min-w-0 flex-1 truncate whitespace-nowrap leading-6 text-destructive"
+              className={cn(
+                "mr-[4px] min-w-0 flex-1 truncate whitespace-nowrap leading-6",
+                notice ? "text-foreground" : "text-destructive",
+              )}
             >
               {headline}
             </span>
@@ -349,7 +367,7 @@ export function ErrorBanner({
             type="button"
             variant="ghost"
             size="icon-xs"
-            aria-label="Dismiss error message"
+            aria-label={notice ? "Dismiss notice" : "Dismiss error message"}
             onClick={(event) => {
               event.stopPropagation();
               setDismissed(true);

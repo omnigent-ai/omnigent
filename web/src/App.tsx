@@ -6,6 +6,7 @@ import { useOmnigentPageView } from "@/lib/analytics";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
 // beside the component, keeps the route table clean and means no route ships
@@ -161,9 +162,13 @@ function App({ basename }: AppProps = {}) {
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section
               is carried in the URL (/settings/<section>); bare /settings
-              defaults to Appearance. */}
-          <Route path={`${prefix}/settings`} element={<SettingsPage />} />
+              redirects to the canonical General section. */}
+          <Route
+            path={`${prefix}/settings`}
+            element={<Navigate to={`${prefix}/settings/general`} replace />}
+          />
           <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
+          <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
           {/* Members / Policies are now settings sub-categories
               (/settings/members, /settings/policies) so entering them
               keeps the settings sidebar nav instead of dropping back to

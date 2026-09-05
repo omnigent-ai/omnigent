@@ -179,6 +179,8 @@ from omnigent.server.routes._sessions.common import (
     _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S as _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
     _APPROVAL_TYPE as _APPROVAL_TYPE,
     _BROWSER_ACTION_AWAIT_S as _BROWSER_ACTION_AWAIT_S,
+    _BROWSER_ACTION_CLAIM_GRACE_S as _BROWSER_ACTION_CLAIM_GRACE_S,
+    _BROWSER_ACTION_NO_RENDERER_RESULT as _BROWSER_ACTION_NO_RENDERER_RESULT,
     _BROWSER_ACTION_TIMEOUT_RESULT as _BROWSER_ACTION_TIMEOUT_RESULT,
     _CHILD_PREVIEW_LIMIT as _CHILD_PREVIEW_LIMIT,
     _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY as _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY,
@@ -211,7 +213,6 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY as _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE as _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE as _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
-    _COMPACT_LOCKS as _COMPACT_LOCKS,
     _COMPACT_TYPE as _COMPACT_TYPE,
     _CURSOR_FORK_HISTORY_HARNESSES as _CURSOR_FORK_HISTORY_HARNESSES,
     _CURSOR_NATIVE_HARNESS as _CURSOR_NATIVE_HARNESS,
@@ -299,6 +300,7 @@ from omnigent.server.routes._sessions.common import (
     _MirroredToolCall as _MirroredToolCall,
     _PendingPolicyAskWrites as _PendingPolicyAskWrites,
     _RelayHandle as _RelayHandle,
+    _browser_action_claim_events as _browser_action_claim_events,
     _browser_action_claims as _browser_action_claims,
     _browser_action_owners as _browser_action_owners,
     _browser_action_registry as _browser_action_registry,
@@ -505,7 +507,6 @@ from omnigent.server.routes._sessions.helpers import (
     _resolve_subagent_spec as _resolve_subagent_spec,
     _resource_event_item_from_sse as _resource_event_item_from_sse,
     _routing_decision_item_from_sse as _routing_decision_item_from_sse,
-    _run_compact_locked as _run_compact_locked,
     _same_provider_family_impl as _same_provider_family_impl,
     _seed_missing_title as _seed_missing_title,
     _seed_missing_title_from_user_message as _seed_missing_title_from_user_message,
@@ -550,9 +551,6 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.helpers import (
     _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,
-)
-from omnigent.server.routes._sessions.helpers import (
-    _compact_lock_impl as _compact_lock,
 )
 from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner_impl as _forward_session_change_to_runner,
@@ -746,7 +744,6 @@ if TYPE_CHECKING:
         "_agent_carries_native_fork_history",
         "_agent_is_native",
         "_build_policy_engine_from_spec",
-        "_compact_lock",
         "_dispatch_session_event_to_runner",
         "_ensure_runner_relay_ready",
         "_forward_session_change_to_runner",

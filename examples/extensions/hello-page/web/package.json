@@ -1,0 +1,17 @@
+{
+  "name": "@omnigent/example-hello-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build && node scripts/ensure-newline.mjs",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@omnigent/extension-sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.2",
+    "vite": "8.1.0"
+  }
+}

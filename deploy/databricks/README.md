@@ -138,7 +138,18 @@ The script builds wheels, archives the SPA as `dist/web-ui.tar.gz`, copies the
 wheels and the single UI archive into `src/`, regenerates `src/pyproject.toml`
 and `src/uv.lock`, runs `databricks bundle deploy --target prod`, runs
 `databricks bundle run omnigent --target prod`, and polls `/health`
-with backoff until 200.
+with backoff until 200. Canvas is disabled by default. Enable the first-party
+Canvas extension for a specific app by setting the deployment environment
+variable when invoking the script:
+
+```bash
+OMNIGENT_ENABLE_CANVAS=true uv run python deploy/databricks/deploy.py \
+    --app-name <canvas-enabled-app> ...
+```
+
+Keep the variable unset for every other app. `--skip-web-ui` remains API-only
+and ignores the Canvas opt-in. Use repeatable `--extension-wheel` arguments for
+additional extensions.
 
 Databricks Apps rejects any single source file over 10 MB. The SPA is
 therefore shipped as one `src/web-ui.tar.gz` archive instead of inside the

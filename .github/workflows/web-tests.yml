@@ -44,18 +44,24 @@ jobs:
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
 
+      - name: Run Electron storage-isolation unit test
+        run: node --test web/electron/test/browserViewRegistry_storage_isolation.test.js
+
       - name: Install dependencies
         # Pin the npm registry to the npmjs default; limit to the web package
         # so the Electron package's large native devDependencies are not fetched.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: pnpm install --frozen-lockfile --filter web
+        run: pnpm install --frozen-lockfile --filter web --filter @omnigent/canvas
 
       - name: Check formatting
         run: pnpm --filter web run format:check
 
       - name: Run tests with coverage
         run: pnpm --filter web run test:coverage
+
+      - name: Canvas extension tests
+        run: pnpm --filter @omnigent/canvas test
 
       # Distill the v8 json-summary into a single total.txt, mirroring the
       # backend's coverage-report job. ui-code-coverage.yml (privileged

@@ -422,6 +422,83 @@ async def test_serve_tunnel_on_reconnect_callback(
     assert reconnects == ["reconnected"]
 
 
+@pytest.mark.asyncio
+async def test_serve_tunnel_records_connection_lifecycle_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner metrics distinguish an initial connection from a reconnect."""
+    call_count = 0
+    connected: list[tuple[str, bool]] = []
+    disconnected: list[tuple[str, BaseException | None]] = []
+
+    async def _serve_once(app: Any, **kwargs: Any) -> None:
+        nonlocal call_count
+        del app
+        call_count += 1
+        kwargs["on_connected"]()
+
+    async def _sleep(delay: float) -> None:
+        del delay
+        if call_count >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(
+        serve_module,
+        "record_websocket_connected",
+        lambda kind, *, reconnect: connected.append((kind, reconnect)),
+    )
+    monkeypatch.setattr(
+        serve_module,
+        "record_websocket_disconnected",
+        lambda kind, error, **_kwargs: disconnected.append((kind, error)),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://localhost:8000",
+            runner_id="r1",
+            runner_version="0.1.0",
+        )
+
+    assert connected == [("runner", False), ("runner", True)]
+    assert disconnected == [("runner", None), ("runner", None)]
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_records_unexpected_error_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected post-connect exception is recorded, not a clean close."""
+    disconnected: list[tuple[str, BaseException | None]] = []
+
+    async def _serve_once(app: Any, **kwargs: Any) -> None:
+        del app
+        kwargs["on_connected"]()
+        raise RuntimeError("callback blew up")
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(
+        serve_module,
+        "record_websocket_disconnected",
+        lambda kind, error, **_kwargs: disconnected.append((kind, error)),
+    )
+
+    with pytest.raises(RuntimeError, match="callback blew up"):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://localhost:8000",
+            runner_id="r1",
+            runner_version="0.1.0",
+        )
+
+    assert len(disconnected) == 1
+    assert disconnected[0][0] == "runner"
+    assert isinstance(disconnected[0][1], RuntimeError)
+
+
 # ── websocket_http_status edge cases ────────────────────
 
 

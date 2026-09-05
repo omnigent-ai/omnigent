@@ -37,19 +37,24 @@ session and logs are things you *produce*, not inputs:
   - **Linear** → query the GraphQL API with `sys_os_shell`, using the Linear key
     from your environment. It arrives as `LINEAR_API_KEY` locally or as
     `DATABRICKS_LINEAR_API_KEY` under `--server` (the CLI→runner env strip only
-    forwards the `DATABRICKS_`-prefixed name), so read whichever is set. Endpoint
-    `https://api.linear.app/graphql`, header `Authorization: <key>` — **no**
-    `Bearer` prefix. Fetch the ticket by its identifier, e.g.:
+    forwards the `DATABRICKS_`-prefixed name), so read whichever is set. A local
+    Linear API key is sent directly as `Authorization: <key>`. A secretless
+    credential proxy instead injects an `oa_cred_*` placeholder, which must be
+    sent as `Authorization: Bearer <placeholder>` so the proxy can recognize and
+    replace it. Fetch the ticket by its identifier, e.g.:
     ```bash
     KEY="${LINEAR_API_KEY:-$DATABRICKS_LINEAR_API_KEY}"
+    AUTH="$KEY"
+    [[ "$KEY" == oa_cred_* ]] && AUTH="Bearer $KEY"
     curl -s https://api.linear.app/graphql \
-      -H "Authorization: $KEY" -H 'Content-Type: application/json' \
+      -H "Authorization: $AUTH" -H 'Content-Type: application/json' \
       -d '{"query":"{ issue(id: \"OMNI-1234\") { identifier title description url state { name } comments(first: 50) { nodes { body } } attachments(first: 20) { nodes { url } } } }"}'
     ```
     If neither `LINEAR_API_KEY` nor `DATABRICKS_LINEAR_API_KEY` is set (or the
-    fetch fails auth), you cannot read the ticket body — stop with verdict
-    `needs_more_info` naming the missing key rather than guessing the bug from the
-    URL slug.
+    fetch fails auth), you cannot read the ticket body. Stop and report the
+    authentication/configuration failure rather than guessing the bug from the
+    URL slug or emitting `needs_more_info`: missing tracker access is an
+    infrastructure failure, not missing information in the report.
   - **Linear → linked GitHub issue.** A Linear ticket often links a GitHub issue
     (in its `attachments`, description, or comments). If you find one, **always
     fetch that GitHub issue too** (`gh issue view <url> --comments`) and treat it
@@ -99,13 +104,16 @@ Your first turn is a fixed checklist — do all of it before Step 1:
    for UI journeys, and `sys_session_*` / HTTP for backend journeys. Confirm you
    can read the report: `gh` is available for a GitHub issue, or a Linear key
    (`LINEAR_API_KEY` or `DATABRICKS_LINEAR_API_KEY`) is set for a Linear ticket
-   (if it isn't, stop with `needs_more_info`). Also note — without failing —
+   (if it isn't, stop and report an infrastructure/configuration failure without
+   emitting a verdict handoff; the workflow must retry it). Also note — without failing —
    whether the recorders are available (Playwright browsers for
    `pytest --video`, `vhs` for CLI tapes): Step 4 degrades gracefully when they
    are missing.
 
-If you cannot reach the app at all, stop and say so. Don't narrate a clean
-preflight.
+If you cannot reach the app at all, stop and report an operational failure
+without emitting a verdict handoff so the workflow retries. App, network,
+authentication, tooling, sandbox, workspace, timeout, and agent-crash failures
+are never `needs_more_info`. Don't narrate a clean preflight.
 
 ## Step 1 — Reconstruct the user journey
 
@@ -118,7 +126,11 @@ Write down the concrete journey: the entry point (which screen/agent/command),
 the ordered user inputs, the environment/data it needed, and the observable
 failure (crash, traceback, wrong output, missing UI affordance). If the report is
 too thin to reconstruct a concrete journey, stop with verdict `needs_more_info`
-naming exactly what the report is missing.
+naming exactly what the report is missing. This verdict is allowed only after you
+successfully read the complete ticket and linked reports and make a reasonable
+investigation attempt. It means the **report itself** omits product information
+required to define or execute the reproduction—never that your turn, tools,
+credentials, environment, or infrastructure failed.
 
 **The journey is user-observable only — an ordered list of actions a user
 takes.** Write it as concrete numbered steps, each one an action the user
@@ -237,7 +249,9 @@ independently, because a compound bug can be partly fixed:
   (e.g. a missing picker, a wrong value, an error toast). The browser tools drive
   the desktop app's embedded browser, so a UI-journey reproduction expects a
   desktop / embedded-browser context; if you have no browser pane to drive, say
-  so and fall back to the backend path or `needs_more_info`.
+  so and fall back to the backend path. If no valid lane is available, report an
+  operational failure without a verdict handoff so the workflow retries; missing
+  browser/tool access is not `needs_more_info`.
 - **Backend/behavioral bugs** — create a session and drive turns via
   `sys_session_*`, or exercise the server's HTTP API directly, and capture the
   bad response / traceback / exit.
@@ -271,6 +285,13 @@ and observe the SPA's error/recovery UI (the error pill, retry, reconnect) — t
 observed error state is the reproduction, and the same test films it in Step 4.
 
 Judge **each sub-symptom** honestly and independently:
+
+**Global `needs_more_info` rule:** use it only for information absent from the
+complete ticket and linked reports. Never use it for work you did not finish,
+evidence you did not attempt to collect, a failed tool, missing credentials,
+unavailable compute/browser/app access, sandbox restrictions, timeout, crash, or
+any other execution problem. Those are workflow failures and must remain
+retryable rather than becoming a product verdict.
 
 - Failure reproduces → **`reproduced`**. Capture the evidence (snapshot, response,
   log excerpt).
@@ -344,12 +365,13 @@ leaked runner env), and the per-surface mechanics (`web` / `mobile` / `terminal`
 `cli` / `desktop`), plus the empty-recordings and caption rules. This section states only
 *which clip repro-agent produces*:
 
-- a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): run the
-  authored test so it FAILS; the failing run's video is the proof the bug is live
-  (e.g. `recordings/1234/before-picker.webm`).
-- an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): run
-  the same authored test so it PASSES; the passing run's video shows the journey
-  behaving correctly on the running build (e.g. `recordings/1234/fixed-picker.webm`).
+- a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): use the
+  authored test to drive and verify the failure, but film only the product surface
+  and the user-visible bug (e.g. `recordings/1234/before-picker.webm`). Never film
+  pytest, assertion output, logs, or the test source.
+- an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): use
+  the same test to drive and verify the passing journey, while the video shows only
+  the product behaving correctly (e.g. `recordings/1234/fixed-picker.webm`).
 
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
 Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
@@ -399,8 +421,11 @@ choice:
   "test_path": "tests/e2e_ui/model_catalog/test_1234.py",
   "recordings": [
     {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm",
+     "capture_mode": "playwright_ui",
      "caption": "open the model picker → select the catalog → picker shows raw IDs instead of names"}
   ],
+  "recording_unavailable_reason": "",
+  "missing_information": [],
   "session_id": "dc59e331-...",
   "journey": "open model picker → select catalog → picker shows raw IDs",
   "evidence": "snapshot ref / response / log excerpt, plus root-cause leads"
@@ -423,6 +448,13 @@ Field meanings:
   relative. When multiple facets still reproduce, cover each live one; if you
   authored more than one file, make this an array of paths. Empty string if you
   authored none (e.g. `needs_more_info`).
+- `missing_information` — `[]` for `reproduced`, `not_reproduced`, and
+  `already_fixed`. For `needs_more_info`, a non-empty list of the concrete
+  product details absent from the full ticket and linked reports that prevent a
+  reproduction, such as the triggering user action, required input, expected
+  behavior, or affected surface. Operational failures, incomplete work, and
+  evidence you simply did not attempt to collect are invalid entries and must
+  not produce this verdict.
 - `session_id` — **this session** (in the app), from `sys_session_get_info`, so
   the fix step can replay how you reproduced it and you can browse it at
   `<server>/c/<session_id>`.
@@ -438,7 +470,7 @@ Field meanings:
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
   only — you do not fix).
 - `recordings` — the Step 4 captures: a list of
-  `{"surface", "kind", "path", "format", "caption"}` objects. `kind` is
+  `{"surface", "kind", "path", "format", "capture_mode", "caption"}` objects. `kind` is
   `"before"` for a `reproduced` facet's failing run or `"fixed"` for an
   `already_fixed` facet's passing run (the fix step later re-records the same
   drivers post-fix as `"after"`); `path` workspace-relative. `caption` is a
@@ -448,10 +480,14 @@ Field meanings:
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
   behavior (the journey completing). This is per-recording (each clip drives its
-  own steps), distinct from the bug-level `journey` field. Include an entry for
-  the authored-but-unrendered VHS tape too (`"format": "tape"`) when rendering
-  was skipped. Empty list when nothing was recorded — then say what was missing
-  in `evidence`.
+  own steps), distinct from the bug-level `journey` field. `capture_mode` is one
+  of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
+  authored-but-unrendered VHS tape in the artifact, but do not declare it as a
+  recording. Empty list when nothing valid was recorded.
+- `recording_unavailable_reason` — empty when every expected clip is present;
+  otherwise the concrete per-surface tooling or reachability blocker. For an
+  API-only bug, say that the evidence is textual. Never substitute a synthetic
+  fallback or test-runner video.
 
 Keep the prose before the block terse — the one exception is the full test
 source, which you paste in full. You produce the live-confirmed reproduction +

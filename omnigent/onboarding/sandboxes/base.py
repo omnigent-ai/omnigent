@@ -23,7 +23,7 @@ import json
 import secrets
 import shlex
 from abc import ABC, abstractmethod
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -483,13 +483,19 @@ class SandboxLifecycle(ABC):
 
     def keep_alive(self, sandbox_id: str) -> None:
         """
-        Configure the sandbox to survive idle periods (disable idle
-        autostop / maximize lifetime), so long agent runs don't lose
-        their host. Soft-fail: implementations should warn rather than
-        raise when the provider rejects the setting.
+        Keep the sandbox from being reclaimed while it is still in use,
+        so long agent runs don't lose their host. Soft-fail:
+        implementations should warn rather than raise when the provider
+        rejects the setting.
 
-        CLI-bootstrap capability — managed-only launchers need not
-        override the raising default.
+        Called BOTH once after a CLI bootstrap provision AND periodically
+        by the managed path for as long as the sandbox has a live runner
+        (:mod:`omnigent.server.managed_host_keepalive`), so an implementation
+        must be idempotent and cheap enough to repeat. Either shape
+        satisfies it: "configure once to maximize lifetime" (disable idle
+        autostop, restate a cap) or "push a deadline forward" (refresh an
+        absolute expiry). Managed-only launchers that cannot extend a
+        sandbox keep the raising default and are skipped.
 
         :param sandbox_id: The sandbox to configure.
         :raises SandboxCapabilityError: When the provider does not
@@ -543,7 +549,9 @@ class SandboxLifecycle(ABC):
         Optional capability: the default implementation raises
         :class:`SandboxCapabilityError` — providers whose SDK exposes
         programmatic termination override it. Used by the server's
-        managed-host cleanup when a managed session is deleted.
+        managed-host cleanup when a managed session is deleted. Implementations
+        must treat an already-absent sandbox as success so cleanup can retry
+        safely after a crash or database failure.
 
         :param sandbox_id: The sandbox to terminate, e.g.
             ``"sb-a1b2c3"``.
@@ -801,6 +809,10 @@ class SandboxHostLauncher(SandboxLifecycle):
     Kubernetes) inherit this class directly and override :meth:`start_host`
     without needing any exec transport.
     """
+
+    def reaper_identity(self, workspace_id: int) -> AbstractContextManager[None]:
+        """Bind credentials needed for background cleanup in one workspace."""
+        return nullcontext()
 
     @abstractmethod
     def start_host(

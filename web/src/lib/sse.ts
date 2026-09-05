@@ -51,6 +51,7 @@ import type {
   SessionTitleEvent,
   SessionCollaborationModeEvent,
   SessionPermissionModeEvent,
+  SessionCodexApprovalModeEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
@@ -70,7 +71,14 @@ import type {
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
 import { routingExtrasFromWire } from "./routingDecision";
-import type { BackgroundTaskInfo, ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
+import type {
+  BackgroundTaskInfo,
+  CodexPersistMode,
+  ErrorInfo,
+  ModelUsage,
+  RememberScope,
+  Response,
+} from "./types";
 
 /**
  * Out-param for `parseSseStream`: `sawDone` is set when the server's `[DONE]`
@@ -679,6 +687,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       permissionMode,
     } satisfies SessionPermissionModeEvent;
   }
+  if (eventType === "session.codex_approval_mode") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const approvalMode = data.approval_mode;
+    if (typeof approvalMode !== "string" || !approvalMode) return null;
+    return {
+      type: "session_codex_approval_mode",
+      conversationId,
+      approvalMode,
+    } satisfies SessionCodexApprovalModeEvent;
+  }
   if (eventType === "session.agent_changed") {
     const conversationId = data.conversation_id;
     if (typeof conversationId !== "string" || !conversationId) return null;
@@ -1013,6 +1032,23 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
                 : undefined,
           }
         : null;
+    const codexMetaRaw = p["_meta"];
+    const codexMeta =
+      codexMetaRaw && typeof codexMetaRaw === "object" && !Array.isArray(codexMetaRaw)
+        ? (codexMetaRaw as Record<string, unknown>)
+        : null;
+    const codexPersistRaw =
+      codexMeta?.codex_approval_kind === "mcp_tool_call" ? codexMeta.persist : null;
+    const codexPersistCandidates = Array.isArray(codexPersistRaw)
+      ? codexPersistRaw
+      : [codexPersistRaw];
+    const codexPersistModes = [
+      ...new Set(
+        codexPersistCandidates.filter(
+          (value): value is CodexPersistMode => value === "session" || value === "always",
+        ),
+      ),
+    ];
     return {
       type: "elicitation_request",
       elicitationId,
@@ -1053,6 +1089,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           : null,
       allowAllEdits,
       rememberScope,
+      codexPersistModes,
     } satisfies ElicitationRequest;
   }
 
@@ -1159,6 +1196,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       error: {
         code: String(rec.code ?? ""),
         message: String(rec.message ?? ""),
+        ...(rec.level === "info" ? { level: "info" as const } : {}),
       },
       itemId,
       responseId,
@@ -1299,6 +1337,7 @@ function parseErrorInfo(raw: unknown): ErrorInfo {
     if (typeof r.title === "string" && r.title) info.title = r.title;
     if (typeof r.cause === "string" && r.cause) info.cause = r.cause;
     if (typeof r.remediation === "string" && r.remediation) info.remediation = r.remediation;
+    if (r.level === "info") info.level = "info";
     return info;
   }
   return { code: "", message: String(raw ?? "") };

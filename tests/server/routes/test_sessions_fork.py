@@ -16,6 +16,7 @@ from starlette.testclient import TestClient
 
 from omnigent.entities import Agent, Conversation, ConversationItem, MessageData, PagedList
 from omnigent.errors import OmnigentError
+from omnigent.server.routes import _session_create_validation as create_validation
 from omnigent.server.routes.sessions import create_sessions_router
 
 # ── Minimal store stubs ──────────────────────────────────────────
@@ -376,7 +377,7 @@ def _build_app(
 
 
 @pytest.mark.asyncio
-async def test_fork_session_happy_path() -> None:
+async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """POST /sessions/{id}/fork returns 201, clones the agent, and
     binds the fork to the cloned agent.
 
@@ -408,6 +409,15 @@ async def test_fork_session_happy_path() -> None:
         }
     )
     client = TestClient(_build_app(conv_store, agent_store=agent_store))
+    original_resolver = create_validation.resolve_project_session_create
+    chokepoint_calls = 0
+
+    async def _recording_resolver(**kwargs: Any) -> Any:
+        nonlocal chokepoint_calls
+        chokepoint_calls += 1
+        return await original_resolver(**kwargs)
+
+    monkeypatch.setattr(create_validation, "resolve_project_session_create", _recording_resolver)
 
     resp = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={"title": "My Fork"}
@@ -437,6 +447,7 @@ async def test_fork_session_happy_path() -> None:
         f"Copied items should preserve content and order, got {item_texts}"
     )
     assert body["title"] == "My Fork"
+    assert chokepoint_calls == 1
 
     # The agent clone is created INSIDE fork_conversation (atomically), not
     # via a separate agent_store.create — a pre-created row would leak as a

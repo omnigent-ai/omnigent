@@ -14,7 +14,7 @@ Env vars read at startup (full contract in
 ``omnigent.inner.kimi_executor``):
 
 - ``HARNESS_KIMI_MODEL`` — model id (e.g. ``kimi-k2-turbo``); ``None``
-  lets kimi's ``default_model`` from ``~/.kimi/config.toml`` win.
+  lets kimi's ``default_model`` from ``~/.kimi-code/config.toml`` win.
 - ``HARNESS_KIMI_CWD`` — working directory the kimi subprocess runs in
   (upstream has no ``--work-dir`` flag, so this is threaded as
   subprocess ``cwd=``).
@@ -31,7 +31,7 @@ Env vars read at startup (full contract in
   own sandbox + approval flow internally).
 
 Provider routing for kimi happens via ``kimi provider add`` / its
-``~/.kimi/config.toml`` (out-of-band from Omnigent) — upstream kimi
+``~/.kimi-code/config.toml`` (out-of-band from Omnigent) — upstream kimi
 has no per-spawn ``--config-file`` or env-var provider override.
 Omnigent-side provider injection remains a deferred follow-up.
 """

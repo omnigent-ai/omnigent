@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.tools.base import Tool
 
 
@@ -295,7 +296,10 @@ class SysReadInboxTool(Tool):
             "want to inspect completions before yielding — e.g., "
             "to plan follow-up work based on the results. Returns "
             "a textual summary; an empty inbox returns a sentinel "
-            "string."
+            "string. It is also the expected response to the runtime's "
+            f"sub-agent wake notice `{SUBAGENT_WAKE_NOTICE_SHAPE}`, which "
+            "Omnigent posts into your session when a dispatched child "
+            "finishes; that notice comes from the runtime, not from a person."
         )
 
     def get_schema(self) -> dict[str, Any]:

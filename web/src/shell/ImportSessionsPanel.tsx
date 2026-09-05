@@ -4,6 +4,7 @@ import { useHosts } from "@/hooks/useHosts";
 import { Link } from "@/lib/routing";
 import { HostLabel } from "./HostLabel";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -13,6 +14,7 @@ import {
 } from "@/components/ui/select";
 import {
   importLocalSessions,
+  type ImportedSessionRef,
   type ImportSourceSelector,
   type LocalImportResult,
 } from "@/lib/sessionsApi";
@@ -31,13 +33,13 @@ const SOURCES: { value: ImportSourceSelector; label: string }[] = [
 ];
 
 const LIMITS = [25, 50, 100];
+type ImportMode = "recent" | "session";
 
 /**
  * Inline (non-modal) import UI for the Settings "Import sessions" section.
- * Batch-imports the caller's recent local transcripts for a chosen harness via
- * `POST /v1/imports/local` — the chosen host reads + normalizes its own
- * transcripts over the tunnel — then refreshes the sidebar. Already-imported
- * sessions are skipped server-side; the result links each newly imported session.
+ * Imports recent transcripts or one known harness session through the chosen
+ * host, then refreshes the sidebar. Already-imported sessions are skipped
+ * server-side; the result links each newly imported session.
  */
 export function ImportSessionsPanel() {
   const queryClient = useQueryClient();
@@ -46,7 +48,12 @@ export function ImportSessionsPanel() {
   const [hostId, setHostId] = useState<string | null>(null);
   const [source, setSource] = useState<ImportSourceSelector>("all");
   const [limit, setLimit] = useState(25);
+  const [mode, setMode] = useState<ImportMode>("recent");
+  const [sessionId, setSessionId] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  // Sessions appended as their frames stream in, so the list fills live rather
+  // than appearing all at once when the import finishes.
+  const [streamed, setStreamed] = useState<ImportedSessionRef[]>([]);
   const [result, setResult] = useState<LocalImportResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -71,11 +78,18 @@ export function ImportSessionsPanel() {
 
   async function handleImport(): Promise<void> {
     if (hostId === null) return;
+    const exactSessionId = sessionId.trim();
+    if (mode === "session" && exactSessionId.length === 0) return;
     setSubmitting(true);
     setError(null);
     setResult(null);
+    setStreamed([]);
     try {
-      const res = await importLocalSessions(hostId, source, limit);
+      const onSession = (s: ImportedSessionRef) => setStreamed((prev) => [...prev, s]);
+      const res =
+        mode === "session"
+          ? await importLocalSessions(hostId, source, limit, onSession, exactSessionId)
+          : await importLocalSessions(hostId, source, limit, onSession);
       setResult(res);
       // Newly imported sessions land in the sidebar list.
       await queryClient.invalidateQueries({ queryKey: ["conversations"] });
@@ -119,13 +133,33 @@ export function ImportSessionsPanel() {
       </div>
 
       <div className="flex flex-col gap-2">
+        <span className="text-sm font-medium text-muted-foreground">Import</span>
+        <Select
+          value={mode}
+          onValueChange={(value) => {
+            const nextMode = value as ImportMode;
+            setMode(nextMode);
+            if (nextMode === "session" && source === "all") setSource("claude");
+          }}
+        >
+          <SelectTrigger className="w-full text-sm" data-testid="import-mode-select">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="recent">Recent sessions</SelectItem>
+            <SelectItem value="session">Session by ID</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      <div className="flex flex-col gap-2">
         <span className="text-sm font-medium text-muted-foreground">Harness</span>
         <Select value={source} onValueChange={(v) => setSource(v as ImportSourceSelector)}>
           <SelectTrigger className="w-full text-sm" data-testid="import-source-select">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            {SOURCES.map((s) => (
+            {SOURCES.filter((s) => mode === "recent" || s.value !== "all").map((s) => (
               <SelectItem key={s.value} value={s.value} data-testid={`import-source-${s.value}`}>
                 {s.label}
               </SelectItem>
@@ -134,48 +168,74 @@ export function ImportSessionsPanel() {
         </Select>
       </div>
 
-      <div className="flex flex-col gap-2">
-        <span className="text-sm font-medium text-muted-foreground">
-          How many recent sessions{source === "all" ? " (across all harnesses)" : ""}
-        </span>
-        <Select value={String(limit)} onValueChange={(v) => setLimit(Number(v))}>
-          <SelectTrigger className="w-full text-sm" data-testid="import-limit-select">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {LIMITS.map((n) => (
-              <SelectItem key={n} value={String(n)}>
-                Last {n}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
+      {mode === "recent" ? (
+        <div className="flex flex-col gap-2">
+          <span className="text-sm font-medium text-muted-foreground">
+            How many recent sessions{source === "all" ? " (across all harnesses)" : ""}
+          </span>
+          <Select value={String(limit)} onValueChange={(v) => setLimit(Number(v))}>
+            <SelectTrigger className="w-full text-sm" data-testid="import-limit-select">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {LIMITS.map((n) => (
+                <SelectItem key={n} value={String(n)}>
+                  Last {n}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2">
+          <label htmlFor="import-session-id" className="text-sm font-medium text-muted-foreground">
+            Session ID
+          </label>
+          <Input
+            id="import-session-id"
+            data-testid="import-session-id"
+            value={sessionId}
+            maxLength={128}
+            autoComplete="off"
+            placeholder="Enter a session ID"
+            onChange={(event) => setSessionId(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void handleImport();
+            }}
+          />
+        </div>
+      )}
 
       <div>
         <Button
           data-testid="import-submit"
           loading={submitting}
-          disabled={hostId === null}
+          disabled={hostId === null || (mode === "session" && sessionId.trim().length === 0)}
           onClick={() => void handleImport()}
         >
           Import
         </Button>
       </div>
 
-      {result !== null && (
+      {(result !== null || streamed.length > 0 || submitting) && (
         <div className="flex flex-col gap-2">
-          <p className="text-sm text-muted-foreground" data-testid="import-result">
-            Imported {result.imported}
-            {result.alreadyImported > 0 && `, ${result.alreadyImported} already imported`}
-            {result.failed > 0 && `, ${result.failed} failed`}.
-          </p>
-          {result.sessions.length > 0 && (
+          {result !== null ? (
+            <p className="text-sm text-muted-foreground" data-testid="import-result">
+              Imported {result.imported}
+              {result.alreadyImported > 0 && `, ${result.alreadyImported} already imported`}
+              {result.failed > 0 && `, ${result.failed} failed`}.
+            </p>
+          ) : submitting ? (
+            <p className="text-sm text-muted-foreground" data-testid="import-progress">
+              Importing{streamed.length > 0 ? ` ${streamed.length} so far` : ""}…
+            </p>
+          ) : null}
+          {streamed.length > 0 && (
             <ul
               className="flex max-h-64 flex-col gap-1 overflow-y-auto"
               data-testid="import-result-sessions"
             >
-              {result.sessions.map((s) => (
+              {streamed.map((s) => (
                 <li key={s.id}>
                   <Link
                     to={`/c/${s.id}`}

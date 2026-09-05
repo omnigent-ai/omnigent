@@ -108,10 +108,12 @@ import type {
   SkillSummary,
 } from "@/lib/types";
 import { uploadFile } from "@/lib/filesApi";
+import { attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
-import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
+import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
+import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { getOmnigentHostConfig } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
@@ -416,6 +418,16 @@ export interface ConversationState {
    */
   claudePermissionMode: string;
   /**
+   * Approval mode of a running codex-native session, one of
+   * ``"ask-for-approval"``, ``"approve-for-me"``, ``"full-access"``,
+   * ``"read-only"`` (Codex's ``/permissions`` presets). Hydrated from the
+   * ``omnigent.codex_native.approval_mode`` read-back label on bind (runtime
+   * approval no longer rides launch args) and updated by the composer's picker
+   * or a live ``session.codex_approval_mode`` event. Empty string when unknown
+   * (non-codex session, or not yet observed).
+   */
+  codexApprovalMode: string;
+  /**
    * True when older items exist before the loaded history window. Binds
    * hydrate only the most recent page (see `fetchSessionItemsPage`);
    * scroll-up `loadMoreHistory` pages older until this goes false.
@@ -583,10 +595,11 @@ export interface ConversationState {
   /**
    * Per-MCP-server startup map for the bound session (codex-native).
    * Updated by `session.mcp_startup` SSE events while the harness boots
-   * its MCP servers; cleared back to `null` once every server settles
-   * `ready`. Failed/cancelled servers are retained so the page can say
-   * which servers never came up. Always `null` for sessions whose
-   * harness reports no MCP startup.
+   * its MCP servers; cleared back to `null` once no server is still
+   * `starting`. Settled failures/cancellations are setup diagnostics
+   * (host logs), never conversation content, so they are dropped rather
+   * than retained. Always `null` for sessions whose harness reports no
+   * MCP startup.
    */
   mcpStartup: Record<string, McpServerStartup> | null;
 
@@ -745,6 +758,7 @@ export interface ChatActions {
     elicitationId: string,
     action: "accept" | "decline" | "cancel",
     content?: Record<string, unknown>,
+    meta?: Record<string, unknown>,
   ) => Promise<void>;
   /**
    * Set sticky effort; PATCH only when the active session supports it.
@@ -800,6 +814,13 @@ export interface ChatActions {
    * No-ops when there is no active conversation.
    */
   setClaudePermissionMode: (mode: string) => Promise<void>;
+  /**
+   * Switch a running codex-native session's approval/sandbox mode (e.g. to
+   * ``"read-only"``). Rejects when the live Codex thread could not accept the
+   * update, so callers surface the error rather than assuming it landed.
+   * No-ops when there is no active conversation.
+   */
+  setCodexApprovalMode: (mode: string) => Promise<void>;
   /**
    * Fetch the next page of older messages and prepend them to `blocks`.
    *
@@ -1437,6 +1458,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   subagentRoutingOverride: null,
   codexPlanMode: false,
   claudePermissionMode: "",
+  codexApprovalMode: "",
   hasMoreHistory: false,
   loadingMoreHistory: false,
   oldestItemId: null,
@@ -1748,9 +1770,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const tempId = `pend_${pendingSeq}`;
     const pendingFileBlocks: MessageContentBlock[] = (files ?? []).map((file) => {
       const filename = file.name || "image.png";
+      // Key the placeholder id on the File's stable identity, not its name:
+      // pasted screenshots all arrive named "image.png", so a name-derived
+      // id would collide across attachments and strand a ghost chip (React
+      // dedupes on the shared key) until a refresh replaces it with the
+      // server's unique file_id.
+      const fileId = `pending:${attachmentKey(file)}`;
       return file.type.startsWith("image/")
-        ? { type: "input_image" as const, file_id: `pending:${filename}`, filename }
-        : { type: "input_file" as const, file_id: `pending:${filename}`, filename };
+        ? { type: "input_image" as const, file_id: fileId, filename }
+        : { type: "input_file" as const, file_id: fileId, filename };
     });
     const content: MessageContentBlock[] = [
       ...pendingFileBlocks,
@@ -1807,6 +1835,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // the ordering barrier.
       if (
         opts?.queueEntry === undefined &&
+        submitConversationId !== null &&
         queuedSendBarrierStillPrecedes(
           queuedBarrierAtSubmit,
           submitConversationId,
@@ -2288,7 +2317,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  submitApproval: async (elicitationId, action, content) => {
+  submitApproval: async (elicitationId, action, content, meta) => {
     const sessionId = get().conversationId;
     if (!sessionId) return;
     const targetSessionId =
@@ -2304,8 +2333,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // ``content`` rides through the response field so multi-choice
     // cards (AskUserQuestion) can render the selected label rather
     // than a generic "Approved" pill.
-    const responseValue: ElicitationBlock["response"] =
-      content === undefined ? { action } : { action, content };
+    const responseValue: ElicitationBlock["response"] = {
+      action,
+      ...(content === undefined ? {} : { content }),
+      ...(meta === undefined ? {} : { _meta: meta }),
+    };
     setActive((s) => ({
       blocks: s.blocks.map((b) =>
         b.type === "elicitation" && b.elicitationId === elicitationId
@@ -2322,11 +2354,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       status: action === "accept" ? "success" : action === "decline" ? "failure" : "cancelled",
     });
     try {
-      await approveElicitation(
-        targetSessionId,
-        elicitationId,
-        content === undefined ? { action } : { action, content },
-      );
+      await approveElicitation(targetSessionId, elicitationId, {
+        action,
+        ...(content === undefined ? {} : { content }),
+        ...(meta === undefined ? {} : { _meta: meta }),
+      });
     } catch {
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons
@@ -2594,6 +2626,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       patchSet({ claudePermissionMode: claudePermissionModeFromSession(session) ?? "" });
     } catch (err) {
       patchSet({ claudePermissionMode: previous });
+      throw err;
+    }
+  },
+
+  setCodexApprovalMode: async (mode) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().codexApprovalMode;
+    // Pinned for the same reason as `setCostControlMode` — see there.
+    const patchSet = setterFor(conversationId);
+    // Optimistic, then reconciled against the mode the server confirms the
+    // Codex thread landed on.
+    patchSet({ codexApprovalMode: mode });
+    try {
+      const session = await updateSession(conversationId, { codexApprovalMode: mode });
+      patchSet({ codexApprovalMode: codexApprovalModeFromSession(session) ?? "" });
+    } catch (err) {
+      patchSet({ codexApprovalMode: previous });
       throw err;
     }
   },
@@ -2971,19 +3021,27 @@ conversationRegistry.subscribe((id) => {
 type NativeModelFamily = "claude" | "codex";
 
 /**
- * Resolve the native model family from a session wrapper label.
+ * Resolve the native model family from a session snapshot.
+ *
+ * The wrapper label is authoritative. Custom YAML agents carry no
+ * presentation label, so for label-less sessions the resolved harness is the
+ * fallback — mirroring the composer capability gates, so a custom
+ * codex-native session keeps its reported model in the composer label.
  *
  * :param session: Session snapshot from the API.
- * :returns: ``"claude"`` / ``"codex"`` for native wrappers, else ``null``.
+ * :returns: ``"claude"`` / ``"codex"`` for native sessions, else ``null``.
  */
-function nativeModelFamilyForSession(session: Pick<Session, "labels">): NativeModelFamily | null {
-  switch (session.labels?.["omnigent.wrapper"]) {
+function nativeModelFamilyForSession(
+  session: Pick<Session, "labels" | "harness">,
+): NativeModelFamily | null {
+  const wrapper = session.labels?.["omnigent.wrapper"];
+  switch (wrapper) {
     case "claude-code-native-ui":
       return "claude";
     case "codex-native-ui":
       return "codex";
     default:
-      return null;
+      return wrapper == null && session.harness === "codex-native" ? "codex" : null;
   }
 }
 
@@ -3177,6 +3235,23 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
 }
 
 /**
+ * An MCP startup map reduced to what the chat surface may show: the map
+ * while any server is still `starting`, else `null`. A settled round —
+ * all ready, or ended with failures/cancellations — renders nothing:
+ * failure notices are setup diagnostics that belong in host logs, not
+ * items in the conversation viewport. Applied at both intake points
+ * (SSE event and session snapshot) so a reload can't resurrect a notice
+ * the live handler would have dropped.
+ */
+function activeMcpStartup(
+  servers: Record<string, McpServerStartup> | null | undefined,
+): Record<string, McpServerStartup> | null {
+  if (!servers) return null;
+  const anyStarting = Object.values(servers).some((r) => r.status === "starting");
+  return anyStarting ? servers : null;
+}
+
+/**
  * Store fields derived from the session's agent binding, computed from a
  * session snapshot.
  *
@@ -3211,6 +3286,7 @@ function sessionBindingPatch(
   | "subagentRoutingOverride"
   | "codexPlanMode"
   | "claudePermissionMode"
+  | "codexApprovalMode"
   | "contextWindow"
   | "gitBranch"
   | "skills"
@@ -3239,13 +3315,16 @@ function sessionBindingPatch(
     claudePermissionMode: isNativeTerminalSessionFn(session)
       ? (claudePermissionModeFromSession(session) ?? "")
       : "",
+    codexApprovalMode: isCodexNativeSession(session)
+      ? (codexApprovalModeFromSession(session) ?? "")
+      : "",
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
     skills: session.skills ?? [],
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
-    mcpStartup: session.mcpStartup ?? null,
+    mcpStartup: activeMcpStartup(session.mcpStartup),
   };
 }
 
@@ -4827,6 +4906,11 @@ export async function pumpStreamEvents(
   const stream = new BlockStream();
   const sseResult: SseStreamResult = { sawDone: false };
   const rawEvents = parseSseStream(body, sseResult);
+  // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
+  // both committed and still-buffered blocks. Lives for the whole stream
+  // (one SSE connection); bounded by item count like `blocks` itself.
+  const buffer: AnyBlock[] = [];
+  const seenItemIds = new Set<string>();
   // Tap the raw event stream for `session.*` side effects (sessionStatus,
   // pending-message promotion, interrupted decoration) before handing it
   // to the BlockStream reducer. The reducer is intentionally pure
@@ -4835,13 +4919,31 @@ export async function pumpStreamEvents(
   // A scheduled wake can stream before its new turn id arrives. Ignore the
   // rest of that message so it cannot attach to the completed prior turn.
   const ignoredWakeMessages = new Set<string>();
-  const events = tapLiveDeltas(tapSessionEvents(rawEvents, id), id, ignoredWakeMessages, set, get);
-
-  // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
-  // both committed and still-buffered blocks. Lives for the whole stream
-  // (one SSE connection); bounded by item count like `blocks` itself.
-  const buffer: AnyBlock[] = [];
-  const seenItemIds = new Set<string>();
+  const events = tapLiveDeltas(
+    tapSessionEvents(rawEvents, id, (elicitationId) => {
+      // A fast native approval can resolve in the few milliseconds between
+      // the reducer yielding its card and the next animation-frame flush.
+      // `handleSessionEvent` can only update committed blocks, so settle the
+      // buffered copy here instead of dropping that resolved edge.
+      const at = buffer.findIndex(
+        (block) =>
+          block.type === "elicitation" &&
+          block.elicitationId === elicitationId &&
+          block.status === "pending",
+      );
+      if (at === -1) return;
+      const target = buffer[at] as ElicitationBlock;
+      buffer[at] = {
+        ...target,
+        status: "responded",
+        response: { action: "auto_resolved" },
+      };
+    }),
+    id,
+    ignoredWakeMessages,
+    set,
+    get,
+  );
   // First content block of each response flushes synchronously (snappy
   // first-token paint); the rest batch.
   let paintedFirstContent = false;
@@ -5411,11 +5513,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
 
   switch (event.type) {
     case "response_completed":
+    case "response_failed":
       // Prefer contextTokens (last sub-call total) for the context ring — on
       // tool-call turns, totalTokens is the billing sum across all sub-calls
       // which inflates the ring. contextTokens is set only by multi-sub-call
       // executors (e.g. openai-agents); for all others it is null and we fall
       // back to totalTokens, which equals contextTokens for single-call turns.
+      // A FAILED turn carries the usage the harness observed before dying
+      // (e.g. the prompt size from an aborted model call): apply it the same
+      // way, so the ring reflects real window fill instead of freezing at the
+      // previous successful turn's value. Executors that report nothing on
+      // failure leave usage null, which no-ops here.
       if (event.response.usage != null) {
         const ringTokens = event.response.usage.contextTokens ?? event.response.usage.totalTokens;
         if (ringTokens != null) {
@@ -5444,13 +5552,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "session_mcp_startup": {
-      // Mirror the harness's per-MCP-server startup map. Cleared once
-      // every server settles `ready` (the band disappears); failures and
-      // cancellations are retained so the page can say which servers
-      // never came up.
-      const records = Object.values(event.servers);
-      const allReady = records.length === 0 || records.every((r) => r.status === "ready");
-      applyToConversation({ mcpStartup: allReady ? null : event.servers });
+      // Mirror the harness's per-MCP-server startup map while the round
+      // is in flight; cleared once no server is still `starting`.
+      // Failures/cancellations are setup diagnostics (host logs), not
+      // conversation content — retaining them rendered an inline notice
+      // in the chat viewport and pinned the message-flow branch open.
+      applyToConversation({ mcpStartup: activeMcpStartup(event.servers) });
       return;
     }
     case "session_usage": {
@@ -5548,6 +5655,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Guard by conversation id so a late frame from an aborted stream
       // cannot paint Plan mode onto the newly-opened conversation.
       applyToNamedConversation(event.conversationId, { codexPlanMode: event.mode === "plan" });
+      return;
+    case "session_codex_approval_mode":
+      // A Codex approval switch made in the web picker or the native TUI's
+      // /permissions popup; the server has confirmed it's the live mode.
+      applyToNamedConversation(event.conversationId, {
+        codexApprovalMode: event.approvalMode,
+      });
       return;
     case "session_presence":
       // Full-state replacement — every presence event carries the
@@ -6319,9 +6433,13 @@ function applyChildSessionUpdated(
 async function* tapSessionEvents(
   events: AsyncIterable<StreamEvent>,
   conversationId: string,
+  onElicitationResolved?: (elicitationId: string) => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
     handleSessionEvent(event, conversationId);
+    if (event.type === "elicitation_resolved") {
+      onElicitationResolved?.(event.elicitationId);
+    }
     pushSseEvent(conversationId, event);
     yield event;
   }
