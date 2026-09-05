@@ -159,3 +159,42 @@ def test_session_switch_chord_does_not_navigate_behind_open_palette(
     # The app did not navigate behind the still-open palette.
     expect(palette_input).to_be_visible()
     assert page.url.endswith(f"/c/{session_a}"), f"route moved behind the palette: {page.url}"
+
+
+def test_command_palette_new_chat_focuses_landing_composer(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """Picking "New chat" lands on "/" with the landing composer focused.
+
+    The palette is a modal dialog: its close-time focus handling runs after
+    the landing screen mounts and used to strand focus on ``<body>``, so
+    typing right after "New chat" went nowhere until the palette handed focus
+    to the landing composer explicitly.
+    """
+    base_url, session_a, _session_b = seeded_session_pair
+
+    # Warm the landing screen's queries first: with them cached, the landing
+    # composer mounts in the same commit that closes the palette — the timing
+    # where the dialog's teardown used to strand focus (a cold cache mounts the
+    # composer only after the dialog is gone, masking the bug).
+    page.goto(f"{base_url}/")
+    expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=30_000)
+
+    page.goto(f"{base_url}/c/{session_a}")
+    expect(page.locator(f'a[href="/c/{session_a}"]')).to_be_visible(timeout=30_000)
+
+    page.keyboard.press("ControlOrMeta+k")
+    dialog = page.get_by_role("dialog")
+    expect(dialog).to_be_visible(timeout=10_000)
+
+    dialog.get_by_text("New chat", exact=True).click()
+
+    expect(page).to_have_url(f"{base_url}/", timeout=10_000)
+    landing = page.get_by_test_id("new-chat-landing-input")
+    expect(landing).to_be_visible(timeout=10_000)
+
+    # The point of the hand-off: typing immediately goes into the composer.
+    expect(landing).to_be_focused()
+    page.keyboard.type("Plan a weekend hike")
+    expect(landing).to_have_value("Plan a weekend hike")
