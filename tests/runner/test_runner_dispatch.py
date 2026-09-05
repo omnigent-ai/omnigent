@@ -11316,3 +11316,356 @@ def test_response_failed_event_llm_source_is_preserved() -> None:
     )
     payload = _json.loads(raw.decode().split("data: ", 1)[1])
     assert payload["source"] == "llm"
+
+
+# ---------------------------------------------------------------------------
+# Steering an in-flight sub-agent turn instead of bouncing the send.
+#
+# A sub-agent whose turn never yields (e.g. a post-completion compaction
+# spiral) used to make the parent's same-title / same-session steering send
+# bounce with "already has a launching or running turn", leaving cancellation
+# as the only lever. The runner now injects the nudge into the running turn --
+# the same path the web composer uses to steer a live session -- so the child
+# stays interruptible. A turn that has not started streaming yet ("launching")
+# is still deferred with a transient retry, since there is no active turn to
+# inject into and a send then could race a parallel start.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_named_send_steers_running_child_instead_of_refusing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-title nudge to a running child is injected, not refused.
+
+    On the unfixed runner this send bounced with "already has a launching or
+    running turn", so a spiraling child could only be cancelled. It must now
+    deliver the message into the child's in-flight turn and return a steering
+    handle.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_posts = 0
+    patch_posts = 0
+    event_posts: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal create_posts, patch_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_spiral":
+            return httpx.Response(
+                200,
+                json={"labels": {"omnigent.turn_actor": "alice@example.com"}},
+            )
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_spiral/child_sessions"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "conv_coder",
+                            "tool": "claude",
+                            "session_name": "merge-task",
+                            "busy": False,
+                        }
+                    ]
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts += 1
+            return httpx.Response(500, json={"error": "duplicate"})
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_coder":
+            patch_posts += 1
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_coder/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    entry = runner_app.register_subagent_work(
+        parent_session_id="conv_parent_spiral",
+        child_session_id="conv_coder",
+        agent="claude",
+        title="merge-task",
+    )
+    entry.status = "running"
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "claude",
+                        "title": "merge-task",
+                        "args": "stop compacting and report where the merge stands",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_spiral",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_coder")
+            runner_app._session_inboxes_ref.pop("conv_parent_spiral", None)
+
+    assert "already has a launching or running turn" not in output
+    payload = json.loads(output)
+    assert payload["status"] == "steering"
+    assert payload["conversation_id"] == "conv_coder"
+    assert create_posts == 0, "steering must not create a duplicate child session"
+    assert patch_posts == 0, "a steered nudge is absorbed by the running turn; no re-stamp"
+    assert len(event_posts) == 1, "the nudge is posted once into the running child turn"
+    assert event_posts[0]["created_by"] == "alice@example.com"
+    assert event_posts[0]["data"]["content"][0] == {
+        "type": "input_text",
+        "text": "stop compacting and report where the merge stands",
+    }
+
+
+@pytest.mark.asyncio
+async def test_named_send_steers_busy_child_when_local_work_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server-reported busy child steers even with no local work entry.
+
+    After a runner restart the in-flight turn's local bookkeeping is gone, but
+    the server still reports the child busy. The unfixed runner refused this
+    with "is already running"; it must now steer the still-running turn so a
+    restart does not strand a spiraling child as uninterruptible.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_busy":
+            return httpx.Response(
+                200,
+                json={"labels": {"omnigent.turn_actor": "alice@example.com"}},
+            )
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_busy/child_sessions"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "conv_busy_coder",
+                            "tool": "claude",
+                            "session_name": "merge-task",
+                            "busy": True,
+                        }
+                    ]
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_busy_coder/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"agent": "claude", "title": "merge-task", "args": "please stop and report"}
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_busy",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent_busy", None)
+
+    assert "already has a launching or running turn" not in output
+    assert "is already running" not in output
+    payload = json.loads(output)
+    assert payload["status"] == "steering"
+    assert payload["conversation_id"] == "conv_busy_coder"
+    assert len(event_posts) == 1
+    assert event_posts[0]["data"]["content"][0]["text"] == "please stop and report"
+
+
+@pytest.mark.asyncio
+async def test_named_send_defers_when_child_turn_still_launching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child whose turn has not started streaming defers with a retry.
+
+    There is no active turn to inject into yet and steering now could race a
+    parallel start, so the send returns a transient "still starting ... retry"
+    error and posts nothing to the child -- distinct from both the old blanket
+    refusal and the steering path for a running turn.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_launch":
+            return httpx.Response(
+                200,
+                json={"labels": {"omnigent.turn_actor": "alice@example.com"}},
+            )
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_launch/child_sessions"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "conv_launching_coder",
+                            "tool": "claude",
+                            "session_name": "merge-task",
+                            "busy": False,
+                        }
+                    ]
+                },
+            )
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_launching_coder/events"
+        ):
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    # Default status of freshly registered work is "launching".
+    runner_app.register_subagent_work(
+        parent_session_id="conv_parent_launch",
+        child_session_id="conv_launching_coder",
+        agent="claude",
+        title="merge-task",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"agent": "claude", "title": "merge-task", "args": "please stop and report"}
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_launch",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_launching_coder")
+            runner_app._session_inboxes_ref.pop("conv_parent_launch", None)
+
+    assert "already has a launching or running turn" not in output
+    assert "still starting its turn" in output
+    assert "retry the send in a moment" in output
+    assert event_posts == [], "a launching turn is not steered into"
+
+
+@pytest.mark.asyncio
+async def test_send_by_session_id_steers_running_child() -> None:
+    """By-session-id send steers a running direct child instead of refusing.
+
+    The by-id path shares the fix: a running child is nudged into its
+    in-flight turn rather than bounced with "already has a launching or running
+    turn".
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+    patch_posts = 0
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal patch_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_byid":
+            return httpx.Response(
+                200,
+                json={"labels": {"omnigent.turn_actor": "alice@example.com"}},
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_byid_coder":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_byid_coder",
+                    "parent_session_id": "conv_parent_byid",
+                    "title": "claude:merge-task",
+                    "busy": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_byid_coder":
+            patch_posts += 1
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_byid_coder/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    entry = runner_app.register_subagent_work(
+        parent_session_id="conv_parent_byid",
+        child_session_id="conv_byid_coder",
+        agent="claude",
+        title="merge-task",
+    )
+    entry.status = "running"
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"session_id": "conv_byid_coder", "args": "please stop and report"}
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_byid",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_byid_coder")
+            runner_app._session_inboxes_ref.pop("conv_parent_byid", None)
+
+    assert "already has a launching or running turn" not in output
+    payload = json.loads(output)
+    assert payload["status"] == "steering"
+    assert payload["conversation_id"] == "conv_byid_coder"
+    assert patch_posts == 0, "a steered nudge is absorbed by the running turn; no re-stamp"
+    assert len(event_posts) == 1
+    assert event_posts[0]["created_by"] == "alice@example.com"
+    assert event_posts[0]["data"]["content"][0]["text"] == "please stop and report"
