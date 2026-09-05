@@ -8207,17 +8207,14 @@ def create_runner_app(
                                                 {"message": _err_msg, "type": _err_type}
                                             )
                                             return
-                                        _dispatch_workdir = (
-                                            _resolved_workdir_for_spec(
-                                                _spec_for_dispatch_entry,
-                                                runner_workspace,
-                                            )
-                                            if _is_spec_local
-                                            else runner_workspace
+                                        _local_tool_workdir = _resolved_workdir_for_spec(
+                                            _spec_for_dispatch_entry,
+                                            runner_workspace,
                                         )
                                         _spec_for_dispatch = _unwrap_resolved_spec(
                                             _spec_for_dispatch_entry
                                         )
+                                        _dispatch_workspace = await _session_runtime_cwd(conv_id)
                                         event[_RUNNER_DISPATCHED_FIELD] = True
                                         raw_sse_bytes = _encode_sse_event(event)
                                         _agent_id_for_dispatch = cast(
@@ -8244,7 +8241,8 @@ def create_runner_app(
                                                     task_id=_omnigent_task_id or _response_id,
                                                     agent_id=_agent_id_for_dispatch,
                                                     agent_name=cast(str | None, body.get("model")),
-                                                    runner_workspace=_dispatch_workdir,
+                                                    runner_workspace=_dispatch_workspace,
+                                                    local_tool_workdir=_local_tool_workdir,
                                                     mcp_manager=cast(
                                                         "RunnerMcpManager", _dispatch_mcp
                                                     ),
@@ -11165,15 +11163,8 @@ def create_runner_app(
                     except (OmnigentError, httpx.HTTPError, RuntimeError):
                         pass
                 _agent_id_local = _session_agent_ids.get(session_id)
-                dispatch_workspace = (
-                    # A resolved entry with no bundle dir gets no workspace at
-                    # all: widening that to the runner workspace would hand a
-                    # sub-agent the tool tree its own bundle does not contain.
-                    spec_workdir
-                    if _is_spec_local_native_python_tool(spec, tool_name)
-                    else runner_workspace
-                )
                 try:
+                    dispatch_workspace = await _session_runtime_cwd(session_id)
                     output = await execute_tool(
                         tool_name=tool_name,
                         arguments=_json.dumps(arguments),
@@ -11186,6 +11177,7 @@ def create_runner_app(
                         agent_id=_agent_id_local,
                         agent_name=getattr(spec, "name", None),
                         runner_workspace=dispatch_workspace,
+                        local_tool_workdir=spec_workdir,
                         mcp_manager=None,
                         session_inbox=_session_inboxes.get(session_id),
                         session_async_tasks=_session_async_tasks.get(session_id),
