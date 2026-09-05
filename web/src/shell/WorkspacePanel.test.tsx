@@ -115,6 +115,7 @@ function renderWorkspace(
         onCloseFile={onCloseFile}
         onShowScopeView={vi.fn()}
         onCommentsOpenChange={vi.fn()}
+        onDiffViewActiveChange={vi.fn()}
         openTerminalTab={openTerminalTab}
         openTerminals={overrides.openTerminals ?? []}
         selectedTerminalKey={overrides.selectedTerminalKey ?? null}

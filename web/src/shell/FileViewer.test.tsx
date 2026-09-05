@@ -214,6 +214,8 @@ interface RenderProps {
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
   onNavigateTo?: (path: string) => void;
+  /** Spy for the host's diff-view-active notification. */
+  onDiffViewActiveChange?: (active: boolean) => void;
 }
 
 /**
@@ -231,6 +233,7 @@ function viewerTree({
   onClose = vi.fn(),
   sort,
   onNavigateTo,
+  onDiffViewActiveChange,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -245,6 +248,7 @@ function viewerTree({
           onClose={onClose}
           sort={sort}
           onNavigateTo={onNavigateTo}
+          onDiffViewActiveChange={onDiffViewActiveChange}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -1320,6 +1324,54 @@ describe("FileViewer split-toggle width gating", () => {
     expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Split view" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Unified view" })).toBeNull();
+  });
+});
+
+// ── Diff-view notification to the host ──────────────────────────────────────
+//
+// The host rail widens to SPLIT_DIFF_MIN_WIDTH while the diff view is showing
+// (see AppShell's inlinePanelMinWidth); FileViewer reports that state through
+// onDiffViewActiveChange. Without the report, a saved split preference opens
+// unified at the rail's compact default (Monaco's 900px inline breakpoint)
+// with the split/unified toggle hidden.
+
+describe("FileViewer diff-view notification (onDiffViewActiveChange)", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  it("reports active when the viewer opens on the diff view", async () => {
+    const onDiffViewActiveChange = vi.fn();
+    renderViewer({ open: true, path: "file1.py", initialSearch: "diff=1", onDiffViewActiveChange });
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+    // Failure: the diff view rendered but the host was never told, so the
+    // rail keeps its compact width and split collapses to unified.
+    expect(onDiffViewActiveChange).toHaveBeenLastCalledWith(true);
+  });
+
+  it("reports inactive on the source view, active after toggling the diff on", () => {
+    const onDiffViewActiveChange = vi.fn();
+    renderViewer({ open: true, path: "file1.py", onDiffViewActiveChange });
+    expect(onDiffViewActiveChange).toHaveBeenLastCalledWith(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+    expect(onDiffViewActiveChange).toHaveBeenLastCalledWith(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Exit diff view" }));
+    expect(onDiffViewActiveChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("clears the claim on unmount so a stale width floor can't outlive the viewer", async () => {
+    const onDiffViewActiveChange = vi.fn();
+    const view = render(
+      viewerTree({ open: true, path: "file1.py", initialSearch: "diff=1", onDiffViewActiveChange }),
+    );
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+    expect(onDiffViewActiveChange).toHaveBeenLastCalledWith(true);
+
+    view.unmount();
+    // Failure: no cleanup — the rail would stay wide with no diff showing.
+    expect(onDiffViewActiveChange).toHaveBeenLastCalledWith(false);
   });
 });
 

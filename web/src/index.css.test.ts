@@ -476,6 +476,7 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           onCloseFile: () => {},
           onShowScopeView: () => {},
           onCommentsOpenChange: () => {},
+          onDiffViewActiveChange: () => {},
           openTerminalTab: () => {},
           openTerminals: [],
           selectedTerminalKey: null,

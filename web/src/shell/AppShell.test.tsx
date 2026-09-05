@@ -18,7 +18,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { resetWidthStoreForTesting } from "@/hooks/useResizableInlinePanel";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
@@ -141,32 +142,58 @@ vi.mock("./FilesPanel", () => ({
     </div>
   ),
 }));
-vi.mock("./FileViewer", () => ({
+vi.mock("./FileViewer", async () => {
+  const React = await import("react");
   // frameless=true → the inline desktop viewer (always open when rendered).
   // frameless=false/absent → the mobile push-panel (open prop controls visibility).
   // Use different testids so tests can target the one they care about.
-  FileViewer: ({
+  const FileViewer = ({
     open,
     path,
     onClose,
     frameless,
+    onDiffViewActiveChange,
   }: {
     open: boolean;
     path: string;
     onClose: () => void;
     frameless?: boolean;
-  }) => (
-    <div
-      data-testid={frameless ? "file-viewer-inline" : "file-viewer"}
-      data-state={open ? "open" : "closed"}
-      data-path={path}
-    >
-      <button type="button" aria-label="file-viewer: close" onClick={onClose}>
-        close
-      </button>
-    </div>
-  ),
-}));
+    onDiffViewActiveChange?: (active: boolean) => void;
+  }) => {
+    // Mirror the real viewer's unmount contract: the diff-view claim is
+    // cleared when the viewer goes away (see FileViewer's notify effect).
+    const notifyRef = React.useRef(onDiffViewActiveChange);
+    notifyRef.current = onDiffViewActiveChange;
+    React.useEffect(() => () => notifyRef.current?.(false), []);
+    return (
+      <div
+        data-testid={frameless ? "file-viewer-inline" : "file-viewer"}
+        data-state={open ? "open" : "closed"}
+        data-path={path}
+      >
+        <button type="button" aria-label="file-viewer: close" onClick={onClose}>
+          close
+        </button>
+        {/* Stand-ins for the real viewer's diff view starting/stopping. */}
+        <button
+          type="button"
+          aria-label="file-viewer: diff-view on"
+          onClick={() => onDiffViewActiveChange?.(true)}
+        >
+          diff on
+        </button>
+        <button
+          type="button"
+          aria-label="file-viewer: diff-view off"
+          onClick={() => onDiffViewActiveChange?.(false)}
+        >
+          diff off
+        </button>
+      </div>
+    );
+  };
+  return { FileViewer };
+});
 vi.mock("./InlineTerminalsSection", () => ({
   // Minimal stand-in exposing onExpand so tests can trigger the inline terminal expand path.
   InlineTerminalsSection: ({ onExpand }: { onExpand: (key: string) => void }) => (
@@ -3180,6 +3207,88 @@ describe("AppShell scope view — conversation redirect (stale-closure regressio
     expect(screen.getByTestId("url-pathname").textContent).toBe("/c/conv_xyz");
     // And the file params were cleared (the scope view is now active).
     expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+  });
+});
+
+describe("Workspace rail split-diff width floor", () => {
+  // While the rail's FileViewer shows a diff, the rail must widen to
+  // SPLIT_DIFF_MIN_WIDTH (920px) so the diff area clears Monaco's 900px
+  // inline breakpoint — otherwise a saved split preference silently renders
+  // unified at the rail's compact default and the split/unified toggle is
+  // hidden. The floor is render-time only: the user's persisted width
+  // preference must not be overwritten by it.
+  const originalInnerWidth = window.innerWidth;
+
+  beforeEach(() => {
+    // A wide desktop viewport so the 920px floor can actually be granted
+    // (the chat column keeps its 480px minimum: 2000 - 480 - 8 = 1512 cap).
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      writable: true,
+      value: 2000,
+    });
+    resetWidthStoreForTesting();
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+  });
+
+  afterEach(() => {
+    resetWidthStoreForTesting();
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      writable: true,
+      value: originalInnerWidth,
+    });
+  });
+
+  const railWidth = () => screen.getByRole("complementary", { name: "Workspace" }).style.width;
+
+  // The mobile push-panel FileViewer mounts alongside the inline one, so
+  // scope the diff-view stand-in buttons to the rail's inline viewer.
+  const inlineViewerButton = (name: RegExp | string) =>
+    within(screen.getByTestId("file-viewer-inline")).getByRole("button", { name });
+
+  it("widens the rail to the split-diff floor while the diff view shows, then releases it", () => {
+    renderShell("/c/conv_abc");
+
+    // Open a file; the rail sits at its viewport default (600px at 2000w).
+    fireEvent.click(screen.getByRole("button", { name: /files: select README\.md/i }));
+    expect(railWidth()).toBe("600px");
+
+    // The viewer reports its diff view active → the rail claims 920px.
+    // Failure: AppShell ignores the report and the rail stays at 600px,
+    // under Monaco's 900px breakpoint (the reported bug).
+    fireEvent.click(inlineViewerButton("file-viewer: diff-view on"));
+    expect(railWidth()).toBe("920px");
+
+    // Leaving the diff view releases the floor.
+    fireEvent.click(inlineViewerButton("file-viewer: diff-view off"));
+    expect(railWidth()).toBe("600px");
+  });
+
+  it("does not persist the floor as the user's width preference", () => {
+    renderShell("/c/conv_abc");
+    fireEvent.click(screen.getByRole("button", { name: /files: select README\.md/i }));
+    fireEvent.click(inlineViewerButton("file-viewer: diff-view on"));
+    expect(railWidth()).toBe("920px");
+    // The floor is render-time only — no widthPx may be written for the
+    // session, so the user's own (unset) preference survives.
+    expect(readSessionWorkspaceState("conv_abc").widthPx).toBeUndefined();
+  });
+
+  it("drops the floor when the file viewer closes", () => {
+    renderShell("/c/conv_abc");
+    fireEvent.click(screen.getByRole("button", { name: /files: select README\.md/i }));
+    fireEvent.click(inlineViewerButton("file-viewer: diff-view on"));
+    expect(railWidth()).toBe("920px");
+
+    // Closing the file unmounts the viewer; its cleanup must clear the claim
+    // so the rail can't stay wide with no diff showing.
+    fireEvent.click(inlineViewerButton(/file-viewer: close/i));
+    expect(railWidth()).toBe("600px");
   });
 });
 

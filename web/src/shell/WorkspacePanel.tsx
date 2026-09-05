@@ -606,6 +606,10 @@ interface WorkspacePanelProps {
   /** Surface the file viewer's comments-open state up to AppShell (it
    *  widens the rail to fit the comments column). */
   onCommentsOpenChange: (open: boolean) => void;
+  /** Surface the file viewer's diff-view state up to AppShell (it widens the
+   *  rail so the diff area clears Monaco's inline breakpoint instead of
+   *  silently collapsing a split preference to unified). */
+  onDiffViewActiveChange: (active: boolean) => void;
   /** Open a shell as a rail tab (adds/activates its tab), surfacing its
    *  xterm in the content slot. */
   openTerminalTab: (key: string) => void;
@@ -685,6 +689,7 @@ function WorkspacePanelImpl({
   onCloseFile,
   onShowScopeView,
   onCommentsOpenChange,
+  onDiffViewActiveChange,
   openTerminalTab,
   openTerminals,
   selectedTerminalKey,
@@ -976,6 +981,7 @@ function WorkspacePanelImpl({
             onNavigateTo={openFileViewer}
             permissionLevel={permissionLevel}
             onCommentsOpenChange={onCommentsOpenChange}
+            onDiffViewActiveChange={onDiffViewActiveChange}
             sort={filesPanelSort}
           />
         ) : rightRailTab === "browser" && showBrowserTab ? (
