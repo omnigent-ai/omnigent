@@ -359,6 +359,34 @@ def test_write_policy_hook_config_merges_user_model(tmp_path, monkeypatch) -> No
     assert config["hooks_auto_accept"] is True
 
 
+def test_write_policy_hook_config_merges_user_mcp_servers(tmp_path, monkeypatch) -> None:
+    """User-declared ``mcp_servers`` must survive into the per-session config.
+
+    The agent spec's ``tools:`` never reaches the hermes-native harness, so
+    the user's ``~/.hermes/config.yaml`` is the only way to hand a Hermes
+    session operator-provisioned MCP servers. Dropping the key here silently
+    strips those servers.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    user_hermes = tmp_path / ".hermes"
+    user_hermes.mkdir()
+
+    import yaml
+
+    (user_hermes / "config.yaml").write_text(
+        yaml.dump({"mcp_servers": {"github": {"command": "gh-mcp", "args": ["serve"]}}})
+    )
+
+    monkeypatch.setattr(b.Path, "home", staticmethod(lambda: tmp_path))
+
+    hermes_home = b.write_policy_hook_config(bridge_dir, "http://localhost:6767", "s3")
+    config = json.loads((hermes_home / "config.yaml").read_text())
+    assert config["mcp_servers"]["github"] == {"command": "gh-mcp", "args": ["serve"]}
+    # The bridge's own stdio server must still be registered alongside.
+    assert "omnigent" in config["mcp_servers"]
+
+
 def test_read_hermes_home_returns_path_when_exists(tmp_path) -> None:
     (tmp_path / "hermes_home").mkdir()
     assert b.read_hermes_home(tmp_path) == tmp_path / "hermes_home"
