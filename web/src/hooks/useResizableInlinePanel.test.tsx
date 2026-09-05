@@ -69,16 +69,93 @@ const overlaySelector = () =>
   ) ?? null;
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["requestAnimationFrame", "cancelAnimationFrame"] });
   setInnerWidth(2000);
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   localStorage.clear();
   resetWidthStoreForTesting();
   setInnerWidth(originalInnerWidth);
 });
 
+function paintResizeFrame() {
+  expect(vi.getTimerCount()).toBe(1);
+  act(() => vi.advanceTimersToNextFrame());
+}
+
 describe("useResizableInlinePanel persistence", () => {
+  it("preserves panel handle prop identity across unchanged rerenders", () => {
+    const { result, rerender } = renderHook(() => useResizableInlinePanel(SESSION));
+    const handlers = result.current.handleProps;
+
+    rerender();
+    expect(result.current.handleProps).toBe(handlers);
+    rerender();
+    expect(result.current.handleProps).toBe(handlers);
+  });
+
+  it("coalesces move bursts into one shared publication per frame and flushes before persistence", () => {
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    const publish = vi.fn();
+    const subscriber = renderHook(() => {
+      const panel = useResizableInlinePanel(SESSION);
+      publish(panel.panelWidth);
+      return panel;
+    });
+    const handle = createPointerHandle();
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(handle.element)));
+    publish.mockClear();
+
+    for (const clientX of [1200, 1100, 1000]) {
+      act(() =>
+        result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX })),
+      );
+    }
+
+    expect(result.current.panelWidth).toBe(600);
+    expect(publish).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(1);
+    act(() => vi.advanceTimersToNextFrame());
+    expect(publish.mock.calls).toEqual([[1000]]);
+    expect(subscriber.result.current.panelWidth).toBe(1000);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
+
+    act(() =>
+      result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 900 })),
+    );
+    expect(publish.mock.calls).toEqual([[1000]]);
+    act(() => result.current.handleProps.onPointerUp(pointerEvent(handle.element)));
+    expect(publish.mock.calls).toEqual([[1000], [1100]]);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(1100);
+    expect(vi.getTimerCount()).toBe(0);
+    act(() => vi.advanceTimersToNextFrame());
+    expect(publish).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels pending frame publication before rolling back a resize", () => {
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    expect(nudgeWiderOnce(result)).toBe(620);
+    const handle = createPointerHandle();
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(handle.element));
+      result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 1200 }));
+    });
+    expect(result.current.panelWidth).toBe(620);
+    act(() => vi.advanceTimersToNextFrame());
+    expect(result.current.panelWidth).toBe(800);
+    act(() =>
+      result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 1100 })),
+    );
+    expect(vi.getTimerCount()).toBe(1);
+    act(() => result.current.handleProps.onPointerCancel(pointerEvent(handle.element)));
+    expect(vi.getTimerCount()).toBe(0);
+    act(() => vi.advanceTimersToNextFrame());
+    expect(result.current.panelWidth).toBe(620);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(620);
+  });
+
   it("persists explicit keyboard resize per session and restores it after store reset", () => {
     const { result, unmount } = renderHook(() => useResizableInlinePanel(SESSION));
 
@@ -252,6 +329,7 @@ describe("useResizableInlinePanel tablet-width viewports", () => {
       result.current.handleProps.onPointerDown(pointerEvent(handle.element));
       result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 784 }));
     });
+    paintResizeFrame();
     const narrow = result.current.panelWidth;
     expect(narrow).toBe(240);
 
@@ -309,6 +387,7 @@ describe("useResizableInlinePanel pointer drag", () => {
 
     // Live width tracks the drag, but nothing is written to storage mid-drag —
     // persisting per pointermove would fire a synchronous write on every frame.
+    paintResizeFrame();
     expect(result.current.panelWidth).toBe(800);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
 
@@ -361,6 +440,7 @@ describe("useResizableInlinePanel pointer drag", () => {
           pointerEvent(handle.element, { pointerId: 11, clientX: 1200 }),
         );
       });
+      paintResizeFrame();
       expect(result.current.panelWidth).toBe(800);
 
       act(() => {
@@ -421,6 +501,7 @@ describe("useResizableInlinePanel pointer drag", () => {
       );
     });
     expect(nextHandle.setPointerCapture).toHaveBeenCalledWith(6);
+    paintResizeFrame();
     expect(result.current.panelWidth).toBe(900);
   });
 
@@ -435,6 +516,7 @@ describe("useResizableInlinePanel pointer drag", () => {
       result.current.handleProps.onPointerDown(pointerEvent(handle.element));
       result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 1200 }));
     });
+    paintResizeFrame();
     expect(result.current.panelWidth).toBe(800);
 
     rerender({ enabled: false });
@@ -457,6 +539,7 @@ describe("useResizableInlinePanel pointer drag", () => {
       result.current.handleProps.onPointerDown(pointerEvent(handle.element));
       result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 1200 }));
     });
+    paintResizeFrame();
     expect(result.current.panelWidth).toBe(800);
 
     rerender({ persistEnabled: false });
@@ -546,6 +629,7 @@ describe("useResizableInlinePanel pointer drag", () => {
       result.current.handleProps.onPointerDown(pointerEvent(handle.element));
       result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 1200 }));
     });
+    paintResizeFrame();
     expect(result.current.panelWidth).toBe(800);
 
     rerender({ sessionId: "conv_new" });
@@ -585,6 +669,7 @@ describe("useResizableInlinePanel pointer drag", () => {
         pointerEvent(firstHandle.element, { clientX: 1200 }),
       ),
     );
+    paintResizeFrame();
     expect(result.current.panelWidth).toBe(800);
   });
 

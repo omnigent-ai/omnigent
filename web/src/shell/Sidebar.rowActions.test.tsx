@@ -100,7 +100,6 @@ vi.mock("@/hooks/useInputCapabilities", () => ({
     coarsePrimary: mocks.anyCoarse,
     anyCoarse: mocks.anyCoarse,
     hoverPrimary: !mocks.anyCoarse,
-    hasTouch: mocks.anyCoarse,
   }),
 }));
 
@@ -2291,7 +2290,9 @@ describe("touch swipe actions", () => {
     expect(requestFrame).toHaveBeenCalledTimes(1);
     expect(frames).toHaveLength(1);
     act(() => frames[0](1_040));
-    expect(li.querySelector('[style*="margin-right"]')).toHaveStyle({ marginRight: "60px" });
+    expect(screen.getByTestId("conversation-swipe-surface")).toHaveStyle({
+      transform: "translateX(-60px)",
+    });
     requestFrame.mockRestore();
     cancelFrame.mockRestore();
   });
@@ -2551,13 +2552,15 @@ describe("touch swipe actions", () => {
     fireEvent.pointerMove(li, { ...POINTER, clientX: 180, clientY: 100 });
     fireEvent.pointerMove(li, { ...POINTER, clientX: 100, clientY: 100 });
     act(() => frames[0](performance.now()));
-    expect(li.querySelector('[style*="margin-right"]')).toHaveStyle({
-      marginRight: "81.33333333333333px",
+    expect(screen.getByTestId("conversation-swipe-surface")).toHaveStyle({
+      transform: "translateX(-81.33333333333333px)",
     });
 
     fireEvent.lostPointerCapture(li, POINTER);
 
-    expect(li.querySelector('[style*="margin-right"]')).toBeNull();
+    expect(screen.getByTestId("conversation-swipe-surface")).toHaveStyle({
+      transform: "translateX(0px)",
+    });
     fireEvent.pointerUp(li, { ...POINTER, clientX: 100, clientY: 100 });
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
     expect(mocks.del.mutate).not.toHaveBeenCalled();
@@ -2628,20 +2631,17 @@ describe("touch swipe actions", () => {
     },
   );
 
-  it("does not fire at 71px, immediately below the commit boundary", () => {
+  it.each([-72, -71, 71, 72])("enforces the default slow-swipe boundary at %dpx", (deltaX) => {
     renderSidebar();
 
-    swipeRow(-71);
+    swipeRow(deltaX, 500);
 
-    expect(mocks.archive.mutate).not.toHaveBeenCalled();
-  });
-
-  it("fires exactly once at the 72px commit boundary", () => {
-    renderSidebar();
-
-    swipeRow(72);
-
-    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    if (Math.abs(deltaX) < 72) {
+      expectNothingCommitted();
+    } else {
+      expectCommitted(deltaX < 0 ? "delete" : "archive");
+    }
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
   });
 
   it("commits the configured action on a wide viewport with a coarse pointer", () => {

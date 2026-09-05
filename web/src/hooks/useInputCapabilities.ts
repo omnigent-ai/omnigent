@@ -2,14 +2,12 @@ import { useSyncExternalStore } from "react";
 
 export interface InputCapabilities {
   anyCoarse: boolean;
-  hasTouch: boolean;
 }
 
 const COARSE_POINTER_QUERY = "(any-pointer: coarse)";
 
 const SERVER_SNAPSHOT: InputCapabilities = {
   anyCoarse: false,
-  hasTouch: false,
 };
 
 let mediaList: MediaQueryList | null = null;
@@ -23,7 +21,6 @@ function read(): InputCapabilities {
   if (typeof window === "undefined" || !window.matchMedia) return SERVER_SNAPSHOT;
   return {
     anyCoarse: list().matches,
-    hasTouch: navigator.maxTouchPoints > 0,
   };
 }
 
@@ -31,7 +28,7 @@ let cached: InputCapabilities = SERVER_SNAPSHOT;
 
 function getSnapshot(): InputCapabilities {
   const next = read();
-  if (next.anyCoarse !== cached.anyCoarse || next.hasTouch !== cached.hasTouch) {
+  if (next.anyCoarse !== cached.anyCoarse) {
     cached = next;
   }
   return cached;

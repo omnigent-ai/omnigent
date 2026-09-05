@@ -1,5 +1,5 @@
 import { act, renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { useInputCapabilities } from "./useInputCapabilities";
 
@@ -33,35 +33,17 @@ function installMatchMedia(state: Record<string, boolean>) {
   };
 }
 
-function setMaxTouchPoints(value: number) {
-  Object.defineProperty(navigator, "maxTouchPoints", {
-    configurable: true,
-    value,
-  });
-}
-
-afterEach(() => {
-  setMaxTouchPoints(0);
-});
-
 describe("useInputCapabilities", () => {
   it("reports no coarse pointer when the query does not match", () => {
     installMatchMedia({});
     const { result } = renderHook(() => useInputCapabilities());
-    expect(result.current).toEqual({ anyCoarse: false, hasTouch: false });
+    expect(result.current).toEqual({ anyCoarse: false });
   });
 
   it("reports a coarse pointer when the query matches", () => {
     installMatchMedia({ "(any-pointer: coarse)": true });
     const { result } = renderHook(() => useInputCapabilities());
-    expect(result.current).toEqual({ anyCoarse: true, hasTouch: false });
-  });
-
-  it("reports an attached touch digitizer", () => {
-    installMatchMedia({});
-    setMaxTouchPoints(5);
-    const { result } = renderHook(() => useInputCapabilities());
-    expect(result.current).toEqual({ anyCoarse: false, hasTouch: true });
+    expect(result.current).toEqual({ anyCoarse: true });
   });
 
   it("updates live when the coarse-pointer query flips", () => {
