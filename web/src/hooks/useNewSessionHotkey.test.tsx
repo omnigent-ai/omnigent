@@ -6,9 +6,15 @@ import { isNewSessionHotkey, useNewSessionHotkey } from "./useNewSessionHotkey";
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
 
+const selectedTarget = vi.hoisted(() => ({ route: "/" }));
+vi.mock("@/hooks/useNewSessionTarget", () => ({
+  useNewSessionTarget: () => ({ route: selectedTarget.route }),
+}));
+
 afterEach(() => {
   cleanup();
   navigate.mockReset();
+  selectedTarget.route = "/";
   document.body.innerHTML = "";
 });
 
@@ -47,6 +53,16 @@ describe("useNewSessionHotkey", () => {
 
     expect(navigate).toHaveBeenCalledWith("/");
     expect(e.defaultPrevented).toBe(true);
+  });
+
+  it("follows the selected project target", () => {
+    const { rerender } = renderHook(() => useNewSessionHotkey(true, false));
+    selectedTarget.route = "/?project=Alpha%20Team";
+    rerender();
+
+    press({ key: "n", ctrlKey: true });
+
+    expect(navigate).toHaveBeenCalledWith("/?project=Alpha%20Team");
   });
 
   it("works from editable fields so the global action is focus-independent", () => {

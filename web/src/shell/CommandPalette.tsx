@@ -31,6 +31,7 @@ import {
 import { useNavigate } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useNewSessionTarget } from "@/hooks/useNewSessionTarget";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
@@ -105,6 +106,7 @@ export function CommandPalette({
   onToggleRightSidebar,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
+  const { route: newSessionTargetRoute, target: newSessionTarget } = useNewSessionTarget();
   const isMobile = useIsMobileViewport();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
@@ -128,10 +130,13 @@ export function CommandPalette({
     () => [
       {
         id: "new-chat",
-        label: "New chat",
+        label:
+          newSessionTarget.kind === "project"
+            ? `New session in ${newSessionTarget.projectName}`
+            : "New session — No Project",
         icon: SquarePenIcon,
         keywords: ["compose", "start", "new session"],
-        run: () => navigate("/"),
+        run: () => navigate(newSessionTargetRoute),
       },
       {
         id: "go-inbox",
@@ -169,7 +174,7 @@ export function CommandPalette({
         run: onToggleRightSidebar,
       },
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
+    [navigate, newSessionTarget, newSessionTargetRoute, onToggleLeftSidebar, onToggleRightSidebar],
   );
 
   const filteredActions = useMemo(() => {

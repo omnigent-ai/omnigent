@@ -141,6 +141,10 @@ function folderHeader(): HTMLElement {
   return header as HTMLElement;
 }
 
+function folderToggle(): HTMLElement {
+  return screen.getByRole("button", { name: PROJECT_NAME });
+}
+
 function contextTrigger(): HTMLElement {
   const trigger = folderHeader().closest('[data-slot="context-menu-trigger"]');
   if (trigger === null) throw new Error("Folder header has no context-menu trigger");
@@ -279,27 +283,30 @@ describe("project folder header context menu", () => {
     }
   });
 
-  it("still expands and collapses on plain left-click", () => {
+  it("selects the target independently from the expand and collapse button", () => {
     renderSidebar();
 
     expect(contextTrigger()).toBe(folderHeader());
-    expect(folderHeader()).toHaveAttribute("aria-expanded", "false");
+    expect(folderToggle()).toHaveAttribute("aria-expanded", "false");
     fireEvent.click(folderHeader());
-    expect(folderHeader()).toHaveAttribute("aria-expanded", "true");
-    fireEvent.click(folderHeader());
-    expect(folderHeader()).toHaveAttribute("aria-expanded", "false");
+    expect(folderHeader()).toHaveAttribute("aria-pressed", "true");
+    expect(folderToggle()).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(folderToggle());
+    expect(folderToggle()).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(folderToggle());
+    expect(folderToggle()).toHaveAttribute("aria-expanded", "false");
   });
 
-  it("toggles on the first left-click after a mouse-opened menu is dismissed", () => {
+  it("selects on the first left-click after a mouse-opened menu is dismissed", () => {
     renderSidebar();
 
     fireEvent.contextMenu(folderHeader());
     expect(screen.getByTestId("rename-project")).toBeInTheDocument();
-    expect(folderHeader()).toHaveAttribute("aria-expanded", "false");
+    expect(folderHeader()).toHaveAttribute("aria-pressed", "false");
     dismissMenu();
     fireEvent.click(folderHeader());
 
-    expect(folderHeader()).toHaveAttribute("aria-expanded", "true");
+    expect(folderHeader()).toHaveAttribute("aria-pressed", "true");
   });
 
   it("guards touch selection without a viewport breakpoint", () => {
@@ -327,8 +334,8 @@ describe("project folder header context menu", () => {
       renderSidebar();
       const header = folderHeader();
       fireEvent.click(header);
-      const before = header.getAttribute("aria-expanded");
-      if (before === null) throw new Error("Folder header is missing aria-expanded");
+      const before = header.getAttribute("aria-pressed");
+      if (before === null) throw new Error("Folder header is missing aria-pressed");
 
       dispatchTouchPointer(header, "pointerdown");
       act(() => vi.advanceTimersByTime(699));
@@ -339,7 +346,7 @@ describe("project folder header context menu", () => {
       expectProjectMenuActions();
       expect(document.body).toHaveStyle({ pointerEvents: "none" });
       dispatchTouchPointer(header, "pointerup");
-      expect(header).toHaveAttribute("aria-expanded", before);
+      expect(header).toHaveAttribute("aria-pressed", before);
     } finally {
       cleanup();
       vi.useRealTimers();
@@ -378,7 +385,7 @@ describe("project folder header context menu", () => {
     expect(screen.getByTestId("rename-project")).toBeInTheDocument();
   });
 
-  it("toggles on the first keyboard activation after dismissal", async () => {
+  it("selects on the first keyboard activation after dismissal", async () => {
     renderSidebar();
     const header = folderHeader();
     header.focus();
@@ -389,13 +396,13 @@ describe("project folder header context menu", () => {
     await waitFor(() => expect(header).toHaveFocus());
     fireEvent.click(header, { detail: 0 });
 
-    expect(folderHeader()).toHaveAttribute("aria-expanded", "true");
+    expect(folderHeader()).toHaveAttribute("aria-pressed", "true");
   });
 
   it("scopes the trigger to the header button", () => {
     renderSidebar();
 
-    fireEvent.click(folderHeader());
+    fireEvent.click(folderToggle());
     const row = screen.getByRole("link", { name: /My Session/ });
     const trigger = contextTrigger();
 
@@ -406,7 +413,7 @@ describe("project folder header context menu", () => {
   it("leaves a nested session row's context menu intact", () => {
     renderSidebar();
 
-    fireEvent.click(folderHeader());
+    fireEvent.click(folderToggle());
     const row = screen.getByRole("link", { name: /My Session/ });
     expect(contextTrigger().contains(row)).toBe(false);
     fireEvent.contextMenu(row);
@@ -433,7 +440,7 @@ describe("project folder header context menu", () => {
   it("keeps the collapse toggle active when selection mode unmounts an open menu", () => {
     renderSidebar();
     const header = folderHeader();
-    const before = header.getAttribute("aria-expanded");
+    const before = folderToggle().getAttribute("aria-expanded");
     if (before === null) throw new Error("Folder header is missing aria-expanded");
 
     fireEvent.pointerDown(screen.getByTestId("project-list-actions"), { button: 0 });
@@ -442,8 +449,8 @@ describe("project folder header context menu", () => {
     fireEvent.click(screen.getByTestId("projects-select-sessions"));
     const selectionHeader = folderHeader();
     expect(selectionHeader.closest('[data-slot="context-menu-trigger"]')).toBeNull();
-    fireEvent.click(selectionHeader);
+    fireEvent.click(folderToggle());
 
-    expect(selectionHeader).toHaveAttribute("aria-expanded", before === "true" ? "false" : "true");
+    expect(folderToggle()).toHaveAttribute("aria-expanded", before === "true" ? "false" : "true");
   });
 });
