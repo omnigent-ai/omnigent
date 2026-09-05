@@ -158,17 +158,81 @@ def test_write_opencode_policy_plugin(bridge_dir: Path) -> None:
     path = write_opencode_policy_plugin(bridge_dir)
     assert path.name == "omnigent-policy.js"
     src = path.read_text(encoding="utf-8")
-    # The two phase hooks the reactive permission path can't reach.
+    # The three phase hooks the reactive permission path can't reach.
     assert '"chat.message"' in src  # REQUEST phase
+    assert '"tool.execute.before"' in src  # TOOL_CALL phase
     assert '"tool.execute.after"' in src  # TOOL_RESULT phase
     # Posts the proto phases + reads its coordinates from env.
     assert "PHASE_REQUEST" in src and "PHASE_TOOL_RESULT" in src
+    assert "PHASE_TOOL_CALL" in src
     assert "OMNIGENT_POLICY_URL" in src and "OMNIGENT_SESSION_ID" in src
     assert "/policies/evaluate" in src
     # A function export so opencode's Object.values(mod) loader picks it up.
     assert "export const OmnigentPolicyPlugin" in src
     # Idempotent overwrite (re-launch ships fresh code, no error).
     assert write_opencode_policy_plugin(bridge_dir) == path
+
+
+def test_policy_plugin_gates_tool_calls_before_dispatch(bridge_dir: Path) -> None:
+    """TOOL_CALL is the only phase that can stop a write from happening.
+
+    ``tool.execute.after`` fires once the tool has already run, so a DENY there
+    withholds output rather than preventing the effect. Without a pre-dispatch
+    hook a TOOL_CALL policy is unreachable under opencode-native and silently
+    enforces nothing.
+    """
+    src = write_opencode_policy_plugin(bridge_dir).read_text(encoding="utf-8")
+    assert '"tool.execute.before"' in src
+    assert "PHASE_TOOL_CALL" in src
+    # A DENY has to throw: opencode blocks the tool when the hook raises, and
+    # anything softer would be an advisory that reports enforcement it lacks.
+    assert "Omnigent policy blocked this tool call" in src
+
+
+def test_policy_plugin_fails_closed_on_the_fail_closed_phases(
+    bridge_dir: Path,
+) -> None:
+    """Mirrors ``FAIL_CLOSED_PHASES`` in ``omnigent/policies/types.py``.
+
+    For TOOL_CALL the in-band verdict is the only enforcement point, so an
+    unreachable engine must deny rather than wave the call through. The
+    advisory phases keep the original fail-open behaviour, which is why the
+    posture is a per-call argument instead of a global switch.
+    """
+    src = write_opencode_policy_plugin(bridge_dir).read_text(encoding="utf-8")
+    assert "async function evaluate(type, target, data, failClosed)" in src
+    assert "policy engine unavailable" in src
+    # Not wired at all (no server/session) still short-circuits to ALLOW, so a
+    # plain opencode session without Omnigent is never bricked by this plugin.
+    assert 'if (!BASE || !SESSION) return { result: "ALLOW" };' in src
+
+
+def test_policy_plugin_treats_a_non_verdict_body_as_unavailable(
+    bridge_dir: Path,
+) -> None:
+    """A 2xx that carries no verdict must not read as ALLOW on a gated phase.
+
+    A proxy envelope, a ``{"detail": ...}`` error body, or a renamed field would
+    otherwise leave ``verdict.result`` undefined and let the call through --
+    defeating failClosed with a *successful* response.
+    """
+    src = write_opencode_policy_plugin(bridge_dir).read_text(encoding="utf-8")
+    assert "KNOWN_VERDICTS" in src
+    assert "POLICY_ACTION_UNSPECIFIED" in src
+
+
+def test_policy_plugin_denies_an_unresolved_ask_at_tool_call(
+    bridge_dir: Path,
+) -> None:
+    """ASK reaching the plugin means it was not resolved server-side.
+
+    TOOL_CALL is the only pre-execution gate, so allowing it would run the very
+    tool the user was being asked to approve. Matches the ``POLICY_ACTION_ASK ->
+    deny`` mapping in ``omnigent/native_policy_hook.py``.
+    """
+    src = write_opencode_policy_plugin(bridge_dir).read_text(encoding="utf-8")
+    assert 'verdict.result === "POLICY_ACTION_ASK"' in src
+    assert "requires approval for this tool call" in src
 
 
 def test_update_last_event_id(bridge_dir: Path) -> None:
