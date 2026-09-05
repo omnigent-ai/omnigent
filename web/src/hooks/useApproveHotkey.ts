@@ -14,6 +14,12 @@
 // pick on the card itself. An elicitation whose `requestedSchema` names
 // fields is skipped for exactly that reason — the server asked for values,
 // and accepting from the keyboard would send it none of them.
+//
+// A chord that lands in a text field holding a draft is also skipped: the
+// user was mid-composition when the prompt appeared, and Cmd/Ctrl+Enter is a
+// send chord there (the ONLY send key under the Mod+Enter preference). A
+// keystroke that expressed send intent must never resolve a permission
+// prompt that mounted moments earlier.
 
 import { useEffect } from "react";
 
@@ -22,6 +28,21 @@ import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import type { ElicitationBlock } from "@/lib/blocks";
 import { useChatStore } from "@/store/chatStore";
 
+/**
+ * Whether the keystroke landed in a text field that holds a draft — the
+ * signature of a user mid-composition, for whom Cmd/Ctrl+Enter means "send
+ * what I typed", never "approve the prompt that just appeared". An EMPTY
+ * field carries no send intent, so the chord still accepts from there (the
+ * common post-send state, where focus may remain in the cleared composer).
+ */
+export function isDraftingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
+    return target.value.length > 0;
+  }
+  return target.isContentEditable && (target.textContent ?? "").trim().length > 0;
+}
+
 export function useApproveHotkey(isMac = isMacPlatform()): void {
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
@@ -29,6 +50,11 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       // only ⌘↵ on macOS and only Ctrl+↵ on Win/Linux.
       if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return;
       if (e.key !== "Enter") return;
+
+      // Mid-composition chord — a send intent aimed at the draft, not a
+      // verdict. Leave the event for the composer's own handler (whose
+      // send path is separately gated while a prompt is pending).
+      if (isDraftingTarget(e.target)) return;
 
       const { blocks, submitApproval } = useChatStore.getState();
       // Newest-first: accept the most recent still-pending prompt that takes a

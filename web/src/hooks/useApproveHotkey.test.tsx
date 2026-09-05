@@ -1,7 +1,8 @@
 // Cmd/Ctrl+Enter accepts the newest pending accept/decline prompt; skips
 // already-responded prompts and AskUserQuestion (which needs an explicit
 // choice); platform-aware (only ⌘ on macOS, only Ctrl on Win/Linux); ignores
-// bare Enter and Alt/Shift-modified Enter.
+// bare Enter, Alt/Shift-modified Enter, and a chord landing in a text field
+// that holds a draft (a send intent, not a verdict).
 
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -125,5 +126,51 @@ describe("useApproveHotkey", () => {
     press({ metaKey: true, shiftKey: true });
     press({ metaKey: true, altKey: true });
     expect(submitApproval).not.toHaveBeenCalled();
+  });
+
+  it("does not accept from a textarea holding a draft (send intent)", () => {
+    // The user was typing when the prompt appeared. Ctrl+Enter is their
+    // send chord (the ONLY one under the Mod+Enter preference); it must
+    // never resolve a prompt that mounted moments earlier.
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(false));
+    const ta = document.createElement("textarea");
+    ta.value = "deploying the fix, hold on";
+    document.body.appendChild(ta);
+    try {
+      ta.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          ctrlKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      expect(submitApproval).not.toHaveBeenCalled();
+    } finally {
+      ta.remove();
+    }
+  });
+
+  it("still accepts from an empty text field (no draft, no send intent)", () => {
+    // Post-send, focus can legitimately sit in the cleared composer; an
+    // empty field carries no draft, so the chord keeps meaning "approve".
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(false));
+    const ta = document.createElement("textarea");
+    document.body.appendChild(ta);
+    try {
+      ta.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          ctrlKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
+    } finally {
+      ta.remove();
+    }
   });
 });
