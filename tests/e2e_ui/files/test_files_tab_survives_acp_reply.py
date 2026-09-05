@@ -26,6 +26,7 @@ import io
 import json
 import re
 import shlex
+import subprocess
 import sys
 import tarfile
 from collections.abc import Iterator
@@ -34,6 +35,8 @@ from pathlib import Path
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests.e2e_ui.conftest import _ensure_runner_online
 
 _ACP_SLUG = "fake-agent"
 _ACP_REPLY_TEXT = "ACP agent reply: hello from fake-agent"
@@ -118,6 +121,7 @@ def acp_launcher_session(
     live_server: str,
     runner_id: str,
     tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str]]:
     """Bind a session to a generated ``acp:<slug>``-launcher agent.
 
@@ -128,6 +132,7 @@ def acp_launcher_session(
     :param live_server: Spawned server base URL.
     :param runner_id: Token-bound runner id to bind the session to.
     :param tmp_path: Per-test dir for the fake agent script.
+    :param tmp_path_factory: Temp directories for a replacement runner's logs.
     :returns: ``(base_url, session_id)``.
     """
     agent_script = tmp_path / "fake_acp_agent.py"
@@ -143,7 +148,10 @@ def acp_launcher_session(
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
+    respawned_runner: subprocess.Popen[bytes] | None = None
     try:
+        # Earlier tests may deliberately stop the session-scoped runner.
+        respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
         patch_resp = httpx.patch(
             f"{live_server}/v1/sessions/{session_id}",
             json={"runner_id": runner_id},
@@ -152,7 +160,16 @@ def acp_launcher_session(
         patch_resp.raise_for_status()
         yield (live_server, session_id)
     finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        try:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        finally:
+            if respawned_runner is not None:
+                respawned_runner.terminate()
+                try:
+                    respawned_runner.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned_runner.kill()
+                    respawned_runner.wait(timeout=5)
 
 
 def test_files_tab_survives_generic_acp_agent_reply(
