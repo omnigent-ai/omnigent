@@ -78,6 +78,28 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   };
 }
 
+// @tanstack/react-virtual windows rows off the scroll element's measured
+// height, but jsdom does no layout — every element is 0×0, so the real
+// virtualizer renders nothing and component tests can't see any tree rows.
+// Replace it with a pass-through that renders every item; the windowing itself
+// is browser behaviour verified manually, and the tree's logic (flatten,
+// expand/collapse, lazy load) is what the unit tests actually assert.
+vi.mock("@tanstack/react-virtual", () => ({
+  useVirtualizer: ({ count }: { count: number }) => {
+    const items = Array.from({ length: count }, (_, index) => ({
+      index,
+      key: index,
+      start: index * 28,
+      size: 28,
+    }));
+    return {
+      getVirtualItems: () => items,
+      getTotalSize: () => count * 28,
+      measureElement: () => {},
+    };
+  },
+}));
+
 Object.defineProperty(window, "matchMedia", {
   writable: true,
   value: (query: string) => ({

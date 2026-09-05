@@ -33,6 +33,9 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   useWorkspaceAllFiles: vi.fn(),
   useWorkspaceChangedFiles: vi.fn(),
   useWorkspaceDirectory: vi.fn(),
+  // The tree fetches expanded lazy dirs centrally via the plural hook; default
+  // it to no expanded dirs (empty map). Tests that drive lazy content override.
+  useWorkspaceDirectories: vi.fn(() => new Map()),
   useWorkspaceEnvironment: vi.fn(),
   useWorkspaceFileSearch: vi.fn(),
   // Real exports consumed by `instanceof` checks (FlatFileList's offline
