@@ -5773,6 +5773,79 @@ def test_list_conversations_owned_by_excludes_shared_sessions(
     assert ids == {mine.id}
 
 
+def test_list_conversations_shared_only_returns_accessible_but_not_owned(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``shared_only=True`` returns sessions Alice can access but does NOT own —
+    i.e. sessions shared with her by another user. Her own sessions are excluded."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    shared_by_bob = conversation_store.create_conversation()
+    shared_by_carol = conversation_store.create_conversation()
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com", "carol@example.com"):
+        perms.ensure_user(user)
+    # Alice owns "mine"
+    perms.grant("alice@example.com", mine.id, 4)
+    # Bob owns shared_by_bob and shares it with Alice (read)
+    perms.grant("bob@example.com", shared_by_bob.id, 4)
+    perms.grant("alice@example.com", shared_by_bob.id, 1)
+    # Carol owns shared_by_carol and shares it with Alice (edit)
+    perms.grant("carol@example.com", shared_by_carol.id, 4)
+    perms.grant("alice@example.com", shared_by_carol.id, 2)
+
+    ids = {
+        c.id
+        for c in conversation_store.list_conversations(
+            accessible_by="alice@example.com",
+            shared_only=True,
+        ).data
+    }
+    assert ids == {shared_by_bob.id, shared_by_carol.id}
+    assert mine.id not in ids
+
+
+def test_list_conversations_shared_only_empty_when_no_shared_sessions(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``shared_only=True`` returns an empty list when the user owns everything
+    accessible to them (single-user / no sharing scenario)."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user("alice@example.com")
+    perms.grant("alice@example.com", mine.id, 4)
+
+    result = conversation_store.list_conversations(
+        accessible_by="alice@example.com",
+        shared_only=True,
+    )
+    assert result.data == []
+
+
+def test_list_conversations_archived_only_returns_only_archived(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``archived_only=True`` returns only archived sessions; active ones are excluded."""
+    active = conversation_store.create_conversation()
+    archived = conversation_store.create_conversation()
+    conversation_store.update_conversation(archived.id, archived=True)
+
+    result = conversation_store.list_conversations(archived_only=True, include_archived=True)
+    ids = {c.id for c in result.data}
+    assert archived.id in ids
+    assert active.id not in ids
+
+
 def test_live_state_columns_round_trip_without_bumping_updated_at(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

@@ -483,13 +483,19 @@ class SandboxLifecycle(ABC):
 
     def keep_alive(self, sandbox_id: str) -> None:
         """
-        Configure the sandbox to survive idle periods (disable idle
-        autostop / maximize lifetime), so long agent runs don't lose
-        their host. Soft-fail: implementations should warn rather than
-        raise when the provider rejects the setting.
+        Keep the sandbox from being reclaimed while it is still in use,
+        so long agent runs don't lose their host. Soft-fail:
+        implementations should warn rather than raise when the provider
+        rejects the setting.
 
-        CLI-bootstrap capability — managed-only launchers need not
-        override the raising default.
+        Called BOTH once after a CLI bootstrap provision AND periodically
+        by the managed path for as long as the sandbox has a live runner
+        (:mod:`omnigent.server.managed_host_keepalive`), so an implementation
+        must be idempotent and cheap enough to repeat. Either shape
+        satisfies it: "configure once to maximize lifetime" (disable idle
+        autostop, restate a cap) or "push a deadline forward" (refresh an
+        absolute expiry). Managed-only launchers that cannot extend a
+        sandbox keep the raising default and are skipped.
 
         :param sandbox_id: The sandbox to configure.
         :raises SandboxCapabilityError: When the provider does not

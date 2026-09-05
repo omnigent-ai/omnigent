@@ -143,6 +143,8 @@ def _validate_relative_path(
         or len(path.parts) > _MAX_ASSET_DEPTH
     ):
         raise ExtensionValidationError(f"{field_name} {value!r} is not a safe relative path")
+    if route and len(path.parts) != 1:
+        raise ExtensionValidationError(f"{field_name} must contain exactly one segment")
     segment_pattern = _ROUTE_SEGMENT_RE if route else _ASSET_SEGMENT_RE
     if any(not segment_pattern.fullmatch(part) for part in path.parts):
         if route:
@@ -408,9 +410,16 @@ def _entry_point_asset_package(entry_point: Any) -> str | None:
 
     dist = getattr(entry_point, "dist", None)
     files = getattr(dist, "files", None)
-    if files is None:
-        return None
-    owned_packages = {str(file).replace("\\", "/").split("/", 1)[0] for file in files}
+    owned_packages = (
+        {str(file).replace("\\", "/").split("/", 1)[0] for file in files}
+        if files is not None
+        else set()
+    )
+    read_text = getattr(dist, "read_text", None)
+    if callable(read_text):
+        top_level = read_text("top_level.txt")
+        if isinstance(top_level, str):
+            owned_packages.update(line.strip() for line in top_level.splitlines() if line.strip())
     return package if package in owned_packages else None
 
 

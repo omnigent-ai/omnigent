@@ -29,6 +29,7 @@ import {
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import { isNativeShell } from "@/lib/nativeBridge";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
@@ -44,6 +45,8 @@ export function openKeyboardShortcuts(): void {
 // Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
 const UP = "↑";
 const DOWN = "↓";
+const BRACKET_LEFT = "[";
+const BRACKET_RIGHT = "]";
 
 interface Shortcut {
   label: string;
@@ -83,8 +86,8 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "Navigation",
     items: [
-      { label: "Previous session", keys: [MOD_KEY, UP] },
-      { label: "Next session", keys: [MOD_KEY, DOWN] },
+      { label: "Previous session", keys: [MOD_KEY, BRACKET_LEFT] },
+      { label: "Next session", keys: [MOD_KEY, BRACKET_RIGHT] },
     ],
   },
   {
@@ -196,8 +199,9 @@ export function KeyboardShortcutsDialog() {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
-      // trigger, so require the modifier and no Shift/Alt to avoid clashing.
-      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === "/") {
+      // trigger, so require the platform command modifier and no Shift/Alt to
+      // avoid clashing (only ⌘/ on macOS, only Ctrl+/ on Win/Linux).
+      if (hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "/") {
         e.preventDefault();
         setOpen((prev) => !prev);
       }

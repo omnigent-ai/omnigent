@@ -1713,10 +1713,10 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
 _ACCENT_RGB = (244, 59, 166)
 
 # Command names that are pure aliases of another command (the same Click
-# object registered under a second name, e.g. ``update`` -> ``upgrade``).
+# object registered under a second name, e.g. ``antigravity`` -> ``agy``).
 # Kept runnable/registered but omitted from the ``--help`` listing so the
 # alias isn't shown as a duplicate line.
-_ALIAS_COMMANDS: frozenset[str] = frozenset({"update", "antigravity"})
+_ALIAS_COMMANDS: frozenset[str] = frozenset({"antigravity"})
 
 
 def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
@@ -1792,7 +1792,7 @@ class _OmnigentCLI(click.Group):
             cmd = self.get_command(ctx, subcommand)
             if cmd is None or cmd.hidden:
                 continue
-            # Skip pure aliases (e.g. ``update`` -> ``upgrade``) so the
+            # Skip pure aliases (e.g. ``antigravity`` -> ``agy``) so the
             # listing doesn't show a duplicate line; still runnable.
             if subcommand in _ALIAS_COMMANDS:
                 continue
@@ -2041,6 +2041,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "debug",
         "diagnose",
         "doctor",
+        "extensions",
         "goose",
         "hermes",
         "host",
@@ -2079,9 +2080,9 @@ def _should_skip_update_check(argv: list[str]) -> bool:
 
     Skipped for help / version requests, internal TUI subcommands
     (``pane-split`` / ``pane-picker``, invoked by the terminal UI rather
-    than the user), and ``upgrade`` (and its ``update`` alias) itself
-    (pointing the user at ``omni upgrade`` while they are running it is
-    noise).
+    than the user), and ``upgrade`` (and its deprecated ``update`` spelling)
+    itself (pointing the user at ``omni upgrade`` while they are running it
+    is noise).
 
     :param argv: CLI arguments without the program name, e.g.
         ``["run", "agent.yaml"]``.
@@ -4750,6 +4751,76 @@ def _internal_write_ledger(from_env: bool) -> None:
     click.echo(json.dumps({"path": str(ledger_path()), "source": ledger.ledger_source}))
 
 
+@cli.group("extensions")
+def extensions_cli() -> None:
+    """Inspect extensions installed in this Python environment."""
+
+
+@extensions_cli.command("list")
+def extensions_list() -> None:
+    """List accepted extensions without resolving browser assets."""
+    from omnigent.extensions import plugin_state
+
+    state = plugin_state()
+    if not state.manifests:
+        click.echo("No extensions installed.")
+    for manifest in state.manifests:
+        click.echo(f"{manifest.id}\t{manifest.version}\t{manifest.display_name}")
+    if state.load_errors:
+        click.echo(f"{len(state.load_errors)} rejected extension entry point(s)", err=True)
+
+
+@extensions_cli.command("doctor")
+@click.argument("extension_id")
+def extensions_doctor(extension_id: str) -> None:
+    """Validate one extension manifest and its packaged browser bundle."""
+    from omnigent.extensions import plugin_state
+    from omnigent.extensions.assets import (
+        ExtensionAssetError,
+        parse_dev_bundle_overrides,
+        resolve_bundle,
+    )
+
+    state = plugin_state()
+    manifest = state.get(extension_id)
+    if manifest is None:
+        # A rejected manifest never reaches the catalog; its entry point key
+        # (``<distribution>:<name>``) and error are all that is left of it.
+        needle = extension_id.lower().replace(".", "-").replace("_", "-")
+        rejected = {
+            entry_point: error
+            for entry_point, error in state.load_errors.items()
+            if needle in entry_point.lower().replace("_", "-") or extension_id in error
+        }
+        for entry_point, error in rejected.items():
+            click.echo(f"rejected {entry_point}: {error}", err=True)
+        if rejected:
+            raise click.ClickException(f"Extension {extension_id!r} was rejected while loading")
+        raise click.ClickException(f"Extension {extension_id!r} is not installed or was rejected")
+    raw_overrides = os.environ.get("OMNIGENT_EXTENSION_DEV_BUNDLES", "").strip()
+    try:
+        overrides = parse_dev_bundle_overrides(raw_overrides) if raw_overrides else {}
+    except ExtensionAssetError as exc:
+        raise click.ClickException(f"Invalid development bundle override: {exc}") from exc
+    click.echo(f"id: {manifest.id}")
+    click.echo(f"distribution: {manifest.distribution} {manifest.version}")
+    click.echo(f"extension API: {manifest.extension_api}")
+    if manifest.entrypoints.browser is None:
+        click.echo("browser bundle: not declared")
+        return
+    override = overrides.get(extension_id)
+    try:
+        bundle = resolve_bundle(
+            manifest,
+            package=None if override is not None else state.asset_package(extension_id),
+            root_override=override,
+        )
+    except ExtensionAssetError as exc:
+        raise click.ClickException(f"Browser bundle unresolved: {exc}") from exc
+    suffix = " (development override)" if override is not None else ""
+    click.echo(f"browser bundle: ok ({bundle.digest}){suffix}")
+
+
 @cli.command("diagnose")
 @click.option(
     "--server",
@@ -5537,11 +5608,34 @@ def upgrade(
     )
 
 
-# ``omni update`` is an alias for ``omni upgrade`` — mistyping the latter as
-# the former is common, and silently doing nothing is annoying. Registering
-# the same Command object under a second name shares the exact callback,
-# options, and semantics; there is no duplicated implementation to drift.
-cli.add_command(upgrade, name="update")
+@click.pass_context
+def _update_deprecated(ctx: click.Context, **kwargs: object) -> None:
+    """Warn that ``update`` is deprecated, then run the ``upgrade`` flow.
+
+    :param ctx: The click context, used to invoke ``upgrade``.
+    :param kwargs: ``upgrade``'s own parsed options, forwarded verbatim.
+    :returns: None.
+    """
+    click.echo(
+        f"omnigent: `update` is deprecated; use `{cli_invocation(name='omni')} upgrade`.",
+        err=True,
+    )
+    ctx.invoke(upgrade, **kwargs)
+
+
+# Deprecated rather than deleted: the desktop About window shipped this same
+# ``omni update`` hint, and ``server start`` was deleted outright in v0.7.0
+# (#3105) then restored (#3578) when older clients hard-failed on it.
+cli.add_command(
+    click.Command(
+        "update",
+        params=list(upgrade.params),
+        callback=_update_deprecated,
+        hidden=True,
+        # Static: a module-level f-string would freeze the wrapper spelling.
+        help="Deprecated spelling of `upgrade`. Use `upgrade` instead.",
+    )
+)
 
 
 def _bundle(source: Path) -> bytes:
@@ -6814,8 +6908,11 @@ _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnige
 # operations route through the Omnigent dispatch path (runner
 # visibility, timeouts, error recovery) instead of the harness's
 # internal built-in tools.
+# Membership is tested on the canonical id, so "acp" covers every
+# acp:<slug> launcher: without os_env the runner 404s the session's
+# environment resource and the web UI unmounts the Files panel.
 _OS_ENV_HARNESSES: frozenset[str] = frozenset(
-    {"claude-sdk", "codex", "pi", "qwen", "goose", "kimi"}
+    {"claude-sdk", "codex", "pi", "qwen", "goose", "kimi", "acp"}
 )
 
 
@@ -8130,8 +8227,8 @@ class _HostGroup(click.Group):
     --server <url>`` when ``<url>`` is URL-like or the empty local-mode
     marker. A leading positional token that matches a registered
     management subcommand (``enable``, ``disable``, ``status``, ``stop``,
-    ``stop-session``) still dispatches to that subcommand, and other unknown
-    tokens fall through to Click's normal unknown-command error.
+    ``stop-session``, ``reset-id``) still dispatches to that subcommand, and
+    other unknown tokens fall through to Click's normal unknown-command error.
     """
 
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
@@ -8515,8 +8612,8 @@ def host(
 
     The server URL may be given positionally (``omnigent host
     <url>``) or via ``--server <url>``. A leading ``status``, ``stop``,
-    ``enable``, ``disable``, or ``stop-session`` token still runs that
-    management subcommand.
+    ``enable``, ``disable``, ``stop-session``, or ``reset-id`` token still
+    runs that management subcommand.
 
     When the target server is Databricks-fronted and you are not signed
     in, ``host`` runs the same flow ``omnigent login`` would before
@@ -9882,6 +9979,45 @@ def host_stop_session(
             click.echo(f"Failed to stop session {session_id!r}.", err=True)
             continue
         click.echo(f"Stopped session {session_id}.")
+
+
+@host.command("reset-id")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def host_reset_id(yes: bool) -> None:
+    """
+    Mint a fresh host id for this machine.
+
+    The recovery path for ``HTTP 409: this machine is already registered
+    to a different account``: the server keys host registrations by the
+    persisted host id, so once another identity owns it, this machine
+    cannot re-register under yours. Resetting the id lets the next
+    ``omnigent host`` register as a brand-new host under the identity you
+    are signed in as. The host name and other config are preserved.
+
+    :param yes: When ``True``, skip the confirmation prompt.
+    """
+    from omnigent.host.identity import CONFIG_PATH, reset_host_id
+
+    running = [record for record in _list_daemon_records() if _pid_alive(record.pid)]
+    if running:
+        raise click.ClickException(
+            "A host daemon is running; stop it first with "
+            f"`{cli_invocation()} host stop --all`, then re-run "
+            f"`{cli_invocation()} host reset-id`."
+        )
+    if not yes:
+        click.confirm(
+            "Mint a fresh host id? Servers will see this machine as a new "
+            "host; the registration owned by the previous id is left behind "
+            "for an administrator to clean up",
+            abort=True,
+        )
+    old_host_id, new_host_id = reset_host_id(CONFIG_PATH)
+    if old_host_id is None:
+        click.echo(f"No previous host id was persisted; created {new_host_id}.")
+    else:
+        click.echo(f"Host id reset: {old_host_id} -> {new_host_id}.")
+    click.echo(f"Run `{cli_invocation()} host` to register this machine under the new id.")
 
 
 @cli.command(hidden=True)

@@ -429,12 +429,14 @@ def test_github_file_diff_returns_before_after(tmp_path: Path) -> None:
 
 
 def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None:
-    """``github_pr_diff`` delegates to ``gh pr diff``."""
+    """``github_pr_diff`` resolves the PR number, then delegates to ``gh pr diff <n>``."""
     from omnigent import workspace_fs
 
     _git_branch_repo(tmp_path)
 
     def fake_gh(argv, *, cwd):
+        if tuple(argv[:2]) == ("pr", "view"):
+            return (0, '{"number": 3}', "")
         if tuple(argv[:2]) == ("pr", "diff"):
             return (0, "diff --git a/app.txt b/app.txt\n+changed\n", "")
         return (1, "", "")

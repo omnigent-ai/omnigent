@@ -462,6 +462,22 @@ describe("deleteConversation", () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 404 }));
     await expect(deleteConversation("missing")).rejects.toThrow(/404/);
   });
+
+  it("surfaces the server error message instead of a bare 404 status line", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        {
+          error: {
+            code: "conflict",
+            message:
+              "Cannot delete worktree — runner offline. Delete session only (delete_branch=false) or wait for the runner to reconnect.",
+          },
+        },
+        { ok: false, status: 409 },
+      ),
+    );
+    await expect(deleteConversation("conv_abc", true)).rejects.toThrow(/runner offline/);
+  });
 });
 
 describe("useStopAndDeleteConversation stops the running session first", () => {
@@ -771,6 +787,34 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     // The per-session caches survive a failed delete — the session is still
     // there to open.
     expect(queryClient.getQueryData(["session", "conv_x"])).toBeDefined();
+  });
+
+  it("puts the runner-offline worktree message on the restore toast, not a 404", async () => {
+    const { rendered } = seedAndDelete(
+      mockResponse(
+        {
+          error: {
+            code: "conflict",
+            message:
+              "Cannot delete worktree — runner offline. Delete session only (delete_branch=false) or wait for the runner to reconnect.",
+          },
+        },
+        { ok: false, status: 409 },
+      ),
+    );
+    const toasts: string[] = [];
+    window.addEventListener("omnigent:toast", (e) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    });
+
+    rendered.result.current.mutate({ id: "conv_x", deleteBranch: true });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toContain("Couldn't delete Old name — it's back in the sidebar.");
+    expect(toasts[0]).toContain("runner offline");
+    expect(toasts[0]).toContain("delete_branch=false");
+    expect(toasts[0]).not.toMatch(/\b404\b/);
   });
 
   it("does not refetch the conversations list, but does refresh the project list", async () => {

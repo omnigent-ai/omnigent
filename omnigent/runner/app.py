@@ -212,6 +212,18 @@ _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 _CLAUDE_PANE_READY_TIMEOUT_S = 30.0
 _CLAUDE_PANE_READY_POLL_S = 0.25
 
+# Settle delay between keystrokes when driving Codex's /permissions popup. The
+# slash-command menu, the popup, and the Full Access confirm sub-dialog are each
+# drawn asynchronously; without a pause the next key races ahead (e.g. Enter
+# arrives before the /permissions menu commits, so the command never submits).
+_CODEX_PERMISSION_POPUP_RENDER_S = 0.7
+
+# Budget for confirming an approval switch actually landed. Codex echoes
+# "Permissions updated to <label>" once the popup applies; we poll the pane for
+# it so a no-op (e.g. a preset this codex build's /permissions doesn't offer)
+# fails loud instead of the label claiming a mode the TUI never entered.
+_CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
+
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
     """
@@ -5156,6 +5168,75 @@ def create_runner_app(
             },
         )
 
+    async def _handle_codex_native_approval_mode_change(
+        conv_id: str,
+        mode: str,
+    ) -> Response:
+        # Codex switches approval stance through its own /permissions popup, not
+        # thread/settings/update (that RPC drives model/effort but no-ops for
+        # approval). So drive the popup by keystroke into the codex tmux pane —
+        # the same channel /compact uses — selecting the preset by its menu digit.
+        from omnigent.codex_approval_modes import codex_permission_preset
+
+        preset = codex_permission_preset(mode)
+        if preset is None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_input",
+                    "detail": f"Unknown codex approval mode {mode!r}",
+                },
+            )
+        registry = resource_registry.terminal_registry
+        instance = registry.get(conv_id, "codex", "main") if registry is not None else None
+        if instance is None or not instance.running:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_approval_mode_failed",
+                    "detail": "Codex terminal is not running; reconnect first.",
+                },
+            )
+        try:
+            await asyncio.to_thread(
+                _inject_codex_permission_mode,
+                str(instance.socket_path),
+                instance.tmux_target,
+                menu_key=preset.menu_key,
+                needs_confirm=preset.needs_confirm,
+            )
+            # Confirm the switch landed before reporting success — the injection
+            # is otherwise fire-and-forget, so an unsupported preset (a menu row
+            # this codex build lacks) would silently no-op.
+            confirmed = await asyncio.to_thread(
+                _codex_permission_mode_confirmed,
+                str(instance.socket_path),
+                instance.tmux_target,
+                preset.label,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_approval_mode_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="codex-native approval mode change"
+                    ),
+                },
+            )
+        if not confirmed:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_approval_mode_failed",
+                    "detail": (
+                        f"Codex did not confirm the switch to {preset.label!r}; this codex "
+                        "build's /permissions may not offer it."
+                    ),
+                },
+            )
+        return JSONResponse(status_code=200, content={"approval_mode": preset.value})
+
     async def _codex_native_model_options(conv_id: str) -> list[_JsonObject]:
         from omnigent.codex_native_app_server import (
             client_for_transport,
@@ -5967,6 +6048,54 @@ def create_runner_app(
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
+
+    def _inject_codex_permission_mode(
+        socket_path: str,
+        target: str,
+        *,
+        menu_key: str,
+        needs_confirm: bool,
+    ) -> None:
+        # Drive Codex's /permissions popup: open it, then select the preset by
+        # its menu digit (position-independent, unlike arrow navigation). Full
+        # Access opens a "Yes, continue anyway" sub-dialog whose first option
+        # (digit 1) confirms. A settle pause between keystrokes is required — each
+        # screen draws asynchronously, and typing the command then pressing Enter
+        # back-to-back races the slash-menu so the command never submits.
+        from omnigent.claude_native_bridge import _run_tmux
+
+        # Reset to a clean composer so the command submits: close any stray
+        # menu/popup, then clear the line. C-u also wipes any text the TUI user
+        # was mid-typing — a rare, accepted cost for reliable injection.
+        _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
+        _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/permissions")
+        time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+        _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
+        time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, menu_key)
+        if needs_confirm:
+            time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+            _run_tmux(socket_path, "send-keys", "-l", "-t", target, "1")
+
+    def _codex_permission_mode_confirmed(socket_path: str, target: str, label: str) -> bool:
+        # Codex echoes "Permissions updated to <label>" when a /permissions switch
+        # applies. Poll the pane and require the most-recent such line to match the
+        # target, so a keystroke that hit a non-existent menu row (a preset this
+        # codex build doesn't offer) is reported as not-applied rather than the
+        # label claiming a mode the TUI never entered.
+        from omnigent.claude_native_bridge import _capture_pane
+
+        marker = "Permissions updated to "
+        deadline = time.monotonic() + _CODEX_PERMISSION_CONFIRM_BUDGET_S
+        while True:
+            pane = _capture_pane(socket_path, target)
+            updates = [line for line in pane.splitlines() if marker in line]
+            if updates and updates[-1].split(marker, 1)[1].strip() == label:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
 
     async def _handle_hermes_native_compact(conv_id: str) -> Response:
         from omnigent.hermes_native_bridge import (
@@ -8614,6 +8743,24 @@ def create_runner_app(
                         },
                     )
                 return await _handle_claude_native_permission_mode_change(
+                    conversation_id,
+                    mode,
+                )
+            return Response(status_code=204)
+
+        if body_type == "codex_approval_mode_change":
+            harness = _session_harness_name(conversation_id)
+            if harness == "codex-native":
+                mode = body.get("approval_mode") if isinstance(body, dict) else None
+                if not isinstance(mode, str) or not mode:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_input",
+                            "detail": "Body 'approval_mode' must be a non-empty string",
+                        },
+                    )
+                return await _handle_codex_native_approval_mode_change(
                     conversation_id,
                     mode,
                 )

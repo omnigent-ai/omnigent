@@ -10,7 +10,7 @@ its connection store are present).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,11 +23,18 @@ class ConnectionProvider:
     :param client_factory: ``(config) -> client`` for the OAuth/API client.
     :param router_factory: ``(config, store, *, auth_provider, client) ->
         APIRouter`` building the provider's ``/connections/{name}/*`` routes.
+    :param credential_resolver: ``(user_id, *, store, client) -> {"token": …,
+        **attribution metadata} | None`` — the adapter the generic host
+        credential broker (:mod:`omnigent.server.routes.host_credentials`) calls
+        to vend this provider's secret to a sandbox. ``None`` when the provider
+        has no broker endpoint (connect-only, or on-demand delivery not built
+        yet), in which case ``/hosts/{id}/credentials/{name}`` returns ``404``.
     """
 
     name: str
     client_factory: Callable[[Any], Any]
     router_factory: Callable[..., Any]
+    credential_resolver: Callable[..., Awaitable[dict[str, Any] | None]] | None = None
 
 
 def connection_providers() -> list[ConnectionProvider]:
@@ -37,6 +44,7 @@ def connection_providers() -> list[ConnectionProvider]:
     cycles through the route modules.
     """
     from omnigent.server.github_app_client import GitHubAppClient
+    from omnigent.server.github_identity import resolve_github_credential
     from omnigent.server.routes.connections_github import (
         create_connections_github_router,
     )
@@ -46,5 +54,6 @@ def connection_providers() -> list[ConnectionProvider]:
             name="github",
             client_factory=GitHubAppClient,
             router_factory=create_connections_github_router,
+            credential_resolver=resolve_github_credential,
         ),
     ]

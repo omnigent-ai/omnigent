@@ -48,6 +48,7 @@ import importlib.util
 import json
 import os
 import selectors
+import signal
 import socket
 import sys
 import threading
@@ -672,12 +673,19 @@ class _ZygoteServer:
     def _drop_runner(self, conn: socket.socket) -> None:
         """Forget a runner whose control socket closed (the runner exited).
 
-        Its harness children self-terminate via their own watchdog (which
-        probes the runner pid). With the runner gone, nothing will ever poll
-        their exit codes, so mark them orphaned: _reap still waitpid's them (no
-        zombies) but discards the code instead of leaking it in _exit_codes —
-        which would otherwise grow unbounded and risk pid-reuse misattribution.
-        Any already-reaped codes for this runner's harnesses are dropped too.
+        Its harness children are SIGTERM'd here. They also self-terminate via
+        their own watchdog (a 1 Hz probe of the runner pid), but that probe is
+        their ONLY death signal on macOS — PR_SET_PDEATHSIG is Linux-only and is
+        skipped for zygote-forked harnesses regardless — so a wedged harness or
+        a starved watchdog thread would otherwise survive for the zygote's whole
+        life. We are these children's real OS parent and already track their
+        pids, so an explicit signal is both cheap and correct.
+
+        With the runner gone, nothing will ever poll their exit codes, so mark
+        them orphaned: _reap still waitpid's them (no zombies) but discards the
+        code instead of leaking it in _exit_codes — which would otherwise grow
+        unbounded and risk pid-reuse misattribution. Any already-reaped codes
+        for this runner's harnesses are dropped too.
 
         :param conn: The closed runner socket.
         """
@@ -690,6 +698,10 @@ class _ZygoteServer:
             self._exit_codes.pop(harness_pid, None)
             if harness_pid in self._live:
                 self._orphaned.add(harness_pid)
+                # Signal the pid, never the group: everything the zygote forks
+                # shares the daemon's group, so a killpg would take it down too.
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    os.kill(harness_pid, signal.SIGTERM)
         with contextlib.suppress(OSError):
             conn.close()
 

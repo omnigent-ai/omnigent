@@ -912,6 +912,15 @@ export async function updateSession(
      * promise means the mode really changed.
      */
     claudePermissionMode?: string;
+    /**
+     * Codex-native approval mode to switch a RUNNING session to, one of
+     * `"ask-for-approval"`, `"approve-for-me"`, `"full-access"`, `"read-only"`
+     * (Codex's `/permissions` presets; the set is codex-version-dependent).
+     * Rejected by the server unless the session is codex-native, and the PATCH
+     * fails unless the runner confirms Codex applied it via its `/permissions`
+     * popup — so a resolved promise means the mode really changed.
+     */
+    codexApprovalMode?: string;
     costControlModeOverride?: "on" | "off" | null;
     subagentRoutingOverride?: "on" | "off" | null;
     runnerId?: string;
@@ -931,6 +940,9 @@ export async function updateSession(
   }
   if (updates.claudePermissionMode !== undefined) {
     body.permission_mode = updates.claudePermissionMode;
+  }
+  if (updates.codexApprovalMode !== undefined) {
+    body.approval_mode = updates.codexApprovalMode;
   }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;

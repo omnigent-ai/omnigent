@@ -1095,16 +1095,14 @@ def test_help_groups_harnesses_and_other_commands() -> None:
     assert commands_at < result.output.index("server")
 
 
-def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
-    """The ``update`` alias is omitted from --help but stays registered."""
+def test_help_hides_deprecated_update_spelling_but_keeps_it_runnable() -> None:
+    """``update`` is omitted from --help but stays registered and runnable."""
     result = CliRunner().invoke(cli, ["--help"])
 
     assert result.exit_code == 0, result.output
     assert "upgrade" in result.output
-    # The alias line is suppressed so it doesn't duplicate ``upgrade``...
     assert "\n  update " not in result.output
-    # ...but it's still a real, invokable command.
-    assert cli.commands["update"] is cli.commands["upgrade"]
+    assert cli.commands["update"].hidden is True
 
 
 def test_help_hides_extras_gated_harness_when_sdk_missing(
@@ -3489,6 +3487,21 @@ def test_materialize_harness_launcher_file_acp_slug() -> None:
     assert raw["executor"]["harness"] == "acp:qwenacp"  # slug preserved for the runner
     assert raw["name"] == "acp-qwenacp"
     assert re.fullmatch(r"[a-zA-Z0-9_-]+", raw["name"])  # passes the agent-name validator
+
+
+def test_materialize_harness_launcher_file_acp_gets_os_env() -> None:
+    """``run --harness acp:<slug>`` bakes a caller-process ``os_env``.
+
+    Regression: ``acp`` was missing from ``_OS_ENV_HARNESSES``, so generic-ACP
+    launcher specs had no ``os_env`` block - the runner 404d the session's
+    default environment resource and the web UI unmounted the Files panel as
+    soon as the agent's first reply resolved availability.
+    """
+    generated = _materialize_harness_launcher_file(
+        harness="acp:qwenacp", model=None, system_prompt=None
+    )
+    raw = yaml.safe_load(generated.read_text())
+    assert raw["os_env"] == {"type": "caller_process", "sandbox": {"type": "none"}}
 
 
 def test_run_from_openclaw_dispatches_ephemeral_acp_agent(

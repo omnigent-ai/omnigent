@@ -13,7 +13,7 @@ import json
 import math
 import secrets
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import httpx
@@ -56,6 +56,7 @@ from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
+from omnigent.model_metadata import concrete_reported_model
 from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -165,6 +166,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _deferred_elicitation_clear_tasks,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
+    _llm_response_denied_turns,
     _logger,
     _managed_launch_tasks,
     _MirroredToolCall,
@@ -846,7 +848,10 @@ def _build_session_list_item(
         id=conv.id,
         agent_id=conv.agent_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
-        status=_session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status),
+        status=_list_status_with_starting(
+            _session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status),
+            conv.id,
+        ),
         created_at=conv.created_at,
         updated_at=conv.updated_at,
         title=title_without_closed_marker(conv.title),
@@ -1370,9 +1375,9 @@ async def _persist_relay_reported_model(
     if not isinstance(usage_obj, dict):
         return
     raw_model = usage_obj.get("model")
-    if not isinstance(raw_model, str) or not raw_model.strip():
+    model = concrete_reported_model(raw_model)
+    if model is None:
         return
-    model = raw_model.strip()
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conv is None or conv.reported_model == model:
         return
@@ -3582,6 +3587,13 @@ def _kick_managed_wake_impl(
     # session page when the wake fires (the composer let them send into a
     # host_asleep session).
     _publish_sandbox_status(session_id, "provisioning")
+    wake_agent_store = getattr(app_state, "agent_store", None)
+    if wake_agent_store is None:
+        _logger.warning(
+            "session %s: wake has no agent store; woken runner stays unclassified",
+            session_id,
+            extra={"session_id": session_id},
+        )
     wake_task = asyncio.create_task(
         _run_managed_wake(
             session_id=session_id,
@@ -3592,6 +3604,8 @@ def _kick_managed_wake_impl(
             host_store=host_store,
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
+            agent_store=wake_agent_store,
+            agent_id=conv.agent_id,
         )
     )
     _managed_launch_tasks.add(wake_task)
@@ -3608,6 +3622,8 @@ async def _run_managed_wake(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    agent_store: AgentStore | None = None,
+    agent_id: str | None = None,
 ) -> None:
     """
     Wake a dormant resumable managed host in the background, settling the
@@ -3636,8 +3652,16 @@ async def _run_managed_wake(
         frame. ``None`` in minimal test wirings.
     :param tunnel_registry: Runner-tunnel registry used to await the launched
         runner's connection. ``None`` in minimal test wirings.
+    :param agent_store: Store the runner's agent classifier is resolved from,
+        or ``None`` (a stripped test wiring) to leave the runner unclassified.
+    :param agent_id: Agent the session is bound to, resolved through the
+        built-in gate into the woken runner Pod's ``omnigent.ai/agent``
+        classifier, or ``None`` to leave it unstamped.
     """
-    from omnigent.server.managed_hosts import resume_managed_host
+    from omnigent.server.managed_hosts import (
+        resolve_managed_agent_label,
+        resume_managed_host,
+    )
     from omnigent.server.routes import sessions as _facade
 
     host_id = conv.host_id
@@ -3661,8 +3685,25 @@ async def _run_managed_wake(
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
+        # Re-derived here rather than by the caller, matching the launch path:
+        # the read runs on the task that already owns the single-flight claim,
+        # and it is never read back from a stored label — so there is nothing to
+        # keep in sync, or to forge.
+        agent_name: str | None = None
+        if agent_store is not None and agent_id is not None:
+            agent_name = await asyncio.to_thread(
+                resolve_managed_agent_label,
+                agent_store,
+                agent_id,
+                session_id=session_id,
+            )
         await resume_managed_host(
-            host_id, host_store, sandbox_config, force=True, on_stage=_on_stage
+            host_id,
+            host_store,
+            sandbox_config,
+            force=True,
+            on_stage=_on_stage,
+            agent_name=agent_name,
         )
         _publish_sandbox_status(session_id, "connecting")
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -5517,11 +5558,69 @@ async def _record_create_route_prompt(
     return conv
 
 
+# Sessions with a message dispatch still awaiting its runner (cold boot). The
+# session list reports them as running so a booting session spins instead of
+# reading idle until the runner accepts the message. Process-local and
+# best-effort: with several replicas only the one handling the POST knows.
+_dispatch_in_flight: dict[str, int] = {}
+
+
+@contextlib.contextmanager
+def _mark_dispatch_in_flight(conversation_id: str) -> Iterator[None]:
+    """
+    Count a message as in flight for *conversation_id* until the block exits.
+
+    :param conversation_id: Session/conversation identifier.
+    """
+    _dispatch_in_flight[conversation_id] = _dispatch_in_flight.get(conversation_id, 0) + 1
+    try:
+        yield
+    finally:
+        remaining = _dispatch_in_flight.get(conversation_id, 1) - 1
+        if remaining > 0:
+            _dispatch_in_flight[conversation_id] = remaining
+        else:
+            _dispatch_in_flight.pop(conversation_id, None)
+
+
+def _session_is_starting(conversation_id: str) -> bool:
+    """
+    Whether a session has a message waiting on a runner that has not taken it.
+
+    :param conversation_id: Session/conversation identifier.
+    :returns: ``True`` while a dispatch is in flight or a native message is
+        parked in :mod:`omnigent.runtime.pending_inputs`.
+    """
+    return _dispatch_in_flight.get(conversation_id, 0) > 0 or pending_inputs.has_pending(
+        conversation_id
+    )
+
+
+def _list_status_with_starting(
+    status: Literal["idle", "running", "failed"],
+    conversation_id: str,
+) -> Literal["idle", "running", "failed"]:
+    """
+    Promote an idle session with a message still waiting on its runner to running.
+
+    :param status: Rolled-up list status for the session.
+    :param conversation_id: Session/conversation identifier.
+    :returns: ``"running"`` for a booting session, else *status* unchanged.
+    """
+    if status == "idle" and _session_is_starting(conversation_id):
+        return "running"
+    return status
+
+
 async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
     """Call-time proxy so a facade patch of this symbol is honored here."""
     from omnigent.server.routes import sessions as _facade
 
-    return await _facade._dispatch_session_event_to_runner(*args, **kwargs)
+    session_id = kwargs.get("session_id", args[0] if args else None)
+    if not isinstance(session_id, str):
+        return await _facade._dispatch_session_event_to_runner(*args, **kwargs)
+    with _mark_dispatch_in_flight(session_id):
+        return await _facade._dispatch_session_event_to_runner(*args, **kwargs)
 
 
 async def _dispatch_session_event_to_runner_impl(
@@ -6216,6 +6315,10 @@ async def _relay_runner_stream_once(
                             )
                         if status == "running":
                             text_acc.clear()
+                            # A new turn invalidates any deny marker a prior
+                            # turn left un-consumed (e.g. its terminal event
+                            # never reached the relay across a reconnect).
+                            _llm_response_denied_turns.pop(session_id, None)
                         continue
 
                     # Terminal spin-up status from the runner's auto-create
@@ -6298,13 +6401,29 @@ async def _relay_runner_stream_once(
                         and _item.get("status") == "completed"
                         and text_acc
                     ):
+                        # A deny recorded by a mid-turn LLM_RESPONSE evaluation
+                        # (harnesses that gate per LLM call) marks this segment
+                        # as denied content; consume it the same way the
+                        # terminal flush does.
+                        _boundary_deny = _llm_response_denied_turns.pop(session_id, None)
                         await _flush_relay_text(
                             conversation_store,
                             session_id,
                             text_acc,
                             current_response_id,
                             current_model,
+                            deny_reason=_boundary_deny,
+                            # Gate each segment as it becomes durable: without
+                            # this a RESPONSE-phase policy is bypassed whenever
+                            # the model emits the offending text before a tool
+                            # call (the segment persists here, ahead of the
+                            # terminal-flush evaluation).
+                            evaluate_response_phase=_boundary_deny is None,
                         )
+                        # A failed append leaves text_acc for retry — re-arm
+                        # the marker so the retry persists the sentinel.
+                        if _boundary_deny is not None and text_acc:
+                            _llm_response_denied_turns[session_id] = _boundary_deny
 
                     conv_item = _extract_persistent_item_from_sse(
                         event,
@@ -6335,13 +6454,37 @@ async def _relay_runner_stream_once(
                             if isinstance(_resp_model, str) and _resp_model
                             else current_model
                         )
+                        # An LLM_RESPONSE DENY recorded by the policy-evaluate
+                        # route means this buffered text is the denied content;
+                        # the flush persists the deny sentinel instead. Popped
+                        # here (not merely read) so the marker can never bleed
+                        # into a later turn.
+                        #
+                        # Scope: the LLM_RESPONSE verdict exists only after the
+                        # full stream, so it can sanitize only this final
+                        # buffered segment; text persisted at earlier tool-call
+                        # boundaries is already durable (the turn still fails
+                        # with a persisted deny error item). Segment-complete
+                        # durable gating is the RESPONSE phase's job — the
+                        # boundary flush above evaluates it for every segment.
+                        _deny_reason = _llm_response_denied_turns.pop(session_id, None)
                         await _flush_relay_text(
                             conversation_store,
                             session_id,
                             text_acc,
                             current_response_id,
                             _final_model,
+                            deny_reason=_deny_reason,
+                            # Terminal flush is the only place the runner
+                            # topology can evaluate the spec's RESPONSE-phase
+                            # output policies over the final assistant text.
+                            evaluate_response_phase=_deny_reason is None,
                         )
+                        # A failed append leaves text_acc intact for a retry
+                        # at a later flush — re-arm the marker so the retry
+                        # still persists the sentinel, not the denied text.
+                        if _deny_reason is not None and text_acc:
+                            _llm_response_denied_turns[session_id] = _deny_reason
 
                     error_item = _error_item_from_sse(
                         event,
@@ -6684,6 +6827,11 @@ def _ensure_runner_relay(
         current = _runner_relay_tasks.get(session_id)
         if current is not None and current.task is t:
             _runner_relay_tasks.pop(session_id, None)
+            # A deny marker is only consumable by this relay's flushes;
+            # drop any leftover so the (unbounded) marker dict cannot
+            # leak entries for relays that died before their terminal
+            # flush. A replacement relay re-records on the next verdict.
+            _llm_response_denied_turns.pop(session_id, None)
 
     task.add_done_callback(_on_done)
     return handle
@@ -8349,7 +8497,9 @@ async def _create_session_from_existing_agent(
     # the validated body args (e.g. ``["--permission-mode",
     # "bypassPermissions"]`` from the web permission-mode selector). The
     # flat-list shape plus this bounds check is the security boundary;
-    # mirrors the multipart create + PATCH paths.
+    # mirrors the multipart create + PATCH paths. When the body carries no
+    # args, the agent's own trusted spec seeds them below — explicit
+    # opt-ins only, never the headless worker default bypass.
     sub_spec: AgentSpec | None = None
     if body.sub_agent_name:
         sub_spec = _resolve_subagent_spec(
@@ -8375,24 +8525,46 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    # Spec-seeded defaults: a self-resolved agent's stored spec supplies the
+    # spec-level reasoning effort and, when the body carried no launch args,
+    # its explicit native-bypass opt-ins; one tolerant load serves both.
+    own_spec: AgentSpec | None = None
+    needs_launch_args_from_spec = not body.sub_agent_name and validated_launch_args is None
+    needs_effort_from_spec = reasoning_effort is None and sub_spec is None
+    if (
+        (needs_launch_args_from_spec or needs_effort_from_spec)
+        and agent_cache is not None
+        and agent.bundle_location is not None
+    ):
+        try:
+            own_loaded = await asyncio.to_thread(
+                agent_cache.load,
+                agent.id,
+                agent.bundle_location,
+                expand_env=agent.session_id is None,
+            )
+            own_spec = own_loaded.spec if own_loaded is not None else None
+        except (OSError, ValueError, RuntimeError, KeyError, AttributeError, ImportError):
+            _logger.warning(
+                "create: spec load for spec-seeded defaults failed "
+                "(agent=%s); session starts with no spec-level effort or launch args",
+                agent.id,
+                exc_info=True,
+            )
+
+    if needs_launch_args_from_spec and own_spec is not None:
+        try:
+            validated_launch_args = _derive_terminal_launch_args_from_spec(
+                own_spec, headless_defaults=False
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid terminal_launch_args in agent spec: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+
     if reasoning_effort is None:
-        effort_spec: AgentSpec | None = sub_spec
-        if effort_spec is None and agent_cache is not None and agent.bundle_location is not None:
-            try:
-                effort_loaded = await asyncio.to_thread(
-                    agent_cache.load,
-                    agent.id,
-                    agent.bundle_location,
-                    expand_env=agent.session_id is None,
-                )
-                effort_spec = effort_loaded.spec if effort_loaded is not None else None
-            except (OSError, ValueError, RuntimeError, KeyError, AttributeError, ImportError):
-                _logger.warning(
-                    "create: spec load for reasoning_effort default failed "
-                    "(agent=%s); session starts with no spec-level effort",
-                    agent.id,
-                    exc_info=True,
-                )
+        effort_spec: AgentSpec | None = sub_spec if sub_spec is not None else own_spec
         spec_effort = effort_spec.executor.reasoning_effort if effort_spec is not None else None
         if spec_effort is not None:
             _, reasoning_effort = validate_session_model_metadata(
@@ -8806,6 +8978,21 @@ def _create_session_from_bundle(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
         metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
+    elif metadata.terminal_launch_args is None:
+        # Top-level bundle create (the ``omnigent run <dir>`` shape): honor the
+        # spec's explicit bypass opt-ins (e.g. codex-native ``yolo: true``);
+        # an interactive session never inherits the headless default bypass.
+        try:
+            terminal_launch_args = _derive_terminal_launch_args_from_spec(
+                spec, headless_defaults=False
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid terminal_launch_args in bundled spec: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if terminal_launch_args is not None:
+            metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
 
     agent_id = generate_agent_id()
     agent_bundle_location = bundle_location(agent_id, bundle_bytes)
@@ -9675,8 +9862,8 @@ async def _get_session_snapshot(
     # a verbatim ``reported_model``, it supersedes the spec-derived value on
     # the wire's ``llm_model`` field (the web renders and highlights only
     # from this).
-    if conv.reported_model:
-        llm_model = conv.reported_model
+    if reported_model := concrete_reported_model(conv.reported_model):
+        llm_model = reported_model
     # Skills are runner-owned: the bound runner discovers them against its
     # own filesystem (bundled skills + host skills under the session's
     # workspace and ``~/.claude/skills/``) — the host where the harness

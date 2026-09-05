@@ -52,3 +52,29 @@ def test_host_images_include_kiro_installer_dependency(dockerfile: Path) -> None
     """Kiro's installer needs ``unzip`` on Linux."""
     text = dockerfile.read_text()
     assert "unzip" in text
+
+
+def test_extra_cli_rows_match_harness_install_table() -> None:
+    """install-harness-cli.sh's npm + goose rows stay in sync with _HARNESS_INSTALL.
+
+    The script resolves ``EXTRA_HARNESS_CLIS`` names to the same npm package
+    and default pin the runtime installs via ``omnigent setup``, behind a
+    "keep in sync" comment. A drift would bake a package or pin the runtime
+    then rejects (opencode's runtime gate bounds 1.18.x), so assert the two
+    tables agree instead of trusting the comment.
+    """
+    from omnigent.onboarding import harness_install as hi
+
+    script = (_ROOT / "deploy/docker/install-harness-cli.sh").read_text()
+
+    opencode = hi._HARNESS_INSTALL[hi.OPENCODE_KEY]
+    assert opencode.package == "opencode-ai@~1.18.0"
+    pkg, _, pin = opencode.package.rpartition("@")
+    assert f"{pkg}@${{version:-{pin}}}" in script
+
+    qwen = hi._HARNESS_INSTALL[hi.QWEN_KEY]
+    assert qwen.package == "@qwen-code/qwen-code"
+    assert f"{qwen.package}${{version:+@$version}}" in script
+
+    # goose's default pin mirrors the runtime's minimum supported goose.
+    assert f"${{1:-{hi._GOOSE_MIN_VERSION}}}" in script

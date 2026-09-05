@@ -26,6 +26,7 @@ from omnigent._native_post_delivery import (
     replay_dead_letters,
 )
 from omnigent.claude_native_bridge import url_component
+from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.codex_native_app_server import (
     CodexAppServerClient,
     CodexMessage,
@@ -408,6 +409,8 @@ class _CodexForwarderState:
     posted_collaboration_mode: str | None = None
     terminal_launch_args: list[str] | None = None
     posted_terminal_launch_args: list[str] | None = None
+    approval_preset: str | None = None
+    posted_approval_preset: str | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
@@ -880,10 +883,17 @@ class _CodexForwarderState:
             self.collaboration_mode = mode
 
     def _note_approval_mode_fields(self, payload: _JsonObject) -> None:
-        """Record Codex approval/sandbox settings as launch args."""
+        """Record Codex approval/sandbox settings as launch args + a runtime preset."""
         args = _codex_terminal_launch_args_from_settings(payload)
         if args is not None:
             self.terminal_launch_args = args
+        # Also resolve the /permissions preset for the web read-back label. A
+        # payload that maps to no preset (e.g. a custom permission profile) has no
+        # preset value to show, so the last-known one stays put — the picker keeps
+        # its prior value rather than blanking. Known limitation for custom profiles.
+        preset = codex_permission_preset_from_thread_settings(payload)
+        if preset is not None:
+            self.approval_preset = preset
 
 
 @dataclass(frozen=True)
@@ -3029,19 +3039,35 @@ async def _sync_codex_approval_mode_change(
     session_id: str,
     forwarder_state: _CodexForwarderState,
 ) -> None:
-    """Mirror Codex ``/permissions`` changes into session metadata."""
+    """Mirror Codex ``/permissions`` changes into session metadata.
+
+    Posts two things the server persists differently: ``terminal_launch_args``
+    (the create/fork/resume vocabulary) and ``approval_mode`` (the runtime
+    ``/permissions`` preset that drives the web read-back label + live picker).
+    """
     args = forwarder_state.terminal_launch_args
-    if args is None or args == forwarder_state.posted_terminal_launch_args:
+    preset = forwarder_state.approval_preset
+    args_changed = args is not None and args != forwarder_state.posted_terminal_launch_args
+    preset_changed = preset is not None and preset != forwarder_state.posted_approval_preset
+    if not args_changed and not preset_changed:
         return
+    data: _JsonObject = {}
+    if args is not None:
+        data["terminal_launch_args"] = args
+    if preset is not None:
+        data["approval_mode"] = preset
     response = await _post_session_event(
         client,
         session_id,
         event_type="external_codex_approval_mode_change",
-        data={"terminal_launch_args": args},
+        data=data,
     )
     _log_failed_session_event_post("external_codex_approval_mode_change", response)
     if response is not None and response.status_code < 400:
-        forwarder_state.posted_terminal_launch_args = list(args)
+        if args is not None:
+            forwarder_state.posted_terminal_launch_args = list(args)
+        if preset is not None:
+            forwarder_state.posted_approval_preset = preset
 
 
 async def _maybe_handle_turn_event(

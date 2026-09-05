@@ -2618,6 +2618,85 @@ async def test_resume_managed_host_forwards_on_stage(db_uri: str) -> None:
     assert "starting" in stages
 
 
+async def test_resume_threads_agent_name_to_classifying_start_host(db_uri: str) -> None:
+    """
+    A wake re-stamps the runner's classifier.
+
+    The resume rebuilds the runner from scratch under the same sandbox id, so a
+    classifier the first launch stamped is NOT carried over by the provider. If
+    the wake omits it, the woken runner comes back unclassified, the admission
+    policy that selects on the label stops matching, and the runner silently
+    loses the credential the label exists to attract.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = _ClassifyingFakeSandboxLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(
+        config=config, owner=_OWNER, host_store=host_store, agent_name="code-reviewer"
+    )
+    host_store.set_offline(first.host_id)
+
+    await resume_managed_host(first.host_id, host_store, config, agent_name="code-reviewer")
+
+    assert fake.resumed == ["sb-fake-1"]
+    assert fake.agent_names == ["code-reviewer", "code-reviewer"]
+
+
+async def test_resume_never_passes_agent_name_to_a_non_classifying_launcher(
+    db_uri: str,
+) -> None:
+    """
+    The wake gates on the capability, not on the value.
+
+    An exec-model launcher has no ``agent_name`` keyword, so a wake that reached
+    it with one would raise ``TypeError`` and 502. The wake succeeding proves the
+    keyword was omitted.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(first.host_id)
+
+    await resume_managed_host(first.host_id, host_store, config, agent_name="code-reviewer")
+
+    assert fake.resumed == ["sb-fake-1"]
+    assert host_store.get_host(first.host_id) is not None
+
+
+async def test_resume_without_a_classifier_leaves_the_woken_runner_unstamped(
+    db_uri: str,
+) -> None:
+    """No resolved name means the classifying launcher is told nothing to stamp."""
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = _ClassifyingFakeSandboxLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(first.host_id)
+
+    await resume_managed_host(first.host_id, host_store, config)
+
+    assert fake.agent_names == [None, None]
+
+
 async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> None:
     """A local missing-tunnel wake can bypass stale cross-replica DB freshness."""
     host_store = HostStore(db_uri)
@@ -3561,6 +3640,138 @@ async def test_run_managed_launch_omits_the_classifier_for_a_session_scoped_impo
     assert captured["agent_name"] is None
 
 
+async def test_kick_managed_wake_defers_the_classifier_to_the_wake_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The wake hands the agent store and the bound agent id to the wake task rather
+    than resolving the classifier itself, matching the relaunch path: the
+    claim-to-task region stays synchronous and only the winning caller pays for
+    the read.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(orchestration, "_run_managed_wake", _capture)
+
+    builtin = Agent(
+        id=builtin_agent_id("code-reviewer"),
+        created_at=now_epoch(),
+        name="code-reviewer",
+        bundle_location="bundle/loc",
+        session_id=None,
+    )
+
+    reads: list[str] = []
+
+    class _RecordingStore(_StubAgentStore):
+        def get(self, agent_id: str) -> Agent | None:
+            reads.append(agent_id)
+            return super().get(agent_id)
+
+    store = _RecordingStore({builtin.id: builtin})
+    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
+    before = set(orchestration._managed_launch_tasks)
+    orchestration._kick_managed_wake_impl(
+        session_id="conv_1",
+        conv=conv,
+        sandbox_config=SimpleNamespace(),
+        tracker=ManagedLaunchTracker(),
+        conversation_store=SimpleNamespace(),
+        host_store=SimpleNamespace(),
+        app_state=SimpleNamespace(agent_store=store),
+    )
+    scheduled = set(orchestration._managed_launch_tasks) - before
+    assert scheduled, "the claim was taken but no task was scheduled to settle it"
+    await asyncio.gather(*scheduled)
+    assert reads == [], "the kick must not read the agent store; the wake task does"
+    assert captured["agent_store"] is store
+    assert captured["agent_id"] == builtin.id
+
+
+async def test_run_managed_wake_re_stamps_the_woken_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The wake task resolves the bound agent through the built-in gate and forwards
+    the name into the resume, so the rebuilt runner carries its classifier again.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _resume(*args: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", _resume)
+
+    builtin = Agent(
+        id=builtin_agent_id("code-reviewer"),
+        created_at=now_epoch(),
+        name="code-reviewer",
+        bundle_location="bundle/loc",
+        session_id=None,
+    )
+    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
+    await orchestration._run_managed_wake(
+        session_id="conv_1",
+        conv=conv,
+        sandbox_config=SimpleNamespace(),
+        tracker=ManagedLaunchTracker(),
+        conversation_store=SimpleNamespace(get_conversation=lambda _sid: None),
+        host_store=SimpleNamespace(),
+        host_registry=None,
+        tunnel_registry=None,
+        agent_store=_StubAgentStore({builtin.id: builtin}),
+        agent_id=builtin.id,
+    )
+    assert captured["agent_name"] == "code-reviewer"
+
+
+async def test_run_managed_wake_omits_the_classifier_for_a_session_scoped_impostor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A session-scoped agent named after a built-in resolves to no classifier on
+    the wake path too, so a wake cannot be used to obtain a label the initial
+    launch would have refused.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _resume(*args: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", _resume)
+
+    impostor = Agent(
+        id="9f2c1b7e4a5d4c8fa1b2c3d4e5f60718",
+        created_at=now_epoch(),
+        name="code-reviewer",
+        bundle_location="bundle/loc",
+        session_id="conv_1",
+    )
+    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=impostor.id)
+    await orchestration._run_managed_wake(
+        session_id="conv_1",
+        conv=conv,
+        sandbox_config=SimpleNamespace(),
+        tracker=ManagedLaunchTracker(),
+        conversation_store=SimpleNamespace(get_conversation=lambda _sid: None),
+        host_store=SimpleNamespace(),
+        host_registry=None,
+        tunnel_registry=None,
+        agent_store=_StubAgentStore({impostor.id: impostor}),
+        agent_id=impostor.id,
+    )
+    assert captured["agent_name"] is None
+
+
 async def test_concurrent_relaunch_messages_kick_a_single_launch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3805,3 +4016,35 @@ def test_builtin_without_a_branch_is_unaffected_by_the_registry(
     assert cfg.default.managed_launch_supported is False
     with pytest.raises(HTTPException):
         cfg.default.launcher_factory()
+
+
+def test_agent_sandbox_reuses_the_kubernetes_config_block() -> None:
+    """
+    `provider: agent_sandbox` reads the same `sandbox.kubernetes` block as the
+    Job provider, so switching between them needs no other config change, and
+    builds the agent-sandbox launcher.
+    """
+    from omnigent.onboarding.sandboxes.agent_sandbox import AgentSandboxLauncher
+
+    cfg = parse_sandbox_config(
+        {
+            "provider": "agent_sandbox",
+            "server_url": "http://omnigent.omnigent.svc.cluster.local/",
+            "kubernetes": {
+                "namespace": "omnigent-sandboxes",
+                "secret_name": "omnigent-creds",
+                "in_cluster": True,
+            },
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    assert cfg.provider == "agent_sandbox"
+    assert cfg.managed_launch_supported is True
+    assert cfg.token_ttl_s == KUBERNETES_MANAGED_TOKEN_TTL_S
+    launcher = cfg.launcher_factory()
+    assert isinstance(launcher, AgentSandboxLauncher)
+    assert launcher.provider == "agent_sandbox"
+    # keep_alive is what the managed path needs from it, so it must not be the
+    # raising capability default it inherits two levels up.
+    assert type(launcher).keep_alive is not SandboxHostLauncher.keep_alive

@@ -4,7 +4,7 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -1440,6 +1440,55 @@ describe("Composer claude-native permission mode", () => {
     );
 
     expect(screen.getByTestId("composer-config-gear")).toBeInTheDocument();
+  });
+});
+
+describe("Composer codex-native approval mode", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    useChatStore.setState({ codexApprovalMode: "" });
+  });
+
+  it("shows the Approvals row with the current mode inside the gear modal", async () => {
+    useChatStore.setState({ conversationId: "conv_test", codexApprovalMode: "approve-for-me" });
+
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Approve for me");
+  });
+
+  it("follows a live store change while the modal is open and untouched", async () => {
+    // Repro: the mode changes externally (a TUI /permissions switch arrives as
+    // a session.codex_approval_mode SSE) while the gear modal is open. The open
+    // picker must update, not stay on the value it snapshotted on open.
+    useChatStore.setState({ conversationId: "conv_test", codexApprovalMode: "approve-for-me" });
+
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+    await screen.findByTestId("composer-config-modal");
+    expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Approve for me");
+
+    act(() => {
+      useChatStore.setState({ codexApprovalMode: "full-access" });
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Full Access"),
+    );
+  });
+
+  it("shows the placeholder until a mode is known", async () => {
+    // Label-only reader: an unset mode reads as the placeholder, never a guess.
+    useChatStore.setState({ conversationId: "conv_test", codexApprovalMode: "" });
+
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Set in Codex");
   });
 });
 

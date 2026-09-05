@@ -8,12 +8,16 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from omnigent.db.utils import builtin_agent_id
-from omnigent.errors import OmnigentError
-from omnigent.server.routes.imports import _stream_local_sessions_from_host
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.host_registry import HostRegistry
+from omnigent.server.routes.imports import _stream_local_sessions_from_host, create_imports_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.host_store import HostStore
 
 
 def _seed_claude_agent(db_uri: str) -> str:
@@ -504,3 +508,66 @@ async def test_local_import_stream_emits_ndjson_session_then_done(
     # Each streamed session was actually persisted.
     for e in session_events:
         assert conversation_store.get_conversation(e["session_id"]) is not None
+
+
+def _host_import_client(db_uri: str, host_registry: HostRegistry) -> httpx.AsyncClient:
+    """Mount only the imports router with host support wired, auth disabled.
+
+    The default ``client`` fixture builds the app with ``host_store=None``, so
+    ``/imports/local`` short-circuits before the host lookup. Here host_store is
+    real (holds the seeded row) and the registry is caller-supplied (empty = the
+    host's tunnel is not on this replica), which is what exercises the
+    wrong-replica-vs-offline classification.
+    """
+    app = FastAPI()
+    app.include_router(
+        create_imports_router(
+            SqlAlchemyConversationStore(db_uri),
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=host_registry,
+            host_store=HostStore(db_uri),
+        ),
+        prefix="/v1",
+    )
+
+    @app.exception_handler(OmnigentError)
+    async def _handle(_request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+async def test_import_local_live_host_off_replica_is_wrong_replica(db_uri: str) -> None:
+    """A live host absent from this replica is WRONG_REPLICA, not "not connected".
+
+    Regression: the route used to flatten every registry miss into a 409
+    CONFLICT, so a host live on another replica never got the 400 wrong_replica
+    signal the client re-addresses on — the import failed permanently.
+    """
+    host_id = "host_0123456789abcdef0123456789abcdef"
+    HostStore(db_uri).upsert_on_connect(host_id, "laptop", "alice@example.com")
+    async with _host_import_client(db_uri, HostRegistry()) as client:
+        res = await client.post(
+            "/v1/imports/local",
+            json={"host_id": host_id, "source": "all", "limit": 5},
+        )
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+
+
+async def test_import_local_offline_host_is_conflict(db_uri: str) -> None:
+    """A genuinely offline host stays a 409 CONFLICT (not re-addressable)."""
+    host_id = "host_fedcba9876543210fedcba9876543210"
+    store = HostStore(db_uri)
+    store.upsert_on_connect(host_id, "laptop", "alice@example.com")
+    store.set_offline(host_id)
+    async with _host_import_client(db_uri, HostRegistry()) as client:
+        res = await client.post(
+            "/v1/imports/local",
+            json={"host_id": host_id, "source": "all", "limit": 5},
+        )
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == ErrorCode.CONFLICT

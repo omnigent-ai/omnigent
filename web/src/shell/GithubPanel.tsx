@@ -42,7 +42,6 @@ import {
   type LucideIcon,
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
-  RefreshCwIcon,
   Rows2Icon,
   TerminalIcon,
 } from "lucide-react";
@@ -52,7 +51,6 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { useQueryClient } from "@tanstack/react-query";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
@@ -542,8 +540,9 @@ function SidebarNode({
 }
 
 export function GithubPanel({ conversationId }: { conversationId: string }) {
-  const queryClient = useQueryClient();
-  const info = useGithubInfo(conversationId);
+  // Poll for live CI status only while this panel is mounted (the status-line
+  // indicator keeps the non-polling default). Self-limits to unsettled checks.
+  const info = useGithubInfo(conversationId, { poll: true });
   // The tab is a pure PR view: the list + patch are the PR's, fetched only when
   // one exists. `baseRef` is kept for the on-demand expand-context loader
   // (git show <base>:<path>) and the "branch → base" label.
@@ -697,13 +696,6 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
     sectionEls.current.get(path)?.scrollIntoView({ block: "start" });
   }, []);
 
-  const refresh = () => {
-    void queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
-    void queryClient.invalidateQueries({ queryKey: ["github-changed-files", conversationId] });
-    void queryClient.invalidateQueries({ queryKey: ["github-pr-diff", conversationId] });
-    void queryClient.invalidateQueries({ queryKey: ["github-file-diff", conversationId] });
-  };
-
   // ── Whole-panel states (before the header + stacked diff) ───────────────
   // One central switch: every non-`ready` kind returns its own whole-panel
   // state, so the diff below renders only when there's an open PR.
@@ -799,28 +791,20 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   return (
     <TooltipProvider delayDuration={0}>
       <div className="flex h-full min-h-0 flex-col">
-        {/* Header: repo + PR metadata + Refresh. */}
+        {/* Header: repo + PR metadata. Refreshes on its own — via the
+            git-activity SSE signal and the panel's own CI poll — so there's no
+            manual Refresh control. */}
         <div className="shrink-0 border-b border-border p-2">
-          <div className="flex items-center justify-between gap-2">
-            <span className="min-w-0 truncate text-xs text-muted-foreground">
-              {data.repo?.name_with_owner ?? "GitHub"}
-              {data.branch && (
-                <>
-                  {" · "}
-                  <span className="font-mono">{data.branch}</span>
-                  {baseRef && <span className="text-muted-foreground"> → {baseRef}</span>}
-                </>
-              )}
-            </span>
-            <IconButton label="Refresh" onClick={refresh}>
-              <RefreshCwIcon
-                className={cn(
-                  "size-3.5",
-                  (info.isFetching || changes.isFetching || prDiff.isFetching) && "animate-spin",
-                )}
-              />
-            </IconButton>
-          </div>
+          <span className="block min-w-0 truncate text-xs text-muted-foreground">
+            {data.repo?.name_with_owner ?? "GitHub"}
+            {data.branch && (
+              <>
+                {" · "}
+                <span className="font-mono">{data.branch}</span>
+                {baseRef && <span className="text-muted-foreground"> → {baseRef}</span>}
+              </>
+            )}
+          </span>
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <a
               href={pr.url}

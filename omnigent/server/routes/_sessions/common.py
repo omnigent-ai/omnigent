@@ -199,6 +199,12 @@ _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY = "omnigent.codex_native.agent_role"
 _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
 
 
+# Current approval/sandbox mode of a live codex-native session. ``terminal_launch_args``
+# carries the persisted CLI form; this label is the read-back the web picker prefers,
+# mirroring ``_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY``.
+_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY = "omnigent.codex_native.approval_mode"
+
+
 _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE: str = "external_codex_collaboration_mode_change"
 
 
@@ -651,6 +657,21 @@ _pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = 
 _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 
 
+# Sessions whose in-flight turn's assistant output a PHASE_LLM_RESPONSE
+# policy denied, mapped to the deny reason. Set by the policy-evaluate
+# route when it returns the DENY (the harness only errors the turn AFTER
+# the denied text already streamed and filled the relay's persistence
+# buffer), consumed by the relay's terminal text flush so the buffered
+# text persists as the deny sentinel instead of the denied content.
+# A plain dict, NOT an evicting cache: this is an enforcement decision,
+# and a silent eviction would downgrade a DENY into normal persistence.
+# Leak-safety comes from lifetime, not bounding — writes are gated on an
+# active relay for the session (routes_hooks), and the entry is popped at
+# every consume point, on each new turn, and when the relay task ends
+# (the relay's done-callback), so an entry can never outlive its relay.
+_llm_response_denied_turns: dict[str, str] = {}
+
+
 _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
@@ -866,6 +887,7 @@ __all__ = [
     "_CLAUDE_NATIVE_UI_LABEL_VALUE",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_KEY",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE",
+    "_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY",
     "_CODEX_NATIVE_COLLABORATION_MODES",
     "_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY",
     "_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
@@ -981,6 +1003,7 @@ __all__ = [
     "_deferred_elicitation_clear_tasks",
     "_intentional_stop_sessions",
     "_interrupt_fenced_sessions",
+    "_llm_response_denied_turns",
     "_logger",
     "_managed_launch_tasks",
     "_model_options_cache",

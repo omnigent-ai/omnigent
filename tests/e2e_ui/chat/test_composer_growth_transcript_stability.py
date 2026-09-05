@@ -658,3 +658,85 @@ def test_composer_growth_reflows_transcript_without_covering_output(
     assert send_relocked_grown["distanceFromBottom"] <= 1, send_relocked_grown
     assert abs(send_relocked_grown["overlap"]) <= 1, send_relocked_grown
     expect(composer).to_be_focused()
+
+
+def test_composer_growth_keeps_bottom_locked_transcript_pinned_every_frame(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A bottom-locked transcript must pin in the same frame the composer grows.
+
+    The library's ``scrollToBottom`` defers through a ``requestAnimationFrame``
+    promise, so without a synchronous re-pin the frame after a viewport shrink
+    paints with the transcript shoved up by one line height (the "jumping text"
+    of the auto-grow bounce) and snaps back a frame later. Settlement-only
+    probes can't see that intermediate frame, so this test samples the
+    scroll container's distance-from-bottom on every animation frame while
+    three newlines grow the composer: no sampled frame may fall off the bottom.
+    """
+    base_url, session_id = seeded_session
+    for i in range(6):
+        seed_committed_turn(
+            session_id,
+            prompt=f"Question {i}?",
+            reply=f"Paragraph {i}. " + ("filler sentence for height. " * 12),
+            response_id=f"frame_pin_{i}",
+        )
+    page.goto(f"{base_url}/c/{session_id}")
+
+    expect(page.locator(_TEXT_SECTION)).to_have_count(6, timeout=30_000)
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.click()
+    baseline = _settled_geometry(page)
+    assert baseline["distanceFromBottom"] <= 1, baseline
+
+    # The page-load layout may still be settling through one last async pin
+    # (the library's `scrollToBottom` fires on mount). Wait until two
+    # consecutive rAF frames agree on distance ≤ 0 so we only sample growth
+    # frames, not the initial mount settle.
+    page.wait_for_timeout(200)
+    assert _settled_geometry(page)["distanceFromBottom"] <= 1
+
+    distances = page.evaluate(
+        """async () => {
+            const textarea = document.querySelector(
+                'textarea[aria-label="Message the agent"]'
+            );
+            const scroller = textarea.closest('form')
+                .parentElement.querySelector('[role="log"] > div');
+            const samples = [];
+            let sampling = true;
+            const sample = () => {
+                samples.push(
+                    scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
+                );
+                if (sampling) requestAnimationFrame(sample);
+            };
+            requestAnimationFrame(sample);
+            const setter = Object.getOwnPropertyDescriptor(
+                HTMLTextAreaElement.prototype, 'value'
+            ).set;
+            for (let i = 0; i < 3; i += 1) {
+                setter.call(textarea, textarea.value + '\\n');
+                textarea.dispatchEvent(new InputEvent('input', { bubbles: true }));
+                await new Promise((resolve) => setTimeout(resolve, 60));
+            }
+            sampling = false;
+            // One settle window, then a final reading after the last frame.
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            samples.push(
+                scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
+            );
+            return samples;
+        }"""
+    )
+    # Every observed frame stays pinned: the deferred library pin may park one
+    # pixel short of the maximum, but never a full wrapped line behind it.
+    assert max(distances, default=0) <= 1, distances
+
+    grown = _settled_geometry(page)
+    assert grown["composerHeight"] > baseline["composerHeight"], grown
+    assert grown["distanceFromBottom"] <= 1, grown
+    assert abs(grown["overlap"]) <= 1, grown
+    expect(composer).to_be_focused()

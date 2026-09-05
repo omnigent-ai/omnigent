@@ -147,9 +147,12 @@ def test_new_session_shows_first_prompt_optimistically(
 
     # Sanity: the real auto-send handoff ran (its POST was intercepted),
     # so a green run isn't a composer that silently never sent.
+    # Pump the driver with wait_for_timeout, not time.sleep: the sync API
+    # dispatches route handlers only inside Playwright calls, so a bare
+    # sleep loop never runs handle_events for a late-landing POST.
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline and _PROMPT not in event_texts:
-        time.sleep(0.05)
+        page.wait_for_timeout(50)
     assert _PROMPT in event_texts, (
         f"the initial prompt was never POSTed to the session's /events "
         f"(observed: {event_texts}) — the auto-send path did not run"

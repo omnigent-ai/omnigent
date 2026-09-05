@@ -21,7 +21,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
 
 /** True when `id` is the focused conversation and its agent loop is live. */
-function useSessionActive(conversationId: string | undefined): boolean {
+export function useSessionActive(conversationId: string | undefined): boolean {
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   if (!conversationId || conversationId !== focusedId) return false;
@@ -62,7 +62,7 @@ export function useWorkspaceServeable(conversationId: string | undefined): boole
  * invalidate refetches once so the panel reflects end-of-turn state without
  * the user having to reload the page.
  */
-function useTrailingInvalidate(
+export function useTrailingInvalidate(
   conversationId: string | undefined,
   sessionActive: boolean,
   queryKeyPrefix: string,

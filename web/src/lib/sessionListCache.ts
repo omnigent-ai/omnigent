@@ -59,6 +59,12 @@ export interface ConversationListFilters {
    * "all projects".
    */
   project?: string;
+  /**
+   * Ownership/archive scope for the sidebar tabs. ``"mine"`` holds only owned
+   * sessions; ``"shared"`` holds accessible-but-not-owned; ``"archived"`` holds
+   * only archived sessions. ``undefined`` is the default all-sessions list.
+   */
+  visibility?: "mine" | "shared" | "archived";
 }
 
 /**
@@ -125,34 +131,47 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
 /**
  * Decode the filter dimensions from a conversations query key.
  *
- * The base key is `["conversations", searchQuery, includeArchived]`. The
- * project-filtered variant appends a fourth element:
- * `["conversations", searchQuery, includeArchived, project]` (the Archived
- * settings picker is the only producer today). Both lengths are accepted so
- * the rename overlay and push-delta merge — which iterate *every* cached
- * `["conversations", ...]` query — never throw on the project variant. Query
- * membership decisions depend on these dimensions, so malformed keys fail
- * loudly instead of being guessed.
+ * The base key is `["conversations", searchQuery, includeArchived]`. Variants:
+ * - 4 elements: `[..., project]` — the Archived settings picker's project filter.
+ * - 5 elements: `[..., project|null, visibility]` — the sidebar's mine/shared
+ *   tab-scoped query (project is `null` here since it's always unset for those
+ *   tabs). All lengths are accepted so the rename overlay and push-delta merge
+ *   — which iterate *every* cached `["conversations", ...]` query — never throw
+ *   on unknown variants. Query membership decisions depend on these dimensions,
+ *   so malformed keys fail loudly instead of being guessed.
  *
  * @param key - TanStack Query key for a conversations query.
  * @returns Parsed list filters.
  * @throws Error if the key is not a conversations list key.
  */
 export function filtersFromConversationQueryKey(key: readonly unknown[]): ConversationListFilters {
-  if ((key.length !== 3 && key.length !== 4) || key[0] !== "conversations") {
+  if (key.length < 3 || key.length > 5 || key[0] !== "conversations") {
     throw new Error("Invalid conversations query key");
   }
   const [, searchQuery, includeArchived, project] = key;
   if (typeof searchQuery !== "string" || typeof includeArchived !== "boolean") {
     throw new Error("Invalid conversations query key");
   }
-  if (project !== undefined && typeof project !== "string") {
+  // project is undefined (3-element), a string (4-element project-scoped), or
+  // null (5-element visibility-scoped where project is always unset).
+  if (project !== undefined && project !== null && typeof project !== "string") {
+    throw new Error("Invalid conversations query key");
+  }
+  const visibility = key[4];
+  if (
+    visibility !== undefined &&
+    visibility !== "mine" &&
+    visibility !== "shared" &&
+    visibility !== "archived"
+  ) {
     throw new Error("Invalid conversations query key");
   }
   return {
     searchQuery,
     includeArchived,
-    project,
+    // Treat null (visibility-scoped key) the same as undefined (no project filter).
+    project: project ?? undefined,
+    visibility: visibility as ConversationListFilters["visibility"],
   };
 }
 
@@ -173,6 +192,17 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
  * @returns `true` when the row should be removed immediately.
  */
 function violatesKnownMembership(conv: Conversation, filters: ConversationListFilters): boolean {
+  // Visibility-scoped caches have strict membership rules beyond archive/project:
+  if (filters.visibility === "archived") {
+    // The archived cache holds only archived rows. A non-archived row (or one
+    // that just got un-archived) does not belong; evict it so the overlay paths
+    // don't leave stale active sessions in this cache.
+    return conv.archived !== true;
+  }
+  if (filters.visibility === "mine" || filters.visibility === "shared") {
+    // Mine/shared caches hold only active (non-archived) sessions. Evict if archived.
+    if (conv.archived === true) return true;
+  }
   if (!filters.includeArchived && conv.archived === true) return true;
   if (filters.project && conv.labels?.[PROJECT_LABEL_KEY] !== filters.project) return true;
   return false;
@@ -296,8 +326,11 @@ export function insertNewRowsIntoPages(
   candidates: Map<string, SessionListWireItem>,
   filters: ConversationListFilters,
   skip?: (id: string) => boolean,
+  viewerId?: string | null,
 ): { data: ConversationsInfiniteData | undefined; inserted: Conversation[] } {
+  // Archived caches hold only archived rows; new sessions are never archived.
   if (!data || candidates.size === 0 || filters.searchQuery) return { data, inserted: [] };
+  if (filters.visibility === "archived") return { data, inserted: [] };
   const present = new Set<string>();
   for (const page of data.pages) for (const c of page.data) present.add(c.id);
   const rows: Conversation[] = [];
@@ -314,6 +347,12 @@ export function insertNewRowsIntoPages(
       id,
     };
     if (conv.parent_session_id != null || violatesKnownMembership(conv, filters)) continue;
+    // Ownership-aware insertion for scoped caches. `conv.owner` is null/absent
+    // when the row is owned by the viewer (single-user / legacy shape) or
+    // explicitly set to another user's id when the session was shared.
+    const ownedByViewer = conv.owner == null || conv.owner === viewerId;
+    if (filters.visibility === "mine" && !ownedByViewer) continue;
+    if (filters.visibility === "shared" && ownedByViewer) continue;
     rows.push(conv);
   }
   if (rows.length === 0) return { data, inserted: [] };
