@@ -55,11 +55,13 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.e2e.helpers import live_server_client
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# CI shells can carry an egress proxy in the environment; every HTTP call in
-# this test targets 127.0.0.1, so bypass proxy autodetection entirely.
-_http = httpx.Client(trust_env=False)
+# Proxy-blind, keep-alive reuse disabled: a pooled client must not reuse a
+# connection the spawned server idle-closed (see live_server_client).
+_http = live_server_client()
 
 # The runner imports ``omnigent_client`` / ``omnigent_ui_sdk``; in a worktree
 # they resolve from sdks/, in an installed venv from site-packages.

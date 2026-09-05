@@ -58,6 +58,7 @@ from tests.e2e.conftest import (
     register_inline_agent,
     reset_mock_llm,
 )
+from tests.e2e.helpers import live_server_client
 
 # The auto-wake notice is the ONLY place this substring is emitted
 # (``_format_subagent_wake_notice``); the sys_read_inbox drain message does
@@ -134,7 +135,7 @@ class _WakeLossStack:
         self._server_log_handle = None
         self._runner_proc: subprocess.Popen[bytes] | None = None
         self._runner_log_handle = None
-        self.client = httpx.Client(base_url=self.base_url, timeout=30.0, trust_env=False)
+        self.client = live_server_client(base_url=self.base_url, timeout=30.0)
 
     def _server_env(self) -> dict[str, str]:
         env = {

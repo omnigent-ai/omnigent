@@ -45,6 +45,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.e2e.helpers import live_server_client
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Polly's codex sub-agent shape (examples/polly/agents/codex/config.yaml),
@@ -88,9 +90,10 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-# Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars
-# that must not intercept loopback requests to the spawned server.
-_client = httpx.Client(trust_env=False)
+# Proxy-blind, keep-alive reuse disabled (see live_server_client): CI egress
+# proxies must not intercept loopback, and a pooled client must not reuse a
+# connection the spawned server idle-closed.
+_client = live_server_client()
 
 # Shared fixtures/helpers (e.g. the conftest session factory) use ambient
 # ``httpx`` calls that DO trust env, so also exclude loopback from any forced

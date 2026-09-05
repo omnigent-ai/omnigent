@@ -49,6 +49,7 @@ import yaml
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests._helpers.compat import apply_runner_env, apply_server_env
 from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
+from tests.e2e.helpers import live_server_client
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -118,9 +119,8 @@ def _merged_no_proxy(env: dict[str, str]) -> str:
     return ",".join(parts)
 
 
-# Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars
-# that must not intercept loopback requests to the spawned server.
-_client = httpx.Client(trust_env=False, timeout=30.0)
+# Proxy-blind, keep-alive reuse disabled (see live_server_client).
+_client = live_server_client(timeout=30.0)
 
 
 @pytest.fixture

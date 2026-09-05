@@ -61,6 +61,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.e2e.helpers import live_server_client
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _CODEX_BYPASS_FLAG = "--dangerously-bypass-approvals-and-sandbox"
@@ -116,9 +118,8 @@ llm:
 
 _HEALTH_TIMEOUT_S = 90.0
 
-# Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars
-# that must not intercept loopback requests to the spawned server.
-_client = httpx.Client(trust_env=False, timeout=30.0)
+# Proxy-blind, keep-alive reuse disabled (see live_server_client).
+_client = live_server_client(timeout=30.0)
 
 
 def _free_port() -> int:

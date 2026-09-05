@@ -20,6 +20,8 @@ import configparser
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 # Polling cadence for server-health and response-poll loops. 0.1s
 # was empirically the sweet spot — tighter feedback than the prior
 # 0.5s without measurable CPU cost on the e2e harness.
@@ -50,6 +52,31 @@ def lookup_databricks_host(profile: str) -> str | None:
         cfg.read(_DATABRICKSCFG_PATH)
     host = cfg[profile].get("host") if profile in cfg else None
     return host.rstrip("/") if host else None
+
+
+def live_server_client(**kwargs: Any) -> httpx.Client:
+    """Build an ``httpx.Client`` for driving a spawned e2e server.
+
+    Keep-alive reuse is disabled (``max_keepalive_connections=0``): the
+    spawned uvicorn server closes idle connections after its 5 s default
+    keep-alive window, and on a CPU-starved parallel run a pooled client
+    can reuse a connection in the exact window the server closes it --
+    the request then dies with an unretried
+    ``httpx.ReadError: [Errno 104] Connection reset by peer``. Opening a
+    fresh connection per request costs microseconds on loopback and
+    removes that race entirely.
+
+    ``trust_env`` defaults to ``False`` so loopback traffic never routes
+    through a CI egress proxy.
+
+    :param kwargs: Passed through to ``httpx.Client`` (``base_url``,
+        ``timeout``, ``headers``, ...). ``trust_env`` / ``limits`` may be
+        overridden explicitly when a test needs different behavior.
+    :returns: A client that stays safe across long idle gaps.
+    """
+    kwargs.setdefault("trust_env", False)
+    kwargs.setdefault("limits", httpx.Limits(max_keepalive_connections=0))
+    return httpx.Client(**kwargs)
 
 
 def get_output_items(

@@ -25,6 +25,7 @@ from typing import Any
 import httpx
 import pytest
 
+from tests.e2e.helpers import live_server_client
 from tests.e2e.omnigent._snapshot import compare_snapshot
 
 _YAML_RELPATH = ("tests", "resources", "examples", "hello_world.yaml")
@@ -115,7 +116,7 @@ def _find_free_port() -> int:
 
 def _gather_omnigent_observations(port: int) -> dict[str, Any]:
     """Capture structural observations proving the server is omnigent."""
-    with httpx.Client(
+    with live_server_client(
         base_url=f"http://127.0.0.1:{port}",
         timeout=_HTTP_TIMEOUT,
     ) as client:

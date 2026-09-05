@@ -36,6 +36,8 @@ from typing import Any
 import httpx
 import pytest
 
+from tests.e2e.helpers import live_server_client
+
 pytestmark = pytest.mark.skipif(
     os.name != "posix", reason="boots POSIX server/host daemons with fake CLIs"
 )
@@ -176,7 +178,7 @@ class _CatalogRig:
         self.host_id = ""
         self._server: subprocess.Popen[bytes] | None = None
         self._host: subprocess.Popen[bytes] | None = None
-        self._client = httpx.Client(trust_env=False, timeout=10.0)
+        self._client = live_server_client(timeout=10.0)
 
     def _env(self) -> dict[str, str]:
         env = {
