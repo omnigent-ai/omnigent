@@ -3391,14 +3391,10 @@ def test_inject_user_message_pastes_content_then_submits(
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message(bridge_dir, content=content)
 
-    # C-a, C-k (clear), load-buffer, paste-buffer, Enter — fewer than 5
-    # means a delivery step was dropped.
-    assert len(captured) == 5, (
-        f"Expected 5 tmux calls (C-a, C-k, load-buffer, paste-buffer, Enter), got {len(captured)}."
+    assert len(captured) == 3, (
+        f"Expected 3 tmux calls (load-buffer, paste-buffer, Enter), got {len(captured)}."
     )
-    clear_home, clear_kill, load, paste, submit = captured
-    assert clear_home[-1] == "C-a"
-    assert clear_kill[-1] == "C-k"
+    load, paste, submit = captured
     # The buffer file carried the normalized content + trailing CR. A
     # missing trailing CR is the trailing-CR regression; a newline that stayed
     # \n (not CR) is the anthropics/claude-code#52126 multi-line collapse.
@@ -3629,19 +3625,13 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message(bridge_dir, content="hello")
 
-    # Gate polled until the third capture (prompt present), then the
-    # five delivery calls (C-a, C-k, load-buffer, paste-buffer, Enter)
-    # fired.
     assert capture_calls["n"] >= 3, (
         f"Expected >=3 capture-pane polls before the prompt rendered, got {capture_calls['n']}."
     )
-    assert len(send_keys) == 5, (
-        f"Expected 5 tmux calls (C-a, C-k, load-buffer, paste-buffer, Enter), "
-        f"got {len(send_keys)}."
+    assert len(send_keys) == 3, (
+        f"Expected 3 tmux calls (load-buffer, paste-buffer, Enter), got {len(send_keys)}."
     )
-    clear_home, clear_kill, load, paste, submit = send_keys
-    assert clear_home[-1] == "C-a"
-    assert clear_kill[-1] == "C-k"
+    load, paste, submit = send_keys
     # The paste fires after the gate via the buffer path. The exact
     # payload/flag assertions live in the dedicated paste test; here the
     # gate ordering is the claim.
@@ -7025,39 +7015,70 @@ def test_multiline_diagram_draft_keeps_composer_ready(
 
 @pytest.mark.parametrize("labelled", [False, True])
 @pytest.mark.parametrize("draft_line", ["  │   │", "  ─── note ─"])
+@pytest.mark.parametrize("cursor_at_end", [False, True])
+@pytest.mark.parametrize("repeat_lines", [1, 40])
 def test_inject_user_message_replaces_multiline_diagram_draft(
     labelled: bool,
     draft_line: str,
+    cursor_at_end: bool,
+    repeat_lines: int,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An existing diagram draft is cleared and replaced without an Escape."""
     rule = "─" * 40
     opening = f"{rule} my session ─" if labelled else rule
-    tui = {"pane": f"{opening}\n❯ explain this diagram\n{draft_line}\n  end\n{rule}"}
+    draft = "\n".join(["explain this diagram", *([draft_line.strip()] * repeat_lines), "end"])
+    cursor = len(draft) if cursor_at_end else len("explain this diagram\n") + 2
+    payload = ""
+    submitted: list[str] = []
     commands: list[list[str]] = []
     bridge_dir = _picker_bridge_dir(tmp_path)
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
 
     def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal draft, cursor, payload
         if "capture-pane" in command:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+            rendered = draft.replace("\n", "\n  ")
+            pane = f"{opening}\n❯ {rendered}\n{rule}"
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
         commands.append(command)
-        if command[-1] == "C-k":
-            tui["pane"] = _composer_pane()
+        if "load-buffer" in command:
+            payload = Path(command[-1]).read_bytes().decode().replace("\r", "\n")
         elif "paste-buffer" in command:
-            tui["pane"] = _composer_pane("new message")
-        elif command[-1] == "Enter":
-            tui["pane"] = _composer_pane()
+            draft = draft[:cursor] + payload + draft[cursor:]
+            cursor += len(payload)
+        elif "send-keys" in command:
+            for key in command[command.index("-t") + 2 :]:
+                if key == "C-a":
+                    cursor = draft.rfind("\n", 0, cursor) + 1
+                elif key == "C-k":
+                    end = draft.find("\n", cursor)
+                    if end < 0:
+                        end = len(draft)
+                    elif end == cursor:
+                        end += 1
+                    draft = draft[:cursor] + draft[end:]
+                elif key == "C-u":
+                    start = draft.rfind("\n", 0, cursor) + 1
+                    if start == cursor:
+                        start = max(0, cursor - 1)
+                    draft = draft[:start] + draft[cursor:]
+                    cursor = start
+                elif key == "Enter":
+                    submitted.append(draft)
+                    draft = ""
+                    cursor = 0
+                else:
+                    pytest.fail(f"Unexpected delivery key: {key}")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     inject_user_message(bridge_dir, content="new message", timeout_s=1)
 
-    keys = [command[-1] for command in commands if "send-keys" in command]
-    assert keys == ["C-a", "C-k", "Enter"]
+    assert submitted == ["new message\n"]
     assert sum("paste-buffer" in command for command in commands) == 1
-    assert tui["pane"] == _composer_pane()
+    assert draft == ""
 
 
 def test_labelled_scrollback_composer_does_not_hide_overlay() -> None:
@@ -7076,6 +7097,43 @@ def test_labelled_scrollback_composer_does_not_hide_overlay() -> None:
     )
     assert _claude_prompt_rendered(pane) is False
     assert _occupying_surface(pane) == "an overlay"
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_composer_pane(), True),
+        (_composer_pane("\n  continuation"), False),
+        (_composer_pane("\n  ─────\n  continuation"), False),
+        (_composer_pane("[Pasted text #1 +20 lines]"), False),
+        ("──────────\n❯", False),
+    ],
+)
+def test_clear_input_requires_a_visibly_empty_frame(pane: str, expected: bool) -> None:
+    """An empty first row does not prove a multiline or clipped draft empty."""
+    assert claude_native_bridge._claude_input_empty(pane) is expected
+
+
+def test_inject_user_message_never_pastes_when_clear_cannot_be_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unresponsive editing must fail before any paste or submission."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_composer_pane("stuck draft")])
+    with pytest.raises(RuntimeError, match="Could not clear"):
+        inject_user_message(bridge_dir, content="new message")
+    assert sends
+    assert all(command[:3] == ["send-keys", "-t", "claude:0.0"] for command in sends)
+    assert all(set(command[3:]) <= {"C-u", "C-k"} for command in sends)
+
+
+def test_clear_input_waits_through_unavailable_composer_without_typing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A torn capture or changed mode must not receive editing keys."""
+    sends = _fake_tmux(monkeypatch, ["", _SHELL_MODE_PANE, _composer_pane()])
+    claude_native_bridge._clear_claude_input("unused", "claude:0.0")
+    assert sends == []
 
 
 def _write_deltas_lines(bridge_dir: Path, lines: list[str]) -> None:
@@ -8608,8 +8666,8 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
 
     tails = [cmd[-1] for cmd in captured]
     # Escape (dismiss the surface) must precede every delivery keystroke.
-    assert tails[:3] == ["Escape", "C-a", "C-k"], (
-        f"Expected the occupying surface to be Escaped before the clear; got {tails}."
+    assert tails[0] == "Escape", (
+        f"Expected the occupying surface to be Escaped before the paste; got {tails}."
     )
     assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
     assert tails[-1] == "Enter"

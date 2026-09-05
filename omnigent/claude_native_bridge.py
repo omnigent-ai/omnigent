@@ -167,6 +167,8 @@ _MIN_TITLED_RULE_RUN = 3
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
+_CLEAR_INPUT_TIMEOUT_S = 5.0
+_CLEAR_INPUT_KEYS = ("C-u",) * 8 + ("C-k",) * 8
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
@@ -3196,15 +3198,7 @@ def inject_user_message(
         info["tmux_target"],
         timeout_s=timeout_s,
     )
-    # Clear any leftover text in Claude's input field before typing.
-    # After Escape-cancel, Claude Code re-populates the prompt area
-    # with the previous input for re-editing. Without this clear,
-    # the new message appends to the stale buffer (e.g.
-    # "old promptnew prompt" with no separator).
-    # Ctrl-A (Home) + Ctrl-K (kill-to-end) is the safest pair —
-    # Ctrl-U only clears backwards from cursor.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-a")
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-k")
+    _clear_claude_input(info["socket_path"], info["tmux_target"])
     # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
     # Claude Code TUI treats them as user text instead of invoking a state
     # that Omnigent cannot drive. Allowed commands (``/clear``,
@@ -4270,6 +4264,47 @@ def _format_terminal_failure_tail(pane: str) -> str:
     if len(tail) > _TERMINAL_FAILURE_TAIL_CHARS:
         tail = "…" + tail[-_TERMINAL_FAILURE_TAIL_CHARS:]
     return f" Last terminal output:\n{tail}"
+
+
+def _claude_input_empty(pane: str) -> bool:
+    """Require a blank composer row immediately followed by its closing rule."""
+    row = _composer_row(pane)
+    if row is None or row.strip() != _CLAUDE_PROMPT_GLYPH:
+        return False
+    lines = [line for line in pane.splitlines() if line.strip()]
+    row_index = max(index for index, line in enumerate(lines) if line == row)
+    if row_index + 1 >= len(lines):
+        return False
+    closing = lines[row_index + 1]
+    return _is_box_rule(closing) and len(closing) - len(closing.lstrip()) == len(row) - len(
+        row.lstrip()
+    )
+
+
+def _clear_claude_input(socket_path: str, tmux_target: str) -> None:
+    """Clear and verify the entire draft without interrupting a running turn.
+
+    Ctrl-A/Ctrl-K clears only the current logical line. Repeated Ctrl-U
+    and Ctrl-K also remove preceding and following lines from any cursor
+    position. Never paste until the closing frame proves the draft empty.
+
+    :raises RuntimeError: If the composer cannot be verified empty in time.
+    """
+    deadline = time.monotonic() + _CLEAR_INPUT_TIMEOUT_S
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        ready = _claude_prompt_rendered(pane)
+        if ready and _claude_input_empty(pane):
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Could not clear Claude Code's existing input draft. "
+                "The new message was not pasted or submitted."
+                + _format_terminal_failure_tail(pane)
+            )
+        if ready:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, *_CLEAR_INPUT_KEYS)
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
 def _wait_for_claude_prompt_ready(
