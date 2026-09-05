@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
@@ -8,19 +8,25 @@ export function browserViewId(conversationId: string, tabId: string | null): str
     : `browser-tab:${encodeURIComponent(conversationId)}:${tabId}`;
 }
 
+interface BrowserTabsState {
+  tabs: string[];
+  selected: string | null;
+}
+
+function readBrowserTabsState(conversationId: string): BrowserTabsState {
+  const saved = readSessionWorkspaceState(conversationId);
+  const tabs = saved.openBrowsers ?? [];
+  return {
+    tabs,
+    selected: tabs.includes(saved.selectedBrowserId ?? "") ? saved.selectedBrowserId! : null,
+  };
+}
+
 export function useBrowserTabs(conversationId: string) {
-  const [state, setState] = useState(() => {
-    const saved = readSessionWorkspaceState(conversationId);
-    const tabs = saved.openBrowsers ?? [];
-    return {
-      tabs,
-      selected: tabs.includes(saved.selectedBrowserId ?? "") ? saved.selectedBrowserId! : null,
-    };
-  });
-  const stateRef = useRef(state);
+  const [state, setState] = useState(() => readBrowserTabsState(conversationId));
   const update = useCallback(
-    (next: typeof state) => {
-      stateRef.current = next;
+    (mutate: (current: BrowserTabsState) => BrowserTabsState) => {
+      const next = mutate(readBrowserTabsState(conversationId));
       writeSessionWorkspaceState(conversationId, {
         openBrowsers: next.tabs,
         selectedBrowserId: next.selected,
@@ -31,14 +37,14 @@ export function useBrowserTabs(conversationId: string) {
   );
 
   const select = (selected: string | null) => {
-    update({ ...stateRef.current, selected });
+    update((current) => ({ ...current, selected }));
   };
 
   useEffect(
     () =>
       onBrowserActionRequest((event, sourceConversationId) => {
         if (sourceConversationId === conversationId && event.action === "navigate") {
-          update({ ...stateRef.current, selected: null });
+          update((current) => ({ ...current, selected: null }));
         }
       }),
     [conversationId, update],
@@ -46,11 +52,10 @@ export function useBrowserTabs(conversationId: string) {
 
   const add = () => {
     const selected = crypto.randomUUID();
-    const tabs = [...stateRef.current.tabs, selected];
-    update({ tabs, selected });
+    update((current) => ({ tabs: [...current.tabs, selected], selected }));
   };
 
-  const close = async (tabId: string) => {
+  const close = async (tabId: string): Promise<boolean> => {
     const desktop = (
       window as unknown as {
         omnigentDesktop?: {
@@ -61,14 +66,16 @@ export function useBrowserTabs(conversationId: string) {
     const result = await desktop
       ?.browserClose?.(browserViewId(conversationId, tabId))
       .catch(() => ({ ok: false }));
-    if (result && !result.ok) return;
-    const previous = stateRef.current;
-    const tabs = previous.tabs.filter((id) => id !== tabId);
-    const selected =
-      previous.selected === tabId
-        ? (tabs[Math.max(0, previous.tabs.indexOf(tabId) - 1)] ?? null)
-        : previous.selected;
-    update({ tabs, selected });
+    if (result && !result.ok) return false;
+    update((previous) => {
+      const index = previous.tabs.indexOf(tabId);
+      if (index === -1) return previous;
+      const tabs = previous.tabs.filter((id) => id !== tabId);
+      const selected =
+        previous.selected === tabId ? (tabs[Math.max(0, index - 1)] ?? null) : previous.selected;
+      return { tabs, selected };
+    });
+    return true;
   };
 
   return { ...state, add, close, select, viewId: browserViewId(conversationId, state.selected) };

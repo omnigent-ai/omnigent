@@ -96,6 +96,7 @@ describe("BrowserPane cold-start (no view yet)", () => {
     fireEvent.change(address, { target: { value: "example.com" } });
     fireEvent.keyDown(address, { key: "Enter" });
     expect(await screen.findByRole("alert")).toHaveTextContent("browser view cap reached");
+    expect(address).toHaveValue("example.com");
   });
 
   it("renders the URL bar in the empty state so the first page is reachable", async () => {
@@ -172,7 +173,7 @@ describe("BrowserPane design-mode toggle", () => {
     expect(screen.getByRole("button", { name: /enter design mode/i })).toBeDisabled();
   });
 
-  it("calls enable then disable IPC as it toggles, once a view is active", async () => {
+  it("calls enable then disable IPC as it toggles, and disables on unmount", async () => {
     let fireCreated: ((p: { conversationId: string }) => void) | undefined;
     const bridge = installBridge({
       onBrowserViewCreated: vi.fn((cb: (p: { conversationId: string }) => void) => {
@@ -181,7 +182,7 @@ describe("BrowserPane design-mode toggle", () => {
       }),
     });
 
-    render(<BrowserPane conversationId="conv_dm3" />);
+    const { unmount } = render(<BrowserPane conversationId="conv_dm3" />);
     await screen.findByRole("textbox", { name: /address bar/i });
 
     // Activate a view so the toggle is enabled.
@@ -207,6 +208,12 @@ describe("BrowserPane design-mode toggle", () => {
       "aria-pressed",
       "false",
     );
+    screen.getByRole("button", { name: /enter design mode/i }).click();
+    await waitFor(() => {
+      expect(bridge.browserEnableDesignMode).toHaveBeenCalledTimes(2);
+    });
+    unmount();
+    expect(bridge.browserDisableDesignMode).toHaveBeenCalledTimes(2);
   });
 });
 

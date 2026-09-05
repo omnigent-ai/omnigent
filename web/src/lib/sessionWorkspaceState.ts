@@ -150,6 +150,11 @@ export function writeSessionWorkspaceState(
   if (next.openTerminals && next.openTerminals.length > MAX_OPEN_FILES) {
     next.openTerminals = next.openTerminals.slice(-MAX_OPEN_FILES);
   }
+  // Same bound for browser tabs. Native view creation enforces its own lower
+  // runtime cap; this keeps the persisted rail from growing without bound.
+  if (next.openBrowsers && next.openBrowsers.length > MAX_OPEN_FILES) {
+    next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_FILES);
+  }
   // Drop any existing entry and re-append so the most-recently-touched session
   // moves to the end; pruning then evicts from the front (oldest-touched).
   if (existingIdx >= 0) store.splice(existingIdx, 1);

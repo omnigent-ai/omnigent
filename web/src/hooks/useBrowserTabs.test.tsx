@@ -31,6 +31,42 @@ describe("browser soft tabs", () => {
     expect(readSessionWorkspaceState("session-a").openBrowsers).toEqual([]);
   });
 
+  it("does not clobber a tab added after remount while a close resolves", async () => {
+    let finishClose!: (value: { ok: boolean }) => void;
+    const browserClose = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finishClose = resolve;
+        }),
+    );
+    Object.assign(window, { omnigentDesktop: { browserClose } });
+
+    const first = renderHook(() => useBrowserTabs("session-a"));
+    act(() => first.result.current.add());
+    const firstId = first.result.current.selected!;
+    act(() => first.result.current.add());
+    const secondId = first.result.current.selected!;
+    const pendingClose = first.result.current.close(firstId);
+    first.unmount();
+
+    const second = renderHook(() => useBrowserTabs("session-a"));
+    act(() => second.result.current.add());
+    const thirdId = second.result.current.selected!;
+
+    await act(async () => {
+      finishClose({ ok: true });
+      await pendingClose;
+    });
+    second.unmount();
+    const reopened = renderHook(() => useBrowserTabs("session-a"));
+    expect(reopened.result.current.tabs).toEqual([secondId, thirdId]);
+    expect(reopened.result.current.selected).toBe(thirdId);
+    expect(readSessionWorkspaceState("session-a")).toEqual({
+      openBrowsers: [secondId, thirdId],
+      selectedBrowserId: thirdId,
+    });
+  });
+
   it("creates independent views and restores the selection on remount", () => {
     const first = renderHook(() => useBrowserTabs("session-a"));
     expect(first.result.current.viewId).toBe("session-a");
@@ -76,7 +112,11 @@ describe("browser soft tabs", () => {
     await act(() => result.current.close(firstId));
     expect(result.current.selected).toBe(secondId);
     browserClose.mockRejectedValueOnce(new Error("disconnected"));
-    await act(() => result.current.close(secondId));
+    let closed = true;
+    await act(async () => {
+      closed = await result.current.close(secondId);
+    });
+    expect(closed).toBe(false);
     expect(result.current.tabs).toEqual([secondId]);
   });
 

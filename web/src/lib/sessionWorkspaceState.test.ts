@@ -75,6 +75,14 @@ describe("sessionWorkspaceState", () => {
     expect(stored).toEqual(Array.from({ length: 20 }, (_, i) => `terminal:t${i + 5}`));
   });
 
+  it("caps the persisted browser tabs at 20, keeping the most recent", () => {
+    const browsers = Array.from({ length: 25 }, (_, i) => `browser:b${i}`);
+    writeSessionWorkspaceState("conv_browsers", { openBrowsers: browsers });
+
+    const stored = readSessionWorkspaceState("conv_browsers").openBrowsers;
+    expect(stored).toEqual(Array.from({ length: 20 }, (_, i) => `browser:b${i + 5}`));
+  });
+
   it("prunes the least-recently-touched session past the cap (numeric ids)", () => {
     // Seed exactly MAX_SESSIONS sessions with purely numeric ids ("1".."100").
     // Numeric-string keys are the case a plain object store gets wrong: V8

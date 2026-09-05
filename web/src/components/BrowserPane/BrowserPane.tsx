@@ -207,12 +207,12 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
     const raw = currentUrl.trim();
     if (!raw) return;
     const navUrl = normalizeTypedUrl(raw);
-    setCurrentUrl(navUrl);
     setNavigationError(null);
     void bridge
       .browserOpenOrNavigate(conversationId, navUrl, undefined, { force: true })
       .then((result) => {
-        if (!result.ok) setNavigationError(result.error ?? "Unable to open this page.");
+        if (result.ok) setCurrentUrl(navUrl);
+        else setNavigationError(result.error ?? "Unable to open this page.");
       })
       .catch(() => setNavigationError("Unable to open this page."));
   }, [conversationId, currentUrl]);
@@ -323,6 +323,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
     return () => {
       cancelled = true;
       lastBoundsRef.current = null;
+      if (designMode) void getBridge()?.browserDisableDesignMode?.(conversationId);
       // Detach whatever is currently active (this pane owned it). The view
       // survives in the registry; only an explicit close destroys it.
       try {
@@ -331,7 +332,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
         /* swallow — window may be tearing down */
       }
     };
-  }, [conversationId, browserSupported, viewActive, syncBounds]);
+  }, [conversationId, browserSupported, designMode, viewActive, syncBounds]);
 
   // Reconcile bounds every frame while shown (cheap: same-rect setBounds is a
   // no-op + we dedupe via lastBoundsRef). Catches position-only shifts that

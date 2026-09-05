@@ -817,10 +817,12 @@ export function AppShell() {
   useEffect(() => {
     if (!supportsBrowser()) return;
     return onBrowserActionRequest((evt, sourceConversationId) => {
-      if (evt.action !== "navigate" || sourceConversationId !== conversationId) return;
-      if (conversationId) writeSessionWorkspaceState(conversationId, { selectedBrowserId: null });
-      setRightRailTab("browser");
-      setRightPanelOpen(true);
+      if (evt.action !== "navigate" || !sourceConversationId) return;
+      writeSessionWorkspaceState(sourceConversationId, { selectedBrowserId: null });
+      if (sourceConversationId === conversationId) {
+        setRightRailTab("browser");
+        setRightPanelOpen(true);
+      }
     });
   }, [conversationId]);
 

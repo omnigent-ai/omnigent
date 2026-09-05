@@ -11,6 +11,7 @@ import {
   TerminalIcon,
   XIcon,
 } from "lucide-react";
+import { toast } from "sonner";
 import {
   type CSSProperties,
   type ReactElement,
@@ -711,6 +712,10 @@ function WorkspacePanelImpl({
   onShellCreateFailed,
 }: WorkspacePanelProps) {
   const browsers = useBrowserTabs(conversationId);
+  const closeBrowserTab = async (tabId: string) => {
+    const closed = await browsers.close(tabId);
+    if (!closed) toast.error("Couldn't close browser tab. Try again.");
+  };
   const activeBrowserRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     activeBrowserRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -947,7 +952,7 @@ function WorkspacePanelImpl({
                       onAuxClick={(event) => {
                         if (event.button === 1) {
                           event.preventDefault();
-                          void browsers.close(tabId);
+                          void closeBrowserTab(tabId);
                         }
                       }}
                       onClick={() => {
@@ -962,7 +967,7 @@ function WorkspacePanelImpl({
                       type="button"
                       aria-label={`Close Browser ${index + 1}`}
                       className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                      onClick={() => void browsers.close(tabId)}
+                      onClick={() => void closeBrowserTab(tabId)}
                     >
                       <XIcon className="size-3" />
                     </button>
