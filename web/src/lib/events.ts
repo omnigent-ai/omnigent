@@ -724,6 +724,31 @@ export interface SessionInputConsumedEvent {
 }
 
 /**
+ * `session.input.delivered` — a persisted input item was parked for a
+ * running turn and is NOT consumed yet.
+ *
+ * The intermediate sibling of `session_input_consumed`: the message was
+ * steered into an already-active turn, so it exists in conversation
+ * history and in the turn's message buffer, but the agent loop has
+ * verifiably not seen it. The store keeps (or creates) a pending bubble
+ * for it — rendered with the not-yet-consumed affordance — until the
+ * matching `session_input_consumed` for the same `itemId` promotes it.
+ * Same payload shape as the consumed event, minus `clearedPendingId`.
+ */
+export interface SessionInputDeliveredEvent {
+  type: "session_input_delivered";
+  itemId: string;
+  /** Item-type discriminator, e.g. `"message"`. */
+  itemType: string;
+  /** True when the persisted item is durable hidden context. */
+  isMeta?: boolean;
+  /** Human author email, when known. */
+  createdBy?: string;
+  /** Decoded item payload — heterogeneous, `itemType`-specific. */
+  data: Record<string, unknown>;
+}
+
+/**
  * `session.interrupted` — user-triggered cancel reached the loop.
  *
  * Co-emitted with `response.incomplete` (whose underlying
@@ -967,6 +992,7 @@ export type StreamEvent =
   | SessionSandboxStatusEvent
   | SessionMcpStartupEvent
   | SessionInputConsumedEvent
+  | SessionInputDeliveredEvent
   | SessionInterruptedEvent
   | SessionCreatedEvent
   | SessionSupersededEvent

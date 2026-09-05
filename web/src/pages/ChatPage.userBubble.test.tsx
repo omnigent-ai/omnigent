@@ -328,3 +328,23 @@ describe("UserBubble @-mention attachment chips", () => {
     expect(screen.queryByText(/uploads\/image\.png/)).toBeNull();
   });
 });
+
+describe("UserBubble pending (delivered, not yet consumed) affordance", () => {
+  // A steered message the harness hasn't consumed renders in an
+  // intermediate state: a `data-pending` hook plus a dimmed treatment.
+  // Both prongs matter — the attribute is the semantic contract tests and
+  // tooling key off, the dimming is what the user actually sees.
+  it("marks a pending bubble with data-pending and dims it", () => {
+    renderBubble(userBubble("steered follow-up", { pending: true }));
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble.getAttribute("data-pending")).toBe("true");
+    expect(bubble.className).toContain("opacity-60");
+  });
+
+  it("renders a committed bubble with no pending affordance", () => {
+    renderBubble(userBubble("normal message"));
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble.getAttribute("data-pending")).toBeNull();
+    expect(bubble.className).not.toContain("opacity-60");
+  });
+});

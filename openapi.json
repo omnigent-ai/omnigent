@@ -4563,6 +4563,7 @@
             "session.created": "#/components/schemas/SessionCreatedEvent",
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
+            "session.input.delivered": "#/components/schemas/SessionInputDeliveredEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
@@ -4636,6 +4637,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionInputConsumedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionInputDeliveredEvent"
           },
           {
             "$ref": "#/components/schemas/SessionInterruptedEvent"
@@ -5298,6 +5302,40 @@
           "data"
         ],
         "title": "SessionInputConsumedPayload",
+        "type": "object"
+      },
+      "SessionInputDeliveredEvent": {
+        "description": "A persisted input item was parked for a running turn, not consumed.\n\nEmitted by `POST /v1/sessions/{id}/events` when a message is\nsteered into an already-active turn: the item is persisted into\nconversation history and delivered into the turn's message buffer,\nbut the agent loop has verifiably NOT seen it yet. Clients render\nthe message in an intermediate (pending) state until the follow-up\n`session.input.consumed` for the same `item_id` arrives \u2014 which\nthe server publishes only once the runner reports the buffered\nmessage was actually drained into a turn.\n\nWire shape uses the NESTED envelope with the same payload as\n`SessionInputConsumedEvent` (`cleared_pending_id` is always\n`None` here), so consumers can decode both with one parser.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/SessionInputConsumedPayload",
+            "description": "The delivered-item payload \u2014 see `SessionInputConsumedPayload`."
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.input.delivered",
+            "description": "Always `\"session.input.delivered\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "data"
+        ],
+        "title": "SessionInputDeliveredEvent",
         "type": "object"
       },
       "SessionInterruptedEvent": {
@@ -6678,6 +6716,14 @@
             ],
             "description": "Cumulative LLM spend for this session in USD, e.g. `0.42`. `None` when the session is **unpriced** \u2014 no turn has been priced yet (the model is absent from the pricing catalog, or no usage has been recorded) \u2014 so clients render \"\u2014\" rather than a misleading `$0.00`. Server-computed (cache-aware for relay/codex, exact billing for claude-native), the same total the cost-budget policy gates on. Lets clients seed their cost indicator on resume without waiting for the next `session.usage` SSE event.",
             "title": "Total Cost Usd"
+          },
+          "unconsumed_input_ids": {
+            "description": "Ids of persisted user-message items that were steered into a running turn and are still awaiting harness consumption at snapshot time, oldest first. Clients render these in the intermediate (pending) state the live `session.input.delivered` event drives. Empty otherwise. Sourced from the in-memory `omnigent.runtime.unconsumed_inputs` index.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Unconsumed Input Ids",
+            "type": "array"
           },
           "updated_at": {
             "anyOf": [

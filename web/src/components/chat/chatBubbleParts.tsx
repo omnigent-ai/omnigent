@@ -190,6 +190,10 @@ export function buildPendingBubbles(
       // Stamped once at send time; absent for snapshot-replayed entries,
       // which show no timestamp rather than a re-stamped render time.
       ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
+      // Delivered into a running turn but not yet consumed by the agent
+      // loop (steered message) — render the intermediate affordance.
+      // Ordinary in-flight sends stay full-strength as before.
+      ...(p.deliveredItemId !== undefined ? { pending: true } : {}),
     };
   });
 }
@@ -600,7 +604,10 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-testid="message-bubble"
       data-role="user"
       data-user-message-id={bubble.itemId}
-      className="max-w-[640px]"
+      // Delivered-but-unconsumed steered message: gray the bubble out and
+      // expose a semantic hook until the agent loop actually consumes it.
+      data-pending={bubble.pending ? "true" : undefined}
+      className={cn("max-w-[640px]", bubble.pending && "opacity-60")}
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
         {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
