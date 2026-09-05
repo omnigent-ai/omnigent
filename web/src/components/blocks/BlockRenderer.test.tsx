@@ -325,6 +325,19 @@ describe("BlockRenderer dispatch", () => {
     expect(sections[1]!.contains(strong)).toBe(true);
   });
 
+  it("keeps single newlines in assistant text as visible line breaks", () => {
+    const { container } = renderMarkdownText(
+      [
+        "This series: complete",
+        "Other series: continue GTR03",
+        "Other series: continue IMP01",
+        "git add -- files && git commit",
+      ].join("\n"),
+    );
+
+    expect(container.querySelectorAll("br")).toHaveLength(3);
+  });
+
   it("does not add adjacent-text spacing across tool items", () => {
     // Rendered as a live turn ("running") so the whole trace stays
     // expanded — a settled turn would fold "Before tool." behind the
