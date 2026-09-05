@@ -2737,6 +2737,45 @@ def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
         )
 
 
+def test_resolve_databricks_codex_model_canonical_pin_skips_discovery() -> None:
+    """An exact ``system.ai.`` pin resolves without credentials or a listing.
+
+    The listing's ids carry the ``system.ai.`` spelling by construction, so
+    discovery could only echo such a pin back; running credential resolution
+    plus a live workspace listing anyway stalls every launch on a slow
+    workspace for an answer that is already known.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from omnigent.codex_native_app_server import _resolve_databricks_codex_model
+
+    with (
+        patch(
+            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            return_value=SimpleNamespace(token="tok"),
+        ) as creds,
+        patch(
+            "omnigent.databricks_model_discovery.discover_databricks_codex_models",
+            return_value=("system.ai.gpt-5-6-sol",),
+        ) as discovery,
+    ):
+        assert (
+            _resolve_databricks_codex_model(
+                "https://h.example.com", "prof", "system.ai.gpt-5-6-sol"
+            )
+            == "system.ai.gpt-5-6-sol"
+        )
+        # A pin the workspace may not even serve still passes through without
+        # a lookup — the gateway's error beats a stalled launch.
+        assert (
+            _resolve_databricks_codex_model("https://h.example.com", "prof", "system.ai.kimi-k3")
+            == "system.ai.kimi-k3"
+        )
+    creds.assert_not_called()
+    discovery.assert_not_called()
+
+
 def test_probe_codex_home_bridges_provider_tables_and_credential(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

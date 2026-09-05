@@ -2268,7 +2268,10 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
     An explicit model is matched against the servable ids, so a legacy
     ``model_override`` persisted before this change still launches; one the
     workspace does not serve passes through untouched, because the gateway's
-    error beats a silent substitution.
+    error beats a silent substitution. An exact ``system.ai.`` pin resolves
+    to itself without credentials or a listing: the listing's ids carry that
+    spelling by construction, so discovery could only echo the pin back while
+    stalling the launch on a slow workspace.
 
     :param host: Workspace origin, e.g. ``"https://example.com"``.
     :param profile: Databricks CLI profile backing the launch.
@@ -2278,8 +2281,15 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
     """
     from omnigent.databricks_model_discovery import (
         discover_databricks_codex_models,
+        is_system_catalog_spelling,
         select_servable_model,
     )
+
+    if requested and is_system_catalog_spelling(requested):
+        # A canonical pin needs no rediscovery: a listing hit echoes it back
+        # and a miss passes it through untouched, so the credential + live
+        # listing round-trip below could never change the outcome.
+        return requested
 
     servable: tuple[str, ...] = ()
     try:

@@ -413,6 +413,24 @@ def _codex_preference_rank(model_id: str) -> tuple[int, int, int, int, str]:
     return (1, int(major), int(minor), 0 if tier else 1, tier or "")
 
 
+def is_system_catalog_spelling(model_id: str) -> bool:
+    """Whether *model_id* already carries the served ``system.ai.`` spelling.
+
+    Unity Catalog model services spell every id ``system.ai.`` by
+    construction, so resolving such an id against a listing can only echo it
+    back — or leave it for the caller's untouched passthrough when the
+    workspace does not serve it. Callers use this to skip a redundant live
+    listing (and the credential acquisition it needs) for an exact pin.
+
+    :param model_id: Model id in either vocabulary, e.g.
+        ``"system.ai.gpt-5-6-sol"``.
+    :returns: ``True`` for the exact ``system.ai.`` spelling; any other
+        spelling (including a differently-cased one) keeps the full
+        resolution path.
+    """
+    return model_id.startswith(_SYSTEM_MODEL_PREFIX)
+
+
 def select_servable_model(requested: str, servable: Iterable[str]) -> str | None:
     """Resolve *requested* against the ids a workspace actually serves.
 
