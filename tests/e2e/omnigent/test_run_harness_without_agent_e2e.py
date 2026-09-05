@@ -31,7 +31,7 @@ from tests.e2e.omnigent._pexpect_harness import (
     spawn_omnigent_run,
     strip_ansi,
 )
-from tests.e2e.omnigent.conftest import configure_mock_llm
+from tests.e2e.omnigent.conftest import configure_mock_llm, set_fallback_mock_llm
 
 _PROMPT_TEMPLATE = (
     "Reply with exactly the identifier between <answer> tags, but omit the tags: "
@@ -76,14 +76,15 @@ def test_run_harness_without_agent_live_repl_round_trip(
     marker = f"{probe.marker}_RUN_HARNESS_WITHOUT_AGENT"
     prompt = _PROMPT_TEMPLATE.format(marker=marker)
 
-    # claude-code issues a warmup/title call before the turn that consumes one
-    # queued response, so the turn call needs another; queue a few markers.
-    responses = [{"text": marker}] * (4 if probe.harness == "claude-sdk" else 1)
+    # A background session-title generator races the user turn for this same
+    # keyed queue, so the call count per run is not fixed. The fallback answers
+    # every call with the marker, so whichever wins, the turn still renders it.
     configure_mock_llm(
         mock_llm_server_url,
-        responses,
+        [{"text": marker}],
         key=model,
     )
+    set_fallback_mock_llm(mock_llm_server_url, model, marker)
 
     # claude-sdk speaks the Anthropic wire, not OPENAI_*. Point it at the mock
     # and pass a static gateway token via ANTHROPIC_AUTH_TOKEN (Authorization:

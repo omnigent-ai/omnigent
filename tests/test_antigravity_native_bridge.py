@@ -1564,6 +1564,149 @@ def test_seed_isolated_agy_home_trusts_workspace_in_isolated_settings(
     }
 
 
+def test_seed_isolated_agy_home_copies_real_settings_as_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh seed copies the user's real settings.json into the isolated dir.
+
+    The real settings carry backend config agy needs at turn time — notably the
+    ``gcp`` project/location block for GCP/enterprise logins, without which every
+    turn fails server-side with ``invalid location: ""`` while the session still
+    looks logged in.
+    """
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_settings.write_text(
+        json.dumps(
+            {
+                "gcp": {"project": "acme-prod", "location": "global"},
+                "theme": "dark",
+                "trustedWorkspaces": ["/real/repo"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    seed_isolated_agy_home(bridge_dir, trusted_workspace=workspace)
+
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    isolated = json.loads(iso_settings.read_text(encoding="utf-8"))
+    # Backend config survives the copy; the trust seeder merged on top of it.
+    assert isolated["gcp"] == {"project": "acme-prod", "location": "global"}
+    assert isolated["theme"] == "dark"
+    assert isolated["trustedWorkspaces"] == ["/real/repo", str(workspace.resolve())]
+    # The real settings file is never modified.
+    assert json.loads(real_settings.read_text(encoding="utf-8"))["trustedWorkspaces"] == [
+        "/real/repo"
+    ]
+
+
+def test_seed_isolated_agy_home_never_clobbers_existing_isolated_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-seed keeps the isolated settings file — per-session edits survive."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_settings.write_text(json.dumps({"theme": "dark"}), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    iso_settings.parent.mkdir(parents=True)
+    iso_settings.write_text(json.dumps({"model": "session-pick"}), encoding="utf-8")
+
+    seed_isolated_agy_home(bridge_dir)
+
+    assert json.loads(iso_settings.read_text(encoding="utf-8")) == {"model": "session-pick"}
+
+
+def test_seed_isolated_agy_home_prefers_real_onboarding_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user's real onboarding marker is copied over the synthetic default.
+
+    The real marker carries auth-flow state the synthetic one lacks
+    (``enterpriseOnboardingComplete``, ``previousAuthMethod``); without it an
+    enterprise/GCP login re-enters the first-run wizard, which blocks TUI
+    injection.
+    """
+    fake_home = tmp_path / "real-home"
+    real_marker = fake_home / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json"
+    real_marker.parent.mkdir(parents=True)
+    real_state = {
+        "consumerOnboardingComplete": True,
+        "enterpriseOnboardingComplete": True,
+        "onboardingComplete": True,
+        "previousAuthMethod": "gcp",
+    }
+    real_marker.write_text(json.dumps(real_state), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_marker = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "cache" / "onboarding.json"
+    assert json.loads(iso_marker.read_text(encoding="utf-8")) == real_state
+
+
+def test_seed_isolated_agy_home_tolerates_absent_real_settings_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user with no settings.json seeds cleanly — no spurious gcp block appears.
+
+    Non-GCP (consumer subscription) users have no settings.json; seeding must
+    not fail or inject a gcp key the user never configured.
+    """
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    # Absent, or created by the trust/survey seeders without a gcp key.
+    if iso_settings.exists():
+        assert "gcp" not in json.loads(iso_settings.read_text(encoding="utf-8"))
+
+
+def test_seed_isolated_agy_home_synthetic_onboarding_does_not_downgrade_enterprise_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The synthetic onboarding marker never hard-wires enterpriseOnboardingComplete=false.
+
+    When the real onboarding.json is absent (e.g. a cleared agy cache on a
+    GCP-authenticated host), a synthetic marker with
+    ``enterpriseOnboardingComplete: false`` re-triggers the first-run wizard
+    for enterprise accounts, which blocks TUI injection. If the seeder writes
+    the key at all, it must be True.
+    """
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    # No real onboarding.json.
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    onboarding_path = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "cache" / "onboarding.json"
+    onboarding = json.loads(onboarding_path.read_text(encoding="utf-8"))
+    assert onboarding.get("onboardingComplete") is True
+    if "enterpriseOnboardingComplete" in onboarding:
+        assert onboarding["enterpriseOnboardingComplete"] is True
+
+
 def test_seed_isolated_agy_home_tolerates_missing_credential(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1581,6 +1724,179 @@ def test_seed_isolated_agy_home_tolerates_missing_credential(
     # No token copied (none existed), but the isolated Gemini dir + markers still exist.
     assert not (iso_gemini / "antigravity-cli" / "antigravity-oauth-token").exists()
     assert (iso_gemini / "antigravity-cli" / "cache" / "onboarding.json").is_file()
+
+
+def test_seed_isolated_agy_home_exposes_user_plugins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user's imported plugins (skills + hooks) are visible under --gemini_dir."""
+    fake_home = tmp_path / "real-home"
+    real_config = fake_home / ".gemini" / "config"
+    (real_config / "plugins" / "superpowers" / "skills").mkdir(parents=True)
+    (real_config / "plugins" / "superpowers" / "skills" / "brainstorming.md").write_text(
+        "# brainstorming", encoding="utf-8"
+    )
+    manifest = json.dumps(
+        {"imports": [{"name": "superpowers", "components": ["skills", "hooks"]}]}
+    )
+    (real_config / "import_manifest.json").write_text(manifest, encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_config = agy_gemini_dir(bridge_dir) / "config"
+    # agy resolves plugins relative to --gemini_dir, so both the manifest and the
+    # plugin payload must be reachable there or the session lists zero skills.
+    assert json.loads((iso_config / "import_manifest.json").read_text(encoding="utf-8")) == (
+        json.loads(manifest)
+    )
+    seeded_skill = iso_config / "plugins" / "superpowers" / "skills" / "brainstorming.md"
+    assert seeded_skill.read_text(encoding="utf-8") == "# brainstorming"
+
+
+def test_seed_isolated_agy_home_does_not_copy_plugin_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plugins are linked, not copied, so plugin updates are picked up live."""
+    fake_home = tmp_path / "real-home"
+    real_plugins = fake_home / ".gemini" / "config" / "plugins"
+    (real_plugins / "superpowers").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_plugins = agy_gemini_dir(bridge_dir) / "config" / "plugins"
+    assert iso_plugins.is_symlink()
+    assert iso_plugins.resolve() == real_plugins.resolve()
+    # A plugin installed/updated after the session started is still visible.
+    (real_plugins / "later").mkdir()
+    assert (iso_plugins / "later").is_dir()
+
+
+def test_seed_isolated_agy_home_plugin_seed_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-seeding an existing bridge dir does not fail on the existing link."""
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "config" / "plugins").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_plugins = agy_gemini_dir(bridge_dir) / "config" / "plugins"
+    assert iso_plugins.is_symlink()
+
+
+def test_seed_isolated_agy_home_tolerates_absent_plugins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user with no imported plugins seeds cleanly — no link, no manifest."""
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_config = agy_gemini_dir(bridge_dir) / "config"
+    assert not (iso_config / "plugins").exists()
+    assert not (iso_config / "import_manifest.json").exists()
+    # The rest of the seed still landed.
+    assert (iso_config / ".migrated").is_file()
+
+
+def test_seed_isolated_agy_home_exposes_user_skill_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """agy's Global and Shared skill trees resolve under ``--gemini_dir``.
+
+    The ``/skills`` menu enumerates these from the REAL home, so a session that
+    cannot resolve them there would offer a skill agy then fails to expand.
+    """
+    fake_home = tmp_path / "real-home"
+    real_global = fake_home / ".gemini" / "antigravity-cli" / "skills"
+    real_shared = fake_home / ".gemini" / "skills"
+    (real_global / "global-skill").mkdir(parents=True)
+    (real_global / "global-skill" / "SKILL.md").write_text("# global", encoding="utf-8")
+    (real_shared / "shared-skill").mkdir(parents=True)
+    (real_shared / "shared-skill" / "SKILL.md").write_text("# shared", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    iso_global = iso_gemini / "antigravity-cli" / "skills"
+    iso_shared = iso_gemini / "skills"
+    # Linked, not copied: a skill authored mid-session is visible immediately.
+    assert iso_global.is_symlink() and iso_shared.is_symlink()
+    assert (iso_global / "global-skill" / "SKILL.md").read_text(encoding="utf-8") == "# global"
+    assert (iso_shared / "shared-skill" / "SKILL.md").read_text(encoding="utf-8") == "# shared"
+    (real_shared / "later").mkdir()
+    assert (iso_shared / "later").is_dir()
+
+
+def test_seed_isolated_agy_home_skill_dir_seed_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-seeding an existing bridge dir does not fail on the existing links."""
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "antigravity-cli" / "skills").mkdir(parents=True)
+    (fake_home / ".gemini" / "skills").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    assert (iso_gemini / "antigravity-cli" / "skills").is_symlink()
+    assert (iso_gemini / "skills").is_symlink()
+
+
+def test_seed_isolated_agy_home_tolerates_absent_skill_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user with no Global/Shared skills seeds cleanly — no links, no failure."""
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    assert not (iso_gemini / "skills").exists()
+    assert not (iso_gemini / "antigravity-cli" / "skills").exists()
+    # agy owns ``antigravity-cli`` itself; seeding must not have clobbered it.
+    assert (iso_gemini / "antigravity-cli" / "cache" / "onboarding.json").is_file()
+
+
+def test_seed_isolated_agy_home_skill_links_never_mutate_real_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seeding links INTO the real skill trees; it never writes through them."""
+    fake_home = tmp_path / "real-home"
+    real_shared = fake_home / ".gemini" / "skills"
+    real_shared.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    assert sorted(p.name for p in real_shared.iterdir()) == []
 
 
 def test_agy_home_dir_is_under_bridge_dir(tmp_path: Path) -> None:
@@ -1742,6 +2058,52 @@ def test_ensure_agy_feedback_survey_disabled_creates_missing_settings(tmp_path: 
     }
 
 
+def test_ensure_agy_settings_selects_gemini_for_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The isolated settings activate agy's direct Gemini API-key provider."""
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    assert json.loads(_agy_settings_path(tmp_path).read_text(encoding="utf-8")) == {
+        "modelProvider": "gemini",
+        "showFeedbackSurvey": False,
+    }
+
+
+def test_ensure_agy_settings_clears_gemini_provider_when_api_key_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resumed OAuth session is not trapped on stale API-key configuration."""
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    monkeypatch.delenv("GEMINI_API_KEY")
+
+    ensure_agy_feedback_survey_disabled(tmp_path)
+
+    assert json.loads(_agy_settings_path(tmp_path).read_text(encoding="utf-8")) == {
+        "showFeedbackSurvey": False
+    }
+
+
+def test_ensure_agy_settings_preserves_non_gemini_provider_without_api_key(
+    tmp_path: Path,
+) -> None:
+    """Provider cleanup does not overwrite another explicitly selected backend."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        json.dumps({"modelProvider": "vertex", "showFeedbackSurvey": False}),
+        encoding="utf-8",
+    )
+
+    ensure_agy_feedback_survey_disabled(tmp_path)
+
+    assert json.loads(settings.read_text(encoding="utf-8")) == {
+        "modelProvider": "vertex",
+        "showFeedbackSurvey": False,
+    }
+
+
 def test_ensure_agy_feedback_survey_disabled_merges_preserving_keys(tmp_path: Path) -> None:
     """The user's other settings (model/trustedWorkspaces/…) survive the merge."""
     settings = _agy_settings_path(tmp_path)
@@ -1895,3 +2257,55 @@ def test_ensure_agy_feedback_survey_disabled_write_failure_never_raises(
     leftover = [p.name for p in settings.parent.iterdir() if p.name != settings.name]
     assert leftover == []
     assert "could not write" in caplog.text
+
+
+# ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
+
+
+def test_prepare_bridge_dir_writes_owner_pid_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prepare_bridge_dir records the creating pid so the periodic sweep can
+    prune the dir only when its owner is provably dead."""
+    import os
+
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+
+    bridge_dir = _mod.prepare_bridge_dir("bridge_owner")
+
+    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
+    import os
+    import subprocess
+    import sys
+
+    root = tmp_path / "antigravity-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", root)
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    dead_dir = root / "deadowner"
+    dead_dir.mkdir()
+    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+
+    live_dir = root / "liveowner"
+    live_dir.mkdir()
+    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    unmarked_dir = root / "unmarked"
+    unmarked_dir.mkdir()
+
+    pruned = _mod.prune_orphaned_bridge_dirs()
+
+    assert pruned == 1
+    assert not dead_dir.exists()
+    assert live_dir.exists()
+    assert unmarked_dir.exists()

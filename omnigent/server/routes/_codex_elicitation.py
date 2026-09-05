@@ -237,7 +237,7 @@ def _codex_request_user_input_response(
 def _codex_mcp_elicitation_response(
     result: ElicitationResult,
     _method: str,
-    _params: dict[str, Any],
+    params: dict[str, Any],
 ) -> dict[str, Any]:
     """
     Convert a web approval result into Codex MCP elicitation output.
@@ -245,15 +245,38 @@ def _codex_mcp_elicitation_response(
     :param result: Web-submitted elicitation result.
     :param _method: Codex app-server method, unused because MCP
         elicitation has one response shape.
-    :param _params: Original Codex request params, unused because the
-        response depends only on the web verdict.
+    :param params: Original Codex request params. Its ``_meta.persist``
+        declaration bounds which persistence choices the web verdict
+        may return.
     :returns: Codex ``McpServerElicitationRequestResponse`` payload.
+    :raises OmnigentError: If the verdict asks for a persistence mode
+        the original Codex request did not advertise.
     """
+    response_meta: dict[str, str] | None = None
+    requested_persist = result.meta.get("persist") if result.meta is not None else None
+    if result.action == "accept" and requested_persist is not None:
+        advertised = _codex_mcp_persist_modes(params)
+        if not isinstance(requested_persist, str) or requested_persist not in advertised:
+            raise OmnigentError(
+                "Codex MCP persistence choice was not advertised by the request.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        response_meta = {"persist": requested_persist}
     return {
         "action": result.action,
         "content": result.content if result.action == "accept" else None,
-        "_meta": None,
+        "_meta": response_meta,
     }
+
+
+def _codex_mcp_persist_modes(params: dict[str, Any]) -> set[str]:
+    """Return the supported persistence modes advertised by Codex."""
+    meta = params.get("_meta")
+    if not isinstance(meta, dict) or meta.get("codex_approval_kind") != "mcp_tool_call":
+        return set()
+    persist = meta.get("persist")
+    values = persist if isinstance(persist, list) else [persist]
+    return {value for value in values if isinstance(value, str) and value in {"session", "always"}}
 
 
 def _execpolicy_amendment(value: Any) -> list[str] | None:

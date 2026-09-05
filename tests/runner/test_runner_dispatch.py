@@ -27,17 +27,23 @@ Architecture verified end-to-end:
 The OpenAI-key-gated test runs the full chain against gpt-4o-mini.
 The unkeyed test asserts on plumbing only (handler is reached,
 503 on bad harness name).
+
+Turn-context recovery tests are also included here (see the
+``# ── turn-context recovery ──`` section at the bottom of this
+file): verdict-delivery failure retry/signal, ``_resync_turn_state``
+edge cases, and the three-factor causal chain.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import tempfile
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
@@ -46,17 +52,54 @@ from typing import Any, cast
 import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse as _StreamingResponse
 
+import omnigent.runtime.harnesses._executor_adapter as _adapter_mod_recovery
+from omnigent.inner.executor import (
+    Executor as _RecoveryExecutor,
+)
+from omnigent.inner.executor import (
+    ExecutorConfig as _RecoveryExecutorConfig,
+)
+from omnigent.inner.executor import (
+    ExecutorEvent as _RecoveryExecutorEvent,
+)
+from omnigent.inner.executor import (
+    Message as _RecoveryMessage,
+)
+from omnigent.inner.executor import (
+    ToolSpec as _RecoveryToolSpec,
+)
+from omnigent.inner.executor import (
+    TurnComplete as _RecoveryTurnComplete,
+)
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
+    _RUNNER_TURN_CONTEXT_DESYNC_CODE,
     _build_spawn_env_from_spec,
+    _evaluate_policy_via_omnigent,
     _forward_harness_response,
     _resolve_harness_config,
 )
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.runtime.harnesses._executor_adapter import (
+    _ORPHAN_RESYNC_THRESHOLD,
+    ExecutorAdapter,
+)
+from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy
+from tests.runner.conftest import (
+    _FakeProcessManager as _RecoveryFakeProcessManager,
+)
+from tests.runner.conftest import (
+    _runner_client as _recovery_runner_client,
+)
+from tests.runner.conftest import (
+    _ScriptedHarnessClient as _RecoveryScriptedHarnessClient,
+)
 from tests.runner.helpers import NullServerClient
 
 _TEST_HARNESS_NAME = "runner-test-default"
@@ -171,6 +214,7 @@ async def _await_bg_turn_task(conv: str, *, timeout: float = 10.0) -> None:
 
 
 async def _drain_published_statuses(
+    queues: dict[str, Any],
     conv: str,
     *,
     until: str,
@@ -178,15 +222,16 @@ async def _drain_published_statuses(
 ) -> list[str]:
     """Collect ``session.status`` values a runner published for a session.
 
-    Reads the runner's module-level per-session event queue
-    (``omnigent.runner.app._session_event_queues_ref``) — the same queue
-    the SSE ``/stream`` endpoint drains — and returns the ordered list of
-    ``session.status`` values seen, stopping once *until* is published. This
-    polls the in-process queue rather than a concurrent SSE ``GET`` because
-    ``httpx.ASGITransport`` does not interleave a streaming response with a
-    concurrent ``POST`` on the same client, so a live SSE subscriber would
-    never observe the background turn's events.
+    Reads the runner's per-session event queue (``app.state.session_event_queues``)
+    — the same queue the SSE ``/stream`` endpoint drains — and returns the
+    ordered list of ``session.status`` values seen, stopping once *until* is
+    published. This polls the in-process queue rather than a concurrent SSE
+    ``GET`` because ``httpx.ASGITransport`` does not interleave a streaming
+    response with a concurrent ``POST`` on the same client, so a live SSE
+    subscriber would never observe the background turn's events.
 
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
     :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param until: Stop once this ``session.status`` value is observed,
         e.g. ``"failed"``.
@@ -195,12 +240,10 @@ async def _drain_published_statuses(
         assertion instead of spinning forever.
     :returns: Ordered ``session.status`` values published for *conv*.
     """
-    from omnigent.runner.app import _session_event_queues_ref
-
     statuses: list[str] = []
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        queue = _session_event_queues_ref.get(conv)
+        queue = queues.get(conv)
         drained = False
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
@@ -218,6 +261,7 @@ async def _drain_published_statuses(
 
 
 async def _drain_failed_status_event(
+    queues: dict[str, Any],
     conv: str,
     *,
     timeout: float,
@@ -229,17 +273,17 @@ async def _drain_failed_status_event(
     ``error`` payload. Used to prove a SETUP-phase failure forwards its
     error message on the terminal ``failed`` event instead of dropping it.
 
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
     :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param timeout: Hard cap in seconds; returns ``None`` if no failed
         event arrives so a regression fails the assertion rather than
         hanging.
     :returns: The ``session.status: failed`` event dict, or ``None``.
     """
-    from omnigent.runner.app import _session_event_queues_ref
-
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        queue = _session_event_queues_ref.get(conv)
+        queue = queues.get(conv)
         drained = False
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
@@ -334,6 +378,10 @@ class _FakeProcessManager:
     def clear_in_flight(self, conversation_id: str) -> None:
         """Reaper in-flight clear — no-op for this stub (issue #1414)."""
         del conversation_id
+
+    async def release(self, conversation_id: str, **kwargs: object) -> None:
+        """Agent-switch subprocess release — no-op for this stub."""
+        del conversation_id, kwargs
 
 
 @pytest.fixture
@@ -442,6 +490,121 @@ async def test_runner_resolves_harness_from_fallback_when_no_agent_id(
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/event-stream")
         assert "event: response.created" in response.text
+
+
+@pytest.mark.asyncio
+async def test_resolve_harness_config_raises_when_spec_resolver_returns_none() -> None:
+    """_resolve_harness_config raises RuntimeError when spec_resolver is wired
+    but returns no spec, instead of silently falling back to runner-test-default.
+
+    The fallback is only valid when no spec_resolver is configured (test mode).
+    A production runner that has a spec_resolver must never silently spawn the
+    test harness — the caller's ``except RuntimeError`` will surface a clean
+    error instead of leaving the session in a broken/hung state.
+
+    :returns: None.
+    """
+
+    async def _resolver_returning_none(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        """
+        Always return None to simulate an agent that cannot be resolved.
+
+        :param agent_id: Ignored.
+        :param session_id: Ignored.
+        :returns: None.
+        """
+        return None
+
+    with pytest.raises(RuntimeError, match="No agent spec found for agent_id="):
+        await _resolve_harness_config(
+            agent_id="ag_missing",
+            spec_resolver=_resolver_returning_none,
+            session_id="conv_x",
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_harness_config_raises_when_agent_id_missing_with_spec_resolver() -> None:
+    """_resolve_harness_config raises when spec_resolver is set but agent_id is absent.
+
+    A production runner with a spec_resolver requires agent_id to select the
+    right harness. If it's missing the runner must fail loudly so the problem
+    surfaces immediately rather than spawning the test-only harness and hanging.
+
+    :returns: None.
+    """
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return a valid spec — should never be reached in this test.
+
+        :param agent_id: Agent id.
+        :param session_id: Session id.
+        :returns: A minimal agent spec.
+        """
+        return AgentSpec(
+            spec_version=1,
+            name="x",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    with pytest.raises(RuntimeError, match="agent_id is missing"):
+        await _resolve_harness_config(
+            agent_id=None,
+            spec_resolver=_resolver,
+            session_id="conv_x",
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_session_returns_400_when_spec_resolver_returns_none(
+    started_manager: HarnessProcessManager,
+) -> None:
+    """POST /v1/sessions returns 400 no_agent_spec when spec_resolver returns no spec.
+
+    When the server sends a session-create request with an agent_id that
+    doesn't map to any registered agent, the runner must return a clear 400
+    rather than silently proceeding with the test-only harness (which would
+    either fail with a 503 or, worse, appear to succeed and then hang on the
+    first turn because no real LLM is configured for it).
+
+    :param started_manager: A real HarnessProcessManager fixture.
+    :returns: None.
+    """
+
+    async def _resolver_returning_none(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        """
+        Always return None to simulate an unregistered agent.
+
+        :param agent_id: Ignored.
+        :param session_id: Ignored.
+        :returns: None.
+        """
+        return None
+
+    app = create_runner_app(
+        process_manager=started_manager,
+        spec_resolver=_resolver_returning_none,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            "/v1/sessions",
+            json={"session_id": "conv_bad_agent", "agent_id": "ag_unregistered"},
+        )
+
+    assert response.status_code == 400, (
+        f"Expected 400 no_agent_spec; got {response.status_code}: {response.text!r}. "
+        "Without the safeguard the runner falls back to runner-test-default and "
+        "returns 503 (unregistered harness) or silently spawns a test harness."
+    )
+    body = response.json()
+    assert body["error"] == "no_agent_spec"
+    assert "ag_unregistered" in body["detail"]
 
 
 class _RecordingProcessManager:
@@ -1368,6 +1531,97 @@ async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> Non
     assert "stream spec resolver unavailable for ag_stream" not in response.text
 
 
+def test_direct_and_background_switch_sites_share_one_invalidation_routine() -> None:
+    """Both dispatch paths must call the shared `_invalidate_session_agent_state` helper."""
+    import inspect
+
+    import omnigent.runner.app as runner_app_mod
+
+    source = inspect.getsource(runner_app_mod)
+    direct_stream_start = source.index("async def _stream_message_to_harness(")
+    direct_stream_body = source[direct_stream_start : direct_stream_start + 4000]
+    background_start = source.index("async def _run_turn_bg_setup_and_stream(")
+    background_body = source[background_start : background_start + 4000]
+
+    assert "_invalidate_session_agent_state(" in direct_stream_body, (
+        "_stream_message_to_harness must call the shared "
+        "_invalidate_session_agent_state helper on its switch/provenance-"
+        "reject branch, not an inline cache-pop list of its own."
+    )
+    assert "_invalidate_session_agent_state(" in background_body, (
+        "_run_turn_bg_setup_and_stream must call the shared "
+        "_invalidate_session_agent_state helper on its switch/provenance-"
+        "reject branch, not an inline cache-pop list of its own."
+    )
+
+
+def test_agent_cache_reset_clears_the_agent_id_marker_too() -> None:
+    """`_clear_session_agent_caches` must pop `_session_agent_ids` with the other tagged caches."""
+    import inspect
+
+    import omnigent.runner.app as runner_app_mod
+
+    source = inspect.getsource(runner_app_mod)
+    start = source.index("def _clear_session_agent_caches(")
+    end = source.index("\n    async def _invalidate_session_agent_state(", start)
+    body = source[start:end]
+
+    assert "_session_agent_ids.pop(" in body, (
+        "_clear_session_agent_caches must pop _session_agent_ids(session_id) "
+        "so it doesn't outlive the caches it's supposed to describe."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+class _RecordingHarnessClient:
+    """Fake harness client that records the event body posted to it."""
+
+    def __init__(self, chunks: list[str]) -> None:
+        self._chunks = chunks
+        self.posted_bodies: list[dict[str, Any]] = []
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, object],
+        timeout: float | None,
+    ) -> _FakeHarnessStream:
+        del method, url, timeout
+        self.posted_bodies.append(json)  # type: ignore[arg-type]
+        return _FakeHarnessStream(self._chunks)
+
+
+_INSTRUCTION_WARN_CHUNKS = [
+    'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_iw_1"}}\n\n',
+    (
+        "event: response.completed\ndata: "
+        '{"type":"response.completed","response":{"id":"resp_iw_1","status":"completed"}}\n\n'
+    ),
+]
+
+
+async def _post_stream_message(http: httpx.AsyncClient, conv: str, **body: Any) -> httpx.Response:
+    """POST a minimal ``?stream=true`` message body for the warn-site tests.
+
+    :param http: Test HTTP client bound to the runner app.
+    :param conv: Conversation id.
+    :param body: Extra fields merged into the message body (``harness``,
+        ``harness_override``, ``agent_id``, ...).
+    :returns: The runner's HTTP response.
+    """
+    payload: dict[str, Any] = {
+        "type": "message",
+        "role": "user",
+        "model": "x",
+        "content": [],
+        **body,
+    }
+    return await http.post(f"/v1/sessions/{conv}/events?stream=true", json=payload)
+
+
 def test_build_spawn_env_applies_model_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1411,6 +1665,45 @@ def test_build_spawn_env_applies_model_override(
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
 
 
+def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dispatch chain routes ``hermes`` to its builder.
+
+    Regression: hermes had no arm here, so this returned ``None`` and the
+    subprocess got no spawn env at all — the session's sandbox fell back to the
+    wrap's ``sandbox=none`` default and its workspace to the runner's launch
+    directory, both silently. Having the builder is not enough; the chain has
+    to reach it.
+
+    :param tmp_path: Pytest temp dir for an isolated provider config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.delenv("OMNIGENT_HERMES_PATH", raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        os_env=OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+
+    env = _build_spawn_env_from_spec(spec, "hermes", cwd=workspace)
+
+    assert env is not None, "hermes is not routed to a spawn-env builder"
+    assert env["HARNESS_HERMES_CWD"] == str(workspace)
+    assert json.loads(env["HARNESS_HERMES_OS_ENV"])["sandbox"]["type"] == "linux_bwrap"
+    # The /model override reaches hermes through the same model env key.
+    overridden = _build_spawn_env_from_spec(spec, "hermes", model_override="hermes-4-70b")
+    assert overridden is not None
+    assert overridden["HARNESS_HERMES_MODEL"] == "hermes-4-70b"
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_resolve_harness_config_applies_harness_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1567,8 +1860,12 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
             },
         )
         assert response.status_code == 202
+        # Await the background turn task (main's helper) before draining, then
+        # read the runner's per-session queue via the ``app.state`` test seam.
         await _await_bg_turn_task(conv)
-        statuses = await _drain_published_statuses(conv, until="failed", timeout=2.0)
+        statuses = await _drain_published_statuses(
+            app.state.session_event_queues, conv, until="failed", timeout=2.0
+        )
 
     # The turn published "running" then "failed" — it reached a terminal
     # state and cleared. Without the fix, the setup-phase OmnigentError is
@@ -1655,8 +1952,12 @@ async def test_runner_failed_status_carries_setup_error_message(
             },
         )
         assert response.status_code == 202
+        # Await the background turn task (main's helper) before draining, then
+        # read the runner's per-session queue via the ``app.state`` test seam.
         await _await_bg_turn_task(conv)
-        failed_event = await _drain_failed_status_event(conv, timeout=2.0)
+        failed_event = await _drain_failed_status_event(
+            app.state.session_event_queues, conv, timeout=2.0
+        )
 
     # The failed event must carry the real setup error message — not a
     # bare status. Without the fix ``error`` is absent and the REPL
@@ -1675,6 +1976,7 @@ async def test_runner_failed_status_carries_setup_error_message(
 
 
 async def _drain_status_events(
+    queues: dict[str, Any],
     conv: str,
     *,
     until: str,
@@ -1686,6 +1988,8 @@ async def _drain_status_events(
     so one drain can assert both the status order and the carried ``error``
     payload — the queue is consumed by reading, so a test cannot drain twice.
 
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
     :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param until: Stop once this ``session.status`` value is observed,
         e.g. ``"failed"``.
@@ -1694,12 +1998,10 @@ async def _drain_status_events(
         assertion instead of spinning forever.
     :returns: Ordered ``session.status`` event dicts published for *conv*.
     """
-    from omnigent.runner.app import _session_event_queues_ref
-
     events: list[dict[str, Any]] = []
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        queue = _session_event_queues_ref.get(conv)
+        queue = queues.get(conv)
         drained = False
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
@@ -1836,11 +2138,13 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
             },
         )
         assert response.status_code == 202
-        # Await the background turn task directly so we know it has completed
-        # (and published its terminal status) before draining — the same race
-        # guard the sibling failed-status tests use.
+        # Await the background turn task (main's helper) before draining — the
+        # same race guard the sibling failed-status tests use — then read the
+        # runner's per-session queue via the ``app.state`` test seam.
         await _await_bg_turn_task(conv)
-        events = await _drain_status_events(conv, until=until, timeout=2.0)
+        events = await _drain_status_events(
+            app.state.session_event_queues, conv, until=until, timeout=2.0
+        )
 
     statuses = [event.get("status") for event in events]
     # The turn must reach the parametrized terminal state. Without the fix,
@@ -2262,7 +2566,6 @@ class _StubTerminalInstance:
         self.tmux_target = "main"
         # ``terminal_resource_view`` reads this to project the effective
         # web-attach transport into metadata; ``None`` => the global default.
-        self.terminal_transport = None
         # Records on_activity callbacks the dispatch wires up so a fresh
         # launch's pane-activity watcher start is observable (and so the
         # call doesn't AttributeError against this stub).
@@ -2516,6 +2819,29 @@ async def test_runner_read_inbox_continues_after_malformed_terminal_idle_item() 
     assert "task handle_after completed" in inbox_output
     assert "sys_os_shell returned: after" in inbox_output
     assert session_inbox.empty()
+
+
+@pytest.mark.asyncio
+async def test_async_inbox_dispatch_does_not_create_unused_harness_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct async-inbox dispatch must not allocate an unused HTTP client."""
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    def unexpected_client(*args: object, **kwargs: object) -> None:
+        raise AssertionError("async-inbox dispatch created an unused HTTP client")
+
+    monkeypatch.setattr(tool_dispatch.httpx, "AsyncClient", unexpected_client)
+
+    output = await execute_tool(
+        tool_name="sys_read_inbox",
+        arguments="{}",
+        session_inbox=asyncio.Queue(),
+        harness_client=None,
+    )
+
+    assert output == "Inbox is empty — no completed tasks."
 
 
 @pytest.mark.parametrize(
@@ -2780,6 +3106,7 @@ async def test_sys_session_send_reuses_existing_child_session(
 
     create_posts = 0
     event_posts: list[dict[str, Any]] = []
+    dispatch_stamps: list[dict[str, Any]] = []
     published: list[dict[str, Any]] = []
 
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
@@ -2813,6 +3140,11 @@ async def test_sys_session_send_reuses_existing_child_session(
         if request.method == "POST" and request.url.path == "/v1/sessions":
             create_posts += 1
             return httpx.Response(500, json={"error": "duplicate"})
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_existing":
+            dispatch_stamps.append(
+                {"events_before": len(event_posts), **json.loads(request.content)["labels"]}
+            )
+            return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_existing/events":
             event_posts.append(json.loads(request.content))
             return httpx.Response(200, json={"ok": True})
@@ -2849,6 +3181,11 @@ async def test_sys_session_send_reuses_existing_child_session(
     assert "continued ok" not in payload["message"]
     assert event_posts[0]["created_by"] == "bob@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "continue"
+    # The new turn's dispatch id is stamped on the child before its message
+    # is posted, so a restart can tell this turn from the drained one.
+    [stamp] = dispatch_stamps
+    assert stamp["events_before"] == 0
+    assert stamp[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY].startswith("subagent_")
     assert published[-1]["type"] == "session.child_session.updated"
     assert published[-1]["child"]["current_task_status"] == "launching"
     assert published[-1]["child"]["busy"] is False
@@ -2947,6 +3284,8 @@ async def test_sys_session_send_existing_child_retries_without_rejected_actor(
                     "title": "worker:retry",
                 },
             )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_existing_retry":
+            return httpx.Response(200, json={"ok": True})
         if (
             request.method == "POST"
             and request.url.path == "/v1/sessions/conv_existing_retry/events"
@@ -3815,8 +4154,10 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
 
     With a subscription default (static — no HTTP), the payload must
     carry one row per declared sub-agent plus ``self``, each in the
-    documented ``{source, verified, models, note}`` shape with the
-    curated claude ids surviving the claude-family filter.
+    documented ``{source, verified, models, note}`` shape. Subscription
+    listings enumerate nothing pre-launch (the curated stand-ins are
+    gone; live harness probes are the source of truth), so the row is
+    an honest empty listing, not a failure shape.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir for the isolated provider config.
@@ -3839,17 +4180,10 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
     worker = payload["worker"]
     assert worker["source"] == "static"
     assert worker["verified"] is False
-    # The curated claude aliases survive the claude-family filter — the
-    # exact ids an orchestrator may pass back as args.model.
-    assert [m["id"] for m in worker["models"]] == [
-        "claude-fable-5",
-        "claude-opus-5",
-        "claude-opus-4-8",
-        "claude-sonnet-5",
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5",
-    ]
-    assert worker["note"]
+    # No curated stand-ins: a path that cannot probe reports nothing
+    # rather than a plausible-but-stale list.
+    assert worker["models"] == []
+    assert "probing the harness" in worker["note"]
 
 
 @pytest.mark.asyncio
@@ -3944,6 +4278,150 @@ async def test_sys_session_send_by_id_rejects_closed_child(
     assert registrations == []
 
 
+_BY_ID_CHILD_IDENTITY_SCENARIOS = [
+    # A sys_session_create child: verbatim title, no sub_agent_name, and
+    # agent_name is the child's own agent.
+    pytest.param("wake-check", "responder", None, "responder", "wake-check", id="verbatim-title"),
+    # A named child continued by id: the "<agent>:<title>" parse wins, so
+    # the parent's agent_name never leaks into the label.
+    pytest.param(
+        "researcher:auth", "orchestrator", "researcher", "researcher", "auth", id="parsed-title"
+    ),
+    # An Add-agent child continued by id: the "ui:<agent>:<label>" form
+    # parses the same way.
+    pytest.param(
+        "ui:claude-native-ui:1", "claude-native-ui", None, "claude-native-ui", "1", id="ui-title"
+    ),
+    # A renamed named child: the title no longer parses, and agent_name
+    # reports the parent when the sub-spec did not resolve, so
+    # sub_agent_name must outrank it.
+    pytest.param(
+        "wake-check", "orchestrator", "researcher", "researcher", "wake-check", id="sub-agent-name"
+    ),
+    # No title at all: the agent still comes from the snapshot and the
+    # instance title stays empty.
+    pytest.param(None, "responder", None, "responder", "", id="no-title"),
+    # Malformed agent fields: an empty sub_agent_name and a non-str
+    # agent_name both fall through to the last-resort label.
+    pytest.param("wake-check", 42, "", "agent", "wake-check", id="malformed-agent-fields"),
+]
+
+
+@pytest.mark.parametrize(
+    ("snapshot_title", "agent_name", "sub_agent_name", "expected_agent", "expected_title"),
+    _BY_ID_CHILD_IDENTITY_SCENARIOS,
+)
+@pytest.mark.asyncio
+async def test_sys_session_send_by_id_names_child_from_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot_title: str | None,
+    agent_name: object,
+    sub_agent_name: str | None,
+    expected_agent: str,
+    expected_title: str,
+) -> None:
+    """
+    By-id ``sys_session_send`` names the child from its snapshot.
+
+    A child dispatched by session id (``sys_session_create`` followed by
+    ``sys_session_send(session_id=...)``) keeps the verbatim title it was
+    created with and has no ``sub_agent_name``, so the
+    ``"<agent>:<title>"`` parse alone yields nothing. Everything that
+    identifies the child downstream (the work entry the wake notice is
+    rendered from, the child-to-parent registration, the launching event
+    on the parent stream, the returned handle, and the launching tool
+    result) must fall through to the snapshot's agent fields instead of
+    a literal ``agent`` with an empty title. A parsed title keeps winning
+    over those fields, ``sub_agent_name`` outranks ``agent_name``, and
+    malformed agent fields fall through to the last-resort label.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param snapshot_title: The child's stored title, e.g. ``"wake-check"``.
+    :param agent_name: The snapshot's bound agent name; a non-str value
+        stands in for malformed JSON.
+    :param sub_agent_name: The snapshot's ``sub_agent_name``, or ``None``.
+    :param expected_agent: The agent label the dispatch must resolve.
+    :param expected_title: The instance title the dispatch must resolve.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    registrations: list[dict[str, Any]] = []
+    published: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    monkeypatch.setattr(
+        runner_app,
+        "register_child_session",
+        lambda child_id, **kwargs: registrations.append({"child_id": child_id, **kwargs}),
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_by_id_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_by_id_child",
+                    "title": snapshot_title,
+                    "agent_name": agent_name,
+                    "sub_agent_name": sub_agent_name,
+                    "parent_session_id": "conv_parent_by_id",
+                    "labels": {},
+                    "busy": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_by_id_child":
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_by_id_child/events":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_by_id_child", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_parent_by_id",
+                session_inbox=session_inbox,
+                publish_event=_capturing_publish_event(published),
+            )
+            entry = runner_app.get_subagent_work("conv_by_id_child")
+        finally:
+            runner_app.unregister_subagent_work("conv_by_id_child")
+            runner_app._session_inboxes_ref.pop("conv_parent_by_id", None)
+
+    assert entry is not None, output
+    assert (entry.agent, entry.title) == (expected_agent, expected_title)
+    assert registrations == [
+        {
+            "child_id": "conv_by_id_child",
+            "parent_session_id": "conv_parent_by_id",
+            "title": snapshot_title or "",
+            "tool": expected_agent,
+            "session_name": expected_title,
+        }
+    ]
+    # The launching event is the Agents rail's live row for the child.
+    [launching] = published
+    assert launching["type"] == "session.child_session.updated"
+    assert launching["child"]["tool"] == expected_agent
+    assert launching["child"]["session_name"] == expected_title
+    assert launching["child"]["title"] == (snapshot_title or "")
+    handle = json.loads(output)
+    assert (handle["agent"], handle["title"]) == (expected_agent, expected_title)
+    assert f"sub-agent {expected_agent} title {expected_title!r}" in handle["message"]
+    # The wake notice is rendered from the registered entry, so this is the
+    # line the parent reads when the child finishes.
+    notice = runner_app._format_subagent_wake_notice(
+        agent=entry.agent, title=entry.title, status="completed", pending=1
+    )
+    assert f"sub-agent {expected_agent}/{expected_title} finished" in notice
+
+
 @pytest.mark.asyncio
 async def test_sys_session_send_completion_drains_from_parent_inbox(
     monkeypatch: pytest.MonkeyPatch,
@@ -3961,6 +4439,8 @@ async def test_sys_session_send_completion_drains_from_parent_inbox(
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
     monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    create_bodies: list[dict[str, Any]] = []
+    label_patches: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         """Serve child-session create, lookup, and message POST requests."""
@@ -3970,7 +4450,11 @@ async def test_sys_session_send_completion_drains_from_parent_inbox(
         ):
             return httpx.Response(200, json={"data": []})
         if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
             return httpx.Response(201, json={"id": "conv_child_inbox"})
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child_inbox":
+            label_patches.append(json.loads(request.content)["labels"])
+            return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child_inbox/events":
             return httpx.Response(202, json={"queued": True})
         if (
@@ -4021,6 +4505,11 @@ async def test_sys_session_send_completion_drains_from_parent_inbox(
 
     assert "sub-agent task conv_child_inbox completed" in inbox_output
     assert "worker:phase-a returned: CHILD_MARKER" in inbox_output
+    # The dispatch id rides along with child creation, and the drain writes
+    # it back as the delivered-id receipt a runner restart checks.
+    dispatch_id = create_bodies[0]["labels"][runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY]
+    assert dispatch_id.startswith("subagent_")
+    assert label_patches == [{runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: dispatch_id}]
 
 
 @pytest.mark.asyncio
@@ -4070,6 +4559,8 @@ async def test_subagent_inbox_cleanup_does_not_unregister_next_turn(
             )
         if request.method == "POST" and request.url.path == "/v1/sessions":
             return httpx.Response(201, json={"id": child_id})
+        if request.method == "PATCH" and request.url.path == f"/v1/sessions/{child_id}":
+            return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
             return httpx.Response(202, json={"queued": True})
         if (
@@ -4795,12 +5286,10 @@ async def test_sys_cancel_task_reports_codex_native_cancel_as_best_effort() -> N
     """
     Unconfirmed codex-native cancel must not promise terminal inbox status.
 
-    Codex-native has no runner-side hard-stop path, so the cancel routes to
-    ``interrupt`` (not ``stop_session``, which the runner 204 no-ops for every
-    non-claude-native harness). For codex-native that interrupt is itself a
-    best-effort no-op — the child can remain running after the POST returns —
-    so the tool result must say cancellation is best-effort instead of telling
-    the parent to wait forever for a terminal inbox item.
+    Codex-native has no runner-side hard-stop path (stop aliases to
+    interrupt), so the cancel routes to ``interrupt`` and the tool result
+    must say cancellation is best-effort instead of telling the parent to
+    wait forever for a terminal inbox item.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
@@ -4845,8 +5334,7 @@ async def test_sys_cancel_task_reports_codex_native_cancel_as_best_effort() -> N
     finally:
         runner_app.unregister_subagent_work(child_id)
 
-    # codex-native routes to interrupt, not stop_session (which the runner
-    # 204 no-ops for non-claude-native harnesses). ``data`` rides along for
+    # Codex-native routes to interrupt; ``data`` rides along for
     # SessionEventInput compatibility with older servers.
     assert stops == [{"type": "interrupt", "data": {}}]
     assert cancel_output == {
@@ -4856,9 +5344,9 @@ async def test_sys_cancel_task_reports_codex_native_cancel_as_best_effort() -> N
         "task_id": child_id,
         "status": "launching",
         "message": (
-            "Interrupt forwarded, but a runner-side hard-stop is not wired "
-            "for codex-native workers yet; the child may keep running and no "
-            "terminal inbox status is guaranteed."
+            "Interrupt forwarded, but no runner-side hard-stop is wired for "
+            "this harness; the child may keep running and no terminal inbox "
+            "status is guaranteed."
         ),
     }
 
@@ -4920,8 +5408,8 @@ async def test_sys_cancel_task_interrupts_non_native_subagent() -> None:
         runner_app.unregister_subagent_work(child_id)
 
     # The regression guard: a non-native child must route to interrupt, never
-    # the stop_session that the runner no-ops for non-claude-native harnesses.
-    # ``data`` rides along for SessionEventInput compatibility with older servers.
+    # ``stop_session``. ``data`` rides along for SessionEventInput compatibility
+    # with older servers.
     assert posts == [{"type": "interrupt", "data": {}}]
     # Not codex → generic (non-best-effort) pending result; the terminal
     # status will arrive on the inbox once the interrupted turn ends.
@@ -4935,6 +5423,579 @@ async def test_sys_cancel_task_interrupts_non_native_subagent() -> None:
             "Use sys_read_inbox to observe terminal status."
         ),
     }
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_stops_terminal_claude_native_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed work status does not block cleanup of a live Claude pane."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    parent_id = "conv_parent_terminal"
+    child_id = "conv_child_terminal"
+    _install_cancel_pane(
+        monkeypatch,
+        wrapper_label="claude-code-native-ui",
+        task_id=child_id,
+        alive=True,
+    )
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="implementation",
+        wrapper_label="claude-code-native-ui",
+    )
+    entry.status = "failed"
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content))
+        entry.status = "cancelled"
+        return httpx.Response(204)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = json.loads(
+                await _cancel_subagent_task(
+                    {"task_id": child_id},
+                    conversation_id=parent_id,
+                    server_client=server_client,
+                )
+            )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+
+    assert posts == [{"type": "stop_session", "data": {}}]
+    assert output == {"cancelled": True, "task_id": child_id, "status": "cancelled"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "cancelled"),
+    [("completed", False), ("cancelled", True)],
+)
+async def test_sys_cancel_task_returns_cached_finished_claude_native_status(
+    status: str,
+    cancelled: bool,
+) -> None:
+    """Finished Claude work does not issue a redundant hard-stop."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    parent_id = "conv_parent_finished"
+    child_id = f"conv_child_{status}"
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="implementation",
+        wrapper_label="claude-code-native-ui",
+    )
+    entry.status = status
+
+    try:
+        output = json.loads(
+            await _cancel_subagent_task(
+                {"task_id": child_id},
+                conversation_id=parent_id,
+                server_client=None,
+            )
+        )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+
+    assert output == {"cancelled": cancelled, "task_id": child_id, "status": status}
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_stops_evicted_claude_native_entry() -> None:
+    """Server metadata restores the cleanup path after local eviction."""
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    parent_id = "conv_parent_evicted"
+    child_id = "conv_child_evicted"
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "parent_session_id": parent_id,
+                    "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+                },
+            )
+        posts.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = json.loads(
+            await _cancel_subagent_task(
+                {"task_id": child_id},
+                conversation_id=parent_id,
+                server_client=server_client,
+            )
+        )
+
+    assert posts == [{"type": "stop_session", "data": {}}]
+    assert output == {"cancelled": True, "task_id": child_id, "status": "cancelled"}
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_rejects_foreign_evicted_entry() -> None:
+    """Eviction recovery cannot stop another parent's child."""
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    child_id = "conv_child_foreign"
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "parent_session_id": "conv_other_parent",
+                    "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+                },
+            )
+        posts.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await _cancel_subagent_task(
+            {"task_id": child_id},
+            conversation_id="conv_requesting_parent",
+            server_client=server_client,
+        )
+
+    assert posts == []
+    assert output == f"Error: no in-flight task with task_id {child_id}"
+
+
+class _CancelPane:
+    """Stand-in pane whose ``is_alive`` answer is fixed for the cancel matrix."""
+
+    def __init__(self, alive: bool) -> None:
+        self.alive = alive
+        self.probed = 0
+
+    async def is_alive(self) -> bool:
+        self.probed += 1
+        return self.alive
+
+
+class _CancelPaneRegistry:
+    """Registry that returns one pane for the expected native ``main`` slot."""
+
+    def __init__(self, pane: _CancelPane | None, terminal_name: str, task_id: str) -> None:
+        self.pane = pane
+        self.terminal_name = terminal_name
+        self.task_id = task_id
+
+    def get(
+        self, conversation_id: str, terminal_name: str, session_key: str
+    ) -> _CancelPane | None:
+        if (
+            conversation_id == self.task_id
+            and terminal_name == self.terminal_name
+            and session_key == "main"
+        ):
+            return self.pane
+        return None
+
+
+def _install_cancel_pane(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    wrapper_label: str,
+    task_id: str,
+    alive: bool | None,
+) -> _CancelPane | None:
+    """Install a fake terminal registry for one native child's ``main`` pane."""
+    from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+
+    agent = native_coding_agent_for_wrapper_label(wrapper_label)
+    assert agent is not None, f"unknown wrapper {wrapper_label!r}"
+    pane = None if alive is None else _CancelPane(alive)
+    registry = _CancelPaneRegistry(pane, agent.terminal_name, task_id)
+
+    def _get_registry() -> _CancelPaneRegistry:
+        return registry
+
+    monkeypatch.setattr("omnigent.runtime.get_terminal_registry", _get_registry)
+    monkeypatch.setattr(
+        "omnigent.runner.tool_dispatch.get_terminal_registry",
+        _get_registry,
+        raising=False,
+    )
+    return pane
+
+
+async def _drive_cancel_matrix_row(
+    *,
+    parent_id: str,
+    child_id: str,
+    wrapper_label: str | None,
+    status: str,
+    http_status: int,
+    evicted: bool,
+    requesting_parent: str,
+) -> tuple[list[dict[str, Any]], Any]:
+    """Run ``_cancel_subagent_task`` for one matrix row and return posts + output."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    if not evicted:
+        entry = runner_app.register_subagent_work(
+            parent_session_id=parent_id,
+            child_session_id=child_id,
+            agent="matrix_impl",
+            title="native",
+            wrapper_label=wrapper_label,
+        )
+        entry.status = status
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{child_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "parent_session_id": parent_id,
+                    "labels": {"omnigent.wrapper": wrapper_label},
+                },
+            )
+        body = json.loads(request.content)
+        posts.append(body)
+        if http_status == 503:
+            return httpx.Response(503, json={"error": "native_stop_failed"})
+        if not evicted and body.get("type") == "stop_session":
+            updated = runner_app.get_subagent_work(child_id)
+            if updated is not None:
+                updated.status = "cancelled"
+        return httpx.Response(http_status)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            raw = await _cancel_subagent_task(
+                {"task_id": child_id},
+                conversation_id=requesting_parent,
+                server_client=server_client,
+            )
+    finally:
+        if not evicted:
+            runner_app.unregister_subagent_work(child_id)
+
+    try:
+        output: Any = json.loads(raw)
+    except json.JSONDecodeError:
+        output = raw
+    return posts, output
+
+
+def _assert_unconfirmed_hard_stop(output: Any, *, task_id: str) -> None:
+    """A 503 hard-stop must not look like a cached terminal / absent result."""
+    assert isinstance(output, dict), f"expected JSON unconfirmed result, got {output!r}"
+    assert output.get("cancelled") is False
+    assert output.get("cancel_requested") is True
+    assert output.get("cancel_confirmed") is False
+    assert output.get("best_effort") is True
+    assert output.get("task_id") == task_id
+    assert output.get("status") not in {"absent", "cancelled"}
+    # Old masking collapsed 503 into these 3-key terminal shapes.
+    assert output != {"cancelled": False, "task_id": task_id, "status": "failed"}
+    assert output != {"cancelled": False, "task_id": task_id, "status": "absent"}
+    message = str(output.get("message", "")).lower()
+    assert "may still be running" in message
+    assert "not confirmed" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "row_id",
+        "wrapper_label",
+        "status",
+        "pane_alive",
+        "http_status",
+        "expect_event",
+        "expect_best_effort",
+        "expect_status",
+        "expect_cancelled",
+    ),
+    [
+        (
+            "claude_running_stop_session",
+            "claude-code-native-ui",
+            "running",
+            None,
+            204,
+            "stop_session",
+            False,
+            "running",
+            None,
+        ),
+        (
+            "goose_running_stop_session",
+            "goose-native-ui",
+            "running",
+            None,
+            204,
+            "stop_session",
+            False,
+            "running",
+            None,
+        ),
+        (
+            "opencode_running_best_effort",
+            "opencode-native-ui",
+            "running",
+            None,
+            204,
+            "interrupt",
+            True,
+            "running",
+            None,
+        ),
+        (
+            "antigravity_running_best_effort",
+            "antigravity-native-ui",
+            "running",
+            None,
+            204,
+            "interrupt",
+            True,
+            "running",
+            None,
+        ),
+        (
+            "failed_dead_pane_cached_failure",
+            "claude-code-native-ui",
+            "failed",
+            False,
+            503,
+            None,
+            False,
+            "failed",
+            False,
+        ),
+        (
+            "failed_live_pane_stop",
+            "goose-native-ui",
+            "failed",
+            True,
+            204,
+            "stop_session",
+            False,
+            "cancelled",
+            True,
+        ),
+        (
+            "failed_live_pane_503_unconfirmed",
+            "claude-code-native-ui",
+            "failed",
+            True,
+            503,
+            "stop_session",
+            True,
+            "unconfirmed",
+            False,
+        ),
+        (
+            "running_stop_503_unconfirmed",
+            "goose-native-ui",
+            "running",
+            None,
+            503,
+            "stop_session",
+            True,
+            "unconfirmed",
+            False,
+        ),
+        (
+            "failed_opencode_cached",
+            "opencode-native-ui",
+            "failed",
+            None,
+            204,
+            None,
+            False,
+            "failed",
+            False,
+        ),
+    ],
+    ids=[
+        "claude_running_stop_session",
+        "goose_running_stop_session",
+        "opencode_running_best_effort",
+        "antigravity_running_best_effort",
+        "failed_dead_pane_cached_failure",
+        "failed_live_pane_stop",
+        "failed_live_pane_503_unconfirmed",
+        "running_stop_503_unconfirmed",
+        "failed_opencode_cached",
+    ],
+)
+async def test_sys_cancel_task_native_harness_cancel_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    row_id: str,
+    wrapper_label: str,
+    status: str,
+    pane_alive: bool | None,
+    http_status: int,
+    expect_event: str | None,
+    expect_best_effort: bool,
+    expect_status: str,
+    expect_cancelled: bool | None,
+) -> None:
+    """Parent cancel must follow the native stop registry, not a Claude label.
+
+    Rows:
+    * ``claude_running_stop_session`` / ``goose_running_stop_session`` — both
+      stop-capable natives must POST ``stop_session``. On main, Goose is
+      routed to ``interrupt``.
+    * ``opencode_running_best_effort`` / ``antigravity_running_best_effort`` —
+      no runner-side hard-stop; result is best-effort/unconfirmed, not a
+      fake kill.
+    * ``failed_dead_pane_cached_failure`` — a failed Claude entry whose pane
+      is gone must return the cached failure. Routing ``stop_session`` at a
+      dead pane answers 503; that must not replace the terminal status.
+    * ``failed_live_pane_stop`` — a failed Goose entry whose pane still
+      answers must POST ``stop_session``. On main, non-Claude failed entries
+      return cached status and never stop.
+    * ``failed_live_pane_503_unconfirmed`` / ``running_stop_503_unconfirmed``
+      — a ``stop_session`` 503 is a failed kill, not a gone pane. Must
+      report explicit unconfirmed/best-effort, never the cached
+      ``failed`` / ``absent`` 3-key terminal shapes.
+    * ``failed_opencode_cached`` — a failed OpenCode entry stays cached;
+      there is no hard-stop to apply.
+    """
+    parent_id = f"conv_parent_{row_id}"
+    child_id = f"conv_child_{row_id}"
+    if pane_alive is not None:
+        _install_cancel_pane(
+            monkeypatch,
+            wrapper_label=wrapper_label,
+            task_id=child_id,
+            alive=pane_alive,
+        )
+    posts, output = await _drive_cancel_matrix_row(
+        parent_id=parent_id,
+        child_id=child_id,
+        wrapper_label=wrapper_label,
+        status=status,
+        http_status=http_status,
+        evicted=False,
+        requesting_parent=parent_id,
+    )
+    if expect_event is None:
+        assert posts == [], f"{row_id}: dead/absent pane must not POST a stop"
+        assert isinstance(output, dict)
+        assert output == {
+            "cancelled": expect_cancelled,
+            "task_id": child_id,
+            "status": expect_status,
+        }
+        assert not str(output).startswith("Error:")
+        return
+    assert posts == [{"type": expect_event, "data": {}}], (
+        f"{row_id}: expected {expect_event} , got {posts}"
+    )
+    if expect_status == "unconfirmed":
+        _assert_unconfirmed_hard_stop(output, task_id=child_id)
+        return
+    assert isinstance(output, dict)
+    assert not str(output).startswith("Error:")
+    if expect_best_effort:
+        assert output.get("best_effort") is True, f"{row_id}: must be explicit best-effort"
+        assert output.get("cancel_confirmed") is False
+        assert output.get("task_id") == child_id
+        assert output.get("status") == expect_status
+        message = str(output.get("message", ""))
+        assert "hard-stop" in message
+        assert "may keep running" in message
+        return
+    if expect_cancelled is not None:
+        assert output == {
+            "cancelled": expect_cancelled,
+            "task_id": child_id,
+            "status": expect_status,
+        }
+        return
+    assert output.get("task_id") == child_id
+    assert output.get("status") in {expect_status, "cancelled"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_id", "requesting_parent", "expect_stop"),
+    [
+        ("evicted_goose_owned_stop", "conv_owner_evicted_goose", True),
+        ("evicted_goose_foreign_refused", "conv_someone_else", False),
+    ],
+    ids=["evicted_goose_owned_stop", "evicted_goose_foreign_refused"],
+)
+async def test_cancel_evicted_native_subagent_ownership_matrix(
+    row_id: str,
+    requesting_parent: str,
+    expect_stop: bool,
+) -> None:
+    """Evicted-work recovery keeps the parent ownership check for every stop-capable native."""
+    owner = "conv_owner_evicted_goose"
+    child_id = f"conv_child_{row_id}"
+    posts, output = await _drive_cancel_matrix_row(
+        parent_id=owner,
+        child_id=child_id,
+        wrapper_label="goose-native-ui",
+        status="running",
+        http_status=204,
+        evicted=True,
+        requesting_parent=requesting_parent,
+    )
+    if expect_stop:
+        assert posts == [{"type": "stop_session", "data": {}}], (
+            f"{row_id}: owned Goose evicted work must hard-stop"
+        )
+        assert output == {"cancelled": True, "task_id": child_id, "status": "cancelled"}
+        return
+    assert posts == [], f"{row_id}: foreign parent must not stop the child"
+    assert isinstance(output, str)
+    assert output.startswith("Error:")
+
+
+@pytest.mark.asyncio
+async def test_cancel_evicted_native_subagent_503_is_unconfirmed() -> None:
+    """Evicted stop 503 must not report ``absent`` as if the pane were gone."""
+    child_id = "conv_child_evicted_503"
+    posts, output = await _drive_cancel_matrix_row(
+        parent_id="conv_owner_evicted_503",
+        child_id=child_id,
+        wrapper_label="goose-native-ui",
+        status="running",
+        http_status=503,
+        evicted=True,
+        requesting_parent="conv_owner_evicted_503",
+    )
+    assert posts == [{"type": "stop_session", "data": {}}]
+    _assert_unconfirmed_hard_stop(output, task_id=child_id)
 
 
 def test_session_status_to_task_status_maps_known_values() -> None:
@@ -5212,6 +6273,75 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
         ("user", "where is the bug"),
         ("assistant", "found it"),
     ]
+
+
+_REST_HISTORY_CONTENT_SCENARIOS = [
+    pytest.param(3000, 4000, "R" * 3000, id="raised-limit"),
+    pytest.param(3000, None, "R" * 2000 + " [truncated]", id="default-limit"),
+    pytest.param(13000, 50000, "R" * 12000 + " [truncated]", id="ceiling"),
+    # No REST request is expected because validation rejects before the GET.
+    pytest.param(None, 0, "content_max_chars must be >= 1", id="non-positive"),
+]
+
+
+@pytest.mark.parametrize(
+    ("content_length", "content_max_chars", "expected"),
+    _REST_HISTORY_CONTENT_SCENARIOS,
+)
+@pytest.mark.asyncio
+async def test_session_peek_rest_content_limit_scenario(
+    content_length: int | None,
+    content_max_chars: int | None,
+    expected: str,
+) -> None:
+    """Apply one history content-limit scenario through runner REST dispatch."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    content = "R" * content_length if content_length is not None else None
+    arguments: dict[str, object] = {"conversation_id": "conv_target"}
+    if content is not None:
+        arguments["tail_items"] = 1
+    if content_max_chars is not None:
+        arguments["content_max_chars"] = content_max_chars
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if content is None:
+            pytest.fail("REST request should not run for rejected arguments")
+        if request.url.path == "/v1/sessions/conv_target/items":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i1",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": content}],
+                        }
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        payload = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps(arguments),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    if "error" in payload:
+        actual = payload["error"]
+    else:
+        assert payload["title"] == "auth"
+        actual = payload["items"][0]["text"]
+    assert actual == expected
 
 
 @pytest.mark.asyncio
@@ -5997,11 +7127,9 @@ async def test_sys_agent_get_projects_agent_metadata() -> None:
 @pytest.mark.asyncio
 async def test_sys_agent_list_degrades_when_sources_fail(tmp_path: Path) -> None:
     """
-    A failing source degrades to an empty section rather than failing the
-    whole call. Here the server 500s both list endpoints and no local
-    config dir exists, so all three sections come back empty — but the
-    tool still returns a well-formed result. If a source error
-    propagated, the tool would return an ``error`` instead.
+    A failing source degrades to an empty, retryable section rather than
+    failing the whole call or claiming that the source is exhausted. Here
+    the server 500s both list endpoints and no local config dir exists.
 
     :param tmp_path: Workspace dir with no agent-config subdir.
     """
@@ -6023,7 +7151,15 @@ async def test_sys_agent_list_degrades_when_sources_fail(tmp_path: Path) -> None
         )
 
     info = json.loads(output)
-    assert info == {"builtins": [], "session_agents": [], "local_configs": []}
+    assert info["builtins"] == []
+    assert info["session_agents"] == []
+    assert info["local_configs"] == []
+    assert info["page"]["has_more"] == {
+        "builtins": True,
+        "session_agents": True,
+        "local_configs": False,
+    }
+    assert isinstance(info["page"]["next_cursor"], str)
 
 
 @pytest.mark.asyncio
@@ -6808,7 +7944,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
     and folds in live runner connectivity from ``GET
-    /v1/runners/{id}/status``.
+    /v1/runners/{id}/status`` and host harness readiness from ``GET
+    /v1/hosts/{id}``.
 
     Proves the full runner-dispatch path: read the session snapshot,
     derive the effective model (a per-session ``model_override`` wins
@@ -6836,7 +7973,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "updated_at": 84,
                     "title": "auth flow",
                     "runner_id": "runner_1",
-                    "host_id": None,
+                    "host_id": "host_1",
                     "reasoning_effort": "high",
                     "parent_session_id": "conv_parent",
                     "sub_agent_name": "researcher",
@@ -6849,6 +7986,11 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
             )
         if request.method == "GET" and request.url.path == "/v1/runners/runner_1/status":
             return httpx.Response(200, json={"runner_id": "runner_1", "online": True})
+        if request.method == "GET" and request.url.path == "/v1/hosts/host_1":
+            return httpx.Response(
+                200,
+                json={"configured_harnesses": {"codex-native": True, "cursor-native": False}},
+            )
         return httpx.Response(404, json={"error": str(request.url)})
 
     async with httpx.AsyncClient(
@@ -6873,6 +8015,11 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     # Live connectivity folded in from the runners status endpoint —
     # None here would mean the best-effort status call was skipped.
     assert info["runner_online"] is True
+    assert info["host_id"] == "host_1"
+    assert info["configured_harnesses"] == {
+        "codex-native": True,
+        "cursor-native": False,
+    }
     assert info["parent_session_id"] == "conv_parent"
     # Effective model: the per-session override wins over the spec
     # default. "anthropic/claude-sonnet-4-6" here would mean the
@@ -6886,6 +8033,64 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     assert info["pending_elicitations"] == [{"id": "el_1"}, {"id": "el_2"}]
     # Metadata-only: the full transcript is never embedded.
     assert "items" not in info
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_response", [httpx.Response(503), httpx.Response(200, text="bad")])
+async def test_sys_session_get_info_tolerates_host_readiness_failure(
+    host_response: httpx.Response,
+) -> None:
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "host_id": "host_1"})
+        if request.url.path == "/v1/hosts/host_1":
+            return host_response
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_target"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert json.loads(output)["configured_harnesses"] is None
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_reports_null_readiness_without_host() -> None:
+    """Skip the host lookup when the session has no bound host."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    host_calls: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "host_id": None})
+        if request.url.path.startswith("/v1/hosts/"):
+            host_calls.append(request.url.path)
+            return httpx.Response(404)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_target"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert json.loads(output)["configured_harnesses"] is None
+    assert host_calls == []
 
 
 @pytest.mark.asyncio
@@ -6936,6 +8141,68 @@ async def test_sys_session_get_info_hides_native_ui_wrapper_agent_name() -> None
 
 
 @pytest.mark.asyncio
+async def test_sys_session_send_failed_continuation_receipts_its_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A continued turn stamped on the child but never sent gets a receipt.
+
+    The dispatch id is written before the message post so a runner restart can
+    find the turn. When the post then fails, the child keeps that stamp with no
+    turn behind it; without the receipt, recovery would replay the previous
+    turn's result as this one after a restart.
+
+    :param monkeypatch: Stubs the runner-local child registration so the
+        dispatch runs without a live runner.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    label_patches: list[dict[str, str]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "parent_session_id": "conv_caller",
+                    "title": "researcher:auth",
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            label_patches.append(json.loads(request.content)["labels"])
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            return httpx.Response(503, json={"error": "child unavailable"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_child", "args": "continue please"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=asyncio.Queue(),
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child")
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    assert output.startswith("Error: failed to send message to child: 503")
+    assert runner_app.get_subagent_work("conv_child") is None
+    stamp, receipt = label_patches
+    dispatch_id = stamp[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY]
+    assert dispatch_id.startswith("subagent_")
+    assert receipt == {runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: dispatch_id}
+
+
+@pytest.mark.asyncio
 async def test_sys_session_send_session_id_posts_to_direct_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6968,6 +8235,8 @@ async def test_sys_session_send_session_id_posts_to_direct_child(
                     "title": "researcher:auth",
                 },
             )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
             event_posts.append(json.loads(request.content))
             return httpx.Response(200, json={"ok": True})
@@ -7259,6 +8528,96 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
 
 
 # ── approval-event flattening (elicitation-approval hang regression) ──────
+
+
+@pytest.mark.parametrize("second_turn", ["background", "known_harness"])
+@pytest.mark.asyncio
+async def test_unresolvable_sub_agent_warns_again_on_later_turns(
+    caplog: pytest.LogCaptureFixture,
+    second_turn: str,
+) -> None:
+    """A parent kept after a miss must not become a resolved child on turn 2.
+
+    Session creation misses on ``sub_agent_name``, warns, and caches the
+    PARENT spec for the session. Later turns read that cache instead of
+    resolving again, and decide "is this the already-resolved child?" by
+    comparing the cached spec's name against the requested name. A root
+    whose own name equals the requested sub-agent satisfies that equality,
+    so the cached parent answers as though it were the child — and the
+    warning that made turn 1 honest never fires again.
+
+    :param caplog: Pytest log capture, read once per turn.
+    :param second_turn: Which dispatch path drives the turn after create.
+    """
+    conv = f"conv_fallback_second_turn_{second_turn}"
+
+    root_spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        instructions="Root instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return root_spec
+
+    recorder = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    pm = _FakeProcessManager(recorder)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            created = await http.post(
+                "/v1/sessions",
+                json={
+                    "session_id": conv,
+                    "agent_id": "ag_root",
+                    "sub_agent_name": "worker",
+                },
+            )
+        assert created.status_code == 201, created.text
+        assert "did not resolve" in caplog.text
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            if second_turn == "background":
+                bg = await http.post(
+                    f"/v1/sessions/{conv}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "ag_root",
+                        "model": "x",
+                        "content": [{"role": "user", "content": "hi"}],
+                    },
+                )
+                assert bg.status_code == 202, bg.text
+                await _await_bg_turn_task(conv)
+                statuses = await _drain_published_statuses(
+                    app.state.session_event_queues, conv, until="idle", timeout=2.0
+                )
+                assert "failed" not in statuses
+            else:
+                streamed = await _post_stream_message(
+                    http,
+                    conv,
+                    agent_id="ag_root",
+                    harness="claude-sdk",
+                    instructions="Caller-supplied instructions.",
+                )
+                assert streamed.status_code == 200, streamed.text
+
+    assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
+        f"The {second_turn} turn reused a PARENT kept after a miss silently; "
+        f"warnings: {caplog.text!r}."
+    )
+    assert recorder.posted_bodies
+    composed = recorder.posted_bodies[-1].get("instructions")
+    assert isinstance(composed, str) and "Root instructions." in composed
 
 
 @pytest.mark.asyncio
@@ -7602,3 +8961,2358 @@ async def test_spawn_async_tool_phase_tool_call_policy_allow(
     item = inbox.get_nowait()
     assert item["status"] == "completed"
     assert item["output"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_dispatch_admits_researcher_without_harness_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """web_fetch's synthesized ``__web_researcher`` passes the dispatch gate,
+    and the child create carries no ``harness_override`` / ``model_override``
+    (#2426).
+
+    The runner never persists ``__web_researcher``, so before the gate/lookup
+    reconciliation the dispatch aborted with "sub-agent '__web_researcher' not
+    found in agent spec". After it, the gate admits the researcher AND the
+    create body is unchanged: ``harness_override`` stays absent (it comes only
+    from an explicit ``args.harness``, never set on the web_fetch path), so the
+    server-side reconstruction that resolves the researcher spec remains
+    authoritative. This locks down that the fix reconciled the local resolvers
+    without altering what is POSTed to ``/v1/sessions``.
+    """
+    import shutil
+
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+    from omnigent.spec.types import BuiltinToolConfig, LLMConfig, ToolsConfig
+    from omnigent.tools.builtins.web_fetch import RESEARCHER_NAME
+
+    # Hermetic bwrap probe: ``build_researcher_spec`` probes PATH for a
+    # no-``os_env`` parent; don't depend on bubblewrap on the test host.
+    monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+
+    parent = AgentSpec(
+        spec_version=1,
+        name="coordinator",
+        llm=LLMConfig(model="openai/gpt-5.4"),
+        executor=ExecutorSpec(max_iterations=40, config={"harness": "claude-sdk"}),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_fetch")]),
+    )
+    # Precondition: the re-parsed bundle does not carry the researcher.
+    assert RESEARCHER_NAME not in [s.name for s in parent.sub_agents]
+
+    create_bodies: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_wf_parent/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_wf_child"})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_wf_child/events":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="web_fetch",
+                arguments=json.dumps({"query": "latest score"}),
+                server_client=server_client,
+                conversation_id="conv_wf_parent",
+                agent_spec=parent,
+                task_id="t1",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_wf_child")
+            runner_app._session_inboxes_ref.pop("conv_wf_parent", None)
+
+    # The gate admitted the researcher -- no "not found in agent spec" error.
+    assert "not found in agent spec" not in output
+    assert len(create_bodies) == 1, "web_fetch must create exactly one researcher child"
+    body = create_bodies[0]
+    assert body["sub_agent_name"] == RESEARCHER_NAME
+    # Acceptance C: server-side reconstruction stays authoritative.
+    assert "harness_override" not in body
+    assert "model_override" not in body
+
+
+# ── cross-process lifecycle desync recovery ── ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_setup_cancel_does_not_leave_active_turn() -> None:
+    """Cancel during SETUP must not leave ``_active_turns`` stale.
+
+    A ``CancelledError`` raised before the streaming phase escapes
+    ``_run_turn_bg``'s ``except Exception``; without the dedicated
+    ``except asyncio.CancelledError`` clause nothing pops ``_active_turns``
+    and every later message buffers forever (the permanent-wedge mode).
+    """
+    conv = "conv_setup_cancel"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        started.set()
+        # Park the turn in the SETUP phase (before the streaming phase).
+        await release.wait()
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+
+        active = app.state.active_turns
+        task = active.get(conv)
+        assert isinstance(task, asyncio.Task)
+
+        # Cancel during SETUP.
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+        # Slot cleared via terminal-cleanup path, not stale.
+        assert conv not in active
+
+
+@pytest.mark.asyncio
+async def test_desync_emits_user_visible_error() -> None:
+    """Recovered desync surfaces a distinct, non-retryable error code.
+
+    With no buffered continuation, ``_resync_turn_state`` publishes a
+    ``session.status: failed`` carrying ``runner_turn_context_desync`` — a
+    code intentionally absent from AP's retryable allowlist so the L2
+    classifier treats it as terminal instead of retry-looping.
+    """
+    conv = "conv_desync_visible"
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app):
+        # Drive the recovery entry directly (no live turn, no buffer).
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+        failed_event = await _drain_failed_status_event(
+            app.state.session_event_queues, conv, timeout=5.0
+        )
+
+    assert conv in app.state.desynced_sessions
+    assert failed_event is not None
+    error = failed_event.get("error")
+    assert isinstance(error, dict)
+    assert error["code"] == "runner_turn_context_desync"
+    assert error["message"]
+
+
+class _SetupBoom(BaseException):
+    """Non-Exception BaseException exercises the terminal-cleanup finally floor."""
+
+
+@pytest.mark.asyncio
+async def test_setup_base_exception_does_not_leave_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BaseException during SETUP must not leave ``_active_turns`` stale.
+
+    A non-``Exception`` ``BaseException`` raised in the BACKGROUND setup phase
+    (here the spawn-env build, the same background-only step the
+    spawn-env-failure test drives) escapes ``_run_turn_bg``'s
+    ``except Exception``. The real ``finally`` floor must still pop the slot —
+    otherwise every later message buffers forever (the permanent-wedge mode).
+    """
+    conv = "conv_setup_base_exc"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    def _raising_build(
+        spec: object, *, cwd: object = None, workdir: object = None
+    ) -> dict[str, str]:
+        del spec, workdir
+        # A BaseException that is NOT an Exception subclass, raised inside the
+        # background setup phase (after the 202).
+        raise _SetupBoom("spawn-env aborted")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._build_claude_sdk_spawn_env",
+        _raising_build,
+    )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+
+        active = app.state.active_turns
+        # Wait for the background turn task to bind, then finish unwinding
+        # through the finally floor (the BaseException propagates out).
+        deadline = asyncio.get_running_loop().time() + 5.0
+        task: asyncio.Task[None] | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            candidate = active.get(conv)
+            if isinstance(candidate, asyncio.Task):
+                task = candidate
+                if task.done():
+                    break
+            elif task is not None:
+                # Slot already cleared by the finally floor.
+                break
+            await asyncio.sleep(0.02)
+
+        # The finally floor popped the slot despite the BaseException — never
+        # left stale (the permanent-wedge failure mode).
+        assert conv not in active
+        # The BaseException propagated out of the task (finally did not swallow).
+        assert task is not None
+        assert task.done() and not task.cancelled()
+        assert isinstance(task.exception(), _SetupBoom)
+
+
+# ── turn-context recovery ──────────────────────────────────────────────────
+#
+# Tests for harness↔runner turn-context recovery (``_resync_turn_state``),
+# policy-verdict delivery failures, and the three-factor causal chain.
+# Consolidated from former test_app_sessions_desync, test_evaluate_policy_desync,
+# and test_desync_live_repro modules.
+
+# ── Helpers shared across recovery tests ──────────────────────────────────
+
+
+def _recovery_request(text: str = "hi") -> _CreateResponseRequest:
+    return _CreateResponseRequest(model="agent", input=text)
+
+
+def _recovery_tool_result(call_id: str, output: str) -> _ToolResultEvent:
+    return _ToolResultEvent(type="tool_result", call_id=call_id, output=output)
+
+
+def _drain_recovery_status_events(queues: dict[str, Any], conv_id: str) -> list[dict[str, Any]]:
+    """Pop every queued ``session.status`` event for *conv_id*."""
+    queue = queues.get(conv_id)
+    out: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if isinstance(event, dict) and event.get("type") == "session.status":
+            out.append(event)
+    return out
+
+
+# ── Verdict-delivery failure tests (from test_evaluate_policy_desync) ─────
+
+
+class _PolicyOkServerClient:
+    """Server client whose evaluate POST returns a real ALLOW verdict."""
+
+    async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+        del json, timeout
+        return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW", "reason": None})
+
+
+class _PolicyDeadChannelHarnessClient:
+    """Harness client whose verdict POST always raises a dead-channel error."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.attempts = 0
+        self._exc = exc
+
+    async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+        del json, timeout
+        self.attempts += 1
+        raise self._exc
+
+
+async def test_verdict_delivery_failure_retries_then_signals() -> None:
+    """A dead-channel verdict POST retries once, then fires on_delivery_failure."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(httpx.RemoteProtocolError("peer closed connection"))
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_xyz",
+        evaluation_id="poleval_1",
+        phase="PHASE_TOOL_CALL",
+        data={"name": "mcp__github__merge_pull_request", "arguments": {}},
+        on_delivery_failure=_on_delivery_failure,
+    )
+
+    assert harness.attempts == 2
+    assert signaled == ["conv_xyz"]
+
+
+async def test_httpcore_read_error_is_treated_as_dead_channel() -> None:
+    """An httpcore-level read error also retries-then-signals."""
+    import httpcore
+
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(httpcore.ReadError("read failed"))
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_abc",
+        evaluation_id="poleval_2",
+        phase="PHASE_LLM_REQUEST",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_abc"]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectError("connection refused"),
+        httpx.ConnectTimeout("connect timed out"),
+    ],
+)
+async def test_connect_failure_is_treated_as_dead_channel(exc: BaseException) -> None:
+    """A connect failure (subprocess already gone) retries-then-signals."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(exc)
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_conn",
+        evaluation_id="poleval_conn",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_conn"]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ReadTimeout("read timed out"),
+        httpx.WriteTimeout("write timed out"),
+        httpx.PoolTimeout("pool timed out"),
+    ],
+)
+async def test_delivery_timeout_is_treated_as_dead_channel(exc: BaseException) -> None:
+    """A verdict-delivery timeout retries-then-signals, not parks for 24h."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(exc)
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_timeout",
+        evaluation_id="poleval_timeout",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_timeout"]
+
+
+async def test_non_2xx_verdict_response_retries_then_signals() -> None:
+    """A non-2xx verdict POST is an unacknowledged delivery: retry then signal."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    class _Non2xxHarness:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+            del json, timeout
+            self.attempts += 1
+            return httpx.Response(500, text="boom")
+
+    harness = _Non2xxHarness()
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_500",
+        evaluation_id="poleval_500",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_500"]
+
+
+async def test_non_transport_delivery_error_signals_without_retry() -> None:
+    """A non-transport delivery error signals without retry."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(ValueError("malformed body"))
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_q",
+        evaluation_id="poleval_3",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 1
+    assert signaled == ["conv_q"]
+
+
+async def test_3xx_verdict_response_is_unacknowledged_and_signals() -> None:
+    """A 3xx verdict response is NOT a 2xx ack: retry then signal."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    class _RedirectHarness:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+            del json, timeout
+            self.attempts += 1
+            return httpx.Response(302, headers={"location": "/elsewhere"})
+
+    harness = _RedirectHarness()
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_3xx",
+        evaluation_id="poleval_3xx",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_3xx"]
+
+
+async def test_successful_delivery_does_not_signal() -> None:
+    """A clean delivery posts exactly once and never signals a recovery."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    class _OkHarness:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+            del json, timeout
+            self.attempts += 1
+            return httpx.Response(200, json={})
+
+    harness = _OkHarness()
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_ok",
+        evaluation_id="poleval_4",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 1
+    assert signaled == []
+
+
+# ── Turn-state recovery tests (from test_app_sessions_desync) ─────────────
+
+
+@pytest.mark.asyncio
+async def test_wedged_session_releases_and_recovers() -> None:
+    """A wedged turn with a buffered message releases promptly.
+
+    Simulates a turn parked on the 24h policy-evaluation future. ``_resync_turn_state``
+    must release it in milliseconds, flag the conversation as needing recovery, and let
+    the buffered continuation bind a fresh turn (which clears the flag).
+    """
+    conv = "conv_recovery_recover"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    forever = asyncio.Event()
+
+    async def _wedged_turn() -> None:
+        await forever.wait()
+
+    async with _recovery_runner_client(app) as http:
+        task = asyncio.create_task(_wedged_turn())
+        app.state.active_turns[conv] = task
+        try:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "follow up"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+            elapsed = loop.time() - t0
+
+            assert elapsed < 2.0, elapsed
+            assert task.cancelled() or task.done()
+            assert conv in app.state.desynced_sessions
+
+            deadline = loop.time() + 3.0
+            while loop.time() < deadline and conv in app.state.desynced_sessions:
+                await asyncio.sleep(0.02)
+            assert conv not in app.state.desynced_sessions
+        finally:
+            forever.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    queue = app.state.session_event_queues.get(conv)
+    recovery_failed = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "session.status"
+            and event.get("status") == "failed"
+            and isinstance(event.get("error"), dict)
+            and event["error"].get("code") == "runner_turn_context_desync"
+        ):
+            recovery_failed.append(event)
+    assert recovery_failed == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_drains_buffer_when_turn_pops_active_slot() -> None:
+    """Recovery drains the buffer even when the cancelled turn self-pops."""
+    conv = "conv_recovery_selfpop"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    forever = asyncio.Event()
+
+    async def _wedged_turn() -> None:
+        try:
+            await forever.wait()
+        except asyncio.CancelledError:
+            app.state.active_turns.pop(conv, None)
+            raise
+
+    async with _recovery_runner_client(app) as http:
+        task = asyncio.create_task(_wedged_turn())
+        app.state.active_turns[conv] = task
+        try:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "follow up"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            loop = asyncio.get_running_loop()
+            await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+            assert task.cancelled() or task.done()
+
+            deadline = loop.time() + 3.0
+            while loop.time() < deadline and conv in app.state.desynced_sessions:
+                await asyncio.sleep(0.02)
+            assert conv not in app.state.desynced_sessions
+        finally:
+            forever.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+async def test_recovery_stream_mode_forwards_interrupt() -> None:
+    """Stream-mode recovery clears the gate and forwards interrupt."""
+    conv = "conv_recovery_streammode"
+    harness = _RecoveryScriptedHarnessClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv not in app.state.active_turns
+    assert {"type": "interrupt"} in harness.patched_events
+
+
+class _DeadInterruptHarnessClient(_RecoveryScriptedHarnessClient):
+    """Scripted harness whose interrupt POST always raises (wedged/dead harness)."""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        raise httpx.ConnectError("harness gone")
+
+
+@pytest.mark.asyncio
+async def test_recovery_stream_mode_clears_gate_even_when_interrupt_fails() -> None:
+    """Stream-mode sentinel clears and buffer drains even on a dead interrupt."""
+    conv = "conv_recovery_streammode_dead"
+    harness = _DeadInterruptHarnessClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app) as http:
+        app.state.active_turns[conv] = None
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag",
+                "model": "x",
+                "content": [{"role": "user", "content": "follow up"}],
+            },
+        )
+        assert resp.status_code == 202, resp.text
+
+        loop = asyncio.get_running_loop()
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+        deadline = loop.time() + 3.0
+        while loop.time() < deadline and conv in app.state.desynced_sessions:
+            await asyncio.sleep(0.02)
+        assert conv not in app.state.desynced_sessions
+
+
+class _InterruptEndsStreamHarnessClient(_RecoveryScriptedHarnessClient):
+    """Interrupt POST succeeds AND drives proxy_stream terminal bookkeeping."""
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            self.app.state.on_proxy_stream_end(self.conv)
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_recovery_stream_mode_publishes_single_terminal_status() -> None:
+    """Stream-mode no-buffer recovery publishes exactly ONE terminal status."""
+    conv = "conv_recovery_single_terminal"
+    harness = _InterruptEndsStreamHarnessClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    queue = app.state.session_event_queues.get(conv)
+    statuses: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if isinstance(ev, dict) and ev.get("type") == "session.status":
+            statuses.append(ev)
+
+    assert len(statuses) == 1, statuses
+    assert statuses[0]["status"] == "failed"
+    assert statuses[0]["error"]["code"] == "runner_turn_context_desync"
+    assert {"type": "interrupt"} in harness.patched_events
+
+
+class _SlotSwapBaseException(BaseException):
+    """A non-Exception raised in setup to exercise the finally floor."""
+
+
+@pytest.mark.asyncio
+async def test_run_turn_bg_finalizer_identity_guard_spares_foreign_slot() -> None:
+    """F2: the ``_run_turn_bg`` finally floor must identity-compare before popping."""
+    conv = "conv_finalizer_identity"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+
+    foreign_task = asyncio.create_task(asyncio.Event().wait())
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        app.state.active_turns[conv] = foreign_task
+        raise _SlotSwapBaseException
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    try:
+        async with _recovery_runner_client(app) as http:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "turn A"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            task = app.state.active_turns.get(conv)
+            assert isinstance(task, asyncio.Task)
+
+            with contextlib.suppress(BaseException):
+                await task
+
+        assert app.state.active_turns.get(conv) is foreign_task
+    finally:
+        foreign_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await foreign_task
+        app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_on_proxy_stream_end_spares_superseded_response() -> None:
+    """BLOCKING-1: a stale stream terminal must not clobber a newer turn's state."""
+    conv = "conv_stream_supersede"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    newer = asyncio.create_task(asyncio.Event().wait())
+    try:
+        app.state.active_turns[conv] = newer
+        app.state.live_response_id[conv] = "resp_new"
+
+        app.state.on_proxy_stream_end(conv, owner_response_id="resp_old")
+
+        assert app.state.active_turns.get(conv) is newer
+        assert app.state.live_response_id.get(conv) == "resp_new"
+        assert conv not in pm.cleared_in_flight
+
+        app.state.on_proxy_stream_end(conv, owner_response_id="resp_new")
+        assert conv not in app.state.active_turns
+        assert conv not in app.state.live_response_id
+        assert conv in pm.cleared_in_flight
+    finally:
+        newer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await newer
+        app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_resync_ownership_gate_ignores_superseded_delivery_failure() -> None:
+    """BLOCKING-2: a delayed verdict-delivery failure must not cancel a newer turn."""
+    conv = "conv_delivery_supersede"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.live_response_id[conv] = "resp_new"
+
+        await app.state.resync_turn_state(
+            conv, "verdict_delivery_channel_dead", owner_response_id="resp_old"
+        )
+
+    assert conv in app.state.active_turns
+    assert app.state.live_response_id.get(conv) == "resp_new"
+    queue = app.state.session_event_queues.get(conv)
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        assert not (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ), ev
+    app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_resync_clears_in_flight_marker_no_buffer() -> None:
+    """B1: an accepted no-buffer resync clears the process-manager in-flight marker."""
+    conv = "conv_resync_inflight"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.live_response_id[conv] = "resp_live"
+        pm.mark_in_flight(conv, "resp_live")
+        assert conv not in pm.cleared_in_flight
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv in pm.cleared_in_flight
+    queue = app.state.session_event_queues.get(conv)
+    failed = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ):
+            failed.append(ev)
+    assert len(failed) == 1, failed
+    app.state.active_turns.pop(conv, None)
+
+
+class _InterruptBindsContinuationClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, bind a continuation AND drain the buffer."""
+
+    app: Any = None
+    conv: str = ""
+    continuation: asyncio.Task[None] | None = None
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            self.app.state.session_message_buffers.pop(self.conv, None)
+            self.continuation = asyncio.create_task(asyncio.Event().wait())
+            self.app.state.turn_bind_epoch[self.conv] = (
+                self.app.state.turn_bind_epoch.get(self.conv, 0) + 1
+            )
+            self.app.state.active_turns[self.conv] = self.continuation
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_does_not_publish_failed_over_drained_continuation() -> None:
+    """NB3: a continuation that binds AND drains the buffer during teardown wins."""
+    conv = "conv_resync_cont_race"
+    harness = _InterruptBindsContinuationClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.session_message_buffers[conv] = [{"content": "follow up"}]
+        try:
+            await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+            assert app.state.active_turns.get(conv) is harness.continuation
+            queue = app.state.session_event_queues.get(conv)
+            while queue is not None and not queue.empty():
+                ev = queue.get_nowait()
+                assert not (
+                    isinstance(ev, dict)
+                    and ev.get("type") == "session.status"
+                    and ev.get("status") == "failed"
+                    and isinstance(ev.get("error"), dict)
+                    and ev["error"].get("code") == "runner_turn_context_desync"
+                ), ev
+        finally:
+            if harness.continuation is not None:
+                harness.continuation.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await harness.continuation
+            app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_resync_removes_completed_stale_task_and_publishes_terminal() -> None:
+    """BLOCKING (round 5): a COMPLETED task in the slot is a corpse, not a continuation."""
+    conv = "conv_resync_corpse"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    done_task = asyncio.create_task(asyncio.sleep(0))
+    await done_task
+    assert done_task.done()
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = done_task
+        app.state.live_response_id[conv] = "resp_dead"
+        pm.mark_in_flight(conv, "resp_dead")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv not in app.state.active_turns
+    assert conv in pm.cleared_in_flight
+    queue = app.state.session_event_queues.get(conv)
+    failed = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ):
+            failed.append(ev)
+    assert len(failed) == 1, failed
+    assert conv not in app.state.active_turns
+
+
+class _CompleteTaskOnInterruptClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, complete the wedged task so it arrives DONE."""
+
+    task: asyncio.Task[None] | None = None
+    release: asyncio.Event | None = None
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt":
+            if self.release is not None:
+                self.release.set()
+            if self.task is not None:
+                with contextlib.suppress(BaseException):
+                    await self.task
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_clears_interrupt_token_when_task_completes_during_teardown() -> None:
+    """Round-6 pre-empt: a task that completes during teardown must not leak its token."""
+    conv = "conv_resync_token_leak"
+    harness = _CompleteTaskOnInterruptClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    release = asyncio.Event()
+
+    async def _turn() -> None:
+        await release.wait()
+
+    task = asyncio.create_task(_turn())
+    harness.task = task
+    harness.release = release
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = task
+        app.state.live_response_id[conv] = "resp_live"
+        pm.mark_in_flight(conv, "resp_live")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert task.done()
+    assert conv not in app.state.interrupted_sessions
+    assert conv not in app.state.active_turns
+    app.state.active_turns.pop(conv, None)
+
+
+class _InterruptBindsStreamContinuationClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, bind a NEW stream=true turn (None sentinel)."""
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            self.app.state.turn_bind_epoch[self.conv] = (
+                self.app.state.turn_bind_epoch.get(self.conv, 0) + 1
+            )
+            self.app.state.active_turns[self.conv] = None
+            self.app.state.live_response_id[self.conv] = "resp_new"
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_does_not_clobber_stream_continuation_reusing_none_sentinel() -> None:
+    """BLOCKING (round 6): a new stream=true turn (None sentinel) is not a corpse."""
+    conv = "conv_resync_stream_reuse"
+    harness = _InterruptBindsStreamContinuationClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.live_response_id[conv] = "resp_old"
+        pm.mark_in_flight(conv, "resp_old")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv in app.state.active_turns
+    assert app.state.live_response_id.get(conv) == "resp_new"
+    queue = app.state.session_event_queues.get(conv)
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        assert not (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ), ev
+    app.state.active_turns.pop(conv, None)
+
+
+class _ReplacementRunsToCompletionClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, run a replacement turn to COMPLETION."""
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            st = self.app.state
+            st.turn_bind_epoch[self.conv] = st.turn_bind_epoch.get(self.conv, 0) + 1
+            st.active_turns[self.conv] = None
+            st.live_response_id[self.conv] = "resp_new"
+            st.on_proxy_stream_end(self.conv, owner_response_id="resp_new")
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_does_not_clobber_replacement_that_finished_during_interrupt() -> None:
+    """BLOCKING (round 7): a replacement that starts AND finishes during teardown wins."""
+    conv = "conv_resync_replacement_done"
+    harness = _ReplacementRunsToCompletionClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.live_response_id[conv] = "resp_old"
+        pm.mark_in_flight(conv, "resp_old")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    queue = app.state.session_event_queues.get(conv)
+    statuses: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if isinstance(ev, dict) and ev.get("type") == "session.status":
+            statuses.append(ev)
+
+    recovery_failed = [
+        s
+        for s in statuses
+        if s.get("status") == "failed"
+        and isinstance(s.get("error"), dict)
+        and s["error"].get("code") == "runner_turn_context_desync"
+    ]
+    assert recovery_failed == [], statuses
+    assert any(s.get("status") == "idle" for s in statuses), statuses
+    app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_delete_session_clears_all_paired_recovery_state() -> None:
+    """A deleted session must not leave recovery state that a same-id recreate inherits."""
+    conv = "conv_delete_recreate"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app) as http:
+        app.state.begin_turn_slot(conv)
+        app.state.desync_terminalized[conv] = app.state.turn_bind_epoch[conv]
+        app.state.desynced_sessions.add(conv)
+
+        resp = await http.request("DELETE", f"/v1/sessions/{conv}")
+        assert resp.status_code in (200, 204), resp.text
+
+    assert conv not in app.state.turn_bind_epoch
+    assert conv not in app.state.desync_terminalized
+    assert conv not in app.state.desynced_sessions
+
+    app.state.begin_turn_slot(conv)
+    app.state.on_proxy_stream_end(conv)
+    queue = app.state.session_event_queues.get(conv)
+    statuses = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if isinstance(ev, dict) and ev.get("type") == "session.status":
+            statuses.append(ev)
+    assert any(s.get("status") == "idle" for s in statuses), statuses
+
+
+class _DeleteRecreateDuringInterruptClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, simulate a same-id delete → recreate mid-await."""
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            st = self.app.state
+            st.active_turns.pop(self.conv, None)
+            st.turn_bind_epoch.pop(self.conv, None)
+            st.desync_terminalized.pop(self.conv, None)
+            st.desynced_sessions.discard(self.conv)
+            st.begin_turn_slot(self.conv)
+            st.live_response_id[self.conv] = "resp_new"
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_does_not_clobber_recreated_session_after_delete_mid_interrupt() -> None:
+    """BLOCKING-class (round 8): a same-id recreate during the interrupt await is not clobbered."""
+    conv = "conv_delete_mid_interrupt"
+    harness = _DeleteRecreateDuringInterruptClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.begin_turn_slot(conv)
+        app.state.live_response_id[conv] = "resp_old"
+        pm.mark_in_flight(conv, "resp_old")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv in app.state.active_turns
+    assert app.state.live_response_id.get(conv) == "resp_new"
+    queue = app.state.session_event_queues.get(conv)
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        assert not (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ), ev
+    app.state.active_turns.pop(conv, None)
+
+
+class _NestedRecoveryDuringInterruptClient(_RecoveryScriptedHarnessClient):
+    """On the OLD recovery's interrupt, bind a replacement AND claim a nested token."""
+
+    app: Any = None
+    conv: str = ""
+    nested_epoch: int = 0
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            st = self.app.state
+            st.begin_turn_slot(self.conv)
+            st.live_response_id[self.conv] = "resp_new"
+            self.nested_epoch = st.turn_bind_epoch[self.conv]
+            st.desync_terminalized[self.conv] = self.nested_epoch
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_old_recovery_does_not_strip_nested_recovery_token() -> None:
+    """BLOCKING (round 9): the old recovery must not pop a nested recovery's token."""
+    conv = "conv_nested_recovery"
+    harness = _NestedRecoveryDuringInterruptClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.begin_turn_slot(conv)
+        app.state.live_response_id[conv] = "resp_old"
+        pm.mark_in_flight(conv, "resp_old")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert app.state.desync_terminalized.get(conv) == harness.nested_epoch
+
+
+# ── Three-factor causal chain tests (from test_desync_live_repro) ─────────
+
+_ADAPTER_LOGGER_RECOVERY = "omnigent.runtime.harnesses._executor_adapter"
+_APP_LOGGER_RECOVERY = "omnigent.runner.app"
+
+_ORPHAN_RESYNC_THRESHOLD_DEFAULT_RECOVERY = _ORPHAN_RESYNC_THRESHOLD
+
+
+class _DispatchParkingExecutor(_RecoveryExecutor):
+    """Inner executor that parks a REAL tool dispatch through production code."""
+
+    def __init__(self, events: list[_RecoveryExecutorEvent] | None = None) -> None:
+        self._events = events or []
+        self.interrupt_calls: list[str] = []
+        self.close_calls = 0
+        self.close_session_calls = 0
+
+    async def run_turn(
+        self,
+        messages: list[_RecoveryMessage],
+        tools: list[_RecoveryToolSpec],
+        system_prompt: str,
+        config: _RecoveryExecutorConfig | None = None,
+    ) -> Any:
+        await self._tool_executor("Bash", {"command": "ls"})  # type: ignore[attr-defined]
+        for event in self._events:
+            yield event
+
+    async def interrupt_session(self, session_key: str) -> bool:
+        self.interrupt_calls.append(session_key)
+        return True
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+    async def close_session(self, session_key: str) -> None:
+        del session_key
+        self.close_session_calls += 1
+
+    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+        del session_key, content
+        return True
+
+
+class _ChainOkServerClient:
+    """Server client whose ``/policies/evaluate`` returns ALLOW."""
+
+    async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+        del json, timeout
+        return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW", "reason": None})
+
+
+class _ChainDeadChannelHarnessClient:
+    """Harness client whose verdict POST raises a real dead-channel error."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.attempts = 0
+        self._exc = exc
+
+    async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+        del json, timeout
+        self.attempts += 1
+        raise self._exc
+
+
+class _HarnessInterruptClient:
+    """Harness HTTP client modelling the runner→harness interrupt hop."""
+
+    def __init__(self, pm: _ChainProcessManager) -> None:
+        self._pm = pm
+
+    async def post(
+        self, _url: str, *, json: dict[str, Any], timeout: Any = None
+    ) -> httpx.Response:
+        del timeout
+        if json.get("type") == "interrupt":
+            task = self._pm.consume_task
+            if task is not None and not task.done():
+                task.cancel()
+        return httpx.Response(200, json={})
+
+    def stream(self, _method: str, _url: str, **_kwargs: Any) -> _ChainEmptyStream:
+        return _ChainEmptyStream()
+
+
+class _ChainEmptyStream:
+    """Async-context-manager stub yielding a 200 response with no SSE frames."""
+
+    status_code = 200
+    headers: dict[str, str] = {}
+
+    async def __aenter__(self) -> _ChainEmptyStream:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+    async def aiter_text(self) -> Any:
+        return
+        yield  # pragma: no cover
+
+
+class _ChainProcessManager:
+    """Process-manager stub for the three-factor chain."""
+
+    handles_tool_dispatch = True
+
+    def __init__(self) -> None:
+        self._sessions: set[str] = set()
+        self.consume_task: asyncio.Task[None] | None = None
+        self.respawn_hook: Any = None
+        self.marked_in_flight: list[tuple[str, str]] = []
+        self.cleared_in_flight: list[str] = []
+
+    def set_respawn_hook(self, hook: Any) -> None:
+        self.respawn_hook = hook
+
+    async def get_client(self, conversation_id: str, harness: str, env: Any = None) -> Any:
+        del harness, env
+        self._sessions.add(conversation_id)
+        return _HarnessInterruptClient(self)
+
+    def has_session(self, conversation_id: str) -> bool:
+        return conversation_id in self._sessions
+
+    def has_active_turn(self, conversation_id: str) -> bool:
+        del conversation_id
+        return False
+
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        self.marked_in_flight.append((conversation_id, response_id))
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        self.cleared_in_flight.append(conversation_id)
+
+    async def forward_cancel(self, conversation_id: str) -> bool:
+        del conversation_id
+        return True
+
+    async def release(self, conversation_id: str) -> None:
+        self._sessions.discard(conversation_id)
+
+
+def _chain_request(text: str = "hi") -> _CreateResponseRequest:
+    return _CreateResponseRequest(model="agent", input=text)
+
+
+def _chain_tool_result(call_id: str, output: str) -> _ToolResultEvent:
+    return _ToolResultEvent(type="tool_result", call_id=call_id, output=output)
+
+
+def _chain_drain_status_events(queues: dict[str, Any], conv_id: str) -> list[dict[str, Any]]:
+    queue = queues.get(conv_id)
+    out: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if isinstance(event, dict) and event.get("type") == "session.status":
+            out.append(event)
+    return out
+
+
+async def _chain_start_turn_stream(
+    adapter: ExecutorAdapter, request: _CreateResponseRequest
+) -> _StreamingResponse:
+    resp = await adapter._start_or_inject_turn(request)
+    assert isinstance(resp, _StreamingResponse), resp
+    return resp
+
+
+async def _chain_drain_stream(body_iterator: Any) -> None:
+    async for _chunk in body_iterator:
+        pass
+
+
+async def _chain_spin_until(predicate: Any, *, limit: int = 200) -> None:
+    for _ in range(limit):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never became true")
+
+
+def _chain_wedged_dispatch_call_id(adapter: ExecutorAdapter) -> str | None:
+    for ctx in adapter._in_flight.values():
+        if ctx._pending_tool_calls:
+            return next(iter(ctx._pending_tool_calls))
+    return None
+
+
+async def _run_three_factor_chain(adapter: ExecutorAdapter) -> tuple[Any, str]:
+    """Wire factors 1→2→3 through real callsites and return the wedged state."""
+    conv = "conv_chain"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+
+    resp = await _chain_start_turn_stream(adapter, _chain_request("primary turn"))
+    consume_task: asyncio.Task[None] = asyncio.create_task(_chain_drain_stream(resp.body_iterator))
+    pm.consume_task = consume_task
+    await _chain_spin_until(lambda: _chain_wedged_dispatch_call_id(adapter) is not None)
+    app.state.active_turns[conv] = None
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        buffered = await client.post(
+            f"/v1/sessions/{conv}/events",
+            json={"type": "message", "role": "user", "content": "queued during the drop"},
+        )
+    assert buffered.status_code == 202
+    assert app.state.session_message_buffers.get(conv)
+
+    async def _on_delivery_failure(cid: str) -> None:
+        await app.state.resync_turn_state(cid, "verdict_delivery_channel_dead")
+
+    harness = _ChainDeadChannelHarnessClient(
+        httpx.RemoteProtocolError("Server disconnected without sending a response")
+    )
+    await _evaluate_policy_via_omnigent(
+        server_client=_ChainOkServerClient(),
+        harness_client=harness,
+        conversation_id=conv,
+        evaluation_id="poleval_chain",
+        phase="PHASE_TOOL_CALL",
+        data={"name": "mcp__github__merge_pull_request", "arguments": {}},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+
+    await asyncio.gather(consume_task, return_exceptions=True)
+    await _chain_spin_until(lambda: adapter._current_ctx is None)
+    return app, conv
+
+
+async def test_three_factor_chain_self_heals_and_recovers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Fix LIVE: the chained recovery fails CLOSED, self-heals, and recovers."""
+    executor = _DispatchParkingExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.ERROR, logger=_ADAPTER_LOGGER_RECOVERY):
+        app, conv = await _run_three_factor_chain(adapter)
+
+        verdict = await adapter._stable_policy_evaluator("PHASE_TOOL_CALL", {})
+        assert verdict.action == "POLICY_ACTION_DENY"
+
+        for _ in range(_ORPHAN_RESYNC_THRESHOLD):
+            result = await adapter._stable_tool_executor("Bash", {"command": "ls"})
+            assert result["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+
+    text = caplog.text
+    assert "defaulting to POLICY_ACTION_DENY" in text
+    assert "returning ALLOW by default" not in text
+    assert "defaulting to POLICY_ACTION_ALLOW" not in text
+    assert "forcing Tier-1 SDK reset" in text
+    assert adapter._orphan_callback_count < _ORPHAN_RESYNC_THRESHOLD
+
+    statuses = _chain_drain_status_events(app.state.session_event_queues, conv)
+    assert all(
+        s.get("error", {}).get("code") != _RUNNER_TURN_CONTEXT_DESYNC_CODE for s in statuses
+    ), statuses
+    assert conv not in app.state.desync_terminalized
+
+    cont_executor = _DispatchParkingExecutor(events=[_RecoveryTurnComplete(response="ok")])
+    adapter._executor_factory = lambda: cont_executor
+    cont_resp = await _chain_start_turn_stream(adapter, _chain_request("continuation work"))
+    cont_consume: asyncio.Task[None] = asyncio.create_task(
+        _chain_drain_stream(cont_resp.body_iterator)
+    )
+
+    await _chain_spin_until(lambda: _chain_wedged_dispatch_call_id(adapter) is not None)
+    cont_call_id = _chain_wedged_dispatch_call_id(adapter)
+    assert cont_call_id is not None and cont_call_id != "call_inflight"
+
+    await adapter._handle_tool_result_event(_chain_tool_result(cont_call_id, "dispatched-live"))
+    await asyncio.gather(cont_consume, return_exceptions=True)
+    await _chain_spin_until(lambda: adapter._current_ctx is None)
+    assert adapter._orphan_callback_count == 0
+
+
+async def test_three_factor_chain_fix_disabled_reproduces_wedge(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NEGATIVE CONTROL: with the fix toggled OFF, the chain WEDGES (from real code)."""
+    monkeypatch.setattr(_adapter_mod_recovery, "FAIL_CLOSED_PHASES", ())
+    monkeypatch.setattr(_adapter_mod_recovery, "_ORPHAN_RESYNC_THRESHOLD", 10**9)
+
+    executor = _DispatchParkingExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.ERROR, logger=_ADAPTER_LOGGER_RECOVERY):
+        await _run_three_factor_chain(adapter)
+
+        verdict = await adapter._stable_policy_evaluator("PHASE_TOOL_CALL", {})
+        assert verdict.action == "POLICY_ACTION_ALLOW"
+
+        n_orphans = _ORPHAN_RESYNC_THRESHOLD_DEFAULT_RECOVERY * 2
+        for _ in range(n_orphans):
+            result = await adapter._stable_tool_executor("Bash", {"command": "ls"})
+            assert result["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+
+    text = caplog.text
+    assert "policy evaluator fired with no active turn context (phase=PHASE_TOOL_CALL" in text
+    assert "defaulting to POLICY_ACTION_ALLOW" in text
+    assert "tool callback fired with no active turn context (tool=" in text
+    assert "returning error" in text
+    assert "forcing Tier-1 SDK reset" not in text
+    assert adapter._orphan_callback_count >= n_orphans
+
+
+async def test_runner_recovery_publishes_single_recovery_terminal_status() -> None:
+    """Fix LIVE (runner half): a recovery signal with NO buffer yields ONE status."""
+    conv = "conv_runner_recovery"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    app.state.active_turns[conv] = None
+
+    async def _on_delivery_failure(cid: str) -> None:
+        await app.state.resync_turn_state(cid, "verdict_delivery_channel_dead")
+
+    harness = _ChainDeadChannelHarnessClient(
+        httpx.RemoteProtocolError("Server disconnected without sending a response")
+    )
+    await _evaluate_policy_via_omnigent(
+        server_client=_ChainOkServerClient(),
+        harness_client=harness,
+        conversation_id=conv,
+        evaluation_id="poleval_runner",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+
+    assert harness.attempts == 2
+    assert conv not in app.state.active_turns
+    statuses = _chain_drain_status_events(app.state.session_event_queues, conv)
+    assert len(statuses) == 1, statuses
+    assert statuses[0]["status"] == "failed"
+    assert statuses[0]["error"]["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+    assert conv in app.state.desync_terminalized
+
+
+async def test_negative_control_runner_legacy_swallow_leaves_turn_wedged() -> None:
+    """NEGATIVE CONTROL (runner half): legacy log-and-swallow leaves the wedge."""
+    conv = "conv_legacy_wedge"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    app.state.active_turns[conv] = None
+
+    harness = _ChainDeadChannelHarnessClient(
+        httpx.RemoteProtocolError("Server disconnected without sending a response")
+    )
+    await _evaluate_policy_via_omnigent(
+        server_client=_ChainOkServerClient(),
+        harness_client=harness,
+        conversation_id=conv,
+        evaluation_id="poleval_legacy",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=None,
+    )
+
+    assert conv in app.state.active_turns
+    assert _chain_drain_status_events(app.state.session_event_queues, conv) == []
+    assert conv not in app.state.desync_terminalized
+
+
+def _fake_entry(harness: str, model: str | None, returncode: int | None = None) -> Any:
+    """Build a ``_SubprocessEntry`` with a fake process + client."""
+    from omnigent.runtime.harnesses.process_manager import _SubprocessEntry
+
+    class _FakeProc:
+        def __init__(self, rc: int | None) -> None:
+            self.returncode = rc
+
+    return _SubprocessEntry(
+        process=_FakeProc(returncode),  # type: ignore[arg-type]
+        client=object(),  # type: ignore[arg-type]
+        endpoint=None,  # type: ignore[arg-type]
+        harness=harness,
+        model=model,
+    )
+
+
+async def test_get_client_signals_resync_on_model_and_agent_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gap 1 (process-manager half): a model/agent-switch respawn fires the hook."""
+    from omnigent.runtime.harnesses.process_manager import (
+        HarnessProcessManager,
+        _model_env_key,
+    )
+
+    pm = HarnessProcessManager()
+    pm._started = True
+    signals: list[tuple[str, str, str]] = []
+
+    async def _hook(conv_id: str, reason: str, replaced_response_id: str) -> None:
+        signals.append((conv_id, reason, replaced_response_id))
+
+    pm.set_respawn_hook(_hook)
+
+    closed: list[Any] = []
+
+    async def _fake_close(entry: Any) -> None:
+        closed.append(entry)
+
+    async def _fake_spawn(conv_id: str, harness: str, env: Any) -> Any:
+        del conv_id
+        return _fake_entry(harness, (env or {}).get(_model_env_key(harness)))
+
+    monkeypatch.setattr(pm, "_close_entry", _fake_close)
+    monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
+
+    conv = "conv_pm_switch"
+    harness = "claude-sdk"
+    model_key = _model_env_key(harness)
+
+    pm._entries[conv] = _fake_entry(harness, "model-A")
+    pm._in_flight_response_ids[conv] = "resp_live_1"
+
+    await pm.get_client(conv, harness, env={model_key: "model-B"})
+    assert signals == [(conv, "harness_respawn_model_switch", "resp_live_1")]
+    assert len(closed) == 1
+
+    signals.clear()
+    await pm.get_client(conv, harness, env={model_key: "model-B"})
+    assert signals == []
+
+    signals.clear()
+    pm._in_flight_response_ids[conv] = "resp_live_2"
+    await pm.get_client(conv, "openai-agents", env={})
+    assert signals == [(conv, "harness_respawn_agent_switch", "resp_live_2")]
+
+    signals.clear()
+    pm._entries[conv] = _fake_entry("openai-agents", "model-A")
+    pm._in_flight_response_ids.pop(conv, None)
+    await pm.get_client(conv, "openai-agents", env={model_key: "model-B"})
+    assert signals == []
+
+    signals.clear()
+    pm._entries[conv] = _fake_entry("openai-agents", None, returncode=1)
+    pm._in_flight_response_ids[conv] = "resp_dead"
+    await pm.get_client(conv, "openai-agents", env={})
+    assert signals == []
+
+
+async def test_get_client_isolates_respawn_hook_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising respawn hook must NOT break harness acquisition."""
+    from omnigent.runtime.harnesses.process_manager import (
+        HarnessProcessManager,
+        _model_env_key,
+    )
+
+    pm = HarnessProcessManager()
+    pm._started = True
+
+    async def _boom_hook(conv_id: str, reason: str, replaced_response_id: str) -> None:
+        del conv_id, reason, replaced_response_id
+        raise RuntimeError("resync adapter blew up")
+
+    pm.set_respawn_hook(_boom_hook)
+
+    async def _fake_close(entry: Any) -> None:
+        del entry
+
+    spawned: list[Any] = []
+
+    async def _fake_spawn(conv_id: str, harness: str, env: Any) -> Any:
+        del conv_id
+        entry = _fake_entry(harness, (env or {}).get(_model_env_key(harness)))
+        spawned.append(entry)
+        return entry
+
+    monkeypatch.setattr(pm, "_close_entry", _fake_close)
+    monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
+
+    conv = "conv_pm_hook_boom"
+    harness = "claude-sdk"
+    model_key = _model_env_key(harness)
+    pm._entries[conv] = _fake_entry(harness, "model-A")
+    pm._in_flight_response_ids[conv] = "resp_live"
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.runtime.harnesses.process_manager"):
+        client = await pm.get_client(conv, harness, env={model_key: "model-B"})
+
+    assert spawned
+    assert client is spawned[-1].client
+    assert pm._entries[conv] is spawned[-1]
+    assert "respawn resync hook failed" in caplog.text
+
+
+async def test_respawn_adapter_gates_on_active_turn() -> None:
+    """Gap 1 (runner gate): the respawn adapter only resyncs the MATCHING turn."""
+    conv = "conv_respawn_gate"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    assert pm.respawn_hook is not None
+
+    await pm.respawn_hook(conv, "harness_respawn_model_switch", "resp_gone")
+    assert _chain_drain_status_events(app.state.session_event_queues, conv) == []
+    assert conv not in app.state.desync_terminalized
+
+    app.state.active_turns[conv] = None
+    app.state.live_response_id[conv] = "resp_new"
+    await pm.respawn_hook(conv, "harness_respawn_model_switch", "resp_old")
+    assert conv in app.state.active_turns
+    assert _chain_drain_status_events(app.state.session_event_queues, conv) == []
+
+    app.state.active_turns[conv] = None
+    app.state.live_response_id[conv] = "resp_wedged"
+    await pm.respawn_hook(conv, "harness_respawn_model_switch", "resp_wedged")
+    assert conv not in app.state.active_turns
+    statuses = _chain_drain_status_events(app.state.session_event_queues, conv)
+    assert len(statuses) == 1, statuses
+    assert statuses[0]["status"] == "failed"
+    assert statuses[0]["error"]["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+
+
+async def _run_respawn_chain(
+    adapter: ExecutorAdapter,
+) -> tuple[Any, str, asyncio.Task[None], _ChainProcessManager]:
+    """Wire a real in-flight turn + buffered message, then fire the respawn hook."""
+    conv = "conv_respawn_chain"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    assert pm.respawn_hook is not None
+
+    resp = await _chain_start_turn_stream(adapter, _chain_request("primary turn"))
+    consume_task: asyncio.Task[None] = asyncio.create_task(_chain_drain_stream(resp.body_iterator))
+    pm.consume_task = consume_task
+    await _chain_spin_until(lambda: _chain_wedged_dispatch_call_id(adapter) is not None)
+    app.state.active_turns[conv] = None
+    app.state.live_response_id[conv] = "resp_wedged"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        buffered = await client.post(
+            f"/v1/sessions/{conv}/events",
+            json={"type": "message", "role": "user", "content": "after the switch"},
+        )
+    assert buffered.status_code == 202
+    assert app.state.session_message_buffers.get(conv)
+
+    assert adapter._orphan_callback_count == 0
+    await pm.respawn_hook(conv, "harness_respawn_model_switch", "resp_wedged")
+    return app, conv, consume_task, pm
+
+
+async def test_model_switch_mid_turn_orphan_burst_next_turn_recovers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Gap 1+2 headline: mid-turn model switch → resync at respawn → recovers."""
+    executor = _DispatchParkingExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.ERROR, logger=_ADAPTER_LOGGER_RECOVERY):
+        app, conv, consume_task, pm = await _run_respawn_chain(adapter)
+
+        assert conv not in app.state.active_turns
+        await asyncio.gather(consume_task, return_exceptions=True)
+        await _chain_spin_until(lambda: adapter._current_ctx is None)
+        statuses = _chain_drain_status_events(app.state.session_event_queues, conv)
+        assert all(
+            s.get("error", {}).get("code") != _RUNNER_TURN_CONTEXT_DESYNC_CODE for s in statuses
+        ), statuses
+
+        await _chain_spin_until(
+            lambda: (
+                conv not in app.state.desynced_sessions
+                and not app.state.session_message_buffers.get(conv)
+                and conv in pm.cleared_in_flight
+            )
+        )
+        assert conv not in app.state.desynced_sessions
+        assert not app.state.session_message_buffers.get(conv)
+        assert conv in pm.cleared_in_flight
+
+        adapter._ensure_executor()
+        out = await adapter._stable_tool_executor("sys_os_shell", {"command": "ls"})
+        assert out["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+        assert adapter._executor is None
+
+    assert "forcing Tier-1 SDK reset" in caplog.text
+
+    cont_executor = _DispatchParkingExecutor(events=[_RecoveryTurnComplete(response="ok")])
+    adapter._executor_factory = lambda: cont_executor
+    cont_resp = await _chain_start_turn_stream(adapter, _chain_request("continuation work"))
+    cont_consume: asyncio.Task[None] = asyncio.create_task(
+        _chain_drain_stream(cont_resp.body_iterator)
+    )
+    await _chain_spin_until(lambda: _chain_wedged_dispatch_call_id(adapter) is not None)
+    cont_call_id = _chain_wedged_dispatch_call_id(adapter)
+    assert cont_call_id is not None
+    await adapter._handle_tool_result_event(_chain_tool_result(cont_call_id, "dispatched-live"))
+    await asyncio.gather(cont_consume, return_exceptions=True)
+    await _chain_spin_until(lambda: adapter._current_ctx is None)
+    assert adapter._orphan_callback_count == 0
+
+
+async def test_respawn_without_hook_leaves_turn_wedged() -> None:
+    """NEGATIVE CONTROL (gap 1): no respawn signal → the turn stays wedged."""
+    conv = "conv_respawn_nohook"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    app.state.active_turns[conv] = None
+    app.state.session_message_buffers[conv] = [
+        {"content": "after the switch", "conversation_id": conv}
+    ]
+
+    assert conv in app.state.active_turns
+    assert _chain_drain_status_events(app.state.session_event_queues, conv) == []
+    assert conv not in app.state.desync_terminalized
+    assert app.state.session_message_buffers.get(conv)
+
+
+async def test_factor2_verdict_post_remoteprotocolerror_retries_then_signals() -> None:
+    """Factor #2: the verdict POST raising ``RemoteProtocolError`` signals recovery."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _ChainDeadChannelHarnessClient(
+        httpx.RemoteProtocolError("Server disconnected without sending a response")
+    )
+    await _evaluate_policy_via_omnigent(
+        server_client=_ChainOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_factor2",
+        evaluation_id="poleval_factor2",
+        phase="PHASE_TOOL_CALL",
+        data={"name": "mcp__github__merge_pull_request", "arguments": {}},
+        on_delivery_failure=_on_delivery_failure,
+    )
+
+    assert harness.attempts == 2
+    assert signaled == ["conv_factor2"]
+
+
+async def test_factor3_new_message_lands_in_real_buffer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Factor #3: a new message lands in the real ``buffering ...`` branch."""
+    conv = "conv_factor3"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.active_turns[conv] = None
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        with caplog.at_level(logging.INFO, logger=_APP_LOGGER_RECOVERY):
+            resp = await client.post(
+                f"/v1/sessions/{conv}/events",
+                json={"type": "message", "role": "user", "content": "second message"},
+            )
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["status"] == "buffered"
+    assert "buffering message for active turn" in caplog.text
+    buffered = app.state.session_message_buffers.get(conv)
+    assert buffered
+    assert buffered[-1]["content"] == "second message"
+    assert buffered[-1]["conversation_id"] == conv
+
+
+_CONTRACT_PARENT_WITH_CHILD = {
+    "name": "root",
+    "instructions": "Root instructions.",
+    "child": "worker",
+    "child_instructions": "Worker instructions.",
+}
+
+
+def _contract_root_spec(*, with_child: bool) -> AgentSpec:
+    """Build the contract test's parent spec, with or without the child."""
+    return AgentSpec(
+        spec_version=1,
+        name=_CONTRACT_PARENT_WITH_CHILD["name"],
+        instructions=_CONTRACT_PARENT_WITH_CHILD["instructions"],
+        executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        sub_agents=(
+            [
+                AgentSpec(
+                    spec_version=1,
+                    name=_CONTRACT_PARENT_WITH_CHILD["child"],
+                    instructions=_CONTRACT_PARENT_WITH_CHILD["child_instructions"],
+                    executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+                )
+            ]
+            if with_child
+            else []
+        ),
+    )
+
+
+class _ContractSnapshotClient(NullServerClient):
+    """Session snapshot naming the requested sub-agent."""
+
+    def __init__(self, conv: str) -> None:
+        super().__init__()
+        self._conv = conv
+
+    async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+        del kwargs
+        _conv = self._conv
+
+        class _Resp(NullServerClient._Response):
+            status_code = 200
+
+            def json(self) -> dict[str, object]:
+                return {"agent_id": "ag_contract_root", "sub_agent_name": "worker"}
+
+        if url.endswith(f"/v1/sessions/{_conv}"):
+            return _Resp()
+        return await super().get(url)
+
+
+_CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
+
+
+async def _contract_run_no_harness(
+    http: httpx.AsyncClient, conv: str, recording: _RecordingHarnessClient
+) -> dict[str, Any]:
+    """Adapter 1: direct ``?stream=true`` with no harness in the body."""
+    resp = await http.post(
+        f"/v1/sessions/{conv}/events?stream=true",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": "ag_contract_root",
+            "model": "x",
+            "content": [],
+        },
+    )
+    return {
+        "status": resp.status_code,
+        "error": (resp.json().get("error") if resp.status_code >= 400 else None),
+        "instructions": (
+            recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
+        ),
+    }
+
+
+async def _contract_run_known_harness(
+    http: httpx.AsyncClient, conv: str, recording: _RecordingHarnessClient
+) -> dict[str, Any]:
+    """Adapter 2: direct ``?stream=true`` with the harness already known."""
+    resp = await http.post(
+        f"/v1/sessions/{conv}/events?stream=true",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": "ag_contract_root",
+            "harness": "hermes",
+            "model": "x",
+            "content": [],
+            "instructions": _CONTRACT_CALLER_INSTRUCTIONS,
+        },
+    )
+    return {
+        "status": resp.status_code,
+        "error": (resp.json().get("error") if resp.status_code >= 400 else None),
+        "instructions": (
+            recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
+        ),
+    }
+
+
+async def _contract_run_background(
+    http: httpx.AsyncClient, conv: str, recording: _RecordingHarnessClient
+) -> dict[str, Any]:
+    """Adapter 3: background non-stream dispatch."""
+    resp = await http.post(
+        f"/v1/sessions/{conv}/events",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": "ag_contract_root",
+            "model": "x",
+            "content": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    await _await_bg_turn_task(conv)
+    return {
+        "status": resp.status_code,
+        "terminal_status": None,  # populated by the caller with app.state access
+        "instructions": (
+            recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
+        ),
+    }
+
+
+_CONTRACT_ADAPTERS = {
+    "no_harness": _contract_run_no_harness,
+    "known_harness": _contract_run_known_harness,
+    "background": _contract_run_background,
+}
+
+
+def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
+    """Build the scenario's ``spec_resolver``.
+
+    :param scenario: Contract scenario key.
+    :param calls: Mutable list each invocation appends to, so a scenario can
+        assert how many resolutions a path actually performed.
+    :returns: An async resolver matching that scenario's failure mode.
+    """
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec | None:
+        del session_id
+        calls.append(agent_id)
+        if scenario == "resolver_raises":
+            raise RuntimeError("contract: resolver unavailable")
+        if scenario == "resolver_none":
+            return None
+        return _contract_root_spec(with_child=(scenario != "child_missing"))
+
+    return _resolver
+
+
+@pytest.mark.parametrize(
+    "scenario, path, expected",
+    [
+        # child present: all paths select the same child spec.
+        pytest.param(
+            "child_present",
+            "no_harness",
+            {"status": 200, "instructions": "Worker instructions."},
+            id="child_present-no_harness",
+        ),
+        pytest.param(
+            "child_present",
+            "known_harness",
+            # same child; caller text composes additively on top.
+            {
+                "status": 200,
+                "instructions": (f"Worker instructions.\n\n{_CONTRACT_CALLER_INSTRUCTIONS}"),
+            },
+            id="child_present-known_harness",
+        ),
+        pytest.param(
+            "child_present",
+            "background",
+            {"terminal_status": "idle", "instructions": "Worker instructions."},
+            id="child_present-background",
+        ),
+        # child missing: all paths agree — warn, fall back to the parent spec.
+        pytest.param(
+            "child_missing",
+            "no_harness",
+            {"status": 200, "error": None, "instructions": "Root instructions."},
+            id="child_missing-no_harness-parent",
+        ),
+        pytest.param(
+            "child_missing",
+            "known_harness",
+            # same shape as child_present — caller text still composes additively.
+            {
+                "status": 200,
+                "instructions": (f"Root instructions.\n\n{_CONTRACT_CALLER_INSTRUCTIONS}"),
+            },
+            id="child_missing-known_harness-parent",
+        ),
+        pytest.param(
+            "child_missing",
+            "background",
+            {"status": 202, "terminal_status": "idle", "instructions": "Root instructions."},
+            id="child_missing-background-parent",
+        ),
+        # ── Resolver raises: same three-way split, different trigger.
+        pytest.param(
+            "resolver_raises",
+            "no_harness",
+            {"status": 503, "error": "spec_resolver_failed"},
+            id="resolver_raises-no_harness-503",
+        ),
+        pytest.param(
+            "resolver_raises",
+            "known_harness",
+            {"status": 200, "instructions": _CONTRACT_CALLER_INSTRUCTIONS},
+            id="resolver_raises-known_harness-degrades",
+        ),
+        pytest.param(
+            "resolver_raises",
+            "background",
+            {"status": 202, "terminal_status": "failed"},
+            id="resolver_raises-background-async-failure",
+        ),
+        # resolver returns None: treated the same as resolver_raises after #5505.
+        pytest.param(
+            "resolver_none",
+            "no_harness",
+            {"status": 503, "error": "spec_resolver_failed"},
+            id="resolver_none-no_harness-503",
+        ),
+        pytest.param(
+            "resolver_none",
+            "known_harness",
+            {"status": 200, "instructions": _CONTRACT_CALLER_INSTRUCTIONS},
+            id="resolver_none-known_harness-continues-unknown-spec",
+        ),
+        pytest.param(
+            "resolver_none",
+            "background",
+            # resolver called twice: once in bg setup, once in _resolve_harness_config.
+            {
+                "status": 202,
+                "terminal_status": "failed",
+                "resolver_calls": 2,
+            },
+            id="resolver_none-background",
+        ),
+        # cache hit: resolver_calls == 1 is the load-bearing assertion.
+        pytest.param(
+            "cache_holds_child",
+            "background",
+            {
+                "terminal_status": "idle",
+                "instructions": "Worker instructions.",
+                "resolver_calls": 1,
+            },
+            id="cache_holds_child-background-shortcut",
+        ),
+        pytest.param(
+            "cache_holds_child",
+            "known_harness",
+            {
+                "status": 200,
+                "instructions": (f"Worker instructions.\n\n{_CONTRACT_CALLER_INSTRUCTIONS}"),
+                "resolver_calls": 1,
+            },
+            id="cache_holds_child-known_harness-shortcut",
+        ),
+        # no_harness path resolves a second time even with a cached child.
+        pytest.param(
+            "cache_holds_child",
+            "no_harness",
+            {"status": 200, "instructions": "Worker instructions.", "resolver_calls": 2},
+            id="cache_holds_child-no_harness-resolves-again",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cross_path_resolution_contract(
+    scenario: str,
+    path: str,
+    expected: dict[str, Any],
+) -> None:
+    """Pin the resolution behaviour matrix across all three dispatch paths.
+
+    Reading the table: ``child_present`` and ``child_missing`` are the
+    scenarios where all three paths agree, and for ``child_missing`` the
+    agreement is load-bearing — an unresolvable ``sub_agent_name`` gets one
+    answer (warn, then the parent's spec) no matter which transport asked.
+    The remaining scenarios still record transport-driven differences that
+    are intended: a synchronous 503, graceful degradation preserving the
+    caller's own instructions, and an asynchronous terminal ``failed``
+    against a 202 that has already gone out. Those differences come from
+    what each transport can report, not from differing answers.
+
+    If you change one path and a row here starts failing, that is the point:
+    decide whether the contract moved, do not quietly re-align the table.
+
+    :param scenario: Which resolution outcome the fake resolver produces.
+    :param path: Which dispatch path adapter drives the turn.
+    :param expected: Subset of the adapter's normalized result to assert.
+    """
+    conv = f"conv_contract_{scenario}_{path}"
+    calls: list[str] = []
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=_contract_resolver_for(scenario, calls),
+        server_client=_ContractSnapshotClient(conv),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        if scenario == "cache_holds_child":
+            # Session-create resolves "worker" and caches the CHILD spec
+            # directly, which is the common real shape. The dispatch below
+            # must then reuse it rather than resolving again.
+            created = await http.post(
+                "/v1/sessions",
+                json={
+                    "session_id": conv,
+                    "agent_id": "ag_contract_root",
+                    "sub_agent_name": "worker",
+                },
+            )
+            assert created.status_code == 201, created.text
+            assert len(calls) == 1, f"session-create should resolve once, got {calls!r}"
+        result = await _CONTRACT_ADAPTERS[path](http, conv, recording)
+        if path == "background" and result.get("terminal_status") is None:
+            # Background adapter needs the app's queue to drain terminal status.
+            statuses = await _drain_published_statuses(
+                app.state.session_event_queues, conv, until="failed", timeout=2.0
+            )
+            result["terminal_status"] = statuses[-1] if statuses else None
+    result["resolver_calls"] = len(calls)
+
+    for key, want in expected.items():
+        assert result.get(key) == want, (
+            f"cross-path contract drift: scenario={scenario!r} path={path!r} "
+            f"key={key!r} expected {want!r}, got {result.get(key)!r}. "
+            f"Full observed result: {result!r}. If this change is intended, "
+            f"update the matrix deliberately — where paths differ, they differ "
+            f"because their transports report differently, not because they "
+            f"answer the same question differently."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _response_failed_event source propagation
+# ---------------------------------------------------------------------------
+
+
+def test_response_failed_event_default_source_is_execution() -> None:
+    """``_response_failed_event`` without explicit source encodes ``"execution"``."""
+    import json as _json
+
+    from omnigent.runner.app import _response_failed_event
+
+    raw = _response_failed_event({"code": "connection_error", "message": "dropped"})
+    payload = _json.loads(raw.decode().split("data: ", 1)[1])
+    assert payload["source"] == "execution"
+
+
+def test_response_failed_event_llm_source_is_preserved() -> None:
+    """``_response_failed_event(source="llm")`` encodes ``"llm"`` for inference faults."""
+    import json as _json
+
+    from omnigent.runner.app import _response_failed_event
+
+    raw = _response_failed_event(
+        {"code": "context_length_exceeded", "message": "too long"},
+        source="llm",
+    )
+    payload = _json.loads(raw.decode().split("data: ", 1)[1])
+    assert payload["source"] == "llm"

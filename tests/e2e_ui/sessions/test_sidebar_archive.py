@@ -1,10 +1,11 @@
 """Browser e2e for archiving a session from the sidebar.
 
-The row kebab's "Archive" item fires a single
-``PATCH /v1/sessions/{id}`` with ``archived: true``; the row shows a
-transient "Archiving…" status and then drops out of the default list
-(archived sessions live on the Settings page). The runner stop is the
-server's job, spawned in the background once the flag commits.
+The row kebab's "Archive" item fires a single ``PATCH /v1/sessions/{id}``
+with ``archived: true``. The row leaves the sidebar optimistically — the
+cached ``archived`` flag flips in ``onMutate`` and the sidebar filters
+archived rows out client-side — and the server stops the session in the
+background once the flag commits. Archived sessions live on the Settings
+page, not the sidebar.
 
 This asserts both halves of a real archive:
 
@@ -89,10 +90,14 @@ def test_archive_session_removes_row_without_stop_event(
     row.get_by_test_id("conversation-actions").click()
     page.get_by_test_id("archive-conversation").click()
 
-    # The row drops out of the default sidebar list: it first swaps to a
-    # transient "Archiving…" status (no href) while the PATCH is in
-    # flight, then unmounts entirely once the list refetches without it.
+    # The row drops out of the default sidebar list immediately: the cached
+    # ``archived`` flag flips optimistically in onMutate and the sidebar filters
+    # archived rows out client-side, so the row unmounts on the next frame.
     expect(page.locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+
+    # Archiving the *active* session redirects to home so the user isn't
+    # stranded on a stale URL with no sidebar row to navigate from.
+    page.wait_for_url(f"{base_url}/", timeout=10_000)
 
     # And the archive is durable: the store row carries the flag, not
     # just the client cache. Poll — the list refetch that unmounts the

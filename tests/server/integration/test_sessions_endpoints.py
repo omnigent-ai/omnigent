@@ -14,17 +14,28 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
+from omnigent.entities import (
+    USER_SESSION_TITLE_MAX_CHARS,
+    MessageData,
+    NewConversationItem,
+)
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
-from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+from omnigent.server.routes._sessions.helpers import (
+    _NativeTerminalEnsureOutcome,
+    _RunnerForwardResult,
+)
 from omnigent.spec.types import SkillSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -203,6 +214,148 @@ async def test_first_message_schedules_background_semantic_title(
     await coordinator.wait_for_idle()
     snapshot = await client.get(f"/v1/sessions/{session['id']}")
     assert snapshot.json()["title"] == "Debug authentication timeout"
+
+
+async def test_create_titled_session_keeps_title_after_first_message(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session named at creation is never auto-renamed.
+
+    The background title pipeline only runs on untitled conversations, so
+    the first user turn must leave a create-time title untouched and must
+    not invoke the generator at all.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="canvas-layout")
+    assert session["title"] == "canvas-layout"
+
+    generator_calls: list[BackgroundTitleRequest] = []
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        generator_calls.append(request)
+        return "Generated title that must not land"
+
+    coordinator = app.state.background_title_coordinator
+    coordinator._generator = generator
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "please investigate the authentication timeout",
+                        }
+                    ],
+                },
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert response.status_code == 202, response.text
+    # Scheduling happens inline in the events handler, so after the response
+    # and a drained coordinator nothing more can arrive.
+    await coordinator.wait_for_idle()
+    assert generator_calls == []
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "canvas-layout"
+
+
+async def test_sidebar_rename_wins_in_flight_background_title(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sidebar rename while the background title is in flight is never clobbered.
+
+    End-to-end version of the coordinator-level race test: the first message
+    seeds a title and schedules generation, the user renames from the sidebar
+    (PATCH) before generation finishes, and the generated title must not land.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    generator_started = asyncio.Event()
+    release_generator = asyncio.Event()
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        generator_started.set()
+        await release_generator.wait()
+        return "Generated title that must not land"
+
+    coordinator = app.state.background_title_coordinator
+    coordinator._generator = generator
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "please investigate the authentication timeout",
+                        }
+                    ],
+                },
+            },
+        )
+        assert response.status_code == 202, response.text
+        # The background attempt is mid-generation when the user renames.
+        await asyncio.wait_for(generator_started.wait(), timeout=5)
+        renamed = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"title": "My sidebar name"},
+        )
+        assert renamed.status_code == 200, renamed.text
+        release_generator.set()
+        await coordinator.wait_for_idle()
+    finally:
+        release_generator.set()
+        await fake_runner.aclose()
+
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "My sidebar name"
 
 
 async def test_background_title_failure_does_not_break_subsequent_user_turn(
@@ -892,6 +1045,207 @@ async def test_external_subagent_start_mints_child_session(
     assert child["labels"]["omnigent.claude_native.description"] == "Trace the auth flow"
 
 
+async def test_external_acp_subagent_start_mints_child_without_a_vendor_wrapper(
+    client: httpx.AsyncClient,
+) -> None:
+    """An ACP sub-agent child carries no native wrapper label.
+
+    That absence is the fix: the UI resolves a child's displayed harness from its
+    ``omnigent.wrapper`` label first, so minting a Devin sub-agent through the
+    claude-native path (which stamps ``claude-code-native-ui-subagent``) titled it
+    **"Claude Code"**. With no wrapper value the child's harness resolves to the
+    parent's, and the UI labels it from the harness catalog instead.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_acp_subagent_start",
+            "data": {
+                "subagent_id": "a0ac9364",
+                "title": "mathutils",
+                "description": "create mathutils.py plus tests",
+            },
+        },
+    )
+    assert resp.status_code in (200, 202), f"unexpected status {resp.status_code}: {resp.text}"
+    child_id = resp.json()["child_session_id"]
+
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    matching = [c for c in children if c["id"] == child_id]
+    assert len(matching) == 1, f"child {child_id} not in {children!r}"
+    child = matching[0]
+    assert child["parent_session_id"] == parent["id"]
+    assert child["kind"] == "sub_agent"
+    assert child["tool"] == "mathutils"
+    assert child["session_name"] == "a0ac9364"
+    # The ACP id + task are preserved for downstream surfaces...
+    assert child["labels"]["omnigent.acp.subagent_id"] == "a0ac9364"
+    assert child["labels"]["omnigent.acp.subagent_description"] == "create mathutils.py plus tests"
+    # ...and crucially NO vendor wrapper label is stamped.
+    assert "omnigent.wrapper" not in child["labels"], (
+        f"an ACP sub-agent must not claim a vendor wrapper identity: {child['labels']!r}"
+    )
+
+
+async def test_external_acp_subagent_start_is_idempotent_on_subagent_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """A redelivery with the same ``subagent_id`` returns the same child.
+
+    The runner POSTs best-effort and an agent can re-announce a sub-agent, so a
+    retry must not mint a duplicate row in the panel.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    payload = {
+        "type": "external_acp_subagent_start",
+        "data": {"subagent_id": "dup1", "title": "worker", "description": "do a thing"},
+    }
+
+    first = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    second = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    assert first.json()["child_session_id"] == second.json()["child_session_id"]
+
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    assert len([c for c in children if c["labels"].get("omnigent.acp.subagent_id") == "dup1"]) == 1
+
+
+async def test_external_acp_subagent_start_allows_duplicate_titles(
+    client: httpx.AsyncClient,
+) -> None:
+    """Two sub-agents sharing a title both register (distinct ids).
+
+    An agent can label parallel sub-agents identically; the stable id keeps the
+    ``(parent, title)`` unique index from rejecting the second.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+
+    ids = set()
+    for sub_id in ("s1", "s2"):
+        resp = await client.post(
+            f"/v1/sessions/{parent['id']}/events",
+            json={
+                "type": "external_acp_subagent_start",
+                "data": {"subagent_id": sub_id, "title": "worker", "description": "same task"},
+            },
+        )
+        assert resp.status_code in (200, 202), resp.text
+        ids.add(resp.json()["child_session_id"])
+    assert len(ids) == 2, "parallel sub-agents with the same title must get distinct children"
+
+
+async def test_acp_subagent_summary_needs_an_agent_to_persist(
+    client: httpx.AsyncClient,
+) -> None:
+    """An assistant message seeded into an ACP sub-agent child must carry ``agent``.
+
+    This is the server contract the runner's summary-seeding depends on, and the
+    root cause of the reported "sub-agent's response is missing from its chat"
+    bug: ``MessageData`` rejects an assistant message with no ``agent``, so an
+    item that omits it 400s and never persists (the runner posts best-effort and
+    swallows the rejection). With ``agent`` set — as the fix now sends — it
+    persists and appears in the child's items, exactly as the summary must.
+    """
+    import json
+
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    mint = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_acp_subagent_start",
+            "data": {"subagent_id": "a0ac9364", "title": "mathutils", "description": "t"},
+        },
+    )
+    child_id = mint.json()["child_session_id"]
+
+    def _summary_event(*, with_agent: bool) -> dict[str, object]:
+        item_data: dict[str, object] = {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "3 tests pass"}],
+        }
+        if with_agent:
+            item_data["agent"] = "mathutils"
+        return {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": item_data,
+                "response_id": "resp_acpsub_a0ac9364",
+            },
+        }
+
+    # Without agent: rejected — the exact server response that silently hid the
+    # summary when the runner swallowed it.
+    missing = await client.post(
+        f"/v1/sessions/{child_id}/events", json=_summary_event(with_agent=False)
+    )
+    assert missing.status_code == 400, (
+        f"expected reject, got {missing.status_code}: {missing.text}"
+    )
+
+    # With agent (the fix): accepted and present in the child's transcript.
+    ok = await client.post(f"/v1/sessions/{child_id}/events", json=_summary_event(with_agent=True))
+    assert ok.status_code in (200, 202), ok.text
+
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert any(it.get("type") == "message" for it in items)
+    assert "3 tests pass" in json.dumps(items), (
+        f"summary not persisted into child items: {items!r}"
+    )
+
+
+async def test_acp_subagent_tool_call_persists_into_the_child(
+    client: httpx.AsyncClient,
+) -> None:
+    """A sub-agent's own tool call persists into its child as a ``function_call``.
+
+    The transcript-depth path: the runner appends each of the sub-agent's tool
+    calls to its child as a ``function_call`` item so opening the row shows the
+    work it did, not just the task and summary. ``FunctionCallData`` requires
+    ``agent`` / ``name`` / ``arguments`` / ``call_id``, so this pins that the
+    exact shape the runner sends is accepted and appears in the child's items.
+    """
+    import json
+
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    mint = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_acp_subagent_start",
+            "data": {"subagent_id": "a0ac9364", "title": "mathutils", "description": "t"},
+        },
+    )
+    child_id = mint.json()["child_session_id"]
+
+    resp = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call",
+                "item_data": {
+                    "agent": "mathutils",
+                    "name": "Wrote mathutils.py",
+                    "arguments": '{"file_path": "mathutils.py"}',
+                    "call_id": "toolu_01",
+                },
+                "response_id": "resp_acpsub_a0ac9364",
+            },
+        },
+    )
+    assert resp.status_code in (200, 202), resp.text
+
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert any(it.get("type") == "function_call" for it in items), items
+    assert "Wrote mathutils.py" in json.dumps(items)
+
+
 async def test_external_subagent_start_handles_duplicate_agent_type_and_description(
     client: httpx.AsyncClient,
 ) -> None:
@@ -1289,6 +1643,9 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             "agent_id": agent["id"],
             "model": "skill-agent",
             "has_mcp_servers": False,
+            # No renderer subscribes to the session stream in this test,
+            # so the turn is stamped headless (browser tools stripped).
+            "browser_renderer_available": False,
             # The forwarded message is the meta item; its store id lets the
             # runner dedup it on a cold-cache history reload.
             "persisted_item_id": meta["id"],
@@ -1938,6 +2295,116 @@ async def test_auto_title_rejects_multiline_titles(
     assert response.status_code == 400, response.text
 
 
+async def test_external_session_title_overwrites_an_explicit_title(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A terminal ``/rename`` wins over a title set from the Web UI.
+
+    Unlike ``/auto-title`` — which declines once a human has named the
+    session — this event carries an explicit operator action, so it is
+    authoritative.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="Set from the web UI")
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_title", "data": {"title": "auth-refactor"}},
+    )
+
+    assert response.status_code in (200, 202), response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["title"] == "auth-refactor"
+
+
+async def test_external_session_title_collapses_whitespace(
+    client: httpx.AsyncClient,
+) -> None:
+    """Surrounding and repeated whitespace is normalized before persisting."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_title", "data": {"title": "  auth   refactor  "}},
+    )
+
+    assert response.status_code in (200, 202), response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "auth refactor"
+
+
+async def test_external_session_title_accepts_user_limit(
+    client: httpx.AsyncClient,
+) -> None:
+    """Terminal-originated manual titles accept the full user title limit."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    title = "x" * USER_SESSION_TITLE_MAX_CHARS
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_title", "data": {"title": title}},
+    )
+
+    assert response.status_code in (200, 202), response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == title
+
+
+@pytest.mark.parametrize(
+    "title",
+    ["", "   ", "one\ntwo", "x" * (USER_SESSION_TITLE_MAX_CHARS + 1)],
+)
+async def test_external_session_title_rejects_malformed_titles(
+    client: httpx.AsyncClient,
+    title: str,
+) -> None:
+    """Blank, multi-line, and oversized titles are rejected rather than persisted."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="Original title")
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_title", "data": {"title": title}},
+    )
+
+    assert response.status_code == 400, response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "Original title"
+
+
+async def test_external_session_title_declines_child_sessions(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Child titles are structural (``"<agent>:<label>"``), so a rename is dropped.
+
+    The sub-agent tooling parses those titles back apart; overwriting one
+    with free text would break that lookup.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        kind="sub_agent",
+        title="coder:debug-auth",
+        parent_conversation_id=parent["id"],
+        agent_id=agent["id"],
+    )
+
+    response = await client.post(
+        f"/v1/sessions/{child.id}/events",
+        json={"type": "external_session_title", "data": {"title": "auth-refactor"}},
+    )
+
+    assert response.status_code in (200, 202), response.text
+    assert store.get_conversation(child.id).title == "coder:debug-auth"
+
+
 async def test_patch_session_archive_hides_from_default_list(
     client: httpx.AsyncClient,
 ) -> None:
@@ -2043,6 +2510,114 @@ async def test_create_session_without_terminal_launch_args_is_null(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     assert session["terminal_launch_args"] is None
+
+
+_CODEX_BYPASS_ARGS = ["--dangerously-bypass-approvals-and-sandbox"]
+
+
+async def test_create_session_derives_explicit_yolo_from_agent_spec(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A body-less JSON create honors the agent spec's explicit ``yolo: true``.
+
+    A custom codex-native agent that declares ``executor.config.yolo:
+    true`` opted into full bypass in its own trusted, server-stored
+    bundle. With no ``terminal_launch_args`` in the create body the
+    session must persist the codex bypass flag, matching the named-worker
+    path — otherwise codex launches at its default approval stance and an
+    unattended orchestrator parks on approval prompts despite the opt-in.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-yolo-self-resolved",
+        executor={"type": "omnigent", "config": {"harness": "codex-native", "yolo": True}},
+    )
+    session = await _create_session(client, agent["id"])
+    assert session["terminal_launch_args"] == _CODEX_BYPASS_ARGS
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200
+    assert snap.json()["terminal_launch_args"] == _CODEX_BYPASS_ARGS
+
+
+async def test_create_session_undeclared_codex_spec_keeps_launch_args_null(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    No spec opt-in → no derived args: the headless default must not leak.
+
+    codex-native named WORKERS default to full bypass because nobody can
+    answer a headless prompt, but a top-level session is interactive — a
+    human can answer the ApprovalCard. A codex-native spec that never
+    mentions ``yolo`` must keep ``terminal_launch_args`` NULL rather than
+    silently launching every custom codex agent with approvals and
+    sandbox bypassed.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-plain-self-resolved",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    session = await _create_session(client, agent["id"])
+    assert session["terminal_launch_args"] is None
+
+
+async def test_create_session_body_launch_args_override_spec_yolo(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Explicit body args keep precedence over the spec's opt-in.
+
+    The web permission-mode selector posts concrete args at create time;
+    the spec seam only fills the gap when the body carries none.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-yolo-body-override",
+        executor={"type": "omnigent", "config": {"harness": "codex-native", "yolo": True}},
+    )
+    session = await _create_session(
+        client,
+        agent["id"],
+        terminal_launch_args=["--sandbox", "read-only"],
+    )
+    assert session["terminal_launch_args"] == ["--sandbox", "read-only"]
+
+
+async def test_bundle_create_derives_explicit_yolo_launch_args(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    The multipart bundle create (``omnigent run <dir>``) honors ``yolo: true``.
+
+    ``create_test_agent`` creates its owning session via the multipart
+    bundle path with no metadata launch args, so the owning session's row
+    must carry the spec-derived codex bypass flag — the exact journey the
+    reporter hit with a custom top-level codex-native bundle.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-yolo-bundle",
+        executor={"type": "omnigent", "config": {"harness": "codex-native", "yolo": True}},
+    )
+    owning = await client.get(f"/v1/sessions/{agent['_session_id']}")
+    assert owning.status_code == 200
+    assert owning.json()["terminal_launch_args"] == _CODEX_BYPASS_ARGS
+
+
+async def test_bundle_create_undeclared_codex_spec_keeps_launch_args_null(
+    client: httpx.AsyncClient,
+) -> None:
+    """A bundle that never mentions ``yolo`` gets no default bypass on upload."""
+    agent = await create_test_agent(
+        client,
+        name="codex-plain-bundle",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    owning = await client.get(f"/v1/sessions/{agent['_session_id']}")
+    assert owning.status_code == 200
+    assert owning.json()["terminal_launch_args"] is None
 
 
 async def test_create_session_rejects_oversized_terminal_launch_args(
@@ -2817,6 +3392,85 @@ async def test_list_session_items_404_for_nonexistent(
     """Items endpoint returns 404 for a session that doesn't exist."""
     resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/items")
     assert resp.status_code == 404
+
+
+async def test_list_session_items_big_page_survives_bounded_read_backend(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    ``limit=1000`` on a large conversation must not 500 when the backend can
+    only serve bounded reads.
+
+    A deployed managed-Postgres backend failed single big-page reads of a
+    large conversation (500 at ``limit>=500``, 200 at ``limit<=400``), which
+    turned every valid ``limit=1000`` request into ``internal_error`` — most
+    visibly breaking claude-native cold resume. The route must assemble the
+    page from bounded per-statement reads, so the same request returns 200
+    with the complete, ordered page. The choke is injected at the engine
+    boundary to mirror that deployed failure signature.
+    """
+    from sqlalchemy import event as _sa_event
+
+    # The deployed signature: reads of <=400 rows serve fine, bigger ones fail.
+    deployed_safe_read_rows = 400
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    appended = store.append(
+        session["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_big",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"item-{i}"}],
+                ),
+            )
+            for i in range(600)
+        ],
+    )
+
+    def _choke_on_oversized_reads(conn, clauseelement, multiparams, params, execution_options):
+        limit_clause = getattr(clauseelement, "_limit_clause", None)
+        value = getattr(limit_clause, "value", None)
+        if (
+            isinstance(value, int)
+            and value > deployed_safe_read_rows
+            and "conversation_items" in str(clauseelement)
+        ):
+            raise RuntimeError(f"simulated backend failure on oversized read (limit={value})")
+
+    _sa_event.listen(store._conv_engine, "before_execute", _choke_on_oversized_reads)
+    try:
+        resp = await client.get(
+            f"/v1/sessions/{session['id']}/items",
+            params={"limit": 1000},
+        )
+        assert resp.status_code == 200, resp.text
+        page = resp.json()
+        assert [i["id"] for i in page["data"]] == [i.id for i in appended]
+        assert page["has_more"] is False
+        assert page["first_id"] == appended[0].id
+        assert page["last_id"] == appended[-1].id
+
+        # Cursor pagination stays correct across the same bounded backend.
+        first = await client.get(
+            f"/v1/sessions/{session['id']}/items",
+            params={"limit": 500},
+        )
+        assert first.status_code == 200, first.text
+        assert first.json()["has_more"] is True
+        rest = await client.get(
+            f"/v1/sessions/{session['id']}/items",
+            params={"limit": 500, "after": first.json()["last_id"]},
+        )
+        assert rest.status_code == 200, rest.text
+        assert [i["id"] for i in rest.json()["data"]] == [i.id for i in appended[500:]]
+    finally:
+        _sa_event.remove(store._conv_engine, "before_execute", _choke_on_oversized_reads)
 
 
 # ── GET /v1/sessions/{id} snapshot fields ────────────────
@@ -3698,6 +4352,148 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
             },
         }
     ]
+
+
+async def test_post_external_session_status_failed_forwards_persisted_assistant_output(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``failed`` edge with no wire ``output`` carries the persisted error text.
+
+    claude-native's ``StopFailure`` edge posts no ``output``, but the
+    harness's own explanation (its last assistant message, e.g. "There's an
+    issue with the selected model (…)") is already persisted. The handler
+    must attach it so the parent inbox shows it instead of the generic
+    "Error: native sub-agent turn failed", and surface it as the session's
+    typed error under the harness-neutral ``native_turn_error`` code.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    detail = (
+        "There's an issue with the selected model (claude-3-5-sonnet-20241022). "
+        "It may not exist or you may not have access to it."
+    )
+    forwarded: list[dict[str, Any]] = []
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Capture forwarded runner events.
+
+        :param request: Request sent to the fake runner.
+        :returns: Accepted response.
+        """
+        forwarded.append({"path": request.url.path, "body": json.loads(request.content)})
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient:
+        """
+        Resolve the session to the fake runner client.
+
+        :param session_id: Session id being routed.
+        :param runner_router: Real app runner router, unused here.
+        :returns: The fake runner client.
+        """
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    try:
+        agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+        parent = await _create_session(client, agent["id"])
+        child_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent["id"],
+                "sub_agent_name": "worker",
+                "title": "worker:native",
+            },
+        )
+        assert child_resp.status_code == 201, child_resp.text
+        child = child_resp.json()
+
+        item_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "response_id": "resp_native_failed",
+                    "source_id": "src_native_failed",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": "claude-native-ui",
+                        "content": [{"type": "output_text", "text": detail}],
+                    },
+                },
+            },
+        )
+        assert item_resp.status_code == 202, item_resp.text
+
+        forwarded.clear()
+        status_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "failed"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_resp.status_code == 202, status_resp.text
+    assert forwarded, "the failed edge was never forwarded to the runner"
+    assert forwarded[0]["body"]["data"] == {"status": "failed", "output": detail}
+    failed_events = [ev for _sid, ev in published if ev.get("status") == "failed"]
+    assert failed_events, f"no failed status was published: {published}"
+    error = failed_events[0]["error"]
+    assert error is not None
+    assert error["code"] == "native_turn_error"
+    assert "selected model" in error["message"]
+
+
+async def test_post_external_session_status_failed_keeps_wire_output_and_codex_code(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A forwarder-sent ``output`` stays verbatim under codex's error code.
+
+    The store-side enrichment must never clobber a detail the forwarder
+    attached itself, and a wire-carried detail keeps the ``codex_turn_error``
+    code existing clients already see.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "failed", "output": "You've hit your usage limit."},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    error = published[0][1]["error"]
+    assert error is not None
+    assert error["code"] == "codex_turn_error"
+    assert error["message"] == "You've hit your usage limit."
 
 
 async def test_post_external_session_status_propagates_runner_delivery_failure(
@@ -4938,6 +5734,255 @@ async def test_accumulate_session_usage_provider_cost_prices_uncatalogued_model(
     assert usage["by_model"]["grok-4.3"]["total_cost_usd"] == pytest.approx(0.0042)
 
 
+async def test_accumulate_session_usage_rejects_negative_provider_cost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative reported ``cost_usd`` is not trusted; the catalog estimate is used instead.
+
+    The relay applies the reported cost as an additive delta, so a negative
+    value would subtract from the cumulative total. Since the cost-budget gate
+    reads that total for relay sessions, a runner could otherwise report a
+    negative cost to drive its recorded spend down and slip under the cap. A
+    negative report must fall through to the (non-negative) catalog estimate.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "model": "harness-model",
+                "cost_usd": -100.0,
+            }
+        },
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    # Catalog charges 1000*1e-3 + 500*2e-3 = 2.0; the forged negative is ignored.
+    assert usage.get("total_cost_usd") == pytest.approx(2.0)
+    assert usage["by_model"]["harness-model"]["total_cost_usd"] == pytest.approx(2.0)
+
+
+async def test_accumulate_session_usage_negative_cost_cannot_reset_running_total(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative report on an uncatalogued model can't claw back prior spend.
+
+    With no catalog pricing, a rejected negative ``cost_usd`` leaves the turn
+    unpriced, so the previously accumulated ``total_cost_usd`` (the value the
+    cost-budget gate reads) is unchanged — never driven toward zero / negative.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    # First, an honest priced turn establishes a positive running total.
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: None,  # catalog can't price anything
+    )
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 10, "output_tokens": 2, "model": "grok-4.3", "cost_usd": 5.0}},
+        session["id"],
+        store,
+    )
+    assert _read_session_usage(db_uri, session["id"]).get("total_cost_usd") == pytest.approx(5.0)
+
+    # A forged negative report must not subtract from the running total.
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "model": "grok-4.3",
+                "cost_usd": -50.0,
+            }
+        },
+        session["id"],
+        store,
+    )
+    assert _read_session_usage(db_uri, session["id"]).get("total_cost_usd") == pytest.approx(5.0)
+
+
+async def test_accumulate_session_usage_rejects_non_finite_provider_cost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NaN / infinite reported ``cost_usd`` is rejected in favour of the catalog estimate.
+
+    A non-finite value poisons every downstream sum (and JSON round-trips as
+    ``NaN``), so it must never be trusted as the authoritative cost.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    for bad_cost in (float("nan"), float("inf"), float("-inf")):
+        sessions_routes._accumulate_session_usage(
+            {
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 500,
+                    "model": "harness-model",
+                    "cost_usd": bad_cost,
+                }
+            },
+            session["id"],
+            SqlAlchemyConversationStore(db_uri),
+        )
+    usage = _read_session_usage(db_uri, session["id"])
+    # Three turns, each catalog-priced at 2.0 (the non-finite reports ignored).
+    assert usage.get("total_cost_usd") == pytest.approx(6.0)
+    assert math.isfinite(usage["total_cost_usd"])
+
+
+async def test_accumulate_session_usage_rejects_negative_token_count(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forged negative ``input_tokens`` is coerced to 0, not priced as a negative.
+
+    The ``cost_usd`` guard only covers the harness-reported-cost fast path; the
+    catalog-pricing branch derives the cost delta from the token counts in the
+    same forgeable frame. ``compute_llm_cost`` multiplies without a lower bound,
+    so an unsanitised negative count would make the additive ``total_cost_usd``
+    delta negative — clawing back the running total the relay cost-budget gate
+    reads. The count must collapse to 0 and the turn price on what survives.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": -100_000_000,
+                "output_tokens": 500,
+                "model": "harness-model",
+            }
+        },
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    # input collapses to 0; catalog charges only 500*2e-3 = 1.0 (never negative).
+    assert usage.get("total_cost_usd") == pytest.approx(1.0)
+    assert usage["by_model"]["harness-model"]["total_cost_usd"] == pytest.approx(1.0)
+    # The forged count is not persisted as a negative cumulative counter.
+    assert usage["input_tokens"] == 0
+    assert usage["output_tokens"] == 500
+
+
+async def test_accumulate_session_usage_negative_tokens_cannot_reset_running_total(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forged negative token count can't subtract from a prior running total."""
+    from omnigent.server.routes import sessions as sessions_routes
+
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    # An honest priced turn establishes a positive running total.
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "model": "grok-4.3"}},
+        session["id"],
+        store,
+    )
+    assert _read_session_usage(db_uri, session["id"]).get("total_cost_usd") == pytest.approx(2.0)
+
+    # A forged negative report must not drive the running total (or the token
+    # counters) down.
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": -1_000_000_000,
+                "output_tokens": 0,
+                "model": "grok-4.3",
+            }
+        },
+        session["id"],
+        store,
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage.get("total_cost_usd") == pytest.approx(2.0)
+    assert usage["input_tokens"] == 1000
+
+
+async def test_accumulate_session_usage_rejects_non_finite_token_count(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NaN / infinite token count never reaches the cost sum or the counters.
+
+    ``json.loads`` accepts bare ``NaN`` / ``Infinity``, so a runner can send a
+    non-finite token count. Left unsanitised it poisons ``total_cost_usd``
+    permanently (every ``cost > cap`` comparison is then ``False``) and the
+    stored token counters.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    for bad_tokens in (float("nan"), float("inf"), float("-inf")):
+        sessions_routes._accumulate_session_usage(
+            {
+                "usage": {
+                    "input_tokens": bad_tokens,
+                    "output_tokens": 500,
+                    "model": "harness-model",
+                }
+            },
+            session["id"],
+            SqlAlchemyConversationStore(db_uri),
+        )
+    usage = _read_session_usage(db_uri, session["id"])
+    # Three turns, each priced only on the finite 500 output tokens (1.0 each).
+    assert usage.get("total_cost_usd") == pytest.approx(3.0)
+    assert math.isfinite(usage["total_cost_usd"])
+    assert usage["input_tokens"] == 0
+    assert math.isfinite(usage["input_tokens"])
+
+
 async def test_accumulate_session_usage_unpriced_without_usage_model(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -5751,14 +6796,15 @@ async def test_post_external_model_change_publishes_session_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    ``external_model_change`` persists ``model_override`` and posts a
-    typed SessionModelEvent.
+    ``external_model_change`` persists ``reported_model`` and posts a
+    typed SessionModelEvent, verbatim.
 
-    The claude-native forwarder posts this when the user switches model
-    inside the Claude Code terminal (``/model`` command or in-TUI
-    picker), so the web picker reflects it live (the SSE event) and on
-    reload (the persisted override). Asserts the exact published event
-    type + payload and the persisted snapshot value.
+    A native forwarder posts this with the model the harness is actually
+    on — the launch's own report, or an in-pane switch — in the
+    harness's own spelling. The value must land VERBATIM on the
+    snapshot's ``llm_model`` (the display authority) while the user's
+    request (``model_override``) stays untouched: reports and requests
+    are separate roles.
     """
     published: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
@@ -5770,18 +6816,66 @@ async def test_post_external_model_change_publishes_session_model(
 
     resp = await client.post(
         f"/v1/sessions/{session['id']}/events",
-        json={"type": "external_model_change", "data": {"model": "opus"}},
+        json={"type": "external_model_change", "data": {"model": "claude-opus-4-8[1m]"}},
     )
     assert resp.status_code == 202, resp.text
     assert resp.json() == {"queued": False}
 
     assert [event["type"] for _, event in published] == ["session.model"]
     assert published[0][1]["conversation_id"] == session["id"]
-    assert published[0][1]["model"] == "opus"
+    assert published[0][1]["model"] == "claude-opus-4-8[1m]"
 
-    # Persisted so a reload restores the picker selection.
+    # Persisted verbatim so a reload restores the display; the request
+    # slot is untouched.
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-    assert snapshot["model_override"] == "opus"
+    assert snapshot["llm_model"] == "claude-opus-4-8[1m]"
+    assert snapshot["model_override"] is None
+
+
+@pytest.mark.parametrize("sentinel", ["<synthetic>", " <synthetic> "])
+async def test_external_synthetic_model_preserves_report(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    sentinel: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    response = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "external_model_change", "data": {"model": "gateway-claude-model"}},
+    )
+    assert response.status_code == 202
+    published: list[object] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda *args: published.append(args),
+    )
+    response = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "external_model_change", "data": {"model": sentinel}},
+    )
+    assert response.status_code == 202
+    assert published == []
+    snapshot = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snapshot["llm_model"] == "gateway-claude-model"
+    assert snapshot["model_override"] is None
+
+
+@pytest.mark.parametrize("sentinel", ["<synthetic>", " <synthetic> "])
+async def test_snapshot_ignores_legacy_synthetic_model(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    sentinel: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    original = (await client.get(f"/v1/sessions/{sid}")).json()
+    SqlAlchemyConversationStore(db_uri).update_conversation(sid, reported_model=sentinel)
+    snapshot = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snapshot["llm_model"] == original["llm_model"]
+    assert snapshot["llm_model"] != sentinel
 
 
 async def test_post_external_model_change_dedupes_when_unchanged(
@@ -5789,13 +6883,13 @@ async def test_post_external_model_change_dedupes_when_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A repeat ``external_model_change`` for the already-persisted model
+    A repeat ``external_model_change`` for the already-reported model
     is a no-op: no second ``session.model`` event, no redundant write.
 
-    This is the web→TUI round-trip — the web PATCH set ``model_override``
-    to ``"opus"`` and injected ``/model opus``, then the forwarder
-    echoes the resulting transcript model back. Without server-side
-    dedupe the picker would re-render on its own write.
+    Forwarders re-observe on every poll, so the steady state is the same
+    value arriving repeatedly; the server dedupes by equality against
+    ``reported_model``. A PATCH-written request does NOT suppress a
+    report — requests and reports are separate roles.
     """
     published: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
@@ -5805,21 +6899,28 @@ async def test_post_external_model_change_dedupes_when_unchanged(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
 
-    # Seed the override the way a web picker PATCH would (silent: no
-    # runner forward needed for the test session).
+    # A PATCH-written request must not become the dedupe baseline: the
+    # first report still publishes even when it matches the request.
     patch = await client.patch(
         f"/v1/sessions/{session['id']}",
-        json={"model_override": "opus", "silent": True},
+        json={"model_override": "claude-opus-4-8", "silent": True},
     )
     assert patch.status_code == 200, patch.text
+
+    first = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_model_change", "data": {"model": "claude-opus-4-8"}},
+    )
+    assert first.status_code == 202, first.text
+    assert [event["type"] for _, event in published] == ["session.model"]
     published.clear()
 
     resp = await client.post(
         f"/v1/sessions/{session['id']}/events",
-        json={"type": "external_model_change", "data": {"model": "opus"}},
+        json={"type": "external_model_change", "data": {"model": "claude-opus-4-8"}},
     )
     assert resp.status_code == 202, resp.text
-    # Already on "opus" — nothing re-published.
+    # Already reported — nothing re-published.
     assert [event["type"] for _, event in published] == []
 
 
@@ -6190,6 +7291,215 @@ async def test_post_external_codex_collaboration_mode_change_rejects_unknown_mod
     assert "external_codex_collaboration_mode_change" in resp.text
 
 
+async def test_post_external_permission_mode_change_persists_label_and_publishes(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pane-observed claude-native mode lands on the label and the stream.
+
+    The forwarder posts this when the user pressed shift+tab inside the TUI.
+    The SSE event moves the live picker; the label is what a reconnecting
+    client restores from, so both must happen or the mode goes stale on reload.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_permission_mode_change",
+            "data": {"permission_mode": "auto"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+    assert [event["type"] for _, event in published] == ["session.permission_mode"]
+    assert published[0][1]["conversation_id"] == session["id"]
+    assert published[0][1]["permission_mode"] == "auto"
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "auto"
+    # This session launched without an explicit --permission-mode, so the footer
+    # report must NOT pin one (that would override its settings default on
+    # relaunch); the label alone carries the mode for the web picker.
+    assert snapshot["terminal_launch_args"] is None
+
+
+async def test_post_external_permission_mode_change_rewrites_launch_arg(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A pane switch replaces the create-time ``--permission-mode`` launch arg.
+
+    A session created in one mode keeps that mode in ``terminal_launch_args``;
+    when the user cycles to another mode with shift+tab, the stored launch args
+    must carry the NEW mode (other args untouched) so a cold resume reopens in
+    it rather than the create-time mode.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        terminal_launch_args=["--model", "opus", "--permission-mode", "plan"],
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_permission_mode_change",
+            "data": {"permission_mode": "acceptEdits"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["terminal_launch_args"] == [
+        "--model",
+        "opus",
+        "--permission-mode",
+        "acceptEdits",
+    ]
+
+
+async def test_post_external_permission_mode_change_is_quiet_when_unchanged(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Re-posting the mode already on the label publishes nothing.
+
+    The forwarder dedupes per poll, but a restarted forwarder re-seeds from the
+    pane. Without this guard that would republish on every reconnect and reset
+    the picker's open dropdown for anyone watching the session.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    seed = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_permission_mode_change", "data": {"permission_mode": "plan"}},
+    )
+    assert seed.status_code == 202, seed.text
+    published.clear()
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_permission_mode_change", "data": {"permission_mode": "plan"}},
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert published == []
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "bypassPermissions",  # real CLI mode, but not one shift+tab can reach
+        "turbo",  # not a mode at all
+        "",
+    ],
+)
+async def test_post_external_permission_mode_change_rejects_unsupported_modes(
+    client: httpx.AsyncClient,
+    mode: str,
+) -> None:
+    """
+    Only switchable modes become labels; anything else fails loud.
+
+    A footer misread into an unknown value would otherwise persist a mode the
+    PATCH path and the web picker can't represent, leaving the picker blank.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_permission_mode_change",
+            "data": {"permission_mode": mode},
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "external_permission_mode_change" in resp.text
+
+
+async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    The real forwarder mirror drives a live server and crosses the SSE wire.
+
+    Covers the seams that per-layer tests miss by mocking their neighbour: an
+    event type absent from the route's payload-validation passthrough 400s
+    every POST, and one absent from ``ServerStreamEvent`` fails at the SSE
+    boundary — both invisible to the forwarder, which logs post failures at
+    debug level. Drives ``_forward_permission_mode_from_pane`` itself rather
+    than a hand-rolled POST, so the mirror's own logic is on the path.
+    """
+    from omnigent import claude_native_forwarder as fwd
+    from tests.server.helpers import start_session_stream_collector
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+
+    pane_mode = "default"
+
+    def _fake_read(_bridge_dir: Any) -> str | None:
+        """Serve the pane footer the forwarder would capture via tmux."""
+        return pane_mode
+
+    dedupe = fwd._ForwardDedupeState()
+    collector = await start_session_stream_collector(session_id)
+    try:
+        with (
+            patch.object(fwd, "read_permission_mode", _fake_read),
+            patch.object(fwd, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0),
+        ):
+
+            async def _poll() -> None:
+                """Run one real permission-mode mirror pass against the server."""
+                await fwd._forward_permission_mode_from_pane(
+                    client=client,
+                    session_id=session_id,
+                    bridge_dir=Path("/tmp/omnigent/claude-native/e2e"),
+                    dedupe=dedupe,
+                )
+
+            # The launch mode crosses the wire too, so a session launched into
+            # manual has a mode to render before anyone presses shift+tab.
+            await _poll()
+            # The user presses shift+tab in the TUI.
+            pane_mode = "auto"
+            await _poll()
+
+        launch_event = await collector.next_event()
+        event = await collector.next_event()
+    finally:
+        collector.task.cancel()
+
+    # Crossed the SSE boundary in the shape the frontend parser expects.
+    assert launch_event["type"] == "session.permission_mode"
+    assert launch_event["permission_mode"] == "default"
+    assert event["type"] == "session.permission_mode"
+    assert event["conversation_id"] == session_id
+    assert event["permission_mode"] == "auto"
+    # And it is durable: a reloading client restores the mode from the label.
+    snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "auto"
+
+
 async def test_post_external_codex_approval_mode_change_persists_terminal_args(
     client: httpx.AsyncClient,
 ) -> None:
@@ -6428,7 +7738,15 @@ async def test_patch_model_override_surfaces_a_refused_native_forward(
 
     async def _runner_refused(*_args: Any, **_kwargs: Any) -> _RunnerForwardResult:
         """The runner is up and answered that it could not drive the pane."""
-        return _RunnerForwardResult(status_code=503, body="claude_native_model_failed")
+        return _RunnerForwardResult(
+            status_code=503,
+            body=json.dumps(
+                {
+                    "error": "claude_native_model_unconfirmed",
+                    "detail": "the terminal did not confirm the switch to opus within 10s",
+                }
+            ),
+        )
 
     monkeypatch.setattr(
         "omnigent.server.routes.sessions._forward_session_change_to_runner",
@@ -6454,6 +7772,8 @@ async def test_patch_model_override_surfaces_a_refused_native_forward(
     ]
     assert len(errors) == 1, f"Expected one visible failure notice; got {published!r}"
     assert "opus" in errors[0]["error"]["message"]
+    # The runner's own detail (the concrete cause) rides into the notice.
+    assert "did not confirm the switch" in errors[0]["error"]["message"]
 
 
 async def test_patch_model_override_stays_quiet_when_no_runner_answers(
@@ -6746,6 +8066,59 @@ async def test_post_external_session_todos_rejects_non_list_todos(
     )
     assert resp.status_code == 400, resp.text
     assert "external_session_todos" in resp.text
+
+
+async def test_post_external_session_todos_filters_malformed_items(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Individual malformed todo items are dropped before caching / broadcast.
+
+    The top-level payload is a valid list (so this is not the 400-rejection
+    path), but ``_handle_external_session_todos`` keeps only items with a
+    string ``content``, a ``status`` in {pending, in_progress, completed},
+    and a string ``activeForm``. This mirrors the same filter ``sse.ts``
+    applies on the live path, so a buggy forwarder version can't poison the
+    snapshot or the in-chat Plan tracker with half-formed entries.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sessions_module._session_todos_cache.pop(session["id"], None)
+
+    good = {"content": "Real task", "status": "in_progress", "activeForm": "Doing it"}
+    todos = [
+        good,
+        {"content": "Bad status", "status": "not-a-status", "activeForm": "x"},
+        {"content": 123, "status": "pending", "activeForm": "x"},  # non-str content
+        {"content": "No active form", "status": "completed", "activeForm": None},  # non-str
+        "not-a-dict",
+        {"status": "pending", "activeForm": "x"},  # missing content
+    ]
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_session_todos", "data": {"todos": todos}},
+        )
+        assert resp.status_code in (200, 202), resp.text
+
+        # Only the well-formed item survives — on both the live SSE channel
+        # and the cached snapshot the tracker reads on bind.
+        todo_events = [ev for _sid, ev in published if ev.get("type") == "session.todos"]
+        assert len(todo_events) == 1
+        assert todo_events[0]["todos"] == [good]
+
+        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+        assert snapshot["todos"] == [good]
+    finally:
+        sessions_module._session_todos_cache.pop(session["id"], None)
 
 
 async def test_post_external_mcp_startup_publishes_session_mcp_startup(
@@ -7312,6 +8685,93 @@ async def test_stop_session_no_runner_lifts_stop_fence(
             _interrupt_fenced_sessions.discard(session_id)
 
 
+async def test_retry_session_reports_live_runner_noop_without_mutating_history(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live non-native runner is not falsely reported as recovered."""
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="Keep this once")
+    before = await client.get(f"/v1/sessions/{session['id']}")
+    before_items = before.json()["items"]
+    runner_client = object()
+    get_runner = AsyncMock(return_value=runner_client)
+    monkeypatch.setattr(routes_events, "_get_runner_client", get_runner)
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {
+        "queued": False,
+        "recovered": False,
+        "recovery": "already_connected",
+    }
+    get_runner.assert_awaited()
+    after = await client.get(f"/v1/sessions/{session['id']}")
+    assert after.json()["items"] == before_items
+
+
+async def test_retry_session_ensures_dead_required_native_terminal_once(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live runner still recreates its required native terminal."""
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    session = await _create_session(client, agent["id"], initial_message="Keep this once")
+    before = await client.get(f"/v1/sessions/{session['id']}")
+    before_items = before.json()["items"]
+    runner_client = object()
+    ensure_terminal = AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None))
+    relay_ready = AsyncMock(return_value=None)
+    monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=runner_client))
+    monkeypatch.setattr(routes_events, "_ensure_native_terminal_ready", ensure_terminal)
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", relay_ready)
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {
+        "queued": False,
+        "recovered": True,
+        "recovery": "native_terminal_ready",
+    }
+    ensure_terminal.assert_awaited_once()
+    assert ensure_terminal.await_args.kwargs["persist_resource_event"] is False
+    relay_ready.assert_awaited_once()
+    after = await client.get(f"/v1/sessions/{session['id']}")
+    assert after.json()["items"] == before_items
+
+
+async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
+    client: httpx.AsyncClient,
+) -> None:
+    """Retry fails loud when no runner can reconnect, without adding history."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == 503, response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["items"] == []
+
+
 @pytest.mark.parametrize(
     "failure_mode",
     [
@@ -7633,6 +9093,502 @@ async def test_patch_collaboration_mode_rejects_non_codex_session(
 
     assert resp.status_code == 400, resp.text
     assert "collaboration_mode is only supported" in resp.text
+
+
+async def test_patch_approval_mode_forwards_and_persists_label(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    PATCH ``approval_mode`` drives the Codex ``/permissions`` popup and records it.
+
+    The web picker writes through the sessions PATCH route. The server forwards a
+    harness-agnostic ``codex_approval_mode_change`` event so the runner keys the
+    preset into the Codex TUI, then persists the read-back label and publishes a
+    live ``session.codex_approval_mode``. Codex owns the durable state (its own
+    session config), so the route writes no ``terminal_launch_args``.
+    """
+    from omnigent.runtime import set_runner_client
+
+    captured: list[_ForwardedEffort] = []
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Accept the injection like the codex-native runner handler."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        body: dict[str, Any] | None = None
+        if request.content:
+            body = json.loads(request.content)
+        captured.append(_ForwardedEffort(url=str(request.url), body=body))
+        return httpx.Response(200, json={"approval_mode": "full-access"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "codex-native-ui",
+            },
+            terminal_launch_args=["--model", "gpt-5-codex"],
+        )
+        captured.clear()
+
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"approval_mode": "full-access"},
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["labels"]["omnigent.codex_native.approval_mode"] == "full-access"
+    # Runtime approval rides the /permissions popup, not launch args: the caller's
+    # existing args are left untouched.
+    assert resp.json()["terminal_launch_args"] == ["--model", "gpt-5-codex"]
+    forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
+    assert len(forwards) == 1, f"Expected one runner forward, got {captured!r}"
+    assert forwards[0].body == {
+        "type": "codex_approval_mode_change",
+        "approval_mode": "full-access",
+    }
+    assert [event["type"] for _, event in published] == ["session.codex_approval_mode"]
+    assert published[0][1]["approval_mode"] == "full-access"
+
+
+@pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
+async def test_patch_approval_mode_requires_live_runner_before_persisting(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_status: int | None,
+) -> None:
+    """
+    PATCH ``approval_mode`` must not persist UI state before live success.
+
+    An approval switch is only correct if the runner drove the ``/permissions``
+    popup. With no runner, or a runner that rejects it (e.g. the terminal is not
+    running), the route must fail and leave the approval label absent so the
+    picker rolls back instead of showing a false mode.
+    """
+    from omnigent.runtime import set_runner_client
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+
+    fake_runner: httpx.AsyncClient | None = None
+    if runner_status is not None:
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            """Reject the injection like a stopped codex terminal."""
+            return httpx.Response(
+                runner_status,
+                json={
+                    "error": "codex_native_approval_mode_failed",
+                    "detail": "Codex terminal is not running; reconnect first.",
+                },
+            )
+
+        fake_runner = httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler),
+            base_url="http://runner",
+        )
+
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "codex-native-ui",
+            },
+        )
+
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"approval_mode": "full-access"},
+        )
+        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    finally:
+        if fake_runner is not None:
+            await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 503, resp.text
+    assert "Could not switch to full-access approval mode" in resp.text
+    assert "omnigent.codex_native.approval_mode" not in snapshot["labels"]
+    assert published == []
+
+
+async def test_patch_approval_mode_rejects_non_codex_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """``approval_mode`` is rejected for sessions that are not Codex-native."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"approval_mode": "ask-for-approval"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "approval_mode is only supported" in resp.text
+
+
+async def test_patch_approval_mode_rejects_unknown_mode(
+    client: httpx.AsyncClient,
+) -> None:
+    """An approval mode outside the /permissions presets is rejected pre-forward."""
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "codex-native-ui",
+        },
+    )
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"approval_mode": "turbo"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "approval_mode must be one of" in resp.text
+
+
+async def test_post_external_codex_approval_mode_change_sets_label_and_publishes(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A /permissions change inside the Codex TUI reaches the web picker (TUI→UI).
+
+    The forwarder posts ``external_codex_approval_mode_change`` with the runtime
+    preset it read from ``thread/settings/updated``. The server stamps the
+    read-back label and publishes ``session.codex_approval_mode`` so a connected
+    picker tracks the TUI without a reload.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_codex_approval_mode_change",
+            "data": {"approval_mode": "full-access"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert [event["type"] for _, event in published] == ["session.codex_approval_mode"]
+    assert published[0][1]["approval_mode"] == "full-access"
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"]["omnigent.codex_native.approval_mode"] == "full-access"
+
+
+async def test_post_external_codex_approval_mode_change_requires_a_field(
+    client: httpx.AsyncClient,
+) -> None:
+    """The event must carry terminal_launch_args or approval_mode."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_codex_approval_mode_change", "data": {}},
+    )
+
+    assert resp.status_code == 400, resp.text
+
+
+async def test_patch_permission_mode_persists_label_and_forwards_event(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    PATCH ``permission_mode`` forwards the switch and persists what landed.
+
+    Claude Code's ``--permission-mode`` is launch-only, so the runner has to
+    drive the TUI's shift+tab cycle. The server forwards a
+    ``permission_mode_change`` control event and records the mode the runner
+    reports the pane reached — not the requested one — so a reload shows the
+    session's real mode.
+    """
+    from omnigent.runtime import set_runner_client
+
+    captured: list[_ForwardedEffort] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Echo the switched mode like the claude-native runner handler."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        body: dict[str, Any] | None = None
+        if request.content:
+            body = json.loads(request.content)
+        captured.append(_ForwardedEffort(url=str(request.url), body=body))
+        return httpx.Response(200, json={"permission_mode": "auto"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "claude-code-native-ui",
+            },
+        )
+        captured.clear()
+
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "auto"},
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["labels"]["omnigent.claude_native.permission_mode"] == "auto"
+    # No launch --permission-mode to rewrite, so none is fabricated (see the
+    # rewrite-existing test below for the persist-to-launch-args case).
+    assert resp.json()["terminal_launch_args"] is None
+    forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
+    assert len(forwards) == 1, f"Expected one runner forward, got {captured!r}"
+    assert forwards[0].body == {"type": "permission_mode_change", "permission_mode": "auto"}
+
+
+async def test_patch_permission_mode_rewrites_launch_arg_and_keeps_other_args(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A combined PATCH rewrites the launch --permission-mode and keeps other args.
+
+    Guards two things: the confirmed mode replaces an existing launch
+    ``--permission-mode`` (so a relaunch reopens in it), and merging against the
+    freshly written row — not the pre-update snapshot — means a PATCH that also
+    sets ``terminal_launch_args`` keeps the caller's other args (here
+    ``--model sonnet``) rather than reverting to the pre-PATCH launch args.
+    """
+    from omnigent.runtime import set_runner_client
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Echo the switched mode like the claude-native runner handler."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        return httpx.Response(200, json={"permission_mode": "acceptEdits"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "claude-code-native-ui",
+            },
+            terminal_launch_args=["--model", "opus", "--permission-mode", "plan"],
+        )
+
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={
+                "permission_mode": "acceptEdits",
+                # Same request also replaces the launch args wholesale.
+                "terminal_launch_args": ["--model", "sonnet", "--permission-mode", "plan"],
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 200, resp.text
+    # The PATCH's --model sonnet survives, and --permission-mode is rewritten to
+    # the runner-confirmed mode (not the pre-PATCH --model opus / plan).
+    assert resp.json()["terminal_launch_args"] == [
+        "--model",
+        "sonnet",
+        "--permission-mode",
+        "acceptEdits",
+    ]
+    assert resp.json()["labels"]["omnigent.claude_native.permission_mode"] == "acceptEdits"
+
+
+@pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
+async def test_patch_permission_mode_requires_live_runner_before_persisting(
+    client: httpx.AsyncClient,
+    runner_status: int | None,
+) -> None:
+    """
+    A permission-mode switch must not persist unless the pane really moved.
+
+    The mode lives only in the running TUI. If no runner is reachable, or the
+    runner could not reach the mode (e.g. ``auto`` isn't in this session's
+    shift+tab cycle), persisting the label would make the web UI claim auto
+    mode while Claude still prompts on every edit.
+    """
+    from omnigent.runtime import set_runner_client
+
+    fake_runner: httpx.AsyncClient | None = None
+    if runner_status is not None:
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            """Reject the switch the way an unreachable mode does."""
+            del request
+            return httpx.Response(
+                runner_status,
+                json={
+                    "error": "claude_native_permission_mode_failed",
+                    "detail": "The mode is not available in this session's cycle.",
+                },
+            )
+
+        fake_runner = httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler),
+            base_url="http://runner",
+        )
+
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "claude-code-native-ui",
+            },
+        )
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "auto"},
+        )
+        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    finally:
+        if fake_runner is not None:
+            await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 503, resp.text
+    assert "Could not switch to auto mode" in resp.text
+    assert "omnigent.claude_native.permission_mode" not in snapshot["labels"]
+
+
+async def test_patch_permission_mode_silent_skips_the_switch_without_crashing(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A silent PATCH skips the runner forward and publishes nothing.
+
+    ``silent`` suppresses the live forward, so no runner confirms a mode and
+    no label is written. The publish must be skipped too — reading the label
+    unconditionally would raise ``KeyError`` and 500 a request that changed
+    nothing, and any published mode would be unconfirmed by the pane.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "claude-code-native-ui",
+        },
+    )
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"permission_mode": "auto", "silent": True},
+    )
+
+    assert resp.status_code == 200, resp.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert "omnigent.claude_native.permission_mode" not in snapshot["labels"]
+
+
+@pytest.mark.parametrize("bad_mode", ["dontAsk", "bypassPermissions", "nonsense"])
+async def test_patch_permission_mode_rejects_modes_the_cycle_cannot_reach(
+    client: httpx.AsyncClient,
+    bad_mode: str,
+) -> None:
+    """
+    Launch-only modes are rejected rather than forwarded.
+
+    ``dontAsk`` is never in Claude's shift+tab cycle and
+    ``bypassPermissions`` only joins it when the session launched into it, so
+    a live switch toward either would wander through unrelated modes before
+    failing. Reject up front, before touching the runner.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "claude-code-native-ui",
+        },
+    )
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"permission_mode": bad_mode},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "permission_mode must be one of" in resp.text
+
+
+async def test_patch_permission_mode_rejects_non_claude_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``permission_mode`` is rejected for sessions that aren't claude-native.
+
+    Only Claude Code has the shift+tab cycle the switch drives, so accepting
+    the field elsewhere would persist a mode label no runner can honor.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"permission_mode": "auto"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "permission_mode is only supported" in resp.text
 
 
 @pytest.mark.parametrize(
@@ -8106,6 +10062,189 @@ async def test_external_codex_subagent_start_is_idempotent_and_upserts_labels(
     )
 
 
+# ── POST /v1/sessions/{id}/events external_antigravity_subagent_start ────────
+
+
+async def test_external_antigravity_subagent_start_mints_child_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``external_antigravity_subagent_start`` creates a child session whose rail
+    row names the sub-agent's role.
+
+    agy runs each sub-agent as its own cascade and names it on the parent's
+    ``INVOKE_SUBAGENT`` step; the reader posts this so the Agents rail can show
+    it. Unlike the claude/codex children, the rail's generic
+    ``"<head>:<tail>"`` title split does the display work — so this pins that
+    the title is built to survive that split.
+
+    :param client: The test HTTP client.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "antigravity-native-ui"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_antigravity_subagent_start",
+            "data": {
+                "cascade_id": "1eca7625-be65-4092-8718-273c1bc3436b",
+                "role": "App Router Code Reviewer",
+                "agent_type": "research",
+                "tool_call_id": "agy_call_efb134b2_36",
+            },
+        },
+    )
+
+    assert resp.status_code == 202, f"unexpected status {resp.status_code}: {resp.text}"
+    child_id = resp.json()["child_session_id"]
+
+    children_resp = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    assert children_resp.status_code == 200
+    child = next(
+        (c for c in children_resp.json()["data"] if c["id"] == child_id),
+        None,
+    )
+    assert child is not None, "Child session must appear in child_sessions listing"
+    assert child["tool"] == "App Router Code Reviewer", (
+        f"Expected the rail to name the sub-agent's role; got {child['tool']!r}"
+    )
+    assert child["session_name"] == "1eca7625-be65-4092-8718-273c1bc3436b", (
+        f"Expected session_name=cascade id; got {child['session_name']!r}"
+    )
+    labels = child["labels"]
+    assert labels["omnigent.wrapper"] == "antigravity-native-ui-subagent"
+    assert (
+        labels["omnigent.antigravity_native.subagent_cascade_id"]
+        == "1eca7625-be65-4092-8718-273c1bc3436b"
+    )
+    assert labels["omnigent.antigravity_native.agent_role"] == "App Router Code Reviewer"
+    assert labels["omnigent.antigravity_native.agent_type"] == "research"
+    # Links the child back to the tool card that spawned it.
+    assert labels["omnigent.antigravity_native.tool_call_id"] == "agy_call_efb134b2_36"
+
+
+async def test_external_antigravity_subagent_start_is_idempotent(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Re-registering the same agy sub-agent returns the existing child row.
+
+    The reader re-enters its handler on every frame while the sub-agents work
+    (the owning step stays RUNNING throughout), and a runner restart replays the
+    step, so this POST is repeated many times per sub-agent. Each repeat must
+    resolve to the same row rather than filling the rail with duplicates.
+
+    :param client: The test HTTP client.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "antigravity-native-ui"},
+    )
+    payload = {
+        "type": "external_antigravity_subagent_start",
+        "data": {
+            "cascade_id": "a8009634-3de5-464a-a84c-6f1dafb18942",
+            "role": "Database & Schema Code Reviewer",
+            "agent_type": "research",
+        },
+    }
+
+    first = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    assert first.status_code == 202, first.text
+    second = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    assert second.status_code == 202, second.text
+
+    assert first.json()["child_session_id"] == second.json()["child_session_id"], (
+        "A repeated registration must resolve to the same child session"
+    )
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    matching = [c for c in children if c["session_name"] == "a8009634-3de5-464a-a84c-6f1dafb18942"]
+    assert len(matching) == 1, f"Expected exactly 1 child row; got {len(matching)}"
+
+
+async def test_external_antigravity_subagent_start_requires_cascade_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A registration with no ``cascade_id`` is rejected rather than minting an
+    unaddressable child.
+
+    The cascade id is what the mirror loop polls and what makes the row
+    idempotent; a child without one could never be filled in.
+
+    :param client: The test HTTP client.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "antigravity-native-ui"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_antigravity_subagent_start",
+            "data": {"role": "Nameless Reviewer"},
+        },
+    )
+    assert resp.status_code == 400, (
+        f"Expected 400 for a missing cascade_id; got {resp.status_code}: {resp.text[:200]}"
+    )
+
+
+async def test_external_antigravity_subagent_start_title_survives_a_colon_in_the_role(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A role containing a colon still splits into role / cascade id in the rail.
+
+    The rail splits a child title on its FIRST colon, and agy's roles are
+    model-authored free text — "Review: routing" would otherwise push the cascade
+    id out of ``session_name`` and show a truncated role.
+
+    :param client: The test HTTP client.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "antigravity-native-ui"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_antigravity_subagent_start",
+            "data": {
+                "cascade_id": "84110421-7cfd-4971-8eaa-8e1f390fc92e",
+                "role": "Review: routing and auth",
+                "agent_type": "research",
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    child_id = resp.json()["child_session_id"]
+
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    child = next(c for c in children if c["id"] == child_id)
+    assert child["session_name"] == "84110421-7cfd-4971-8eaa-8e1f390fc92e", (
+        f"The cascade id must stay in session_name; got {child['session_name']!r}"
+    )
+    assert child["tool"] == "Review- routing and auth", (
+        f"Expected the colon folded out of the role; got {child['tool']!r}"
+    )
+    # The unmangled role is still available for any surface that wants it.
+    assert child["labels"]["omnigent.antigravity_native.agent_role"] == "Review: routing and auth"
+
+
 async def test_external_codex_subagent_start_adopts_unlabeled_title_collision(
     client: httpx.AsyncClient,
 ) -> None:
@@ -8422,3 +10561,210 @@ async def test_message_forward_failure_surfaces_runner_unavailable(
         )
     finally:
         await fake_runner.aclose()
+
+
+async def test_message_forward_rejection_surfaces_failed_with_reason(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner that *rejects* the forward fails the session with the reason.
+
+    Distinct from the transport-failure test above. httpx only raises on
+    transport errors, so a runner that answers ``503 harness_spawn_failed``
+    used to read as a started turn: ``input.consumed`` was published and the
+    session settled ``idle``, masking a real failure as a finished turn. The
+    live runner took nothing, so it must surface as ``failed`` carrying the
+    runner's detail, durably enough to survive a reload.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            return httpx.Response(
+                503,
+                json={
+                    "error": "harness_spawn_failed",
+                    "detail": "harness spawn failed (see runner log)",
+                },
+            )
+        return httpx.Response(202, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient | None:
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+        sid = session["id"]
+
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+        assert resp.status_code == 503, resp.text
+
+        # The rejection is durable: the session reads failed on reload and
+        # last_task_error carries the runner's own reason, not a bare "failed".
+        snap = (await client.get(f"/v1/sessions/{sid}")).json()
+        assert snap["status"] == "failed", snap
+        last_error = snap.get("last_task_error")
+        assert last_error is not None, f"expected a persisted last_task_error, got {snap}"
+        assert last_error["code"] == "runner_rejected_event", last_error
+        assert "harness_spawn_failed" in last_error["message"], last_error
+    finally:
+        await fake_runner.aclose()
+
+
+async def test_create_child_session_duplicate_title_returns_409(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /v1/sessions returns 409 when a child with the same title already exists."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+
+    resp1 = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "title": "researcher:researcher-1",
+        },
+    )
+    assert resp1.status_code == 201, resp1.text
+
+    resp2 = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "title": "researcher:researcher-1",
+        },
+    )
+    assert resp2.status_code == 409, (
+        f"expected 409 on duplicate child title, got {resp2.status_code}: {resp2.text}"
+    )
+
+
+async def test_create_session_notifies_runner_with_init_envelope(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The create route notifies the runner with the session-init envelope.
+
+    Cross-component regression: the create route must send the full
+    ``session_init`` envelope — carrying the persisted ``/model`` override —
+    not the legacy id-only body. Otherwise the runner falls back to a
+    best-effort reverse GET and, on any failure, silently spawns the default
+    model and respawns on the first turn. Asserts the captured runner-init POST
+    is the envelope and that it carries the override.
+    """
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PAYLOAD_KEY,
+        parse_runner_session_init_envelope,
+    )
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+
+    captured_inits: list[dict[str, Any]] = []
+
+    def forward_to_runner(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured_inits.append(json.loads(request.content))
+        return httpx.Response(201, json={"status": "initialized"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(forward_to_runner),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "model_override": "model-x"},
+        )
+        assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
+    finally:
+        await fake_runner.aclose()
+
+    assert captured_inits, "create route did not notify the runner of the new session"
+    body = captured_inits[-1]
+    assert SESSION_INIT_PAYLOAD_KEY in body, (
+        "create route sent the legacy id-only body, not the init envelope; the "
+        f"runner would fall back to a reverse GET. Body keys: {sorted(body)}"
+    )
+    envelope = parse_runner_session_init_envelope(body)
+    assert envelope is not None
+    assert envelope.snapshot.model_override == "model-x", (
+        "the init envelope must carry the persisted /model override so the "
+        "runner seeds it into the first spawn; got "
+        f"{envelope.snapshot.model_override!r}"
+    )
+
+
+async def test_external_info_error_item_publishes_and_persists_level(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An external ``error`` item with ``level: "info"`` keeps its level on both
+    the live ``response.output_item.done`` frame and the persisted item.
+
+    This is the runner's fresh-thread notice: the web renders it as a neutral
+    pill live, and again after reload from the items endpoint.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "error",
+                "item_data": {
+                    "source": "harness",
+                    "code": "codex_thread_reset",
+                    "message": "Codex started a fresh thread.",
+                    "level": "info",
+                },
+            },
+        },
+    )
+    assert resp.status_code in (200, 202)
+
+    done = [ev for _sid, ev in published if ev.get("type") == "response.output_item.done"]
+    assert len(done) == 1
+    assert done[0]["item"]["type"] == "error"
+    assert done[0]["item"]["level"] == "info"
+
+    items = await client.get(f"/v1/sessions/{session['id']}/items")
+    errors = [item for item in items.json()["data"] if item["type"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["level"] == "info"

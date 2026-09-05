@@ -5,7 +5,9 @@ Covers the four corners of the matrix:
 - loopback + env-unset → single-user marker (no login);
 - non-loopback + env-unset → accounts mode (login required) + warning;
 - explicit ``OMNIGENT_AUTH_PROVIDER`` → no implicit change;
-- explicit ``OMNIGENT_AUTH_ENABLED=0`` → no implicit re-enable.
+- explicit ``OMNIGENT_AUTH_ENABLED=0`` → no implicit re-enable;
+- non-loopback + explicit ``OMNIGENT_LOCAL_SINGLE_USER=1`` → header mode
+  kept (no accounts auto-enable) + security warning.
 """
 
 from __future__ import annotations
@@ -152,6 +154,141 @@ def test_non_loopback_empty_auth_provider_string_is_unset(monkeypatch: pytest.Mo
     _apply_bind_auth_defaults("0.0.0.0")
 
     assert os.environ.get("OMNIGENT_AUTH_ENABLED") == "1"
+
+
+# ── non-loopback + explicit single-user marker ──────────────────────
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.10", "10.0.0.5"])
+@pytest.mark.parametrize("marker", ["1", "true", "yes", "TRUE"])
+def test_non_loopback_respects_explicit_single_user(
+    host: str, marker: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A truthy OMNIGENT_LOCAL_SINGLE_USER wins on a non-loopback bind.
+
+    Auto-enabling accounts here would switch identity resolution to the
+    cookie path, where neither the ``"local"`` fallback nor the identity
+    header is reachable — every request 401s and the host tunnel 403s.
+    The operator declared a single-operator server, so header mode stays.
+    """
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", marker)
+    _apply_bind_auth_defaults(host)
+
+    # Accounts mode must NOT be auto-enabled over the explicit marker.
+    assert os.environ.get("OMNIGENT_AUTH_ENABLED") is None
+    assert os.environ.get("OMNIGENT_LOCAL_SINGLE_USER") == marker
+
+    from omnigent.server.auth import resolve_auth_source
+
+    assert resolve_auth_source() == "header"
+
+    # The warning names the exposure, not just the mode: this posture
+    # serves unauthenticated to anyone who can reach the bind address.
+    _msg = _stderr(capsys)
+    assert host in _msg
+    assert "unauthenticated" in _msg.lower()
+    assert "OMNIGENT_LOCAL_SINGLE_USER" in _msg
+
+
+def test_non_loopback_single_user_zero_still_enables_accounts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """OMNIGENT_LOCAL_SINGLE_USER=0 is an opt-out — accounts still auto-enable.
+
+    Only a *truthy* marker declares a single-user server; an explicit
+    "off" must not suppress the network-exposed login default.
+    """
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
+    _apply_bind_auth_defaults("0.0.0.0")
+
+    assert os.environ.get("OMNIGENT_AUTH_ENABLED") == "1"
+    assert "accounts" in _stderr(capsys).lower()
+
+
+def test_non_loopback_single_user_with_auth_enabled_one_keeps_accounts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An explicit AUTH_ENABLED=1 beats the single-user marker.
+
+    Both are explicit; the narrower "auth on" wins, and the
+    unauthenticated-exposure warning must not fire for a server that
+    does require login.
+    """
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "1")
+    _apply_bind_auth_defaults("0.0.0.0")
+
+    assert os.environ.get("OMNIGENT_AUTH_ENABLED") == "1"
+    assert _stderr(capsys) == ""
+
+
+@pytest.mark.parametrize("provider", ["accounts", "oidc"])
+def test_non_loopback_single_user_with_explicit_login_provider_is_silent(
+    provider: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An explicit login provider beside the marker suppresses the warning.
+
+    ``OMNIGENT_AUTH_PROVIDER`` wins outright in ``resolve_auth_source``, so
+    identity goes through the cookie path and login *is* required. Claiming
+    unauthenticated exposure here would be false.
+    """
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", provider)
+    _apply_bind_auth_defaults("0.0.0.0")
+
+    from omnigent.server.auth import resolve_auth_source
+
+    assert resolve_auth_source() == provider
+    assert _stderr(capsys) == ""
+
+
+def test_non_loopback_single_user_with_explicit_header_provider_warns(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An explicit header provider beside the marker still warns.
+
+    Header mode is exactly where the ``"local"`` fallback is reachable, so
+    pinning it deliberately is real exposure — the warning must not be
+    silenced just because the provider was named explicitly.
+    """
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "header")
+    _apply_bind_auth_defaults("0.0.0.0")
+
+    assert "unauthenticated" in _stderr(capsys).lower()
+
+
+def test_non_loopback_single_user_with_auth_enabled_zero_warns(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AUTH_ENABLED=0 beside the marker warns: it resolves to header mode.
+
+    The kill-switch is "set" but falsy, so ``resolve_auth_source`` returns
+    ``header`` and the unauthenticated ``"local"`` fallback is live. The
+    exposure is real and must be announced.
+    """
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    _apply_bind_auth_defaults("0.0.0.0")
+
+    from omnigent.server.auth import resolve_auth_source
+
+    assert resolve_auth_source() == "header"
+    assert "unauthenticated" in _stderr(capsys).lower()
+
+
+def test_loopback_single_user_emits_no_warning(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The exposure warning is scoped to non-loopback binds.
+
+    On loopback the single-user marker is the normal, safe default — it
+    must stay silent.
+    """
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    _apply_bind_auth_defaults("127.0.0.1")
+
+    assert _stderr(capsys) == ""
 
 
 # ── OIDC ───────────────────────────────────────────────────────────

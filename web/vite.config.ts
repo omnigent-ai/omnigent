@@ -1,14 +1,35 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import type { Plugin, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
+import { shikiManualChunk } from "./vite.shiki";
 
-import { computeBuildVersion } from "./src/lib/buildVersion";
+// Databricks workspace-hosted omnigent is mounted behind the api-proxy at this
+// path; a local / self-hosted server mounts at the root. Mirrors the Python
+// WORKSPACE_API_PATH (omnigent/cli_auth.py) so both sides agree on the shape of
+// a workspace URL.
+const WORKSPACE_API_PATH = "/api/2.0/omnigent";
 
-const OMNIGENT_URL = process.env.OMNIGENT_URL ?? "http://localhost:6767";
+function isWorkspaceHost(hostname: string): boolean {
+  return hostname.endsWith(".databricks.com") || hostname.endsWith(".azuredatabricks.net");
+}
+
+// Resolve the proxy target. Point OMNIGENT_URL at a bare workspace origin
+// (https://<ws>.databricks.com) and the api-proxy mount is filled in
+// automatically, so the browser's relative /v1/... paths reach the
+// workspace-hosted server without hand-typing the /api/2.0/omnigent prefix. An
+// explicit non-root path is respected (a custom mount, or a local server).
+function resolveTarget(raw: string): string {
+  const url = new URL(raw);
+  if (isWorkspaceHost(url.hostname) && (url.pathname === "" || url.pathname === "/")) {
+    url.pathname = WORKSPACE_API_PATH;
+  }
+  return url.toString().replace(/\/$/, "");
+}
+
+const OMNIGENT_URL = resolveTarget(process.env.OMNIGENT_URL ?? "http://localhost:6767");
 
 let cachedToken: string | null | undefined;
 
@@ -100,19 +121,39 @@ function createProxyConfig(target: string, useAuth: boolean): Record<string, Pro
       changeOrigin: true,
       configure,
     },
+    // The server's version manifest (/.well-known/omnigent.json), which the
+    // desktop shell reads to learn what it's talking to. Without this the dev
+    // server answers with the SPA's index.html, and the shell — which rightly
+    // refuses to parse HTML as a manifest — sees every dev server as
+    // "pre-manifest", making the capability invisible in local development.
+    "/.well-known": {
+      target: origin,
+      changeOrigin: true,
+      configure,
+    },
   };
 }
 
 const parsed = new URL(OMNIGENT_URL);
-const useAuth =
-  !!process.env.OMNIGENT_AUTH_TOKEN ||
-  parsed.hostname.endsWith(".databricks.com") ||
-  parsed.hostname.endsWith(".azuredatabricks.net");
+const useAuth = !!process.env.OMNIGENT_AUTH_TOKEN || isWorkspaceHost(parsed.hostname);
+
+// A Databricks workspace-hosted server sits behind the multi-replica sharding
+// layer, so the dev bundle must emit the host_id slice key on host-scoped
+// traffic — same as the embedded (managed) UI — or requests scatter across
+// replicas and a host's runner tunnel becomes unreachable ("host is offline").
+// Surface it to the browser as a build-time flag (inlined into import.meta.env);
+// the embed path keys off its host fetcher instead (see isDatabricksWorkspace in
+// host.ts). Keyed off the resolved mount so pointing at a bare workspace origin
+// turns it on.
+const isDatabricksWorkspaceEnv = parsed.pathname.replace(/\/$/, "") === WORKSPACE_API_PATH;
+if (isDatabricksWorkspaceEnv) process.env.VITE_DATABRICKS_WORKSPACE = "true";
 
 if (useAuth) {
   const token = resolveToken(parsed.origin);
   if (token) {
-    console.log(`[dev-proxy] target=${OMNIGENT_URL} (authenticated)`);
+    console.log(
+      `[dev-proxy] target=${OMNIGENT_URL} (authenticated${isDatabricksWorkspaceEnv ? ", databricks-workspace" : ""})`,
+    );
   } else {
     console.error(
       `\n[dev-proxy] ERROR: No auth token for ${parsed.origin}.\n` +
@@ -125,83 +166,6 @@ if (useAuth) {
 }
 
 const proxyConfig = createProxyConfig(OMNIGENT_URL, useAuth);
-
-// PWA web app manifest. Static (the app's identity doesn't change per build);
-// emitted by the plugin below — NOT placed in `public/`, because `public/` is
-// copied into the embed-island build too (vite.embed.config.ts), and the embed
-// must never ship a manifest/SW (it loads inside a host app's origin). `id` is
-// pinned independent of a future `start_url` change so the browser keeps
-// treating reinstalls/updates as the same app.
-const PWA_MANIFEST = {
-  id: "/",
-  name: "Omnigent",
-  short_name: "Omnigent",
-  description: "Omnigent — a common layer over coding agents.",
-  start_url: "/",
-  scope: "/",
-  display: "standalone",
-  orientation: "any",
-  theme_color: "#0d1218",
-  background_color: "#0d1218",
-  icons: [
-    { src: "/pwa-192.png", sizes: "192x192", type: "image/png" },
-    { src: "/pwa-512.png", sizes: "512x512", type: "image/png" },
-    { src: "/pwa-maskable-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
-  ],
-};
-
-/**
- * Emit the PWA assets for the standalone build: `version.json`,
- * `manifest.webmanifest`, and a `sw.js` whose `__BUILD_VERSION__` token is
- * replaced with a fingerprint of this build's hashed JS/CSS outputs
- * (`computeBuildVersion`). That fingerprint makes `sw.js` change on every
- * code/style deploy, which is what fires the in-app update prompt. Registered
- * ONLY here (not in `vite.embed.config.ts`), so the embed island ships neither
- * a service worker nor a manifest.
- *
- * In dev, `generateBundle` doesn't run, so the dev server serves the manifest
- * via middleware (otherwise the `index.html` link 404s) — but no `sw.js`: there
- * is deliberately no service worker in dev (see `useServiceWorkerUpdate`).
- */
-function emitPwaAssets(): Plugin {
-  return {
-    name: "emit-pwa-assets",
-    configureServer(server) {
-      server.middlewares.use((req, res, next) => {
-        if (req.url !== "/manifest.webmanifest") return next();
-        res.setHeader("Content-Type", "application/manifest+json");
-        res.end(JSON.stringify(PWA_MANIFEST));
-      });
-    },
-    generateBundle(_options, bundle) {
-      const build = computeBuildVersion(Object.keys(bundle));
-      const swSource = readFileSync(path.resolve(__dirname, "sw-src/sw.js"), "utf8");
-      // Fail the build loudly rather than ship a service worker with no
-      // per-build fingerprint — a missing token would silently leave `sw.js`
-      // byte-identical across deploys, so the update prompt would never fire.
-      if (!swSource.includes("__BUILD_VERSION__")) {
-        this.error("sw-src/sw.js is missing the __BUILD_VERSION__ token; cannot fingerprint sw.js");
-      }
-      this.emitFile({
-        type: "asset",
-        fileName: "version.json",
-        source: JSON.stringify({ build }),
-      });
-      this.emitFile({
-        type: "asset",
-        fileName: "manifest.webmanifest",
-        source: JSON.stringify(PWA_MANIFEST),
-      });
-      this.emitFile({
-        type: "asset",
-        fileName: "sw.js",
-        // replaceAll (not replace): if a second reference to the token is ever
-        // added, replace() would leave it raw and break the cache name.
-        source: swSource.replaceAll("__BUILD_VERSION__", build),
-      });
-    },
-  };
-}
 
 // Safari < 16.4 cannot parse regex lookbehind; these dependency regexes would
 // otherwise throw there, at module scope during boot or on the first rendered
@@ -253,7 +217,7 @@ function safariLookbehindWorkarounds(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [emitPwaAssets(), safariLookbehindWorkarounds(), react(), tailwindcss()],
+  plugins: [safariLookbehindWorkarounds(), react(), tailwindcss()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -277,8 +241,20 @@ export default defineConfig({
         "src/**/*.test.{ts,tsx}",
         "src/**/*.d.ts",
         "src/test-setup.ts",
+        // Storybook-only modules are covered by the pinned visual snapshot suite.
+        "src/**/*.stories.{ts,tsx}",
+        "src/storybook/**",
+        "src/**/*storyFixtures.{ts,tsx}",
+        "src/**/*StoryFixtures.{ts,tsx}",
         // Vendored UI kit, not product code (see tests/e2e_ui/COVERAGE_GAPS.md).
         "src/components/ai-elements/**",
+        // Onboarding wizard pieces with no jsdom-testable logic: the WebGL2
+        // shader + its canvas wrapper (no GL context in jsdom) and the Electron
+        // entry (createRoot against the preload bridge). The flow's real logic
+        // (steps, URL normalization) stays counted and is unit-tested.
+        "src/components/onboarding/PixelBlast.tsx",
+        "src/components/onboarding/AnimatedOmnigentPanel.tsx",
+        "src/server-selector-v2.tsx",
       ],
       reportsDirectory: "./coverage",
       // text-summary: human-readable console line; json-summary: machine-
@@ -296,27 +272,7 @@ export default defineConfig({
     emptyOutDir: true,
     rollupOptions: {
       output: {
-        manualChunks(id) {
-          const normalized = id.replaceAll("\\", "/");
-          // Shiki lazily imports each language grammar (`@shikijs/langs/<lang>`)
-          // via dynamic import; leave those as their own on-demand chunks
-          // instead of folding ~200 grammars into the eagerly-loaded core.
-          if (normalized.includes("/@shikijs/langs/")) {
-            return;
-          }
-          // Keep Shiki's core, engines, and bundle glue (incl. the language
-          // index + alias map) in one chunk. pnpm's symlinks + Vite's default
-          // split otherwise expose a top-level cyclic import between the
-          // language bundle and the alias-map chunk that executes before its
-          // data dependency is initialized, producing "Cannot read properties
-          // of undefined (reading 'flatMap')" and a blank Monaco/file-viewer
-          // screen. The engines must stay here too: excluding them splits the
-          // cyclic core across chunks and reintroduces the bug.
-          if (normalized.includes("/shiki") || normalized.includes("/@shikijs/")) {
-            return "shiki";
-          }
-          return undefined;
-        },
+        manualChunks: shikiManualChunk,
       },
     },
   },

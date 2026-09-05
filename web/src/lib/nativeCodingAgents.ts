@@ -16,7 +16,8 @@ export type NativeCodingAgentIconKind =
   | "antigravity"
   | "kimi"
   | "hermes";
-export type NativeCodingAgentCapability = "permissionMode" | "approvalMode" | "cursorMode";
+export type NativeCodingAgentCapability =
+  "permissionMode" | "approvalMode" | "cursorMode" | "skipPermissions" | "modelPicker";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -52,7 +53,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Claude Code",
     iconKind: "claude",
     sortRank: 10,
-    capabilities: ["permissionMode"],
+    capabilities: ["permissionMode", "modelPicker"],
     fullySupported: true,
   },
   {
@@ -105,6 +106,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Pi",
     iconKind: "pi",
     sortRank: 40,
+    capabilities: ["modelPicker"],
   },
   {
     key: "kiro",
@@ -125,9 +127,14 @@ export const NATIVE_CODING_AGENTS = [
     agentName: "antigravity-native-ui",
     harness: "antigravity-native",
     wrapperLabel: "antigravity-native-ui",
+    subagentWrapperLabel: "antigravity-native-ui-subagent",
     displayName: "Antigravity",
     iconKind: "antigravity",
     sortRank: 45,
+    // agy's only pre-emptive control is the all-or-nothing
+    // `--dangerously-skip-permissions`, so it gets a two-value toggle rather
+    // than Claude's graded permissionMode selector.
+    capabilities: ["skipPermissions"],
   },
   {
     key: "goose",
@@ -202,6 +209,8 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-cursor": "cursor-native",
   "native-kiro": "kiro-native",
   "native-antigravity": "antigravity-native",
+  "agy-native": "antigravity-native",
+  "native-agy": "antigravity-native",
   "native-goose": "goose-native",
   "native-qwen": "qwen-native",
   "native-kimi": "kimi-native",
@@ -209,10 +218,83 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-opencode": "opencode-native",
 };
 
+// Vendors whose elicitation wire prefix differs from their registry `key`:
+// Antigravity's bridge stamps `agy_native_*`.
+const POLICY_NAME_VENDORS: Record<string, string> = { antigravity: "agy" };
+
+// Stamped by the generic native-permission hook when the posting bridge sends
+// no name of its own — native provenance with no vendor attached.
+const VENDORLESS_NATIVE_POLICY_NAME = "native_permission";
+
+// `<vendor>_native_` → spec, derived from the registry so a new vendor row is
+// covered without editing a second list. Mirrors the ids the server bridges
+// stamp: `omnigent/server/routes/sessions/routes_hooks.py` (Claude, Cursor,
+// generic), `routes/_codex_elicitation.py`, `routes/_antigravity_elicitation.py`,
+// and the per-vendor `omnigent/<vendor>_native_permissions.py` hooks.
+// `<vendor>_native_` is reserved for those bridges: a user-authored policy in
+// that shape reads as provenance and loses its own name in the UI.
+const NATIVE_POLICY_PREFIXES: readonly (readonly [string, NativeCodingAgentSpec])[] =
+  NATIVE_CODING_AGENTS.map((agent) => [
+    `${POLICY_NAME_VENDORS[agent.key] ?? agent.key}_native_`,
+    agent,
+  ]);
+
+/**
+ * Resolve the vendor behind an elicitation's synthetic ``policy_name``.
+ *
+ * Native permission bridges stamp provenance ids — ``claude_native_permission``,
+ * ``codex_native_command_approval``, ``kiro_native_permission`` — rather than a
+ * policy anyone wrote, so approval surfaces can name the product that asked
+ * instead of leaking the id.
+ *
+ * @param policyName - ``policy_name`` from the elicitation params.
+ * @returns The vendor spec, or undefined for user-authored policy names and for
+ *   native stamps whose vendor this build doesn't know.
+ */
+export function nativeCodingAgentForPolicyName(
+  policyName: string,
+): NativeCodingAgentSpec | undefined {
+  return NATIVE_POLICY_PREFIXES.find(([prefix]) => policyName.startsWith(prefix))?.[1];
+}
+
+/**
+ * Whether a ``policy_name`` is native provenance rather than a policy someone
+ * wrote. True for every ``<vendor>_native_*`` stamp and for the vendor-less
+ * ``native_permission`` fallback, so callers can hide both the id and the
+ * constant ``phase`` that rides along with it.
+ *
+ * @param policyName - ``policy_name`` from the elicitation params.
+ * @returns True when the name came from a harness-native bridge.
+ */
+export function isNativePolicyName(policyName: string): boolean {
+  return (
+    policyName === VENDORLESS_NATIVE_POLICY_NAME ||
+    nativeCodingAgentForPolicyName(policyName) !== undefined
+  );
+}
+
 export function nativeCodingAgentForAgentName(
   name: string | null | undefined,
 ): NativeCodingAgentSpec | undefined {
   return name == null ? undefined : BY_AGENT_NAME.get(name);
+}
+
+/**
+ * The synthetic ``policy_name`` a native agent's permission prompts carry.
+ *
+ * History hydration rebuilds answered question / plan cards from persisted
+ * tool calls, which name the agent rather than the elicitation provenance
+ * the live card came with. Minting the id from the same prefix table
+ * :func:`nativeCodingAgentForPolicyName` reads keeps both directions on
+ * one source of truth, so the rebuilt card names the same vendor.
+ *
+ * @param name - Agent name from the item, e.g. ``"claude-native-ui"``.
+ * @returns The provenance id, or ``""`` for a non-native agent.
+ */
+export function nativePolicyNameForAgentName(name: string | null | undefined): string {
+  const spec = nativeCodingAgentForAgentName(name);
+  if (spec === undefined) return "";
+  return `${POLICY_NAME_VENDORS[spec.key] ?? spec.key}_native_permission`;
 }
 
 export function nativeCodingAgentForHarness(
@@ -300,6 +382,23 @@ export function isNativeTerminalSession(
   const wrapper = session.labels?.[WRAPPER_LABEL_KEY];
   if (isNativeWrapper(wrapper)) return true;
   return nativeCodingAgentForHarness(session.harness) !== undefined;
+}
+
+/**
+ * Resolve the native coding agent a session runs, from its wrapper label
+ * (authoritative) or its harness field.
+ *
+ * @param session - Session-shaped object with `harness` and `labels`.
+ * @returns The agent spec, or undefined for non-native sessions.
+ */
+export function nativeCodingAgentForSession(
+  session: { harness?: string | null; labels?: Record<string, string> } | null | undefined,
+): NativeCodingAgentSpec | undefined {
+  if (session == null) return undefined;
+  return (
+    nativeCodingAgentForWrapper(session.labels?.[WRAPPER_LABEL_KEY]) ??
+    nativeCodingAgentForHarness(session.harness)
+  );
 }
 
 export function nativeWrapperLabelsForAgent(

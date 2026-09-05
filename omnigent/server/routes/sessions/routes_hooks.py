@@ -15,6 +15,8 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.codex_native_elicitation import codex_elicitation_id
+from omnigent.debug_logging import add_audit_attrs
+from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
@@ -59,7 +61,9 @@ from omnigent.server.routes._content_type import (
 from omnigent.server.routes._sessions.common import (
     _EVALUATE_HOOK_ELICITATION_ID_RE,
     _TURN_ACTOR_LABEL,
+    _llm_response_denied_turns,
     _logger,
+    _runner_relay_tasks,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -365,6 +369,18 @@ def register_hooks_routes(
             and result.content
         ):
             decision["updatedInput"] = {**tool_input, "answers": result.content}
+        # ExitPlanMode is a requiresUserInteraction tool: Claude Code coerces a
+        # bare PermissionRequest allow back to an interactive prompt unless the
+        # decision also carries ``updatedInput``. The plan needs no change, so
+        # echo the model's own input verbatim — its presence, not its content,
+        # is what lets a web-UI approval proceed without a TUI keystroke.
+        if (
+            behavior == "allow"
+            and tool_name == "ExitPlanMode"
+            and isinstance(tool_input, dict)
+            and tool_input
+        ):
+            decision["updatedInput"] = tool_input
         # "Accept & allow all edits" — the user approved this edit AND
         # asked to auto-accept future edits. Echo a ``setMode`` permission
         # update so Claude Code switches this session into ``acceptEdits``
@@ -700,7 +716,14 @@ def register_hooks_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
-        conv = conversation_store.get_conversation(session_id)
+        # Reuse the row the ACL check already fetched — same point in the
+        # request, so no less fresh than reading it again here, one query
+        # fewer on the blocking PreToolUse path. Absent for admin callers
+        # (who bypass the conversation lookup) and when permissions are
+        # disabled, which fall back to their own read.
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise OmnigentError(
                 f"Session {session_id!r} not found.",
@@ -750,6 +773,10 @@ def register_hooks_routes(
             policy_store=get_policy_store(),
             phase=phase,
             tool_name=data.get("name") if isinstance(data, dict) else None,
+            # A sub-agent conversation's own guardrails live on the CHILD
+            # spec inside this bundle; without the row the check would
+            # fast-path skip a bundle whose only policies are child-declared.
+            conversation=conv,
         ):
             return Response(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
@@ -760,7 +787,7 @@ def register_hooks_routes(
             _caps.policy_llm_connection_factory() if _caps.policy_llm_connection_factory else None
         )
 
-        def _build_engine() -> PolicyEngine:
+        def _build_engine(preloaded_conv: Conversation | None = None) -> PolicyEngine:
             """
             Build a policy engine for this session from the loaded spec.
 
@@ -769,6 +796,10 @@ def register_hooks_routes(
             does not re-query it during ``evaluate``, so a fresh build is the
             only way to observe a concurrent sibling's just-recorded approval.
 
+            :param preloaded_conv: The conversation row this handler already
+                loaded, passed on the FIRST build only to skip the builder's
+                re-read. Rebuilds that must observe concurrent writes (the
+                ASK-gate re-evaluation) pass ``None`` for a fresh read.
             :returns: A :class:`PolicyEngine` seeded with the latest
                 persisted state for ``session_id``.
             """
@@ -776,20 +807,30 @@ def register_hooks_routes(
                 spec=loaded.spec,
                 conversation_id=session_id,
                 conversation_store=conversation_store,
+                conversation=preloaded_conv,
+                # ``agent`` below was resolved from conv.agent_id; the builder
+                # re-reads the row and fails closed if it was rebound since.
+                expected_agent_id=agent.id,
                 default_policies=_caps.default_policies,
                 policy_store=get_policy_store(),
                 server_llm=_caps.llm,
                 host_connection=_host_conn,
             )
 
-        engine = _build_engine()
+        engine = _build_engine(conv)
         # Use the turn-initiating human's identity (persisted at forward time)
         # so per-user policies gate on the correct actor even when the HTTP
         # caller is the runner's service-account credential.  Falls back to
         # user_id for direct API callers and native-terminal sessions (whose
         # turns go via _dispatch_session_event_to_runner, which does not write
         # this label).
-        turn_actor = conv.labels.get(_TURN_ACTOR_LABEL)
+        # Read the actor from the engine's label snapshot, not from the row
+        # fetched at the top of this handler: the engine's labels come from a
+        # read taken after the agent/spec load, so a turn-actor label written
+        # in that window still gates on the right principal. (``agent_id``
+        # cannot be treated the same way — it selects the spec the engine is
+        # built from, so it is necessarily read first.)
+        turn_actor = engine.labels.get(_TURN_ACTOR_LABEL)
         ctx = _build_evaluation_context(
             phase, data, event, actor=_build_actor(turn_actor or user_id)
         )
@@ -864,6 +905,12 @@ def register_hooks_routes(
                                 "result": "POLICY_ACTION_DENY",
                                 "reason": exc.args[0] or "Approval was declined.",
                             }
+                            add_audit_attrs(
+                                policy_verdict="POLICY_ACTION_DENY",
+                                policy_phase=phase.value,
+                                policy_reason=decline_body["reason"],
+                                policy_gate="declined",
+                            )
                             return Response(
                                 content=json.dumps(decline_body),
                                 media_type="application/json",
@@ -876,6 +923,13 @@ def register_hooks_routes(
                                 "reason": result.reason or "Approval was not granted.",
                             }
                         )
+                        add_audit_attrs(
+                            policy_verdict=approval_body["result"],
+                            policy_phase=phase.value,
+                            policy_gate="ask",
+                        )
+                        if approval_body.get("reason"):
+                            add_audit_attrs(policy_reason=approval_body["reason"])
                         return Response(
                             content=json.dumps(approval_body),
                             media_type="application/json",
@@ -894,6 +948,18 @@ def register_hooks_routes(
             resp_body["reason"] = result.reason
         if result.data is not None:
             resp_body["data"] = result.data
+        # Tag the audit envelope with the decision so a DENY/ASK is debuggable
+        # (a deny returns HTTP 200, so status alone can't tell you the verdict).
+        add_audit_attrs(policy_verdict=resp_body["result"], policy_phase=phase.value)
+        if result.reason:
+            add_audit_attrs(policy_reason=result.reason)
+        _policy_tool = data.get("name") if isinstance(data, dict) else None
+        if _policy_tool:
+            add_audit_attrs(policy_tool=_policy_tool)
+        if result.deciding_policy is not None:
+            add_audit_attrs(
+                policy=getattr(result.deciding_policy, "name", None) or str(result.deciding_policy)
+            )
         # A request-phase HARD DENY (no approve option) — surface the reason as a
         # dismissable tmux popup on the native pane. opencode hard-blocks the
         # prompt by its plugin throwing (rendered as a generic error), so this is
@@ -910,6 +976,21 @@ def register_hooks_routes(
         # not gated on write access.
         if result.action == PolicyAction.DENY and phase == Phase.TOOL_CALL:
             _publish_policy_denied(session_id, result.reason or "Blocked by policy.", phase.value)
+        # An LLM_RESPONSE DENY reaches the harness only after the assistant
+        # text already streamed through the runner relay, whose terminal
+        # flush would persist it as a normal assistant message. Mark the
+        # session so the relay substitutes the deny sentinel for the
+        # buffered text instead (see the relay's terminal-flush handling).
+        # Gated on write access: a read-only viewer's evaluate call must not
+        # be able to poison the owner's in-flight turn. Also gated on an
+        # active relay for this session — the marker only means something to
+        # a relay flush, and skipping the write otherwise keeps background /
+        # non-relayed evaluations from growing the unbounded marker dict
+        # (its cleanup rides the relay's teardown).
+        if result.action == PolicyAction.DENY and phase == Phase.LLM_RESPONSE and not is_read_only:
+            _relay = _runner_relay_tasks.get(session_id)
+            if _relay is not None and not _relay.task.done():
+                _llm_response_denied_turns[session_id] = result.reason or "Denied by policy"
         return Response(
             content=json.dumps(resp_body),
             media_type="application/json",
@@ -1295,6 +1376,12 @@ def register_hooks_routes(
         policy_name = payload.get("policy_name")
         if not isinstance(policy_name, str) or not policy_name:
             policy_name = "native_permission"
+        extras: dict[str, Any] = {}
+        ask_user_question = payload.get("ask_user_question")
+        if isinstance(ask_user_question, dict) and isinstance(
+            ask_user_question.get("questions"), list
+        ):
+            extras["ask_user_question"] = ask_user_question
         params = ElicitationRequestParams(
             mode="form",
             message=message,
@@ -1303,6 +1390,7 @@ def register_hooks_routes(
             phase="pre_tool_use",
             policy_name=policy_name,
             content_preview=content_preview,
+            **extras,
         )
         from omnigent.server.routes import sessions as _sf
 

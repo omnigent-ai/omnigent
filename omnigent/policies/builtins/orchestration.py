@@ -16,6 +16,7 @@ from collections.abc import Callable, Collection
 from typing import Any, TypeAlias
 
 from omnigent.policies.builtins._shell import SHELL_TOOLS
+from omnigent.policies.builtins.safety import NATIVE_WRITE_TOOLS
 
 # Heterogeneous JSON-shaped maps — the V0 policy event + decision payloads.
 _Json: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
@@ -552,12 +553,12 @@ def worktree_guard(
     :returns: An evaluator ``fn(event, config)`` returning a V0 decision.
     """
 
-    # Match Omnigent built-in OS write/edit, Claude/Codex native Write/Edit
-    # (surfaced via the PreToolUse hook), and Pi's native lowercase
+    # Match Omnigent built-in OS write/edit, every Claude/Codex native write
+    # tool (surfaced via the PreToolUse hook), and Pi's native lowercase
     # write/edit (surfaced via the pi ``tool_call`` hook). Pi uses the same
     # ``path`` argument key as the Omnigent tools, so no Pi-specific arg
     # branch is needed below.
-    _write_tools = {"sys_os_write", "sys_os_edit", "Write", "Edit", "MultiEdit", "write", "edit"}
+    _write_tools = NATIVE_WRITE_TOOLS | {"sys_os_write", "sys_os_edit", "write", "edit"}
 
     def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
         """
@@ -571,35 +572,43 @@ def worktree_guard(
         args = _tool_call(event, _write_tools)
         if args is None:
             return _ALLOW
-        # Omnigent tools use ``path``; Claude native tools use ``file_path``.
-        path = args.get("path") or args.get("file_path")
-        if not isinstance(path, str):
-            return _ALLOW
-        # Backslashes are not valid in POSIX paths and could confuse
-        # downstream processing into treating them as separators, slipping a
-        # ``..\\`` past the split-on-'/' traversal check.
-        if "\\" in path:
-            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
-        # posixpath, NOT os.path: the tool contract is POSIX-shaped, and
-        # ntpath.normpath rewrites "/" to "\", which makes the leading-"/" test
-        # below inert on a Windows runner (absolute paths would ALLOW there).
-        # normpath collapses ``..``/``.``/repeated slashes and pushes every
-        # upward traversal to the front, so a single startswith catches every
-        # escape form (e.g. "a/../../escape" → "../../escape").
-        normalized = posixpath.normpath(path)
-        if normalized.startswith(("/", "~", "..")):
-            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
-        # A drive-qualified path ("C:/Windows/x") is absolute on Windows but
-        # reads as an ordinary relative dir named "C:" to posixpath, so the test
-        # above misses it. Checked on the NORMALIZED path, not the raw one:
-        # normpath strips a leading "./" (and collapses "a/../C:/..."), which
-        # would otherwise hide the drive letter from a raw-string check. UNC
-        # ("//server/share") keeps its leading slashes and is caught above.
-        # ASCII-only: Windows drives are [A-Za-z], but str.isalpha() is
-        # Unicode-aware and would also reject a relative dir named e.g. "Ω:".
-        drive = normalized[:1]
-        if drive.isascii() and drive.isalpha() and normalized[1:2] == ":":
-            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+        # Omnigent tools use ``path``; Claude native tools use ``file_path``,
+        # except NotebookEdit which uses ``notebook_path``. Check EVERY
+        # path-like argument present, not the first truthy one: a decoy
+        # in-tree ``path`` alongside an escaping ``notebook_path`` (or
+        # ``file_path``) must still DENY, since the tool acts on its own
+        # canonical key regardless of what else rides in the payload.
+        paths = [
+            value
+            for key in ("path", "file_path", "notebook_path")
+            if isinstance(value := args.get(key), str)
+        ]
+        for path in paths:
+            # Backslashes are not valid in POSIX paths and could confuse
+            # downstream processing into treating them as separators, slipping a
+            # ``..\\`` past the split-on-'/' traversal check.
+            if "\\" in path:
+                return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+            # posixpath, NOT os.path: the tool contract is POSIX-shaped, and
+            # ntpath.normpath rewrites "/" to "\", which makes the leading-"/" test
+            # below inert on a Windows runner (absolute paths would ALLOW there).
+            # normpath collapses ``..``/``.``/repeated slashes and pushes every
+            # upward traversal to the front, so a single startswith catches every
+            # escape form (e.g. "a/../../escape" → "../../escape").
+            normalized = posixpath.normpath(path)
+            if normalized.startswith(("/", "~", "..")):
+                return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+            # A drive-qualified path ("C:/Windows/x") is absolute on Windows but
+            # reads as an ordinary relative dir named "C:" to posixpath, so the test
+            # above misses it. Checked on the NORMALIZED path, not the raw one:
+            # normpath strips a leading "./" (and collapses "a/../C:/..."), which
+            # would otherwise hide the drive letter from a raw-string check. UNC
+            # ("//server/share") keeps its leading slashes and is caught above.
+            # ASCII-only: Windows drives are [A-Za-z], but str.isalpha() is
+            # Unicode-aware and would also reject a relative dir named e.g. "Ω:".
+            drive = normalized[:1]
+            if drive.isascii() and drive.isalpha() and normalized[1:2] == ":":
+                return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
         return _ALLOW
 
     return _evaluate
@@ -616,7 +625,7 @@ def read_only_os(
     Factory: deny every file-mutating tool call (report-only agents).
 
     DENIES ``sys_os_write`` / ``sys_os_edit`` and the Claude/Codex/Pi native
-    ``Write`` / ``Edit`` / ``MultiEdit`` aliases. Reads, searches, and shell
+    ``Write`` / ``Edit`` / ``MultiEdit`` / ``NotebookEdit`` aliases. Reads, searches, and shell
     commands are left untouched — pair with :func:`blast_radius` to also bound
     shell blast radius. Use on agents whose contract is to investigate and
     report, never to change code (e.g. a security reviewer and its read-only
@@ -628,18 +637,10 @@ def read_only_os(
         write/edit tool call, ALLOW otherwise.
     """
 
-    # Match Omnigent built-in OS write/edit, Claude/Codex native Write/Edit/
-    # MultiEdit, and Pi's native lowercase write/edit — the same tool set
+    # Match Omnigent built-in OS write/edit, every Claude/Codex native write
+    # tool, and Pi's native lowercase write/edit — the same tool set
     # worktree_guard gates, so the two write policies stay in lockstep.
-    write_tools = {
-        "sys_os_write",
-        "sys_os_edit",
-        "Write",
-        "Edit",
-        "MultiEdit",
-        "write",
-        "edit",
-    }
+    write_tools = NATIVE_WRITE_TOOLS | {"sys_os_write", "sys_os_edit", "write", "edit"}
 
     def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
         """
@@ -714,15 +715,15 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "kind": "factory",
         "name": "Restrict Writes to Git Worktree",
         "description": "Blocks file writes (sys_os_write/edit, Claude/Codex native "
-        "Write/Edit, and Pi native write/edit) outside the worker's git worktree to "
-        "prevent cross-branch contamination",
+        "Write/Edit/MultiEdit/NotebookEdit, and Pi native write/edit) outside the worker's "
+        "git worktree to prevent cross-branch contamination",
     },
     {
         "handler": "omnigent.policies.builtins.orchestration.read_only_os",
         "kind": "factory",
         "name": "Report-Only (Deny File Writes)",
         "description": "Denies every file-mutating tool (sys_os_write/edit, Claude/Codex "
-        "native Write/Edit/MultiEdit, and Pi native write/edit) so a report-only agent "
-        "can read and run shell but never change code",
+        "native Write/Edit/MultiEdit/NotebookEdit, and Pi native write/edit) so a "
+        "report-only agent can read and run shell but never change code",
     },
 ]

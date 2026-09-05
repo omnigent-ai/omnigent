@@ -33,6 +33,7 @@ _SMOKE_JOURNEYS = [
     "list_project_sessions",
     "fork_session",
     "add_comment",
+    "native_hook_spawn",
 ]
 
 
@@ -291,12 +292,14 @@ def test_effective_iterations_uncapped_journey_passthrough() -> None:
 
 
 def test_runner_journeys_are_capped() -> None:
-    """Every full-turn journey caps its iterations; HTTP journeys do not."""
+    """Every full-turn journey caps its iterations; HTTP journeys do not.
+
+    Non-runner journeys may also declare a cap when they are inherently slow
+    (e.g. cli_startup which takes ~10s per iteration).
+    """
     for journey in ALL_JOURNEYS.values():
         if journey.needs_runner:
             assert journey.max_iterations is not None, journey.name
-        else:
-            assert journey.max_iterations is None, journey.name
 
 
 @pytest.mark.asyncio
@@ -446,6 +449,13 @@ async def test_benchmark_smoke_end_to_end() -> None:
         # readable: each HTTP journey issues at least one request per op.
         per_op = _d(block["summary"]).get("avg_http_requests_per_op")
         assert per_op is not None, f"{name} produced no request count"
+        if name == "native_hook_spawn":
+            # Subprocess-only by design: a nonzero request count or any
+            # attributed route would mean the hook spawn path grew a server
+            # round-trip.
+            assert cast(float, per_op) == 0.0, f"{name}: {per_op} requests/op"
+            assert not _d(block["summary"]).get("network_routes")
+            continue
         assert cast(float, per_op) >= 1.0, f"{name}: {per_op} requests/op"
         # Per-route appendix: at least one endpoint attributed, and its
         # per-op figures sum to roughly the aggregate per-op count.
@@ -605,3 +615,113 @@ def test_seed_creates_listable_corpus(tmp_path: Path) -> None:
     # NOTE: seed() builds the store, which runs migrations to the current head,
     # so this test always exercises the live schema — it is the safety net that
     # a schema change hasn't broken seeding (no revision constant to maintain).
+
+
+# ── report_markdown: the CI job-summary matrix renderer ──────────────────────
+
+
+def _markdown_report(journeys: dict[str, dict], backend: str = "sqlite") -> dict:
+    """A minimal run.py-shaped report carrying just what the renderer reads."""
+    return {
+        "git_sha": "abcdef1234567890",
+        "harness": "openai-agents",
+        "config": {"iterations": 100, "runs": 3, "warmup": 10, "backend": backend},
+        "journeys": journeys,
+    }
+
+
+def _journey_block(**summary: object) -> dict:
+    """A measured journey block with the given summary metrics."""
+    return {"kind": "latency", "runs": [], "summary": {"runs_total": 3, "runs_ok": 3, **summary}}
+
+
+def test_report_markdown_renders_journey_matrix() -> None:
+    """One report renders a journey × metric table with formatted values.
+
+    The renderer feeds $GITHUB_STEP_SUMMARY; a broken cell silently degrades
+    the CI matrix, so assert the exact row content, not just "contains name".
+    """
+    from dev.benchmarks.omnigent.report_markdown import build_markdown
+
+    report = _markdown_report(
+        {
+            "session_cold_start": _journey_block(
+                avg_mean_ms=1234.5,
+                avg_p50_ms=1200.0,
+                avg_p95_ms=1500.25,
+                avg_p99_ms=1600.0,
+                avg_rps=0.8,
+            ),
+        }
+    )
+    md = build_markdown([("sqlite", report)], title="Host session benchmark")
+
+    assert "## Host session benchmark" in md
+    assert "### sqlite" in md
+    # Caption line carries the run context.
+    assert "_100 iterations × 3 runs · warmup 10 · openai-agents · `abcdef12`_" in md
+    assert "| session_cold_start | 1234.5 | 1200.0 | 1500.2 | 1600.0 | 1 | 3/3 |  |" in md
+
+
+def test_report_markdown_marks_skipped_and_failed_journeys() -> None:
+    """Skipped journeys carry the skip reason; all-failed journeys are flagged.
+
+    A skipped journey has an empty summary, and a fully-failed one has counts
+    but no metric keys — both must render as explicit markers, never as fast
+    zeros.
+    """
+    from dev.benchmarks.omnigent.report_markdown import build_markdown
+
+    report = _markdown_report(
+        {
+            "session_cold_start": {
+                "kind": "latency",
+                "runs": [],
+                "summary": {},
+                "skipped": True,
+                "error": "RuntimeError: host not\nready",
+            },
+            "warm_turn": {
+                "kind": "latency",
+                "runs": [],
+                "summary": {"runs_total": 3, "runs_ok": 0},
+            },
+        }
+    )
+    md = build_markdown([("sqlite", report)])
+
+    assert (
+        "| session_cold_start | — | — | — | — | — | — | ⚠️ skipped — RuntimeError: host not ready |"
+        in md
+    )
+    assert "| warm_turn | — | — | — | — | — | 0/3 | ❌ every run failed |" in md
+
+
+def test_report_markdown_cross_report_matrix() -> None:
+    """Multiple reports lead with a journey × report P50 matrix.
+
+    The nightly renders one report per backend; the cross matrix is what
+    makes them comparable at a glance, including journeys missing from one
+    backend (rendered as —).
+    """
+    from dev.benchmarks.omnigent.report_markdown import build_markdown
+
+    sqlite = _markdown_report(
+        {
+            "create_session": _journey_block(avg_p50_ms=12.5),
+            "session_cold_start": _journey_block(avg_p50_ms=1200.0),
+        },
+        backend="sqlite",
+    )
+    postgres = _markdown_report(
+        {"create_session": _journey_block(avg_p50_ms=20.0)}, backend="postgresql"
+    )
+    md = build_markdown([("sqlite", sqlite), ("postgresql", postgres)])
+
+    assert "### P50 across reports" in md
+    assert "| Journey | sqlite P50 ms | postgresql P50 ms |" in md
+    assert "| create_session | 12.5 | 20.0 |" in md
+    assert "| session_cold_start | 1200.0 | — |" in md
+    # Per-report sections still follow the cross matrix.
+    assert "### sqlite" in md
+    assert "### postgresql" in md

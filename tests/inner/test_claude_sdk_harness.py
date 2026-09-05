@@ -442,7 +442,7 @@ def test_bundle_dir_and_agent_name_env_vars_thread_through(
     inner executor.
 
     Together they wire the SDK ``--plugin-dir`` so any
-    ``<bundle>/skills/<name>/SKILL.md`` files in the agent's
+    ``<bundle>/skills/<dir>/SKILL.md`` files in the agent's
     bundle get exposed as bundled skills, with a stable
     ``<agent>:<skill>`` plugin namespace via the
     ``.claude-plugin/plugin.json`` manifest the inner executor

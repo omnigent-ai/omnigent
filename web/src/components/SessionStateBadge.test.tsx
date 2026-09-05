@@ -43,7 +43,7 @@ describe("SessionStateBadge — per-state rendering", () => {
     expect(spinner).not.toBeNull();
     expect(spinner?.getAttribute("class")).toContain("animate-spin");
     expect(spinner?.getAttribute("class")).toContain("text-muted-foreground");
-    expect(spinner?.getAttribute("class")).toContain("size-2.5");
+    expect(spinner?.getAttribute("class")).toContain("size-3");
     expect(container.querySelector(".bg-success")).toBeNull();
   });
 

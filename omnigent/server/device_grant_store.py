@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import secrets
 from typing import cast
 
 from sqlalchemy import and_, delete, or_, update
@@ -129,6 +130,56 @@ class DeviceGrantStore:
                 created_at=created_at,
                 expires_at=expires_at,
                 approved_at=None,
+                last_polled_at=None,
+            )
+            session.add(row)
+            session.flush()
+            return _to_device_grant(row)
+
+    def create_redeemed_grant(
+        self,
+        grant_id: str,
+        *,
+        user_id: str,
+        client_id: str | None,
+        refresh_token_hash: str,
+        created_at: int,
+    ) -> DeviceGrant:
+        """Persist a grant born ``redeemed`` — no device-code consent step.
+
+        Backs login-issued refresh grants: the user just proved their
+        identity interactively (IdP browser flow or password prompt), so
+        the RFC 8628 pending → approved dance would re-ask for consent
+        already given. The row starts ``redeemed`` with its refresh-token
+        digest set, exactly as if it had completed the device flow.
+
+        The device_code/user_code columns are filled with discarded
+        random material: no client ever polls with them, and ``pending``
+        purge conditions never match a ``redeemed`` row.
+
+        :param grant_id: Opaque grant id (public — travels in JWTs).
+        :param user_id: The authenticated identity (the token ``sub``).
+        :param client_id: Public client name for audit, e.g.
+            ``"omnigent-cli"``.
+        :param refresh_token_hash: HMAC digest of the initial refresh
+            token. The store never sees the raw token.
+        :param created_at: Unix epoch seconds; also ``approved_at``, the
+            anchor for the grant's absolute lifetime.
+        :returns: The created :class:`DeviceGrant`.
+        """
+        with self._session("insert_redeemed_device_grant") as session:
+            row = SqlDeviceGrant(
+                id=grant_id,
+                device_code_hash=secrets.token_urlsafe(32),
+                user_code=secrets.token_urlsafe(16),
+                status=encode_device_grant_status("redeemed"),
+                client_id=client_id,
+                user_id=user_id,
+                refresh_token_hash=refresh_token_hash,
+                prev_refresh_token_hash=None,
+                created_at=created_at,
+                expires_at=created_at,
+                approved_at=created_at,
                 last_polled_at=None,
             )
             session.add(row)

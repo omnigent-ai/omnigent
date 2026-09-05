@@ -41,6 +41,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
@@ -414,7 +415,7 @@ def _run_with_remote_server(
     from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=None)
     try:
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
@@ -497,22 +498,26 @@ async def _prepare_cursor_terminal_via_daemon(
     """
     persist_args = list(cursor_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         # Resuming an existing session can either reattach to a live
         # terminal (prior chat intact) or, if that terminal has exited,
         # cold-start a fresh TUI. We only know which after probing for a
         # running terminal below, so default both flags off here.
         reattached = False
         cold_resumed = False
+        fresh_session = session_id is None
         resume_chat_id: str | None = None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Cursor session requires a session bundle.")
             _update_startup_progress(startup_progress, "Creating Cursor session...")
-            session_id = await _create_cursor_session(
-                client,
-                session_bundle,
-                terminal_launch_args=persist_args or None,
+            session_id, _ = await asyncio.gather(
+                _create_cursor_session(
+                    client,
+                    session_bundle,
+                    terminal_launch_args=persist_args or None,
+                ),
+                wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
             # Persist the model pin before the runner binds and launches the
             # TUI (it reads model_override from the snapshot to build --model).
@@ -573,13 +578,15 @@ async def _prepare_cursor_terminal_via_daemon(
                 _update_startup_progress(startup_progress, "Updating Cursor session...")
                 await _patch_cursor_session(client, session_id, patch)
 
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+        if not fresh_session:
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_startup_progress(startup_progress, "Starting runner...")
         runner_id = await launch_or_reuse_daemon_runner(
             client,
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)

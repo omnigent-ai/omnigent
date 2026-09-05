@@ -183,11 +183,9 @@ export function useIdleNotifications(activeConversationId?: string): void {
     // navigateRef is stable; the listener is mounted once for the app's life.
   }, []);
 
-  // Desktop shell only: clicking an `omnigent://.../c/<id>` deep link for a
-  // server this window is already on sends the in-app path here (no reload —
-  // the main process only forwards it for a window currently on its pinned
-  // server), so we route to it with the same navigate the notification path
-  // uses. basename-less `/c/<id>` is rebased under the mount by the router.
+  // Desktop shell only: native menu actions and same-server deep links send a
+  // basename-less in-app path here, so route it with the same navigate used for
+  // notification clicks. The router rebases it under the current mount.
   useEffect(() => {
     return onOpenPath((path) => navigateRef.current(path));
   }, []);

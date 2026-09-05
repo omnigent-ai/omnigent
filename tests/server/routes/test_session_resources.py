@@ -6,16 +6,24 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runtime import _globals, session_stream, set_runner_client, set_runner_router
+from omnigent.runtime import (
+    _globals,
+    session_stream,
+    set_runner_client,
+    set_runner_direct_attach_resolver,
+    set_runner_router,
+)
+from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 
@@ -156,14 +164,16 @@ class _ConversationStore:
 
         :param conversation_id: Conversation id to update.
         :param title: Optional title to set.
-        :param kwargs: Extra store fields ignored by this test stub.
+        :param kwargs: Additional conversation fields used by relay tests.
         :returns: Updated conversation, or ``None`` if absent.
         """
-        del kwargs
         conv = self._conversations.get(conversation_id)
         if conv is None:
             return None
-        conv.title = title
+        if title is not None:
+            conv.title = title
+        if "reported_model" in kwargs:
+            conv.reported_model = kwargs["reported_model"]
         return conv
 
     def set_labels(
@@ -176,6 +186,22 @@ class _ConversationStore:
         del updated_at
         conv = self._conversations[conversation_id]
         conv.labels.update(updates)
+
+    def set_host_id(
+        self,
+        conversation_id: str,
+        host_id: str,
+        workspace: str | None = None,
+        git_branch: str | None = None,
+    ) -> Conversation:
+        """Set a conversation's host placement fields."""
+        conv = self._conversations[conversation_id]
+        conv.host_id = host_id
+        if workspace is not None:
+            conv.workspace = workspace
+        if git_branch is not None:
+            conv.git_branch = git_branch
+        return conv
 
     def append(
         self,
@@ -411,9 +437,16 @@ class _FakeRunnerRouter:
     def __init__(self, client: _FakeRunnerClient) -> None:
         self.client = client
         self.resource_calls: list[str] = []
+        self.resource_conversations: list[Conversation | None] = []
 
-    def client_for_session_resources(self, session_id: str) -> _RoutedRunner:
+    def client_for_session_resources(
+        self,
+        session_id: str,
+        *,
+        conversation: Conversation | None = None,
+    ) -> _RoutedRunner:
         self.resource_calls.append(session_id)
+        self.resource_conversations.append(conversation)
         return _RoutedRunner(self.client)
 
 
@@ -421,17 +454,22 @@ class _FakeRunnerRouter:
 def runner_globals_reset() -> Iterator[None]:
     prior_client = _globals._runner_client
     prior_router = _globals._runner_router
+    prior_direct = _globals._runner_direct_attach_resolver
     set_runner_client(None)
     set_runner_router(None)
+    set_runner_direct_attach_resolver(None)
     yield
     set_runner_client(prior_client)
     set_runner_router(prior_router)
+    set_runner_direct_attach_resolver(prior_direct)
 
 
 @pytest.fixture
 def app(runner_globals_reset: None) -> FastAPI:
     del runner_globals_reset
     app = FastAPI()
+    conversation_store = _ConversationStore()
+    app.state.test_conversation_store = conversation_store
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -456,7 +494,7 @@ def app(runner_globals_reset: None) -> FastAPI:
 
     app.include_router(
         create_sessions_router(
-            _ConversationStore(),  # type: ignore[arg-type]
+            conversation_store,  # type: ignore[arg-type]
             _StubAgentStore(),  # type: ignore[arg-type]
         ),
         prefix="/v1",
@@ -551,6 +589,9 @@ async def test_list_session_resources_proxies_to_bound_runner(
 
     assert resp.status_code == 200
     assert fake_router.resource_calls == ["79b22ebd2309e48fdeb450c65611d51b"]
+    assert [conv.id for conv in fake_router.resource_conversations if conv is not None] == [
+        "79b22ebd2309e48fdeb450c65611d51b"
+    ]
     assert fake_runner.calls == [
         ("GET", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources")
     ]
@@ -658,6 +699,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 "terminal": "claude",
                 "session_key": "main",
                 "ensure_native_terminal": True,
+                "persist_resource_event": True,
             },
         ),
         (
@@ -1040,6 +1082,85 @@ async def test_list_terminals_forwards_pagination_params_to_runner(
     # here means the proxy dropped the whole query string — the
     # refresh-flips-tab-order regression.
     assert fake_runner.get_params == [{"order": "asc", "limit": "1000"}]
+
+
+def _terminals_only_payload() -> dict[str, object]:
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "terminal_runner_s1",
+                "object": "session.resource",
+                "type": "terminal",
+                "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+                "name": "runner:s1",
+                "metadata": {
+                    "terminal_name": "runner",
+                    "session_key": "s1",
+                    "running": True,
+                },
+            },
+        ],
+        "first_id": "terminal_runner_s1",
+        "last_id": "terminal_runner_s1",
+        "has_more": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_adds_direct_attach_url_when_advertised(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner-advertised loopback listener surfaces per-terminal URLs.
+
+    Permissions are disabled in this harness (single-user mode), which
+    the disclosure gate treats as owner — mirroring the relay's
+    write-attach behavior.
+    """
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_direct_attach_resolver(
+        lambda conversation_id: DirectAttachEndpoint(port=54321, token="tok_abc")
+    )
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert item["metadata"]["direct_attach_url"] == (
+        "ws://127.0.0.1:54321/v1/sessions/79b22ebd2309e48fdeb450c65611d51b"
+        "/resources/terminals/terminal_runner_s1/attach?token=tok_abc"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_without_resolver_leaves_payload_untouched(
+    client: httpx.AsyncClient,
+) -> None:
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert "direct_attach_url" not in item["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_without_runner_advert_leaves_payload_untouched(
+    client: httpx.AsyncClient,
+) -> None:
+    """A resolver miss (runner offline / no listener) adds nothing."""
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_direct_attach_resolver(lambda conversation_id: None)
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert "direct_attach_url" not in item["metadata"]
 
 
 @pytest.mark.asyncio
@@ -1450,8 +1571,15 @@ async def test_delete_terminal_proxies_to_runner(
 @pytest.mark.asyncio
 async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
     client: httpx.AsyncClient,
+    app: FastAPI,
 ) -> None:
-    """POST terminal transfer validates source and target then proxies."""
+    """POST terminal transfer proxies and carries the source placement."""
+    conversation_store: _ConversationStore = app.state.test_conversation_store
+    source = conversation_store.get_conversation("79b22ebd2309e48fdeb450c65611d51b")
+    assert source is not None
+    source.host_id = "host_arca"
+    source.workspace = "/home/alice/workspace"
+    source.git_branch = "feature/clear"
     terminal_resource = {
         "id": "terminal_bash_s1",
         "object": "session.resource",
@@ -1489,6 +1617,11 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
         ),
     ]
     assert router.resource_calls == ["79b22ebd2309e48fdeb450c65611d51b"]
+    target = conversation_store.get_conversation("5d29bee4350489d66feafecfebd94a97")
+    assert target is not None
+    assert target.host_id == "host_arca"
+    assert target.workspace == "/home/alice/workspace"
+    assert target.git_branch == "feature/clear"
 
 
 @pytest.mark.asyncio
@@ -2424,6 +2557,93 @@ async def test_files_route_not_captured_as_resource_id(
 
 
 @pytest.mark.asyncio
+async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
+    """GET /resources/github proxies to the runner and returns its payload.
+
+    Also guards route ordering: registered before the generic
+    ``/resources/{resource_id}`` lookup so ``github`` is not a resource id.
+    """
+    payload = {
+        "object": "session.github.info",
+        "available": True,
+        "authenticated": True,
+        "branch": "feature",
+        "base_ref": "main",
+        "pr": None,
+    }
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github")
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github",
+    ) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+async def test_github_changes_proxies_to_runner(client: httpx.AsyncClient) -> None:
+    """GET /resources/github/changes proxies the PR file list to the runner."""
+    fake_runner = _FakeRunnerClient(payload={"object": "list", "data": [], "has_more": False})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes"
+    )
+
+    assert resp.status_code == 200
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes",
+    ) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+async def test_github_pr_diff_proxies_whole_patch(client: httpx.AsyncClient) -> None:
+    """GET /resources/github/diff (no path) proxies the whole-PR patch."""
+    payload = {"object": "session.github.pr_diff", "patch": "diff --git a/x b/x\n"}
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff")
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff",
+    ) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+async def test_github_diff_proxies_path_and_base(client: httpx.AsyncClient) -> None:
+    """GET /resources/github/diff/{path} proxies the path + base to the runner."""
+    payload = {
+        "object": "session.github.file_diff",
+        "path": "src/app.py",
+        "before": "old",
+        "after": "new",
+    }
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff/src/app.py?base=main"
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff/src/app.py",
+    ) in fake_runner.calls
+    assert {"base": "main"} in fake_runner.get_params
+
+
+@pytest.mark.asyncio
 async def test_files_appear_in_unified_inventory(
     file_client: httpx.AsyncClient,
 ) -> None:
@@ -2725,6 +2945,80 @@ async def test_filesystem_path_omits_absent_cursors(
 
 
 @pytest.mark.asyncio
+async def test_filesystem_base_host_forwards_an_absolute_path(
+    client: httpx.AsyncClient,
+) -> None:
+    """``?base=host`` reads a bare ``{path}`` as an absolute host path and
+    forwards it to the runner ``%2F``-encoded.
+
+    This is the wire form that survives a reverse proxy which merges the ``//``
+    the old leading-``%2F`` marker decoded to (the Databricks Apps front door
+    does exactly that). The path arrives here with literal slashes and no
+    leading marker; ``base=host`` is what restores its absoluteness, so a
+    directory above the workspace lists instead of showing an empty tree.
+    """
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/Users/me/reports?limit=1000&order=asc&base=host",
+    )
+
+    assert resp.status_code == 200
+    forwarded_url = fake_runner.calls[0][1]
+    # The runner receives an absolute path: the leading slash re-added and
+    # sent as %2F, interior slashes literal.
+    assert "/filesystem/%2FUsers/me/reports?" in forwarded_url
+
+
+@pytest.mark.asyncio
+async def test_filesystem_bare_path_without_base_is_workspace_relative(
+    client: httpx.AsyncClient,
+) -> None:
+    """Without ``base=host`` a bare ``{path}`` stays workspace-relative.
+
+    This is the exact shape a slash-merging proxy produced from the old
+    absolute wire form — the regression. Pinned as the contrast that documents
+    why ``base=host`` is load-bearing: the runner must NOT receive a ``%2F``
+    absolute path here.
+    """
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/Users/me/reports?limit=1000&order=asc",
+    )
+
+    assert resp.status_code == 200
+    forwarded_url = fake_runner.calls[0][1]
+    assert "/filesystem/Users/me/reports?" in forwarded_url
+    assert "%2F" not in forwarded_url
+
+
+@pytest.mark.asyncio
+async def test_filesystem_root_base_host_forwards_filesystem_root(
+    client: httpx.AsyncClient,
+) -> None:
+    """``?base=host`` on the no-path route browses the filesystem root, not the
+    workspace root: navigating up to ``/`` must not silently show the workspace.
+    """
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem?limit=1000&order=asc&base=host",
+    )
+
+    assert resp.status_code == 200
+    forwarded_url = fake_runner.calls[0][1]
+    # Root reconstructs to "/" -> %2F with an empty remainder.
+    assert "/filesystem/%2F?" in forwarded_url
+
+
+@pytest.mark.asyncio
 async def test_filesystem_read_proxies_to_runner(
     client: httpx.AsyncClient,
 ) -> None:
@@ -2745,6 +3039,163 @@ async def test_filesystem_read_proxies_to_runner(
     )
     assert resp.status_code == 200
     assert resp.json()["content"] == "hello world"
+
+
+@contextlib.asynccontextmanager
+async def _runner_app_client(runner: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """Route session resources to a stub runner app over a real httpx client.
+
+    The download proxy streams through ``build_request``/``send`` rather
+    than the canned ``get`` the fake client answers, so it needs a client
+    with real transport semantics.
+
+    :param runner: Stub runner app serving the filesystem route.
+    :returns: The client bound to the stub, installed as the runner router.
+    """
+    transport = httpx.ASGITransport(app=runner)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as runner_http:
+        set_runner_router(_FakeRunnerRouter(runner_http))  # type: ignore[arg-type]
+        yield runner_http
+
+
+_FS_ROUTE = (
+    "/v1/sessions/{session_id}/resources/environments/{environment_id}"
+    "/filesystem/{relative_path:path}"
+)
+_DOWNLOAD_URL = (
+    "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+    "/filesystem/data/big.bin?download=true"
+)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_streams_runner_attachment(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """``?download=true`` forwards the runner's attachment and headers verbatim."""
+    payload = bytes(range(256)) * 64
+    (tmp_path / "big.bin").write_bytes(payload)
+    runner = FastAPI()
+    seen: list[tuple[str, bool]] = []
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+        download: bool = False,
+    ) -> FileResponse:
+        del session_id, environment_id
+        seen.append((relative_path, download))
+        return FileResponse(
+            tmp_path / "big.bin",
+            filename="big.bin",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == 200
+    assert resp.content == payload
+    assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
+    assert resp.headers["content-length"] == str(len(payload))
+    assert resp.headers["cache-control"] == "no-store"
+    assert seen == [("data/big.bin", True)]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_rejects_runner_without_download_support(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner that ignores ``download`` answers the capped JSON envelope.
+
+    Serving that would truncate silently, so the proxy fails loudly instead.
+    """
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id, relative_path
+        return JSONResponse(
+            {
+                "object": "session.environment.filesystem.file_content",
+                "content": "partial",
+                "truncated": True,
+            }
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "runner_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runner_status", "code"),
+    [(404, "path_not_found"), (400, "invalid_path"), (403, "path_unreachable")],
+)
+async def test_filesystem_download_forwards_runner_errors(
+    client: httpx.AsyncClient,
+    runner_status: int,
+    code: str,
+) -> None:
+    """A missing, directory, or out-of-grant path keeps the runner's status and code."""
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id, relative_path
+        return JSONResponse(
+            status_code=runner_status,
+            content={"error": {"code": code, "message": "nope"}},
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == runner_status
+    assert resp.json()["error"] == {"code": code, "message": "nope"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["read", "download", "write"])
+async def test_filesystem_forwards_a_literal_percent_still_encoded(
+    client: httpx.AsyncClient,
+    operation: str,
+) -> None:
+    """A name the server decoded to a literal ``%2F`` reaches the runner as that name.
+
+    Forwarded verbatim it would decode once more into an absolute path,
+    past the owner-only gate the server applied at workspace level.
+    """
+    runner = FastAPI()
+    seen: list[str] = []
+
+    @runner.get(_FS_ROUTE)
+    @runner.put(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id
+        seen.append(relative_path)
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "path_not_found", "message": "nope"}},
+        )
+
+    url = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/%252Fetc/passwd"
+    )
+    async with _runner_app_client(runner):
+        if operation == "write":
+            await client.put(url, json={"content": "x", "encoding": "utf-8"})
+        else:
+            await client.get(url, params={"download": "true"} if operation == "download" else None)
+
+    assert seen == ["%2Fetc/passwd"]
 
 
 @pytest.mark.asyncio
@@ -3122,6 +3573,36 @@ async def test_relay_persists_terminal_resource_created_from_runner() -> None:
     assert events[0].data.resource["id"] == "terminal_zsh_s1"
     # Resource events thread on the session id (matches the REST path).
     assert events[0].response_id == "79b22ebd2309e48fdeb450c65611d51b"
+
+
+@pytest.mark.asyncio
+async def test_relay_does_not_persist_transient_terminal_resource_created() -> None:
+    """Retry recovery publishes terminal readiness without changing history."""
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    store = _ConversationStore()
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "session.resource.created",
+                    "persist_resource_event": False,
+                    "resource": {
+                        "id": "terminal_claude_main",
+                        "type": "terminal",
+                        "name": "claude:main",
+                        "metadata": {"terminal_name": "claude", "session_key": "main"},
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
+
+    events = [item for item in store.appended_items if item.type == "resource_event"]
+    assert events == []
 
 
 @pytest.mark.asyncio
@@ -4123,6 +4604,63 @@ async def test_relay_skips_malformed_resource_created_from_runner() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_type", ["response.completed", "response.failed"])
+@pytest.mark.parametrize("reported_model", ["claude-opus-4-8", "<synthetic>"])
+async def test_relay_persists_harness_reported_model(
+    terminal_type: str,
+    reported_model: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK terminal usage records the concrete model on the session snapshot."""
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    store = _ConversationStore()
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": terminal_type,
+                    "response": {
+                        "id": "resp_model",
+                        "model": "repro_agent",
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                            "model": reported_model,
+                        },
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
+
+    expected = None if reported_model == "<synthetic>" else reported_model
+    assert store.get_conversation(session_id).reported_model == expected  # type: ignore[union-attr]
+    model_events = [event for event in published if event.get("type") == "session.model"]
+    assert model_events == (
+        []
+        if expected is None
+        else [
+            {
+                "type": "session.model",
+                "conversation_id": session_id,
+                "model": "claude-opus-4-8",
+            }
+        ]
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "frame_payload",
     [
@@ -5073,3 +5611,552 @@ async def test_relay_never_delivers_terminal_on_pty_status(
     await _relay_runner_stream(child_id, client, store)  # type: ignore[arg-type]
 
     assert client.posts == []
+
+
+# ── Offline (agent asleep) environment synthesis ──────────────────────────────
+
+_OFFLINE_SESSION = "b17c0a4f9d2e4c6a8f1b3d5e7a9c0b2d"
+_OFFLINE_WORKSPACE = "/Users/dev/project"
+
+
+class _OfflineRunnerClient:
+    """Runner client whose tunnel is gone, as a sleeping agent's is."""
+
+    async def get(self, url: str, *, params: Any = None, timeout: float | None = None) -> Any:
+        del params, timeout
+        raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+
+@pytest.fixture
+def offline_env_app(
+    runner_globals_reset: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> FastAPI:
+    """App whose session is host-bound but whose runner is offline."""
+    del runner_globals_reset
+    from types import SimpleNamespace
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.server.routes.sessions import routes_resources as _routes
+
+    conv = Conversation(
+        id=_OFFLINE_SESSION,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=_OFFLINE_SESSION,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        host_id="host_offline",
+        workspace=_OFFLINE_WORKSPACE,
+    )
+    # The seeded native-agent shape: no OS-level sandbox, so the reach the
+    # runner would report is "unconfined, anchored on the workspace".
+    monkeypatch.setattr(
+        _routes,
+        "_load_agent_spec_for_session",
+        lambda _conv, _agent_store: SimpleNamespace(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=".",
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        ),
+    )
+    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+
+    application = FastAPI()
+
+    @application.exception_handler(OmnigentError)
+    async def _handle(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    application.include_router(
+        create_sessions_router(
+            SimpleNamespace(get_conversation=lambda _sid: conv),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]  — stub agent store
+            host_registry=SimpleNamespace(get=lambda _host_id: object()),  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    return application
+
+
+@pytest.fixture
+async def offline_env_client(offline_env_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=offline_env_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_offline_environment_advertises_the_same_reach_as_the_runner(
+    offline_env_client: httpx.AsyncClient,
+) -> None:
+    """A sleeping agent's environment still reports what browsing can reach.
+
+    The file panel gates its navigation affordance on ``metadata.reachable``.
+    When the runner sleeps the server synthesizes this resource itself, and
+    omitting the field there made the panel silently decide "nowhere else to
+    go" and drop the control -- even though the host-served path authorizes
+    and serves absolute browsing exactly as the live runner does.
+
+    Asserted as the full payload, not just presence: a synthesis that
+    advertised a *different* reach from the runner's would be its own bug.
+    """
+    resp = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default"
+    )
+
+    assert resp.status_code == 200, resp.text
+    metadata = resp.json()["metadata"]
+    assert metadata["root"] == _OFFLINE_WORKSPACE
+    assert metadata["reachable"] == {
+        "unconfined": True,
+        "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_github_info_falls_back_to_host_when_runner_offline(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub info is served over the host tunnel when the runner is offline."""
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_read(
+        *,
+        host_registry: Any,
+        host_conn: Any,
+        op: str,
+        workspace: str,
+        session_id: str,
+        params: Any,
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, session_id, params
+        captured["op"] = op
+        captured["workspace"] = workspace
+        return {
+            "object": "session.github.info",
+            "available": True,
+            "gh_available": True,
+            "authenticated": True,
+            "branch": "feature",
+            "base_ref": "main",
+            "repo": {"name_with_owner": "acme/app"},
+            "pr": None,
+        }
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", _fake_read)
+
+    resp = await offline_env_client.get(f"/v1/sessions/{_OFFLINE_SESSION}/resources/github")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["branch"] == "feature"
+    assert captured["op"] == "github_info"
+    assert captured["workspace"] == _OFFLINE_WORKSPACE
+
+
+@pytest.mark.asyncio
+async def test_github_diff_falls_back_to_host_when_runner_offline(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The GitHub diff (gzip route) also falls back to the host tunnel offline.
+
+    Proves the file-read router's GitHub diff route is wired to the fallback,
+    and that the ``base`` + ``path`` reach the host op.
+    """
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_read(
+        *,
+        host_registry: Any,
+        host_conn: Any,
+        op: str,
+        workspace: str,
+        session_id: str,
+        params: Any,
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, session_id, workspace
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "object": "session.github.file_diff",
+            "path": "app.py",
+            "before": "base",
+            "after": "changed",
+        }
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", _fake_read)
+
+    resp = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/diff/app.py?base=main"
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["after"] == "changed"
+    assert captured["op"] == "github_diff"
+    assert captured["params"] == {"base": "main", "path": "app.py"}
+
+
+# ── Workspace-file gzip (GZipFileContentRoute) ───────────────────
+#
+# These exercise the real routes through the real router, because the whole
+# point of the route class is that eligibility follows the route table. A
+# synthesized endpoint would not prove the production routes are wrapped.
+
+
+def _fs_text_read_payload(lines: int = 2000) -> dict[str, object]:
+    """Canned runner response for a text file read.
+
+    Mirrors the runner's ``file_content`` shape and key order, including a
+    ``content_type`` that is deliberately *not* a text type: ``.ts`` resolves
+    to ``video/mp2t`` via ``mimetypes``, so a MIME-based eligibility check
+    would wrongly skip real TypeScript source. Compression must be decided
+    from ``encoding`` instead.
+
+    :param lines: How many lines of source to synthesize, e.g. ``2000``.
+    :returns: The payload dict.
+    """
+    content = "    const someVariableName = computeSomething(alpha, beta);\n" * lines
+    return {
+        "object": "session.environment.filesystem.file_content",
+        "path": "src/main.ts",
+        "content_type": "video/mp2t",
+        "bytes": len(content.encode()),
+        "truncated": False,
+        "encoding": "utf-8",
+        "content": content,
+    }
+
+
+def _fs_binary_read_payload(size: int = 256 * 1024) -> dict[str, object]:
+    """Canned runner response for a binary (base64) file read.
+
+    :param size: Decoded payload size in bytes, e.g. ``262144``.
+    :returns: The payload dict, with ``content`` as base64.
+    """
+    import base64
+
+    # Incompressible bytes: gzip would return ~1.0x for real CPU.
+    raw = bytes((i * 7 + 11) % 256 for i in range(size))
+    return {
+        "object": "session.environment.filesystem.file_content",
+        "path": "docs/logo.png",
+        "content_type": "image/png",
+        "bytes": size,
+        "truncated": False,
+        "encoding": "base64",
+        "content": base64.b64encode(raw).decode(),
+    }
+
+
+_FS_BASE = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+
+
+@pytest.mark.asyncio
+async def test_file_read_is_gzipped(client: httpx.AsyncClient) -> None:
+    """A text file read is compressed, and the body survives the round-trip.
+
+    The read inlines the whole file in ``content``, so without compression the
+    response costs a full file transfer.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_text_read_payload()
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/src/main.ts",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-encoding"] == "gzip"
+    # A shared cache must not serve these bytes to an identity client.
+    assert "accept-encoding" in resp.headers.get("vary", "").lower()
+    # httpx inflates transparently, so an intact body proves the encoding
+    # header and the bytes on the wire agree.
+    assert resp.json() == payload
+    # Compression actually happened, rather than the header being set on
+    # unchanged bytes.
+    assert int(resp.headers["content-length"]) < len(str(payload["content"]))
+
+
+@pytest.mark.asyncio
+async def test_binary_file_read_is_not_gzipped(client: httpx.AsyncClient) -> None:
+    """A base64 (binary) read skips compression.
+
+    Base64 of already-compressed media only carries base64's own redundancy, so
+    gzip returns ~1.3x for real event-loop time — 385 ms at the 10 MiB binary
+    cap. The decision comes from the payload's ``encoding``, because these
+    routes always answer ``application/json`` and the file's own MIME type is
+    merely a field inside that JSON.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_binary_read_payload()
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/docs/logo.png",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_deeply_nested_binary_read_is_not_gzipped(client: httpx.AsyncClient) -> None:
+    """A long ``path`` must not push the ``encoding`` field out of range.
+
+    Eligibility is read from the serialized body. ``path`` precedes ``encoding``
+    and is bounded only by ``PATH_MAX``, so a fixed-size prefix scan would miss
+    the field on a deeply nested file and send a multi-megabyte binary through
+    synchronous gzip — the exact case this guards.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_binary_read_payload()
+    # ~680 chars, comfortably past any small window.
+    payload["path"] = "/".join(["nested_directory"] * 40)
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/{payload['path']}",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_text_whose_content_fakes_the_encoding_marker_is_gzipped(
+    client: httpx.AsyncClient,
+) -> None:
+    """A text file containing ``"encoding":"base64"`` still compresses.
+
+    Eligibility matches the complete serialized key/value pair, which cannot
+    occur inside a JSON string — an embedded quote is backslash-escaped — so a
+    file's own bytes cannot fake a binary payload and suppress compression.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_text_read_payload()
+    payload["content"] = 'config = {"encoding":"base64"}\n' * 200
+    payload["path"] = "settings.py"
+    payload["bytes"] = len(str(payload["content"]).encode())
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/settings.py",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-encoding"] == "gzip"
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_directory_listing_is_gzipped(client: httpx.AsyncClient) -> None:
+    """A directory listing large enough to clear the minimum size compresses.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    listing = _fs_list_payload()
+    entries = listing["data"]
+    assert isinstance(entries, list)
+    # One entry is below minimum_size; a real directory of any depth is not.
+    listing["data"] = [dict(entries[0], id=f"f{i}.py", name=f"f{i}.py") for i in range(200)]
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=listing)))  # type: ignore[arg-type]
+
+    resp = await client.get(f"{_FS_BASE}/filesystem", headers={"Accept-Encoding": "gzip"})
+
+    assert resp.status_code == 200
+    assert resp.headers["content-encoding"] == "gzip"
+    assert resp.json() == listing
+
+
+@pytest.mark.asyncio
+async def test_file_diff_is_gzipped(client: httpx.AsyncClient) -> None:
+    """The diff read carries two file bodies, so it compresses too.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    text = "    const value = compute(alpha, beta);\n" * 1000
+    payload: dict[str, object] = {
+        "object": "session.environment.filesystem.file_diff",
+        "path": "src/main.ts",
+        "before": text,
+        "after": text + "// changed\n",
+    }
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/diff/src/main.ts",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-encoding"] == "gzip"
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_file_read_honors_identity_request(client: httpx.AsyncClient) -> None:
+    """A client that declines gzip receives identity bytes.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_text_read_payload()
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/src/main.ts",
+        headers={"Accept-Encoding": "identity"},
+    )
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("token", "expect_gzip"),
+    [
+        ("gzip", True),
+        # Coding tokens are case-insensitive (RFC 9110 §12.5.3).
+        ("GZip", True),
+        ("GZIP", True),
+        ("gzip, deflate, br", True),
+        ("gzip;q=0.5", True),
+        ("*;q=0, gzip", True),
+        # q=0 means "do not use this coding" — a substring test would miss it.
+        ("gzip;q=0", False),
+        ("deflate, gzip;q=0", False),
+        ("deflate", False),
+        ("identity", False),
+    ],
+)
+async def test_file_read_negotiates_accept_encoding(
+    client: httpx.AsyncClient,
+    token: str,
+    expect_gzip: bool,
+) -> None:
+    """Compression follows ``Accept-Encoding``, including case and ``q`` values.
+
+    :param client: Test HTTP client.
+    :param token: The ``Accept-Encoding`` value to send.
+    :param expect_gzip: Whether gzip is expected for that value.
+    :returns: None.
+    """
+    payload = _fs_text_read_payload()
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/src/main.ts",
+        headers={"Accept-Encoding": token},
+    )
+
+    assert resp.status_code == 200
+    assert (resp.headers.get("content-encoding") == "gzip") is expect_gzip
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("PUT", "filesystem/notes.txt"),
+        ("PATCH", "filesystem/notes.txt"),
+        ("DELETE", "filesystem/notes.txt"),
+    ],
+)
+async def test_filesystem_mutations_are_not_gzipped(
+    client: httpx.AsyncClient,
+    method: str,
+    path: str,
+) -> None:
+    """Mutating handlers on the read paths stay uncompressed.
+
+    They share a URL with the read but return a small ack, so there is nothing
+    to compress. This is the guarantee a path-matching middleware could not
+    make: a path alone says nothing about the method. Because the reads live on
+    their own router, Starlette rejects a mismatched method before the wrapper
+    is ever reached.
+
+    :param client: Test HTTP client.
+    :param method: HTTP method under test.
+    :param path: Environment-relative request path.
+    :returns: None.
+    """
+    payload: dict[str, object] = {
+        "object": "session.environment.filesystem.write_result",
+        "path": "notes.txt",
+        # Padded past minimum_size so only the method decides the outcome.
+        "detail": "x" * 4096,
+    }
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.request(
+        method,
+        f"{_FS_BASE}/{path}",
+        headers={"Accept-Encoding": "gzip"},
+        json={"content": "hi", "old_text": "a", "new_text": "b"},
+    )
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["changes", "search?q=main", "shell"])
+async def test_sibling_environment_routes_are_not_gzipped(
+    client: httpx.AsyncClient,
+    path: str,
+) -> None:
+    """Sibling environment routes return bounded metadata and stay uncompressed.
+
+    Keeps the change's blast radius to the endpoints that inline file contents.
+
+    :param client: Test HTTP client.
+    :param path: Environment-relative request path.
+    :returns: None.
+    """
+    payload: dict[str, object] = {
+        "object": "list",
+        "data": [{"path": f"f{i}.py", "status": "modified"} for i in range(200)],
+        "has_more": False,
+    }
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    url = f"{_FS_BASE}/{path}"
+    headers = {"Accept-Encoding": "gzip"}
+    if path == "shell":
+        resp = await client.post(url, headers=headers, json={"command": "ls"})
+    else:
+        resp = await client.get(url, headers=headers)
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers

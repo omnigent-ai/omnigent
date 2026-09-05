@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
     from omnigent.stores.artifact_store import ArtifactStore
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
@@ -188,7 +189,11 @@ def _resolve_config() -> _ResolvedConfig:
     # kill-switch path gets the marker: an EXPLICIT
     # OMNIGENT_AUTH_PROVIDER=header deploy declared a header-injecting
     # proxy and must stay strict.
-    from omnigent.server.auth import env_var_is_truthy
+    from omnigent.server.auth import (
+        env_var_is_truthy,
+        resolve_auth_source,
+        warn_if_single_user_exposed,
+    )
 
     # Compose passes OMNIGENT_AUTH_PROVIDER as "" when unset
     # ("${VAR:-}"): empty and missing both mean "not explicitly pinned".
@@ -202,8 +207,6 @@ def _resolve_config() -> _ResolvedConfig:
     # compose up` deploy works with zero config. Gate on the *resolved*
     # selection so an explicit header/oidc deploy (or AUTH_ENABLED=0)
     # doesn't mint accounts secrets it never reads.
-    from omnigent.server.auth import resolve_auth_source
-
     if resolve_auth_source() == "accounts":
         from omnigent.server.accounts_secret import load_or_generate_cookie_secret
 
@@ -220,6 +223,11 @@ def _resolve_config() -> _ResolvedConfig:
             os.environ["OMNIGENT_ACCOUNTS_BASE_URL"] = detect_base_url(
                 os.environ, host=host, port=port
             )
+
+    # Logged, not printed: container stderr is buried in a platform log viewer.
+    _exposure = warn_if_single_user_exposed(host)
+    if _exposure:
+        logger.warning("%s", _exposure)
 
     return _ResolvedConfig(
         cfg=cfg,
@@ -297,6 +305,40 @@ def _build_routing(
     return _build_local_llm_routing_client(server_llm), settings
 
 
+def _resolve_execution_timeout(cfg: dict[str, Any]) -> int:
+    """Return the configured execution limit or the RuntimeCaps default."""
+    return int(cfg.get("execution_timeout") or 7200)
+
+
+def log_capabilities(
+    sandbox_config: ManagedSandboxDeployment | None,
+    github_config: object | None,
+    github_store: object | None,
+) -> None:
+    """
+    Log the same flags ``/v1/info`` exposes, so a missing ``sandbox:``
+    block or GitHub App env shows up in pod logs without curling.
+
+    Reads ``sandbox_config.default.provider``, not ``.provider``:
+    :class:`ManagedSandboxDeployment` wraps one config PER PROVIDER and has
+    no ``provider`` of its own, so the bare attribute raises
+    ``AttributeError`` and kills the server at boot. Split out of
+    :func:`build_app` so the expression is reachable from a test without
+    standing up a database.
+
+    :param sandbox_config: The resolved sandbox deployment, or ``None``.
+    :param github_config: The GitHub App config, or ``None``.
+    :param github_store: The GitHub connection store, or ``None``.
+    """
+    managed = sandbox_config is not None and sandbox_config.managed_launch_supported
+    logger.info(
+        "Capabilities: managed_sandboxes=%s provider=%s github_app=%s",
+        managed,
+        sandbox_config.default.provider if managed and sandbox_config else None,
+        github_config is not None and github_store is not None,
+    )
+
+
 def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     """Resolve config if needed, wire the stores, and build the app.
 
@@ -367,6 +409,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     routing_client, routing_settings = _build_routing(cfg, server_llm)
 
     caps = RuntimeCaps(
+        execution_timeout=_resolve_execution_timeout(cfg),
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
         routing_client=routing_client,
@@ -400,6 +443,28 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
         account_store = SqlAlchemyAccountStore(database_url)
 
+    # GitHub App: same env-driven wiring as `omnigent server`
+    # (omnigent/cli.py). Without these kwargs the Docker image silently
+    # leaves Connect GitHub disabled even when the OMNIGENT_GITHUB_APP_*
+    # env vars are set.
+    from omnigent.server.github_app import GitHubAppConfig
+
+    github_config = GitHubAppConfig.from_env()
+    github_store = None
+    if github_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        cipher = build_secret_cipher()
+        if cipher is None:
+            logger.error(
+                "GitHub App is configured but disabled: set OMNIGENT_CREDENTIAL_ENC_KEY "
+                "(the credential store's encryption key) to enable it."
+            )
+        else:
+            from omnigent.connections.github import GithubConnectionStore
+
+            github_store = GithubConnectionStore(database_url, cipher)
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -420,7 +485,12 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        server_config=cfg,
+        github_config=github_config,
+        github_store=github_store,
     )
+
+    log_capabilities(sandbox_config, github_config, github_store)
 
     return _BuiltApp(app=app, host=resolved_config.host, port=resolved_config.port)
 

@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from alembic import command
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, text
 
 from omnigent.db.utils import (
     _LAKEBASE_POOL_RECYCLE_SECONDS,
@@ -20,6 +20,8 @@ from omnigent.db.utils import (
     _initialize_or_verify_schema,
     _install_lakebase_token_refresh,
     _resolve_lakebase_token_provider,
+    _run_migrations,
+    _shared_read_sessions,
     build_search_snippet,
     builtin_agent_id,
     clear_engine_cache,
@@ -27,7 +29,10 @@ from omnigent.db.utils import (
     generate_agent_id,
     generate_item_id,
     get_or_create_engine,
+    make_managed_session_maker,
+    run_migrations_with_retry,
     set_lakebase_token_provider,
+    shared_read_scope,
     strip_nul_bytes,
 )
 from omnigent.entities.conversation import (
@@ -299,6 +304,29 @@ def test_create_engine_wires_token_refresh_and_short_recycle(
         engine.dispose()
 
 
+def test_build_alembic_config_preserves_percent_encoded_database_url() -> None:
+    """Alembic accepts URL-encoded credentials without changing the URL."""
+    uri = "postgresql+psycopg://user:p%40ss%25word@db.example.com:5432/app"
+
+    config = _build_alembic_config(uri)
+
+    assert config.get_main_option("sqlalchemy.url") == uri
+
+
+def test_alembic_env_override_preserves_percent_encoded_database_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The environment override survives Alembic's ConfigParser boundary."""
+    uri = f"sqlite:///{tmp_path / 'override%25.db'}"
+    config = _build_alembic_config("sqlite:///:memory:")
+    monkeypatch.setenv("OMNIGENT_DB_URL", uri)
+
+    command.upgrade(config, "head")
+
+    assert config.get_main_option("sqlalchemy.url") == uri
+
+
 # ── _initialize_or_verify_schema ────────────────────────
 
 
@@ -321,6 +349,24 @@ def _make_db_at_revision(db_path: Path, revision: str) -> str:
         with engine.begin() as conn:
             config.attributes["connection"] = conn
             command.upgrade(config, revision)
+    finally:
+        engine.dispose()
+    return uri
+
+
+def _make_db_at_unknown_revision(db_path: Path, revision: str) -> str:
+    """Build a SQLite database stamped beyond this build's migration map."""
+    uri = f"sqlite:///{db_path}"
+    engine = create_engine(uri)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+            )
+            conn.exec_driver_sql(
+                "INSERT INTO alembic_version (version_num) VALUES (?)",
+                (revision,),
+            )
     finally:
         engine.dispose()
     return uri
@@ -457,6 +503,63 @@ def test_initialize_or_verify_schema_reports_manual_retry_when_auto_migration_fa
         f"Error message must include the database URL so the "
         f"command is copy-pastable. Got: {msg!r}"
     )
+
+
+def test_initialize_or_verify_schema_reports_database_from_newer_build(
+    tmp_path: Path,
+) -> None:
+    """An unknown DB revision means this build is too old, not that the DB is stale."""
+    future_revision = "deadbeef1234"
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", future_revision)
+    head = _get_head_db_revision(uri)
+
+    engine = create_engine(uri)
+    try:
+        with pytest.raises(RuntimeError, match="newer") as exc_info:
+            _initialize_or_verify_schema(engine, uri)
+    finally:
+        engine.dispose()
+
+    msg = str(exc_info.value)
+    assert future_revision in msg
+    assert head in msg
+    assert "out of date" not in msg.lower()
+    assert "db-upgrade" not in msg
+
+
+def test_initialize_or_verify_schema_does_not_migrate_database_from_newer_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup must leave a database from a newer build untouched."""
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", "deadbeef1234")
+    run_migrations = MagicMock()
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", run_migrations)
+
+    engine = create_engine(uri)
+    try:
+        with pytest.raises(RuntimeError, match="newer"):
+            _initialize_or_verify_schema(engine, uri)
+    finally:
+        engine.dispose()
+
+    run_migrations.assert_not_called()
+
+
+def test_run_migrations_reports_database_from_newer_build(tmp_path: Path) -> None:
+    """The manual db-upgrade path must replace Alembic's CommandError."""
+    future_revision = "deadbeef1234"
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", future_revision)
+
+    engine = create_engine(uri)
+    try:
+        with pytest.raises(RuntimeError, match="newer") as exc_info:
+            _run_migrations(engine, uri)
+        assert _get_current_db_revision(engine) == future_revision
+    finally:
+        engine.dispose()
+
+    assert "Can't locate revision" not in str(exc_info.value)
 
 
 # ── slash_command persistence path ────────────────────
@@ -686,3 +789,323 @@ def test_build_search_snippet_no_match_returns_none() -> None:
     """No occurrence (or empty query) yields None so the caller shows no preview."""
     assert build_search_snippet("no match here", "xyz") is None
     assert build_search_snippet("anything", "") is None
+
+
+# ── shared_read_scope (collapse read checkouts) ─────────
+
+
+def _count_checkouts(engine: Any) -> tuple[list[int], Any]:
+    """Attach a pool-checkout counter to ``engine``.
+
+    :returns: ``(count_list, detach)`` — append-per-checkout list plus a
+        zero-arg callable that removes the listener.
+    """
+    count: list[int] = []
+
+    def _on_checkout(_dbapi: Any, _record: Any, _proxy: Any) -> None:
+        count.append(1)
+
+    event.listen(engine, "checkout", _on_checkout)
+    return count, lambda: event.remove(engine, "checkout", _on_checkout)
+
+
+def test_shared_read_scope_reuses_one_session_per_engine(db_uri: str) -> None:
+    """Inside the scope, every ``managed_session()`` on an engine is the same
+    Session; outside it, each call yields a fresh one."""
+    engine = get_or_create_engine(db_uri)
+    maker = make_managed_session_maker(engine)
+
+    with shared_read_scope():
+        with maker() as s1, maker() as s2:
+            assert s1 is s2, "reads in a scope must share one session"
+
+    with maker() as a:
+        pass
+    with maker() as b:
+        assert a is not b, "without a scope each call opens its own session"
+
+
+def test_shared_read_scope_collapses_checkouts(db_uri: str) -> None:
+    """N back-to-back reads cost one pool checkout in a scope, N without."""
+    engine = get_or_create_engine(db_uri)
+    maker = make_managed_session_maker(engine)
+    count, detach = _count_checkouts(engine)
+    try:
+        with shared_read_scope():
+            for _ in range(3):
+                with maker() as session:
+                    session.execute(text("SELECT 1"))
+        assert len(count) == 1, f"a scope must share one checkout, got {len(count)}"
+
+        count.clear()
+        for _ in range(3):
+            with maker() as session:
+                session.execute(text("SELECT 1"))
+        assert len(count) == 3, f"without a scope each read checks out, got {len(count)}"
+    finally:
+        detach()
+
+
+def test_shared_read_scope_is_noop_outside(db_uri: str) -> None:
+    """With no active scope the context var is unset and behaviour is unchanged."""
+    assert _shared_read_sessions.get() is None
+    engine = get_or_create_engine(db_uri)
+    maker = make_managed_session_maker(engine)
+    with maker() as session:
+        session.execute(text("SELECT 1"))
+    assert _shared_read_sessions.get() is None
+
+
+def test_shared_read_scope_write_maker_bypasses_reuse(db_uri: str) -> None:
+    """A write maker (``immediate=True``) keeps its own session even in a scope,
+    so it never loses its ``BEGIN IMMEDIATE`` write isolation."""
+    engine = get_or_create_engine(db_uri)
+    read_maker = make_managed_session_maker(engine)
+    write_maker = make_managed_session_maker(engine, immediate=True)
+
+    with shared_read_scope():
+        with read_maker() as r1:
+            pass
+        with write_maker() as w1:
+            assert w1 is not r1, "write makers must not join the read scope"
+        with read_maker() as r2:
+            assert r2 is r1, "read makers still reuse the scope's session"
+
+
+def test_shared_read_scope_distinct_engines_get_distinct_sessions(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """Each engine gets its own reused session (split-DB stays correct)."""
+    engine_a = get_or_create_engine(db_uri)
+    engine_b = get_or_create_engine(f"sqlite:///{tmp_path / 'other.db'}")
+    maker_a = make_managed_session_maker(engine_a)
+    maker_b = make_managed_session_maker(engine_b)
+
+    with shared_read_scope():
+        with maker_a() as sa, maker_b() as sb:
+            assert sa is not sb, "distinct engines must not share a session"
+        with maker_a() as sa2:
+            assert sa2 is sa, "same engine reuses within the scope"
+
+
+def test_shared_read_scope_cleans_up_on_error(db_uri: str) -> None:
+    """An exception rolls the scope back and always resets the context var."""
+    engine = get_or_create_engine(db_uri)
+    maker = make_managed_session_maker(engine)
+
+    # An explicit try/except (rather than pytest.raises) keeps the post-scope
+    # assertions on a control-flow path static analysers can see as reachable.
+    raised = False
+    try:
+        with shared_read_scope():
+            with maker() as session:
+                session.execute(text("SELECT 1"))
+            raise RuntimeError("boom")
+    except RuntimeError:
+        raised = True
+
+    assert raised, "the scope must propagate the exception"
+    assert _shared_read_sessions.get() is None, "the scope must reset its context var"
+
+
+def test_shared_read_scope_nesting_reuses_outer(db_uri: str) -> None:
+    """A nested scope defers to the outer one rather than opening a second layer."""
+    engine = get_or_create_engine(db_uri)
+    maker = make_managed_session_maker(engine)
+    with shared_read_scope():
+        with maker() as outer:
+            pass
+        with shared_read_scope():
+            with maker() as inner:
+                assert inner is outer, "nested scope reuses the outer session"
+
+
+def test_shared_read_scope_closes_session_when_init_fails(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure while initializing the scope's session must not leak its
+    checked-out connection — the session is registered before the PRAGMAs run,
+    so the scope's cleanup closes it and the pool checkout is returned."""
+    from sqlalchemy.orm import Session as _Session
+
+    engine = get_or_create_engine(db_uri)
+    if engine.dialect.name != "sqlite":
+        # The init-time checkout this guards against is the SQLite PRAGMA path;
+        # other dialects run no execute between session creation and registration.
+        pytest.skip("exercises the SQLite-only PRAGMA-init checkout path")
+    maker = make_managed_session_maker(engine)
+
+    counts = {"out": 0, "in": 0}
+
+    def _out(*_a: Any) -> None:
+        counts["out"] += 1
+
+    def _in(*_a: Any) -> None:
+        counts["in"] += 1
+
+    event.listen(engine, "checkout", _out)
+    event.listen(engine, "checkin", _in)
+
+    real_execute = _Session.execute
+
+    def _boom(self: _Session, statement: Any, *args: Any, **kwargs: Any) -> Any:
+        # Fail the second PRAGMA — the first has already forced the checkout.
+        if "busy_timeout" in str(statement):
+            raise RuntimeError("simulated PRAGMA failure")
+        return real_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(_Session, "execute", _boom)
+
+    try:
+        with pytest.raises(RuntimeError, match="simulated PRAGMA failure"):
+            with shared_read_scope():
+                with maker():
+                    pass
+    finally:
+        event.remove(engine, "checkout", _out)
+        event.remove(engine, "checkin", _in)
+
+    assert counts["out"] >= 1, "the test must actually force a pool checkout"
+    assert counts["out"] == counts["in"], (
+        f"a session that failed mid-init leaked its checkout: {counts}"
+    )
+
+
+# ── run_migrations_with_retry (cold-start resilience) ──────────────
+
+
+def _operational_error(msg: str = "the database system is starting up") -> Any:
+    """Build an OperationalError shaped like a cold-managed-DB failure."""
+    from sqlalchemy.exc import OperationalError
+
+    return OperationalError(statement=None, params=None, orig=Exception(msg))
+
+
+def test_run_migrations_with_retry_succeeds_first_try(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A healthy DB migrates on the first attempt with no sleeping."""
+    engine = MagicMock()
+    calls: dict[str, int] = {"migrate": 0}
+
+    def _migrate(_engine: Any, _uri: str) -> None:
+        calls["migrate"] += 1
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _migrate)
+    slept: list[float] = []
+
+    run_migrations_with_retry(
+        "postgresql://x",
+        engine_factory=lambda _uri: engine,
+        sleep=slept.append,
+    )
+
+    assert calls["migrate"] == 1
+    assert slept == []
+    # The engine is always disposed, even on the happy path.
+    engine.dispose.assert_called_once()
+
+
+def test_run_migrations_with_retry_recovers_after_cold_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transient OperationalErrors are retried until one attempt succeeds.
+
+    Each attempt must use a FRESH engine (a poisoned pool from a failed
+    connect is never reused), and every engine created must be disposed.
+    """
+    engines: list[MagicMock] = []
+
+    def _factory(_uri: str) -> MagicMock:
+        e = MagicMock(name=f"engine{len(engines)}")
+        engines.append(e)
+        return e
+
+    attempts: dict[str, int] = {"n": 0}
+
+    def _migrate(_engine: Any, _uri: str) -> None:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise _operational_error()
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _migrate)
+    slept: list[float] = []
+
+    run_migrations_with_retry(
+        "postgresql://x",
+        backoff_seconds=2.0,
+        engine_factory=_factory,
+        sleep=slept.append,
+    )
+
+    assert attempts["n"] == 3
+    # A distinct engine per attempt, each disposed exactly once.
+    assert len(engines) == 3
+    for e in engines:
+        e.dispose.assert_called_once()
+    # Linear backoff between the two failed attempts: 2.0*1, 2.0*2.
+    assert slept == [2.0, 4.0]
+
+
+def test_run_migrations_with_retry_raises_after_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB that never comes up fails loudly after max_attempts."""
+    from sqlalchemy.exc import OperationalError
+
+    def _always_cold(_engine: Any, _uri: str) -> None:
+        raise _operational_error()
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _always_cold)
+    engines: list[MagicMock] = []
+    slept: list[float] = []
+
+    def _factory(_uri: str) -> MagicMock:
+        e = MagicMock()
+        engines.append(e)
+        return e
+
+    with pytest.raises(OperationalError):
+        run_migrations_with_retry(
+            "postgresql://x",
+            max_attempts=3,
+            backoff_seconds=1.0,
+            engine_factory=_factory,
+            sleep=slept.append,
+        )
+
+    assert len(engines) == 3
+    for e in engines:
+        e.dispose.assert_called_once()
+    # No sleep after the final (raising) attempt.
+    assert slept == [1.0, 2.0]
+
+
+def test_run_migrations_with_retry_propagates_non_operational_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real migration/schema error is NOT retried — it surfaces at once."""
+
+    def _bad_migration(_engine: Any, _uri: str) -> None:
+        raise ValueError("bad revision")
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _bad_migration)
+    engine = MagicMock()
+    slept: list[float] = []
+
+    with pytest.raises(ValueError, match="bad revision"):
+        run_migrations_with_retry(
+            "postgresql://x",
+            engine_factory=lambda _uri: engine,
+            sleep=slept.append,
+        )
+
+    # Failed on the first attempt without retrying, but still disposed.
+    assert slept == []
+    engine.dispose.assert_called_once()
+
+
+def test_run_migrations_with_retry_rejects_bad_max_attempts() -> None:
+    """max_attempts < 1 is a programming error, not a runtime retry."""
+    with pytest.raises(ValueError, match="max_attempts"):
+        run_migrations_with_retry("postgresql://x", max_attempts=0)

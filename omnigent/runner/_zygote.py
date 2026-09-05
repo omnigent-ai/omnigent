@@ -44,12 +44,17 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import importlib.util
 import json
 import os
 import selectors
+import signal
 import socket
 import sys
 import threading
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 from omnigent.process_logging import LOG_TTY_FD_ENV_VAR, env_truthy
@@ -80,6 +85,97 @@ _ZYGOTE_TEST_CHILD_RAISE_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_RAISE"
 _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_SLEEP"
 
 
+@dataclass(frozen=True)
+class _SourceFileStamp:
+    """Metadata identifying one package source file."""
+
+    path: Path
+    modified_ns: int
+    size: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class _GraphStamp:
+    """Build and source state backing the zygote's imported graph."""
+
+    build: tuple[float, str] | None
+    sources: tuple[_SourceFileStamp, ...] | None
+
+
+def _disk_build_stamp(package_dir: Path | None = None) -> tuple[float, str] | None:
+    """Read ``(BUILD_TIME_EPOCH, COMMIT_SHA)`` from the on-disk ``_build_info.py``.
+
+    Loaded fresh from the file every call — never via ``sys.modules`` — so the
+    value tracks what an in-place ``omnigent`` upgrade rewrote on disk, not
+    what this process imported at boot.
+
+    :param package_dir: Directory holding ``_build_info.py``; defaults to the
+        ``omnigent`` package directory this module was loaded from.
+    :returns: The stamp, or ``None`` when the file is missing or unreadable
+        (e.g. an unbuilt source checkout, or a package mid-rewrite).
+    """
+    if package_dir is None:
+        # Derived from this module's own location rather than the top-level
+        # ``omnigent.__file__``: the zygote runs as ``python -m``, which puts
+        # its cwd on sys.path, so a daemon started from a directory that holds
+        # an ``omnigent`` checkout binds the top-level name to a namespace
+        # package (``__file__`` is None) while this module still loads from the
+        # real package.
+        package_dir = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "_omnigent_zygote_build_probe", package_dir / "_build_info.py"
+    )
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        return float(module.BUILD_TIME_EPOCH), str(module.COMMIT_SHA)
+    except Exception:  # noqa: BLE001 — any failure means "stamp unknown"
+        return None
+
+
+def _source_file_stamps(paths: Iterable[Path]) -> tuple[_SourceFileStamp, ...] | None:
+    """Capture file metadata, returning ``None`` if the baseline is incomplete."""
+    stamps: list[_SourceFileStamp] = []
+    try:
+        unique_paths = sorted(set(paths))
+    except OSError:
+        return None
+    for path in unique_paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        stamps.append(
+            _SourceFileStamp(
+                path=path,
+                modified_ns=stat.st_mtime_ns,
+                size=stat.st_size,
+                inode=stat.st_ino,
+            )
+        )
+    return tuple(stamps)
+
+
+def _package_source_stamps(
+    package_dir: Path | None = None,
+) -> tuple[_SourceFileStamp, ...] | None:
+    """Fingerprint all Python sources, including modules imported lazily later."""
+    package_root = (package_dir or Path(__file__).resolve().parents[1]).resolve()
+    return _source_file_stamps(package_root.rglob("*.py"))
+
+
+def _source_files_match(stamps: tuple[_SourceFileStamp, ...] | None) -> bool:
+    """Return whether every package source still matches its boot metadata."""
+    if stamps is None:
+        return False
+    if not stamps:
+        return True
+    return _source_file_stamps(stamp.path for stamp in stamps) == stamps
+
+
 def _import_runner_graph() -> None:
     """Eagerly import the heavy runner graph so the ~120MB lands once.
 
@@ -93,6 +189,11 @@ def _import_runner_graph() -> None:
     already holds, so this adds little resident cost).
     """
     from omnigent.runner import _entry, app, native  # noqa: F401
+    from omnigent.runner.background_titles import (  # noqa: F401
+        claude_native,
+        codex_native,
+        sdk,
+    )
     from omnigent.runtime.harnesses import _runner as _harness_runner  # noqa: F401
 
 
@@ -165,6 +266,10 @@ def _run_child(request: dict[str, Any], harness_fd: int) -> None:
         zygote, exported so the runner can request harness forks.
     """
     _apply_child_env(request)
+    workspace = request.get("cwd")
+    if not isinstance(workspace, str):
+        raise ValueError("runner fork request requires a cwd")
+    os.chdir(workspace)
     # Tell the runner its harness-fork channel fd (set after the env replace so
     # it survives the clear).
     os.environ[ZYGOTE_HARNESS_FD_ENV_VAR] = str(harness_fd)
@@ -201,6 +306,7 @@ def _maybe_run_test_seam() -> None:
     if test_exit is not None:
         sys.stdout.write(f"marker={os.environ.get('OMNIGENT_ZYGOTE_MARKER', '')}\n")
         sys.stdout.write(f"tty_fd={os.environ.get(LOG_TTY_FD_ENV_VAR, '')}\n")
+        sys.stdout.write(f"cwd={os.getcwd()}\n")
         sys.stdout.flush()
         if env_truthy(os.environ.get(_ZYGOTE_TEST_CHILD_RAISE_ENV_VAR)):
             raise SystemExit(int(test_exit))
@@ -262,9 +368,18 @@ class _ZygoteServer:
     thread per connection.
 
     :param control_sock: The daemon control socket (role ``"daemon"``).
+    :param graph_stamp: Build and package-source state captured before the
+        zygote imports its graph. Both runner and harness forks are refused
+        once either changes on disk: the child would otherwise resolve lazy
+        imports from new files against the old in-memory graph.
     """
 
-    def __init__(self, control_sock: socket.socket) -> None:
+    def __init__(
+        self,
+        control_sock: socket.socket,
+        graph_stamp: _GraphStamp | None = None,
+    ) -> None:
+        self._graph_stamp = graph_stamp
         self._sel = selectors.DefaultSelector()
         # Exit codes of reaped children, held until the requester polls; the
         # daemon/runner are not these children's parents and cannot waitpid().
@@ -442,12 +557,46 @@ class _ZygoteServer:
             with contextlib.suppress(OSError):
                 sock.close()
 
+    def _refuse_if_upgraded(self, conn: socket.socket, kind: str) -> bool:
+        """Answer with an error when the package changed under this zygote.
+
+        A forked child inherits the graph imported at boot but resolves every
+        lazily-imported module from disk. Once an in-place upgrade rewrites the
+        package, those two disagree — the child either misses a name its old
+        in-memory modules gained, or fails to import a module the swapped-out
+        directory no longer offers. Both callers' fallbacks re-launch through a
+        fresh interpreter, which reads everything from disk coherently.
+
+        :param conn: The socket to answer on.
+        :param kind: Child being forked (``"runner"`` / ``"harness"``), named
+            in the error so operator logs say which launch fell back.
+        :returns: ``True`` when the request was refused (caller must return).
+        """
+        stamp = self._graph_stamp
+        if stamp is None:
+            return False
+        build_matches = stamp.build is None or _disk_build_stamp() == stamp.build
+        if build_matches and _source_files_match(stamp.sources):
+            return False
+        _send(
+            conn,
+            {
+                "error": (
+                    "omnigent changed on disk after the zygote imported its "
+                    f"graph; refusing to fork a mixed-version {kind}"
+                )
+            },
+        )
+        return True
+
     def _handle_fork(self, conn: socket.socket, request: dict[str, Any]) -> None:
         """Fork a runner, giving it its own control socket back to the zygote.
 
         :param conn: The daemon socket to answer on.
         :param request: The ``fork`` request (``env`` + optional ``log_path``).
         """
+        if self._refuse_if_upgraded(conn, "runner"):
+            return
         try:
             z_end, r_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         except OSError as exc:
@@ -483,6 +632,8 @@ class _ZygoteServer:
         :param conn: The runner socket to answer on.
         :param request: The ``fork_harness`` request (``argv`` + ``env``).
         """
+        if self._refuse_if_upgraded(conn, "harness"):
+            return
         try:
             pid = os.fork()
         except OSError as exc:
@@ -522,12 +673,19 @@ class _ZygoteServer:
     def _drop_runner(self, conn: socket.socket) -> None:
         """Forget a runner whose control socket closed (the runner exited).
 
-        Its harness children self-terminate via their own watchdog (which
-        probes the runner pid). With the runner gone, nothing will ever poll
-        their exit codes, so mark them orphaned: _reap still waitpid's them (no
-        zombies) but discards the code instead of leaking it in _exit_codes —
-        which would otherwise grow unbounded and risk pid-reuse misattribution.
-        Any already-reaped codes for this runner's harnesses are dropped too.
+        Its harness children are SIGTERM'd here. They also self-terminate via
+        their own watchdog (a 1 Hz probe of the runner pid), but that probe is
+        their ONLY death signal on macOS — PR_SET_PDEATHSIG is Linux-only and is
+        skipped for zygote-forked harnesses regardless — so a wedged harness or
+        a starved watchdog thread would otherwise survive for the zygote's whole
+        life. We are these children's real OS parent and already track their
+        pids, so an explicit signal is both cheap and correct.
+
+        With the runner gone, nothing will ever poll their exit codes, so mark
+        them orphaned: _reap still waitpid's them (no zombies) but discards the
+        code instead of leaking it in _exit_codes — which would otherwise grow
+        unbounded and risk pid-reuse misattribution. Any already-reaped codes
+        for this runner's harnesses are dropped too.
 
         :param conn: The closed runner socket.
         """
@@ -540,6 +698,10 @@ class _ZygoteServer:
             self._exit_codes.pop(harness_pid, None)
             if harness_pid in self._live:
                 self._orphaned.add(harness_pid)
+                # Signal the pid, never the group: everything the zygote forks
+                # shares the daemon's group, so a killpg would take it down too.
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    os.kill(harness_pid, signal.SIGTERM)
         with contextlib.suppress(OSError):
             conn.close()
 
@@ -578,6 +740,11 @@ def main() -> None:
 
     control_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=control_fd)
 
+    # A source update during graph import must make later forks fail closed.
+    graph_stamp = _GraphStamp(
+        build=_disk_build_stamp(),
+        sources=_package_source_stamps(),
+    )
     _import_runner_graph()
     # The import graph is now static; move it out of GC's tracked set so cyclic
     # collections stay cheap and don't dirty shared pages in forked children.
@@ -601,7 +768,7 @@ def main() -> None:
 
     # Ctrl+C is a normal operator-driven shutdown; exit quietly without a traceback.
     with contextlib.suppress(KeyboardInterrupt):
-        _ZygoteServer(control_sock).serve()
+        _ZygoteServer(control_sock, graph_stamp=graph_stamp).serve()
 
 
 if __name__ == "__main__":

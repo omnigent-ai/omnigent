@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 
+from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 
 # Categories every POSIX CLI needs regardless of vendor: where the user's
@@ -57,7 +58,17 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # without it a corporate-CA user upgrading would hit TLS failures from
         # every harness that does not happen to own a NODE_ prefix of its own.
         "NODE_EXTRA_CA_CERTS",
+        # ssh-agent socket path, so an agent's git-over-SSH and SSH-cert
+        # tooling authenticates. A path to a unix socket, not a bearer token:
+        # reaching the agent still requires the user's own ssh-agent to be
+        # running and to hold the key. Shared here because every harness runs
+        # git, not just the one whose bug surfaced it.
+        "SSH_AUTH_SOCK",
         OMNIGENT_SESSION_ENV_VAR,
+        # Windows system / profile constants (SYSTEMROOT is mandatory for
+        # Winsock init, USERPROFILE for Path.home(), etc.); no-ops on POSIX
+        # because these names don't exist there. See omnigent._platform.
+        *WINDOWS_ENV_PASSTHROUGH,
     }
 )
 

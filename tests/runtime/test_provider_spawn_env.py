@@ -20,16 +20,19 @@ subprocess spawn, no real CLI.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml as _yaml
 
+from omnigent.errors import OmnigentError
 from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
     _build_goose_spawn_env,
+    _build_hermes_spawn_env,
     _build_kimi_spawn_env,
     _build_openai_agents_sdk_spawn_env,
     _build_pi_spawn_env,
@@ -323,6 +326,64 @@ def test_codex_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_CODEX_WIRE_API"] == "responses"
 
 
+def test_codex_rejects_chat_only_openrouter_before_harness_spawn(config_home: Path) -> None:
+    """A chat-only OpenRouter route fails before Codex can make a bad request."""
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "openrouter": {
+                    "kind": "gateway",
+                    "default": True,
+                    "openai": _key_family(
+                        "https://openrouter.ai/api/v1",
+                        "sk-or-test",
+                        "stealth/ox-alpha",
+                        wire_api="chat",
+                    ),
+                }
+            }
+        },
+    )
+    spec = _make_spec(harness="codex")
+
+    with pytest.raises(OmnigentError) as raised:
+        _build_codex_spawn_env(spec, workdir=None)
+
+    message = str(raised.value).lower()
+    assert "codex" in message
+    assert "chat" in message
+    assert "responses" in message
+    assert "openrouter.ai/api/v1" in message
+
+
+def test_codex_accepts_explicit_responses_wire_at_same_provider_url(config_home: Path) -> None:
+    """The chat-wire guard does not reject a Responses-capable route by vendor name."""
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "openrouter": {
+                    "kind": "gateway",
+                    "default": True,
+                    "openai": _key_family(
+                        "https://openrouter.ai/api/v1",
+                        "sk-or-test",
+                        "openai/gpt-5",
+                        wire_api="responses",
+                    ),
+                }
+            }
+        },
+    )
+    spec = _make_spec(harness="codex")
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CODEX_GATEWAY_BASE_URL"] == "https://openrouter.ai/api/v1"
+    assert env["HARNESS_CODEX_WIRE_API"] == "responses"
+
+
 def test_codex_falls_back_to_first_available_openai_credential(
     config_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -501,6 +562,35 @@ def test_pi_uses_anthropic_global_default(config_home: Path) -> None:
     assert env["HARNESS_PI_GATEWAY_HOST"] == "https://anthropic.example.com"
     assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
     assert env["HARNESS_PI_MODEL"] == "claude-default-model"
+
+
+def test_pi_gateway_routing_log_reports_the_resolved_base_url(
+    config_home: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    The runner's routing log reports pi's plural ``_BASE_URLS`` key.
+
+    pi's generic-provider path emits only ``HARNESS_PI_GATEWAY_BASE_URLS``
+    (per-family JSON), so a log that reads just the singular
+    ``HARNESS_PI_GATEWAY_BASE_URL`` says ``base_url=None`` on a run that
+    routed fine. Failure means that fallback is gone and the line is
+    misleading again.
+    """
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    _write_config(config_home, _anthropic_default_config())
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        env = _build_spawn_env_from_spec(_make_spec(harness="pi"), "pi")
+
+    assert env is not None
+    assert "HARNESS_PI_GATEWAY_BASE_URL" not in env  # only the plural key is set
+    line = next(
+        rec.getMessage() for rec in caplog.records if "gateway routing" in rec.getMessage()
+    )
+    # Compare against the env value itself: the line must carry the plural
+    # key's URLs, not just some host substring.
+    assert f"base_url={env['HARNESS_PI_GATEWAY_BASE_URLS']}" in line
 
 
 def test_pi_threads_generic_openai_wire_api(config_home: Path) -> None:
@@ -1333,7 +1423,7 @@ def test_kimi_spawn_env_threads_spec_model_only(config_home: Path) -> None:
     """The kimi builder only emits ``HARNESS_KIMI_MODEL`` (when set) and
     ``HARNESS_KIMI_CWD`` (when workdir given). Upstream kimi has no per-spawn
     provider override, so no HARNESS_KIMI_GATEWAY_* / _DATABRICKS_PROFILE
-    env vars are emitted — provider routing lives in ``~/.kimi/config.toml``."""
+    env vars are emitted — provider routing lives in ``~/.kimi-code/config.toml``."""
     _write_config(config_home, {"providers": {}})
     spec = _make_spec(harness="kimi", model="kimi-k2-turbo")
 
@@ -1363,7 +1453,7 @@ def test_kimi_no_provider_emits_no_gateway_vars(config_home: Path) -> None:
 
     A regression here would either steal an ambient OPENAI_API_KEY (mis-billing)
     or point at a stale URL the user never configured. Upstream kimi reads its
-    provider config from ``~/.kimi/config.toml``; Omnigent never injects."""
+    provider config from ``~/.kimi-code/config.toml``; Omnigent never injects."""
     _write_config(config_home, {"providers": {}})
     spec = _make_spec(harness="kimi")
 
@@ -1383,7 +1473,7 @@ def test_kimi_ignores_global_default_provider(config_home: Path) -> None:
     global default. For kimi we DO NOT — upstream has no per-spawn provider
     override flag, so silently injecting a key the executor can't pass to the
     subprocess would be misleading (and would mis-bill the user against an
-    OpenAI key when their ``~/.kimi/config.toml`` actually points at
+    OpenAI key when their ``~/.kimi-code/config.toml`` actually points at
     Moonshot). The builder emits no gateway vars regardless of what's
     configured."""
     _write_config(config_home, _openai_default_config())
@@ -1411,7 +1501,7 @@ def test_kimi_declared_auth_raises(
 
     Upstream kimi has no per-spawn provider override (no ``--config-file`` /
     ``--mcp-config-file``), so declared auth can't be threaded. Silently
-    launching against whatever ambient ``~/.kimi/config.toml`` resolves to
+    launching against whatever ambient ``~/.kimi-code/config.toml`` resolves to
     would be a confused-deputy / mis-attribution risk, so the builder raises
     instead. Regression guard for the originally-dead ``OmnigentError``."""
     from omnigent.errors import OmnigentError
@@ -1448,6 +1538,86 @@ def test_kimi_os_env_serialized(config_home: Path) -> None:
     assert decoded["sandbox"]["type"] == "darwin_seatbelt"
 
 
+# ── Hermes Agent CLI spawn-env ────────────────────────────────────────────
+
+
+def test_hermes_spawn_env_threads_spec_model_and_skills(config_home: Path) -> None:
+    """The hermes builder emits the model plus the skills filter, and no
+    gateway vars: Hermes owns its file-based auth (``hermes setup`` /
+    ``hermes model``) and has no per-spawn provider override to configure.
+
+    Regression: hermes had no builder at all, so a spec model never reached the
+    subprocess and it silently ran on whatever default Hermes had configured."""
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="hermes", model="hermes-4-405b")
+
+    env = _build_hermes_spawn_env(spec, cwd=None, workdir=None)
+
+    assert env == {
+        "HARNESS_HERMES_MODEL": "hermes-4-405b",
+        "HARNESS_HERMES_SKILLS_FILTER": '"all"',
+    }
+
+
+def test_hermes_ignores_global_default_provider(config_home: Path) -> None:
+    """An openai default provider injects no creds into the hermes env.
+
+    Same reasoning as kimi: Hermes reads credentials from its own
+    ``auth.json`` / ``.env`` under ``HERMES_HOME``, so injecting an ambient key
+    the executor cannot pass through would mis-bill the user against a
+    provider their Hermes install never uses."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="hermes")
+
+    env = _build_hermes_spawn_env(spec, cwd=None, workdir=None)
+
+    assert "HARNESS_HERMES_GATEWAY_BASE_URL" not in env
+    assert "HARNESS_HERMES_GATEWAY_API_KEY" not in env
+    assert "HARNESS_HERMES_DATABRICKS_PROFILE" not in env
+
+
+def test_hermes_os_env_serialized(config_home: Path) -> None:
+    """``spec.os_env`` is serialized into ``HARNESS_HERMES_OS_ENV`` so the wrap
+    rebuilds the sandbox spec instead of falling back to ``sandbox=none``.
+
+    This is what makes a sandbox picked in the web session dialog actually
+    confine hermes — without it the harness ran unconfined while the UI
+    reported a sandbox."""
+    import json as _json
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    _write_config(config_home, {"providers": {}})
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+        fork=False,
+    )
+    spec = _make_spec(harness="hermes", os_env=os_env)
+
+    env = _build_hermes_spawn_env(spec, cwd=None, workdir=None)
+
+    assert "HARNESS_HERMES_OS_ENV" in env
+    decoded = _json.loads(env["HARNESS_HERMES_OS_ENV"])
+    assert decoded["sandbox"]["type"] == "linux_bwrap"
+
+
+def test_hermes_omits_reserved_bundle_dir(config_home: Path, tmp_path: Path) -> None:
+    """``workdir`` is accepted for signature parity but not threaded.
+
+    ``HARNESS_HERMES_BUNDLE_DIR`` is reserved in the wrap — there is no
+    ``hermes chat`` flag for it — so emitting it would set a var the executor
+    cannot pass on. Locks the deliberate omission so a future reader doesn't
+    "fix" it without wiring the argv side."""
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="hermes")
+
+    env = _build_hermes_spawn_env(spec, cwd=None, workdir=tmp_path)
+
+    assert "HARNESS_HERMES_BUNDLE_DIR" not in env
+
+
 # ---------------------------------------------------------------------------
 # harness.<canonical>.command → OMNIGENT_<NAME>_PATH (spawn-env builders)
 # ---------------------------------------------------------------------------
@@ -1477,6 +1647,7 @@ def _call_builder(builder: object, spec: AgentSpec) -> dict[str, str]:  # type: 
         ("kimi", _build_kimi_spawn_env, "OMNIGENT_KIMI_PATH"),
         ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
         ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
+        ("hermes", _build_hermes_spawn_env, "OMNIGENT_HERMES_PATH"),
     ],
 )
 def test_spawn_env_threads_config_command_to_path(
@@ -1504,6 +1675,7 @@ def test_spawn_env_threads_config_command_to_path(
         ("kimi", _build_kimi_spawn_env, "OMNIGENT_KIMI_PATH"),
         ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
         ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
+        ("hermes", _build_hermes_spawn_env, "OMNIGENT_HERMES_PATH"),
     ],
 )
 def test_spawn_env_ambient_env_wins_over_config_command(

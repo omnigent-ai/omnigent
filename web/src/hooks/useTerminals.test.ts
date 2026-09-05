@@ -12,7 +12,9 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createTerminal,
+  deleteTerminal,
   fetchTerminals,
+  findAgentTerminal,
   inventoryTerminals,
   isAgentTerminalKey,
   PENDING_RECONCILE_INTERVAL_MS,
@@ -22,6 +24,13 @@ import {
   useTerminals,
   type TerminalInfo,
 } from "./useTerminals";
+import {
+  clearDirectAttachCaches,
+  directProbeUrl,
+  resolveInitialAttachUrl,
+  watchDirectUpgrade,
+  withAttachParams,
+} from "@/lib/terminals";
 
 // useTerminals reads runner liveness to treat an offline runner as zero
 // terminals. Mock it so we can drive that signal directly; it defaults to
@@ -90,38 +99,178 @@ describe("terminalInfoFromResource", () => {
     expect(info).toBeNull();
   });
 
-  it("lifts metadata.terminal_transport, defaulting to undefined for unknown values", () => {
-    const control = terminalInfoFromResource({
+  it("lifts metadata.direct_attach_url only for loopback ws:// URLs", () => {
+    const direct = terminalInfoFromResource({
       id: "terminal_bash_s1",
       type: "terminal",
       name: "bash:s1",
-      metadata: { terminal_transport: "control" },
+      metadata: { direct_attach_url: "ws://127.0.0.1:54321/v1/x/attach?token=t" },
     });
-    expect(control?.transport).toBe("control");
+    expect(direct?.directAttachUrl).toBe("ws://127.0.0.1:54321/v1/x/attach?token=t");
 
-    const pty = terminalInfoFromResource({
-      id: "terminal_bash_s1",
-      type: "terminal",
-      name: "bash:s1",
-      metadata: { terminal_transport: "pty" },
-    });
-    expect(pty?.transport).toBe("pty");
+    // Anything that could steer the terminal socket at a non-loopback
+    // host is dropped, even from our own server.
+    for (const bad of [
+      "wss://127.0.0.1:54321/attach?token=t",
+      "ws://evil.example:54321/attach?token=t",
+      "ws://localhost:54321/attach?token=t",
+      42,
+      null,
+    ]) {
+      const info = terminalInfoFromResource({
+        id: "terminal_bash_s1",
+        type: "terminal",
+        name: "bash:s1",
+        metadata: { direct_attach_url: bad },
+      });
+      expect(info?.directAttachUrl).toBeUndefined();
+    }
+  });
+});
 
-    // Absent or unrecognized → undefined (frontend treats as legacy PTY).
-    const legacy = terminalInfoFromResource({
-      id: "terminal_bash_s1",
-      type: "terminal",
-      name: "bash:s1",
-      metadata: {},
+describe("direct attach URL helpers", () => {
+  beforeEach(() => {
+    clearDirectAttachCaches();
+  });
+
+  it("withAttachParams appends per-attach params after the token", () => {
+    const base = "ws://127.0.0.1:54321/v1/x/attach?token=t";
+    expect(withAttachParams(base, false)).toBe(base);
+    expect(withAttachParams(base, true)).toBe(`${base}&read_only=true`);
+  });
+
+  it("directProbeUrl swaps the path for /probe and keeps the token", () => {
+    expect(directProbeUrl("ws://127.0.0.1:54321/v1/x/attach?token=t&read_only=true")).toBe(
+      "ws://127.0.0.1:54321/probe?token=t&read_only=true",
+    );
+    expect(directProbeUrl("not a url")).toBeNull();
+  });
+});
+
+describe("resolveInitialAttachUrl / watchDirectUpgrade", () => {
+  /** WebSocket stub whose fate is decided by the test. */
+  class FakeWebSocket {
+    static instances: FakeWebSocket[] = [];
+    static behavior: "open" | "error" | "hang" = "open";
+    url: string;
+    closed = false;
+    private listeners = new Map<string, () => void>();
+    constructor(url: string) {
+      this.url = url;
+      FakeWebSocket.instances.push(this);
+      queueMicrotask(() => {
+        const behavior = FakeWebSocket.behavior;
+        if (behavior === "hang") return;
+        this.listeners.get(behavior === "open" ? "open" : "error")?.();
+      });
+    }
+    addEventListener(type: string, listener: () => void): void {
+      this.listeners.set(type, listener);
+    }
+    close(): void {
+      this.closed = true;
+    }
+  }
+
+  /** Stub the Permissions API's local-network-access answer. */
+  function stubPermission(state: "granted" | "denied" | "prompt" | "missing"): void {
+    const base = globalThis.navigator ?? {};
+    const permissions =
+      state === "missing"
+        ? undefined
+        : {
+            query: async (desc: { name: string }) => {
+              expect(desc.name).toBe("local-network-access");
+              return { state };
+            },
+          };
+    vi.stubGlobal("navigator", Object.assign(Object.create(base), { permissions }));
+  }
+
+  beforeEach(() => {
+    clearDirectAttachCaches();
+    FakeWebSocket.instances = [];
+    FakeWebSocket.behavior = "open";
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    stubPermission("missing");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const DIRECT = "ws://127.0.0.1:54321/v1/x/attach?token=t";
+  const RELAY = "wss://server.example/v1/x/attach";
+
+  it("returns the relay URL when no direct URL is offered", async () => {
+    expect(await resolveInitialAttachUrl(undefined, RELAY)).toBe(RELAY);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it("returns the relay immediately when permission state is unknown or prompt", async () => {
+    // Never stall the first paint behind a permission prompt: the
+    // initial dial is relay; the upgrade happens in the background.
+    expect(await resolveInitialAttachUrl(DIRECT, RELAY)).toBe(RELAY);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    stubPermission("prompt");
+    expect(await resolveInitialAttachUrl(DIRECT, RELAY)).toBe(RELAY);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it("dials direct on first connect when permission is granted and the probe opens", async () => {
+    stubPermission("granted");
+    expect(await resolveInitialAttachUrl(DIRECT, RELAY)).toBe(DIRECT);
+    // The probe dialed the side-effect-free /probe route, not the
+    // attach route, and closed its socket after settling.
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(FakeWebSocket.instances[0].url).toBe("ws://127.0.0.1:54321/probe?token=t");
+    expect(FakeWebSocket.instances[0].closed).toBe(true);
+  });
+
+  it("falls back to the relay when granted but nothing is listening", async () => {
+    stubPermission("granted");
+    FakeWebSocket.behavior = "error";
+    expect(await resolveInitialAttachUrl(DIRECT, RELAY)).toBe(RELAY);
+  });
+
+  it("watchDirectUpgrade succeeds on Allow and primes the next dial to go direct", async () => {
+    // Prompt state: the background probe carries the LNA prompt; the
+    // user clicking Allow completes the handshake.
+    stubPermission("prompt");
+    expect(await watchDirectUpgrade(DIRECT)).toBe(true);
+    // The known-good cache now routes the re-dial straight to direct
+    // without consulting the permission API again.
+    stubPermission("missing");
+    expect(await resolveInitialAttachUrl(DIRECT, RELAY)).toBe(DIRECT);
+  });
+
+  it("watchDirectUpgrade skips probing entirely when permission is denied", async () => {
+    stubPermission("denied");
+    expect(await watchDirectUpgrade(DIRECT)).toBe(false);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it("watchDirectUpgrade settles false on abort and on a blocked handshake", async () => {
+    FakeWebSocket.behavior = "hang";
+    const ctl = new AbortController();
+    const pending = watchDirectUpgrade(DIRECT, ctl.signal);
+    await Promise.resolve();
+    ctl.abort();
+    expect(await pending).toBe(false);
+    expect(FakeWebSocket.instances[0].closed).toBe(true);
+
+    FakeWebSocket.behavior = "error";
+    expect(await watchDirectUpgrade(DIRECT)).toBe(false);
+  });
+
+  it("falls back to the relay when the WebSocket constructor throws", async () => {
+    // Safari throws a synchronous SecurityError for ws:// from an
+    // https page; the resolver must treat it as an ordinary miss.
+    stubPermission("granted");
+    vi.stubGlobal("WebSocket", function ThrowingWebSocket() {
+      throw new Error("SecurityError");
     });
-    expect(legacy?.transport).toBeUndefined();
-    const junk = terminalInfoFromResource({
-      id: "terminal_bash_s1",
-      type: "terminal",
-      name: "bash:s1",
-      metadata: { terminal_transport: "garbage" },
-    });
-    expect(junk?.transport).toBeUndefined();
+    expect(await resolveInitialAttachUrl(DIRECT, RELAY)).toBe(RELAY);
   });
 });
 
@@ -237,22 +386,48 @@ describe("createTerminal", () => {
   });
 });
 
-describe("terminalsReconcileInterval", () => {
-  // The spinner is `terminalPending && !terminalsAvailable`. This decides
-  // when the terminals query re-polls to recover a missed
-  // `session.resource.created` (the dbx-apps stuck-spinner bug) — and,
-  // critically, when it STOPS so there's no steady-state polling.
-  it("polls only while pending AND no terminal is visible yet", () => {
-    expect(terminalsReconcileInterval(true, 0)).toBe(PENDING_RECONCILE_INTERVAL_MS);
+describe("deleteTerminal", () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
-  it("stops the instant a terminal lands (clears the spinner via AND)", () => {
-    expect(terminalsReconcileInterval(true, 1)).toBe(false);
+  it("DELETEs the terminal resource by id", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(null, { ok: true, status: 204 }));
+
+    await deleteTerminal("conv_abc", "terminal_bash_s1");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1");
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("treats a 404 (already gone) as success", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(null, { ok: false, status: 404 }));
+    await expect(deleteTerminal("conv_abc", "terminal_gone")).resolves.toBeUndefined();
+  });
+
+  it("throws on a non-404 failure", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(null, { ok: false, status: 500 }));
+    await expect(deleteTerminal("conv_abc", "terminal_bash_s1")).rejects.toThrow(/delete failed/);
+  });
+});
+
+describe("terminalsReconcileInterval", () => {
+  it("polls only while pending AND no agent terminal is visible yet", () => {
+    expect(terminalsReconcileInterval(true, false)).toBe(PENDING_RECONCILE_INTERVAL_MS);
+  });
+
+  it("stops the instant the agent terminal lands", () => {
+    expect(terminalsReconcileInterval(true, true)).toBe(false);
   });
 
   it("never polls when the runner is not spinning up a terminal", () => {
-    expect(terminalsReconcileInterval(false, 0)).toBe(false);
-    expect(terminalsReconcileInterval(false, 2)).toBe(false);
+    expect(terminalsReconcileInterval(false, false)).toBe(false);
+    expect(terminalsReconcileInterval(false, true)).toBe(false);
   });
 });
 
@@ -277,6 +452,19 @@ describe("useTerminals reconcile poll (stuck-spinner self-heal)", () => {
   }
 
   const emptyList = () => mockResponse({ object: "list", data: [] });
+  const oneShell = () =>
+    mockResponse({
+      object: "list",
+      data: [
+        {
+          id: "terminal_bash_s1",
+          type: "terminal",
+          session_id: "conv_abc",
+          name: "bash:s1",
+          metadata: { terminal_name: "bash", session_key: "s1", running: true },
+        },
+      ],
+    });
   const oneTerminal = () =>
     mockResponse({
       object: "list",
@@ -291,13 +479,11 @@ describe("useTerminals reconcile poll (stuck-spinner self-heal)", () => {
       ],
     });
 
-  it("re-polls while pending until the terminal lands, then stops", async () => {
-    // Mount + first reconcile poll see no terminal; the auto-created
-    // terminal lands on the third fetch — exactly the missed-delta case
-    // a page refresh used to be the only recovery for.
+  it("re-polls while pending until the agent terminal lands, then stops", async () => {
+    // A user shell alone must not satisfy the pending agent-terminal launch.
     fetchMock
       .mockResolvedValueOnce(emptyList())
-      .mockResolvedValueOnce(emptyList())
+      .mockResolvedValueOnce(oneShell())
       .mockResolvedValue(oneTerminal());
 
     const { result } = renderHook(() => useTerminals("conv_abc", { reconcileWhilePending: true }), {
@@ -308,29 +494,21 @@ describe("useTerminals reconcile poll (stuck-spinner self-heal)", () => {
     expect(result.current.terminals).toEqual([]);
     const seedCalls = fetchMock.mock.calls.length;
 
-    // First reconcile poll fires while still empty: the interval scheduled a
-    // refetch, so the fetch count must climb past the seed. (Asserting `>`
-    // rather than an exact `+1` because React Query anchors the next interval
-    // off each fetch's settle time, so the precise count under fake timers is
-    // a scheduling detail; a count still == seedCalls would mean no poll fired
-    // — the bug we're guarding against.)
+    // The first interval starts reconciliation. Its exact settle point is a
+    // React Query scheduling detail, so assert that a refetch was issued.
     await act(async () => void (await vi.advanceTimersByTimeAsync(PENDING_RECONCILE_INTERVAL_MS)));
-    expect(result.current.terminals).toEqual([]);
     expect(fetchMock.mock.calls.length).toBeGreaterThan(seedCalls);
 
-    // Further reconcile polls -> terminal lands. Assert the full mapped row
-    // (not just id) so a broken resource→TerminalInfo mapping can't pass.
+    // A later poll finds the agent terminal and unions it with the cached shell.
     await act(
       async () => void (await vi.advanceTimersByTimeAsync(PENDING_RECONCILE_INTERVAL_MS * 2)),
     );
     expect(result.current.terminals).toEqual([
+      { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
       { id: "terminal_claude_main", name: "claude", session: "main", running: true },
     ]);
 
-    // Polling must stop now that a terminal is visible: the refetchInterval
-    // returns false once terminalCount > 0. Assert ZERO further fetches over
-    // 4 would-be intervals — a higher count would mean the interval was never
-    // disabled and the poll runs forever.
+    // The agent terminal stops the interval; shells alone did not.
     const callsAtLand = fetchMock.mock.calls.length;
     await act(
       async () => void (await vi.advanceTimersByTimeAsync(PENDING_RECONCILE_INTERVAL_MS * 4)),
@@ -676,5 +854,35 @@ describe("isAgentTerminalKey", () => {
 
   it("treats a user shell as not-the-agent-terminal", () => {
     expect(isAgentTerminalKey("terminal:terminal_bash_s1")).toBe(false);
+  });
+});
+
+describe("findAgentTerminal", () => {
+  it("selects the agent pane even when a user shell appears first", () => {
+    const shell: TerminalInfo = {
+      id: "terminal_bash_s1",
+      name: "bash",
+      session: "s1",
+      running: true,
+    };
+    const agent: TerminalInfo = {
+      id: "terminal_codex_main",
+      name: "codex",
+      session: "main",
+      running: true,
+    };
+
+    expect(findAgentTerminal([shell, agent])).toBe(agent);
+  });
+
+  it("does not substitute a user shell when the agent pane is absent", () => {
+    const shell: TerminalInfo = {
+      id: "terminal_bash_s1",
+      name: "bash",
+      session: "s1",
+      running: true,
+    };
+
+    expect(findAgentTerminal([shell])).toBeNull();
   });
 });

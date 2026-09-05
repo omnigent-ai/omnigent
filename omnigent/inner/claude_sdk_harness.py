@@ -71,7 +71,7 @@ Env vars read at startup:
 - ``HARNESS_CLAUDE_SDK_BUNDLE_DIR``: Absolute path to the
   agent bundle's extracted root. When set, the inner executor
   passes ``plugins=[{"type": "local", "path": <bundle_dir>}]``
-  to the SDK so any ``<bundle>/skills/<name>/SKILL.md`` files
+  to the SDK so any ``<bundle>/skills/<dir>/SKILL.md`` files
   surface as agent-bundled skills (regardless of
   ``skills_filter``). Unset for agents without a bundled-skills
   directory.

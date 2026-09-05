@@ -14,12 +14,13 @@ is the only production consumer; see designs/RUNNER_MCP.md.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import shlex
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -359,14 +360,45 @@ def _is_sse_endpoint(url: str) -> bool:
     return urlparse(url).path.rstrip("/").endswith("/sse")
 
 
+def _mapping_digest(mapping: Mapping[str, str] | None) -> str:
+    """
+    Digest a possibly-secret str→str mapping for use inside a cache key.
+
+    Order-insensitive: same entries in any insertion order digest
+    identically. An empty or ``None`` mapping digests to a stable
+    constant so keys stay comparable across processes.
+
+    :param mapping: The env / headers mapping, or ``None``.
+    :returns: A short hex digest, e.g. ``"9f86d081884c7d65"``.
+    """
+    items = sorted((mapping or {}).items())
+    payload = json.dumps(items, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def _cache_key(config: MCPServerConfig, cwd: Path | None = None) -> str:
     """
     Build a stable cache key for an MCP server config + stdio cwd.
 
-    Keys include the transport + identifying fields so that two
-    configs pointing at the same live server share the cache
-    entry and two configs pointing at different servers (same
-    name, different url / command / cwd) don't collide.
+    Invariant: the key contains every config field the SERVER can
+    observe — anything that can change what ``tools/list`` returns.
+    For stdio that is the spawned command line (``command`` /
+    ``args`` / ``cwd``) and the ``env`` overlay; for HTTP it is the
+    ``url`` and the request identity (``headers``, and
+    ``databricks_profile``, which resolves to an Authorization
+    header at connect() time). A server may register different
+    tools depending on any of these (an env-gated read-only mode, a
+    remote server that scopes tools per principal), and two configs
+    differing in one must never share a cached tools/list — the
+    second would silently inherit the first's tool surface until
+    the TTL expires. Fields the CLIENT applies after the response
+    (the ``tools:`` allowlist, ``timeout`` / ``retry``,
+    ``description``) stay out so same-server configs keep sharing
+    one entry. When adding a config field, decide which side of
+    that line it falls on.
+
+    The env / headers maps are folded in as a digest, not verbatim:
+    they routinely carry secrets, and cache keys end up in logs.
 
     :param config: The MCP server configuration.
     :param cwd: Optional stdio subprocess working directory;
@@ -376,8 +408,15 @@ def _cache_key(config: MCPServerConfig, cwd: Path | None = None) -> str:
     if config.transport == "stdio":
         args_part = shlex.join(config.args) if config.args else ""
         cwd_part = "" if cwd is None else str(cwd)
-        return f"stdio:{config.name}:{config.command}:{args_part}:{cwd_part}"
-    return f"http:{config.name}:{config.url}"
+        env_part = _mapping_digest(config.env)
+        return f"stdio:{config.name}:{config.command}:{args_part}:{cwd_part}:{env_part}"
+    headers_part = _mapping_digest(config.headers)
+    # databricks_profile resolves to an Authorization header at
+    # connect() time, so it is an identity field even though the
+    # static ``headers`` map doesn't show it. A profile name is not
+    # a secret; keyed verbatim.
+    profile_part = config.databricks_profile or ""
+    return f"http:{config.name}:{config.url}:{profile_part}:{headers_part}"
 
 
 def clear_discovery_cache() -> None:
@@ -1221,14 +1260,27 @@ _CONNECTION_ERROR_TYPES = (
 )
 
 
+# The streamable-HTTP transport reports a dead server-side session as
+# ``ErrorData(code=32600, message="Session terminated")`` (mcp 1.29.0,
+# mcp/client/streamable_http.py). The code is an upstream typo of JSON-RPC's
+# invalid-request ``-32600`` -- positive 32600 is not in the specification --
+# so match on both the code and the message: the SDK could fix the sign of the
+# code at any time, and the message is what the session-lost path emits.
+_SESSION_TERMINATED_CODE = 32600
+_SESSION_TERMINATED_MESSAGE = "session terminated"
+
+
 def _is_connection_error(exc: BaseException) -> bool:
     """
     Determine if an exception indicates a dead MCP connection.
 
     Returns ``True`` for transport-level failures (broken pipe,
     EOF, connection reset) and MCP-level connection-closed
-    errors. Returns ``False`` for tool-level errors (invalid
-    args, tool not found) which should not trigger a reconnect.
+    errors, including the streamable-HTTP transport's
+    ``Session terminated`` (32600) raised when the server no longer
+    knows the session id (e.g. it restarted). Returns ``False`` for
+    tool-level errors (invalid args, tool not found) which should not
+    trigger a reconnect.
 
     :param exc: The exception to classify.
     :returns: ``True`` if the error is connection-related.
@@ -1236,7 +1288,12 @@ def _is_connection_error(exc: BaseException) -> bool:
     if isinstance(exc, _CONNECTION_ERROR_TYPES):
         return True
     if isinstance(exc, McpError):
-        return exc.error.code == CONNECTION_CLOSED
+        if exc.error.code == CONNECTION_CLOSED:
+            return True
+        return exc.error.code == _SESSION_TERMINATED_CODE or (
+            isinstance(exc.error.message, str)
+            and exc.error.message.strip().lower() == _SESSION_TERMINATED_MESSAGE
+        )
     return False
 
 

@@ -20,8 +20,9 @@ A failure here means one of:
   plumbing in ``omnigent/server/app.py`` or ``web/src/lib/capabilities.ts``).
 - The WebSocket route broke (``omnigent/server/routes/dictation.py``).
 - The capture pipeline broke (``web/src/lib/dictation.ts`` worklet/socket).
-- The composer stopped applying interim/final updates
-  (``ComposerMicButton.tsx`` / ``useDictationInsert.ts`` / ``ChatPage.tsx``).
+- The composer stopped applying interim/final updates, or stopped inserting
+  them at the caret (``ComposerMicButton.tsx`` / ``useDictationInsert.ts`` /
+  ``ChatPage.tsx``).
 """
 
 from __future__ import annotations
@@ -77,7 +78,7 @@ def test_dictation_streams_transcript_into_composer(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        composer = page.get_by_placeholder("Ask the agent anything…")
+        composer = page.get_by_placeholder("Send a message…")
         expect(composer).to_be_visible()
 
         # The button only renders once /v1/info reports dictation_available,
@@ -120,7 +121,7 @@ def test_hotkey_toggles_dictation(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
+        expect(page.get_by_placeholder("Send a message…")).to_be_visible()
         mic = page.get_by_role("button", name="Voice dictation")
         expect(mic).to_be_visible()
         expect(mic).to_have_attribute("aria-pressed", "false")
@@ -148,7 +149,7 @@ def test_enter_while_listening_commits_text(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        composer = page.get_by_placeholder("Ask the agent anything…")
+        composer = page.get_by_placeholder("Send a message…")
         expect(composer).to_be_visible()
         # Normalize the starting draft so the assertions are exact.
         composer.fill("")
@@ -171,6 +172,65 @@ def test_enter_while_listening_commits_text(
         context.close()
 
 
+def test_transcript_lands_at_the_caret(
+    browser: Browser,
+    browser_context_args: dict[str, Any],
+    seeded_session: tuple[str, str],
+) -> None:
+    """Dictation inserts at the caret, not at the end of the draft.
+
+    The reported flow: paste a block of context, click above it, dictate the
+    instructions that should lead. Drives the real caret through the browser
+    (click + Ctrl+Home) rather than calling the hook, so it also covers the
+    composer's ``onFocus`` wiring and the caret surviving the mic button
+    taking focus on click.
+    """
+    base_url, session_id = seeded_session
+    context, page = _open_server_dictation_page(
+        browser, browser_context_args, base_url, session_id
+    )
+    try:
+        composer = page.get_by_placeholder("Send a message…")
+        expect(composer).to_be_visible()
+
+        # Paste a block of context, then put the caret at the very top.
+        composer.fill("PASTED CONTEXT")
+        composer.click()
+        page.keyboard.press("Control+Home")
+
+        mic = page.get_by_role("button", name="Voice dictation")
+        mic.click()
+        expect(mic).to_have_attribute("aria-pressed", "true")
+        expect(composer).to_have_value(
+            re.compile(re.escape(_FAKE_SCRIPT)),
+            timeout=_TRANSCRIPT_TIMEOUT_MS,
+        )
+
+        mic.click()
+        expect(mic).to_have_attribute("aria-pressed", "false")
+        # The dictated words lead and the pasted block still trails them.
+        expect(composer).to_have_value(f"{_FAKE_SCRIPT} PASTED CONTEXT")
+
+        # Second take with the caret moved back to the top: the caret must be
+        # honoured again rather than the text chaining onto the first take.
+        # (The related empty-interim-clear regression can't be reached here —
+        # the fake engine always finalizes a non-empty tail, so the mic takes
+        # the onTranscript branch instead of onInterim(""). That path is
+        # covered in web/src/hooks/useDictationInsert.test.tsx.)
+        composer.click()
+        page.keyboard.press("Control+Home")
+        mic.click()
+        expect(mic).to_have_attribute("aria-pressed", "true")
+        expect(composer).to_have_value(
+            f"{_FAKE_SCRIPT} {_FAKE_SCRIPT} PASTED CONTEXT",
+            timeout=_TRANSCRIPT_TIMEOUT_MS,
+        )
+        mic.click()
+        expect(mic).to_have_attribute("aria-pressed", "false")
+    finally:
+        context.close()
+
+
 def test_escape_while_listening_discards_text(
     browser: Browser,
     browser_context_args: dict[str, Any],
@@ -182,7 +242,7 @@ def test_escape_while_listening_discards_text(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        composer = page.get_by_placeholder("Ask the agent anything…")
+        composer = page.get_by_placeholder("Send a message…")
         expect(composer).to_be_visible()
         # Empty snapshot at voice start, so a correct discard empties it again.
         composer.fill("")

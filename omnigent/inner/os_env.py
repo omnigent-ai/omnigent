@@ -42,6 +42,7 @@ from .sandbox import (
     cleanup_private_tmpdir,
     create_private_tmpdir,
     get_backend,
+    reachable_roots,
     resolve_sandbox,
     set_temp_env,
     with_additional_write_roots,
@@ -97,8 +98,13 @@ class _PopenKwargs(TypedDict, total=False):
 #   non-interactive startup.
 # - ``PROMPT_COMMAND``: arbitrary command run by bash before each prompt.
 # - ``CDPATH``: changes the resolution of relative paths in shell ``cd``.
-# - ``SSH_AUTH_SOCK``: the user's running ssh-agent socket — a
-#   credential surface masquerading as a path.
+# - ``SSH_AUTH_SOCK``: the user's ssh-agent socket. Allowed through the
+#   weaker host→runner and harness-CLI boundaries (a socket path, like
+#   ``KUBECONFIG``), but an ACTIVE sandbox is where the agent is being
+#   deliberately confined, and signing with the user's keys is exactly
+#   what that confinement is for. Opt in per-spec, and grant the socket
+#   path too: under seatbelt / bwrap the name alone points at something
+#   unreachable.
 # - ``DBUS_SESSION_BUS_ADDRESS``: lets the helper talk to the user's
 #   D-Bus session.
 # - ``XDG_RUNTIME_DIR``: per-session socket directory (Wayland, ssh-
@@ -991,7 +997,7 @@ def _handle_helper_request(
         path = _resolve_path(cwd, raw_path)
         try:
             _assert_within_reach(cwd, sandbox, path, need_write=False)
-            _assert_read_allowed(sandbox, path)
+            _assert_read_allowed(sandbox, path, cwd)
         except PermissionError as exc:
             return {"error": str(exc)}
         offset_raw = request.get("offset", 1)
@@ -1033,7 +1039,7 @@ def _handle_helper_request(
         path = _resolve_path(cwd, raw_path)
         try:
             _assert_within_reach(cwd, sandbox, path, need_write=True)
-            _assert_read_allowed(sandbox, path)
+            _assert_read_allowed(sandbox, path, cwd)
             _assert_write_allowed(sandbox, path)
         except PermissionError as exc:
             return {"error": str(exc)}
@@ -1113,6 +1119,9 @@ def _assert_within_reach(
     """Confine a file-tool op to *cwd*, extended by declared sandbox grants.
 
     Replaces the historical cwd-only guard at the read / write / edit sites.
+    The grants come from :func:`omnigent.inner.sandbox.reachable_roots`, which
+    is also what the filesystem APIs advertise as reachable, so what is
+    enforced here and what a caller is told it can reach cannot drift apart.
     *resolved* is already canonicalised by :func:`_resolve_path` (symlinks
     followed, ``..`` collapsed) and every grant root is canonicalised at
     resolve time, so a symlink or ``..`` chain whose real target leaves both
@@ -1159,18 +1168,13 @@ def _assert_within_reach(
     :raises PermissionError: If *resolved* is outside *cwd* and no grant of
         the required kind covers it.
     """
-    resolved_cwd = cwd.resolve()
-    if _is_within(resolved, resolved_cwd):
-        return
-    # Write grants (directories + single files) admit both reads and writes.
-    if any(_is_within(resolved, root) for root in policy.write_roots):
-        return
-    if any(resolved == grant for grant in policy.write_files):
-        return
-    # Read grants admit reads only.
-    if not need_write and policy.read_roots is not None:
-        if any(_is_within(resolved, root) for root in policy.read_roots):
+    for root in reachable_roots(cwd, policy):
+        # Read grants admit reads only; write grants admit both.
+        if need_write and root.access != "write":
+            continue
+        if root.contains(resolved):
             return
+    resolved_cwd = cwd.resolve()
     kind = "write" if need_write else "read"
     raise PermissionError(
         f"Access to '{resolved}' is blocked: path is outside the "
@@ -1179,11 +1183,15 @@ def _assert_within_reach(
     )
 
 
-def _assert_read_allowed(policy: SandboxPolicy, path: Path) -> None:
+def _assert_read_allowed(policy: SandboxPolicy, path: Path, cwd: Path) -> None:
     roots = policy.read_roots
     if not policy.active or roots is None:
         return
-    if any(_is_within(path, root) for root in roots):
+    if _is_within(path, cwd):
+        return
+    if any(_is_within(path, root) for root in (*roots, *policy.write_roots)):
+        return
+    if any(path == allowed for allowed in policy.write_files):
         return
     raise PermissionError(f"Read access to '{path}' is blocked by sandbox.")
 

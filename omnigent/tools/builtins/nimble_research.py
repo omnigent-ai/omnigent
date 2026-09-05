@@ -529,7 +529,7 @@ def _start_run(
     # Lazy: nimble-python is the optional `nimble` extra, so the base install
     # never needs it. Checked before anything is sent, so nothing is billed.
     try:
-        from nimble_python import (  # pyrefly: ignore[missing-import]
+        from nimble_python import (
             APIConnectionError,
             APIError,
             APIStatusError,

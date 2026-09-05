@@ -4,20 +4,19 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from issue_prioritization.artifacts import RankedIssue
-from issue_prioritization.domain import Priority, Severity
-from issue_prioritization.labels import LabelManifest
+from issue_prioritization.domain import InformationStatus, Priority
+from issue_prioritization.labels import LEGACY_SEVERITY_LABELS, LabelManifest
 
 
 @dataclass(frozen=True)
 class BotState:
     issue_number: int
     priority: str | None
-    severity: str | None
     components: tuple[str, ...]
 
     @property
     def has_ownership(self) -> bool:
-        return self.priority is not None or self.severity is not None or bool(self.components)
+        return self.priority is not None or bool(self.components)
 
 
 class BotStateRepository(Protocol):
@@ -34,8 +33,9 @@ class LegacyPriorityOwnership(Protocol):
 class MutationTarget:
     issue_number: int
     priority: str
-    severity: str
     components: tuple[str, ...]
+    issue_type: str | None = None
+    needs_info: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -90,20 +90,7 @@ class MutationPlanner:
         priority = next(iter(priorities))
         if not self.legacy_priorities.is_bot_owned(issue_number, priority):
             return None
-        return BotState(issue_number, priority, None, ())
-
-    def severity_override(
-        self,
-        current_labels: tuple[str, ...],
-        state: BotState | None,
-    ) -> Severity | None:
-        labels = set(current_labels) & self.manifest.severity_labels
-        if len(labels) != 1:
-            return None
-        label = next(iter(labels))
-        if state is not None and label == state.severity:
-            return None
-        return Severity(label.removeprefix("severity:"))
+        return BotState(issue_number, priority, ())
 
     def plan_one(
         self,
@@ -113,8 +100,30 @@ class MutationPlanner:
     ) -> MutationPlan:
         existing = set(current_labels)
         labels_add: set[str] = set()
-        labels_remove: set[str] = set()
+        labels_remove = existing & LEGACY_SEVERITY_LABELS
         blocked: list[str] = []
+
+        if target.issue_type is not None:
+            type_labels = {"Bug", "Feature", "Docs"}
+            current_types = existing & type_labels
+            if target.issue_type not in current_types:
+                labels_add.add(target.issue_type)
+            labels_remove.update(current_types - {target.issue_type})
+
+        if target.needs_info is True:
+            lifecycle_labels = {label.casefold() for label in existing}
+            exemption = next(
+                (label for label in ("security", "duplicate") if label in lifecycle_labels),
+                None,
+            )
+            if exemption:
+                blocked.append(f"needs_info_{exemption}_exempt")
+                if "needs-info" in existing:
+                    labels_remove.add("needs-info")
+            elif "needs-info" not in existing:
+                labels_add.add("needs-info")
+        elif target.needs_info is False and "needs-info" in existing:
+            labels_remove.add("needs-info")
 
         current_priorities = existing & self.priority_labels
         current_priority = next(iter(current_priorities)) if len(current_priorities) == 1 else None
@@ -133,23 +142,6 @@ class MutationPlanner:
             else:
                 blocked.append("priority_human_override")
 
-        current_severities = existing & self.manifest.severity_labels
-        current_severity = next(iter(current_severities)) if len(current_severities) == 1 else None
-        severity_written = False
-        severity_owned = (not current_severities and (state is None or state.severity is None)) or (
-            state is not None and current_severity == state.severity
-        )
-        if len(current_severities) > 1:
-            blocked.append("severity_label_conflict")
-        elif current_severity != target.severity:
-            if severity_owned:
-                labels_add.add(target.severity)
-                severity_written = True
-                if current_severity:
-                    labels_remove.add(current_severity)
-            else:
-                blocked.append("severity_human_override")
-
         existing_components = existing & self.manifest.component_labels
         target_components = set(target.components)
         owned_components = set(state.components) if state else set()
@@ -165,7 +157,6 @@ class MutationPlanner:
         next_state = BotState(
             issue_number=target.issue_number,
             priority=target.priority if priority_written else state_priority(state),
-            severity=target.severity if severity_written else state_severity(state),
             components=tuple(sorted(bot_components)),
         )
         return MutationPlan(
@@ -181,14 +172,11 @@ def target_from_ranked(item: RankedIssue) -> MutationTarget:
     return MutationTarget(
         issue_number=item.issue.number,
         priority=item.result.priority.value,
-        severity=f"severity:{item.issue.severity.value}",
         components=item.issue.component_labels,
+        issue_type=item.issue.issue_type.label,
+        needs_info=item.issue.information_status == InformationStatus.NEEDS_INFO,
     )
 
 
 def state_priority(state: BotState | None) -> str | None:
     return state.priority if state else None
-
-
-def state_severity(state: BotState | None) -> str | None:
-    return state.severity if state else None

@@ -163,6 +163,9 @@ def scan_cwd_mask_entries(
     - the entry is a symlink whose resolved target lies outside every
       path in *safe_roots*.
 
+    The explicit ``"*"`` allowlist entry disables dotpath masking for
+    trusted roots. Escaping symlinks remain masked.
+
     Walker termination is deterministic:
 
     - ``follow_symlinks=False`` on the recursion check ensures
@@ -246,6 +249,7 @@ def scan_cwd_mask_entries(
         return entries
 
     allow = set(allow_hidden)
+    allow_all_hidden = "*" in allow
     safe_root_list = list(safe_roots)
     cap_enabled = overflow != "unlimited"
     logger = logging.getLogger(logger_name) if logger_name else _LOGGER
@@ -289,7 +293,7 @@ def scan_cwd_mask_entries(
 
             child_path = Path(child.path)
             should_mask = False
-            if child.name.startswith(".") and child.name not in allow:
+            if child.name.startswith(".") and not allow_all_hidden and child.name not in allow:
                 should_mask = True
             elif child.is_symlink():
                 resolved_target = child_path.resolve(strict=False)
@@ -302,11 +306,11 @@ def scan_cwd_mask_entries(
                     continue
                 seen.add(key)
                 # ``is_dir`` follows symlinks by default — matches what
-                # the agent would observe through the bind. For broken
-                # symlinks it returns False; the backend's "file"
-                # emitter handles both (``--bind /dev/null`` works on
-                # a broken symlink; SBPL ``(literal ...)`` denies the
-                # path regardless of what it points at).
+                # the agent would observe through the bind. Backends decide
+                # how to act on a symlink entry: SBPL ``(literal ...)``
+                # denies the path itself, while bwrap cannot mount onto a
+                # symlink at all and skips it (the mount namespace already
+                # confines where the link resolves).
                 kind: MaskKind = "dir" if child.is_dir() else "file"
                 entries.append(MaskedEntry(path=child_path, kind=kind))
                 # Prune: don't descend into a masked dir.

@@ -35,11 +35,87 @@ class IssueType(StrEnum):
         }[self]
 
 
-class Severity(StrEnum):
-    S0 = "S0"
-    S1 = "S1"
-    S2 = "S2"
-    S3 = "S3"
+class EvidenceKind(StrEnum):
+    DIRECT_STEPS = "direct_steps"
+    OBSERVED_INTERMITTENT = "observed_intermittent"
+    CONTROLLED_TEST = "controlled_test"
+    DIAGNOSTIC_EVIDENCE = "diagnostic_evidence"
+    CODE_ANALYSIS = "code_analysis"
+    NONE = "none"
+
+    @classmethod
+    def parse(cls, value: object) -> EvidenceKind:
+        try:
+            return cls(str(value).strip().casefold())
+        except ValueError as exc:
+            raise ValueError(f"unsupported evidence kind: {value!r}") from exc
+
+
+class InformationStatus(StrEnum):
+    SUFFICIENT = "sufficient"
+    NEEDS_INFO = "needs_info"
+    NOT_APPLICABLE = "not_applicable"
+
+    @classmethod
+    def parse(cls, value: object) -> InformationStatus:
+        try:
+            return cls(str(value).strip().casefold())
+        except ValueError as exc:
+            raise ValueError(f"unsupported information status: {value!r}") from exc
+
+
+class MissingInformation(StrEnum):
+    TRIGGER = "trigger"
+    EXPECTED_BEHAVIOR = "expected_behavior"
+    OBSERVED_BEHAVIOR = "observed_behavior"
+    VERSION_OR_ENVIRONMENT = "version_or_environment"
+    DIAGNOSTIC_EVIDENCE = "diagnostic_evidence"
+
+    @classmethod
+    def parse(cls, value: object) -> MissingInformation:
+        try:
+            return cls(str(value).strip().casefold())
+        except ValueError as exc:
+            raise ValueError(f"unsupported missing information: {value!r}") from exc
+
+
+class Impact(StrEnum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+    @classmethod
+    def parse(cls, value: object) -> Impact:
+        normalized = str(value).strip().casefold()
+        # Remove S-code aliases in v0.3.0 after cached classifications migrate.
+        aliases = {
+            "critical": cls.CRITICAL,
+            "high": cls.HIGH,
+            "medium": cls.MEDIUM,
+            "low": cls.LOW,
+            "s0": cls.CRITICAL,
+            "s1": cls.HIGH,
+            "s2": cls.MEDIUM,
+            "s3": cls.LOW,
+        }
+        try:
+            return aliases[normalized]
+        except KeyError as exc:
+            raise ValueError(f"unsupported impact: {value!r}") from exc
+
+    @property
+    def label(self) -> str:
+        return self.value.title()
+
+    @property
+    def legacy_code(self) -> str:
+        return {
+            Impact.CRITICAL: "S0",
+            Impact.HIGH: "S1",
+            Impact.MEDIUM: "S2",
+            Impact.LOW: "S3",
+        }[self]
 
 
 class Priority(StrEnum):
@@ -55,10 +131,15 @@ class Issue:
     title: str
     url: str
     issue_type: IssueType
-    severity: Severity
+    impact: Impact
     area_keys: tuple[str, ...] = ()
     component_labels: tuple[str, ...] = ()
     classification_reasoning: str = ""
+    classification_content_hash: str = ""
+    reported_type: IssueType | None = None
+    evidence_kind: EvidenceKind = EvidenceKind.NONE
+    information_status: InformationStatus = InformationStatus.NOT_APPLICABLE
+    missing_information: tuple[MissingInformation, ...] = ()
     duplicate_count: int = 0
     upvote_count: int = 0
     current_priority: Priority | None = None
@@ -74,11 +155,22 @@ class Issue:
             title=str(value.get("title", "")),
             url=str(value.get("url", "")),
             issue_type=IssueType.parse(value["type"]),
-            severity=Severity(str(value["severity"])),
+            impact=Impact.parse(value.get("impact", value.get("severity"))),
             area_keys=_string_tuple(value.get("area_keys", ())),
             component_labels=_string_tuple(value.get("component_labels", ())),
             classification_reasoning=str(
                 value.get("classification_reasoning", value.get("reasoning", ""))
+            ),
+            classification_content_hash=str(value.get("classification_content_hash", "")),
+            reported_type=(
+                IssueType.parse(value["reported_type"]) if value.get("reported_type") else None
+            ),
+            evidence_kind=EvidenceKind.parse(value.get("evidence_kind", EvidenceKind.NONE)),
+            information_status=InformationStatus.parse(
+                value.get("information_status", InformationStatus.NOT_APPLICABLE)
+            ),
+            missing_information=tuple(
+                MissingInformation.parse(item) for item in value.get("missing_information", ())
             ),
             duplicate_count=max(0, int(value.get("duplicate_count", 0))),
             upvote_count=max(0, int(value.get("upvote_count", 0))),

@@ -18,20 +18,21 @@ session never double-post.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypeAlias, TypedDict
+from typing import Any, TypeAlias, TypedDict
 from urllib.parse import quote
 
 import httpx
 
 from omnigent.json_types import JsonObject as _JsonObject
-from omnigent.opencode_native_bridge import update_active_message_id, update_last_event_id
-from omnigent.opencode_native_client import OpenCodeClient, OpenCodeEvent
+from omnigent.opencode_native_bridge import update_active_message_id
+from omnigent.opencode_native_client import OpenCodeClient, OpenCodeClientError, OpenCodeEvent
 from omnigent.opencode_native_permissions import (
     OpenCodePermissionRequest,
     PolicyDecision,
@@ -58,6 +59,7 @@ _EXTERNAL_SESSION_USAGE = "external_session_usage"
 # Mirrors a model switch typed in the opencode TUI (``/model`` or the picker)
 # back to Omnigent so the web model pill stays in sync (claude-native contract).
 _EXTERNAL_MODEL_CHANGE = "external_model_change"
+_EXTERNAL_ELICITATION_RESOLVED = "external_elicitation_resolved"
 # Transient chain-of-thought delta — the reasoning analogue of the text delta
 # (same contract codex-native uses). The web paints a reasoning block; it is not
 # persisted, so on reload it is gone (acceptable, mirrors codex).
@@ -123,6 +125,16 @@ class OpenCodeForwarderState:
 def _int_or_zero(value: object) -> int:
     """Coerce an opencode token-count field to a non-negative int (0 otherwise)."""
     return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _message_is_complete(info: Mapping[str, Any] | None) -> bool:
+    """Return whether an OpenCode message snapshot is complete."""
+    if not isinstance(info, Mapping):
+        return False
+    time_info = info.get("time")
+    if not isinstance(time_info, Mapping):
+        return False
+    return isinstance(time_info.get("completed"), (int, float))
 
 
 class OpenCodeNativeForwarder:
@@ -201,6 +213,7 @@ class OpenCodeNativeForwarder:
         # turn; both reset in :meth:`_end_turn`.
         self._active_message_id: str | None = None
         self._running_response_id: str | None = None
+        self._question_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def seed_dedupe_from_history(self) -> None:
         """
@@ -209,6 +222,7 @@ class OpenCodeNativeForwarder:
         Prevents re-posting prior history on a resume/reconnect. Best
         effort: a failure leaves the dedupe set empty (at worst a few
         re-posts on resume).
+
         """
         try:
             messages = await self._opencode.list_messages(self._opencode_session_id)
@@ -231,11 +245,9 @@ class OpenCodeNativeForwarder:
                     part_id = part.get("id")
                     if isinstance(part_id, str):
                         self.state.mark(self._key("part", part_id))
-                    # Pre-mark the keys the live handlers check so a resume
-                    # never re-posts already-finalized text / tool parts.
                     if part.get("type") == "text" and isinstance(part_id, str):
                         # Pre-mark both the assistant-finalize and user-message
-                        # keys so a resume re-posts neither.
+                        # keys so a startup resume re-posts neither.
                         self.state.mark(self._key("text-final", part_id))
                         self.state.mark(self._key("user-text", part_id))
                     if part.get("type") == "tool":
@@ -252,33 +264,112 @@ class OpenCodeNativeForwarder:
                 "OpenCode forwarder could not re-post usage after seeding", exc_info=True
             )
 
+    async def catch_up_from_history(self) -> None:
+        """
+        Replay unseen persisted OpenCode parts after an SSE reconnect.
+
+        The live stream does not replay missed events. On reconnect, re-read
+        persisted history and feed unseen parts through the same posting paths
+        as live events, then let the normal dedupe keys suppress any duplicate
+        live snapshots that arrive after reconnect.
+        """
+        try:
+            messages = await self._opencode.list_messages(self._opencode_session_id)
+        except Exception:  # noqa: BLE001 - catch-up is best effort.
+            _logger.debug("OpenCode forwarder could not catch up from history", exc_info=True)
+            return
+        for message in messages:
+            if not isinstance(message, Mapping):
+                continue
+            info = message.get("info")
+            message_id = info.get("id") if isinstance(info, Mapping) else None
+            role = info.get("role") if isinstance(info, Mapping) else None
+            info_map = info if isinstance(info, Mapping) else None
+            if isinstance(message_id, str) and isinstance(role, str):
+                self._msg_role[message_id] = role
+                if role == "assistant" and info_map is not None:
+                    self._record_assistant_usage(message_id, info_map)
+            parts = message.get("parts")
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if not isinstance(part, Mapping):
+                    continue
+                part_id = part.get("id")
+                if isinstance(part_id, str):
+                    self.state.mark(self._key("part", part_id))
+                part_type = part.get("type")
+                if part_type == "text":
+                    if role == "user":
+                        await self._post_user_text_part(part)
+                    elif role == "assistant":
+                        self._accumulate_text_part(part)
+                elif part_type == "tool":
+                    await self._handle_tool_part(part)
+                elif part_type == "file":
+                    await self._handle_file_part(part)
+            if role == "assistant" and _message_is_complete(info_map):
+                await self._flush_pending_text()
+        try:
+            await self._post_session_usage()
+        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+            _logger.debug(
+                "OpenCode forwarder could not re-post usage after catch-up", exc_info=True
+            )
+
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
-        Run the SSE consume loop with reconnect/backoff.
+        Run the SSE consume loop with reconnect/backoff and gap-fill.
+
+        On the first connection, seeds the dedupe set from the existing
+        session history so a restart (e.g. runner process restart) never
+        re-posts content that was already delivered.
+
+        On every reconnect after a dropped stream, persisted history is replayed
+        through the normal post paths to close the gap that opened during the
+        disconnect window. The dedupe set ensures that items posted before the
+        drop are never duplicated.
 
         :param max_reconnects: Reconnect cap (``None`` = unbounded); used
             by tests to bound the loop.
         """
-        await self.seed_dedupe_from_history()
         attempt = 0
         backoff = 0.5
-        while True:
-            try:
-                await self._consume_once()
-                # Clean stream end (server closed): reconnect.
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - reconnect on any transient SSE failure.
-                _logger.warning(
-                    "OpenCode forwarder SSE error for session=%s; reconnecting",
-                    self._session_id,
-                    exc_info=True,
-                )
-            attempt += 1
-            if max_reconnects is not None and attempt > max_reconnects:
-                return
-            await asyncio.sleep(min(backoff, 5.0))
-            backoff = min(backoff * 2, 5.0)
+        try:
+            while True:
+                if attempt == 0:
+                    await self.seed_dedupe_from_history()
+                else:
+                    await self.catch_up_from_history()
+                try:
+                    await self._consume_once()
+                    # Clean stream end (server closed): reconnect.
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - reconnect on any transient SSE failure.
+                    _logger.warning(
+                        "OpenCode forwarder SSE error for session=%s; reconnecting",
+                        self._session_id,
+                        exc_info=True,
+                    )
+                attempt += 1
+                if max_reconnects is not None and attempt > max_reconnects:
+                    return
+                await asyncio.sleep(min(backoff, 5.0))
+                backoff = min(backoff * 2, 5.0)
+        finally:
+            # Never leave a parked ``question`` task orphaned when the consume
+            # loop exits (cap reached, return, or cancellation): cancel them all.
+            await self._cancel_question_tasks()
+
+    async def _cancel_question_tasks(self) -> None:
+        """Cancel and await every in-flight question park task."""
+        tasks = list(self._question_tasks.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._question_tasks.clear()
 
     async def _consume_once(self) -> None:
         """Consume the SSE stream once, dispatching each event."""
@@ -293,8 +384,6 @@ class OpenCodeNativeForwarder:
         """
         if not self._event_targets_session(event):
             return
-        if event.id and self._bridge_dir is not None:
-            update_last_event_id(self._bridge_dir, event.id)
         handler = _HANDLERS.get(event.type)
         if handler is None:
             _logger.debug(
@@ -945,6 +1034,216 @@ class OpenCodeNativeForwarder:
             return self._default_decision
         return map_verdict_to_decision(verdict)
 
+    async def _on_question_asked(self, event: OpenCodeEvent) -> None:
+        """Handle ``question.asked`` — surface opencode's blocking ``question``.
+
+        opencode's ``question`` tool blocks the turn until answered. Parking the
+        web elicitation card and waiting for the verdict CANNOT run inline here:
+        the SSE consume loop awaits each handler sequentially, so an inline park
+        would stall every other event for this session until the human answers.
+        So spawn a background task (deduped by request id) and return immediately.
+        ``question.asked`` carries the request id under ``id`` (``question.replied``
+        / ``.rejected`` use ``requestID``).
+        """
+        request_id = event.properties.get("id")
+        questions = event.properties.get("questions")
+        if not isinstance(request_id, str) or not request_id:
+            return
+        if not isinstance(questions, list):
+            return
+        if request_id in self._question_tasks:
+            return
+        task = asyncio.create_task(
+            self._handle_question(request_id, questions, event.properties.get("tool"))
+        )
+        self._question_tasks[request_id] = task
+        # Self-evict from the registry once done so it can't grow unbounded; a
+        # later withdrawal (``question.replied``) that already popped it is a
+        # no-op (``pop(..., None)``).
+        task.add_done_callback(lambda _t, rid=request_id: self._question_tasks.pop(rid, None))
+
+    async def _handle_question(self, request_id: str, questions: list[Any], tool: Any) -> None:
+        """Park one opencode ``question`` as a web card and apply the verdict.
+
+        Translates the opencode question shape into the web ``ask_user_question``
+        form (preserving each question's ORIGINAL index as its ``id`` so answers
+        realign), POSTs it to the native permission hook, then maps the web
+        verdict back onto ``reply_question`` (one selected-label list per original
+        question, in order) or ``reject_question``. A ``None`` verdict (the TUI
+        answered, or the wait timed out) rejects to unblock opencode.
+
+        ``asyncio.CancelledError`` PROPAGATES (it is raised by
+        :meth:`_on_question_replied` / ``_on_question_rejected`` when the TUI
+        resolves the question, or by ``run()`` teardown) — the card withdrawal is
+        handled there, so this must NOT reject on cancel.
+        """
+        del tool  # Currently unused; accepted for forward-compat / logging parity.
+        web_questions: list[dict[str, Any]] = []
+        for index, question in enumerate(questions):
+            if not isinstance(question, dict):
+                await self._reject_question_quietly(request_id)
+                return
+            prompt = question.get("question")
+            raw_options = question.get("options")
+            if not isinstance(prompt, str) or not prompt or not isinstance(raw_options, list):
+                await self._reject_question_quietly(request_id)
+                return
+            options = [
+                {"label": opt["label"]}
+                for opt in raw_options
+                if isinstance(opt, dict) and isinstance(opt.get("label"), str) and opt["label"]
+            ]
+            if not options or len(options) != len(raw_options):
+                await self._reject_question_quietly(request_id)
+                return
+            web_questions.append(
+                {
+                    "question": prompt,
+                    "options": options,
+                    "multiSelect": question.get("multiple") is True,
+                    # ORIGINAL index — the answer for question ``i`` is read back
+                    # under ``str(i)`` so skipped/malformed questions don't shift
+                    # the alignment.
+                    "id": str(index),
+                }
+            )
+        if not web_questions:
+            await self._reject_question_quietly(request_id)
+            return
+        first = questions[0] if isinstance(questions[0], dict) else {}
+        header = first.get("header")
+        message = header if isinstance(header, str) and header else "OpenCode is asking a question"
+        preview_text = first.get("question")
+        preview = preview_text[:1024] if isinstance(preview_text, str) and preview_text else None
+        try:
+            verdict = await self._park_question(
+                request_id, message=message, payload={"questions": web_questions}, preview=preview
+            )
+            if verdict is None:
+                # Empty 200 → answered in the TUI or timed out: unblock opencode.
+                await self._reject_question_quietly(request_id)
+                return
+            if verdict.get("action") == "accept":
+                content = verdict.get("content")
+                if not isinstance(content, dict):
+                    content = {}
+                answers: list[list[str]] = []
+                for i in range(len(questions)):
+                    val = content.get(str(i))
+                    if isinstance(val, str):
+                        answers.append([val])
+                    elif isinstance(val, list):
+                        answers.append([x for x in val if isinstance(x, str)])
+                    else:
+                        answers.append([])
+                await self._opencode.reply_question(request_id, answers)
+            else:
+                # ``decline`` / ``cancel`` / anything else → reject.
+                await self._reject_question_quietly(request_id)
+        except asyncio.CancelledError:
+            raise
+        except (httpx.HTTPError, OpenCodeClientError) as exc:
+            _logger.warning(
+                "OpenCode question handling failed for request=%s: %s", request_id, exc
+            )
+            # Best effort: still try to unblock opencode so the turn isn't wedged.
+            with contextlib.suppress(OpenCodeClientError):
+                await self._opencode.reject_question(request_id)
+
+    async def _reject_question_quietly(self, request_id: str) -> None:
+        """Best-effort reject a question, swallowing OpenCode client errors.
+
+        A TUI resolution commonly makes this request return not found. Other
+        client failures are also non-fatal because rejection is only cleanup
+        after the web path can no longer provide an answer.
+        """
+        try:
+            await self._opencode.reject_question(request_id)
+        except OpenCodeClientError:
+            _logger.debug(
+                "OpenCode question reject for request=%s failed during best-effort cleanup",
+                request_id,
+                exc_info=True,
+            )
+
+    async def _park_question(
+        self,
+        request_id: str,
+        *,
+        message: str,
+        payload: dict[str, Any],
+        preview: str | None,
+    ) -> dict[str, Any] | None:
+        """POST the native permission hook for a question; return the web verdict.
+
+        Returns ``None`` for every "no answer" outcome (transport error, status
+        >= 400, empty body, or non-dict JSON) so the caller only handles a real
+        verdict dict — mirrors
+        :func:`omnigent.cursor_native_permissions._park_cursor_elicitation`. The
+        structured ``ask_user_question`` is the authoritative payload the web UI
+        renders; ``content_preview`` is only the legacy fallback.
+        """
+        body: dict[str, Any] = {
+            "elicitation_id": request_id,
+            "operation_type": "question",
+            "agent": "OpenCode",
+            "policy_name": "opencode_native_question",
+            "message": message,
+            "ask_user_question": payload,
+        }
+        if preview is not None:
+            body["content_preview"] = preview
+        url = f"/v1/sessions/{quote(self._session_id, safe='')}/hooks/native-permission-request"
+        try:
+            response = await self._server.post(url, json=body)
+        except httpx.HTTPError:
+            _logger.warning(
+                "OpenCode question hook POST failed for session=%s request=%s",
+                self._session_id,
+                request_id,
+                exc_info=True,
+            )
+            return None
+        if response.status_code >= 400:
+            _logger.warning(
+                "OpenCode question hook rejected: status=%s body=%s",
+                response.status_code,
+                response.text[:512],
+            )
+            return None
+        if not response.content:
+            return None
+        try:
+            result = response.json()
+        except ValueError:
+            _logger.warning("OpenCode question hook returned non-JSON: %s", response.text[:512])
+            return None
+        return result if isinstance(result, dict) else None
+
+    async def _on_question_replied(self, event: OpenCodeEvent) -> None:
+        """Handle ``question.replied`` — the TUI answered, so withdraw the card."""
+        await self._withdraw_question(event.properties.get("requestID"))
+
+    async def _on_question_rejected(self, event: OpenCodeEvent) -> None:
+        """Handle ``question.rejected`` — the TUI declined, so withdraw the card."""
+        await self._withdraw_question(event.properties.get("requestID"))
+
+    async def _withdraw_question(self, request_id: Any) -> None:
+        """Cancel a pending question park (if any) and clear its web card.
+
+        Fired when opencode reports the question was resolved in the TUI
+        (``question.replied`` / ``.rejected`` use ``requestID``, not ``id``):
+        cancel the still-parked POST so it neither double-replies nor lingers,
+        then post ``external_elicitation_resolved`` so the web card disappears.
+        """
+        if not isinstance(request_id, str) or not request_id:
+            return
+        task = self._question_tasks.pop(request_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self._post_event(_EXTERNAL_ELICITATION_RESOLVED, {"elicitation_id": request_id})
+
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
@@ -971,8 +1270,8 @@ def opencode_tool_output_text(state: _JsonMapping) -> str:
 # resolves the method on the instance. Keys are OpenCode event ``type``
 # discriminators (see openapi.json Event* schemas).
 _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitable[None]]] = {
-    # opencode 1.17.x is part-based: text/tool live on message PARTS, lifecycle
-    # on the message + session. (Verified against a real ``opencode serve``.)
+    # opencode 1.17.x–1.18.x is part-based: text/tool live on message PARTS,
+    # lifecycle on the message + session. (Verified against real ``opencode serve``.)
     "message.updated": OpenCodeNativeForwarder._on_message_updated,
     "message.part.updated": OpenCodeNativeForwarder._on_part_updated,
     # NB: ``message.part.delta`` (live token stream) is intentionally NOT
@@ -994,8 +1293,11 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.compacted": OpenCodeNativeForwarder._on_compaction_ended,
     # Mirror a TUI model switch back to Omnigent (in-harness session-cmd sync).
     "session.next.model.switched": OpenCodeNativeForwarder._on_model_switched,
-    # Permission ask: 1.17.x emits ``permission.asked``; keep the ``v2`` spelling
+    # Permission ask: pre-1.18 emits ``permission.asked``; keep the ``v2`` spelling
     # too so a point-release rename still routes through the policy gate.
     "permission.asked": OpenCodeNativeForwarder._on_permission_asked,
     "permission.v2.asked": OpenCodeNativeForwarder._on_permission_asked,
+    "question.asked": OpenCodeNativeForwarder._on_question_asked,
+    "question.replied": OpenCodeNativeForwarder._on_question_replied,
+    "question.rejected": OpenCodeNativeForwarder._on_question_rejected,
 }

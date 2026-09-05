@@ -34,10 +34,12 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, TypeAlias, cast
+from urllib.parse import urlsplit
 
 import click
 import httpx
@@ -46,7 +48,6 @@ from cachetools import TTLCache
 from omnigent._platform import default_shell_argv
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
-from omnigent.model_fallbacks import StaticModelFallback, static_model_fallback
 from omnigent.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -63,6 +64,7 @@ from omnigent.model_resolver import (
 )
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    BEDROCK_KIND,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
     KEY_KIND,
@@ -98,6 +100,15 @@ _LLM_NAME_TOKENS = ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi")
 
 # Chat-capable endpoint tasks ("llm/v1/chat"); embeddings/rerankers don't match.
 _LLM_TASK_TOKENS = ("chat", "completion")
+
+# DATABRICKS-PATCH(model-services-scoped-listing): scope + page the Unity
+# Catalog model-services listing. Mirrors
+# ``databricks_model_discovery._MODEL_SERVICES_PARENT`` /
+# ``_MODEL_SERVICES_MAX_RESULTS`` — including the parameter *name*, so both
+# callers of this endpoint ask for a page size the API actually honors.
+_MODEL_SERVICES_PARENT = "schemas/system.ai"
+_MODEL_SERVICES_MAX_RESULTS = 100
+_MODEL_SERVICES_MAX_PAGES = 100
 
 _ProviderHarness: TypeAlias = Literal[
     "claude-sdk",
@@ -142,6 +153,8 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     # mirroring the claude-native -> claude-sdk rule above.
     "antigravity-native": "antigravity",
     "native-antigravity": "antigravity",
+    "agy-native": "antigravity",
+    "native-agy": "antigravity",
 }
 
 # cursor-agent always routes through its own stored login — there is no
@@ -197,15 +210,12 @@ class ModelListing:
     :param models: The enumerated models, e.g.
         ``(ModelEntry(id="databricks-gpt-5-4", family="openai"),)``.
     :param note: Human-readable provenance / failure explanation.
-    :param static_fallback: Ownership metadata for a release-curated fallback;
-        ``None`` for live or empty listings.
     """
 
     source: str
     verified: bool
     models: tuple[ModelEntry, ...]
     note: str
-    static_fallback: StaticModelFallback | None = None
 
 
 @dataclass(frozen=True)
@@ -240,6 +250,62 @@ class ResolvedModelProvider:
     auth_command: str | None = None
     cli: str | None = None
     detail: str = ""
+
+
+def _model_configuration_host(base_url: str) -> str | None:
+    """Extract a host without carrying URL userinfo into browser metadata."""
+    try:
+        parsed = urlsplit(base_url if "://" in base_url else f"//{base_url}")
+        if not parsed.hostname:
+            return None
+        hostname = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    return f"{hostname}:{port}" if port is not None else hostname
+
+
+def model_configuration_source(
+    provider: ResolvedModelProvider, *, harness: str | None = None
+) -> dict[str, str] | None:
+    """Return non-secret coordinates describing how a model is reached."""
+    if provider.kind == NONE_KIND:
+        return None
+
+    # Native Claude deliberately ignores legacy api_key auth and uses its own
+    # CLI login. Named key providers still route through the configured key.
+    if (
+        harness in {"claude-native", "native-claude"}
+        and provider.kind == KEY_KIND
+        and provider.detail == "api_key auth"
+    ):
+        return {"kind": SUBSCRIPTION_KIND, "label": "Subscription", "name": "claude"}
+
+    source: dict[str, str] = {"kind": provider.kind}
+    if provider.kind == SUBSCRIPTION_KIND:
+        source.update(label="Subscription", name=provider.cli or "CLI login")
+    elif provider.kind == DATABRICKS_KIND:
+        source.update(label="Workspace", name=provider.profile or "DEFAULT")
+    elif provider.kind in {"gateway", "local"}:
+        source["label"] = "AI Gateway" if provider.kind == "gateway" else "Local"
+        name = provider.detail.removeprefix("provider '").removesuffix("'")
+        if name:
+            source["name"] = name
+    elif provider.kind == CLI_CONFIG_KIND:
+        source.update(label="CLI config", name=provider.detail or provider.cli or "Codex")
+    elif provider.kind == BEDROCK_KIND:
+        source["label"] = "Bedrock"
+        name = provider.detail.removeprefix("provider '").removesuffix("'")
+        if name:
+            source["name"] = name
+    else:
+        source["label"] = "API key"
+        name = provider.family or provider.detail.removeprefix("provider '").removesuffix("'")
+        if name:
+            source["name"] = name
+    if provider.base_url and (host := _model_configuration_host(provider.base_url)):
+        source["host"] = host
+    return source
 
 
 def is_direct_openai_provider(provider: ResolvedModelProvider) -> bool:
@@ -888,8 +954,7 @@ def _listing_payload(listing: ModelListing) -> _JsonObject:
     """Serialize a :class:`ModelListing` into the tool's JSON row shape.
 
     :param listing: The listing to serialize.
-    :returns: Row dict; ``context_window`` and ``static_fallback`` appear only
-        when known.
+    :returns: Row dict; ``context_window`` appears only when known.
     """
     models: list[_JsonObject] = []
     for entry in listing.models:
@@ -925,12 +990,6 @@ def _listing_payload(listing: ModelListing) -> _JsonObject:
         "models": models,
         "note": listing.note,
     }
-    if listing.static_fallback is not None:
-        payload["static_fallback"] = {
-            "owner": listing.static_fallback.owner,
-            "provenance": listing.static_fallback.provenance,
-            "discovery_gap": listing.static_fallback.discovery_gap,
-        }
     return payload
 
 
@@ -965,6 +1024,20 @@ def _redacted_failure_reason(exc: Exception) -> str:
     if isinstance(exc, OSError):
         return "provider credentials or network unavailable"
     return type(exc).__name__
+
+
+def listing_for_provider(provider: ResolvedModelProvider) -> ModelListing:
+    """Enumerate one provider's model listing (cached, failures not cached).
+
+    The public face of :func:`_listing_for_provider` for callers that already
+    hold a :class:`ResolvedModelProvider` — e.g. a harness executor asking
+    what its gateway transport serves — rather than an agent spec.
+
+    :param provider: The resolved provider descriptor.
+    :returns: The provider's :class:`ModelListing`; ``verified`` is ``False``
+        with a ``note`` when the fetch failed.
+    """
+    return _listing_for_provider(provider, transport=None)
 
 
 def _listing_for_provider(
@@ -1021,6 +1094,22 @@ def _listing_for_provider(
         _logger.debug(
             "model enumeration failed for %s", provider.detail or provider.kind, exc_info=True
         )
+        if provider.kind == SUBSCRIPTION_KIND:
+            # A failed cursor-agent listing probe says nothing about
+            # dispatchability: the CLI brings its own stored login, so the
+            # worker still runs. Degrade to the usable pre-launch shape the
+            # other subscription CLI logins report, not the dead-worker
+            # "none" that tells orchestrators the worker cannot run here.
+            return ModelListing(
+                source="static",
+                verified=False,
+                models=(),
+                note=(
+                    f"model listing failed for {provider.detail or provider.kind} "
+                    f"({_redacted_failure_reason(exc)}); the CLI launches with its "
+                    "own stored login, so dispatches to this worker can still run"
+                ),
+            )
         return ModelListing(
             source=NONE_KIND,
             verified=False,
@@ -1052,23 +1141,24 @@ def _fetch_cursor_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
 
 
 def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListing:
-    """Build the curated static listing for a subscription CLI login.
+    """Build the (empty) pre-launch listing for a subscription CLI login.
+
+    Subscription logins expose no model-listing API, and the curated
+    stand-ins this used to serve are gone — the live harness probes are the
+    source of truth, so a path that cannot probe reports nothing rather
+    than a plausible-but-stale list.
 
     :param provider: A ``kind="subscription"`` provider descriptor.
-    :returns: A ``source="static"`` listing with ``verified=False``.
+    :returns: A ``source="static"`` listing with no models.
     """
-    fallback = static_model_fallback(SUBSCRIPTION_KIND, provider.cli or "")
-    ids = fallback.model_ids if fallback is not None else ()
     return ModelListing(
         source="static",
         verified=False,
-        models=tuple(ModelEntry(id=i, family=model_family_token(i)) for i in ids),
+        models=(),
         note=(
-            f"curated aliases for the {provider.cli or 'unknown'} CLI login "
-            "(subscription logins expose no model-listing API; availability "
-            "depends on the logged-in plan)"
+            f"the {provider.cli or 'unknown'} CLI login exposes no model-listing "
+            "API before launch; the live listing comes from probing the harness"
         ),
-        static_fallback=fallback,
     )
 
 
@@ -1082,20 +1172,16 @@ def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
     resolve — not a "no credentials" preflight failure.
 
     :param provider: A ``kind="cli-config"`` provider descriptor.
-    :returns: A ``source="static"`` listing with ``verified=False``.
+    :returns: A ``source="static"`` listing with no models.
     """
-    fallback = static_model_fallback(CLI_CONFIG_KIND, provider.cli or "")
-    ids = fallback.model_ids if fallback is not None else ()
     return ModelListing(
         source="static",
         verified=False,
-        models=tuple(ModelEntry(id=i, family=model_family_token(i)) for i in ids),
+        models=(),
         note=(
-            f"curated ids for {provider.detail}; its credential lives in the "
-            "CLI's own config file and is resolved by the CLI at launch, so "
-            "it cannot be verified from here"
+            f"{provider.detail} enumerates its models only from the CLI's own "
+            "config at launch; the live listing comes from probing the harness"
         ),
-        static_fallback=fallback,
     )
 
 
@@ -1222,16 +1308,61 @@ def fetch_databricks_model_service_entries(
     :returns: LLM model-service entries with normalized wire metadata.
     :raises httpx.HTTPError: On transport or HTTP failures.
     """
+    # DATABRICKS-PATCH(model-services-scoped-listing)
+    # The listing must be scoped to the `system.ai` schema and paged. Unscoped,
+    # the endpoint walks the WHOLE metastore and returns one page of whatever
+    # schemas sort first — on a busy workspace that is a slice of unrelated user
+    # schemas with a `next_page_token` this call never followed, so a workspace
+    # serving 53 Databricks models reported 2 and zero Claude entries. Same
+    # scoping `databricks_model_discovery._list_model_service_ids` already uses.
+    services: list[object] = []
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
-        resp = client.get(
-            f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/model-services",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-    services = payload.get("model_services") if isinstance(payload, dict) else None
+        for _ in range(_MODEL_SERVICES_MAX_PAGES):
+            params = {
+                "parent": _MODEL_SERVICES_PARENT,
+                "max_results": str(_MODEL_SERVICES_MAX_RESULTS),
+            }
+            if page_token is not None:
+                params["page_token"] = page_token
+            resp = client.get(
+                f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/model-services",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            page = payload.get("model_services") if isinstance(payload, dict) else None
+            if isinstance(page, list):
+                services.extend(page)
+            raw_next = payload.get("next_page_token") if isinstance(payload, dict) else None
+            if not isinstance(raw_next, str) or not raw_next:
+                break
+            if raw_next in seen_tokens:
+                # A repeated token means the endpoint is looping. Keep the pages
+                # already collected instead of raising (which is what the
+                # sibling ``_list_model_service_ids`` does): every caller here
+                # treats an exception as "no listing" and falls back to the
+                # bundled catalog's retired ``databricks-`` ids, so failing loud
+                # would reintroduce the 501 this patch exists to remove. A
+                # partial ``system.ai`` list still launches.
+                _logger.warning(
+                    "Databricks model-services pagination repeated a page token; "
+                    "returning the %d entries collected so far",
+                    len(services),
+                )
+                break
+            seen_tokens.add(raw_next)
+            page_token = raw_next
+        else:
+            _logger.warning(
+                "Databricks model-services listing truncated after %d pages; "
+                "the model list may be incomplete",
+                _MODEL_SERVICES_MAX_PAGES,
+            )
     models: list[ModelEntry] = []
-    for service in services if isinstance(services, list) else []:
+    for service in services:
         if not isinstance(service, dict):
             continue
         raw_name = service.get("name")
@@ -1269,6 +1400,76 @@ def fetch_databricks_model_service_entries(
             )
         )
     return tuple(models)
+
+
+# A value no endpoint will honor, so the request trips the output-token
+# validator before the model generates anything.
+_PROBE_OUTPUT_TOKENS = 100_000_000
+
+# Databricks serving endpoints report an exceeded output limit in one of two
+# shapes: "max_tokens (N) cannot exceed CAP" or "max_new_tokens N cannot be
+# greater than max_output_tokens CAP". Capture CAP from either.
+_OUTPUT_CAP_RE = re.compile(r"cannot exceed (\d+)|max_output_tokens\D*?(\d+)")
+
+
+def probe_output_token_cap(
+    base_url: str,
+    token: str,
+    model_id: str,
+    *,
+    api_type: str = "openai-completions",
+    transport: httpx.BaseTransport | None = None,
+) -> int | None:
+    """Discover a serving endpoint's enforced per-request output-token cap.
+
+    The Unity Catalog model-services listing carries no token limits, and a
+    model's native ceiling (its catalog ``max_output_tokens``) can exceed what
+    the Databricks serving endpoint accepts — requesting the native value then
+    fails at runtime. Sending an oversized request trips the endpoint's
+    validator, which names the real cap in its 400 body. The model never
+    generates, so this is a single cheap round-trip that also tracks any future
+    increase to the cap.
+
+    :param base_url: Surface base, e.g. ``https://ws/ai-gateway/mlflow/v1``.
+    :param token: Workspace bearer token.
+    :param model_id: Served model id, e.g. ``system.ai.kimi-k3``.
+    :param api_type: ``"openai-responses"`` or ``"openai-completions"`` —
+        selects the request shape and path.
+    :param transport: Optional httpx transport override for tests.
+    :returns: The cap in tokens, or ``None`` when the endpoint accepts the
+        probe (no cap below it) or the limit cannot be read (network/parse
+        failure). ``None`` means "keep the catalog value".
+    """
+    if api_type == "openai-responses":
+        path = "/responses"
+        body: dict[str, object] = {
+            "model": model_id,
+            "input": "cap probe",
+            "max_output_tokens": _PROBE_OUTPUT_TOKENS,
+        }
+    else:
+        path = "/chat/completions"
+        body = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "cap probe"}],
+            "max_tokens": _PROBE_OUTPUT_TOKENS,
+        }
+    try:
+        with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+            resp = client.post(
+                f"{base_url.rstrip('/')}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+                json=body,
+            )
+    except httpx.HTTPError:
+        return None
+    if resp.status_code < 400:
+        return None
+    match = _OUTPUT_CAP_RE.search(resp.text or "")
+    if match is None:
+        return None
+    cap = match.group(1) or match.group(2)
+    return int(cap) if cap else None
 
 
 def _models_url(base_url: str) -> str:

@@ -509,7 +509,12 @@ from omnigent.update_check import (  # noqa: E402
     _read_uv_tool_extras,
     _run_installed_wheel_check,
     _unredact_ssh_userinfo,
+    _uv_python_pin,
 )
+
+# uv upgrade commands pin the interpreter omnigent is running under, so
+# expectations derive the flag instead of hardcoding a python version.
+_UV_PY = _uv_python_pin()
 
 
 @pytest.fixture(autouse=True)
@@ -598,6 +603,7 @@ def _write_fake_dist_info(
     direct_url: dict[str, object] | None = None,
     uv_cache: dict[str, object] | None = None,
     dir_mtime_epoch: float | None = None,
+    version: str = "0.1.0",
 ) -> importlib.metadata.PathDistribution:
     """Build a real ``.dist-info/`` on disk and return a PathDistribution.
 
@@ -619,11 +625,14 @@ def _write_fake_dist_info(
     :param dir_mtime_epoch: When provided, ``os.utime`` is used to
         backdate the dist-info dir's mtime to this Unix timestamp —
         this is the fallback signal when ``uv_cache.json`` is absent.
+    :param version: Installed package version written to ``METADATA``.
     :returns: A ``PathDistribution`` constructed against the dir.
     """
-    dist_info = tmp_path / "omnigent-0.1.0.dist-info"
+    dist_info = tmp_path / f"omnigent-{version}.dist-info"
     dist_info.mkdir()
-    (dist_info / "METADATA").write_text("Metadata-Version: 2.1\nName: omnigent\nVersion: 0.1.0\n")
+    (dist_info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: omnigent\nVersion: {version}\n"
+    )
     if installer is not None:
         (dist_info / "INSTALLER").write_text(installer + "\n")
     if direct_url is not None:
@@ -766,7 +775,7 @@ def test_read_wheel_info_repairs_redacted_ssh_user(
     assert suggestion.runnable is True
     assert (
         suggestion.command
-        == "uv tool install --reinstall git+ssh://git@github.com/omnigent-ai/omnigent.git"
+        == f"uv tool install --reinstall{_UV_PY} git+ssh://git@github.com/omnigent-ai/omnigent.git"
     )
 
 
@@ -863,7 +872,7 @@ def test_read_wheel_info_handles_corrupt_direct_url(
     [
         # uv + git install — recommend ``uv tool install --reinstall``
         # with the original URL so the user pulls a fresh commit.
-        ("uv", _FAKE_GIT_URL, f"uv tool install --reinstall {_FAKE_GIT_URL}", True),
+        ("uv", _FAKE_GIT_URL, f"uv tool install --reinstall{_UV_PY} {_FAKE_GIT_URL}", True),
         # uv + registry install — ``uv tool upgrade`` resolves from the
         # configured index. The user doesn't need to remember the spec.
         ("uv", None, "uv tool upgrade omnigent", True),
@@ -995,6 +1004,30 @@ def test_wheel_check_no_nag_when_up_to_date(
         )
     )
     dist = _write_fake_dist_info(tmp_path, installer="uv")
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+
+    _run_installed_wheel_check()
+
+    assert capsys.readouterr().err == ""
+
+
+def test_wheel_check_no_nag_for_matching_dev_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A dev build from the latest release line is already current."""
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=0,
+            kind="wheel",
+            latest_version="0.9.0",
+        )
+    )
+    dist = _write_fake_dist_info(tmp_path, installer="uv", version="0.9.0.dev0")
     monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
 
     _run_installed_wheel_check()
@@ -1232,6 +1265,15 @@ def test_is_newer_tolerates_garbage() -> None:
 
     assert _is_newer("not-a-version", "0.1.0") is True  # falls back to != and non-empty
     assert _is_newer("", "0.1.0") is False
+
+
+def test_should_notify_release_treats_dev_build_as_current_release() -> None:
+    """Matching finals stay quiet without hiding later release lines."""
+    from omnigent.update_check import _should_notify_release
+
+    assert _should_notify_release("0.9.0", "0.9.0.dev0") is False
+    assert _should_notify_release("0.9.1", "0.9.0.dev0") is True
+    assert _should_notify_release("0.9.0.post1", "0.9.0.dev0") is True
 
 
 class _FakeResp:
@@ -1475,7 +1517,7 @@ def test_build_upgrade_suggestion_allow_prerelease() -> None:
         _build_upgrade_suggestion(
             _info("uv", vcs_url="git+https://x/omnigent.git"), allow_prerelease=True
         ).command
-        == "uv tool install --reinstall git+https://x/omnigent.git --prerelease allow"
+        == f"uv tool install --reinstall{_UV_PY} git+https://x/omnigent.git --prerelease allow"
     )
 
 
@@ -1517,11 +1559,11 @@ def test_build_upgrade_suggestion_preserves_uv_tool_extras() -> None:
     # With extras → reinstall with the PEP 508 spec.
     assert (
         _build_upgrade_suggestion(_make_info("uv", extras=("all",))).command
-        == "uv tool install --reinstall omnigent[all]"
+        == f"uv tool install --reinstall{_UV_PY} omnigent[all]"
     )
     assert (
         _build_upgrade_suggestion(_make_info("uv", extras=("server", "all"))).command
-        == "uv tool install --reinstall omnigent[all,server]"
+        == f"uv tool install --reinstall{_UV_PY} omnigent[all,server]"
     )
 
 
@@ -1529,13 +1571,13 @@ def test_build_upgrade_suggestion_uv_target_version() -> None:
     """A pinned target version produces ``install --reinstall`` with the spec."""
     assert (
         _build_upgrade_suggestion(_make_info("uv"), target_version="0.2.0").command
-        == "uv tool install --reinstall omnigent==0.2.0"
+        == f"uv tool install --reinstall{_UV_PY} omnigent==0.2.0"
     )
     assert (
         _build_upgrade_suggestion(
             _make_info("uv", extras=("all",)), target_version="0.2.0"
         ).command
-        == "uv tool install --reinstall omnigent==0.2.0[all]"
+        == f"uv tool install --reinstall{_UV_PY} omnigent==0.2.0[all]"
     )
 
 
@@ -1545,11 +1587,11 @@ def test_build_upgrade_suggestion_extra_overrides_win() -> None:
         _build_upgrade_suggestion(
             _make_info("uv", extras=("all",)), extra_overrides=("server",)
         ).command
-        == "uv tool install --reinstall omnigent[all,server]"
+        == f"uv tool install --reinstall{_UV_PY} omnigent[all,server]"
     )
     assert (
         _build_upgrade_suggestion(_make_info("uv"), extra_overrides=("all",)).command
-        == "uv tool install --reinstall omnigent[all]"
+        == f"uv tool install --reinstall{_UV_PY} omnigent[all]"
     )
 
 
@@ -1567,11 +1609,11 @@ def test_build_upgrade_suggestion_vcs_preserves_extras() -> None:
     git_url = "git+https://github.com/example-org/omnigent.git"
     assert (
         _build_upgrade_suggestion(_make_info("uv", vcs_url=git_url)).command
-        == f"uv tool install --reinstall {git_url}"
+        == f"uv tool install --reinstall{_UV_PY} {git_url}"
     )
     assert (
         _build_upgrade_suggestion(_make_info("uv", vcs_url=git_url, extras=("all",))).command
-        == f"uv tool install --reinstall {git_url}#egg=omnigent[all]"
+        == f"uv tool install --reinstall{_UV_PY} {git_url}#egg=omnigent[all]"
     )
 
 
@@ -2408,7 +2450,7 @@ def test_cli_upgrade_dry_run_uv_tool_with_extras(
     runner = CliRunner()
     result = runner.invoke(cli, ["upgrade", "--dry-run"])
     assert result.exit_code == 0
-    assert "uv tool install --reinstall omnigent[all]" in result.output
+    assert f"uv tool install --reinstall{_UV_PY} omnigent[all]" in result.output
     assert "Would run:" in result.output
 
 

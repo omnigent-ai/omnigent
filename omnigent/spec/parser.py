@@ -218,6 +218,12 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
             executor.model = llm.model
         if executor.connection is None and llm.connection is not None:
             executor.connection = llm.connection
+        if executor.reasoning_effort is None:
+            llm_effort = llm.extra.get("reasoning_effort")
+            if llm_effort is not None:
+                executor.reasoning_effort = str(llm_effort)
+        elif "reasoning_effort" in llm.extra:
+            llm.extra["reasoning_effort"] = executor.reasoning_effort
     # Ensure spec.llm is populated from executor fields when only the
     # executor: block declares model/connection (the common case for
     # user-authored YAML). Internal consumers (policy builder,
@@ -662,6 +668,8 @@ def _parse_executor(
     )
     raw_model = raw.get("model")
     model: str | None = str(raw_model) if raw_model is not None else None
+    raw_effort = raw.get("reasoning_effort")
+    reasoning_effort: str | None = str(raw_effort) if raw_effort is not None else None
     # Parse ``executor.connection:`` — same shape as ``llm.connection:``
     # (a flat dict of string key-value pairs with optional ${VAR}
     # expansion). Lifted from the ``executor:`` block so connection
@@ -682,6 +690,7 @@ def _parse_executor(
         profile=profile,
         config=config,
         model=model,
+        reasoning_effort=reasoning_effort,
         connection=connection,
         context_window=context_window,
         auth=auth,
@@ -1023,11 +1032,9 @@ def _parse_cwd_allow_hidden(raw: object) -> list[str] | None:
     ``os_env.sandbox``.
 
     Each entry must be a single path component (no ``/``, ``\\``,
-    or ``.`` / ``..`` traversal) so a misconfigured spec can't punch
-    a hole through arbitrary subdirectories of cwd. The bwrap backend
-    looks each entry up in ``cwd.iterdir()`` directly; sanitising
-    here keeps the resolver simple and the failure mode loud at
-    parse time rather than at runtime.
+    or ``.`` / ``..`` traversal). The special entry ``"*"`` explicitly
+    disables dotpath masking for trusted roots while preserving escaping-
+    symlink masking.
 
     :param raw: Raw value from the YAML, e.g. ``[".venv", ".git"]``,
         or ``None`` when the field is absent.
@@ -2138,7 +2145,7 @@ def _parse_skills_filter(raw: object) -> str | list[str]:
     Parse the top-level YAML ``skills:`` field into a host-skill
     filter string or list of names.
 
-    Distinct from the bundle-side ``skills/<name>/SKILL.md`` files
+    Distinct from the bundle-side ``skills/<dir>/SKILL.md`` files
     discovered by :func:`_discover_skills` — that's the agent's own
     bundled skills, always loaded. This filter only controls
     HOST-scope skills that the harness picks up from the user's
@@ -2271,16 +2278,24 @@ def discover_host_skills(
     return skills
 
 
+# How many grouping levels ``_discover_skills`` descends below ``skills/``:
+# ``skills/<namespace>/<skill>/SKILL.md`` is found, deeper nesting is not.
+_SKILL_NAMESPACE_MAX_DEPTH = 1
+
+
 def _discover_skills(
     skills_dir: Path,
     *,
     skipped: list[str] | None = None,
+    _depth: int = 0,
 ) -> list[SkillSpec]:
     """
     Discover and parse all skills under the ``skills/`` directory.
 
     Each subdirectory containing a ``SKILL.md`` file is parsed via
-    :func:`_parse_skill`.
+    :func:`_parse_skill`. A subdirectory without one is a namespace
+    folder and is scanned one level deeper, so
+    ``skills/<namespace>/<skill>/SKILL.md`` is discovered too.
 
     :param skills_dir: Path to the ``skills/`` directory, e.g.
         ``root / "skills"``.
@@ -2291,7 +2306,10 @@ def _discover_skills(
         Pass ``None`` (the default) to fail loud on the first
         error — used for bundled skills that the agent author
         controls.
-    :returns: A sorted list of parsed :class:`SkillSpec` objects.
+    Namespace folders only group skills; they do not alter the skill name
+    declared in ``SKILL.md``.
+
+    :returns: Parsed :class:`SkillSpec` objects in deterministic path order.
         Returns an empty list if *skills_dir* does not exist.
     """
     if not skills_dir.is_dir():
@@ -2309,10 +2327,13 @@ def _discover_skills(
         return []
     skills: list[SkillSpec] = []
     for skill_dir in entries:
-        if not skill_dir.is_dir():
+        if not skill_dir.is_dir() or skill_dir.name.startswith("."):
             continue
         skill_md = skill_dir / "SKILL.md"
         if not skill_md.exists():
+            # Namespace folder: group skills one level deeper.
+            if _depth < _SKILL_NAMESPACE_MAX_DEPTH:
+                skills.extend(_discover_skills(skill_dir, skipped=skipped, _depth=_depth + 1))
             continue
         try:
             skill = _parse_skill(skill_md)
@@ -2356,6 +2377,71 @@ def _falsey_flag(raw: object) -> bool:
     return isinstance(raw, str) and raw.strip().lower() in _FALSEY_STRINGS
 
 
+# The only line recovery rewrites: a top-level ``description:`` whose value
+# starts on the same line. Every other key keeps strict YAML semantics, so a
+# setting like ``user-invocable: false: internal only`` still fails loudly
+# instead of being read as a truthy string.
+_FRONTMATTER_DESCRIPTION_RE = re.compile(r"\Adescription:[ \t]+(?P<value>\S.*)\Z")
+
+# An indented ``key: value`` line is a mis-indented setting, not prose. Folding
+# it into the description would drop the setting it declares.
+_KEY_SHAPED_LINE_RE = re.compile(r"\A[ \t]+[A-Za-z0-9_.-]+:([ \t].*)?\Z")
+
+# Value openers that mean YAML structure (flow collection, block scalar, anchor,
+# alias, tag) or an already-quoted scalar. Quoting these would change what the
+# frontmatter says, so they are left for the strict parse to accept or reject.
+_YAML_VALUE_INDICATORS = ("'", '"', "[", "{", "|", ">", "&", "*", "!", "?", "%", "@", "`")
+
+
+def _quote_description_with_colon(frontmatter_str: str) -> str:
+    """
+    Quote a plain ``description:`` scalar whose value carries a ``": "``.
+
+    Skill authors write prose in ``description:`` and prose contains colons,
+    which YAML reads as a nested mapping and rejects. Claude Code accepts those
+    files, so rejecting them drops a skill the user has installed. Rewriting
+    only that one line and re-parsing keeps every other malformed frontmatter
+    loud: no other key is touched, a value opening a flow collection, block
+    scalar, or quote is left alone, and so is one carrying a `` #`` comment,
+    since quoting any of those would change what the frontmatter says rather
+    than recover it.
+
+    :param frontmatter_str: Raw frontmatter block, e.g.
+        ``"name: x\ndescription: does y: and z\n"``.
+    :returns: The block with a colon-bearing description double-quoted.
+    """
+    lines = frontmatter_str.split("\n")
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        match = _FRONTMATTER_DESCRIPTION_RE.match(line)
+        value = match.group("value").rstrip() if match else ""
+        if (
+            match is None
+            or value.startswith(_YAML_VALUE_INDICATORS)
+            or " #" in value
+            or (": " not in value and not value.endswith(":"))
+        ):
+            out.append(line)
+            continue
+        # A plain scalar folds its indented continuation lines into one value
+        # with single spaces, so absorb a wrapped description. A key-shaped
+        # line ends the run: it is left in place for the re-parse to reject.
+        while (
+            index < len(lines)
+            and lines[index][:1] in (" ", "\t")
+            and lines[index].strip()
+            and not _KEY_SHAPED_LINE_RE.match(lines[index])
+        ):
+            value = f"{value} {lines[index].strip()}"
+            index += 1
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        out.append(f'description: "{escaped}"')
+    return "\n".join(out)
+
+
 def _parse_skill(skill_md: Path) -> SkillSpec:
     """
     Parse a single ``SKILL.md`` file into a :class:`SkillSpec`.
@@ -2393,10 +2479,16 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     try:
         frontmatter = yaml.safe_load(frontmatter_str)
     except yaml.YAMLError as exc:
-        raise OmnigentError(
-            f"SKILL.md has invalid YAML frontmatter: {skill_md}: {exc}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
+        # Retry with colon-bearing prose quoted before giving up, and report
+        # the ORIGINAL error if that still fails so the message names the real
+        # complaint rather than the rewrite's.
+        try:
+            frontmatter = yaml.safe_load(_quote_description_with_colon(frontmatter_str))
+        except yaml.YAMLError:
+            raise OmnigentError(
+                f"SKILL.md has invalid YAML frontmatter: {skill_md}: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
     if not isinstance(frontmatter, dict):
         raise OmnigentError(
             f"SKILL.md frontmatter must be a YAML mapping: {skill_md}",
@@ -2529,8 +2621,8 @@ def _parse_inline_mcp_servers(
         in config.yaml. ``None`` or a non-dict value returns an empty
         list without raising.
     :param expand_env: Whether to expand ``${VAR}`` references in
-        ``headers`` and ``env`` values. ``True`` (default) for
-        deploy/runtime; ``False`` for scaffolding/validation.
+        ``url``, ``headers`` and ``env`` values. ``True`` (default)
+        for deploy/runtime; ``False`` for scaffolding/validation.
     :returns: A list of :class:`MCPServerConfig` objects, one per
         inline MCP entry, in YAML key order.
     """
@@ -2564,6 +2656,8 @@ def _parse_inline_mcp_servers(
                 code=ErrorCode.INVALID_INPUT,
             )
         headers = expand_env_vars(raw_headers) if expand_env and raw_headers else raw_headers
+        if url is not None:
+            url = expand_env_vars({"url": str(url)})["url"] if expand_env else str(url)
         raw_env = val.get("env", {})
         if raw_env and not isinstance(raw_env, dict):
             raise OmnigentError(
@@ -2603,7 +2697,7 @@ def _parse_inline_mcp_servers(
                 description=str(raw_desc)
                 if (raw_desc := val.get("description")) is not None
                 else None,
-                url=str(url) if url is not None else None,
+                url=url if url is not None else None,
                 command=str(command) if command is not None else None,
                 args=args,
                 headers=headers,
@@ -2695,7 +2789,7 @@ def _parse_http_mcp_server(
         ``{"name": "github", "transport": "http", "url": "..."}``.
     :param yaml_file: Path to the source file — used in error messages.
     :param expand_env: Whether to expand ``${VAR}`` references in
-        ``headers``.
+        ``url`` and ``headers``.
     :returns: A fully populated :class:`MCPServerConfig` with
         ``transport == "http"``.
     :raises OmnigentError: If ``url`` is missing or a stdio-only
@@ -2714,6 +2808,9 @@ def _parse_http_mcp_server(
             f"MCP server {name!r} missing required field 'url': {yaml_file}",
             code=ErrorCode.INVALID_INPUT,
         )
+    url_str = str(url)
+    if expand_env:
+        url_str = expand_env_vars({"url": url_str})["url"]
     raw_headers = raw.get("headers", {})
     if not isinstance(raw_headers, dict):
         raise OmnigentError(
@@ -2725,7 +2822,7 @@ def _parse_http_mcp_server(
     return MCPServerConfig(
         name=str(name),
         transport="http",
-        url=str(url),
+        url=url_str,
         headers=expand_env_vars(headers) if expand_env else headers,
         description=str(raw_description) if raw_description is not None else None,
         timeout=(
@@ -2931,7 +3028,12 @@ def _discover_sub_agents(
         config_yaml = agent_dir / "config.yaml"
         if not config_yaml.exists():
             continue
-        sub_agents.append(parse(agent_dir, expand_env=expand_env))
+        sub_spec = parse(agent_dir, expand_env=expand_env)
+        # Provenance for bundle-dir resolution: the directory name, never
+        # the YAML ``name``. A child's skills and local tools live under
+        # ``<parent bundle>/agents/<dir>``, and the two can differ.
+        sub_spec.source_rel_dir = agent_dir.name
+        sub_agents.append(sub_spec)
     return sub_agents
 
 
@@ -3260,6 +3362,30 @@ def _parse_policy_base_fields(
     if is_function:
         # ``on:`` is ignored for function policies — the callable self-selects
         # which events to handle by returning ALLOW for events it doesn't act on.
+        # Silently discarding an authored output-phase binding misleads the
+        # bundle author into believing an output gate is bound when nothing
+        # ever restricts the callable to (or guarantees it sees) that phase —
+        # say so. Scoped to the output phases (``response`` /
+        # ``llm_response``): an unenforced output gate is a policy hole,
+        # while the common ``on: [tool_call]`` annotation is harmless
+        # documentation on a callable that self-filters anyway.
+        raw_on = data.get("on")
+        if isinstance(raw_on, str):
+            entries: list[object] = [raw_on]
+        elif isinstance(raw_on, list):
+            entries = raw_on
+        else:
+            entries = []
+        if any(entry in ("response", "llm_response") for entry in entries):
+            _log.warning(
+                "policy %r: `on: %r` is ignored for type: function policies — "
+                "the callable self-selects which event types it handles at "
+                "runtime. If this policy is meant to gate the assistant's "
+                "output, filter inside the callable instead (e.g. "
+                "make_fixed_action_callable's on_phases=['response']).",
+                name,
+                raw_on,
+            )
         on_value = None
     else:
         on_value = _parse_on(data.get("on", ["request", "response"]), policy_name=name)

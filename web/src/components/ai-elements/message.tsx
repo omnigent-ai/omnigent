@@ -6,7 +6,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
-import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, CopyIcon, WrapTextIcon } from "lucide-react";
+import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
 import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode } from "react";
 import {
   cloneElement,
@@ -22,8 +22,11 @@ import {
 } from "react";
 import { Streamdown, type StreamdownProps } from "streamdown";
 
+import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
+
 import {
   CHAT_LINK_SAFETY,
+  FILE_LINK_STREAMDOWN_REHYPE_PLUGINS,
   SECURE_STREAMDOWN_REHYPE_PLUGINS,
   STREAMDOWN_PLUGINS,
 } from "./streamdown-security";
@@ -35,7 +38,8 @@ export type MessageProps = HTMLAttributes<HTMLDivElement> & {
 export const Message = ({ className, from, ...props }: MessageProps) => (
   <div
     className={cn(
-      "group flex w-full max-w-[95%] flex-col gap-2",
+      // min-w-0 lets this flex item shrink below its content's intrinsic width instead of widening the column.
+      "group flex w-full min-w-0 max-w-[95%] flex-col gap-2",
       from === "user" ? "is-user ml-auto justify-end" : "is-assistant",
       className,
     )}
@@ -293,7 +297,14 @@ export const MessageBranchPage = ({ className, ...props }: MessageBranchPageProp
   );
 };
 
-export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins">;
+export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins"> & {
+  /**
+   * Hand file-path links to the `a` component override instead of letting the
+   * harden pass turn them into app-origin navigations or " [blocked]" text.
+   * Opt-in: only callers that supply that override may set it.
+   */
+  markFileLinks?: boolean;
+};
 
 function getChatCodeControls(controls: StreamdownProps["controls"]): StreamdownProps["controls"] {
   if (typeof controls === "object" && controls !== null) {
@@ -331,12 +342,58 @@ function extractCodeText(children: ReactNode): string {
   return "";
 }
 
-// Shared visual style for the buttons overlaid on a chat code block (copy,
-// wrap toggle). The frosted/ghost look matches the rest of the chat surface;
-// positioning lives on the container in ChatCodeBlockPre, not here, so the
-// buttons stay layout-agnostic.
+// Streamdown ships its own 16px icon set (filled, even-odd fill rule) rather
+// than lucide, so the copy/wrap buttons we overlay on a code block header use
+// the same glyphs as Streamdown's native buttons (e.g. copy/download in a
+// table) instead of lucide look-alikes that render at a different weight. The
+// copy and check paths are reproduced from Streamdown 2.5; Streamdown has no
+// wrap-text icon of its own, so that glyph is drawn to match its style (a
+// 16-viewBox stroke, as Streamdown uses for its own stroked icons). They render
+// through our shared Button, whose `button-standard-icons` rule normalizes them
+// to the standard icon box — the size of Streamdown's own table copy button.
+type CodeHeaderIconProps = ComponentProps<"svg">;
+
+const CodeCopyIcon = (props: CodeHeaderIconProps) => (
+  <svg fill="none" height={16} viewBox="0 0 16 16" width={16} {...props}>
+    <path
+      clipRule="evenodd"
+      d="M2.75 0.5C1.7835 0.5 1 1.2835 1 2.25V9.75C1 10.7165 1.7835 11.5 2.75 11.5H3.75H4.5V10H3.75H2.75C2.61193 10 2.5 9.88807 2.5 9.75V2.25C2.5 2.11193 2.61193 2 2.75 2H8.25C8.38807 2 8.5 2.11193 8.5 2.25V3H10V2.25C10 1.2835 9.2165 0.5 8.25 0.5H2.75ZM7.75 4.5C6.7835 4.5 6 5.2835 6 6.25V13.75C6 14.7165 6.7835 15.5 7.75 15.5H13.25C14.2165 15.5 15 14.7165 15 13.75V6.25C15 5.2835 14.2165 4.5 13.25 4.5H7.75ZM7.5 6.25C7.5 6.11193 7.61193 6 7.75 6H13.25C13.3881 6 13.5 6.11193 13.5 6.25V13.75C13.5 13.8881 13.3881 14 13.25 14H7.75C7.61193 14 7.5 13.8881 7.5 13.75V6.25Z"
+      fill="currentColor"
+      fillRule="evenodd"
+    />
+  </svg>
+);
+
+const CodeCheckIcon = (props: CodeHeaderIconProps) => (
+  <svg fill="none" height={16} viewBox="0 0 16 16" width={16} {...props}>
+    <path
+      clipRule="evenodd"
+      d="M15.5607 3.99999L15.0303 4.53032L6.23744 13.3232C5.55403 14.0066 4.44599 14.0066 3.76257 13.3232L4.2929 12.7929L3.76257 13.3232L0.969676 10.5303L0.439346 9.99999L1.50001 8.93933L2.03034 9.46966L4.82323 12.2626C4.92086 12.3602 5.07915 12.3602 5.17678 12.2626L13.9697 3.46966L14.5 2.93933L15.5607 3.99999Z"
+      fill="currentColor"
+      fillRule="evenodd"
+    />
+  </svg>
+);
+
+const CodeWrapTextIcon = (props: CodeHeaderIconProps) => (
+  <svg fill="none" height={16} viewBox="0 0 16 16" width={16} {...props}>
+    <g stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75}>
+      <path d="M2 4H14" />
+      <path d="M2 8H11A2 2 0 1 1 11 12H8.5" />
+      <path d="M10 10.5 8.5 12 10 13.5" />
+      <path d="M2 12H5.5" />
+    </g>
+  </svg>
+);
+
+// Shared visual style for the buttons in a chat code block header (copy, wrap
+// toggle). Keeps the frosted resting look that matches Streamdown's own button
+// pill, but pins the hover background to that same frosted fill so the ghost
+// variant's grey hover box never appears — on hover only the icon brightens,
+// exactly like Streamdown's built-in buttons (e.g. download). Positioning lives
+// on the container in ChatCodeBlockPre, so the buttons stay layout-agnostic.
 const CODE_BLOCK_OVERLAY_BUTTON_CLASS =
-  "size-8 bg-sidebar/80 text-muted-foreground hover:text-foreground supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur";
+  "size-6 bg-sidebar/80 text-muted-foreground hover:bg-sidebar/80 hover:text-foreground dark:hover:bg-sidebar/80 supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur";
 
 function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
   const [isCopied, setIsCopied] = useState(false);
@@ -368,7 +425,7 @@ function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
     [],
   );
 
-  const Icon = isCopied ? CheckIcon : CopyIcon;
+  const Icon = isCopied ? CodeCheckIcon : CodeCopyIcon;
 
   return (
     <Button
@@ -380,7 +437,7 @@ function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
       type="button"
       variant="ghost"
     >
-      <Icon size={14} />
+      <Icon />
     </Button>
   );
 }
@@ -389,16 +446,17 @@ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: 
   return (
     <Button
       aria-label="Toggle word wrap"
+      // aria-pressed carries the on/off state; the icon stays muted like the
+      // sibling buttons rather than brightening to foreground when active.
       aria-pressed={wrap}
-      // Brighten when active so the pressed state reads at a glance.
-      className={cn(CODE_BLOCK_OVERLAY_BUTTON_CLASS, wrap && "text-foreground")}
+      className={CODE_BLOCK_OVERLAY_BUTTON_CLASS}
       onClick={onToggle}
       size="icon-sm"
       title={wrap ? "Disable word wrap" : "Enable word wrap"}
       type="button"
       variant="ghost"
     >
-      <WrapTextIcon size={14} />
+      <CodeWrapTextIcon />
     </Button>
   );
 }
@@ -419,9 +477,13 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
     <div className={cn("relative", wrap && "chat-code-wrap")}>
       {block}
       {/* Overlay actions, anchored left of Streamdown's own download button
-          (which sits at the header's right edge). A flex row lets the buttons
-          self-arrange, so neither needs a hardcoded horizontal offset. */}
-      <div className="absolute top-2 right-12 z-10 flex items-center gap-1">
+          (which sits at the header's right edge). The py-1 padding plus a 1px
+          transparent top/bottom border match the height of Streamdown's action
+          pill (which has border + py-1) so our buttons land on the same line;
+          the border is y-only so it doesn't add horizontal width that would
+          push the row away from the pill. The -mr-1.5 pull tightens the gap so
+          the row reads as one continuous set of controls. */}
+      <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
         <ChatCodeBlockCopyButton getCode={getCode} />
       </div>
@@ -430,7 +492,7 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
 }
 
 export const MessageResponse = memo(
-  ({ className, components, controls, ...props }: MessageResponseProps) => {
+  ({ className, components, controls, markFileLinks = false, ...props }: MessageResponseProps) => {
     const messageComponents = useMemo(
       () => ({ ...components, pre: ChatCodeBlockPre }),
       [components],
@@ -439,18 +501,26 @@ export const MessageResponse = memo(
     const messageControls = useMemo(() => getChatCodeControls(controls), [controls]);
 
     return (
-      <Streamdown
-        className={cn("size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0", className)}
-        plugins={STREAMDOWN_PLUGINS}
-        // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-        // instead of Streamdown's default "Open external link?" modal.
-        linkSafety={CHAT_LINK_SAFETY}
-        {...props}
-        components={messageComponents}
-        controls={messageControls}
-        // Block remote image fetches that can exfiltrate data through URLs.
-        rehypePlugins={SECURE_STREAMDOWN_REHYPE_PLUGINS}
-      />
+      <MarkdownErrorBoundary source={props.children}>
+        <Streamdown
+          // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+          className={cn(
+            "size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+            className,
+          )}
+          plugins={STREAMDOWN_PLUGINS}
+          // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+          // instead of Streamdown's default "Open external link?" modal.
+          linkSafety={CHAT_LINK_SAFETY}
+          {...props}
+          components={messageComponents}
+          controls={messageControls}
+          // Block remote image fetches that can exfiltrate data through URLs.
+          rehypePlugins={
+            markFileLinks ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS : SECURE_STREAMDOWN_REHYPE_PLUGINS
+          }
+        />
+      </MarkdownErrorBoundary>
     );
   },
 );

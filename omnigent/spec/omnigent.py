@@ -166,7 +166,7 @@ def agent_spec_to_agent_def(spec: AgentSpec) -> AgentDef:
     # ``"inherit"`` sentinel at translation time so it never
     # reaches the forward path as a string.
     # Bundle root: derived from any bundled skill's ``skill_dir``
-    # (each lives at ``<bundle>/skills/<name>/`` per AGENTSPEC.md).
+    # (each lives at ``<bundle>/skills/<dir>/`` per AGENTSPEC.md).
     # Without it the Claude SDK harness can't expose bundled skills
     # via ``--plugin-dir``. ``None`` when the spec has no skills —
     # nothing to expose, nothing to set.
@@ -422,9 +422,7 @@ def _sub_spec_to_agent_tool(sub: AgentSpec) -> AgentTool:
 
     Inverse of :func:`_agent_tool_to_sub_spec`. Reads the sub-spec's
     ``llm.model`` and ``executor.config`` (harness / profile) to
-    reconstruct the omnigent :class:`ExecutorSpec`. Lossy fields
-    (``max_sessions``, ``os_env``, ``pass_history``,
-    ``pass_histories``) are left at omnigent defaults.
+    reconstruct the omnigent :class:`ExecutorSpec`.
 
     :param sub: The nested :class:`AgentSpec` representing a
         sub-agent exposed to the parent as a tool.
@@ -444,6 +442,9 @@ def _sub_spec_to_agent_tool(sub: AgentSpec) -> AgentTool:
         description=sub.description,
         prompt=sub.instructions,
         os_env=sub.os_env,
+        pass_history=sub.pass_history,
+        pass_histories=(list(sub.pass_histories) if sub.pass_histories is not None else None),
+        max_sessions=sub.max_sessions,
         executor=OmniExecutorSpec(
             model=model,
             harness=harness,
@@ -1310,11 +1311,6 @@ def _agent_tool_to_sub_spec(
     :class:`AgentSpec` with ``executor.type == "omnigent"`` so the
     :class:`OmnigentExecutor` runs it when spawned.
 
-    Lossy fields (not modeled on Omnigent' AgentSpec yet):
-    ``max_sessions``, ``pass_history``, ``pass_histories``.
-    omnigent' runtime falls back to its defaults for these on
-    the reverse trip.
-
     :param tool_name: The YAML key under which this AgentTool is
         declared on the parent, e.g. ``"claude_worker"``.
     :param tool: The parsed omnigent :class:`AgentTool`.
@@ -1420,6 +1416,9 @@ def _agent_tool_to_sub_spec(
             parent_harness=parent_harness,
         ),
         os_env=sub_os_env,
+        pass_history=tool.pass_history,
+        pass_histories=(list(tool.pass_histories) if tool.pass_histories is not None else None),
+        max_sessions=tool.max_sessions,
         terminals=sub_terminals,
         sub_agents=child_sub_agents,
         local_tools=child_local_tools,
@@ -1670,10 +1669,9 @@ def _translate_executor_from_def(
         of the supported set so an empty string fails
         hard there.
     :param raw_executor: Optional raw YAML ``executor:`` mapping.
-        When present, ``use_responses`` (``bool | None``) is read
-        from it and forwarded into ``executor.config["use_responses"]``
-        so the openai-agents harness subprocess reads the correct
-        API surface (chat/completions vs. responses). The omnigent
+        When present, OpenAI Agents SDK wire settings are forwarded
+        into ``executor.config`` so the harness subprocess reads the
+        correct API surface and reasoning replay policy. The omnigent
         loader silently drops unknown fields on its own
         :class:`~omnigent.inner.datamodel.ExecutorSpec`, so we
         have to recover this field from the raw dict here.
@@ -1697,7 +1695,16 @@ def _translate_executor_from_def(
     harness = oa_executor.harness if oa_executor is not None else None
     if harness is None:
         harness = ""
-    harness = canonicalize_harness(harness) or ""
+    # A namespaced generic-ACP id (``acp:<slug>``) canonicalizes to the base
+    # ``acp`` harness, but the slug is what selects which user-configured ACP
+    # agent to spawn — ``_build_acp_spawn_env`` reads it back off
+    # ``config["harness"]`` at spawn time (see the dispatch note in
+    # ``runner/app.py``). Canonicalizing it away here silently spawned the first
+    # configured agent instead of the requested one, so keep the full id for
+    # ``acp:`` and canonicalize everything else (so aliases still resolve).
+    # Mirrors ``_materialize_harness_launcher_file`` in ``omnigent/cli.py``.
+    _canonical_harness = canonicalize_harness(harness) or ""
+    harness = harness if _canonical_harness == "acp" and ":" in harness else _canonical_harness
     profile = oa_executor.profile if oa_executor is not None else None
     if profile is None:
         profile = ""
@@ -1740,9 +1747,8 @@ def _translate_executor_from_def(
         "harness": harness,
         "profile": profile,
     }
-    # ``use_responses`` and ``acp_agent`` are not fields on the omnigent inner
-    # ExecutorSpec (the loader drops unknown keys), so read them from the raw
-    # YAML dict and carry them forward explicitly.
+    # These are not fields on the omnigent inner ExecutorSpec, so read them
+    # from the raw YAML dict and carry them forward explicitly.
     # The openai-agents harness spawn-env builder reads
     # ``spec.executor.config["use_responses"]`` to set
     # ``HARNESS_OPENAI_AGENTS_USE_RESPONSES``, which controls
@@ -1752,6 +1758,8 @@ def _translate_executor_from_def(
         use_responses_raw = raw_executor.get("use_responses")
         if use_responses_raw is not None:
             config["use_responses"] = bool(use_responses_raw)
+        if "reasoning_item_id_policy" in raw_executor:
+            config["reasoning_item_id_policy"] = raw_executor["reasoning_item_id_policy"]
         if "acp_agent" in raw_executor:
             config["acp_agent"] = raw_executor["acp_agent"]
     # ``auth`` is now parsed by the loader into OmniExecutorSpec.auth;

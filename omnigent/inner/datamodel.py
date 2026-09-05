@@ -577,6 +577,9 @@ class OSEnvSandboxSpec:
     # Matching is by basename, so an entry ``".venv"`` allows
     # ``cwd/.venv``,
     # ``cwd/services/api/.venv``, and ``<read_path>/.venv`` alike.
+    # The explicit entry ``"*"`` allows every dotpath while the
+    # escaping-symlink defense remains active. Use it only for trusted
+    # roots whose hidden files must persist across helper invocations.
     # ``None`` means "use the backend's documented default" (both
     # bwrap and seatbelt expand ``None`` to ``[".venv"]`` so a
     # typical Python project keeps working out of the box). An empty
@@ -803,13 +806,6 @@ class TerminalEnvSpec:
         into ``no server running``. Opt-in because it changes the
         ``has-session``-means-alive contract; enabled for the claude-native
         agent terminal (#540), whose liveness is decided by ``#{pane_dead}``.
-    :param terminal_transport: How the web UI attaches to this terminal:
-        ``"control"`` (``tmux -C`` control mode, giving the browser xterm
-        native scrollback + selection — the default) or ``"pty"`` (the legacy
-        forked-``tmux attach`` PTY stream). ``None`` defers to the global
-        default, which is control mode unless ``terminal.transport`` in
-        ``~/.omnigent/config.yaml`` opts out to ``pty``. A per-attach
-        ``?transport=`` query overrides both.
     """
 
     command: str | None = None
@@ -826,7 +822,6 @@ class TerminalEnvSpec:
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
     keep_alive_after_exit: bool = False
-    terminal_transport: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -886,7 +881,7 @@ class AgentDef:
     terminals: dict[str, TerminalEnvSpec] = field(default_factory=dict)
     skills: SkillRegistry = field(default_factory=dict)
     # Materialized agent-bundle root on disk, when known. Used by
-    # the Claude SDK harness to expose ``<bundle>/skills/<name>/
+    # the Claude SDK harness to expose ``<bundle>/skills/<dir>/
     # SKILL.md`` files as plugin skills via the SDK's
     # ``--plugin-dir`` mechanism. Set by the AgentSpec → AgentDef
     # bridge from the spec's parsed ``skill_dir`` paths; left
