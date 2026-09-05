@@ -347,7 +347,7 @@ class _RunnerDatabricksAuth(httpx.Auth):
                         request.headers["Authorization"] = f"Bearer {token}"
                         yield request
                     return
-                raise httpx.RequestError("Databricks token refresh returned no token")
+                raise httpx.RequestError(_no_token_error_message(self._server_url))
             request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
         if self._factory is None:
@@ -358,6 +358,27 @@ class _RunnerDatabricksAuth(httpx.Auth):
             if token:
                 request.headers["Authorization"] = f"Bearer {token}"
                 yield request
+
+
+def _no_token_error_message(server_url: str | None) -> str:
+    """Describe why the auth factory produced no token.
+
+    An expired stored login is the accounts/OIDC failure mode; blaming
+    Databricks there hides the actual remedy. Only deployments with no
+    (or a Databricks pointer) record get the Databricks wording.
+
+    :param server_url: Omnigent server URL keying the stored login record.
+    :returns: An operator-actionable error message.
+    """
+    if server_url:
+        from omnigent.cli_auth import stored_token_status
+
+        if stored_token_status(server_url) == "expired":
+            return (
+                f"Omnigent login for {server_url} has expired; run "
+                f"`omnigent login {server_url}` to re-authenticate"
+            )
+    return "Databricks token refresh returned no token"
 
 
 def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
@@ -726,6 +747,18 @@ def _make_auth_token_factory(
             still_valid = load_token(resolved_server_url)
             if still_valid:
                 return still_valid
+            # An expired accounts/OIDC token record means this server
+            # authenticates by login session, not Databricks. Falling
+            # through would mint a Databricks credential the server cannot
+            # accept and surface a misleading "Databricks token refresh"
+            # error; report "no credential" so callers name the real
+            # remedy (re-run `omnigent login`). Databricks pointer records
+            # hold no token and classify as "absent", so they still reach
+            # the SDK path below.
+            from omnigent.cli_auth import stored_token_status
+
+            if stored_token_status(resolved_server_url) == "expired":
+                return None
         return _sdk_token()
 
     # Probe once to check if a user credential is available.
