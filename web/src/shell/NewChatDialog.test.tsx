@@ -101,6 +101,12 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
 }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
+  useHostFilesystemRoots: vi.fn(() => ({
+    data: undefined,
+    isLoading: false,
+    isPlaceholderData: false,
+    error: null,
+  })),
   // WorkspacePicker (rendered by the file browser) reads this on mount;
   // an idle mutation keeps it inert for these tests.
   useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
@@ -301,6 +307,12 @@ describe("isValidWorkspace", () => {
     expect(isValidWorkspace("/")).toBe(true);
   });
 
+  it("accepts Windows drive and UNC absolute paths", () => {
+    expect(isValidWorkspace("D:\\Projects")).toBe(true);
+    expect(isValidWorkspace("E:/Projects/Omnigent")).toBe(true);
+    expect(isValidWorkspace("\\\\server\\share\\repo")).toBe(true);
+  });
+
   it("trims whitespace before checking", () => {
     // Browsers paste with stray whitespace; trim must run before
     // the shape check or "  /Users/corey  " would be rejected.
@@ -348,6 +360,11 @@ describe("normalizeWorkspacePath", () => {
     // Root is preserved, not collapsed away.
     ["/", "/"],
     ["///", "/"],
+    ["D:\\Projects\\", "D:\\Projects"],
+    ["E:/Projects/Omnigent/", "E:/Projects/Omnigent"],
+    ["C:\\", "C:\\"],
+    // On POSIX a backslash is a legal filename character, not a separator.
+    ["/tmp/repo\\", "/tmp/repo\\"],
     // Blank → null (no path) — must NOT become "/", or an empty input would
     // spuriously match a session whose workspace is the root.
     ["", null],
@@ -531,6 +548,10 @@ describe("deriveHomeDir", () => {
     // A home directly under root (e.g. "/root") yields "/" — not "" — so the
     // seeded value is still a valid absolute path.
     expect(deriveHomeDir([fsEntry("/etc")])).toBe("/");
+  });
+
+  it("returns the Windows home directory from a native entry path", () => {
+    expect(deriveHomeDir([fsEntry("C:\\Users\\corey\\Desktop")])).toBe("C:\\Users\\corey");
   });
 
   it("returns null for an empty listing", () => {
@@ -1660,6 +1681,43 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it("keeps the recent path as the new-session default when the Host has a pinned shortcut", async () => {
+    mockHosts([
+      {
+        ...host("online"),
+        default_workspace: "D:\\Projects",
+      },
+    ]);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+  });
+
+  it("opens the footer CWD picker with the selected Host's pinned shortcut", async () => {
+    mockHosts([
+      {
+        ...host("online"),
+        default_workspace: "/Users/corey/Projects",
+      },
+    ]);
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+
+    expect(screen.getByTestId("workspace-picker-default")).toHaveAttribute(
+      "aria-label",
+      "Pin this folder for quick access on machine-1. New sessions remember the last working folder.",
+    );
+    expect(screen.getByTestId("workspace-picker-open-pinned")).toHaveAttribute(
+      "aria-label",
+      "Open pinned folder: /Users/corey/Projects",
+    );
+  });
+
   it("falls back to the host's home directory when there is no recent", async () => {
     // No recents for this host → the field seeds from the home listing
     // (parent of the first entry), so a first-ever session is still one click.
@@ -2538,8 +2596,9 @@ describe("NewChatLandingScreen", () => {
     // The sandbox option is pinned FIRST in the menu, above the host list —
     // DOCUMENT_POSITION_FOLLOWING means the host item comes after it.
     const sandboxOption = screen.getByTestId("new-chat-landing-sandbox-option");
+    const thisMachineLabel = displayNameForHost(host("online"), "host_1", navigator.userAgent);
     const hostItem = screen
-      .getAllByText("This machine")
+      .getAllByText(thisMachineLabel)
       .find((el) => el.closest('[role="menuitem"]') !== null);
     expect(hostItem).toBeTruthy();
     expect(
@@ -2550,7 +2609,7 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(hostItem!);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
+        thisMachineLabel,
       ),
     );
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
@@ -3812,14 +3871,15 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    const thisMachineLabel = displayNameForHost(host("online"), "host_1", navigator.userAgent);
     const hostItem = screen
-      .getAllByText("This machine")
+      .getAllByText(thisMachineLabel)
       .find((el) => el.closest('[role="menuitem"]') !== null);
     expect(hostItem).toBeTruthy();
     fireEvent.click(hostItem!);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
+        thisMachineLabel,
       ),
     );
     // With no custom agents yet, the create item is a top-level row (no
@@ -3839,13 +3899,14 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    const thisMachineLabel = displayNameForHost(host("online"), "host_1", navigator.userAgent);
     const hostItem = screen
-      .getAllByText("This machine")
+      .getAllByText(thisMachineLabel)
       .find((el) => el.closest('[role="menuitem"]') !== null);
     fireEvent.click(hostItem!);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
+        thisMachineLabel,
       ),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });

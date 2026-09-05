@@ -34,7 +34,27 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
 def test_single_alembic_head() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["gb1b2c3d4e5f"], f"expected a single head, got {heads!r}"
+    assert heads == ["c84d6f7a91b2"], f"expected a single head, got {heads!r}"
+
+
+def test_upgrade_from_current_head_applies_host_workspace(tmp_path: Path) -> None:
+    """A database at the prior upstream head applies the Host preference."""
+    uri = f"sqlite:///{tmp_path / 'from-connections.db'}"
+    engine = sa.create_engine(uri)
+
+    _upgrade(uri, engine, "gb1b2c3d4e5f")
+    assert "default_workspace" not in {
+        column["name"] for column in sa.inspect(engine).get_columns("hosts")
+    }
+
+    _upgrade(uri, engine, "head")
+    assert "default_workspace" in {
+        column["name"] for column in sa.inspect(engine).get_columns("hosts")
+    }
+    assert "connections" in sa.inspect(engine).get_table_names()
+
+    engine.dispose()
+    clear_engine_cache()
 
 
 def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:

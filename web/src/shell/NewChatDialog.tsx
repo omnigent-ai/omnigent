@@ -106,7 +106,13 @@ import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
-import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import {
+  HostWorkspacePicker,
+  basename,
+  isAbsoluteHostPath,
+  isNavigablePath,
+  parentOf,
+} from "./WorkspacePicker";
 import {
   initialPrefillState,
   prefillDone,
@@ -441,7 +447,7 @@ export function ConnectHostInstructions({
  * Return true when ``workspace`` is acceptable to send to the backend.
  *
  * Per designs/SESSION_WORKSPACE_SELECTION.md: only fully-absolute
- * paths (starting with ``/``) are accepted. Tilde-prefixed and
+ * POSIX or Windows paths are accepted. Tilde-prefixed and
  * relative paths are rejected because the server never expands ``~``
  * — that's the host's job, and the workspace request body must be
  * an unambiguous absolute path. Empty / whitespace-only input is
@@ -449,10 +455,10 @@ export function ConnectHostInstructions({
  * has typed something usable.
  *
  * @param workspace Value the user typed in the workspace input.
- * @returns true when ``workspace.trim()`` starts with ``/``.
+ * @returns true when ``workspace.trim()`` is absolute for the target host.
  */
 export function isValidWorkspace(workspace: string): boolean {
-  return workspace.trim().startsWith("/");
+  return isAbsoluteHostPath(workspace.trim());
 }
 
 /**
@@ -470,7 +476,16 @@ export function isValidWorkspace(workspace: string): boolean {
 export function normalizeWorkspacePath(path: string): string | null {
   const trimmed = path.trim();
   if (trimmed === "") return null;
-  const stripped = trimmed.replace(/\/+$/, "");
+  if (/^[A-Za-z]:[\\/]+$/.test(trimmed)) {
+    return `${trimmed.slice(0, 2)}\\`;
+  }
+  // A backslash is a separator only for drive-letter and UNC paths. POSIX
+  // filenames may legally contain it, so stripping it there conflates two
+  // distinct directories in occupancy and worktree comparisons.
+  const stripped =
+    /^[A-Za-z]:[\\/]/.test(trimmed) || trimmed.startsWith("\\\\")
+      ? trimmed.replace(/[\\/]+$/, "")
+      : trimmed.replace(/\/+$/, "");
   // All-slashes input (e.g. "///") collapses to the root.
   return stripped === "" ? "/" : stripped;
 }
@@ -1011,9 +1026,7 @@ export function matchSkillInvocation(
 export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
   const first = entries[0];
   if (!first) return null;
-  const slash = first.path.lastIndexOf("/");
-  if (slash < 0) return null;
-  return slash === 0 ? "/" : first.path.slice(0, slash);
+  return parentOf(first.path);
 }
 
 /**
@@ -3964,9 +3977,7 @@ export function NewChatLandingScreen() {
             : null;
 
   // Chip display labels.
-  const workspaceLabel = workspaceTrimmed
-    ? (workspaceTrimmed.split("/").filter(Boolean).pop() ?? workspaceTrimmed)
-    : "Working directory";
+  const workspaceLabel = workspaceTrimmed ? basename(workspaceTrimmed) : "Working directory";
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
     sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel;
@@ -5598,7 +5609,7 @@ export function NewChatLandingScreen() {
                   narrow screen; desktop still gets the full width. */}
                   <PopoverContent align="start" className="w-[min(420px,calc(100vw-2rem))] p-0">
                     {selectedHostId ? (
-                      <WorkspacePicker
+                      <HostWorkspacePicker
                         hostId={selectedHostId}
                         initialPath={
                           isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined

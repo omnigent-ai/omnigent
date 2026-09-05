@@ -7947,6 +7947,27 @@
         "title": "UpdateDefaultPolicyRequest",
         "type": "object"
       },
+      "UpdateHostRequest": {
+        "description": "Mutable user preference fields for a registered host.",
+        "properties": {
+          "default_workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Workspace"
+          }
+        },
+        "required": [
+          "default_workspace"
+        ],
+        "title": "UpdateHostRequest",
+        "type": "object"
+      },
       "UpdateProjectRequest": {
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/projects/{project_id}`.\n\nAll fields optional; `None` leaves a field unchanged.",
@@ -9052,6 +9073,59 @@
         "tags": [
           "hosts"
         ]
+      },
+      "patch": {
+        "description": "Set or clear user-owned preferences for one physical host.",
+        "operationId": "update_host_v1_hosts__host_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateHostRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Host V1 Hosts  Host Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Host",
+        "tags": [
+          "hosts"
+        ]
       }
     },
     "/v1/hosts/{host_id}/credentials/detected": {
@@ -9228,7 +9302,7 @@
     },
     "/v1/hosts/{host_id}/filesystem": {
       "get": {
-        "description": "List the contents of the host daemon's home directory.\n\nEmpty trailing path \u2192 forward `~` to the host (the host\nexpands against its own process owner). Used by the\nWeb UI's directory picker to show the \"root\" view.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...], \"has_more\": bool}` mirroring the existing session-scoped filesystem endpoint shape.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline, 504 on host timeout, 502 on host I/O failure.",
+        "description": "List the contents of a directory on the host daemon.\n\nWith neither query argument, forwards `~` so the Host expands its\nprocess owner's home. `path` preserves a host-native absolute path;\n`roots=true` asks a capable Host to enumerate platform roots (Windows\ndrives or POSIX `/`).\n\n**Returns:** `{\"object\": \"list\", \"data\": [...], \"has_more\": bool}` mirroring the existing session-scoped filesystem endpoint shape.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline, 504 on host timeout, 502 on host I/O failure.",
         "operationId": "list_host_filesystem_root_v1_hosts__host_id__filesystem_get",
         "parameters": [
           {
@@ -9239,6 +9313,34 @@
             "schema": {
               "title": "Host Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "Optional exact Host-native directory path.",
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Path"
+            }
+          },
+          {
+            "description": "Whether to enumerate platform filesystem roots.",
+            "in": "query",
+            "name": "roots",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Roots",
+              "type": "boolean"
             }
           },
           {
@@ -9335,7 +9437,7 @@
             }
           },
           {
-            "description": "Absolute path on the host (e.g. `\"/Users/corey/universe\"`) OR a tilde-prefixed path (`\"~/foo\"`). The host expands `~` itself. FastAPI's `:path` converter strips the leading `/` from the URL, so we re-add it for absolute paths.",
+            "description": "Optional absolute path on the Host (for example `\"/Users/corey/universe\"`) or a tilde-prefixed path (`\"~/foo\"`). The Host expands `~` itself. FastAPI's `:path` converter strips the leading `/` from the URL, so we re-add it for absolute paths.",
             "in": "path",
             "name": "path",
             "required": true,

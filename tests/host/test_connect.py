@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import errno
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -2339,6 +2340,21 @@ def test_build_runner_env_propagates_disable_keyring() -> None:
 
 
 # ── host.list_dir handler ───────────────────────────────
+
+
+def test_handle_list_dir_empty_path_returns_windows_drives(monkeypatch) -> None:
+    """An empty list_dir path is the cross-platform filesystem-roots request."""
+    host = _make_host_process()
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(os, "listdrives", lambda: ["C:\\", "D:\\"], raising=False)
+
+    result = host._handle_list_dir(HostListDirFrame(request_id="roots", path=""))
+
+    assert result.status == "ok"
+    assert [(entry.name, entry.path) for entry in result.entries] == [
+        ("C:\\", "C:\\"),
+        ("D:\\", "D:\\"),
+    ]
 
 
 def test_handle_list_dir_returns_sorted_entries(tmp_path: Path) -> None:

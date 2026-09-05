@@ -59,6 +59,7 @@ def _make_hello(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
     gateway_inference: dict[str, bool] | None = None,
+    filesystem_roots: bool = False,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -78,6 +79,7 @@ def _make_hello(
             name=name,
             configured_harnesses=configured_harnesses,
             gateway_inference=gateway_inference,
+            filesystem_roots=filesystem_roots,
         )
     )
 
@@ -140,6 +142,7 @@ async def _connect_host(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
     gateway_inference: dict[str, bool] | None = None,
+    filesystem_roots: bool = False,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -162,7 +165,12 @@ async def _connect_host(
     await comm.send_input(
         {
             "type": "websocket.receive",
-            "text": _make_hello(name, configured_harnesses, gateway_inference),
+            "text": _make_hello(
+                name,
+                configured_harnesses,
+                gateway_inference,
+                filesystem_roots,
+            ),
         },
     )
     while registry.get(host_id) is None:
@@ -282,6 +290,79 @@ async def test_get_host_returns_details(
     assert data["sandbox_provider"] is None
 
 
+async def test_patch_host_default_workspace_persists_and_surfaces(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    app, registry, _host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        patched = await client.patch(
+            f"/v1/hosts/{_HOST_ID}",
+            json={"default_workspace": "D:\\Projects"},
+        )
+        listed = await client.get("/v1/hosts")
+
+    assert patched.status_code == 200
+    assert patched.json()["default_workspace"] == "D:\\Projects"
+    assert listed.json()["hosts"][0]["default_workspace"] == "D:\\Projects"
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        missing = await client.patch(f"/v1/hosts/{_HOST_ID}", json={})
+        cleared = await client.patch(f"/v1/hosts/{_HOST_ID}", json={"default_workspace": None})
+    assert missing.status_code == 422
+    assert cleared.status_code == 200
+    assert cleared.json()["default_workspace"] is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["relative/path", "~", "\\\\", "\\\\server", "ä:\\folder", "bad\x00path", "/" + "a" * 2048],
+)
+async def test_patch_host_default_workspace_rejects_invalid_paths(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    value: str,
+) -> None:
+    app, registry, _host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(f"/v1/hosts/{_HOST_ID}", json={"default_workspace": value})
+
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize("value", ["\\\\server\\share", "/tmp/project "])
+async def test_patch_host_default_workspace_preserves_valid_native_paths(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    value: str,
+) -> None:
+    app, registry, _host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(f"/v1/hosts/{_HOST_ID}", json={"default_workspace": value})
+
+    assert response.status_code == 200
+    assert response.json()["default_workspace"] == value
+
+
+async def test_patch_host_default_workspace_reports_concurrent_owner_change(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, registry, host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+    monkeypatch.setattr(host_store, "set_default_workspace", lambda *args, **kwargs: None)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(
+            f"/v1/hosts/{_HOST_ID}", json={"default_workspace": "D:\\Projects"}
+        )
+
+    assert response.status_code == 409
+
+
 async def test_hosts_api_surfaces_configured_harnesses(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
@@ -335,6 +416,36 @@ async def test_hosts_api_configured_harnesses_null_for_older_host(
 
     assert resp.status_code == 200
     assert resp.json()["hosts"][0]["configured_harnesses"] is None
+
+
+async def test_hosts_api_gates_filesystem_roots_on_host_capability(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """Only a Host that advertises root enumeration exposes the UI capability."""
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(app, registry, filesystem_roots=True)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.json()["hosts"][0]["filesystem_roots"] is True
+    assert single.json()["filesystem_roots"] is True
+
+
+async def test_hosts_api_hides_filesystem_roots_for_older_host(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """An older Host omits the hello field and keeps the legacy picker flow."""
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.json()["hosts"][0]["filesystem_roots"] is False
+    assert single.json()["filesystem_roots"] is False
 
 
 async def test_hosts_api_surfaces_gateway_inference(
@@ -909,6 +1020,27 @@ async def test_get_host_403_wrong_owner(
         f"Expected 403 for wrong owner, got {resp.status_code}. "
         "Owner check on GET /v1/hosts/{{id}} is missing."
     )
+
+
+async def test_patch_host_default_workspace_403_wrong_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A user cannot change another user's pinned folder shortcut."""
+    app, _registry, host_store, _cs = multi_user_app
+    host_id = "6a4670481346725470e480959336424b"
+    host_store.upsert_on_connect(host_id, "alice-laptop", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(
+            f"/v1/hosts/{host_id}",
+            headers={"x-test-user": "bob@test.com"},
+            json={"default_workspace": "D:\\Bob"},
+        )
+
+    assert response.status_code == 403
+    stored = host_store.get_host(host_id)
+    assert stored is not None
+    assert stored.default_workspace is None
 
 
 async def test_launch_runner_403_wrong_owner(

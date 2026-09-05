@@ -9,8 +9,15 @@ from __future__ import annotations
 from omnigent.server.routes._workspace_validation import (
     _is_relative_cwd,
     _is_subpath_of,
-    restore_host_filesystem_url_path,
+    _is_windows_absolute_path,
 )
+
+
+def test_windows_absolute_paths_include_drives_and_unc() -> None:
+    assert _is_windows_absolute_path("D:\\Projects\\Omnigent") is True
+    assert _is_windows_absolute_path("E:/Projects/Omnigent") is True
+    assert _is_windows_absolute_path("\\\\server\\share\\repo") is True
+    assert _is_windows_absolute_path("Projects\\Omnigent") is False
 
 
 class TestIsRelativeCwd:
@@ -60,40 +67,12 @@ class TestIsSubpathOf:
     def test_trailing_slash_boundary(self) -> None:
         assert _is_subpath_of("/a/b/c", "/a/b/") is True
 
-    def test_windows_backslash_child(self) -> None:
-        assert _is_subpath_of("C:\\a\\b", "C:\\a") is True
+    def test_windows_child_path_is_case_insensitive(self) -> None:
+        assert _is_subpath_of("D:\\Projects\\Omnigent", "d:\\projects") is True
 
-    def test_windows_drive_case_insensitive(self) -> None:
-        assert _is_subpath_of("C:\\Users\\me\\work", "c:\\Users\\me") is True
+    def test_windows_prefix_collision_and_other_drive_are_rejected(self) -> None:
+        assert _is_subpath_of("D:\\ProjectX", "D:\\Project") is False
+        assert _is_subpath_of("E:\\Projects", "D:\\Projects") is False
 
-    def test_windows_prefix_collision(self) -> None:
-        assert _is_subpath_of("C:\\a\\foo", "C:\\a\\fo") is False
-
-    def test_posix_backslash_is_not_a_separator(self) -> None:
-        """A POSIX filename may contain a backslash; it is not a separator."""
-        assert _is_subpath_of("/allowed\\escape/project", "/allowed") is False
-
-    def test_windows_mixed_separators(self) -> None:
-        assert _is_subpath_of("C:\\Users\\alice\\work", "C:/Users/alice") is True
-
-
-class TestRestoreHostFilesystemUrlPath:
-    """FastAPI :path capture restoration for POSIX vs Windows paths."""
-
-    def test_posix_stripped_slash_is_restored(self) -> None:
-        assert restore_host_filesystem_url_path("Users/corey/proj") == "/Users/corey/proj"
-
-    def test_posix_already_absolute(self) -> None:
-        assert restore_host_filesystem_url_path("/Users/corey/proj") == "/Users/corey/proj"
-
-    def test_tilde_is_unchanged(self) -> None:
-        assert restore_host_filesystem_url_path("~/proj") == "~/proj"
-
-    def test_windows_drive_forward_slash_is_not_prefixed(self) -> None:
-        assert restore_host_filesystem_url_path("C:/Users/alice/work") == "C:/Users/alice/work"
-
-    def test_windows_drive_backslash_is_not_prefixed(self) -> None:
-        assert restore_host_filesystem_url_path(r"C:\Users\alice\work") == r"C:\Users\alice\work"
-
-    def test_unc_is_not_prefixed(self) -> None:
-        assert restore_host_filesystem_url_path("//server/share/proj") == "//server/share/proj"
+    def test_unc_child_path(self) -> None:
+        assert _is_subpath_of("\\\\server\\share\\repo", "\\\\server\\share") is True

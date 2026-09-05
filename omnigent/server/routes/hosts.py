@@ -421,6 +421,14 @@ class CreateDirectoryRequest(BaseModel):
     path: str
 
 
+class UpdateHostRequest(BaseModel):
+    """Mutable user preference fields for a registered host."""
+
+    # Required but nullable: explicit null clears it; an empty or misspelled
+    # PATCH body must not silently erase an existing preference.
+    default_workspace: str | None
+
+
 class StoreHarnessCredentialRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{id}/harnesses/{harness}/credential``.
 
@@ -590,6 +598,7 @@ def create_hosts_router(
         now = now_epoch()
         result: list[dict[str, Any]] = []
         for host in hosts:
+            live_connection = host_registry.get(host.host_id)
             # Status comes from the DB, not host_registry. The registry
             # is per-replica; if a host is connected to replica B and
             # this request lands on replica A, A's registry won't know
@@ -612,6 +621,13 @@ def create_hosts_router(
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
+                    "default_workspace": host.default_workspace,
+                    # Root enumeration was added after the original filesystem
+                    # RPC. Missing/remote-replica hello metadata fails closed so
+                    # the web picker keeps its existing home/path flow.
+                    "filesystem_roots": bool(
+                        live_connection and live_connection.hello.filesystem_roots
+                    ),
                     # Held in memory from the host's connect handshake, not the
                     # hosts row. ``None`` means this replica has no report yet —
                     # emitted as-is so a client can tell "unknown" from "not
@@ -656,10 +672,49 @@ def create_hosts_router(
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
+            "default_workspace": host.default_workspace,
+            "filesystem_roots": bool(
+                (live_connection := host_registry.get(host.host_id))
+                and live_connection.hello.filesystem_roots
+            ),
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "runners": [],
+        }
+
+    @router.patch("/hosts/{host_id}")
+    async def update_host(
+        request: Request, host_id: str, body: UpdateHostRequest
+    ) -> dict[str, Any]:
+        """Set or clear user-owned preferences for one physical host."""
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        value = body.default_workspace
+        if value is not None:
+            if value == "":
+                value = None
+            elif len(value) > 2048 or "\x00" in value:
+                raise HTTPException(status_code=400, detail="invalid default workspace")
+            elif not (value.startswith("/") or _is_windows_absolute_path(value)):
+                raise HTTPException(status_code=400, detail="default workspace must be absolute")
+
+        updated = await asyncio.to_thread(
+            host_store.set_default_workspace,
+            host_id,
+            value,
+            expected_user_id=host.user_id,
+        )
+        if updated is None:
+            raise HTTPException(status_code=409, detail="host ownership changed while updating")
+        return {
+            "host_id": updated.host_id,
+            "default_workspace": updated.default_workspace,
         }
 
     @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
@@ -1003,20 +1058,25 @@ def create_hosts_router(
     async def list_host_filesystem_root(
         request: Request,
         host_id: str,
+        path: str | None = Query(default=None),
+        roots: bool = Query(default=False),
         limit: int = Query(default=_LIST_DIR_DEFAULT_LIMIT, ge=1, le=_LIST_DIR_MAX_LIMIT),
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
     ) -> dict[str, Any]:
         """
-        List the contents of the host daemon's home directory.
+        List the contents of a directory on the host daemon.
 
-        Empty trailing path → forward ``~`` to the host (the host
-        expands against its own process owner). Used by the
-        Web UI's directory picker to show the "root" view.
+        With neither query argument, forwards ``~`` so the Host expands its
+        process owner's home. ``path`` preserves a host-native absolute path;
+        ``roots=true`` asks a capable Host to enumerate platform roots (Windows
+        drives or POSIX ``/``).
 
         :param request: FastAPI request (for auth).
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param path: Optional exact Host-native directory path.
+        :param roots: Whether to enumerate platform filesystem roots.
         :param limit: Max entries per page.
         :param after: Optional forward pagination cursor (entry
             path), e.g. ``"/Users/corey/projects/m"``.
@@ -1031,7 +1091,7 @@ def create_hosts_router(
         return await _list_host_filesystem(
             request=request,
             host_id=host_id,
-            path="~",
+            path="" if roots else (path if path else "~"),
             limit=limit,
             after=after,
             before=before,
@@ -1059,9 +1119,9 @@ def create_hosts_router(
 
         :param request: FastAPI request (for auth).
         :param host_id: Host identifier.
-        :param path: Absolute path on the host (e.g.
-            ``"/Users/corey/universe"``) OR a tilde-prefixed
-            path (``"~/foo"``). The host expands ``~`` itself.
+        :param path: Optional absolute path on the Host (for example
+            ``"/Users/corey/universe"``) or a tilde-prefixed path
+            (``"~/foo"``). The Host expands ``~`` itself.
             FastAPI's ``:path`` converter strips the leading
             ``/`` from the URL, so we re-add it for absolute paths.
         :param limit: Max entries per page.

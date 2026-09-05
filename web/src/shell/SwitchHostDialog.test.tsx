@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import type * as WorkspacePickerModule from "./WorkspacePicker";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -19,8 +20,9 @@ vi.mock("./WorkspacePathField", () => ({
     />
   ),
 }));
-vi.mock("./WorkspacePicker", () => ({
-  WorkspacePicker: () => <div data-testid="mock-workspace-picker" />,
+vi.mock("./WorkspacePicker", async (importOriginal) => ({
+  ...(await importOriginal<typeof WorkspacePickerModule>()),
+  HostWorkspacePicker: () => <div data-testid="mock-workspace-picker" />,
   homeFromEntries: () => null,
   isNavigablePath: () => false,
 }));
@@ -93,7 +95,13 @@ beforeEach(() => {
   useHostsMock.mockReturnValue({
     data: [
       { host_id: "host_old", name: "mac-laptop", owner: "alice", status: "online" },
-      { host_id: "host_new", name: "linux-box", owner: "alice", status: "online" },
+      {
+        host_id: "host_new",
+        name: "linux-box",
+        owner: "alice",
+        status: "online",
+        default_workspace: "/Users/alice/pinned-shortcut",
+      },
     ],
   } as unknown as ReturnType<typeof useHosts>);
   useHostFilesystemMock.mockReturnValue({
@@ -124,6 +132,8 @@ describe("SwitchHostDialog", () => {
       silent: true,
     });
     await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+    // A Host pin is only a picker shortcut. The most recently used folder
+    // remains the automatic choice for a switch, matching new-session flow.
     expect(launchRunnerMock).toHaveBeenCalledWith("host_new", "conv_1", "/Users/alice/repo");
     // The launch endpoint binds with `WHERE runner_id IS NULL`, so a launch
     // that raced ahead of the release would be rejected outright.

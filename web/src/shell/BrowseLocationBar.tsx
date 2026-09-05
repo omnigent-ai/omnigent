@@ -3,7 +3,7 @@ import { useState } from "react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { WorkspaceReach } from "@/hooks/useWorkspaceChangedFiles";
-import { isNavigablePath, WorkspacePicker } from "./WorkspacePicker";
+import { HostWorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 
 interface BrowseLocationBarProps {
   /** Absolute path currently shown. */
@@ -32,9 +32,10 @@ interface BrowseLocationBarProps {
  *
  * The path opens the same directory browser the new-session flow uses to pick
  * a workspace, so choosing where to look is one interaction the user has
- * already learned — and it brings that browser's typed path, Up / Home, and
- * show-hidden along with it. Navigation applies live as the user browses (no
- * separate confirm), matching the new-session chip.
+ * already learned — and it brings that browser's roots, typed path, Host pin,
+ * folder search, Up / Home, and show-hidden controls along with it. Navigation
+ * applies live as the user browses (no separate confirm), matching the
+ * new-session chip.
  *
  * Falls back to a plain label when there is nowhere else to go OR this
  * viewer may not go there — a confined agent, a session with no host, or a
@@ -93,7 +94,7 @@ export function BrowseLocationBar({
         </PopoverTrigger>
         {/* Cap to the viewport so the browser can't overflow a narrow panel. */}
         <PopoverContent align="start" className="w-[min(420px,calc(100vw-2rem))] p-0">
-          <WorkspacePicker
+          <HostWorkspacePicker
             hostId={hostId}
             initialPath={isNavigablePath(current) ? current : undefined}
             workspacePath={workspace}

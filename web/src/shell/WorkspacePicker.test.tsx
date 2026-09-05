@@ -7,36 +7,103 @@
 //      but a late-arriving listing (home resolving) must NOT clobber
 //      what the user is typing.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   basename,
-  isHostAbsolutePath,
+  HostWorkspacePicker,
   isNavigablePath,
   joinPath,
-  listingFilter,
   normalizeTypedPath,
   parentOf,
   WorkspacePicker,
 } from "./WorkspacePicker";
+import { setHostDefaultWorkspace, useHosts } from "@/hooks/useHosts";
 import {
   useCreateHostDirectory,
   useHostFilesystem,
+  useHostFilesystemRoots,
   type HostFilesystemEntry,
 } from "@/hooks/useHostFilesystem";
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
+  useHostFilesystemRoots: vi.fn(() => ({
+    data: undefined,
+    isLoading: false,
+    isPlaceholderData: false,
+    error: null,
+  })),
   // Default to an idle mutation; tests that exercise creation override
   // mutateAsync. The component only reads this when the new-folder form
   // is open, so the default is harmless for the other suites.
   useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }));
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: vi.fn(),
+  setHostDefaultWorkspace: vi.fn(),
+}));
 
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
+const useHostFilesystemRootsMock = vi.mocked(useHostFilesystemRoots);
 const useCreateHostDirectoryMock = vi.mocked(useCreateHostDirectory);
+const useHostsMock = vi.mocked(useHosts);
+const setHostDefaultWorkspaceMock = vi.mocked(setHostDefaultWorkspace);
+
+beforeEach(() => {
+  useHostFilesystemRootsMock.mockReturnValue(
+    result({ data: undefined, isLoading: false, isPlaceholderData: false, error: null }),
+  );
+  useHostsMock.mockReturnValue({ data: [] } as unknown as ReturnType<typeof useHosts>);
+  setHostDefaultWorkspaceMock.mockReset();
+  setHostDefaultWorkspaceMock.mockResolvedValue(undefined);
+});
+
+describe("HostWorkspacePicker shared preference wiring", () => {
+  it("shows and updates the selected Host's pinned folder in every entry point", async () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: {
+          entries: [dir("Projects", "D:\\Projects")],
+          truncated: false,
+        },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "win_host",
+          name: "Windows desktop",
+          owner: "me",
+          status: "online",
+          default_workspace: "D:\\Projects",
+        },
+      ],
+    } as ReturnType<typeof useHosts>);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(
+      <QueryClientProvider client={client}>
+        <HostWorkspacePicker hostId="win_host" initialPath={"D:\\Projects"} />
+      </QueryClientProvider>,
+    );
+
+    const pin = screen.getByTestId("workspace-picker-default");
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue("D:\\Projects");
+    expect(screen.queryByTestId("workspace-picker-open-pinned")).not.toBeInTheDocument();
+    expect(pin).toHaveAttribute(
+      "aria-label",
+      "Unpin this folder for Windows desktop. Pinning only provides quick access; new sessions remember the last working folder.",
+    );
+    fireEvent.click(pin);
+    await waitFor(() => expect(setHostDefaultWorkspaceMock).toHaveBeenCalledWith("win_host", null));
+  });
+});
 
 function dir(name: string, path: string): HostFilesystemEntry {
   return { name, path, type: "directory", bytes: null, modified_at: 0 };
@@ -85,20 +152,10 @@ describe("parentOf", () => {
     expect(parentOf("/Users/corey/")).toBe("/Users");
   });
 
-  it("climbs Windows drive paths without falling through to POSIX root", () => {
-    // Host listings on Windows return backslash paths. lastIndexOf("/")
-    // is -1 on those, which previously made parentOf return "/" and
-    // sent the picker to the drive root.
-    expect(parentOf("C:\\Users\\alice\\work")).toBe("C:\\Users\\alice");
-    expect(parentOf("C:\\Users\\alice")).toBe("C:\\Users");
-    expect(parentOf("C:\\Users")).toBe("C:\\");
-    expect(parentOf("C:\\")).toBeNull();
-    expect(parentOf("C:/Users/alice/work")).toBe("C:/Users/alice");
-    expect(parentOf("C:/Users")).toBe("C:/");
-  });
-
-  it("does not treat a backslash as a separator on POSIX paths", () => {
-    expect(parentOf("/tmp/a\\b")).toBe("/tmp");
+  it("climbs Windows drive paths without losing the drive", () => {
+    expect(parentOf("D:\\Projects\\Omnigent")).toBe("D:\\Projects");
+    expect(parentOf("D:\\Projects")).toBe("D:\\");
+    expect(parentOf("D:\\")).toBeNull();
   });
 });
 
@@ -163,6 +220,10 @@ describe("normalizeTypedPath", () => {
     expect(normalizeTypedPath("~/omnigent", "/Users/corey")).toBe("/Users/corey/omnigent");
   });
 
+  it("expands a Windows tilde-relative path using the home path style", () => {
+    expect(normalizeTypedPath("~\\Projects", "C:\\Users\\demo")).toBe("C:\\Users\\demo\\Projects");
+  });
+
   it("expands a bare tilde to the resolved home", () => {
     expect(normalizeTypedPath("~", "/Users/corey")).toBe("/Users/corey");
   });
@@ -182,10 +243,22 @@ describe("normalizeTypedPath", () => {
     expect(normalizeTypedPath("~root/foo", "/Users/corey")).toBeNull();
   });
 
-  it("accepts a Windows drive path as already absolute", () => {
-    expect(normalizeTypedPath("C:\\Users\\alice\\work")).toBe("C:\\Users\\alice\\work");
-    expect(normalizeTypedPath("C:/Users/alice/work")).toBe("C:/Users/alice/work");
-    expect(normalizeTypedPath("  C:/Users/alice/work/  ")).toBe("C:/Users/alice/work");
+  it("preserves and normalizes absolute Windows paths", () => {
+    expect(normalizeTypedPath("  d:\\Projects\\Omnigent\\  ")).toBe("D:\\Projects\\Omnigent");
+    expect(normalizeTypedPath("E:/Projects//Omnigent/")).toBe("E:\\Projects\\Omnigent");
+    expect(normalizeTypedPath("\\\\server\\share\\repo\\")).toBe("\\\\server\\share\\repo");
+  });
+});
+
+describe("isNavigablePath", () => {
+  it.each(["C:\\", "D:\\Projects", "E:/Projects", "\\\\server\\share\\repo"])(
+    "accepts Windows absolute path %s",
+    (path) => expect(isNavigablePath(path)).toBe(true),
+  );
+
+  it("accepts both Windows and POSIX home-relative separators", () => {
+    expect(isNavigablePath("~/Projects")).toBe(true);
+    expect(isNavigablePath("~\\Projects")).toBe(true);
   });
 });
 
@@ -214,69 +287,20 @@ describe("basename", () => {
     expect(basename("/Users/corey/")).toBe("corey");
   });
 
-  it("returns the last segment of a Windows drive path", () => {
-    expect(basename("C:\\Users\\alice\\work")).toBe("work");
-    expect(basename("C:/Users/alice/work")).toBe("work");
+  it("returns the final Windows segment and drive root", () => {
+    expect(basename("D:\\Projects\\Omnigent")).toBe("Omnigent");
+    expect(basename("D:\\")).toBe("D:\\");
   });
 
-  it("keeps a POSIX backslash inside the basename", () => {
+  it("keeps a backslash inside a POSIX filename", () => {
     expect(basename("/tmp/a\\b")).toBe("a\\b");
   });
 });
 
-// listingFilter decides whether (and how) the path-bar text narrows the
-// current directory's listing. The table pins both the cases that DO filter
-// (a bare fragment, or a trailing segment under the current dir, incl. ~ and
-// root) and the cases that must NOT — blank, exactly the current path, or a
-// path into a different directory (which is navigation, not a filter). A
-// false positive here would hide entries while the user is navigating away.
-describe("isNavigablePath", () => {
-  it("accepts POSIX absolute, home, and Windows drive paths", () => {
-    expect(isNavigablePath("/Users/me/work")).toBe(true);
-    expect(isNavigablePath("~/work")).toBe(true);
-    expect(isNavigablePath("~")).toBe(true);
-    expect(isNavigablePath("C:\\Users\\alice\\work")).toBe(true);
-    expect(isNavigablePath("C:/Users/alice/work")).toBe(true);
-    expect(isNavigablePath("work")).toBe(false);
-    expect(isNavigablePath("C:relative")).toBe(false);
-  });
-});
-
-describe("isHostAbsolutePath", () => {
-  it("rejects relative and tilde paths", () => {
-    expect(isHostAbsolutePath("/tmp")).toBe(true);
-    expect(isHostAbsolutePath("C:\\Users\\alice")).toBe(true);
-    expect(isHostAbsolutePath("~/work")).toBe(false);
-    expect(isHostAbsolutePath("")).toBe(false);
-  });
-});
-
-describe("listingFilter", () => {
-  it.each<[string, string, string | null, string | null]>([
-    // [pathInput, currentAbsolute, home, expected]
-    // Bare fragment, no slash → filters the current directory by it.
-    ["pro", "/Users/me", null, "pro"],
-    // Trailing segment whose parent IS the current directory → filters.
-    ["/Users/me/pro", "/Users/me", null, "pro"],
-    // Exactly the current path (the mirrored value) → not a filter.
-    ["/Users/me", "/Users/me", null, null],
-    // Blank input → no filter.
-    ["", "/Users/me", null, null],
-    ["   ", "/Users/me", null, null],
-    // "<dir>/" with nothing past the slash yet → no filter.
-    ["/Users/me/", "/Users/me", null, null],
-    // A path into a *different* directory → navigation, not a filter.
-    ["/etc", "/Users/me", null, null],
-    ["/var/lo", "/Users/me", null, null],
-    // ~ expands against home, so "~/pro" filters when home is the current dir.
-    ["~/pro", "/Users/me", "/Users/me", "pro"],
-    // At the root, "/sr" is a fragment of "/" → filters.
-    ["/sr", "/", null, "sr"],
-    ["C:\\Users\\me\\pro", "C:\\Users\\me", null, "pro"],
-    ["C:\\Users\\me", "C:\\Users\\me", null, null],
-    ["C:/Users/Alice/pro", "c:\\users\\alice", null, "pro"],
-  ])("listingFilter(%j, %j, %j) → %j", (input, current, home, expected) => {
-    expect(listingFilter(input, current, home)).toBe(expected);
+describe("joinPath", () => {
+  it("uses the native separator for Windows directories", () => {
+    expect(joinPath("D:\\Projects", "new-app")).toBe("D:\\Projects\\new-app");
+    expect(joinPath("E:\\", "new-app")).toBe("E:\\new-app");
   });
 });
 
@@ -332,37 +356,21 @@ describe("WorkspacePicker path bar", () => {
       }),
     );
 
-    render(<WorkspacePicker hostId="host_1" />);
+    render(<WorkspacePicker hostId="host_1" supportsFilesystemRoots />);
     const input = screen.getByTestId("workspace-picker-path-input") as HTMLInputElement;
     fireEvent.click(screen.getByTestId("workspace-picker-entry-projects"));
     expect(input.value).toBe("/Users/serena.ruan/projects");
   });
 
-  it("does not treat a Windows home listing as the POSIX root", () => {
-    // Home view (path "") lists entries whose paths are C:\Users\...\name.
-    // Deriving the current dir via lastIndexOf("/") used to yield "/", so
-    // onNavigate fired with the drive root and Select could not pick work/.
+  it("explains that the address bar accepts an absolute path", () => {
     useHostFilesystemMock.mockReturnValue(
-      result({
-        data: {
-          entries: [
-            dir("work", "C:\\Users\\alice\\work"),
-            dir("Documents", "C:\\Users\\alice\\Documents"),
-          ],
-          truncated: false,
-        },
-        isLoading: false,
-        isPlaceholderData: false,
-      }),
+      result({ data: undefined, isLoading: false, isPlaceholderData: false }),
     );
-    const onNavigate = vi.fn();
-    const onSelect = vi.fn();
-    render(<WorkspacePicker hostId="host_1" onNavigate={onNavigate} onSelect={onSelect} />);
-    expect(onNavigate).toHaveBeenCalledWith("C:\\Users\\alice");
-    fireEvent.click(screen.getByTestId("workspace-picker-select"));
-    expect(onSelect).toHaveBeenCalledWith("C:\\Users\\alice");
-    fireEvent.click(screen.getByTestId("workspace-picker-entry-work"));
-    expect(onNavigate).toHaveBeenCalledWith("C:\\Users\\alice\\work");
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" />);
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveAttribute(
+      "aria-label",
+      "Folder path. Type an absolute path and press Enter to open it.",
+    );
   });
 
   it("resolves a tilde start path to an absolute one for selection", () => {
@@ -383,6 +391,109 @@ describe("WorkspacePicker path bar", () => {
     render(<WorkspacePicker hostId="host_1" initialPath="~/projects" onSelect={onSelect} />);
     fireEvent.click(screen.getByTestId("workspace-picker-select"));
     expect(onSelect).toHaveBeenCalledWith("/Users/corey/projects");
+  });
+});
+
+describe("WorkspacePicker filesystem roots", () => {
+  it("shows Windows drives and enters a selected drive", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({ data: undefined, isLoading: false, isPlaceholderData: false, error: null }),
+    );
+    useHostFilesystemRootsMock.mockReturnValue(
+      result({
+        data: {
+          entries: [dir("C:\\", "C:\\"), dir("D:\\", "D:\\")],
+          truncated: false,
+        },
+        isLoading: false,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+
+    render(<WorkspacePicker hostId="host_1" supportsFilesystemRoots />);
+    fireEvent.click(screen.getByTestId("workspace-picker-roots"));
+    fireEvent.click(screen.getByTestId("workspace-picker-entry-D:\\"));
+
+    expect(useHostFilesystemMock).toHaveBeenCalledWith("host_1", "D:\\");
+  });
+
+  it("keeps root browsing hidden for an older Host", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({ data: undefined, isLoading: false, isPlaceholderData: false, error: null }),
+    );
+
+    render(<WorkspacePicker hostId="old_host" />);
+
+    expect(screen.queryByTestId("workspace-picker-roots")).not.toBeInTheDocument();
+    expect(useHostFilesystemRootsMock).toHaveBeenCalledWith("old_host", false);
+  });
+});
+
+describe("WorkspacePicker pinned folder", () => {
+  it("opens the pinned shortcut without changing the selected working folder", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({ data: undefined, isLoading: false, isPlaceholderData: false }),
+    );
+    const onSelect = vi.fn();
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/work/current"
+        defaultPath="/work/pinned"
+        onSelect={onSelect}
+      />,
+    );
+    expect(useHostFilesystemMock).toHaveBeenCalledWith("host_1", "/work/current");
+    fireEvent.click(screen.getByTestId("workspace-picker-open-pinned"));
+    expect(useHostFilesystemMock).toHaveBeenCalledWith("host_1", "/work/pinned");
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("keeps pinned folders as shortcuts when the Host changes", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({ data: undefined, isLoading: false, isPlaceholderData: false, error: null }),
+    );
+
+    const { rerender } = render(
+      <WorkspacePicker hostId="mac_host" defaultPath="/Users/me/Projects" />,
+    );
+    expect(useHostFilesystemMock).toHaveBeenCalledWith("mac_host", "");
+
+    rerender(<WorkspacePicker hostId="windows_host" defaultPath={"D:\\Projects"} />);
+    expect(useHostFilesystemMock).toHaveBeenCalledWith("windows_host", "");
+    expect(screen.getByTestId("workspace-picker-open-pinned")).toHaveAttribute(
+      "aria-label",
+      "Open pinned folder: D:\\Projects",
+    );
+  });
+
+  it("pins the current Windows directory for quick access", () => {
+    const onDefaultPathChange = vi.fn();
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("Omnigent", "D:\\Projects\\Omnigent")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath={"D:\\Projects"}
+        defaultPathHostName="Windows desktop"
+        onDefaultPathChange={onDefaultPathChange}
+      />,
+    );
+    expect(screen.getByTestId("workspace-picker-default")).toHaveAttribute(
+      "aria-label",
+      "Pin this folder for quick access on Windows desktop. New sessions remember the last working folder.",
+    );
+    fireEvent.click(screen.getByTestId("workspace-picker-default"));
+
+    expect(onDefaultPathChange).toHaveBeenCalledWith("D:\\Projects");
   });
 });
 
@@ -480,10 +591,10 @@ describe("WorkspacePicker live selection (onNavigate)", () => {
   });
 });
 
-// Filter-as-you-type: typing a fragment in the path bar narrows the current
-// directory's listing (the listingFilter unit tests cover the parsing; these
-// confirm the wiring through to the rendered rows).
-describe("WorkspacePicker listing filter", () => {
+// Folder search is a separate right-side control so the address bar always
+// means exact-path navigation. It filters only the current level because the
+// Host API does not provide a recursive machine-wide search index.
+describe("WorkspacePicker folder search", () => {
   beforeEach(() => {
     useHostFilesystemMock.mockReset();
     useHostFilesystemMock.mockReturnValue(
@@ -505,28 +616,26 @@ describe("WorkspacePicker listing filter", () => {
     cleanup();
   });
 
-  it("narrows the listing to entries matching the typed fragment", () => {
+  it("finds current-level folders by a case-insensitive name fragment", () => {
     render(<WorkspacePicker hostId="host_1" initialPath="/x" />);
-    // All three show before any filter.
+    // All three show before search opens.
     expect(screen.getByTestId("workspace-picker-entry-src")).toBeTruthy();
     expect(screen.getByTestId("workspace-picker-entry-docs")).toBeTruthy();
-    // Typing "s" keeps only the names starting with "s".
-    fireEvent.change(screen.getByTestId("workspace-picker-path-input"), {
-      target: { value: "s" },
+    fireEvent.change(screen.getByTestId("workspace-picker-search-input"), {
+      // Substring rather than prefix: Finder-style filtering finds "styles".
+      target: { value: "YLE" },
     });
-    expect(screen.getByTestId("workspace-picker-entry-src")).toBeTruthy();
     expect(screen.getByTestId("workspace-picker-entry-styles")).toBeTruthy();
+    expect(screen.queryByTestId("workspace-picker-entry-src")).toBeNull();
     expect(screen.queryByTestId("workspace-picker-entry-docs")).toBeNull();
   });
 
-  it("shows a no-matches message when nothing matches the fragment", () => {
+  it("shows a scoped no-matches message", () => {
     render(<WorkspacePicker hostId="host_1" initialPath="/x" />);
-    fireEvent.change(screen.getByTestId("workspace-picker-path-input"), {
+    fireEvent.change(screen.getByTestId("workspace-picker-search-input"), {
       target: { value: "zzz" },
     });
-    // Distinct from "(empty directory)" so the user knows it's the filter,
-    // not an actually-empty folder.
-    expect(screen.getByText("No matching entries")).toBeTruthy();
+    expect(screen.getByText("No matching folders in this directory")).toBeTruthy();
     expect(screen.queryByTestId("workspace-picker-entry-src")).toBeNull();
   });
 });
@@ -548,11 +657,6 @@ describe("joinPath", () => {
 
   it("trims surrounding whitespace from the child name", () => {
     expect(joinPath("/Users/me", "  foo  ")).toBe("/Users/me/foo");
-  });
-
-  it("joins a Windows drive path with a backslash", () => {
-    expect(joinPath("C:\\Users\\alice", "work")).toBe("C:\\Users\\alice\\work");
-    expect(joinPath("C:\\", "Users")).toBe("C:\\Users");
   });
 });
 

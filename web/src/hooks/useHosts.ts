@@ -28,6 +28,10 @@ export interface Host {
    * or server — and must not gate anything away; only an explicit `false` does.
    */
   gateway_inference?: Record<string, boolean> | null;
+  /** Host-native directory pinned as a quick picker shortcut on this machine. */
+  default_workspace?: string | null;
+  /** Whether the connected Host can enumerate platform filesystem roots. */
+  filesystem_roots?: boolean;
 }
 
 interface HostsResponse {
@@ -83,6 +87,22 @@ export function useHosts(options: UseHostsOptions = {}) {
     refetchOnWindowFocus: refetchOnFocus,
     refetchInterval: enabled ? 60_000 : false,
   });
+}
+
+/** Persist or clear the pinned workspace shortcut for one physical Host. */
+export async function setHostDefaultWorkspace(
+  hostId: string,
+  defaultWorkspace: string | null,
+): Promise<void> {
+  const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ default_workspace: defaultWorkspace }),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { detail?: string };
+    throw new Error(body.detail ?? `Couldn't save the pinned folder (HTTP ${res.status}).`);
+  }
 }
 
 async function fetchHostModelOptions(

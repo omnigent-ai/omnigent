@@ -38,12 +38,11 @@ interface HostFilesystemResponse {
 /**
  * Build the filesystem URL for a given host + absolute path.
  *
- * The path is passed through ``encodeURIComponent`` per segment
- * so names with spaces or special chars survive. An empty
+ * The complete host-native path is passed as one encoded query value
+ * so names, drive letters, UNC prefixes, and separators survive. An empty
  * string maps to the ``/v1/hosts/{id}/filesystem`` route which
  * forwards ``~`` to ``host.list_dir`` server-side. Absolute
- * paths land on ``/v1/hosts/{id}/filesystem/{path:path}``;
- * FastAPI strips the leading slash and the route re-adds it.
+ * paths use the same route with an exact ``?path=...`` query value.
  *
  * @param hostId Host identifier, e.g. ``"host_a1b2..."``.
  * @param absolutePath Absolute path to list (e.g.
@@ -55,33 +54,15 @@ export function buildHostFilesystemUrl(hostId: string, absolutePath: string): st
   if (absolutePath === "") {
     return base;
   }
-  if (absolutePath === "/") {
-    // Browsing exactly "/" must hit /filesystem/ (with trailing
-    // slash) to match the {path:path} route. Without the trailing
-    // slash we'd hit the no-path route which forwards ~ instead.
-    return `${base}/`;
-  }
-  // Windows drive and UNC paths are already absolute. Encode each
-  // segment after normalizing backslashes so FastAPI captures
-  // ``C:/Users/me`` (not ``/C:/Users/me``).
-  if (/^[A-Za-z]:[\\/]/.test(absolutePath) || absolutePath.startsWith("\\\\")) {
-    const normalized = absolutePath.replace(/\\/g, "/");
-    const encoded = normalized
-      .split("/")
-      .map((segment) => encodeURIComponent(segment))
-      .join("/");
-    return `${base}/${encoded}`;
-  }
-  // Strip the single leading slash; the route handler re-adds it.
-  const stripped = absolutePath.startsWith("/") ? absolutePath.slice(1) : absolutePath;
-  if (stripped === "") {
-    return `${base}/`;
-  }
-  const encoded = stripped
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-  return `${base}/${encoded}`;
+  // Keep the host-native path as one query value. Route-path transport cannot
+  // faithfully represent Windows drive and UNC paths (FastAPI also strips a
+  // leading POSIX slash), while a query parameter round-trips every separator.
+  return `${base}?path=${encodeURIComponent(absolutePath)}`;
+}
+
+/** URL for the host's filesystem roots (Windows drives, or POSIX `/`). */
+export function buildHostFilesystemRootsUrl(hostId: string): string {
+  return `/v1/hosts/${encodeURIComponent(hostId)}/filesystem?roots=true`;
 }
 
 interface FetchError extends Error {
@@ -180,8 +161,14 @@ const MAX_PAGES = 50;
  *   when the page cap was hit with more entries still pending.
  * @throws FetchError carrying the HTTP status on a non-OK response.
  */
-async function fetchHostFilesystem(hostId: string, path: string): Promise<HostDirectoryListing> {
-  const baseUrl = buildHostFilesystemUrl(hostId, path);
+async function fetchHostFilesystem(
+  hostId: string,
+  path: string,
+  roots = false,
+): Promise<HostDirectoryListing> {
+  const baseUrl = roots
+    ? buildHostFilesystemRootsUrl(hostId)
+    : buildHostFilesystemUrl(hostId, path);
   const entries: HostFilesystemEntry[] = [];
   let after: string | null = null;
   let truncated = false;
@@ -248,6 +235,17 @@ export function useHostFilesystem(hostId: string | null, path: string | null) {
     // the query pending, so the placeholder above would leave the previous
     // directory's rows on screen instead of surfacing the error. Transient
     // failures still retry.
+    retry: shouldRetryHostFilesystem,
+  });
+}
+
+/** List the top-level filesystem roots exposed by a host. */
+export function useHostFilesystemRoots(hostId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: ["host-filesystem-roots", hostId],
+    queryFn: () => fetchHostFilesystem(hostId as string, "", true),
+    enabled: enabled && hostId !== null,
+    staleTime: 30_000,
     retry: shouldRetryHostFilesystem,
   });
 }

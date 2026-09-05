@@ -229,6 +229,7 @@ def test_hello_frame_round_trip() -> None:
         frame_protocol_version=1,
         name="corey-laptop",
         runners=["runner_token_aaa", "runner_token_bbb"],
+        filesystem_roots=True,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -236,6 +237,7 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.frame_protocol_version == 1
     assert decoded.name == "corey-laptop"
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
+    assert decoded.filesystem_roots is True
 
 
 def test_hello_frame_empty_runners() -> None:
@@ -252,6 +254,42 @@ def test_hello_frame_empty_runners() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
     assert decoded.runners == []
+    assert decoded.filesystem_roots is False
+
+
+def test_hello_frame_omitted_filesystem_roots_is_legacy_false() -> None:
+    """An older Host that omits the capability keeps root browsing disabled."""
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "0.1.0",
+                "frame_protocol_version": 1,
+                "name": "older-host",
+                "runners": [],
+            }
+        )
+    )
+
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.filesystem_roots is False
+
+
+def test_hello_frame_filesystem_roots_requires_boolean() -> None:
+    """Capability metadata must fail closed instead of coercing strings."""
+    with pytest.raises(ValueError, match="filesystem_roots"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.hello",
+                    "version": "0.1.0",
+                    "frame_protocol_version": 1,
+                    "name": "invalid-host",
+                    "runners": [],
+                    "filesystem_roots": "true",
+                }
+            )
+        )
 
 
 def test_launch_runner_frame_round_trip() -> None:

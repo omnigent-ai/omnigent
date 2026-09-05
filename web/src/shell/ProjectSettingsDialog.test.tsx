@@ -10,17 +10,27 @@ vi.mock("@/lib/projectsApi", () => ({
   updateProjectConfig: vi.fn(),
   createProject: vi.fn(),
 }));
-// Hoisted so the vi.mock factory can reference it; per-test overrides let
-// cases control the host-resolved model catalog (default: empty, so the
-// Claude static-alias fallback is what populates the picker).
-const { hostModelOptionsMock } = vi.hoisted(() => ({ hostModelOptionsMock: vi.fn() }));
+// Hoisted so the vi.mock factory below can reference it; per-test overrides
+// let cases control the agent and host-model catalogs (the defaults are set in beforeEach).
+const { availableAgentsMock, hostModelOptionsMock, workspacePickerPropsMock } = vi.hoisted(() => ({
+  availableAgentsMock: vi.fn(),
+  hostModelOptionsMock: vi.fn(),
+  workspacePickerPropsMock: vi.fn(),
+}));
 vi.mock("@/hooks/useHosts", () => ({
-  useHosts: () => ({ data: [{ host_id: "h1", name: "Laptop", owner: "me", status: "online" }] }),
+  useHosts: () => ({
+    data: [
+      {
+        host_id: "h1",
+        name: "Laptop",
+        owner: "me",
+        status: "online",
+        default_workspace: "/Users/me/Projects",
+      },
+    ],
+  }),
   useHostModelOptions: hostModelOptionsMock,
 }));
-// Hoisted so the vi.mock factory below can reference it; per-test overrides
-// let cases control the agent catalog (the default is set in beforeEach).
-const { availableAgentsMock } = vi.hoisted(() => ({ availableAgentsMock: vi.fn() }));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: availableAgentsMock,
   // The reused agent picker prefetches details on open; no-op in the dialog test.
@@ -46,13 +56,16 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 // the live workspace update without the host-filesystem plumbing.
 vi.mock("./WorkspacePicker", () => ({
   isNavigablePath: (p: string) => p.startsWith("/"),
-  WorkspacePicker: ({ onNavigate }: { onNavigate: (p: string) => void }) => (
-    <div data-testid="mock-workspace-picker">
-      <button type="button" onClick={() => onNavigate("/picked/dir")}>
-        pick dir
-      </button>
-    </div>
-  ),
+  HostWorkspacePicker: (props: { onNavigate: (p: string) => void }) => {
+    workspacePickerPropsMock(props);
+    return (
+      <div data-testid="mock-workspace-picker">
+        <button type="button" onClick={() => props.onNavigate("/picked/dir")}>
+          pick dir
+        </button>
+      </div>
+    );
+  },
 }));
 
 const getProjectMock = vi.mocked(getProject);
@@ -73,6 +86,7 @@ beforeEach(() => {
   updateMock.mockReset();
   createMock.mockReset();
   availableAgentsMock.mockReset();
+  workspacePickerPropsMock.mockReset();
   availableAgentsMock.mockReturnValue({ data: [pickerAgent()] });
   hostModelOptionsMock.mockReset();
   hostModelOptionsMock.mockReturnValue({ data: [] });
@@ -270,6 +284,21 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", { host_id: "h1", workspace: "/picked/dir" }),
+    );
+  });
+
+  it("uses the shared Host-aware picker for the selected machine", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
+    renderDialog();
+
+    await waitFor(() => expect(screen.getByText("Browse…")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Browse…"));
+
+    expect(workspacePickerPropsMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        hostId: "h1",
+        initialPath: undefined,
+      }),
     );
   });
 

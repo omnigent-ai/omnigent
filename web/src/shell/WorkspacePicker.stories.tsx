@@ -26,6 +26,9 @@ const meta = {
   args: {
     hostId: workspaceStoryHost,
     initialPath: workspaceStoryProjects,
+    defaultPath: workspaceStoryProjects,
+    defaultPathHostName: "MacBook Pro",
+    onDefaultPathChange: () => undefined,
     onSelect: () => undefined,
   },
   decorators: [
@@ -59,9 +62,11 @@ export const PopulatedWithConflict: Story = {
 };
 
 export const TypedFilter: Story = {
+  // Keep the export key stable so the existing visual-baseline id remains
+  // stable; the user-facing story name reflects the now-separate search UI.
+  name: "Folder search",
   play: async ({ canvasElement }) => {
-    const input = within(canvasElement).getByTestId("workspace-picker-path-input");
-    await userEvent.clear(input);
-    await userEvent.type(input, `${workspaceStoryProjects}/ap`);
+    const canvas = within(canvasElement);
+    await userEvent.type(canvas.getByTestId("workspace-picker-search-input"), "ap");
   },
 };

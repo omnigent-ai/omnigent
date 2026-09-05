@@ -49,7 +49,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
 // real path helpers stay, since other code under test imports them.
 vi.mock("./WorkspacePicker", async (importOriginal) => ({
   ...(await importOriginal<typeof WorkspacePickerModule>()),
-  WorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
+  HostWorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
     <button type="button" data-testid="stub-picker-navigate" onClick={() => onNavigate?.("/etc")}>
       pick /etc
     </button>
