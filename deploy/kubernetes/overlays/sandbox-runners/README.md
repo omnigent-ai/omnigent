@@ -209,13 +209,125 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 | `secret_name` | Harness-creds Secret projected into every Pod via `envFrom`. |
 | `service_account` | ServiceAccount the runner Pods run as (powerless). |
 | `image` | Optional runner image override (defaults to the official multi-arch amd64/arm64 host image). |
-| `env` | Optional list of SERVER env-var names to inject as literal Pod env (prefer `secret_name` for credentials). |
+| `env` | Optional list of SERVER env-var names to inject as literal host-container env. Each name must be set on the server; credential-looking and launcher-reserved names are rejected. If omitted, `OMNIGENT_KUBERNETES_SANDBOX_ENV` supplies the list; `[]` disables that fallback. |
+| `env_values` | Optional mapping of non-secret names to string values for the host container only, without reading or changing the server environment. Defaults to no values. Names must not overlap `env` or its environment-variable fallback. See [Pod-only literal environment](#pod-only-literal-environment-env_values). |
 | `node_selector` | Optional extra node labels, merged with a default `kubernetes.io/arch: amd64` — set that key to `arm64` to schedule runners on arm64 nodes. |
 | `resources` | Optional `requests` / `limits` (`cpu` / `memory`) override. |
 | `pod_ready_timeout_s` | Optional override for how long to wait for a runner Pod to reach `Running` (schedule + image pull + init container) before failing the launch — default 90s. Raise it for deployments whose host image regularly takes longer to pull. Also settable via env: `OMNIGENT_K8S_POD_READY_TIMEOUT_S` (this key takes precedence when both are set). |
 | `in_cluster` | Optional cluster-config source: `true` (in-cluster SA only), `false` (kubeconfig only), omit (try in-cluster, then kubeconfig). |
 | `kubeconfig` | Optional kubeconfig path for the out-of-cluster fallback (env: `OMNIGENT_KUBERNETES_KUBECONFIG`). |
 | `pvc_mounts` | Optional pre-created PersistentVolumeClaims mounted into every runner Pod — see [Persistent storage mounts](#persistent-storage-mounts-pvc_mounts). |
+
+## Pod-only literal environment (`env_values`)
+
+Use `sandbox.kubernetes.env_values` when a value belongs in the runner Pod but
+not in the server process. Both `kubernetes` and `agent_sandbox` use the same
+block. For example, point the host at a CA bundle mounted only in its container:
+
+```yaml
+sandbox:
+  provider: kubernetes  # or agent_sandbox
+  server_url: http://omnigent.omnigent.svc.cluster.local
+  kubernetes:
+    env: []  # optional: disable the SERVER env-name fallback
+    env_values:
+      SSL_CERT_FILE: /mnt/ca/ca.crt
+    secret_mounts:
+      - secret_name: runner-ca
+        mount_path: /mnt/ca
+```
+
+Create `runner-ca` in the runner namespace with a `ca.crt` key containing a
+valid PEM CA bundle. Do **not** export this Pod-only `SSL_CERT_FILE` path on the
+server: the file need not exist there, and parsing or launching a sandbox never
+copies `env_values` into server `os.environ`.
+
+The mapping must have names matching `[A-Za-z_][A-Za-z0-9_]*` and string values.
+Quote YAML numbers and booleans (`"123"`, `"true"`); empty strings and whitespace
+are preserved. `null`, non-string values, malformed names, and NUL characters
+are rejected. Omitting `env_values` or using `{}` preserves existing defaults.
+Omnigent does not expand values; Kubernetes applies its normal `env.value`
+expansion rules (use `$$` to escape a dollar sign).
+
+These are **not secrets**: values appear in the Pod spec and etcd. The existing
+credential-name protection also applies here: names with an underscore-delimited
+`TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `CREDENTIAL`, or `CREDENTIALS` segment
+(case-insensitive) are rejected. This is a name guard, not secret-content
+detection; keep all credentials in `secret_name` or Secret file mounts.
+`HOME`, `IS_SANDBOX`, `OMNIGENT_HOST_ID`, `OMNIGENT_HOST_NAME`, and
+`OMNIGENT_HOST_TOKEN` remain launcher-reserved.
+
+A name cannot appear in both `env` and `env_values`, even with the same value
+or when the server variable is unset. Explicit-list overlap fails at config
+parse time; overlap with `OMNIGENT_KUBERNETES_SANDBOX_ENV` fails at launch.
+The existing name-only `env` setting still reads values from the server and
+fails if a requested variable is missing.
+
+Like existing `env` passthrough, these values go to the **host container**, not
+the workspace-preparation init container. PVC and Secret file mounts are also
+host-only, so forwarding a Pod-only CA path into init would point it at an
+unmounted file. The existing exception is `OMNIGENT_CONFIG_HOME`: both containers
+receive it so init writes `sandbox.host_config` where the host reads it. When
+`host_config` is set, that directory must resolve under `/home/omnigent`.
+This setting does not change the separate host-to-runner environment
+passthrough rules or supply a CA bundle for init's optional repository clone.
+
+### Live-cluster happy-path test
+
+Use a **disposable** server built from this checkout with the `kubernetes`
+extra, the overlay's runner RBAC, a usable host image, and at least one
+registered agent. The server URL must be reachable from both the test machine
+and runner Pods (separate external test and internal `sandbox.server_url`
+URLs are fine). The `agent_sandbox` variant also needs the agent-sandbox
+controller/CRD. The test caller needs `kubectl` access to list/get runner Pods
+and `pods/exec`; this is not an additional permission for the server.
+
+Create a test CA Secret containing public certificates only:
+
+```sh
+kubectl create secret generic omnigent-e2e-ca -n omnigent-sandboxes \
+  --from-file=ca.crt=/etc/ssl/certs/ca-certificates.crt
+```
+
+Configure the disposable server's `sandbox.kubernetes` block as follows (keep
+the namespace, service account, image, and other required deployment settings):
+
+```yaml
+env: []
+env_values:
+  SSL_CERT_FILE: /mnt/omnigent-e2e-ca/ca.crt
+  OMNIGENT_CONFIG_HOME: /home/omnigent/e2e-config
+  POD_ENV_VALUES_MARKER: "  pod-only literal  "
+  POD_ENV_VALUES_EMPTY: ""
+secret_mounts:
+  - secret_name: omnigent-e2e-ca
+    mount_path: /mnt/omnigent-e2e-ca
+```
+
+Do not mount this CA path or set these variables on the server. Restart it to
+load the config. Use a single-user test server (or a test proxy supplying the
+required identity); no LLM credentials or LLM call are needed for this
+host-startup test. On Linux/macOS, from the checkout:
+
+```sh
+uv sync --extra all --extra kubernetes --group dev
+export OMNIGENT_E2E_KUBERNETES_SERVER=http://localhost:8080
+# For a second disposable server configured with provider: agent_sandbox:
+export OMNIGENT_E2E_AGENT_SANDBOX_SERVER=http://localhost:8081
+(uv run --no-sync pytest -o addopts= \
+  tests/e2e/integrations/deploy/kubernetes/test_managed_env_values.py \
+  -q -rs > /tmp/omnigent-env-values-e2e.log 2>&1) &
+```
+
+Only configured provider rows run; unset URLs skip explicitly. Optional
+`OMNIGENT_E2E_KUBECTL` selects a command/context (for example,
+`kubectl --context test-cluster`), `OMNIGENT_E2E_KUBERNETES_NAMESPACE` overrides
+the runner namespace, and `OMNIGENT_E2E_AGENT_ID` selects the registered agent.
+The test creates and deletes its own managed session, waits for an online
+host, inspects the real Pod's host/init environment and mounts, then executes
+Python in the host container to assert exact values and load the mounted CA
+with `ssl.create_default_context()`. Inspect
+`/tmp/omnigent-env-values-e2e.log` for results.
 
 ## Self-reclaiming sandboxes (`provider: agent_sandbox`)
 

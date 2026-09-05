@@ -39,7 +39,12 @@ data:
         service_account: omnigent-runner
         # ── all optional below ──
         # image: ghcr.io/your-org/omnigent-host:latest  # default: official multi-arch (amd64/arm64) host image
-        # env: [PROXY_URL]           # SERVER env vars injected as literal Pod env (prefer secret_name for creds)
+        # env: [PROXY_URL]           # SERVER env vars injected into the host container (non-secret names only)
+        # env_values:               # Pod-only non-secret strings; never set in the server environment
+        #   SSL_CERT_FILE: /mnt/ca/ca.crt  # requires a CA bundle mounted in the host container
+        # secret_mounts:
+        #   - secret_name: runner-ca # pre-created Secret containing a ca.crt key
+        #     mount_path: /mnt/ca
         # node_selector:             # extra node labels; default kubernetes.io/arch: amd64, override to arm64 to run there
         #   disktype: ssd
         # resources:                 # runner Pod sizing (defaults: 0.5-2 cpu / 1-4Gi)

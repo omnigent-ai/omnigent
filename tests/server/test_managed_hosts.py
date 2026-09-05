@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import os
 import re
 import sys
 import types
@@ -27,6 +28,7 @@ from omnigent.onboarding.sandboxes.base import (
 )
 from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
+from omnigent.onboarding.sandboxes.kubernetes import KubernetesSandboxLauncher
 from omnigent.onboarding.sandboxes.registry import (
     COMMUNITY_MODULE_PREFIX,
     SandboxProviderContribution,
@@ -755,6 +757,7 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
             "kubernetes": {
                 "image": "ghcr.io/me/omnigent-host:latest",
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "env_values": {"SSL_CERT_FILE": "/mnt/ca/ca.crt"},
                 "namespace": "omnigent-sandboxes",
                 "secret_name": "omnigent-creds",
                 "service_account": "omnigent-runner",
@@ -777,6 +780,7 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
     assert cfg.launcher_factory() is fake
     assert fake.image == "ghcr.io/me/omnigent-host:latest"
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.env_values == {"SSL_CERT_FILE": "/mnt/ca/ca.crt"}
     assert fake.namespace == "omnigent-sandboxes"
     assert fake.secret_name == "omnigent-creds"
     assert fake.service_account == "omnigent-runner"
@@ -800,12 +804,138 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     fake = FakeSandboxLauncher()
     install_fake_kubernetes_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
+    assert fake.env_values is None
     assert fake.namespace is None
     assert fake.secret_name is None
     assert fake.in_cluster is None
     assert fake.resources is None
     assert fake.pvc_mounts is None
     assert fake.pod_ready_timeout_s is None
+
+
+@pytest.mark.parametrize("provider", ["kubernetes", "agent_sandbox"])
+@pytest.mark.parametrize("server_cert", [None, "/server-only/ca.crt"])
+def test_parse_kubernetes_env_values_are_pod_only(
+    provider: str, server_cert: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected_env = {"PLAIN_CONFIG": "from-server"}
+    if server_cert is not None:
+        expected_env["SSL_CERT_FILE"] = server_cert
+    monkeypatch.setattr(os, "environ", expected_env.copy())
+    values = {
+        "SSL_CERT_FILE": "/mnt/ca/ca.crt",
+        "EMPTY": "",
+        "TEXT": "  spaces\nand unicode: \u00e9  ",
+        "MONKEY": "not a credential name",
+    }
+    cfg = parse_sandbox_config(
+        {
+            "provider": provider,
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"env": ["PLAIN_CONFIG"], "env_values": values},
+        }
+    )
+    assert cfg is not None
+    launcher = cfg.default.launcher_factory()
+    assert isinstance(launcher, KubernetesSandboxLauncher)
+    assert launcher.provider == provider
+    assert launcher._resolve_sandbox_env() == {**values, "PLAIN_CONFIG": "from-server"}
+    assert os.environ == expected_env
+
+
+@pytest.mark.parametrize("provider", ["kubernetes", "agent_sandbox"])
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        (None, "must be a mapping"),
+        ([], "must be a mapping"),
+        ("SSL_CERT_FILE=/mnt/ca/ca.crt", "must be a mapping"),
+        (True, "must be a mapping"),
+        ({1: "value"}, "invalid environment variable name"),
+        ({"": "value"}, "invalid environment variable name"),
+        ({" SSL_CERT_FILE": "value"}, "invalid environment variable name"),
+        ({"BAD-NAME": "value"}, "invalid environment variable name"),
+        ({"NAME=VALUE": "value"}, "invalid environment variable name"),
+        ({"1NAME": "value"}, "invalid environment variable name"),
+        ({"NAME\n": "value"}, "invalid environment variable name"),
+        ({"caf\u00e9": "value"}, "invalid environment variable name"),
+        ({"SSL_CERT_FILE": None}, "must be a string"),
+        ({"SSL_CERT_FILE": False}, "must be a string"),
+        ({"SSL_CERT_FILE": 42}, "must be a string"),
+        ({"SSL_CERT_FILE": 1.5}, "must be a string"),
+        ({"SSL_CERT_FILE": ["/mnt/ca"]}, "must be a string"),
+        ({"SSL_CERT_FILE": {"value": "/mnt/ca"}}, "must be a string"),
+        ({"SSL_CERT_FILE": "/mnt/\0ca"}, "NUL"),
+        ({"HOME": "not-for-errors"}, "reserved"),
+        ({"OMNIGENT_HOST_TOKEN": "not-for-errors"}, "reserved"),
+        ({"OPENAI_API_KEY": "not-for-errors"}, "credential"),
+        ({"GIT_TOKEN": "not-for-errors"}, "credential"),
+        ({"my_password": "not-for-errors"}, "credential"),
+    ],
+)
+def test_parse_kubernetes_env_values_rejects_invalid(
+    provider: str, values: object, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message) as exc:
+        parse_sandbox_config(
+            {
+                "provider": provider,
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {"env_values": values},
+            }
+        )
+    assert "sandbox.kubernetes.env_values" in str(exc.value)
+    assert "not-for-errors" not in str(exc.value)
+
+
+@pytest.mark.parametrize("provider", ["kubernetes", "agent_sandbox"])
+def test_parse_kubernetes_env_remains_name_only(provider: str) -> None:
+    with pytest.raises(ValueError, match=r"sandbox\.kubernetes\.env.*must be a list"):
+        parse_sandbox_config(
+            {
+                "provider": provider,
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {"env": {"SSL_CERT_FILE": "/mnt/ca/ca.crt"}},
+            }
+        )
+
+
+@pytest.mark.parametrize("provider", ["kubernetes", "agent_sandbox"])
+def test_parse_kubernetes_env_values_rejects_overlap(
+    provider: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    with pytest.raises(ValueError, match=r"env_values overlaps.*env.*SSL_CERT_FILE"):
+        parse_sandbox_config(
+            {
+                "provider": provider,
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {
+                    "env": [" SSL_CERT_FILE "],
+                    "env_values": {"SSL_CERT_FILE": "/mnt/ca/ca.crt"},
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize("provider", ["kubernetes", "agent_sandbox"])
+@pytest.mark.parametrize("section", [{}, {"env_values": {}}])
+def test_parse_kubernetes_env_values_defaults_preserve_env_fallback(
+    provider: str, section: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_KUBERNETES_SANDBOX_ENV", "PLAIN_CONFIG")
+    monkeypatch.setenv("PLAIN_CONFIG", "from-server")
+    cfg = parse_sandbox_config(
+        {
+            "provider": provider,
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": section,
+        }
+    )
+    assert cfg is not None
+    launcher = cfg.default.launcher_factory()
+    assert isinstance(launcher, KubernetesSandboxLauncher)
+    assert launcher._resolve_sandbox_env() == {"PLAIN_CONFIG": "from-server"}
 
 
 def test_parse_host_config_threads_verbatim_without_resolving_secrets(

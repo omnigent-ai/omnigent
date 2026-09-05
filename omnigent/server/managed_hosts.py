@@ -1342,6 +1342,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                 {
                     "image",
                     "env",
+                    "env_values",
                     "namespace",
                     "secret_name",
                     "service_account",
@@ -1359,10 +1360,12 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         pvc_mounts = _parse_kubernetes_pvc_mounts(raw)
         secret_mounts = _parse_kubernetes_secret_mounts(raw)
         _reject_overlapping_kubernetes_mounts(pvc_mounts, secret_mounts)
+        env = _parse_provider_env(raw, "kubernetes")
         launcher_factory = _kubernetes_launcher_factory(
             agent_sandbox=provider == "agent_sandbox",
             image=_parse_provider_image(raw, "kubernetes"),
-            env=_parse_provider_env(raw, "kubernetes"),
+            env=env,
+            env_values=_parse_kubernetes_env_values(raw, env),
             namespace=_parse_provider_string(raw, "kubernetes", "namespace"),
             secret_name=_parse_provider_string(raw, "kubernetes", "secret_name"),
             service_account=_parse_provider_string(raw, "kubernetes", "service_account"),
@@ -2343,6 +2346,18 @@ def _validate_kubernetes_identifiers(
             )
 
 
+def _parse_kubernetes_env_values(
+    raw: dict[str, object], env: list[str] | None
+) -> dict[str, str] | None:
+    """Parse non-secret Pod-only literals, preserving empty strings and whitespace."""
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None or "env_values" not in section:
+        return None
+    from omnigent.onboarding.sandboxes.kubernetes import validate_env_values
+
+    return validate_env_values(section["env_values"], env=env or ())
+
+
 def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | None:
     """
     Extract and validate the optional ``sandbox.kubernetes.resources`` block.
@@ -2637,6 +2652,7 @@ def _kubernetes_launcher_factory(
     agent_sandbox: bool = False,
     image: str | None,
     env: list[str] | None,
+    env_values: dict[str, str] | None,
     namespace: str | None,
     secret_name: str | None,
     service_account: str | None,
@@ -2660,6 +2676,7 @@ def _kubernetes_launcher_factory(
     :param env: Names of server-process environment variables injected into
         every Pod as literal ``env``, or ``None``. Prefer *secret_name* for
         credentials.
+    :param env_values: Non-secret Pod-only literal values, or ``None``.
     :param namespace: Namespace to create Pods in, or ``None`` for the default.
     :param secret_name: Pre-created Secret projected into every Pod via
         ``envFrom`` (harness credentials), or ``None``.
@@ -2700,6 +2717,7 @@ def _kubernetes_launcher_factory(
         return launcher_cls(
             image=image,
             env=env,
+            env_values=env_values,
             namespace=namespace,
             secret_name=secret_name,
             service_account=service_account,
