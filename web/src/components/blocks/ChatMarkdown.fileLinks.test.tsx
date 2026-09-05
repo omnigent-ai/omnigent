@@ -12,11 +12,52 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
+vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+import { showToast } from "@/components/ui/toast";
+
+const toastMock = vi.mocked(showToast);
+const fetchMock = vi.fn();
+
+beforeEach(() => {
+  fetchMock.mockReset();
+  toastMock.mockReset();
+  vi.stubGlobal("fetch", fetchMock);
+});
+
 afterEach(cleanup);
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: status === 200 ? "OK" : "Error",
+    json: async () => body,
+  } as unknown as Response;
+}
+
+// Absolute (base=host) listings echo entries as names relative to the listed
+// dir, with the dir itself in `base` — mirror that wire shape so what's
+// tested includes the existence check re-attaching the dir.
+function dirListing(paths: string[]): Response {
+  const parent = paths.length ? paths[0].slice(0, paths[0].lastIndexOf("/")) || "/" : "/";
+  return jsonResponse({
+    object: "list",
+    base: parent,
+    data: paths.map((path) => ({
+      id: path,
+      name: path.split("/").pop(),
+      path: path.split("/").pop(),
+      type: "file",
+      bytes: 5,
+      modified_at: 1,
+    })),
+    has_more: false,
+  });
+}
 
 const WORKSPACE = "/home/u/ws";
 
@@ -28,12 +69,24 @@ const FILE_VIEWER = {
   openFile,
   openGithubTab: () => {},
   isChangedPath: (p: string) => changedPaths.includes(p),
-  conversationId: undefined,
+  conversationId: undefined as string | undefined,
   workspaceRoot: WORKSPACE,
   workspaceHome: "/home/u",
 };
 
-function renderMarkdown(markdown: string, changed: string[] = []): void {
+// Same shape, but with a live conversation id so the existence check can run
+// (its query is disabled without one — exactly what the base fixture relies
+// on to keep those tests network-free).
+const FILE_VIEWER_WITH_SESSION = {
+  ...FILE_VIEWER,
+  conversationId: "conv_1",
+};
+
+function renderMarkdown(
+  markdown: string,
+  changed: string[] = [],
+  viewer: typeof FILE_VIEWER = FILE_VIEWER,
+): void {
   changedPaths = changed;
   openFile.mockClear();
   const client = new QueryClient({
@@ -41,7 +94,7 @@ function renderMarkdown(markdown: string, changed: string[] = []): void {
   });
   render(
     <QueryClientProvider client={client}>
-      <FileViewerContext.Provider value={FILE_VIEWER}>
+      <FileViewerContext.Provider value={viewer}>
         <FilePathAwareMessageResponse>{markdown}</FilePathAwareMessageResponse>
       </FileViewerContext.Provider>
     </QueryClientProvider>,
@@ -165,5 +218,81 @@ describe("cited positions", () => {
     renderMarkdown("`docs/notes.md:abc` is not a position", ["docs/notes.md"]);
 
     expect(screen.queryByRole("button", { name: "docs/notes.md:abc" })).toBeNull();
+  });
+});
+
+// Files OUTSIDE the workspace root. The FileViewer and filesystem API open
+// host-absolute paths (the files panel's browse-anywhere plumbing), so an
+// agent-cited outside file must linkify once its existence is confirmed —
+// before this, such links dropped to dead text that did nothing when
+// clicked, and gave a touch user (no hover title) no feedback at all.
+describe("links to files outside the workspace", () => {
+  it("linkifies an outside-workspace markdown link and opens it host-absolute", async () => {
+    fetchMock.mockResolvedValue(dirListing(["/etc/hosts"]));
+    renderMarkdown("[/etc/hosts](/etc/hosts)", [], FILE_VIEWER_WITH_SESSION);
+
+    const link = await screen.findByRole("button", { name: "/etc/hosts" });
+    // The existence check listed the ABSOLUTE parent via base=host — never a
+    // leading %2F that a slash-merging proxy would collapse.
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("/filesystem/etc?");
+    expect(url).toContain("base=host");
+
+    fireEvent.click(link);
+    expect(openFile).toHaveBeenCalledWith("/etc/hosts");
+  });
+
+  it("linkifies an outside-workspace inline-code path", async () => {
+    fetchMock.mockResolvedValue(dirListing(["/etc/hosts"]));
+    renderMarkdown("see `/etc/hosts` for the mapping", [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "/etc/hosts" }));
+    expect(openFile).toHaveBeenCalledWith("/etc/hosts");
+  });
+
+  it("resolves an outside-workspace home-relative path through the runner home", async () => {
+    fetchMock.mockResolvedValue(dirListing(["/home/u/other/notes.md"]));
+    renderMarkdown("[notes](~/other/notes.md)", [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "notes" }));
+    expect(openFile).toHaveBeenCalledWith("/home/u/other/notes.md");
+  });
+});
+
+// A marked link that names no openable file. Silent inertness is only
+// acceptable while the answer isn't known yet; once it is, the reference must
+// explain itself when activated — on touch there is no hover title, so an
+// inert span reads as "tapping does nothing".
+describe("dead file links give feedback instead of a silent no-op", () => {
+  it("explains a confirmed-missing link on click instead of doing nothing", async () => {
+    // Parent listing exists but the file isn't in it → definitively absent.
+    fetchMock.mockResolvedValue(dirListing(["/no/such/other.txt"]));
+    renderMarkdown("[missing](/no/such/file.txt)", [], FILE_VIEWER_WITH_SESSION);
+
+    const dead = await screen.findByRole("button", { name: "missing" });
+    fireEvent.click(dead);
+    expect(openFile).not.toHaveBeenCalled();
+    expect(toastMock).toHaveBeenCalledTimes(1);
+    expect(String(toastMock.mock.calls[0][0])).toContain("/no/such/file.txt");
+  });
+
+  it("explains on keyboard activation too", async () => {
+    fetchMock.mockResolvedValue(dirListing([]));
+    renderMarkdown("[missing](/no/such/file.txt)", [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.keyDown(await screen.findByRole("button", { name: "missing" }), { key: "Enter" });
+    expect(openFile).not.toHaveBeenCalled();
+    expect(toastMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays inert (no feedback affordance) while the check is in flight", () => {
+    // Never resolves → the answer isn't known; claiming "can't open" now
+    // would be wrong for a file that's about to be confirmed.
+    fetchMock.mockReturnValue(new Promise<Response>(() => {}));
+    renderMarkdown("[pending](/no/such/file.txt)", [], FILE_VIEWER_WITH_SESSION);
+
+    expect(screen.queryByRole("button", { name: "pending" })).toBeNull();
+    expect(screen.getByText("pending")).toBeInTheDocument();
+    expect(toastMock).not.toHaveBeenCalled();
   });
 });
