@@ -13,10 +13,12 @@ import pytest
 
 from omnigent import claude_native_hook, native_policy_hook
 from omnigent.claude_native_bridge import (
+    ClaudeNativeHookInterpreterMismatchError,
     build_hook_settings,
     prepare_bridge_dir,
     read_transcript_path,
     record_hook_event,
+    validate_claude_hook_interpreter_compatibility,
     write_active_session_id,
 )
 from tests.native_hook_helpers import make_failing_client
@@ -33,6 +35,78 @@ def _trust_tmp_bridge_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path)
+
+
+def test_wsl_rejects_windows_native_claude_for_hook_interpreter() -> None:
+    """WSL must fail before Windows Claude Code reaches its incompatible hook."""
+    path = "/mnt/c/Users/example/AppData/Roaming/npm/claude.cmd"
+
+    with pytest.raises(ClaudeNativeHookInterpreterMismatchError, match="WSL-native"):
+        validate_claude_hook_interpreter_compatibility(path, wsl=True)
+
+    with pytest.raises(ClaudeNativeHookInterpreterMismatchError):
+        validate_claude_hook_interpreter_compatibility("/opt/claude/claude.exe", wsl=True)
+
+
+@pytest.mark.parametrize(
+    ("path", "wsl"),
+    [
+        ("/home/example/.local/bin/claude", True),
+        ("/usr/local/bin/claude", False),
+        ("/Applications/Claude/bin/claude", False),
+        ("C:/Users/example/AppData/Roaming/npm/claude.cmd", False),
+    ],
+    ids=["wsl-native-claude", "linux", "macos", "windows"],
+)
+def test_claude_hook_interpreter_check_allows_compatible_platforms(path: str, wsl: bool) -> None:
+    """Only the WSL runner plus Windows-native CLI combination is rejected."""
+    validate_claude_hook_interpreter_compatibility(path, wsl=wsl)
+
+
+@pytest.mark.parametrize(
+    ("path", "head"),
+    [
+        ("/mnt/c/dev/myproject/node_modules/.bin/claude", b"\x7fELF\x02\x01\x01"),
+        ("/mnt/c/dev/myproject/.venv/bin/claude", b"#!/usr/bin/env node\n"),
+    ],
+    ids=["elf-binary", "shebang-script"],
+)
+def test_wsl_allows_posix_binary_checked_out_on_a_windows_mount(path: str, head: bytes) -> None:
+    """
+    A real Linux binary living under /mnt/<drive> must not be rejected.
+
+    Regression guard for a false-positive: /mnt/<drive> is also where a repo
+    checked out on a Windows-mounted drive puts its own
+    ``node_modules/.bin/claude`` shim or a vendored interpreter. The mount
+    location alone is not a reliable Windows-native signal for an
+    extensionless path -- only the file's own magic bytes (ELF header or a
+    ``#!`` shebang) or a recognized Windows extension are.
+    """
+    validate_claude_hook_interpreter_compatibility(path, wsl=True, read_head=lambda _p: head)
+
+
+@pytest.mark.parametrize(
+    ("head", "case_id"),
+    [
+        (b"MZ\x90\x00", "pe-header"),
+        (b"", "unreadable"),
+    ],
+    ids=["pe-header", "unreadable"],
+)
+def test_wsl_rejects_extensionless_windows_binary_under_a_mount(head: bytes, case_id: str) -> None:
+    """
+    An extensionless Windows PE binary under /mnt/<drive> is still rejected.
+
+    Confirms the magic-byte check is a real gate rather than a blanket allow
+    for every /mnt/<drive> path: a PE header ('MZ') -- or a file this check
+    can't even read -- keeps the original reject-by-default behavior for
+    this ambiguous, extensionless case.
+    """
+    del case_id
+    path = "/mnt/c/Users/example/AppData/Roaming/npm/claude"
+
+    with pytest.raises(ClaudeNativeHookInterpreterMismatchError, match="WSL-native"):
+        validate_claude_hook_interpreter_compatibility(path, wsl=True, read_head=lambda _p: head)
 
 
 def test_session_start_hook_records_transcript_state_without_output(

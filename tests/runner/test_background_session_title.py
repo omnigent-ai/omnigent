@@ -503,6 +503,52 @@ async def test_claude_native_title_uses_tool_free_print_mode(
 
 
 @pytest.mark.asyncio
+async def test_claude_native_title_skips_under_windows_native_claude_on_wsl(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """
+    A WSL host with a Windows-native ``claude`` on PATH skips the title, not crash.
+
+    Mirrors the interpreter-mismatch guard in ``_auto_create_claude_terminal``:
+    this print-mode subprocess would hit the same hook incompatibility, so it
+    must be caught before ``create_subprocess_exec`` ever runs, and title
+    generation is best-effort -- it degrades to ``None`` instead of raising.
+    """
+
+    async def _unreached_subprocess_exec(command: str, *args: str, **kwargs: Any) -> object:
+        raise AssertionError("must not spawn claude when the interpreter check fails")
+
+    monkeypatch.setattr(
+        "omnigent.claude_native.resolve_native_claude_config",
+        lambda spec=None: None,
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_launcher.resolve_claude_launch",
+        lambda command, args: (command, args),
+    )
+    monkeypatch.setattr("omnigent.claude_native_bridge.is_wsl", lambda: True)
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary",
+        lambda name, **kwargs: "/mnt/c/Users/example/AppData/Roaming/npm/claude.cmd",
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _unreached_subprocess_exec)
+
+    title = await claude_native_titles.generate_background_title(
+        BackgroundTitleContext(
+            prompt="please investigate the authentication timeout",
+            harness="claude-native",
+            spawn_env={},
+            process_manager=None,
+            cwd=tmp_path,
+            model_override="claude-sonnet-4-6",
+        )
+    )
+
+    assert title is None
+
+
+@pytest.mark.asyncio
 async def test_claude_native_title_prefers_title_model_over_session_sources(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

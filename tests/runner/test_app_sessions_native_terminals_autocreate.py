@@ -30,6 +30,7 @@ from omnigent.antigravity_native_bridge import (
 )
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
+    ClaudeNativeHookInterpreterMismatchError,
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
     read_permission_hook_config,
@@ -754,6 +755,230 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     assert "--effort" in args
     effort_idx = args.index("--effort")
     assert args[effort_idx + 1] == "high"
+
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_rejects_windows_native_claude_under_wsl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    WSL + a Windows-native ``claude`` on PATH must fail fast, not time out.
+
+    With no ``OMNIGENT_CLAUDE_PATH`` / config override, this launch path
+    spawns the harness default ``"claude"`` resolved against the process
+    PATH. When that resolution lands on a Windows-native CLI (which cannot
+    execute the WSL Python hook command), the launch must raise the
+    actionable mismatch error before any terminal is spawned.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr("omnigent.claude_native_bridge.is_wsl", lambda: True)
+    # No ambient override may leak in: the launch must resolve the bare
+    # "claude" name, and config isolation keeps a developer's real
+    # ``harness.claude-native.command`` out of the test.
+    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    windows_claude = "/mnt/c/Users/example/AppData/Roaming/npm/claude.cmd"
+    monkeypatch.setattr(
+        "omnigent._platform.shutil.which",
+        lambda name: windows_claude if name == "claude" else None,
+    )
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    class _UnreachedResourceRegistry:
+        """Fails the test if the launch reaches actual terminal spawn."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(self, **kwargs: Any) -> SessionResourceView:
+            raise AssertionError(
+                "terminal launch must not proceed past the interpreter-mismatch check"
+            )
+
+    def _handle_request(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    with pytest.raises(ClaudeNativeHookInterpreterMismatchError, match="Windows-native"):
+        await _auto_create_claude_terminal(
+            "conv_wsl_mismatch",
+            _UnreachedResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+        )
+
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_rejects_windows_native_claude_env_override_under_wsl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A Windows-native ``OMNIGENT_CLAUDE_PATH`` override is rejected under WSL.
+
+    This launch path honours the env/config command override (the same
+    resolver the local CLI uses), so the override *is* the binary that
+    would spawn -- a Windows-native override must be validated and
+    rejected just like a PATH-resolved one.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr("omnigent.claude_native_bridge.is_wsl", lambda: True)
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    windows_claude = "/mnt/c/Users/example/AppData/Roaming/npm/claude.cmd"
+    monkeypatch.setenv("OMNIGENT_CLAUDE_PATH", windows_claude)
+    # The override is an absolute path; resolution passes it through
+    # rather than looking up the bare "claude" name.
+    monkeypatch.setattr(
+        "omnigent._platform.shutil.which",
+        lambda name: windows_claude if name == windows_claude else None,
+    )
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    class _UnreachedResourceRegistry:
+        """Fails the test if the launch reaches actual terminal spawn."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(self, **kwargs: Any) -> SessionResourceView:
+            raise AssertionError(
+                "terminal launch must not proceed past the interpreter-mismatch check"
+            )
+
+    def _handle_request(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    with pytest.raises(ClaudeNativeHookInterpreterMismatchError, match="Windows-native"):
+        await _auto_create_claude_terminal(
+            "conv_wsl_env_override_mismatch",
+            _UnreachedResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+        )
+
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_honors_compatible_claude_env_override_under_wsl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A WSL-compatible ``OMNIGENT_CLAUDE_PATH`` override launches even with bad PATH.
+
+    The override wins command resolution, so a working WSL-native binary
+    must not be blocked merely because the PATH fallback would have
+    resolved a Windows-native ``claude`` -- the launched spec carries the
+    override as its command.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr("omnigent.claude_native_bridge.is_wsl", lambda: True)
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    compatible_override = tmp_path / "claude"
+    compatible_override.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+    compatible_override.chmod(0o755)
+    monkeypatch.setenv("OMNIGENT_CLAUDE_PATH", str(compatible_override))
+    windows_claude = "/mnt/c/Users/example/AppData/Roaming/npm/claude.cmd"
+    monkeypatch.setattr(
+        "omnigent._platform.shutil.which",
+        lambda name: (
+            str(compatible_override)
+            if name == str(compatible_override)
+            else (windows_claude if name == "claude" else None)
+        ),
+    )
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec and return a terminal resource view."""
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    def _handle_request(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    await _auto_create_claude_terminal(
+        "conv_wsl_good_override",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+    )
+
+    assert captured["spec"].command == str(compatible_override)
 
     await fake_client.aclose()
 
