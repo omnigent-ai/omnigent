@@ -202,6 +202,11 @@ class HostStore:
             self._engine,
             query_name_prefix="omnigent.host_store",
         )
+        self._lifecycle_session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.host_store",
+            immediate=True,
+        )
 
     def upsert_on_connect(
         self,
@@ -761,7 +766,7 @@ class HostStore:
         token_expires_at: int,
     ) -> Host:
         """
-        Pre-register a server-managed sandbox host with its credential.
+        Create a server-managed sandbox host with its credential.
 
         Called by the managed-launch orchestration after the sandbox is
         provisioned and BEFORE the in-sandbox host process starts, so
@@ -769,13 +774,6 @@ class HostStore:
         the tunnel. The row is created ``"offline"``; the tunnel's
         normal ``upsert_on_connect`` flips it online when the host
         registers.
-
-        If a row already exists for *host_id* (a RELAUNCH: the host
-        identity is durable across sandbox generations so session
-        bindings survive a dead sandbox), the credential and sandbox
-        columns are overwritten in place — which atomically revokes the
-        previous generation's token, since its digest no longer matches
-        anything.
 
         :param host_id: Server-generated host identifier, e.g.
             ``"host_a1b2c3d4..."``.
@@ -792,48 +790,10 @@ class HostStore:
         :param token_expires_at: Unix epoch seconds after which the
             token no longer authenticates.
         :returns: The registered :class:`Host`.
-        :raises ValueError: If a row for *host_id* belongs to another user,
-            changes provider while cleanup is pending, or tries to re-arm the
-            exact sandbox id still awaiting termination.
         """
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
         with self._session("register_managed_host") as session:
-            existing = session.execute(
-                select(SqlHost)
-                .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
-                .with_for_update()
-            ).scalar_one_or_none()
-            if existing is not None:
-                if existing.user_id != user_id:
-                    # Fail closed (W2-class boundary): re-crediting a host
-                    # row hands its launch token holder the row owner's
-                    # identity, so a cross-owner overwrite would be a host
-                    # hijack. host_id is server-generated today (uuid4 per
-                    # launch), so this can only fire on a bug or a forged
-                    # id — refuse rather than re-own.
-                    raise ValueError(
-                        f"host {host_id!r} is registered to a different user; "
-                        "refusing to re-credential it"
-                    )
-                if (
-                    existing.terminating_sandbox_id is not None
-                    and existing.sandbox_provider != provider
-                ):
-                    raise ValueError(
-                        "cannot change managed sandbox provider while termination is pending"
-                    )
-                if existing.terminating_sandbox_id == sandbox_id:
-                    raise ValueError(
-                        f"sandbox {sandbox_id!r} is still pending termination; "
-                        "refusing to re-arm it"
-                    )
-                existing.token_hash = token_hash
-                existing.token_expires_at = token_expires_at
-                existing.sandbox_provider = provider
-                existing.sandbox_id = sandbox_id
-                existing.updated_at = now
-                return _row_to_host(existing)
             row = SqlHost(
                 user_id=user_id,
                 name=name,
@@ -848,6 +808,55 @@ class HostStore:
             )
             session.add(row)
             return _row_to_host(row)
+
+    def replace_managed_host_sandbox(
+        self,
+        *,
+        host_id: str,
+        user_id: str,
+        token: str,
+        provider: str,
+        sandbox_id: str,
+        token_expires_at: int,
+    ) -> Host | None:
+        """Replace the sandbox generation backing an existing managed host.
+
+        The row lock serializes replacement with :meth:`delete_host`. A missing
+        result means full teardown already removed the durable host, so the
+        caller must clean up the unregistered sandbox instead of recreating it.
+        """
+        now = now_epoch()
+        token_hash = hash_host_launch_token(token)
+        with self._lifecycle_session("replace_managed_host_sandbox") as session:
+            existing = session.execute(
+                select(SqlHost)
+                .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if existing is None:
+                return None
+            if existing.user_id != user_id:
+                raise ValueError(
+                    f"host {host_id!r} is registered to a different user; "
+                    "refusing to re-credential it"
+                )
+            if (
+                existing.terminating_sandbox_id is not None
+                and existing.sandbox_provider != provider
+            ):
+                raise ValueError(
+                    "cannot change managed sandbox provider while termination is pending"
+                )
+            if existing.terminating_sandbox_id == sandbox_id:
+                raise ValueError(
+                    f"sandbox {sandbox_id!r} is still pending termination; refusing to re-arm it"
+                )
+            existing.token_hash = token_hash
+            existing.token_expires_at = token_expires_at
+            existing.sandbox_provider = provider
+            existing.sandbox_id = sandbox_id
+            existing.updated_at = now
+            return _row_to_host(existing)
 
     def rearm_managed_host(
         self,
@@ -935,20 +944,34 @@ class HostStore:
                 return None
             return _row_to_host(row)
 
-    def delete_host(self, host_id: str) -> None:
+    def delete_host(self, host_id: str) -> Host | None:
         """
-        Delete a host row entirely.
+        Atomically take and delete a host row.
 
         Managed-host teardown: removes the host from the picker AND
         revokes its launch token in one operation (the row IS the
         credential). Explicitly nulls ``conversations.host_id`` for any
         sessions still bound to this host — the DB no longer cascades
         this via FK. No-op when the row does not exist — deletion is
-        invoked from best-effort cleanup paths that may race.
+        invoked from best-effort cleanup paths that may race. The row lock
+        serializes deletion with managed-host generation replacement, and the
+        returned snapshot lets teardown target the generation actually removed.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: The deleted host snapshot, or ``None`` when already absent.
         """
-        with self._session("delete_host") as session:
+        with self._lifecycle_session("delete_host") as session:
+            row = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            deleted = _row_to_host(row)
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -963,6 +986,7 @@ class HostStore:
                     SqlHost.host_id == host_id,
                 )
             )
+            return deleted
 
     def detach_stale_managed_sandbox(
         self,
@@ -1042,8 +1066,9 @@ class HostStore:
         the token it armed (the new sandbox never came up to use it)
         without deleting the durable host row — the session binding
         survives, and the next relaunch attempt re-arms a fresh token
-        via :meth:`register_managed_host`. Contrast :meth:`delete_host`,
-        which is full teardown. No-op when the row does not exist.
+        via :meth:`replace_managed_host_sandbox`. Contrast
+        :meth:`delete_host`, which is full teardown. No-op when the row
+        does not exist.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         """

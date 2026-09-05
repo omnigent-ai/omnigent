@@ -16,7 +16,8 @@ survive a sandbox dying at the provider's lifetime cap.
 
 The sandbox host authenticates back with a dedicated launch token the
 server mints per launch (see
-:meth:`omnigent.stores.host_store.HostStore.register_managed_host` and
+:meth:`omnigent.stores.host_store.HostStore.register_managed_host`,
+:meth:`omnigent.stores.host_store.HostStore.replace_managed_host_sandbox`, and
 the managed-token branch in
 :mod:`omnigent.server.routes.host_tunnel`) — the user's own
 credentials never enter the sandbox.
@@ -2888,7 +2889,12 @@ async def relaunch_managed_host(
     # here), but terminate defensively so a transient tunnel outage
     # can never leave two live sandboxes claiming one host identity.
     if host.sandbox_id is not None:
-        await _terminate_sandbox_best_effort(launcher, host, host.sandbox_id)
+        await _terminate_sandbox_best_effort(
+            launcher,
+            host.sandbox_id,
+            host_id=host.host_id,
+            provider=host.sandbox_provider,
+        )
     try:
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
@@ -2914,7 +2920,7 @@ async def relaunch_managed_host(
     except ValueError as exc:
         raise HTTPException(
             status_code=409,
-            detail=f"managed sandbox relaunch conflicted with pending cleanup: {exc}",
+            detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
         ) from exc
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
 
@@ -3065,16 +3071,35 @@ async def _register_and_start_host(
         registration fails.
     """
     token = secrets.token_urlsafe(32)
-    record = await asyncio.to_thread(
-        host_store.register_managed_host,
-        host_id=host_id,
-        name=host_name,
-        user_id=owner,
-        token=token,
-        provider=launcher.provider,
-        sandbox_id=sandbox_id,
-        token_expires_at=now_epoch() + config.token_ttl_s,
-    )
+    if keep_host_on_failure:
+        record = await asyncio.to_thread(
+            host_store.replace_managed_host_sandbox,
+            host_id=host_id,
+            user_id=owner,
+            token=token,
+            provider=launcher.provider,
+            sandbox_id=sandbox_id,
+            token_expires_at=now_epoch() + config.token_ttl_s,
+        )
+        if record is None:
+            await _terminate_sandbox_best_effort(
+                launcher,
+                sandbox_id,
+                host_id=host_id,
+                provider=launcher.provider,
+            )
+            raise ValueError(f"managed host {host_id!r} no longer exists")
+    else:
+        record = await asyncio.to_thread(
+            host_store.register_managed_host,
+            host_id=host_id,
+            name=host_name,
+            user_id=owner,
+            token=token,
+            provider=launcher.provider,
+            sandbox_id=sandbox_id,
+            token_expires_at=now_epoch() + config.token_ttl_s,
+        )
     try:
         # Uniform across providers: provision() fixed the sandbox id and the
         # token was armed against it above, so start_host starts the host with
@@ -3105,7 +3130,12 @@ async def _register_and_start_host(
         # cap. Cleanup-then-reraise at a system boundary, not a
         # swallow: every path below re-raises as an HTTPException.
         if keep_host_on_failure:
-            await _terminate_sandbox_best_effort(launcher, record, sandbox_id)
+            await _terminate_sandbox_best_effort(
+                launcher,
+                sandbox_id,
+                host_id=record.host_id,
+                provider=record.sandbox_provider,
+            )
             await asyncio.to_thread(host_store.revoke_launch_token, host_id)
         else:
             # The row was just armed with THIS single-provider config, so a
@@ -3313,17 +3343,6 @@ async def resume_managed_host(
             return
         entry = config.recorded(host.sandbox_provider)
         sandbox_id = host.sandbox_id
-        token = secrets.token_urlsafe(32)
-        armed = await asyncio.to_thread(
-            host_store.rearm_managed_host,
-            host.host_id,
-            sandbox_id=sandbox_id,
-            expected_updated_at=host.updated_at,
-            token=token,
-            token_expires_at=now_epoch() + entry.token_ttl_s,
-        )
-        if armed is None:
-            return
         _logger.info(
             "Waking dormant managed host %s (sandbox %s, provider %s)",
             host.host_id,
@@ -3332,6 +3351,39 @@ async def resume_managed_host(
         )
         try:
             await asyncio.to_thread(launcher.resume, sandbox_id)
+            token = secrets.token_urlsafe(32)
+            armed = await asyncio.to_thread(
+                host_store.rearm_managed_host,
+                host.host_id,
+                sandbox_id=sandbox_id,
+                expected_updated_at=host.updated_at,
+                token=token,
+                token_expires_at=now_epoch() + entry.token_ttl_s,
+            )
+            if armed is None:
+                current = await asyncio.to_thread(host_store.get_host, host.host_id)
+                if current is None:
+                    await _terminate_sandbox_best_effort(
+                        launcher,
+                        sandbox_id,
+                        host_id=host.host_id,
+                        provider=host.sandbox_provider,
+                    )
+                    raise ValueError(f"managed host {host.host_id!r} no longer exists")
+                if current.sandbox_id != sandbox_id:
+                    terminated = await _terminate_sandbox_best_effort(
+                        launcher,
+                        sandbox_id,
+                        host_id=host.host_id,
+                        provider=host.sandbox_provider,
+                    )
+                    if terminated and current.terminating_sandbox_id == sandbox_id:
+                        await asyncio.to_thread(
+                            host_store.mark_terminating_sandbox_terminated,
+                            host.host_id,
+                            sandbox_id=sandbox_id,
+                        )
+                return
             await _start_sandbox_host(
                 launcher,
                 sandbox_id,
@@ -3348,8 +3400,8 @@ async def resume_managed_host(
             )
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:
-            # A failed wake must NOT tear the sandbox down (the volume is the
-            # user's); just surface it.
+            # An ordinary failed wake must NOT tear the sandbox down (the volume
+            # is the user's); just surface it. Full teardown is handled above.
             if isinstance(exc, HTTPException):
                 raise
             message = exc.message if isinstance(exc, click.ClickException) else str(exc)
@@ -3366,13 +3418,12 @@ async def terminate_managed_host(
     """
     Terminate a managed host's sandbox and delete its host row.
 
-    Deleting the row is both teardown and revocation in one operation:
-    the host disappears from the picker AND its launch token stops
-    resolving. Best-effort on the sandbox side: termination failures
-    (or a missing/mismatched launcher after a config change) are
-    logged, not raised — the provider's lifetime cap reaps stragglers,
-    and the caller (session delete / launch-failure cleanup) must not
-    be blocked by provider hiccups.
+    The latest row is locked and deleted before provider termination. This
+    serializes full teardown with generation replacement: either teardown takes
+    the newly registered generation, or replacement observes the missing row
+    and cleans up its unregistered sandbox. Deleting the row also removes the
+    host from the picker and revokes its launch token. Provider termination
+    remains best-effort and never blocks database teardown.
 
     :param host: The managed host to tear down. Active and pending sandbox ids
         are both terminated when present.
@@ -3381,25 +3432,34 @@ async def terminate_managed_host(
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
     """
-    launcher = _launcher_for_teardown(host, config)
-    sandbox_ids = dict.fromkeys((host.sandbox_id, host.terminating_sandbox_id))
+    deleted = await asyncio.to_thread(host_store.delete_host, host.host_id)
+    if deleted is None:
+        return
+    launcher = _launcher_for_teardown(deleted, config)
+    sandbox_ids = dict.fromkeys((deleted.sandbox_id, deleted.terminating_sandbox_id))
     for sandbox_id in sandbox_ids:
         if sandbox_id is not None:
-            await _terminate_sandbox_best_effort(launcher, host, sandbox_id)
-    await asyncio.to_thread(host_store.delete_host, host.host_id)
+            await _terminate_sandbox_best_effort(
+                launcher,
+                sandbox_id,
+                host_id=deleted.host_id,
+                provider=deleted.sandbox_provider,
+            )
 
 
 async def _terminate_sandbox_best_effort(
     launcher: SandboxHostLauncher | None,
-    host: Host,
     sandbox_id: str,
+    *,
+    host_id: str,
+    provider: str | None,
 ) -> bool:
-    """Terminate one explicit provider sandbox id without touching its row."""
+    """Terminate one provider sandbox id without touching its host row."""
     if launcher is None:
         _logger.warning(
             "No launcher available for managed sandbox provider %s; "
             "sandbox %s must be deleted with the provider's own tooling",
-            host.sandbox_provider,
+            provider,
             sandbox_id,
         )
         return False
@@ -3410,8 +3470,8 @@ async def _terminate_sandbox_best_effort(
         _logger.warning(
             "Failed to terminate managed sandbox %s (provider=%s) for host %s",
             sandbox_id,
-            host.sandbox_provider,
-            host.host_id,
+            provider,
+            host_id,
             exc_info=True,
         )
         return False
