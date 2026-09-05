@@ -1,7 +1,7 @@
 """Tests for :class:`RunnerToolPolicyGate` resolve-time fail-closed behavior.
 
 A configured tool-phase policy that fails to resolve must not disappear
-silently: ``from_spec`` installs a sentinel that DENYs on TOOL_CALL and
+silently: ``from_spec`` installs a sentinel that ASKs on TOOL_CALL and
 TOOL_RESULT. Successfully resolved policies keep their existing verdicts.
 """
 
@@ -62,24 +62,25 @@ def _broken_policy(name: str = "broken") -> FunctionPolicySpec:
 
 
 @pytest.mark.asyncio
-async def test_single_unresolved_policy_denies_tool_call() -> None:
-    """One broken configured policy must DENY TOOL_CALL, not leave an empty ALLOW gate."""
+async def test_single_unresolved_policy_asks_tool_call() -> None:
+    """A broken configured policy asks for approval on TOOL_CALL rather than auto-denying."""
     gate = RunnerToolPolicyGate.from_spec(_agent_with_policies(_broken_policy()))
     assert not gate.is_empty
 
     verdict = await gate.evaluate_tool_call("web_search", {"q": "x"})
-    assert verdict.action == "deny"
+    assert verdict.action == "ask"
     assert verdict.policy_name == "broken"
-    assert verdict.deny_text is not None
-    assert "failed to resolve" in verdict.deny_text
-    assert "ModuleNotFoundError" in verdict.deny_text
-    assert _BROKEN_PATH in verdict.deny_text
+    assert verdict.reason is not None
+    assert "failed to resolve" in verdict.reason
+    assert "ModuleNotFoundError" in verdict.reason
+    assert _BROKEN_PATH in verdict.reason
 
 
 @pytest.mark.asyncio
-async def test_single_unresolved_policy_denies_tool_result() -> None:
-    """Unresolved policies must also fail closed on TOOL_RESULT."""
+async def test_single_unresolved_policy_asks_tool_result() -> None:
+    """Unresolved policies ask on TOOL_RESULT — ASK on tool_result collapses to deny output."""
     gate = RunnerToolPolicyGate.from_spec(_agent_with_policies(_broken_policy()))
+    # evaluate_tool_result collapses ASK → deny output (tool already ran, no rollback path)
     output = await gate.evaluate_tool_result("web_search", "raw tool output")
     assert "Denied by policy: broken" in output
     assert "failed to resolve" in output
@@ -87,8 +88,8 @@ async def test_single_unresolved_policy_denies_tool_result() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unresolved_alongside_valid_still_denies() -> None:
-    """A broken policy next to a valid ALLOW policy must still DENY."""
+async def test_unresolved_alongside_valid_still_asks() -> None:
+    """A broken policy next to a valid ALLOW policy produces ASK (not ALLOW)."""
     gate = RunnerToolPolicyGate.from_spec(
         _agent_with_policies(
             _tool_policy("allow_all", _FIXED_ALLOW),
@@ -96,7 +97,7 @@ async def test_unresolved_alongside_valid_still_denies() -> None:
         ),
     )
     verdict = await gate.evaluate_tool_call("web_search", {})
-    assert verdict.action == "deny"
+    assert verdict.action == "ask"
     assert verdict.policy_name == "broken"
 
     output = await gate.evaluate_tool_result("web_search", "ok")
@@ -105,10 +106,10 @@ async def test_unresolved_alongside_valid_still_denies() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("configured_phase", [Phase.TOOL_CALL, Phase.TOOL_RESULT])
-async def test_unresolved_policy_denies_both_tool_phases(
+async def test_unresolved_policy_asks_both_tool_phases(
     configured_phase: Phase,
 ) -> None:
-    """Resolution failure denies both tool phases regardless of its selector."""
+    """Resolution failure produces ASK on both tool phases regardless of its selector."""
     broken = _tool_policy(
         "phase_broken",
         FunctionRef(path=_BROKEN_PATH),
@@ -117,7 +118,7 @@ async def test_unresolved_policy_denies_both_tool_phases(
     gate = RunnerToolPolicyGate.from_spec(_agent_with_policies(broken))
 
     verdict = await gate.evaluate_tool_call("web_search", {})
-    assert verdict.action == "deny"
+    assert verdict.action == "ask"
     assert verdict.policy_name == "phase_broken"
 
     output = await gate.evaluate_tool_result("web_search", "raw tool output")
@@ -229,12 +230,12 @@ async def test_resolve_diagnostic_omits_exception_message_secrets() -> None:
         policy_mod.resolve_function_policy = original
 
     verdict = await gate.evaluate_tool_call("web_search", {})
-    assert verdict.action == "deny"
-    assert verdict.deny_text is not None
-    assert secret not in verdict.deny_text
-    assert "SUPER_SECRET" not in verdict.deny_text
-    assert "_SecretError" in verdict.deny_text
-    assert "failed to resolve" in verdict.deny_text
+    assert verdict.action == "ask"
+    assert verdict.reason is not None
+    assert secret not in verdict.reason
+    assert "SUPER_SECRET" not in verdict.reason
+    assert "_SecretError" in verdict.reason
+    assert "failed to resolve" in verdict.reason
 
 
 @pytest.mark.asyncio
@@ -267,8 +268,8 @@ async def test_resolve_log_omits_exception_message_secrets(
 
 
 @pytest.mark.asyncio
-async def test_evaluation_time_exception_still_fails_closed() -> None:
-    """A resolved policy that raises at evaluate time remains fail-closed DENY."""
+async def test_evaluation_time_exception_fails_ask() -> None:
+    """A resolved policy that raises at evaluate time produces ASK, not DENY."""
     # arguments force the factory to return a raising evaluator.
     raising = FunctionRef(
         path=_RAISING_PATH,
@@ -290,11 +291,11 @@ async def test_evaluation_time_exception_still_fails_closed() -> None:
     finally:
         gated.policy._callable = original
 
-    assert verdict.action == "deny"
+    assert verdict.action == "ask"
     assert verdict.policy_name == "raises_at_eval"
-    assert verdict.deny_text is not None
-    assert "policy raised" in verdict.deny_text
-    assert "RuntimeError" in verdict.deny_text
+    assert verdict.reason is not None
+    assert "policy error" in verdict.reason
+    assert "RuntimeError" in verdict.reason
 
 
 @pytest.mark.asyncio

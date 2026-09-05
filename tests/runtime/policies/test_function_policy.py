@@ -20,7 +20,7 @@ From ``test_labels_and_policies.py`` (FunctionPolicy-context):
 - ``test_zero_arg_factory_copy_creates_fresh_state``
 
 Plus Phase 4 carve-outs:
-- Exception → DENY (fail-closed)
+- Exception → ASK (fail-ask: broken policy asks user to decide manually)
 - set_labels whitelist filtering
 """
 
@@ -675,12 +675,15 @@ async def test_factory_closure_counter_isolated_per_build(
 
 
 @pytest.mark.asyncio
-async def test_function_policy_exception_fails_closed_to_deny(
+async def test_function_policy_exception_fails_ask(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A callable that raises → engine coerces to DENY with
-    the exception message in reason. Critical safety property
-    — a broken callable must not silently ALLOW."""
+    """A callable that raises → engine coerces to ASK so the user can decide.
+
+    A broken policy must not silently ALLOW (no enforcement) nor auto-DENY
+    (invisible blocker). ASK surfaces the error to a human who can approve
+    or reject the gated action manually.
+    """
 
     def fn(event: dict) -> PolicyResult:
         raise RuntimeError("crashed")
@@ -688,8 +691,9 @@ async def test_function_policy_exception_fails_closed_to_deny(
     policy = FunctionPolicy(_spec(), fn)
     engine = _build_engine(conversation_store, [policy])
     result = await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="x"))
-    assert result.action == PolicyAction.DENY
-    # Reason contains both the policy name and the exception.
+    assert result.action == PolicyAction.ASK
+    # Reason surfaces both the policy name and the exception text so the
+    # approval dialog gives the user enough context to decide.
     assert "crashed" in result.reason
     assert "p" in result.reason  # policy name
 

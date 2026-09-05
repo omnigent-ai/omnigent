@@ -127,13 +127,17 @@ def _unresolved_policy_sentinel(
     ps: FunctionPolicySpec,
     exc: BaseException,
 ) -> FunctionPolicy:
-    """Fail-closed stand-in for a configured policy that failed to resolve."""
+    """Fail-ask stand-in for a configured policy that failed to resolve.
+
+    Returns ASK so the user can approve or deny the gated action manually
+    rather than having the broken policy silently block every tool call.
+    """
     reason = _resolve_failure_diagnostic(ps, exc)
 
-    def _always_deny(_event: object) -> dict[str, object]:
-        return {"result": "DENY", "reason": reason}
+    def _always_ask(_event: object) -> dict[str, object]:
+        return {"result": "ASK", "reason": reason}
 
-    return FunctionPolicy(ps, _always_deny)
+    return FunctionPolicy(ps, _always_ask)
 
 
 class RunnerToolPolicyGate:
@@ -300,23 +304,25 @@ class RunnerToolPolicyGate:
             try:
                 result: PolicyResult = await gated.policy.evaluate(ctx, {})
             except Exception as exc:
-                # Fail-closed: a raised policy denies the call rather
-                # than silently allowing it. Matches the server-side
-                # engine's wrapping behavior.
+                # Fail-ask: a raised policy asks the user to decide rather
+                # than silently blocking. Matches the server-side engine's
+                # _dispatch_policy behavior.
                 _logger.exception(
-                    "runner policy %r raised on %s; treating as DENY",
+                    "runner policy %r raised on %s; asking for manual approval",
                     gated.name,
                     phase.value,
                     extra={"session_id": runner_primary_session_id()},
                 )
-                return PolicyVerdict(
-                    action="deny",
-                    deny_text=format_deny_text(
-                        gated.name,
-                        f"policy raised: {type(exc).__name__}: {exc}",
+                if pending_ask is None:
+                    pending_ask = PolicyVerdict(
+                        action="ask",
+                        policy_name=gated.name,
+                        reason=(
+                        f"policy error — please approve or deny manually:"
+                        f" {type(exc).__name__}: {exc}"
                     ),
-                    policy_name=gated.name,
-                )
+                    )
+                continue
             if result.action == PolicyAction.DENY:
                 return PolicyVerdict(
                     action="deny",

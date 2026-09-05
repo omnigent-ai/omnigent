@@ -952,9 +952,12 @@ async def _dispatch_policy(
     try:
         result = await policy.evaluate(ctx, context)
     except Exception as exc:
+        # Fail-ask: a broken policy should prompt the user rather than silently
+        # blocking, so they can decide whether to proceed. A corrupt or
+        # misconfigured policy must not invisibly veto every tool call or turn.
         return PolicyResult(
-            action=PolicyAction.DENY,
-            reason=f"policy {policy.spec.name!r} failed: {exc}",
+            action=PolicyAction.ASK,
+            reason=f"policy {policy.spec.name!r} error — please approve or deny manually: {exc}",
             set_labels=None,
         )
     return result

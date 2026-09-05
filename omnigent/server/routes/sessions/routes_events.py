@@ -665,11 +665,13 @@ def register_events_routes(
                     artifact_store=artifact_store,
                 )
             except Exception as _policy_exc:
-                # Policy evaluation crashed (e.g. factory misconfigured).
-                # Log and treat as DENY so the session doesn't hang on
-                # "working" forever. The full cause is logged for admins;
-                # the denial reason returned to (and streamed at) the client
-                # stays generic so the raw exception text isn't exposed.
+                # Unexpected crash outside the policy engine's own error
+                # handling (e.g. DB failure during spec load). Log and
+                # fail-closed so the session doesn't hang on "working"
+                # forever. CEL compile errors and broken callables are
+                # handled inside _evaluate_input_policy itself (via the
+                # engine build try/except) and reach here only on truly
+                # unexpected failures.
                 _logger.warning(
                     "Input policy evaluation failed for %s: %s",
                     session_id,

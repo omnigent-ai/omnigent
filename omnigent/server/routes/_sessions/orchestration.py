@@ -334,6 +334,7 @@ from omnigent.session_lifecycle import (
     title_without_closed_marker,
 )
 from omnigent.spec.types import (
+    DEFAULT_ASK_TIMEOUT,
     AgentSpec,
     Phase,
     PolicyAction,
@@ -1992,7 +1993,7 @@ async def _hold_native_ask_gate_impl(
     session_id: str,
     phase: Phase,
     data: dict[str, Any],
-    engine: PolicyEngine,
+    engine: PolicyEngine | None,
     result: PolicyResult,
     conversation_store: ConversationStore,
     elicitation_id: str | None = None,
@@ -2062,7 +2063,11 @@ async def _hold_native_ask_gate_impl(
         content_preview=json.dumps(data)[:1024],
     )
     # Per-policy ``ask_timeout`` override wins over the spec-level default.
-    timeout_s = float(resolve_ask_timeout(engine, result))
+    # When engine is None (broken-policy ask synthesized without a live engine)
+    # fall back to the spec-wide default so the gate still parks correctly.
+    timeout_s = float(
+        resolve_ask_timeout(engine, result) if engine is not None else DEFAULT_ASK_TIMEOUT
+    )
     # Use the caller-supplied id when present (hook retries re-attach to
     # the same elicitation); otherwise mint a fresh one so we can surface
     # this ASK in the native terminal before parking on the web verdict.
@@ -2092,9 +2097,9 @@ async def _hold_native_ask_gate_impl(
     if approved:
         # POLICIES.md §7.2: writes accumulated by the ASKing policy
         # land only on approve.
-        if result.set_labels:
+        if result.set_labels and engine is not None:
             engine.apply_label_writes(result.set_labels)
-        if result.state_updates:
+        if result.state_updates and engine is not None:
             with contextlib.suppress(ConversationNotFoundError):
                 engine.apply_state_updates(result.state_updates)
     return approved
@@ -6994,9 +6999,35 @@ async def _evaluate_tool_call_policy(
     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
         return None
-    engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
-    )
+    try:
+        engine = await asyncio.to_thread(
+            _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
+        )
+    except Exception as _build_exc:  # noqa: BLE001 — e.g. CEL compile error in policy factory
+        _logger.warning(
+            "TOOL_CALL policy engine build failed for session=%s; asking for manual approval: %s",
+            session_id,
+            _build_exc,
+            extra={"session_id": session_id},
+        )
+        elicitation_id = await _register_policy_elicitation(
+            session_id=session_id,
+            result=PolicyResult(
+                action=PolicyAction.ASK,
+                reason=f"Policy engine error — please approve or deny manually: {_build_exc}",
+            ),
+            arguments_preview=arguments_str,
+            conversation_store=conversation_store,
+        )
+        _pending_policy_ask_writes[elicitation_id] = _PendingPolicyAskWrites(
+            state_updates=None,
+            set_labels=None,
+        )
+        return {
+            "verdict": "pending",
+            "elicitation_id": elicitation_id,
+            "ask_timeout": None,
+        }
 
     try:
         args_payload = json.loads(arguments_str)
@@ -7151,9 +7182,37 @@ async def _evaluate_input_policy(
     # can reason about attachments per-file instead of a merged string.
     request_content = {"user_content": user_text, "attachments": attachments}
 
-    engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
-    )
+    try:
+        engine = await asyncio.to_thread(
+            _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
+        )
+    except Exception as _build_exc:  # noqa: BLE001 — e.g. CEL compile error in policy factory
+        _logger.warning(
+            "REQUEST policy engine build failed for session=%s; asking for manual approval: %s",
+            session_id,
+            _build_exc,
+            extra={"session_id": session_id},
+        )
+        # Synthesize an ASK result and route it through the same server-side
+        # gate as normal ASK verdicts, so the user gets an approval card.
+        _ask_result = PolicyResult(
+            action=PolicyAction.ASK,
+            reason=f"Policy engine error — please approve or deny manually: {_build_exc}",
+        )
+        try:
+            approved = await _hold_native_ask_gate(
+                request,
+                session_id=session_id,
+                phase=Phase.REQUEST,
+                data=body.data,
+                engine=None,
+                result=_ask_result,
+                conversation_store=conversation_store,
+            )
+        except ElicitationDeclinedError as exc:
+            return {"verdict": "deny", "reason": exc.args[0] or "Denied by policy"}
+        return None if approved else {"verdict": "deny", "reason": _ask_result.reason}
+
     ctx = EvaluationContext(
         phase=Phase.REQUEST,
         content=request_content,
