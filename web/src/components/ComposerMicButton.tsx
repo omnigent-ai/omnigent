@@ -68,6 +68,7 @@ const BAR_BASELINE = 0.2;
 
 export interface ComposerMicButtonProps {
   onTranscript: (text: string) => void;
+  className?: string;
   /**
    * Streaming partial transcripts (server dictation only): called with the
    * revisable in-progress utterance as it forms, and with "" when the take
@@ -97,6 +98,7 @@ const isPermissionError = (error: unknown): boolean =>
 
 export const ComposerMicButton = ({
   onTranscript,
+  className,
   onInterim,
   disabled,
   lang = getDefaultDictationLang(),
@@ -495,6 +497,7 @@ export const ComposerMicButton = ({
         isListening &&
           "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
         error && "text-destructive",
+        className,
       )}
     >
       {isListening ? (

@@ -54,6 +54,11 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.helpers import (
+    commit_landing_workspace_picker,
+    open_landing_workspace_picker,
+)
+
 # Stubbed host the composer auto-selects (the tunneled runner registers no
 # host). Keyed identically in the recent-workspaces localStorage seed.
 _HOST_ID = "host_e2e"
@@ -2673,14 +2678,13 @@ async def _drive_folder_selection(base_url: str, session_id: str) -> None:
             )
 
             # Open the file browser and navigate into the "projects" folder.
-            await page.get_by_test_id("new-chat-landing-workspace-chip").click()
-            await expect(page.get_by_test_id("workspace-picker")).to_be_visible()
+            await open_landing_workspace_picker(page)
             await page.get_by_test_id("workspace-picker-entry-projects").click()
             # The child listing confirms we navigated in.
             await expect(page.get_by_test_id("workspace-picker-entry-src")).to_be_visible()
+            await commit_landing_workspace_picker(page)
 
-            # Filling the message clicks outside the popover, closing it; the
-            # chip now shows the navigated folder.
+            # The explicit Select action commits the navigated folder.
             await page.get_by_test_id("new-chat-landing-input").fill("explore the project")
             await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
                 "projects"
@@ -2786,8 +2790,7 @@ async def _drive_create_folder(base_url: str, session_id: str) -> None:
 
             # Open the picker and navigate into "projects" so the new folder
             # has a resolved absolute parent to be created under.
-            await page.get_by_test_id("new-chat-landing-workspace-chip").click()
-            await expect(page.get_by_test_id("workspace-picker")).to_be_visible()
+            await open_landing_workspace_picker(page)
             await page.get_by_test_id("workspace-picker-entry-projects").click()
             await expect(page.get_by_test_id("workspace-picker-entry-src")).to_be_visible()
 
@@ -2799,9 +2802,9 @@ async def _drive_create_folder(base_url: str, session_id: str) -> None:
             # The picker POSTs the joined path and drops into the new folder.
             await _wait_until(lambda: len(create_dir_bodies) == 1)
             assert create_dir_bodies[0]["path"] == "/home/e2e/projects/new-app", create_dir_bodies
+            await commit_landing_workspace_picker(page)
 
-            # Filling the message closes the popover; the chip now shows the
-            # folder we just created.
+            # The explicit Select action commits the folder we just created.
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
                 "new-app"
@@ -2892,8 +2895,7 @@ async def _drive_type_tilde_path(base_url: str, session_id: str) -> None:
             )
 
             # Open the browser and type a ~-relative path, then commit with Enter.
-            await page.get_by_test_id("new-chat-landing-workspace-chip").click()
-            await expect(page.get_by_test_id("workspace-picker")).to_be_visible()
+            await open_landing_workspace_picker(page)
             path_input = page.get_by_test_id("workspace-picker-path-input")
             await path_input.fill("~/Desktop")
             await path_input.press("Enter")
@@ -2902,9 +2904,9 @@ async def _drive_type_tilde_path(base_url: str, session_id: str) -> None:
             # child confirms we're inside /home/e2e/Desktop (pre-fix the bar
             # reverted to /home/e2e and this row never appeared).
             await expect(page.get_by_test_id("workspace-picker-entry-notes")).to_be_visible()
+            await commit_landing_workspace_picker(page)
 
-            # Filling the message closes the popover; the chip follows the
-            # navigated folder.
+            # The explicit Select action commits the tilde-expanded directory.
             await page.get_by_test_id("new-chat-landing-input").fill("explore the desktop")
             await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
                 "Desktop"
@@ -2989,8 +2991,7 @@ async def _drive_type_nonexistent_path(base_url: str, session_id: str) -> None:
             )
 
             # Open the browser; the valid home listing shows Desktop.
-            await page.get_by_test_id("new-chat-landing-workspace-chip").click()
-            await expect(page.get_by_test_id("workspace-picker")).to_be_visible()
+            await open_landing_workspace_picker(page)
             await expect(page.get_by_test_id("workspace-picker-entry-Desktop")).to_be_visible()
 
             # Type a nonexistent path and commit with Enter.

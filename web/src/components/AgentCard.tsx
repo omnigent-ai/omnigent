@@ -28,7 +28,7 @@ import { AgentHoverCard } from "@/components/AgentHoverCard";
  * @param agent - The catalog entry to render.
  * @returns The icon component to render for the agent.
  */
-function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGElement>> {
+export function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGElement>> {
   if (agent.name === "nessie") return NessieIcon;
   const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
   if (nativeAgent?.iconKind === "claude") return ClaudeIcon;

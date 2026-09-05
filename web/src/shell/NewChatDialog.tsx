@@ -16,9 +16,8 @@ import {
   FileTextIcon,
   FolderIcon,
   ImageIcon,
-  PaperclipIcon,
+  HandIcon,
   PlusIcon,
-  SettingsIcon,
   ShuffleIcon,
   TriangleAlertIcon,
   XIcon,
@@ -40,6 +39,7 @@ import {
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { iconForAgent } from "@/components/AgentCard";
 import { showToast } from "@/components/ui/toast";
 import {
   CLAUDE_NATIVE_EFFORTS,
@@ -1020,8 +1020,8 @@ export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
  * The home-page ("/") landing composer.
  *
  * Owns session creation end-to-end: the textarea is the first message and the
- * configuration chips (host, working directory, git worktree) plus the agent
- * picker supply every required parameter. Hitting send POSTs /v1/sessions and
+ * workspace shell plus the compact host, permission, and agent controls supply
+ * every required parameter. Hitting send POSTs /v1/sessions and
  * navigates to the new session — there is no modal.
  */
 /** Group / section header inside the picker dropdown (plain div, so Radix
@@ -1031,6 +1031,17 @@ function PickerSectionHeader({ children }: { children: ReactNode }) {
     <div className="px-2 pt-1.5 pb-0.5 text-sm font-medium text-muted-foreground">{children}</div>
   );
 }
+
+function visibleModelLabel(label: string): string {
+  return label.replaceAll("`", "");
+}
+
+function compactHarnessTriggerValue(value: string): string {
+  const defaultModel = /^Default \((.*)\)$/.exec(value)?.[1] ?? value;
+  return defaultModel.replace(/ \([^()]*context[^()]*\)$/i, "");
+}
+
+const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
 
 /**
  * Unified two-level agent/harness picker for the landing composer.
@@ -1075,6 +1086,9 @@ export function AgentHarnessPicker({
   triggerClassName,
   triggerLabelClassName,
   triggerTooltip,
+  triggerDetails = EMPTY_HARNESS_TRIGGER_DETAILS,
+  triggerIcon,
+  selectedConfigContent,
   autoHarnessAvailable = false,
   autoHarnessActive = false,
   onSelectAutoHarness,
@@ -1119,6 +1133,12 @@ export function AgentHarnessPicker({
   /** Hover text explaining the current pick, when the label alone doesn't say
    *  what runs (e.g. "Auto"). Omitted → no tooltip, as before. */
   triggerTooltip?: string;
+  /** Model / effort values joined inside the harness trigger. */
+  triggerDetails?: readonly { label: string; value: string }[];
+  /** Harness glyph rendered before the joined model / effort label. */
+  triggerIcon?: ReactNode;
+  /** Integrated configuration menu for the currently selected entry. */
+  selectedConfigContent?: ReactNode;
   /** Whether the top-level Smart Routing row is offered (routing enabled and
    *  both native CLIs ready). Defaults off, so an embedder that doesn't wire
    *  routing never shows it. */
@@ -1136,6 +1156,21 @@ export function AgentHarnessPicker({
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
   const collapsedBadge = isFeatureEnabled(info, "harness_install");
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const triggerModel = triggerDetails.find((detail) => detail.label === "Model");
+  const triggerEffort = triggerDetails.find(
+    (detail) => detail.label === "Effort" || detail.label === "Thinking level",
+  );
+  const triggerModelText = triggerModel ? compactHarnessTriggerValue(triggerModel.value) : "";
+  const triggerEffortText = triggerEffort ? compactHarnessTriggerValue(triggerEffort.value) : "";
+  const visibleModelText = triggerModelText === "Default" ? "" : triggerModelText;
+  const visibleEffortText =
+    triggerEffortText === "Default" || triggerEffortText === "—" ? "" : triggerEffortText;
+  const triggerAccessibleDetails = triggerDetails
+    .map((detail) => `${detail.label} ${compactHarnessTriggerValue(detail.value)}`)
+    .join(", ");
+  const triggerAccessibleName = [hasAgents ? agentLabel : "No agents", triggerAccessibleDetails]
+    .filter(Boolean)
+    .join(", ");
 
   // Touch devices can't hover, so the desktop submenu flyouts ("More",
   // "Custom agents") are unreachable there. On mobile we swap the dropdown's
@@ -1143,7 +1178,7 @@ export function AgentHarnessPicker({
   // Back row), instead of opening a hover flyout. `mobilePage` is the open
   // group (null = the main list); inert on desktop.
   const isMobile = useIsMobileViewport();
-  const [mobilePage, setMobilePage] = useState<"more" | "custom" | null>(null);
+  const [mobilePage, setMobilePage] = useState<"more" | "custom" | "config" | null>(null);
   // Reset to the main list whenever the menu closes so it never reopens on a
   // stale drill-in page.
   useEffect(() => {
@@ -1151,8 +1186,7 @@ export function AgentHarnessPicker({
   }, [open]);
 
   // The agent name + optional short blurb, with the full spec description on
-  // hover. Run-config knobs now live in the gear-icon config modal, not here —
-  // this picker only selects the agent / harness.
+  // hover. Run-config knobs live in the selected entry's integrated submenu.
   const renderRowInner = (agent: AvailableAgent, withTooltip: boolean) => {
     const blurb = AGENT_PICKER_DESCRIPTIONS[agent.name];
     const inner = (
@@ -1178,12 +1212,61 @@ export function AgentHarnessPicker({
       </Badge>
     ) : null;
 
-  // Each entry is a plain selectable row — selecting commits the pick and
-  // closes the menu. Run-config knobs moved to the gear-icon config modal.
   const renderEntry = (agent: AvailableAgent): ReactNode => {
     // Smart Routing binds a placeholder agent for the create call, so its own
     // row owns the active state while it's picked.
     const active = !autoHarnessActive && agent.id === effectiveAgentId;
+    if (active && selectedConfigContent) {
+      const details = triggerDetails.map((detail) => detail.value).join(" ");
+      const configLabel = (
+        <span
+          className="flex max-w-32 shrink-0 items-center gap-1 truncate text-sm text-muted-foreground"
+          data-testid={`new-chat-landing-agent-config-${agent.id}`}
+        >
+          {details}
+          {!isMobile && <span className="text-xs">Edit</span>}
+        </span>
+      );
+      if (isMobile) {
+        return (
+          <DropdownMenuItem
+            key={agent.id}
+            data-testid={`new-chat-landing-agent-${agent.id}`}
+            data-active="true"
+            onSelect={(event) => {
+              event.preventDefault();
+              setMobilePage("config");
+            }}
+            className="items-center data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+          >
+            {renderRowInner(agent, true)}
+            {renderBadge(agent)}
+            {configLabel}
+            <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
+          </DropdownMenuItem>
+        );
+      }
+      return (
+        <DropdownMenuSub key={agent.id}>
+          <DropdownMenuSubTrigger
+            data-testid={`new-chat-landing-agent-${agent.id}`}
+            data-active="true"
+            className="cursor-pointer items-center data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+          >
+            {renderRowInner(agent, true)}
+            {renderBadge(agent)}
+            {configLabel}
+          </DropdownMenuSubTrigger>
+          <DropdownMenuSubContent
+            sideOffset={4}
+            collisionPadding={12}
+            className="max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.625rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto [&_[role=menuitem]]:min-h-6 [&_[role=menuitem]]:py-0.5"
+          >
+            {selectedConfigContent}
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
+      );
+    }
     return (
       <DropdownMenuItem
         key={agent.id}
@@ -1285,12 +1368,14 @@ export function AgentHarnessPicker({
   // list refresh — can't strand the menu on an empty page).
   const showMore = isMobile && mobilePage === "more" && moreHarnessEntries.length > 0;
   const showCustom = isMobile && mobilePage === "custom" && hasCustomGroup;
+  const showConfig = isMobile && mobilePage === "config" && selectedConfigContent != null;
   // If the open page's group disappears (or the viewport grows to desktop),
   // fall back to the main list so a reopened menu never lands on an empty page.
   useEffect(() => {
     if (mobilePage === "more" && !showMore) setMobilePage(null);
     if (mobilePage === "custom" && !showCustom) setMobilePage(null);
-  }, [mobilePage, showMore, showCustom]);
+    if (mobilePage === "config" && !showConfig) setMobilePage(null);
+  }, [mobilePage, showMore, showCustom, showConfig]);
 
   return (
     <DropdownMenu
@@ -1316,6 +1401,7 @@ export function AgentHarnessPicker({
           size="sm"
           disabled={!hasAgents}
           data-testid="new-chat-landing-agent-select"
+          aria-label={triggerAccessibleName}
           title={triggerTooltip}
           // Drop the Button's focus-visible ring/border that otherwise shows
           // when focus returns to the trigger after a pick. `triggerClassName`
@@ -1326,12 +1412,29 @@ export function AgentHarnessPicker({
             triggerClassName,
           )}
         >
+          {triggerIcon}
           <span
-            className={cn("max-w-[12rem] truncate text-ui text-foreground", triggerLabelClassName)}
+            className={cn("inline-flex min-w-0 items-baseline gap-1", triggerLabelClassName)}
+            data-testid="new-chat-landing-agent-config-value"
           >
-            {hasAgents ? agentLabel : "No agents"}
+            {(visibleModelText || triggerModel === undefined) && (
+              <span
+                className="min-w-0 truncate text-ui font-medium text-foreground"
+                data-testid="new-chat-landing-agent-model-value"
+              >
+                {visibleModelText || (hasAgents ? agentLabel : "No agents")}
+              </span>
+            )}
+            {visibleEffortText && (
+              <span
+                className="hidden shrink-0 text-ui font-normal text-muted-foreground md:inline"
+                data-testid="new-chat-landing-agent-effort-value"
+              >
+                {visibleEffortText}
+              </span>
+            )}
           </span>
-          <ChevronDownIcon className="size-3.5 opacity-60" />
+          <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent
@@ -1349,7 +1452,23 @@ export function AgentHarnessPicker({
           contentClassName,
         )}
       >
-        {showMore ? (
+        {showConfig ? (
+          <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
+            <DropdownMenuItem
+              data-testid="new-chat-landing-page-back"
+              onSelect={(event) => {
+                event.preventDefault();
+                setMobilePage(null);
+              }}
+              className="items-center font-medium"
+            >
+              <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
+              <span className="truncate">{agentLabel}</span>
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            {selectedConfigContent}
+          </div>
+        ) : showMore ? (
           // Mobile drill-in page for the "needs setup" harnesses.
           <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
             <DropdownMenuItem
@@ -1713,11 +1832,19 @@ function HarnessConfigModal({
   const configTitleName = autoNative ? SMART_ROUTING_LABEL : agent.display_name;
   const modelValue = smartRoutingOn ? MODEL_SELECT_SMART : draftModel || MODEL_SELECT_DEFAULT;
   const claudeModelSelectOptions = useMemo(
-    () => claudeModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
+    () =>
+      claudeModelOptions.map((m) => ({
+        id: m.id,
+        label: visibleModelLabel(nativeModelLabel(m)),
+      })),
     [claudeModelOptions],
   );
   const codexModelSelectOptions = useMemo(
-    () => codexModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
+    () =>
+      codexModelOptions.map((m) => ({
+        id: m.id,
+        label: visibleModelLabel(nativeModelLabel(m)),
+      })),
     [codexModelOptions],
   );
   // The host catalog re-polls while the modal is open (a provider switch under
@@ -1895,7 +2022,7 @@ function HarnessConfigModal({
                   offerSmartRouting={smartRoutingEligible}
                   testId="new-chat-landing-config-model"
                   models={claudeModelSelectOptions}
-                  defaultLabel={defaultModelLabel(claudeModelOptions)}
+                  defaultLabel={visibleModelLabel(defaultModelLabel(claudeModelOptions))}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
                   componentId="new_chat.config.model"
                 >
@@ -1968,7 +2095,7 @@ function HarnessConfigModal({
                   offerSmartRouting={smartRoutingEligible}
                   testId="new-chat-landing-config-model"
                   models={codexModelSelectOptions}
-                  defaultLabel={defaultModelLabel(codexModelOptions)}
+                  defaultLabel={visibleModelLabel(defaultModelLabel(codexModelOptions))}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
                   componentId="new_chat.config.model"
                 >
@@ -2663,6 +2790,7 @@ export function NewChatLandingScreen() {
   }, []);
   // Controls the working-directory popover so picking a directory closes it.
   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
+  const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
   // Controlled so selecting an existing worktree can close the popover.
   const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -3174,13 +3302,24 @@ export function NewChatLandingScreen() {
     if (supportsModelPicker && !supportsPermissionMode) {
       const modelValue =
         piModelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
-      return [{ label: "Model", value: modelValue }, ...sourceRows(piModelOptions)];
+      const thinkingLevelValue = !pickedEffort
+        ? "Default"
+        : (PI_NATIVE_EFFORTS.find((effort) => effort.value === pickedEffort)?.label ?? "Default");
+      return [
+        { label: "Model", value: modelValue },
+        ...(selectedNativeHarness === "pi-native"
+          ? [{ label: "Thinking level", value: thinkingLevelValue }]
+          : []),
+        ...sourceRows(piModelOptions),
+      ];
     }
     if (supportsPermissionMode) {
-      const modelValue = routingOn
-        ? SMART_ROUTING_LABEL
-        : (claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ??
-          defaultModelLabel(claudeModelOptions));
+      const modelValue = visibleModelLabel(
+        routingOn
+          ? SMART_ROUTING_LABEL
+          : (claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ??
+              defaultModelLabel(claudeModelOptions)),
+      );
       // Routing picks the model + effort per turn, so mirror the modal's frozen
       // Effort row: an em-dash when routing is on, else the picked level.
       const effortValue = routingOn
@@ -3221,9 +3360,11 @@ export function NewChatLandingScreen() {
           : [
               {
                 label: "Model",
-                value: pickedCodexRow
-                  ? nativeModelLabel(pickedCodexRow)
-                  : defaultModelLabel(codexModelOptions),
+                value: visibleModelLabel(
+                  pickedCodexRow
+                    ? nativeModelLabel(pickedCodexRow)
+                    : defaultModelLabel(codexModelOptions),
+                ),
               },
             ];
       return [
@@ -3271,7 +3412,129 @@ export function NewChatLandingScreen() {
     cursorExecMode,
     agySkipMode,
     pickedHarness,
+    selectedNativeHarness,
   ]);
+  const harnessTriggerDetails = configSummary.filter(
+    (row) => row.label === "Model" || row.label === "Effort" || row.label === "Thinking level",
+  );
+  const permissionConfigRow = configSummary.find(
+    (row) => row.label === "Permissions" || row.label === "Approval" || row.label === "Mode",
+  );
+  const pickerModelOptions = supportsPermissionMode
+    ? claudeModelOptions
+    : selectedNativeHarness === "pi-native"
+      ? piModelOptions
+      : selectedNativeHarness === "codex-native"
+        ? codexModelOptions
+        : [];
+  const pickerEffortOptions = supportsPermissionMode
+    ? CLAUDE_NATIVE_EFFORTS
+    : selectedNativeHarness === "pi-native"
+      ? PI_NATIVE_EFFORTS
+      : [];
+  const selectPickerModel = (model: string) => {
+    if (!selectedNativeHarness) return;
+    if (model === MODEL_SELECT_SMART) {
+      setPickedModel("");
+      setPickedEffort("");
+      setCostControlMode("on");
+      writeHarnessOption(selectedNativeHarness, { routing: "on", model: "", effort: "" });
+      return;
+    }
+    const picked = model === MODEL_SELECT_DEFAULT ? "" : model;
+    setPickedModel(picked);
+    setCostControlMode(null);
+    writeHarnessOption(selectedNativeHarness, { model: picked, routing: "off" });
+  };
+  const selectPickerEffort = (effort: string) => {
+    if (!selectedNativeHarness) return;
+    const picked = effort === EFFORT_SELECT_NONE ? "" : effort;
+    setPickedEffort(picked);
+    writeHarnessOption(selectedNativeHarness, { effort: picked });
+  };
+  const selectedConfigContent = selectedAgentHasKnobs ? (
+    <>
+      {pickerModelOptions.length > 0 && (
+        <div data-testid="new-chat-landing-agent-models">
+          <PickerSectionHeader>Models</PickerSectionHeader>
+          {smartRoutingEligible && (
+            <DropdownMenuItem
+              data-testid="new-chat-landing-agent-model-smart-routing"
+              onSelect={() => selectPickerModel(MODEL_SELECT_SMART)}
+            >
+              {SMART_ROUTING_LABEL}
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem
+            data-testid="new-chat-landing-agent-model-default"
+            onSelect={() => selectPickerModel(MODEL_SELECT_DEFAULT)}
+          >
+            Default
+          </DropdownMenuItem>
+          {pickerModelOptions.map((option) => (
+            <DropdownMenuItem
+              key={option.id}
+              data-testid={`new-chat-landing-agent-model-${option.id}`}
+              onSelect={() => selectPickerModel(option.id)}
+            >
+              {visibleModelLabel(nativeModelLabel(option))}
+            </DropdownMenuItem>
+          ))}
+        </div>
+      )}
+      {pickerEffortOptions.length > 0 && (
+        <div data-testid="new-chat-landing-agent-efforts">
+          <DropdownMenuSeparator />
+          <PickerSectionHeader>
+            {selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort"}
+          </PickerSectionHeader>
+          <DropdownMenuItem
+            data-testid="new-chat-landing-agent-effort-default"
+            onSelect={() => selectPickerEffort(EFFORT_SELECT_NONE)}
+          >
+            Default
+          </DropdownMenuItem>
+          {pickerEffortOptions.map((option) => (
+            <DropdownMenuItem
+              key={option.value}
+              data-testid={`new-chat-landing-agent-effort-${option.value}`}
+              onSelect={() => selectPickerEffort(option.value)}
+            >
+              {option.label}
+            </DropdownMenuItem>
+          ))}
+        </div>
+      )}
+      <DropdownMenuSeparator />
+      <DropdownMenuItem
+        data-testid="new-chat-landing-config-gear"
+        onSelect={() => setConfigOpen(true)}
+      >
+        Advanced settings
+      </DropdownMenuItem>
+    </>
+  ) : null;
+  const directModeOptions = smartRoutingHarnessSelected
+    ? []
+    : supportsPermissionMode
+      ? CLAUDE_NATIVE_PERMISSION_MODES
+      : supportsApprovalMode
+        ? CODEX_NATIVE_APPROVAL_MODES
+        : supportsCursorMode
+          ? CURSOR_NATIVE_EXEC_MODES
+          : supportsAgySkipPermissions
+            ? AGY_NATIVE_SKIP_MODES
+            : [];
+  const selectDirectMode = (mode: string) => {
+    if (!selectedNativeHarness) return;
+    if (supportsPermissionMode) setPermissionMode(mode);
+    else if (supportsApprovalMode) {
+      setApprovalMode(mode);
+      setBypassSandbox(false);
+    } else if (supportsCursorMode) setCursorExecMode(mode);
+    else if (supportsAgySkipPermissions) setAgySkipMode(mode);
+    writeHarnessOption(selectedNativeHarness, { mode });
+  };
   // Reset per-agent-instance run-config that must not carry across an agent
   // change. The DANGEROUS Codex bypass re-opts-in per context (matching the
   // store's fork / agent-switch behavior; CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
@@ -3989,9 +4252,10 @@ export function NewChatLandingScreen() {
       : sandboxSelected
         ? selectedSandboxLabel
         : (selectedHostDisplayName ?? (onlineHosts.length === 0 ? "No hosts" : "Choose host"));
-  // The chip shows just the branch (the "(existing)" distinction lives in the
-  // popover's warning; appending it here only gets clipped by the chip's cap).
-  const worktreeLabel = branchName.trim() || "Worktree";
+  const worktreeControlAvailable =
+    !sandboxSelected &&
+    (branchName.trim() !== "" ||
+      (worktreesEnabled && (hostWorktrees === undefined || hostWorktrees.length > 0)));
   // Sandbox repository chip label: repo name (server's clone-dir rule)
   // plus the pinned branch, e.g. "repo#main"; placeholder when unset.
   const sandboxRepoName = deriveRepoName(sandboxRepoUrl);
@@ -4021,6 +4285,17 @@ export function NewChatLandingScreen() {
       : configuredAgentUnavailable
         ? "Agent unavailable"
         : "Select agent";
+  const harnessTriggerTooltipDetails = [
+    ...harnessTriggerDetails,
+    ...configSummary.filter((detail) => detail.label === "Connection"),
+  ];
+  const harnessTriggerTitle = [
+    agentLabel,
+    ...harnessTriggerTooltipDetails.map(
+      (detail) => `${detail.label} ${compactHarnessTriggerValue(detail.value)}`,
+    ),
+  ].join(", ");
+  const SelectedAgentIcon = selectedAgent ? iconForAgent(selectedAgent) : null;
 
   // Wrap the harness setter so every explicit pick is persisted to
   // localStorage. The caller can pass an explicit `agentId` for the
@@ -4690,32 +4965,29 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <button
       type="button"
-      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+      aria-label={`Working directory: ${workspaceTrimmed || "Not selected"}`}
+      className="relative z-0 mx-4 -mb-px flex h-8 w-[calc(100%-2rem)] cursor-pointer items-center gap-2 rounded-t-2xl border border-border bg-muted/70 px-3 text-sm font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
       data-testid="new-chat-landing-workspace-chip"
     >
       <FolderIcon className="ui-icon" />
-      {/* Label collapses to icon-only on narrow viewports (mobile). Capped
-          tight so a long working-directory path truncates instead of pushing
-          the chip row onto a second line. */}
-      <span className="hidden max-w-40 truncate text-sm sm:block">{workspaceLabel}</span>
+      <span className="min-w-0 flex-1 truncate text-left text-sm">{workspaceLabel}</span>
       <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
     </button>
   );
 
   return (
-    // pb-12 lifts the content slightly above the geometric center, where
-    // the hero reads better optically.
+    // pb-24 lifts the centered hero and composer by 48px for optical balance.
     <div
       ref={setLandingSurface}
-      className="relative flex flex-1 items-center justify-center"
+      className="relative flex flex-1 items-center justify-center pb-24"
       data-testid="new-chat-landing"
     >
-      {/* Padding lives inside the 840px cap, so the composer renders at
-          840 − 80 = 760px max on desktop. px-4 on phones (16px gutters)
+      {/* Padding lives inside the 800px cap, so the composer renders at
+          800 − 80 = 720px max on desktop. px-4 on phones (16px gutters)
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
-      <div className="flex w-full max-w-[840px] flex-col items-center gap-6 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex w-full flex-col items-center justify-center gap-3.5">
+      <div className="flex w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-16 md:select-none md:px-10">
+        <div className="mb-6 flex w-full flex-col items-center justify-center gap-3.5">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the project's
             // icon — the default pink folder, or a chosen emoji — and name the
@@ -4745,7 +5017,57 @@ export function NewChatLandingScreen() {
         </div>
         {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
-        <div className="relative flex w-full flex-col gap-1">
+        <div
+          className="relative flex w-full flex-col gap-0"
+          data-testid="new-chat-landing-composer-surface"
+        >
+          {!sandboxSelected && (
+            <Popover open={workspacePopoverOpen} onOpenChange={setWorkspacePopoverOpen}>
+              <PopoverTrigger asChild>{workspaceChip}</PopoverTrigger>
+              <PopoverContent
+                align="start"
+                sideOffset={4}
+                className="w-[31rem] max-w-[calc(100vw-2rem)] gap-1 p-1.5"
+              >
+                {recent.length > 0 && (
+                  <>
+                    <div className="px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                      Recents
+                    </div>
+                    {recent.map((path, index) => (
+                      <button
+                        key={path}
+                        type="button"
+                        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted"
+                        onClick={() => {
+                          workspaceFromConfigRef.current = false;
+                          setWorkspace(path);
+                          setWorkspacePopoverOpen(false);
+                        }}
+                        data-testid={`new-chat-landing-workspace-recent-${index}`}
+                      >
+                        <FolderIcon className="size-4 shrink-0 text-muted-foreground" />
+                        <span className="truncate">{path}</span>
+                      </button>
+                    ))}
+                    <div className="my-1 h-px bg-border" />
+                  </>
+                )}
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted"
+                  onClick={() => {
+                    setWorkspacePopoverOpen(false);
+                    setWorkspacePickerOpen(true);
+                  }}
+                  data-testid="new-chat-landing-workspace-open-folder"
+                >
+                  <FolderIcon className="size-4 shrink-0 text-muted-foreground" />
+                  Open folder
+                </button>
+              </PopoverContent>
+            </Popover>
+          )}
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -4756,7 +5078,7 @@ export function NewChatLandingScreen() {
             // dark:bg-card-solid stays opaque so dark glass --card doesn't show
             // through. Drag-over keeps its separate inset ring.
             className={cn(
-              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+              "relative z-10 flex min-h-[105px] w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
               isDragActive && "ring-2 ring-ring ring-inset",
             )}
             data-testid="new-chat-landing-composer"
@@ -4922,7 +5244,7 @@ export function NewChatLandingScreen() {
                 // inside them): max 200px = the spec's 180px of content.
                 // A 60px floor holds two 20px lines plus that padding;
                 // useAutoGrowTextarea expands from there to the unchanged cap.
-                className="block min-h-[60px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui leading-5 text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground md:select-text [&::-webkit-scrollbar]:hidden"
+                className="block min-h-[52px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-1 text-ui leading-5 text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground md:select-text [&::-webkit-scrollbar]:hidden"
               />
               {/* Gated on an empty draft so it reads as the placeholder.
                   pointer-events-none lets clicks fall through to focus the
@@ -5022,43 +5344,620 @@ export function NewChatLandingScreen() {
                 here would also catch the .dark .bg-card glass rule (border +
                 shadow) and visually split the pill in half. */}
             <div
-              className="flex items-center justify-between px-2 pb-2"
+              className="mt-2 flex min-w-0 items-center justify-between gap-2 px-2 pt-1 pb-0"
               data-testid="new-chat-landing-actions"
             >
-              {/* Attach + dictate — left side, mirroring the in-session composer. */}
-              <div className="flex items-center gap-0.5">
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="size-9 md:size-8"
-                  disabled={creating}
-                  onClick={() => fileInputRef.current?.click()}
-                  title="Attach files"
-                  data-testid="new-chat-landing-attach"
-                  componentId="new_chat.attach_files"
-                >
-                  <PaperclipIcon className="size-4" data-icon-size="16" />
-                  <span className="sr-only">Attach files</span>
-                </Button>
-                <ComposerMicButton
-                  enableHotkey
-                  disabled={creating}
-                  onVoiceStart={() => {
-                    voiceSnapshotRef.current = message;
+              <div
+                className="flex min-w-0 flex-1 items-center gap-1 overflow-visible"
+                data-testid="new-chat-landing-left-controls"
+              >
+                <div className="flex shrink-0 items-center">
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="size-8 md:size-7"
+                    disabled={creating}
+                    onClick={() => fileInputRef.current?.click()}
+                    title="Attach files"
+                    data-testid="new-chat-landing-attach"
+                    componentId="new_chat.attach_files"
+                  >
+                    <PlusIcon
+                      className="size-4"
+                      data-icon-size="16"
+                      data-testid="new-chat-landing-attach-icon"
+                    />
+                    <span className="sr-only">Attach files</span>
+                  </Button>
+                </div>
+                {/* Host chip */}
+                <DropdownMenu
+                  onOpenChange={(open) => {
+                    // Run a requested "connect this machine" only once the menu
+                    // has closed.
+                    if (!open && pendingConnectRef.current) {
+                      pendingConnectRef.current = false;
+                      void connectThisMachine();
+                    }
+                    if (!open && pendingArcaConnectRef.current) {
+                      pendingArcaConnectRef.current = false;
+                      void connectArca();
+                    }
                   }}
-                  onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
-                  onTranscript={dictation.appendFinal}
-                  onInterim={dictation.replaceInterim}
-                />
+                >
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label={`Host: ${hostLabel}${
+                        !sandboxSelected && selectedHost != null
+                          ? `, ${selectedHost.status === "online" ? "Online" : "Offline"}`
+                          : ""
+                      }`}
+                      title={`Host: ${hostLabel}${
+                        !sandboxSelected && selectedHost != null
+                          ? `, ${selectedHost.status === "online" ? "Online" : "Offline"}`
+                          : ""
+                      }`}
+                      className="flex h-8 shrink-0 cursor-pointer items-center gap-1 rounded-lg bg-transparent px-1.5 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground dark:hover:bg-muted/50 md:h-7"
+                      data-testid="new-chat-landing-host-chip"
+                    >
+                      <span
+                        aria-hidden
+                        className={`size-1 shrink-0 rounded-full ${
+                          selectedHost?.status === "online" && !sandboxSelected
+                            ? "bg-success"
+                            : "bg-muted-foreground/40"
+                        }`}
+                        data-testid="new-chat-landing-host-status"
+                      />
+                      {isCloudHost ? (
+                        <MonitorCloudIcon
+                          className="size-3.5 shrink-0"
+                          data-testid="new-chat-landing-host-icon"
+                        />
+                      ) : (
+                        <MonitorIcon
+                          className="size-3.5 shrink-0"
+                          data-testid="new-chat-landing-host-icon"
+                        />
+                      )}
+                      <span className="sr-only">{hostLabel}</span>
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="min-w-52">
+                    {/* Server-provisioned sandbox — only advertised when
+                    /v1/info reports managed_sandboxes_enabled. Pinned
+                    first, above the connected-host list. */}
+                    {(managedSandboxesEnabled || showDisabledSandboxWithDocs) && (
+                      <>
+                        {managedSandboxesEnabled ? (
+                          sandboxProviderRows.map((provider, index) => (
+                            <DropdownMenuItem
+                              key={provider ?? "default"}
+                              onSelect={() => selectSandbox(provider)}
+                              // First row keeps the original testid; later
+                              // rows get a scoped one.
+                              data-testid={
+                                index === 0
+                                  ? "new-chat-landing-sandbox-option"
+                                  : `new-chat-landing-sandbox-option-${provider}`
+                              }
+                              data-active={
+                                sandboxSelected && sandboxProvider === provider ? "true" : undefined
+                              }
+                              className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                            >
+                              <span className="flex items-center gap-2">
+                                <MonitorCloudIcon className="size-4 text-muted-foreground" />
+                                <span className="text-sm">{sandboxOptionLabel(provider)}</span>
+                              </span>
+                            </DropdownMenuItem>
+                          ))
+                        ) : (
+                          <DropdownMenuItem
+                            aria-disabled="true"
+                            onSelect={(e) => e.preventDefault()}
+                            className="flex items-center justify-between px-2 py-1.5 text-sm text-muted-foreground opacity-60"
+                            data-testid="new-chat-landing-sandbox-option-disabled"
+                          >
+                            <span className="flex items-center gap-2">
+                              <MonitorCloudIcon className="size-4 text-muted-foreground" />
+                              <span className="text-sm">New Sandbox</span>
+                            </span>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <button
+                                  type="button"
+                                  className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/80 hover:text-foreground"
+                                  aria-label="Why New Sandbox is unavailable"
+                                  onClick={(e) => e.stopPropagation()}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+                                  }}
+                                >
+                                  <CircleHelpIcon className="size-3.5" />
+                                </button>
+                              </TooltipTrigger>
+                              <TooltipContent className="max-w-64">
+                                {newSandboxTooltipContent}
+                              </TooltipContent>
+                            </Tooltip>
+                          </DropdownMenuItem>
+                        )}
+                        <DropdownMenuSeparator />
+                      </>
+                    )}
+                    {allHosts.length === 0 && !showConnectThisMachine && (
+                      <div className="px-2 py-1.5 text-sm text-muted-foreground">
+                        No hosts connected yet.
+                      </div>
+                    )}
+                    {onlineHosts.map((host) => (
+                      <DropdownMenuItem
+                        key={host.host_id}
+                        onSelect={() => selectHost(host.host_id)}
+                        data-testid={`new-chat-landing-host-${host.host_id}`}
+                        data-active={host.host_id === selectedHostId ? "true" : undefined}
+                        className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                      >
+                        <HostOption
+                          host={host}
+                          displayName={displayNameForHost(
+                            host,
+                            thisMachineHostId,
+                            navigator.userAgent,
+                          )}
+                          subtitle={host.host_id === arcaHostId ? "Arca instance" : undefined}
+                        />
+                      </DropdownMenuItem>
+                    ))}
+                    {offlineHosts.map((host) => {
+                      // This machine, offline: make the row itself the connect
+                      // affordance instead of a disabled entry + a duplicate "Run
+                      // on this machine" item. Connect after the menu closes.
+                      if (host.host_id === thisMachineHostId && canConnectThisMachine) {
+                        return (
+                          <DropdownMenuItem
+                            key={host.host_id}
+                            onSelect={() => {
+                              pendingConnectRef.current = true;
+                            }}
+                            disabled={connectingThisMachine}
+                            data-testid="new-chat-landing-run-on-this-machine"
+                            className="text-sm"
+                          >
+                            <HostOption
+                              host={host}
+                              displayName={displayNameForHost(
+                                host,
+                                thisMachineHostId,
+                                navigator.userAgent,
+                              )}
+                              subtitle={connectingThisMachine ? "connecting…" : "select to connect"}
+                            />
+                          </DropdownMenuItem>
+                        );
+                      }
+                      return (
+                        <DropdownMenuItem key={host.host_id} disabled className="text-sm">
+                          <HostOption
+                            host={host}
+                            displayName={displayNameForHost(
+                              host,
+                              thisMachineHostId,
+                              navigator.userAgent,
+                            )}
+                          />
+                        </DropdownMenuItem>
+                      );
+                    })}
+                    {/* Desktop shell, machine not in the list yet: offer to connect
+                    it in one click. */}
+                    {showConnectThisMachine && (
+                      <DropdownMenuItem
+                        onSelect={() => {
+                          pendingConnectRef.current = true;
+                        }}
+                        disabled={connectingThisMachine}
+                        data-testid="new-chat-landing-run-on-this-machine"
+                        className="gap-2 text-sm"
+                      >
+                        <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
+                        <span className="text-sm">
+                          {connectingThisMachine
+                            ? "Connecting this machine…"
+                            : "Run on this machine"}
+                        </span>
+                      </DropdownMenuItem>
+                    )}
+                    {/* Databricks-internal (MDM-gated): one flat action — run
+                    on the Arca instance, starting it first when it's down.
+                    Hidden entirely once the box is connected: its own
+                    (tagged) host row above covers it. */}
+                    {showArcaOption && (
+                      <DropdownMenuItem
+                        onSelect={() => {
+                          pendingArcaConnectRef.current = true;
+                        }}
+                        disabled={connectingArca}
+                        data-testid="new-chat-landing-run-on-arca"
+                        className="gap-2 text-sm"
+                      >
+                        <MonitorCloudIcon className="size-4 shrink-0 text-muted-foreground" />
+                        <span className="text-sm">
+                          {connectingArca ? "Connecting to Arca…" : "Run on Arca"}
+                        </span>
+                      </DropdownMenuItem>
+                    )}
+                    {(allHosts.length > 0 || showConnectThisMachine || showArcaOption) && (
+                      <DropdownMenuSeparator />
+                    )}
+                    {/* Persistent escape hatch: open the connect-a-host
+                    instructions. Present even with zero hosts so a fresh user
+                    is never stuck. */}
+                    <DropdownMenuItem
+                      onSelect={() => setConnectOpen(true)}
+                      data-testid="new-chat-landing-connect-host"
+                      className="gap-2 text-ui text-muted-foreground"
+                    >
+                      <PlusIcon className="size-3.5" />
+                      Connect new host
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+
+                {selectedAgent && permissionConfigRow && (
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <button
+                        type="button"
+                        className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-lg bg-transparent p-0 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 md:h-7 md:w-auto md:gap-1 md:px-2"
+                        aria-label={`${permissionConfigRow.label}: ${permissionConfigRow.value}`}
+                        title={`${permissionConfigRow.label}: ${permissionConfigRow.value}`}
+                        data-testid="new-chat-landing-permission-chip"
+                      >
+                        <HandIcon className="size-3 shrink-0" />
+                        <span className="hidden max-w-20 truncate text-ui font-normal md:block">
+                          {permissionConfigRow.value}
+                        </span>
+                        <ChevronDownIcon className="hidden size-4 shrink-0 opacity-60 md:block" />
+                      </button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent
+                      align="start"
+                      className="w-[13.75rem] min-w-0"
+                      data-testid="new-chat-landing-permission-menu"
+                    >
+                      <PickerSectionHeader>{permissionConfigRow.label}</PickerSectionHeader>
+                      {directModeOptions.map((option) => (
+                        <DropdownMenuItem
+                          key={option.value}
+                          onSelect={() => selectDirectMode(option.value)}
+                          data-testid={`new-chat-landing-permission-option-${option.value}`}
+                        >
+                          <span className="flex-1">{option.label}</span>
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                )}
+
+                {/* Sandbox repository chip — the sandbox counterpart of the
+                working-directory chip. There is no filesystem to browse
+                before the sandbox exists, so the workspace is specified as
+                a git repository URL (+ optional branch) the server clones
+                at create time. Blank = empty server-created workspace. */}
+                {sandboxSelected && (
+                  <Popover>
+                    <PopoverTrigger asChild>
+                      <button
+                        type="button"
+                        aria-label={`Sandbox repository: ${
+                          sandboxRepoName ? sandboxRepoLabel : "Not selected"
+                        }`}
+                        className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                        data-testid="new-chat-landing-repo-chip"
+                      >
+                        <GitBranchIcon className="ui-icon" />
+                        <span className="hidden max-w-40 truncate text-sm lg:block">
+                          {sandboxRepoLabel}
+                        </span>
+                        <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+                      </button>
+                    </PopoverTrigger>
+                    <PopoverContent align="start" className="w-96 p-3">
+                      <div className="flex flex-col gap-2">
+                        <div className="flex items-center gap-1.5">
+                          <label
+                            htmlFor="landing-repo-url"
+                            className="text-sm font-medium text-foreground"
+                          >
+                            Repository (optional)
+                          </label>
+                          {databricksGitCredentialsTooltipContent && (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <button
+                                  type="button"
+                                  className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground"
+                                  aria-label="How to set up Databricks git credentials"
+                                >
+                                  <CircleHelpIcon className="size-3.5" />
+                                </button>
+                              </TooltipTrigger>
+                              <TooltipContent className="max-w-64">
+                                {databricksGitCredentialsTooltipContent}
+                              </TooltipContent>
+                            </Tooltip>
+                          )}
+                        </div>
+                        {/* Connected-GitHub picker: choose one of the caller's
+                          repos + a branch, which fills the same URL/branch state
+                          the free-text inputs below drive. Only shown when the
+                          server advertises the GitHub App and the account is
+                          linked; otherwise the free-text URL is the only path. */}
+                        {showGithubRepoPicker && (
+                          <>
+                            <SandboxRepoCombobox
+                              repos={sandboxRepos}
+                              value={selectedSandboxRepo?.full_name ?? ""}
+                              onSelect={(repo) => {
+                                setSandboxRepoUrl(
+                                  repo
+                                    ? (repo.clone_url ?? `https://github.com/${repo.full_name}.git`)
+                                    : "",
+                                );
+                                // A new repo has its own branches — reset so a
+                                // stale branch never rides along.
+                                setSandboxRepoBranch("");
+                              }}
+                            />
+                            {sandboxReposTruncated && (
+                              <p
+                                className="text-sm text-muted-foreground"
+                                data-testid="new-chat-landing-repo-truncated"
+                              >
+                                Showing your most recently pushed repositories. Don't see one? Paste
+                                its URL below.
+                              </p>
+                            )}
+                            {selectedSandboxRepo && (
+                              <SandboxRepoBranchSelect
+                                fullName={selectedSandboxRepo.full_name}
+                                value={sandboxRepoBranch}
+                                defaultBranch={selectedSandboxRepo.default_branch}
+                                onChange={setSandboxRepoBranch}
+                              />
+                            )}
+                            <p className="text-sm text-muted-foreground">
+                              or paste a repository URL:
+                            </p>
+                          </>
+                        )}
+                        {/* Connected but the repo list failed to load: say so
+                          explicitly, so a transient error isn't mistaken for
+                          "GitHub not connected" (the picker just wouldn't render). */}
+                        {githubReposEnabled && sandboxReposErrored && !showGithubRepoPicker && (
+                          <p
+                            className="text-sm text-destructive"
+                            data-testid="new-chat-landing-repo-error"
+                          >
+                            Couldn't load your GitHub repositories. Paste a repository URL below.
+                          </p>
+                        )}
+                        <input
+                          id="landing-repo-url"
+                          type="text"
+                          value={sandboxRepoUrl}
+                          onChange={(e) => {
+                            // Editing the repo invalidates a branch picked for the
+                            // previous repo, so clear it (mirrors the repo select).
+                            setSandboxRepoUrl(e.target.value);
+                            setSandboxRepoBranch("");
+                          }}
+                          placeholder="https://github.com/org/repo"
+                          className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
+                          data-testid="new-chat-landing-repo-input"
+                        />
+                        <input
+                          type="text"
+                          value={sandboxRepoBranch}
+                          onChange={(e) => setSandboxRepoBranch(e.target.value)}
+                          placeholder="Branch (defaults to the repo's default)"
+                          aria-label="Repository branch"
+                          className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
+                          data-testid="new-chat-landing-repo-branch-input"
+                        />
+                        <p className="text-sm text-muted-foreground">
+                          Cloned into the sandbox as the session's working directory. Leave blank to
+                          start in an empty workspace.
+                        </p>
+                      </div>
+                    </PopoverContent>
+                  </Popover>
+                )}
+
+                {/* Git worktree chip — hidden for sandbox sessions (worktree
+                creation requires a caller-supplied host_id). */}
+                {worktreeControlAvailable && (
+                  <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
+                    <PopoverTrigger asChild>
+                      <button
+                        type="button"
+                        aria-label={`Worktree: ${branchName.trim() || "None"}`}
+                        title={`Worktree: ${branchName.trim() || "None"}`}
+                        className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-lg bg-transparent p-0 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground dark:hover:bg-muted/50 md:h-7 md:w-11 md:gap-1"
+                        data-testid="new-chat-landing-branch-chip"
+                      >
+                        <GitBranchIcon className="size-3.5 shrink-0" />
+                        <ChevronDownIcon className="hidden size-4 shrink-0 opacity-60 md:block" />
+                      </button>
+                    </PopoverTrigger>
+                    <PopoverContent
+                      align="start"
+                      collisionPadding={16}
+                      // No overflow clip here — the worktree dropdown floats as an
+                      // absolute overlay (below) and must be able to escape the
+                      // popover's padding box.
+                      className="w-[min(20rem,calc(100vw-2rem))] p-3"
+                    >
+                      <div className="flex flex-col gap-2">
+                        <label
+                          htmlFor="landing-branch-name"
+                          className="text-sm font-medium text-foreground"
+                        >
+                          Git worktree branch (optional)
+                        </label>
+                        {/* Help text sits above the field. The warning for a picked
+                        existing worktree stays below the input (contextual to the
+                        selection). */}
+                        <p className="text-sm text-muted-foreground">
+                          New branch name, or pick an existing worktree. Leave blank to start
+                          directly in the working directory.
+                        </p>
+                        {/* The branch field is a combobox: focusing it reveals the
+                        repo's existing worktrees, and typing filters them.
+                        Picking one starts in that worktree; a name matching none
+                        creates a new worktree. */}
+                        <div className="relative flex flex-col">
+                          <input
+                            id="landing-branch-name"
+                            type="text"
+                            value={branchName}
+                            onChange={(e) => setBranchName(e.target.value)}
+                            onFocus={() => setBranchInputFocused(true)}
+                            // Delay so a click on a dropdown option registers
+                            // before the list unmounts on blur.
+                            onBlur={() => setTimeout(() => setBranchInputFocused(false), 120)}
+                            placeholder="feature/my-branch"
+                            role="combobox"
+                            aria-expanded={branchInputFocused && filteredWorktrees.length > 0}
+                            aria-autocomplete="list"
+                            // Suppress the browser's native autofill dropdown so it
+                            // doesn't overlay our worktree combobox. `off` alone is
+                            // ignored by some browsers, so also disable spellcheck /
+                            // autocorrect and give it an unrecognized name.
+                            autoComplete="off"
+                            autoCorrect="off"
+                            autoCapitalize="off"
+                            spellCheck={false}
+                            name="omnigent-worktree-branch"
+                            // pr-9 leaves room for the generate button overlaid at
+                            // the right edge.
+                            className="rounded-md border border-input bg-background py-2 pr-9 pl-3 text-sm outline-none transition-colors focus-visible:border-ring"
+                            data-testid="new-chat-landing-branch-input"
+                          />
+                          {/* Fill a unique branch name for a throwaway worktree.
+                          onMouseDown so it fires before the input's blur closes
+                          the combobox and preventDefault keeps focus on the
+                          input. */}
+                          <button
+                            type="button"
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              generateBranchName();
+                            }}
+                            title="Generate a unique branch name"
+                            aria-label="Generate a unique branch name"
+                            className="absolute top-0 right-0 flex h-9 w-9 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
+                            data-testid="new-chat-landing-branch-generate"
+                          >
+                            <ShuffleIcon className="size-4" />
+                          </button>
+                          {branchInputFocused && filteredWorktrees.length > 0 && (
+                            <div
+                              // Floats over the popover as a combobox popup, so it
+                              // doesn't stretch the box. Bounded height + internal
+                              // scroll keep it from running off the viewport.
+                              className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-[12px] border border-border bg-popover p-2 shadow-menu"
+                              data-testid="new-chat-landing-worktree-dropdown"
+                            >
+                              <span className="px-1.5 py-1 text-sm font-medium text-muted-foreground">
+                                Existing worktrees
+                              </span>
+                              <ul className="flex flex-col gap-0.5">
+                                {filteredWorktrees.map((w) => {
+                                  const selected =
+                                    normalizeWorkspacePath(w.path) ===
+                                    normalizeWorkspacePath(workspaceTrimmed);
+                                  return (
+                                    <li key={w.path}>
+                                      <button
+                                        type="button"
+                                        // onMouseDown (not onClick): fires before the
+                                        // input's blur, so the selection lands even
+                                        // though blur is about to hide the list.
+                                        onMouseDown={(e) => {
+                                          e.preventDefault();
+                                          workspaceFromConfigRef.current = false;
+                                          setWorkspace(w.path);
+                                          setBranchInputFocused(false);
+                                          setWorktreePopoverOpen(false);
+                                        }}
+                                        className={`flex w-full flex-col items-start gap-0.5 rounded-md px-1.5 py-1 text-left text-sm transition-colors hover:bg-muted dark:hover:bg-muted/50 ${
+                                          selected ? "bg-muted dark:bg-muted/50" : ""
+                                        }`}
+                                        data-testid="new-chat-landing-worktree-option"
+                                      >
+                                        <span className="font-medium text-foreground">
+                                          {w.branch ?? "(detached)"}
+                                        </span>
+                                        {/* Tail-truncated so the disambiguating
+                                      folder shows, not a shared prefix; full
+                                      path on hover. */}
+                                        <span
+                                          className="w-full truncate text-muted-foreground"
+                                          title={w.path}
+                                        >
+                                          {worktreePathTail(w.path)}
+                                        </span>
+                                      </button>
+                                    </li>
+                                  );
+                                })}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                        {/* Base branch only matters when creating a NEW worktree
+                        — hidden once the workspace points at an existing one
+                        (no worktree is created, so there's nothing to base). */}
+                        {branchName.trim() !== "" && !startInExistingWorktree && (
+                          <input
+                            type="text"
+                            value={baseBranch}
+                            onChange={(e) => setBaseBranch(e.target.value)}
+                            placeholder="Base branch (defaults to current)"
+                            aria-label="Base branch"
+                            className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
+                            data-testid="new-chat-landing-base-branch-input"
+                          />
+                        )}
+                        {startInExistingWorktree && (
+                          <p
+                            className="text-sm text-amber-600 dark:text-amber-500"
+                            data-testid="new-chat-landing-existing-worktree-warning"
+                          >
+                            Starts in existing worktree, edit the name to create a new one.
+                          </p>
+                        )}
+                      </div>
+                    </PopoverContent>
+                  </Popover>
+                )}
+
+                {/* The session's project membership (from a `?project=` landing)
+                is shown in the hero heading instead of a tray chip; filing on
+                create still uses `selectedProject`. */}
               </div>
-              <div className="flex items-center gap-0.5 md:gap-2">
-                <div className="flex items-center rounded-lg transition-colors has-[button:not(:disabled)]:hover:bg-muted dark:has-[button:not(:disabled)]:hover:bg-muted/50 has-aria-expanded:bg-muted dark:has-aria-expanded:bg-muted/50 [&>button]:bg-transparent!">
-                  {/* Agent / harness picker — selects the agent or harness only.
-                    Its run-config knobs (model / effort / permission mode for
-                    Claude Code, approval mode for Codex/OpenCode, exec mode for
-                    Cursor, brain-harness override for bundle agents) live in the
-                    gear-icon config modal beside it. */}
+              <div
+                className="flex shrink-0 items-center gap-1"
+                data-testid="new-chat-landing-right-controls"
+              >
+                <div className="flex min-w-0 items-center rounded-lg">
+                  {/* One trigger combines the harness glyph with model / effort;
+                    the selected entry's submenu owns run configuration. */}
                   <AgentHarnessPicker
                     agentEntries={agentEntries}
                     harnessEntries={harnessEntries}
@@ -5073,66 +5972,30 @@ export function NewChatLandingScreen() {
                     onCreateCustomAgent={() => setCreateAgentOpen(true)}
                     sandboxSelected={sandboxSelected}
                     triggerTooltip={
-                      smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
+                      smartRoutingHarnessSelected
+                        ? AUTO_HARNESS_DESCRIPTION
+                        : harnessTriggerDetails.length > 0
+                          ? harnessTriggerTitle
+                          : undefined
                     }
+                    triggerDetails={harnessTriggerDetails}
+                    triggerIcon={
+                      SelectedAgentIcon ? (
+                        <span
+                          className="flex size-3.5 shrink-0 items-center justify-center"
+                          data-testid="new-chat-landing-agent-icon"
+                        >
+                          <SelectedAgentIcon className="size-full text-foreground" />
+                        </span>
+                      ) : null
+                    }
+                    selectedConfigContent={selectedConfigContent}
                     autoHarnessAvailable={smartRoutingHarnessAvailable}
                     autoHarnessActive={smartRoutingHarnessSelected}
                     onSelectAutoHarness={handleSelectSmartRoutingHarness}
-                    // Match the gear's touch-target height so both halves fill
-                    // the shared pill; pr-2 equals the gear icon's own centering
-                    // inset (8px) so the divider sits evenly between them.
-                    triggerClassName="h-9 pr-2 md:h-8"
+                    contentClassName="w-[17.25rem] min-w-0"
+                    triggerClassName="h-8 min-w-0 w-full max-w-[7.25rem] gap-1 rounded-lg pl-2 pr-0 text-[13px] leading-5 md:h-7 md:w-auto md:max-w-40"
                   />
-                  {/* Gear — opens the selected agent's run-config modal, behind
-                    a hairline divider. Both are hidden when the selected agent
-                    has no knobs to configure, leaving a plain single-segment
-                    pill. Hovering shows the current settings so they're readable
-                    without opening the modal. */}
-                  {selectedAgent && selectedAgentHasKnobs && (
-                    <>
-                      {/* The segments' own padding (trigger pr-2, gear icon
-                        centering) supplies the gap on either side. */}
-                      <span aria-hidden className="h-4 w-px shrink-0 bg-border" />
-                      <TooltipProvider>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              type="button"
-                              size="icon"
-                              variant="ghost"
-                              className="size-9 text-muted-foreground md:size-8"
-                              disabled={creating}
-                              onClick={() => setConfigOpen(true)}
-                              data-testid="new-chat-landing-config-gear"
-                              componentId="new_chat.open_config"
-                            >
-                              <SettingsIcon className="size-4" data-icon-size="16" />
-                              <span className="sr-only">
-                                Configure {selectedAgent.display_name}
-                              </span>
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent
-                            side="top"
-                            className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
-                            data-testid="new-chat-landing-config-gear-tooltip"
-                          >
-                            {configSummary.map((row) => (
-                              <span
-                                key={row.label}
-                                className="max-w-72 truncate text-muted-foreground"
-                              >
-                                {row.label}:{" "}
-                                <span className="text-background dark:text-popover-foreground">
-                                  {row.value}
-                                </span>
-                              </span>
-                            ))}
-                          </TooltipContent>
-                        </Tooltip>
-                      </TooltipProvider>
-                    </>
-                  )}
                 </div>
                 {selectedAgent && selectedAgentHasKnobs && (
                   <HarnessConfigModal
@@ -5193,13 +6056,24 @@ export function NewChatLandingScreen() {
                     }}
                   />
                 )}
+                <ComposerMicButton
+                  className="size-8 md:size-7"
+                  enableHotkey
+                  disabled={creating}
+                  onVoiceStart={() => {
+                    voiceSnapshotRef.current = message;
+                  }}
+                  onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
+                  onTranscript={dictation.appendFinal}
+                  onInterim={dictation.replaceInterim}
+                />
                 {/* Routing is not a standalone composer toggle — it folds into
                   the gear modal's Model dropdown as an "Smart Routing"
                   option (see HarnessConfigModal). */}
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <span className="inline-flex">
+                      <span className="inline-flex shrink-0">
                         <Button
                           type="submit"
                           size="icon"
@@ -5207,7 +6081,7 @@ export function NewChatLandingScreen() {
                           aria-label={creating ? "Starting session" : "Start session"}
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
-                          className="size-8 rounded-lg bg-foreground disabled:bg-muted disabled:text-muted-foreground transition-opacity hover:opacity-80 disabled:opacity-100 "
+                          className="size-8 rounded-lg bg-foreground disabled:bg-muted disabled:text-muted-foreground transition-opacity hover:opacity-80 disabled:opacity-100 md:size-7"
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />
@@ -5230,583 +6104,33 @@ export function NewChatLandingScreen() {
               </div>
             </div>
           </form>
-          {/* Footer tray (host / cwd / worktree). Sits below the composer with
-              symmetric vertical padding and no overlap. */}
-          <div
-            className="relative z-0 flex w-full items-center rounded-b-2xl py-1.5 pr-4 pl-2"
-            data-testid="new-chat-landing-footer"
-          >
-            <div className="flex flex-wrap items-center gap-1">
-              {/* Host chip */}
-              <DropdownMenu
-                onOpenChange={(open) => {
-                  // Run a requested "connect this machine" only once the menu
-                  // has closed.
-                  if (!open && pendingConnectRef.current) {
-                    pendingConnectRef.current = false;
-                    void connectThisMachine();
-                  }
-                  if (!open && pendingArcaConnectRef.current) {
-                    pendingArcaConnectRef.current = false;
-                    void connectArca();
-                  }
+          <Dialog open={workspacePickerOpen} onOpenChange={setWorkspacePickerOpen}>
+            <DialogContent className="max-w-[min(64rem,calc(100vw-2rem))] border-0 bg-transparent p-0 shadow-none sm:max-w-[min(64rem,calc(100vw-2rem))]">
+              <DialogHeader className="sr-only">
+                <DialogTitle>Select working directory</DialogTitle>
+                <DialogDescription>Choose a folder for the new session.</DialogDescription>
+              </DialogHeader>
+              <WorkspacePicker
+                hostId={selectedHostId}
+                initialPath={isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined}
+                onSelect={(path) => {
+                  workspaceFromConfigRef.current = false;
+                  setWorkspace(path);
+                  addRecent(path);
+                  setWorkspacePickerOpen(false);
                 }}
-              >
-                <DropdownMenuTrigger asChild>
-                  <button
-                    type="button"
-                    className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
-                    data-testid="new-chat-landing-host-chip"
-                  >
-                    {selectedHost?.status === "online" && !sandboxSelected ? (
-                      <>
-                        <span aria-hidden className="size-2 shrink-0 rounded-full bg-success" />
-                        <span className="sr-only">Online</span>
-                      </>
-                    ) : isCloudHost ? (
-                      <MonitorCloudIcon className="ui-icon" />
-                    ) : (
-                      <MonitorIcon className="ui-icon" />
-                    )}
-                    <span className="hidden max-w-32 truncate text-sm sm:block">{hostLabel}</span>
-                    <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
-                  </button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start" className="min-w-52">
-                  {/* Server-provisioned sandbox — only advertised when
-                    /v1/info reports managed_sandboxes_enabled. Pinned
-                    first, above the connected-host list. */}
-                  {(managedSandboxesEnabled || showDisabledSandboxWithDocs) && (
-                    <>
-                      {managedSandboxesEnabled ? (
-                        sandboxProviderRows.map((provider, index) => (
-                          <DropdownMenuItem
-                            key={provider ?? "default"}
-                            onSelect={() => selectSandbox(provider)}
-                            // First row keeps the original testid; later
-                            // rows get a scoped one.
-                            data-testid={
-                              index === 0
-                                ? "new-chat-landing-sandbox-option"
-                                : `new-chat-landing-sandbox-option-${provider}`
-                            }
-                            data-active={
-                              sandboxSelected && sandboxProvider === provider ? "true" : undefined
-                            }
-                            className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
-                          >
-                            <span className="flex items-center gap-2">
-                              <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                              <span className="text-sm">{sandboxOptionLabel(provider)}</span>
-                            </span>
-                          </DropdownMenuItem>
-                        ))
-                      ) : (
-                        <DropdownMenuItem
-                          aria-disabled="true"
-                          onSelect={(e) => e.preventDefault()}
-                          className="flex items-center justify-between px-2 py-1.5 text-sm text-muted-foreground opacity-60"
-                          data-testid="new-chat-landing-sandbox-option-disabled"
-                        >
-                          <span className="flex items-center gap-2">
-                            <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                            <span className="text-sm">New Sandbox</span>
-                          </span>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <button
-                                type="button"
-                                className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/80 hover:text-foreground"
-                                aria-label="Why New Sandbox is unavailable"
-                                onClick={(e) => e.stopPropagation()}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter" || e.key === " ") e.stopPropagation();
-                                }}
-                              >
-                                <CircleHelpIcon className="size-3.5" />
-                              </button>
-                            </TooltipTrigger>
-                            <TooltipContent className="max-w-64">
-                              {newSandboxTooltipContent}
-                            </TooltipContent>
-                          </Tooltip>
-                        </DropdownMenuItem>
-                      )}
-                      <DropdownMenuSeparator />
-                    </>
-                  )}
-                  {allHosts.length === 0 && !showConnectThisMachine && (
-                    <div className="px-2 py-1.5 text-sm text-muted-foreground">
-                      No hosts connected yet.
-                    </div>
-                  )}
-                  {onlineHosts.map((host) => (
-                    <DropdownMenuItem
-                      key={host.host_id}
-                      onSelect={() => selectHost(host.host_id)}
-                      data-testid={`new-chat-landing-host-${host.host_id}`}
-                      data-active={host.host_id === selectedHostId ? "true" : undefined}
-                      className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
-                    >
-                      <HostOption
-                        host={host}
-                        displayName={displayNameForHost(
-                          host,
-                          thisMachineHostId,
-                          navigator.userAgent,
-                        )}
-                        subtitle={host.host_id === arcaHostId ? "Arca instance" : undefined}
-                      />
-                    </DropdownMenuItem>
-                  ))}
-                  {offlineHosts.map((host) => {
-                    // This machine, offline: make the row itself the connect
-                    // affordance instead of a disabled entry + a duplicate "Run
-                    // on this machine" item. Connect after the menu closes.
-                    if (host.host_id === thisMachineHostId && canConnectThisMachine) {
-                      return (
-                        <DropdownMenuItem
-                          key={host.host_id}
-                          onSelect={() => {
-                            pendingConnectRef.current = true;
-                          }}
-                          disabled={connectingThisMachine}
-                          data-testid="new-chat-landing-run-on-this-machine"
-                          className="text-sm"
-                        >
-                          <HostOption
-                            host={host}
-                            displayName={displayNameForHost(
-                              host,
-                              thisMachineHostId,
-                              navigator.userAgent,
-                            )}
-                            subtitle={connectingThisMachine ? "connecting…" : "select to connect"}
-                          />
-                        </DropdownMenuItem>
-                      );
-                    }
-                    return (
-                      <DropdownMenuItem key={host.host_id} disabled className="text-sm">
-                        <HostOption
-                          host={host}
-                          displayName={displayNameForHost(
-                            host,
-                            thisMachineHostId,
-                            navigator.userAgent,
-                          )}
-                        />
-                      </DropdownMenuItem>
-                    );
-                  })}
-                  {/* Desktop shell, machine not in the list yet: offer to connect
-                    it in one click. */}
-                  {showConnectThisMachine && (
-                    <DropdownMenuItem
-                      onSelect={() => {
-                        pendingConnectRef.current = true;
-                      }}
-                      disabled={connectingThisMachine}
-                      data-testid="new-chat-landing-run-on-this-machine"
-                      className="gap-2 text-sm"
-                    >
-                      <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
-                      <span className="text-sm">
-                        {connectingThisMachine ? "Connecting this machine…" : "Run on this machine"}
-                      </span>
-                    </DropdownMenuItem>
-                  )}
-                  {/* Databricks-internal (MDM-gated): one flat action — run
-                    on the Arca instance, starting it first when it's down.
-                    Hidden entirely once the box is connected: its own
-                    (tagged) host row above covers it. */}
-                  {showArcaOption && (
-                    <DropdownMenuItem
-                      onSelect={() => {
-                        pendingArcaConnectRef.current = true;
-                      }}
-                      disabled={connectingArca}
-                      data-testid="new-chat-landing-run-on-arca"
-                      className="gap-2 text-sm"
-                    >
-                      <MonitorCloudIcon className="size-4 shrink-0 text-muted-foreground" />
-                      <span className="text-sm">
-                        {connectingArca ? "Connecting to Arca…" : "Run on Arca"}
-                      </span>
-                    </DropdownMenuItem>
-                  )}
-                  {(allHosts.length > 0 || showConnectThisMachine || showArcaOption) && (
-                    <DropdownMenuSeparator />
-                  )}
-                  {/* Persistent escape hatch: open the connect-a-host
-                    instructions. Present even with zero hosts so a fresh user
-                    is never stuck. */}
-                  <DropdownMenuItem
-                    onSelect={() => setConnectOpen(true)}
-                    data-testid="new-chat-landing-connect-host"
-                    className="gap-2 text-ui text-muted-foreground"
-                  >
-                    <PlusIcon className="size-3.5" />
-                    Connect new host
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-
-              {/* Sandbox repository chip — the sandbox counterpart of the
-                working-directory chip. There is no filesystem to browse
-                before the sandbox exists, so the workspace is specified as
-                a git repository URL (+ optional branch) the server clones
-                at create time. Blank = empty server-created workspace. */}
-              {sandboxSelected && (
-                <Popover>
-                  <PopoverTrigger asChild>
-                    <button
-                      type="button"
-                      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
-                      data-testid="new-chat-landing-repo-chip"
-                    >
-                      <GitBranchIcon className="ui-icon" />
-                      <span className="hidden max-w-40 truncate text-sm sm:block">
-                        {sandboxRepoLabel}
-                      </span>
-                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
-                    </button>
-                  </PopoverTrigger>
-                  <PopoverContent align="start" className="w-96 p-3">
-                    <div className="flex flex-col gap-2">
-                      <div className="flex items-center gap-1.5">
-                        <label
-                          htmlFor="landing-repo-url"
-                          className="text-sm font-medium text-foreground"
-                        >
-                          Repository (optional)
-                        </label>
-                        {databricksGitCredentialsTooltipContent && (
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <button
-                                type="button"
-                                className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground"
-                                aria-label="How to set up Databricks git credentials"
-                              >
-                                <CircleHelpIcon className="size-3.5" />
-                              </button>
-                            </TooltipTrigger>
-                            <TooltipContent className="max-w-64">
-                              {databricksGitCredentialsTooltipContent}
-                            </TooltipContent>
-                          </Tooltip>
-                        )}
-                      </div>
-                      {/* Connected-GitHub picker: choose one of the caller's
-                        repos + a branch, which fills the same URL/branch state
-                        the free-text inputs below drive. Only shown when the
-                        server advertises the GitHub App and the account is
-                        linked; otherwise the free-text URL is the only path. */}
-                      {showGithubRepoPicker && (
-                        <>
-                          <SandboxRepoCombobox
-                            repos={sandboxRepos}
-                            value={selectedSandboxRepo?.full_name ?? ""}
-                            onSelect={(repo) => {
-                              setSandboxRepoUrl(
-                                repo
-                                  ? (repo.clone_url ?? `https://github.com/${repo.full_name}.git`)
-                                  : "",
-                              );
-                              // A new repo has its own branches — reset so a
-                              // stale branch never rides along.
-                              setSandboxRepoBranch("");
-                            }}
-                          />
-                          {sandboxReposTruncated && (
-                            <p
-                              className="text-xs text-muted-foreground"
-                              data-testid="new-chat-landing-repo-truncated"
-                            >
-                              Showing your most recently pushed repositories. Don't see one? Paste
-                              its URL below.
-                            </p>
-                          )}
-                          {selectedSandboxRepo && (
-                            <SandboxRepoBranchSelect
-                              fullName={selectedSandboxRepo.full_name}
-                              value={sandboxRepoBranch}
-                              defaultBranch={selectedSandboxRepo.default_branch}
-                              onChange={setSandboxRepoBranch}
-                            />
-                          )}
-                          <p className="text-xs text-muted-foreground">
-                            or paste a repository URL:
-                          </p>
-                        </>
-                      )}
-                      {/* Connected but the repo list failed to load: say so
-                        explicitly, so a transient error isn't mistaken for
-                        "GitHub not connected" (the picker just wouldn't render). */}
-                      {githubReposEnabled && sandboxReposErrored && !showGithubRepoPicker && (
-                        <p
-                          className="text-xs text-destructive"
-                          data-testid="new-chat-landing-repo-error"
-                        >
-                          Couldn't load your GitHub repositories. Paste a repository URL below.
-                        </p>
-                      )}
-                      <input
-                        id="landing-repo-url"
-                        type="text"
-                        value={sandboxRepoUrl}
-                        onChange={(e) => {
-                          // Editing the repo invalidates a branch picked for the
-                          // previous repo, so clear it (mirrors the repo select).
-                          setSandboxRepoUrl(e.target.value);
-                          setSandboxRepoBranch("");
-                        }}
-                        placeholder="https://github.com/org/repo"
-                        className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
-                        data-testid="new-chat-landing-repo-input"
-                      />
-                      <input
-                        type="text"
-                        value={sandboxRepoBranch}
-                        onChange={(e) => setSandboxRepoBranch(e.target.value)}
-                        placeholder="Branch (defaults to the repo's default)"
-                        aria-label="Repository branch"
-                        className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
-                        data-testid="new-chat-landing-repo-branch-input"
-                      />
-                      <p className="text-sm text-muted-foreground">
-                        Cloned into the sandbox as the session's working directory. Leave blank to
-                        start in an empty workspace.
-                      </p>
-                    </div>
-                  </PopoverContent>
-                </Popover>
-              )}
-
-              {/* Working directory chip — opens the file browser directly (no
-                separate "browse" toggle). onNavigate updates the workspace
-                live as the user browses (no "Select" button); the popover
-                closes on click-out. The directory-conflict warning shows as a
-                banner inside the browser on the occupied folder. Hidden for
-                sandbox sessions — the repository chip above replaces it (the
-                server creates the directory inside the sandbox). */}
-              {!sandboxSelected && (
-                <Popover open={workspacePopoverOpen} onOpenChange={setWorkspacePopoverOpen}>
-                  <PopoverTrigger asChild>{workspaceChip}</PopoverTrigger>
-                  {/* Cap to the viewport so the 420px browser can't overflow a
-                  narrow screen; desktop still gets the full width. */}
-                  <PopoverContent align="start" className="w-[min(420px,calc(100vw-2rem))] p-0">
-                    {selectedHostId ? (
-                      <WorkspacePicker
-                        hostId={selectedHostId}
-                        initialPath={
-                          isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
-                        }
-                        onNavigate={(path) => {
-                          // Browsing is an explicit choice: the create sends
-                          // the workspace even if it matches the config seed.
-                          workspaceFromConfigRef.current = false;
-                          setWorkspace(path);
-                        }}
-                        // Warn when browsing into a directory other live agents
-                        // occupy. Suppressed only when a NEW isolated worktree
-                        // will be created (no shared-dir conflict then). When
-                        // starting directly in an existing worktree the branch
-                        // is prefilled but the dir IS shared, so keep warning.
-                        occupancyForPath={
-                          !shouldCreateWorktree
-                            ? (abs) => occupancyByDir.get(normalizeWorkspacePath(abs) ?? "") ?? 0
-                            : undefined
-                        }
-                      />
-                    ) : (
-                      <p className="p-3 text-sm text-muted-foreground">Select a host first.</p>
-                    )}
-                  </PopoverContent>
-                </Popover>
-              )}
-
-              {/* Git worktree chip — hidden for sandbox sessions (worktree
-                creation requires a caller-supplied host_id). */}
-              {!sandboxSelected && (
-                <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
-                  <PopoverTrigger asChild>
-                    <button
-                      type="button"
-                      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
-                      data-testid="new-chat-landing-branch-chip"
-                    >
-                      <GitBranchIcon className="ui-icon" />
-                      <span className="hidden max-w-32 truncate text-sm sm:block">
-                        {worktreeLabel}
-                      </span>
-                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
-                    </button>
-                  </PopoverTrigger>
-                  <PopoverContent
-                    align="start"
-                    collisionPadding={16}
-                    // No overflow clip here — the worktree dropdown floats as an
-                    // absolute overlay (below) and must be able to escape the
-                    // popover's padding box.
-                    className="w-[min(20rem,calc(100vw-2rem))] p-3"
-                  >
-                    <div className="flex flex-col gap-2">
-                      <label
-                        htmlFor="landing-branch-name"
-                        className="text-sm font-medium text-foreground"
-                      >
-                        Git worktree branch (optional)
-                      </label>
-                      {/* Help text sits above the field. The warning for a picked
-                        existing worktree stays below the input (contextual to the
-                        selection). */}
-                      <p className="text-sm text-muted-foreground">
-                        New branch name, or pick an existing worktree. Leave blank to start directly
-                        in the working directory.
-                      </p>
-                      {/* The branch field is a combobox: focusing it reveals the
-                        repo's existing worktrees, and typing filters them.
-                        Picking one starts in that worktree; a name matching none
-                        creates a new worktree. */}
-                      <div className="relative flex flex-col">
-                        <input
-                          id="landing-branch-name"
-                          type="text"
-                          value={branchName}
-                          onChange={(e) => setBranchName(e.target.value)}
-                          onFocus={() => setBranchInputFocused(true)}
-                          // Delay so a click on a dropdown option registers
-                          // before the list unmounts on blur.
-                          onBlur={() => setTimeout(() => setBranchInputFocused(false), 120)}
-                          placeholder="feature/my-branch"
-                          role="combobox"
-                          aria-expanded={branchInputFocused && filteredWorktrees.length > 0}
-                          aria-autocomplete="list"
-                          // Suppress the browser's native autofill dropdown so it
-                          // doesn't overlay our worktree combobox. `off` alone is
-                          // ignored by some browsers, so also disable spellcheck /
-                          // autocorrect and give it an unrecognized name.
-                          autoComplete="off"
-                          autoCorrect="off"
-                          autoCapitalize="off"
-                          spellCheck={false}
-                          name="omnigent-worktree-branch"
-                          // pr-9 leaves room for the generate button overlaid at
-                          // the right edge.
-                          className="rounded-md border border-input bg-background py-2 pr-9 pl-3 text-sm outline-none transition-colors focus-visible:border-ring"
-                          data-testid="new-chat-landing-branch-input"
-                        />
-                        {/* Fill a unique branch name for a throwaway worktree.
-                          onMouseDown so it fires before the input's blur closes
-                          the combobox and preventDefault keeps focus on the
-                          input. */}
-                        <button
-                          type="button"
-                          onMouseDown={(e) => {
-                            e.preventDefault();
-                            generateBranchName();
-                          }}
-                          title="Generate a unique branch name"
-                          aria-label="Generate a unique branch name"
-                          className="absolute top-0 right-0 flex h-9 w-9 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
-                          data-testid="new-chat-landing-branch-generate"
-                        >
-                          <ShuffleIcon className="size-4" />
-                        </button>
-                        {branchInputFocused && filteredWorktrees.length > 0 && (
-                          <div
-                            // Floats over the popover as a combobox popup, so it
-                            // doesn't stretch the box. Bounded height + internal
-                            // scroll keep it from running off the viewport.
-                            className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-[12px] border border-border bg-popover p-2 shadow-menu"
-                            data-testid="new-chat-landing-worktree-dropdown"
-                          >
-                            <span className="px-1.5 py-1 text-sm font-medium text-muted-foreground">
-                              Existing worktrees
-                            </span>
-                            <ul className="flex flex-col gap-0.5">
-                              {filteredWorktrees.map((w) => {
-                                const selected =
-                                  normalizeWorkspacePath(w.path) ===
-                                  normalizeWorkspacePath(workspaceTrimmed);
-                                return (
-                                  <li key={w.path}>
-                                    <button
-                                      type="button"
-                                      // onMouseDown (not onClick): fires before the
-                                      // input's blur, so the selection lands even
-                                      // though blur is about to hide the list.
-                                      onMouseDown={(e) => {
-                                        e.preventDefault();
-                                        workspaceFromConfigRef.current = false;
-                                        setWorkspace(w.path);
-                                        setBranchInputFocused(false);
-                                        setWorktreePopoverOpen(false);
-                                      }}
-                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-1.5 py-1 text-left text-sm transition-colors hover:bg-muted dark:hover:bg-muted/50 ${
-                                        selected ? "bg-muted dark:bg-muted/50" : ""
-                                      }`}
-                                      data-testid="new-chat-landing-worktree-option"
-                                    >
-                                      <span className="font-medium text-foreground">
-                                        {w.branch ?? "(detached)"}
-                                      </span>
-                                      {/* Tail-truncated so the disambiguating
-                                      folder shows, not a shared prefix; full
-                                      path on hover. */}
-                                      <span
-                                        className="w-full truncate text-muted-foreground"
-                                        title={w.path}
-                                      >
-                                        {worktreePathTail(w.path)}
-                                      </span>
-                                    </button>
-                                  </li>
-                                );
-                              })}
-                            </ul>
-                          </div>
-                        )}
-                      </div>
-                      {/* Base branch only matters when creating a NEW worktree
-                        — hidden once the workspace points at an existing one
-                        (no worktree is created, so there's nothing to base). */}
-                      {branchName.trim() !== "" && !startInExistingWorktree && (
-                        <input
-                          type="text"
-                          value={baseBranch}
-                          onChange={(e) => setBaseBranch(e.target.value)}
-                          placeholder="Base branch (defaults to current)"
-                          aria-label="Base branch"
-                          className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
-                          data-testid="new-chat-landing-base-branch-input"
-                        />
-                      )}
-                      {startInExistingWorktree && (
-                        <p
-                          className="text-sm text-amber-600 dark:text-amber-500"
-                          data-testid="new-chat-landing-existing-worktree-warning"
-                        >
-                          Starts in existing worktree, edit the name to create a new one.
-                        </p>
-                      )}
-                    </div>
-                  </PopoverContent>
-                </Popover>
-              )}
-
-              {/* The session's project membership (from a `?project=` landing)
-                is shown in the hero heading instead of a tray chip; filing on
-                create still uses `selectedProject`. */}
-            </div>
-            {/* The agent / harness picker moved out of the tray and into the
-                composer's right action cluster (next to Send) — see
-                AgentHarnessPicker above. The tray now holds only the
-                host / working-directory / worktree / project chips. */}
-          </div>
-
+                onClose={() => setWorkspacePickerOpen(false)}
+                occupancyForPath={
+                  !shouldCreateWorktree
+                    ? (absolutePath) =>
+                        occupancyByDir.get(normalizeWorkspacePath(absolutePath) ?? "") ?? 0
+                    : undefined
+                }
+              />
+            </DialogContent>
+          </Dialog>
+        </div>
+        <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
           {/* Warn (don't block) when the selected agent's harness isn't
               configured on the selected host — the host re-checks at
               launch, so submitting surfaces a specific error if it
@@ -5892,7 +6216,7 @@ export function NewChatLandingScreen() {
           )}
         </div>
         {hasNoSessions ? (
-          <div className="flex flex-col items-center gap-2">
+          <div className="mt-5 flex flex-col items-center gap-2">
             <Button
               variant="outline"
               onClick={() => navigate("/settings/import")}
