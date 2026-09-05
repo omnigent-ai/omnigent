@@ -319,3 +319,47 @@ describe("FolderTree nested lazy loading", () => {
     expect(await screen.findByText("leaf.ts")).toBeInTheDocument();
   });
 });
+
+describe("FolderTree default expansion on conversation switch", () => {
+  const baseProps = {
+    isLoading: false,
+    isError: false,
+    error: null,
+    onFileSelect: vi.fn(),
+    showHidden: false,
+    changedFiles: undefined,
+    sort: "alpha" as const,
+  };
+
+  it("seeds a switched-to conversation's expansion from its own files, not the previous one's", () => {
+    // Regression guard: FolderTree isn't keyed by conversation, so a switch
+    // re-renders the same instance and a layout effect seeds the new
+    // conversation's default-expansion cache. The All-files query intentionally
+    // drops cross-key placeholderData, so on a real switch `files` goes
+    // undefined before the new conversation's list arrives — the effect must
+    // early-return on that undefined frame and then seed defaults from the NEW
+    // conversation's files. (A cross-key placeholder would instead leave the
+    // previous conversation's files on screen under the new key, seeding it
+    // with the wrong auto-expanded folders for the rest of the session.)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = (conversationId: string, files: WorkspaceFile[] | undefined) => (
+      <QueryClientProvider client={client}>
+        <FolderTree {...baseProps} conversationId={conversationId} files={files} />
+      </QueryClientProvider>
+    );
+
+    // Conversation A: a nested file makes its intermediate dir auto-expand.
+    const { rerender } = render(view("conv_A", [file("alpha/a.ts")]));
+    expect(screen.getByText("a.ts")).toBeInTheDocument();
+
+    // Switch to B: with no cross-key placeholder the files blank to undefined
+    // first, then B's real files arrive.
+    rerender(view("conv_B", undefined));
+    rerender(view("conv_B", [file("beta/b.ts")]));
+
+    // B auto-expands its OWN nested dir; A's folder is gone entirely.
+    expect(screen.getByText("b.ts")).toBeInTheDocument();
+    expect(screen.queryByText("a.ts")).toBeNull();
+    expect(screen.getByRole("button", { name: "beta/" })).toHaveAttribute("aria-expanded", "true");
+  });
+});
