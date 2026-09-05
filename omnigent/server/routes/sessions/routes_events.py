@@ -925,6 +925,24 @@ def register_events_routes(
                         timeout=5.0,
                     )
                     interrupt_delivered = interrupt_resp.status_code < 400
+                    if not interrupt_delivered:
+                        try:
+                            interrupt_error = interrupt_resp.json()
+                        except ValueError:
+                            interrupt_error = None
+                        if (
+                            isinstance(interrupt_error, dict)
+                            and interrupt_error.get("error") == "codex_native_interrupt_failed"
+                            and "no active turn to interrupt"
+                            in str(interrupt_error.get("detail", "")).lower()
+                        ):
+                            _logger.info(
+                                "Interrupt reconciled stale running state for %r: "
+                                "Codex reports no active turn",
+                                session_id,
+                            )
+                            _publish_status(session_id, "idle")
+                            interrupt_delivered = True
                 except (httpx.HTTPError, ConnectionError):
                     # WSTunnelTransport raises bare ConnectionError on tunnel close.
                     _logger.exception(

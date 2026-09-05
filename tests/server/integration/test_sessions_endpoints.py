@@ -8490,6 +8490,66 @@ async def test_interrupt_on_claude_native_session_skips_idle_publish_on_runner_f
     )
 
 
+async def test_interrupt_reconciles_codex_no_active_turn_to_idle(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex's no-active-turn response repairs a stale running status."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            503,
+            json={
+                "error": "codex_native_interrupt_failed",
+                "detail": "codex-native interrupt failed: no active turn to interrupt",
+            },
+        )
+
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture_publish(conversation_id: str, event: dict[str, Any]) -> None:
+        published.append({"conversation_id": conversation_id, **event})
+        real_publish(conversation_id, event)
+
+    monkeypatch.setattr(session_stream, "publish", _capture_publish)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: Any,
+    ) -> httpx.AsyncClient:
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "interrupt", "data": {}},
+        )
+        assert resp.status_code == 202, resp.text
+    finally:
+        await fake_runner.aclose()
+
+    idle_status = [
+        event
+        for event in published
+        if event.get("type") == "session.status" and event.get("status") == "idle"
+    ]
+    assert idle_status, f"Codex no-active-turn response did not publish idle: {published!r}"
+
+
 async def test_stop_session_forwards_stop_session_event_to_runner(
     client: httpx.AsyncClient,
 ) -> None:
