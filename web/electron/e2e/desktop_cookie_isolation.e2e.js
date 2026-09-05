@@ -113,7 +113,7 @@ describe(
       async () => {
         // Launch on the bundled setup page and connect interactively (the same
         // proven journey as desktop_connect.e2e.js), then drive the browser APIs.
-        const { electronApp, window, userDataDir } = await launchDesktop({
+        const { electronApp, window, userDataDir, stopDisplayCapture } = await launchDesktop({
           recordDir: RECORD_DIR,
         });
         let saved;
@@ -174,6 +174,7 @@ describe(
           );
         } finally {
           await electronApp.close();
+          await stopDisplayCapture();
           saved = saveRecording(RECORD_DIR, "after-cookie-isolation");
           fs.rmSync(userDataDir, { recursive: true, force: true });
         }
