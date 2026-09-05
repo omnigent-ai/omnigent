@@ -3277,7 +3277,6 @@ function ComposerImpl(
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
     // interrupts.
-    if (trimmed) appendEntry(fullText, storedReplyDraft);
     const sendFiles = files.length > 0 ? files : undefined;
     if (draft.quotes.length > 0) {
       // Preserve authored whitespace and quote provenance, including mention markers.
@@ -3288,6 +3287,7 @@ function ComposerImpl(
         ),
       };
       const serialized = serializeReplyDraft(outgoing);
+      appendEntry(serialized, snapshotReplyDraft(outgoing));
       if (sideChat && supportsSideChat(sessionHarness)) {
         // Route the quoted selection + question to a side chat: the /side
         // pipeline keys off the leading command and forks. No main-chat bubble
@@ -3297,6 +3297,7 @@ function ComposerImpl(
         onSend(serialized, sendFiles, snapshotReplyDraft(outgoing));
       }
     } else {
+      appendEntry(mentionPreamble + trimmed);
       onSend(mentionPreamble + trimmed, sendFiles);
     }
     dirtyRef.current = true;
@@ -3432,6 +3433,20 @@ function ComposerImpl(
         const recalled = recallPrevious(fullText, storedReplyDraft);
         if (recalled !== null) {
           e.preventDefault();
+          // Recall from an empty composer edits the matching queued row,
+          // preserving its attachments and preventing duplicate sends.
+          if (fullText.trim() === "" && files.length === 0 && mentionedItems.length === 0) {
+            const target = queuedMessages.findLast(
+              (m) =>
+                m.conversationId === conversationId &&
+                m.text === recalled.text &&
+                JSON.stringify(m.replyDraft) === JSON.stringify(recalled.replyDraft),
+            );
+            if (target !== undefined) {
+              setFiles(target.files ?? []);
+              dequeueMessage(target.queueId);
+            }
+          }
           applyRecall(ta, recalled);
         }
       } else if (e.key === "ArrowDown" && ta.selectionEnd === ta.value.length) {
