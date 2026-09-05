@@ -1038,7 +1038,8 @@ async def test_external_subagent_start_mints_child_session(
     # with the same agent_type + description don't collide on the
     # ``(parent, title)`` unique index (the LLM routinely emits the
     # same description for parallel Task spawns).
-    assert child["tool"] == "Explore"
+    assert child["title"] == "Explore:a5c7effac5a9a35ab"
+    assert child["tool"] == "Trace the auth flow"
     assert child["session_name"] == "a5c7effac5a9a35ab"
     # Description is preserved on the row's labels for surfaces that
     # want it; the rail's row UI ignores ``session_name``.
@@ -1303,6 +1304,36 @@ async def test_external_subagent_start_handles_duplicate_agent_type_and_descript
     children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
     child_ids = {c["id"] for c in children}
     assert {first_id, second_id} <= child_ids
+    spawned = [c for c in children if c["id"] in {first_id, second_id}]
+    assert [c["tool"] for c in spawned] == ["Tell a joke", "Tell a joke"]
+    assert {c["session_name"] for c in spawned} == {"a03186614301289fb", "aefb9a13a81715740"}
+
+
+async def test_external_subagent_start_falls_back_to_the_bare_agent_type(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "claude-code-native-ui"}
+    )
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": "a361e6a6aa05689cb",
+                "agent_type": "rpw-published:debug-lead",
+                "description": "",
+                "tool_use_id": "toolu_namespaced",
+            },
+        },
+    )
+    assert resp.status_code in (200, 202), resp.text
+    child_id = resp.json()["child_session_id"]
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    child = next(c for c in children if c["id"] == child_id)
+    assert child["tool"] == "debug-lead"
+    assert child["session_name"] == "a361e6a6aa05689cb"
 
 
 async def test_external_subagent_start_is_idempotent_on_subagent_id(
