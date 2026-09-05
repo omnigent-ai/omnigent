@@ -28,6 +28,7 @@ vi.mock("@/extensions/ExtensionPageHost", () => ({
   ),
 }));
 vi.mock("@/extensions/ExtensionProvider", () => ({
+  useExtensionsLoading: () => false,
   useExtensions: () => [
     {
       object: "extension",

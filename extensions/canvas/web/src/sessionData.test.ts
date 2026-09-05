@@ -64,7 +64,7 @@ describe("loadSessions", () => {
     });
     expect(extensionContext.sessions.listPage).toHaveBeenNthCalledWith(2, {
       after: "next",
-      limit: 25,
+      limit: 1_000,
     });
     expect(progress).toHaveBeenNthCalledWith(1, {
       sessions: [first],

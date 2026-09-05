@@ -4,15 +4,17 @@ import type { ConversationsPage } from "@/hooks/useConversations";
 import { isConversationUnseen } from "@/hooks/useUnseenConversations";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import type { ExtensionSessionPage, ExtensionSessionSummary } from "../types";
+import { isExtensionSessionPageWithinBudget } from "../rpc/validation";
 import { ExtensionHostServiceError } from "./errors";
 
 export const SESSION_PAGE_DEFAULT_LIMIT = 25;
-export const SESSION_PAGE_MAX_LIMIT = 25;
+export const SESSION_PAGE_MAX_LIMIT = 1_000;
 export const SESSION_TITLE_MAX_LENGTH = 256;
 export const SESSION_WORKSPACE_MAX_LENGTH = 512;
 export const SESSION_READ_INTERVAL_MS = 100;
 const SESSION_CURSOR_MAX_LENGTH = 256;
 const SESSION_ID_MAX_LENGTH = 256;
+const MAX_CURSOR_BUDGET_VALUE = "x".repeat(SESSION_CURSOR_MAX_LENGTH);
 const STATUSES = new Set<ExtensionSessionSummary["status"]>([
   "idle",
   "running",
@@ -188,15 +190,53 @@ export function projectSessionPage(payload: unknown, limit: number): ExtensionSe
   ) {
     throw new ExtensionHostServiceError("HostError", "Session cursor is malformed");
   }
-  const sessions = page.data.map(projectSession);
-  let nextCursor: string | null = null;
-  if (page.has_more) {
-    nextCursor = typeof page.last_id === "string" ? page.last_id : (sessions.at(-1)?.id ?? null);
-    if (!nextCursor) {
+  const projected = page.data.map(projectSession);
+  const serverHasMore = page.has_more;
+  const serverCursor = typeof page.last_id === "string" ? page.last_id : null;
+  const resultFor = (count: number): ExtensionSessionPage => {
+    const sessions = projected.slice(0, count);
+    const truncated = count < projected.length;
+    const hasMore = truncated || serverHasMore;
+    const nextCursor = hasMore
+      ? truncated
+        ? (sessions.at(-1)?.id ?? null)
+        : (serverCursor ?? sessions.at(-1)?.id ?? null)
+      : null;
+    return { sessions, nextCursor, hasMore };
+  };
+
+  if (projected.length === 0) {
+    const result = resultFor(0);
+    if (result.hasMore && !result.nextCursor) {
       throw new ExtensionHostServiceError("HostError", "Session list has more pages but no cursor");
     }
+    return result;
   }
-  return { sessions, nextCursor, hasMore: page.has_more };
+
+  const fullResult = resultFor(projected.length);
+  if (isExtensionSessionPageWithinBudget(fullResult)) return fullResult;
+
+  let result: ExtensionSessionPage | null = null;
+  let lower = 1;
+  let upper = projected.length - 1;
+  while (lower <= upper) {
+    const count = Math.floor((lower + upper) / 2);
+    const candidate = resultFor(count);
+    const budgetCandidate = { ...candidate, nextCursor: MAX_CURSOR_BUDGET_VALUE };
+    if (isExtensionSessionPageWithinBudget(budgetCandidate)) {
+      result = candidate;
+      lower = count + 1;
+    } else {
+      upper = count - 1;
+    }
+  }
+  if (!result) {
+    throw new ExtensionHostServiceError("HostError", "Session page exceeds the response budget");
+  }
+  if (result.hasMore && !result.nextCursor) {
+    throw new ExtensionHostServiceError("HostError", "Session list has more pages but no cursor");
+  }
+  return result;
 }
 
 export async function listSessionPage(

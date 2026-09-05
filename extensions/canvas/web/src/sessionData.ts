@@ -5,7 +5,8 @@ import type {
   ExtensionSessionSummary,
 } from "@omnigent/extension-sdk";
 
-const SESSION_PAGE_LIMIT = 25;
+const INITIAL_SESSION_PAGE_LIMIT = 25;
+const SESSION_PAGE_LIMIT = 1_000;
 const MAX_SESSION_PAGES = 200;
 const MAX_SESSIONS = 5_000;
 
@@ -39,7 +40,7 @@ export async function loadSessions(
   for (let pageNumber = 0; pageNumber < MAX_SESSION_PAGES; pageNumber += 1) {
     const page: ExtensionSessionPage = await context.sessions.listPage({
       after,
-      limit: SESSION_PAGE_LIMIT,
+      limit: pageNumber === 0 ? INITIAL_SESSION_PAGE_LIMIT : SESSION_PAGE_LIMIT,
     });
     sessions.push(...page.sessions);
     if (sessions.length > MAX_SESSIONS) {

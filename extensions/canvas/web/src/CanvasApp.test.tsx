@@ -219,6 +219,41 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("CanvasApp", () => {
+  it("signals readiness only after the initial Canvas content is committed", async () => {
+    const firstPage = deferred<ExtensionSessionPage>();
+    const { context } = contextWith();
+    const onReady = vi.fn();
+    vi.mocked(context.sessions.listPage).mockImplementationOnce(
+      () => firstPage.promise,
+    );
+
+    render(<CanvasApp context={context} onReady={onReady} />);
+
+    expect(
+      screen.getByRole("status", { name: "Loading Canvas" }),
+    ).toBeInTheDocument();
+    expect(onReady).not.toHaveBeenCalled();
+
+    await act(async () => firstPage.resolve(page(sessions)));
+
+    expect(await screen.findByText("2 sessions")).toBeInTheDocument();
+    await waitFor(() => expect(onReady).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("status", { name: "Loading Canvas" })).toBeNull();
+  });
+
+  it("signals readiness once an initial load error can be acted on", async () => {
+    const { context } = contextWith();
+    const onReady = vi.fn();
+    vi.mocked(context.sessions.listPage).mockRejectedValue(
+      new Error("offline"),
+    );
+
+    render(<CanvasApp context={context} onReady={onReady} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("offline");
+    await waitFor(() => expect(onReady).toHaveBeenCalledOnce());
+  });
+
   it("loads every session into a draggable controlled canvas", async () => {
     const { context } = contextWith();
     render(<CanvasApp context={context} />);

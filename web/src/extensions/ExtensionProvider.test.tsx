@@ -2,7 +2,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchExtensionCatalog } from "./catalog";
-import { ExtensionProvider, loadExtensionCatalog, useExtensions } from "./ExtensionProvider";
+import {
+  ExtensionProvider,
+  loadExtensionCatalog,
+  useExtensions,
+  useExtensionsLoading,
+} from "./ExtensionProvider";
 
 vi.mock("./catalog", () => ({
   EXTENSIONS_QUERY_KEY: ["extensions"],
@@ -10,7 +15,9 @@ vi.mock("./catalog", () => ({
 }));
 
 function Consumer() {
-  return <span>extensions:{useExtensions().length}</span>;
+  const extensions = useExtensions();
+  const loading = useExtensionsLoading();
+  return <span>{loading ? "loading" : `extensions:${extensions.length}`}</span>;
 }
 
 function renderProvider() {
@@ -24,13 +31,23 @@ function renderProvider() {
   );
 }
 
-beforeEach(() => vi.mocked(fetchExtensionCatalog).mockReset());
+beforeEach(() => {
+  vi.mocked(fetchExtensionCatalog).mockReset();
+});
 
 describe("ExtensionProvider", () => {
-  it("publishes the loaded catalog", async () => {
-    vi.mocked(fetchExtensionCatalog).mockResolvedValue([]);
+  it("publishes loading until the catalog resolves", async () => {
+    let resolveCatalog!: (value: []) => void;
+    vi.mocked(fetchExtensionCatalog).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveCatalog = resolve;
+        }),
+    );
     renderProvider();
 
+    expect(screen.getByText("loading")).toBeInTheDocument();
+    resolveCatalog([]);
     expect(await screen.findByText("extensions:0")).toBeInTheDocument();
     await waitFor(() => expect(fetchExtensionCatalog).toHaveBeenCalledOnce());
   });

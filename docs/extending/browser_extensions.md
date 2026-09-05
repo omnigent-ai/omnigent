@@ -67,8 +67,9 @@ directory paths visible to that user. Summaries contain ID, title, status, an `u
 current user has not viewed yet, using the sidebar's unread rule), a
 `titleProvisional` flag (the title is the shell's first-message placeholder
 until the server names the session), working
-directory, worktree branch, project ID, and created/updated timestamps. Pages are capped at 25 rows and the
-SDK drains at most 200 pages or 5,000 sessions. Extensions receive neither raw
+directory, worktree branch, project ID, and created/updated timestamps. Pages default to 25 rows and accept up to
+1,000; the host shortens unusually large pages to stay within the RPC response budget. The SDK drains at most
+200 pages or 5,000 sessions. Extensions receive neither raw
 authenticated fetch nor the internal session WebSocket.
 
 The projects API returns the current user's projects as ID, name, and icon.

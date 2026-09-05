@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import type { ExtensionCatalogItem, ExtensionPage } from "./types";
 import { buildExtensionDocument, createExtensionNonce, loadExtensionBundle } from "./rpc/host";
 import {
@@ -9,7 +10,11 @@ import {
   type ExtensionInitMessage,
   type ExtensionResponseMessage,
 } from "./rpc/protocol";
-import { isExtensionInboundMessage, isExtensionPayloadWithinBudget } from "./rpc/validation";
+import {
+  isExtensionInboundMessage,
+  isExtensionPayloadWithinBudget,
+  isExtensionSessionPageWithinBudget,
+} from "./rpc/validation";
 import { ExtensionHostServiceError } from "./services/errors";
 
 const ACTIVATION_TIMEOUT_MS = 10_000;
@@ -224,7 +229,11 @@ export function ExtensionViewHost({
             const pending = pendingRef.current.get(message.requestId);
             if (!pending || !pendingRef.current.delete(message.requestId)) return;
             clearTimeout(pending.timeout);
-            if (!isExtensionPayloadWithinBudget(result)) {
+            const withinBudget =
+              message.method === "sessions.listPage"
+                ? isExtensionSessionPageWithinBudget(result)
+                : isExtensionPayloadWithinBudget(result);
+            if (!withinBudget) {
               channel.port1.postMessage({
                 ...response,
                 error: { code: "ResponseTooLarge", message: "Host response exceeds the limit" },
@@ -301,11 +310,8 @@ export function ExtensionViewHost({
         />
       )}
       {status !== "ready" && (
-        <div
-          role="status"
-          className="extension-view-status absolute inset-x-0 bottom-0 top-14 flex items-center justify-center bg-background text-sm text-muted-foreground md:top-12"
-        >
-          {status === "loading" ? "Loading extension…" : "Starting extension…"}
+        <div className="extension-view-status absolute inset-x-0 bottom-0 top-14 flex items-center justify-center bg-background md:top-12">
+          <Spinner className="size-5 text-muted-foreground" aria-label="Loading extension" />
         </div>
       )}
     </div>

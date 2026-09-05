@@ -120,7 +120,13 @@ function mergePartialSessions(
   ];
 }
 
-function CanvasSurface({ context }: { context: ExtensionContext }) {
+function CanvasSurface({
+  context,
+  onReady,
+}: {
+  context: ExtensionContext;
+  onReady?: () => void;
+}) {
   const { fitView, getViewport, setViewport } = useReactFlow();
   const [nodes, setNodes] = useState<SessionNode[]>([]);
   const [sessions, setSessions] = useState<ExtensionSessionSummary[]>([]);
@@ -157,6 +163,7 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
   const refreshInFlightRef = useRef<Promise<void> | null>(null);
   const viewportTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aliveRef = useRef(true);
+  const readyRef = useRef(false);
 
   const projectIds = useMemo(
     () => new Set(projects.map((project) => project.id)),
@@ -175,6 +182,12 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
       pullRequestQueueRef.current?.clear();
     };
   }, []);
+
+  useEffect(() => {
+    if (loading || readyRef.current) return;
+    readyRef.current = true;
+    onReady?.();
+  }, [loading, onReady]);
 
   const applyDefaultViewport = useCallback(
     (sessionCount: number, duration = 0) => {
@@ -712,8 +725,15 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
 
   if (loading) {
     return (
-      <div className="canvas-state" role="status">
-        Loading sessions…
+      <div className="canvas-state">
+        <svg
+          className="canvas-spinner"
+          role="status"
+          aria-label="Loading Canvas"
+          viewBox="0 0 24 24"
+        >
+          <path d="M21 12a9 9 0 1 1-6.22-8.56" />
+        </svg>
       </div>
     );
   }
@@ -923,10 +943,16 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
   );
 }
 
-export function CanvasApp({ context }: { context: ExtensionContext }) {
+export function CanvasApp({
+  context,
+  onReady,
+}: {
+  context: ExtensionContext;
+  onReady?: () => void;
+}) {
   return (
     <ReactFlowProvider>
-      <CanvasSurface context={context} />
+      <CanvasSurface context={context} onReady={onReady} />
     </ReactFlowProvider>
   );
 }

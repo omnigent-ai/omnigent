@@ -73,7 +73,8 @@ describe("ExtensionViewHost", () => {
     expect(iframe).toHaveAttribute("allow", "");
     expect(iframe).toHaveClass("min-h-0", "flex-1");
     expect(iframe.parentElement).toHaveClass("extension-view-host", "pt-14", "md:pt-12");
-    expect(screen.getByRole("status")).toHaveTextContent("Starting extension");
+    expect(screen.getByRole("status", { name: "Loading extension" })).toBeInTheDocument();
+    expect(screen.queryByText(/Loading extension|Starting extension/)).toBeNull();
     await waitFor(() => expect(FakeMessageChannel.latest).not.toBeNull());
     act(() => {
       FakeMessageChannel.latest!.port1.onmessage?.({
@@ -196,6 +197,71 @@ describe("ExtensionViewHost", () => {
     expect(dark).toHaveBeenCalledOnce();
     expect(FakeMessageChannel.latest!.port1.postMessage).toHaveBeenCalledWith(
       expect.objectContaining({ requestId: "theme", result: { theme: "dark" } }),
+    );
+  });
+
+  it("uses the larger outbound budget only for bounded session pages", async () => {
+    const largePage = {
+      sessions: Array.from({ length: 400 }, (_, index) => ({
+        id: `session-${index}`,
+        title: "t".repeat(256),
+        status: "idle",
+        unread: false,
+        titleProvisional: false,
+        workspace: `/workspace/${"w".repeat(128)}`,
+        gitBranch: null,
+        projectId: null,
+        createdAt: 1,
+        updatedAt: 1,
+      })),
+      nextCursor: null,
+      hasMore: false,
+    };
+    const returnLargePage = vi.fn(() => largePage);
+    render(
+      <ExtensionViewHost
+        extension={extension}
+        page={page}
+        refresh={refresh}
+        methods={{
+          "sessions.listPage": returnLargePage,
+          "test.large": returnLargePage,
+        }}
+      />,
+    );
+    await screen.findByTitle("Dashboard");
+    await waitFor(() => expect(FakeMessageChannel.latest).not.toBeNull());
+
+    const request = (requestId: string, method: string) => {
+      act(() => {
+        FakeMessageChannel.latest!.port1.onmessage?.({
+          data: {
+            ...identity,
+            source: EXTENSION_RPC_SOURCE,
+            type: "request",
+            requestId,
+            method,
+            params: {},
+          },
+        } as MessageEvent<unknown>);
+      });
+    };
+
+    request("sessions", "sessions.listPage");
+    await waitFor(() =>
+      expect(FakeMessageChannel.latest!.port1.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ requestId: "sessions", result: largePage }),
+      ),
+    );
+
+    request("ordinary", "test.large");
+    await waitFor(() =>
+      expect(FakeMessageChannel.latest!.port1.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requestId: "ordinary",
+          error: { code: "ResponseTooLarge", message: "Host response exceeds the limit" },
+        }),
+      ),
     );
   });
 

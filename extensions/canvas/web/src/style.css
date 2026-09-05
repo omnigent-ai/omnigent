@@ -389,6 +389,22 @@ button:disabled {
   margin-top: 8px;
 }
 
+.canvas-spinner {
+  width: 20px;
+  height: 20px;
+  animation: canvas-spin 1s linear infinite;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 2;
+}
+
+@keyframes canvas-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 @media (max-width: 767px) {
   .canvas-toolbar {
     align-items: flex-start;

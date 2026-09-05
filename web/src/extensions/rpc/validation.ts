@@ -5,12 +5,20 @@ import {
   type ExtensionInboundMessage,
 } from "./protocol";
 
-export function isExtensionPayloadWithinBudget(value: unknown): boolean {
-  let budget = MAX_EXTENSION_MESSAGE_BYTES;
+const MAX_EXTENSION_MESSAGE_NODES = 5_000;
+const MAX_EXTENSION_SESSION_PAGE_BYTES = 512 * 1024;
+const MAX_EXTENSION_SESSION_PAGE_NODES = 25_000;
+
+function isPayloadWithinBudget(
+  value: unknown,
+  maximumBytes: number,
+  maximumNodes: number,
+): boolean {
+  let budget = maximumBytes;
   let nodes = 0;
   const seen = new WeakSet<object>();
   const visit = (item: unknown, depth: number): boolean => {
-    if (depth > 20 || ++nodes > 5_000) return false;
+    if (depth > 20 || ++nodes > maximumNodes) return false;
     if (item === null || typeof item === "boolean" || typeof item === "number") {
       budget -= 8;
       return budget >= 0;
@@ -36,6 +44,20 @@ export function isExtensionPayloadWithinBudget(value: unknown): boolean {
     return entries.every(([key, entry]) => visit(key, depth + 1) && visit(entry, depth + 1));
   };
   return visit(value, 0);
+}
+
+export function isExtensionPayloadWithinBudget(value: unknown): boolean {
+  return isPayloadWithinBudget(value, MAX_EXTENSION_MESSAGE_BYTES, MAX_EXTENSION_MESSAGE_NODES);
+}
+
+// Session pages are bounded host projections, so their outbound-only budget
+// can be larger without relaxing limits on extension requests or events.
+export function isExtensionSessionPageWithinBudget(value: unknown): boolean {
+  return isPayloadWithinBudget(
+    value,
+    MAX_EXTENSION_SESSION_PAGE_BYTES,
+    MAX_EXTENSION_SESSION_PAGE_NODES,
+  );
 }
 
 export function isExtensionInboundMessage(

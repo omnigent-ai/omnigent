@@ -1,7 +1,7 @@
 import { QueryClient } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
-import { isExtensionPayloadWithinBudget } from "../rpc/validation";
+import { isExtensionSessionPageWithinBudget } from "../rpc/validation";
 import { ExtensionHostServiceError } from "./errors";
 import {
   cachedInitialSessionPage,
@@ -77,7 +77,7 @@ describe("session page request", () => {
     expect(query).not.toMatch(/search_query|project|pinned|agent_id/);
   });
 
-  it.each([0, 26, -1, 1.5, "20", Number.NaN])("rejects invalid limit %p", (limit) => {
+  it.each([0, 1_001, -1, 1.5, "20", Number.NaN])("rejects invalid limit %p", (limit) => {
     expect(() => parseSessionPageRequest({ limit })).toThrow(ExtensionHostServiceError);
   });
 
@@ -89,6 +89,7 @@ describe("session page request", () => {
     expect(parseSessionPageRequest({})).toEqual({ after: null, limit: 25 });
     expect(parseSessionPageRequest({ limit: 1 })).toEqual({ after: null, limit: 1 });
     expect(parseSessionPageRequest({ limit: 25 })).toEqual({ after: null, limit: 25 });
+    expect(parseSessionPageRequest({ limit: 1_000 })).toEqual({ after: null, limit: 1_000 });
   });
 });
 
@@ -145,33 +146,27 @@ describe("projectSessionPage", () => {
     expect(titled).toMatchObject({ title: "Session one", titleProvisional: false });
   });
 
-  it("keeps a worst-case page within the RPC response budget", () => {
+  it("fits a safe prefix of a large page within the RPC response budget", () => {
     const result = projectSessionPage(
       {
-        data: Array.from({ length: 25 }, (_, index) => ({
+        data: Array.from({ length: 1_000 }, (_, index) => ({
           ...wireRow,
           id: `${index}`.padEnd(256, "i"),
           title: "t".repeat(400),
           workspace: "w".repeat(900),
+          git_branch: "b".repeat(400),
+          project_id: "p".repeat(400),
         })),
         has_more: false,
         last_id: null,
       },
-      25,
+      1_000,
     );
-    expect(
-      isExtensionPayloadWithinBudget({
-        source: "omnigent-extension",
-        type: "response",
-        extensionId: "acme.canvas",
-        pageId: "acme.canvas.page",
-        view: "canvas",
-        nonce: "n".repeat(48),
-        apiVersion: 1,
-        requestId: "request",
-        result,
-      }),
-    ).toBe(true);
+    expect(result.sessions.length).toBeGreaterThan(0);
+    expect(result.sessions.length).toBeLessThan(1_000);
+    expect(result.hasMore).toBe(true);
+    expect(result.nextCursor).toBe(result.sessions.at(-1)?.id);
+    expect(isExtensionSessionPageWithinBudget(result)).toBe(true);
   });
 
   it("uses last_id or the last row id only when another page exists", () => {
