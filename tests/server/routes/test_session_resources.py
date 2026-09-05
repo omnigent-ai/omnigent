@@ -5862,6 +5862,79 @@ def _fs_binary_read_payload(size: int = 256 * 1024) -> dict[str, object]:
 _FS_BASE = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
 
 
+# ── Structured runner errors survive the filesystem proxy ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_git_status_failure_reaches_client_with_reason(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner git-status failure surfaces its code and reason, never a bare 502.
+
+    The runner answers changes/diff reads with
+    ``500 {"error": {"code": "git_status_failed", "message": <git reason>}}``
+    when ``git status`` cannot run. The proxy used to collapse that to
+    ``502 {"detail": <msg>}``, so clients reading ``error.message`` (the web
+    diff view and changes panel) fell back to the bare "502 Bad Gateway"
+    status line. The structured error must survive the proxy unchanged.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    reason = "git status exited 128: fatal: bad config line 1 in file .git/config"
+    fake_runner = _FakeRunnerClient(
+        payload={"error": {"code": "git_status_failed", "message": reason}},
+        status_code=500,
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(f"{_FS_BASE}/diff/hello.py")
+
+    assert resp.status_code == 500
+    assert resp.json() == {"error": {"code": "git_status_failed", "message": reason}}
+
+
+@pytest.mark.asyncio
+async def test_runner_client_error_mirrors_status_and_shape(
+    client: httpx.AsyncClient,
+) -> None:
+    """A structured runner 4xx keeps its status and error body through the proxy.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    fake_runner = _FakeRunnerClient(
+        payload={"error": {"code": "invalid_path", "message": "Cannot diff the environment root"}},
+        status_code=400,
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(f"{_FS_BASE}/diff/hello.py")
+
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "error": {"code": "invalid_path", "message": "Cannot diff the environment root"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_unstructured_runner_failure_stays_a_502(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner failure without a structured error body keeps the generic 502.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    fake_runner = _FakeRunnerClient(payload={"whoops": True}, status_code=500)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(f"{_FS_BASE}/diff/hello.py")
+
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "runner resource endpoint failed"}
+
+
 @pytest.mark.asyncio
 async def test_file_read_is_gzipped(client: httpx.AsyncClient) -> None:
     """A text file read is compressed, and the body survives the round-trip.

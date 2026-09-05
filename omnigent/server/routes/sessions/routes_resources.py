@@ -120,6 +120,29 @@ class _RunnerStreamResponse(StreamingResponse):
             await self._upstream.aclose()
 
 
+def _upstream_fs_error(status: int, code: object, message: str) -> OmnigentError:
+    """Mirror a structured runner/host filesystem error to the API client.
+
+    Preserves the upstream ``{"error": {"code", "message"}}`` shape (rendered
+    by the global :class:`OmnigentError` handler) so clients surface the real
+    reason — e.g. the ``git status`` failure behind a changes/diff read —
+    instead of a bare gateway status line.
+
+    :param status: The upstream HTTP status, mirrored when it is an error
+        status; anything else collapses to 502 (a non-2xx/4xx/5xx answer is
+        a transport-level surprise, not an application error).
+    :param code: The upstream machine-readable code; non-string/empty values
+        fall back to ``internal_error``.
+    :param message: Human-readable reason from the upstream error body.
+    :returns: The error to raise.
+    """
+    return OmnigentError(
+        message,
+        code=code if isinstance(code, str) and code else ErrorCode.INTERNAL_ERROR,
+        http_status=status if status >= 400 else 502,
+    )
+
+
 def register_resources_routes(
     router: APIRouter,
     *,
@@ -367,7 +390,10 @@ def register_resources_routes(
         :param params: Optional query params forwarded to the runner,
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
         :returns: Parsed JSON response body.
-        :raises HTTPException: 502 on runner failure.
+        :raises OmnigentError: Mirroring the runner's structured error
+            (status/code/message) when it reported one.
+        :raises HTTPException: 502 on transport failure or an
+            unstructured runner error.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
@@ -403,11 +429,15 @@ def register_resources_routes(
             )
         if resp.status_code != 200:
             if isinstance(response_payload, dict):
-                error = response_payload.get("error", {})
-                msg = error.get("message") or "runner resource endpoint failed"
-            else:
-                msg = "runner resource endpoint failed"
-            raise HTTPException(status_code=502, detail=msg)
+                error = response_payload.get("error")
+                if isinstance(error, dict) and isinstance(error.get("message"), str):
+                    # The runner reported a structured application error (e.g.
+                    # git_status_failed): mirror its status/code/message so
+                    # the real reason reaches the client.
+                    raise _upstream_fs_error(
+                        resp.status_code, error.get("code"), error["message"]
+                    )
+            raise HTTPException(status_code=502, detail="runner resource endpoint failed")
         if not isinstance(response_payload, dict):
             raise HTTPException(
                 status_code=502, detail="runner resource endpoint returned non-object JSON"
@@ -452,8 +482,8 @@ def register_resources_routes(
             though the online runner can serve them.
         :returns: The runner-shaped filesystem result.
         :raises OmnigentError: Re-raised runner-offline error when the
-            host cannot serve the read either.
-        :raises HTTPException: On host-reported filesystem failures.
+            host cannot serve the read either, or a host-reported
+            filesystem failure mirrored with its status/code/message.
         """
         try:
             return await _proxy_get_to_runner(
@@ -670,8 +700,8 @@ def register_resources_routes(
         :param host_params: Op-specific args for the host reader.
         :returns: The runner-shaped result, or ``None`` when no host is
             bound / connected / reachable (caller falls back to 503).
-        :raises HTTPException: On host-reported filesystem failures,
-            reproducing the runner's status.
+        :raises OmnigentError: On host-reported filesystem failures,
+            reproducing the runner's status/code/message.
         """
         from omnigent.server.routes._host_filesystem import (
             HostFsError,
@@ -700,13 +730,10 @@ def register_resources_routes(
         except HostFsError as exc:
             if exc.status == 404:
                 raise OmnigentError(exc.message, code=ErrorCode.NOT_FOUND) from exc
-            if exc.status == 400:
-                # Invalid path is a client error; surface it verbatim like the
-                # runner's 400 rather than collapsing it to a 502.
-                raise HTTPException(status_code=400, detail=exc.message) from exc
-            # Any other host FS failure (e.g. git_status_failed 500) mirrors the
-            # runner proxy, which wraps non-200/404 responses as a 502.
-            raise HTTPException(status_code=502, detail=exc.message) from exc
+            # Any other host FS failure mirrors the runner proxy: the host
+            # reproduces the runner's error shape, so surface its
+            # status/code/message (e.g. git_status_failed 500) unchanged.
+            raise _upstream_fs_error(exc.status, exc.code, exc.message) from exc
 
     async def _proxy_post_to_runner(
         session_id: str,
