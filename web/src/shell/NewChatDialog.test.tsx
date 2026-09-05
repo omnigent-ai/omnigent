@@ -360,17 +360,19 @@ describe("normalizeWorkspacePath", () => {
 // The warning's count comes from this filter. The table pins both the positive
 // match (incl. trailing-slash normalization on either side) and every reason
 // a session must NOT count — wrong host, wrong dir, null workspace, offline
-// runner — so the warning can't fire on unrelated/dead sessions. `offline`
-// lists ids whose runner is down; the rest are treated as online.
+// runner, parked idle — so the warning can't fire on unrelated/dead/idle
+// sessions. `offline` lists ids whose runner is down; the rest are treated as
+// online.
 describe("sessionsSharingDirectory", () => {
-  // Online sessions sharing /repo on host_1 = a + b; the rest are decoys,
-  // each covering one non-match reason.
+  // Working online sessions sharing /repo on host_1 = a + b; the rest are
+  // decoys, each covering one non-match reason (all running, so nothing is
+  // excluded for a second reason).
   const base: Conversation[] = [
-    conv({ id: "a", host_id: "host_1", workspace: "/repo" }),
-    conv({ id: "b", host_id: "host_1", workspace: "/repo/" }),
-    conv({ id: "c", host_id: "host_2", workspace: "/repo" }), // wrong host
-    conv({ id: "d", host_id: "host_1", workspace: "/other" }), // wrong dir
-    conv({ id: "e", host_id: "host_1", workspace: null }), // no workspace
+    conv({ id: "a", host_id: "host_1", workspace: "/repo", status: "running" }),
+    conv({ id: "b", host_id: "host_1", workspace: "/repo/", status: "running" }),
+    conv({ id: "c", host_id: "host_2", workspace: "/repo", status: "running" }), // wrong host
+    conv({ id: "d", host_id: "host_1", workspace: "/other", status: "running" }), // wrong dir
+    conv({ id: "e", host_id: "host_1", workspace: null, status: "running" }), // no workspace
   ];
 
   const cases: {
@@ -426,8 +428,8 @@ describe("sessionsSharingDirectory", () => {
       // gate as the sidebar's dots. x shares the dir but is down.
       name: "excludes sessions whose runner is offline",
       sessions: [
-        conv({ id: "a", host_id: "host_1", workspace: "/repo" }),
-        conv({ id: "x", host_id: "host_1", workspace: "/repo" }),
+        conv({ id: "a", host_id: "host_1", workspace: "/repo", status: "running" }),
+        conv({ id: "x", host_id: "host_1", workspace: "/repo", status: "running" }),
       ],
       hostId: "host_1",
       workspace: "/repo",
@@ -435,15 +437,36 @@ describe("sessionsSharingDirectory", () => {
       expected: ["a"],
     },
     {
+      // A session parked idle after its turn isn't working in the directory,
+      // even though its runner stays attached — otherwise a default launch
+      // would always warn about the user's own sole session.
+      name: "excludes a session parked idle whose runner is still online",
+      sessions: [conv({ id: "i", host_id: "host_1", workspace: "/repo", status: "idle" })],
+      hostId: "host_1",
+      workspace: "/repo",
+      offline: [],
+      expected: [],
+    },
+    {
       // openui excludes only *disconnected* agents, not errored ones — a
-      // failed session whose runner is still online occupies the dir. Guards
-      // against re-adding a status-based filter.
+      // failed session whose runner is still online occupies the dir. The
+      // idle exclusion must not over-reach to errored sessions.
       name: "counts a failed session whose runner is still online",
       sessions: [conv({ id: "f", host_id: "host_1", workspace: "/repo", status: "failed" })],
       hostId: "host_1",
       workspace: "/repo",
       offline: [],
       expected: ["f"],
+    },
+    {
+      // No status on the row (older server / focused test router) — fail
+      // safe toward warning rather than silently dropping the hint.
+      name: "counts a session with no status field",
+      sessions: [conv({ id: "u", host_id: "host_1", workspace: "/repo", status: undefined })],
+      hostId: "host_1",
+      workspace: "/repo",
+      offline: [],
+      expected: ["u"],
     },
   ];
 
@@ -1925,10 +1948,13 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
-    // A live session in the seeded workspace ("/Users/corey/repo") on the
-    // auto-selected host occupies the directory the picker opens at.
+    // A session actively working in the seeded workspace
+    // ("/Users/corey/repo") on the auto-selected host occupies the directory
+    // the picker opens at.
     useDirectorySessionsMock.mockReturnValue({
-      data: [conv({ id: "s1", host_id: "host_1", workspace: "/Users/corey/repo" })],
+      data: [
+        conv({ id: "s1", host_id: "host_1", workspace: "/Users/corey/repo", status: "running" }),
+      ],
     } as unknown as ReturnType<typeof useDirectorySessions>);
     useRunnerHealthMock.mockReturnValue(new Map([["s1", true]]));
     renderLanding();
@@ -1942,6 +1968,23 @@ describe("NewChatLandingScreen", () => {
     // Singular copy proves the count (1) flowed through, not just that *some*
     // banner rendered.
     expect(banner.textContent).toContain("1 other agent is");
+  });
+
+  it("shows no conflict banner when the directory's only session sits idle", async () => {
+    // The default-launch shape: the user's sole session finished its turn and
+    // parked idle in the seeded workspace with its runner still attached.
+    // Nothing is working there, so browsing to it must not warn.
+    useDirectorySessionsMock.mockReturnValue({
+      data: [conv({ id: "s1", host_id: "host_1", workspace: "/Users/corey/repo", status: "idle" })],
+    } as unknown as ReturnType<typeof useDirectorySessions>);
+    useRunnerHealthMock.mockReturnValue(new Map([["s1", true]]));
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    await screen.findByTestId("workspace-picker");
+    expect(screen.queryByTestId("workspace-picker-conflict")).not.toBeInTheDocument();
   });
 
   it("keeps footer chip labels compact, muted and truncated", async () => {

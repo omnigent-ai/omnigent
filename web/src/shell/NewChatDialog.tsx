@@ -492,6 +492,25 @@ export function worktreePathTail(path: string): string {
 }
 
 /**
+ * Whether a session's lifecycle status counts as "working" for the
+ * directory-conflict hints.
+ *
+ * The hints read "N other agents are working in this directory", so a
+ * session parked ``idle`` after its turn must not count — its runner stays
+ * attached, which would otherwise make every default launch warn about the
+ * user's own sole session. An errored (``failed``) session whose runner is
+ * still online does count, mirroring openui: only *disconnected* agents are
+ * excluded, not merely errored ones. A missing status (older servers,
+ * focused test routers) fails safe toward warning.
+ *
+ * @param status The session row's lifecycle status, if the server sent one.
+ * @returns ``false`` only for a session known to be idle.
+ */
+export function isWorkingStatus(status: Conversation["status"]): boolean {
+  return status !== "idle";
+}
+
+/**
  * Existing sessions that would share an on-disk working directory with a new
  * session created in ``workspace`` on ``hostId``.
  *
@@ -509,7 +528,8 @@ export function worktreePathTail(path: string): string {
  * Deleted sessions (≈ openui's archived) are already filtered out
  * server-side. An errored (``failed``) session whose runner is still online
  * counts, mirroring openui: only *disconnected* agents are excluded, not
- * merely errored ones.
+ * merely errored ones. An ``idle`` session does **not** count — nothing is
+ * working there (see :func:`isWorkingStatus`).
  *
  * Returns ``[]`` when ``hostId`` is unset or ``workspace`` is blank.
  *
@@ -539,6 +559,9 @@ export function sessionsSharingDirectory(
       s.host_id === hostId &&
       s.workspace != null &&
       normalizeWorkspacePath(s.workspace) === target &&
+      // A parked-idle session isn't working in the directory, even with
+      // its runner still attached.
+      isWorkingStatus(s.status) &&
       // Only a session whose runner is actually online has a live process
       // that could write here — same connectivity signal as the sidebar.
       isRunnerOnline(s.id),
@@ -3596,13 +3619,16 @@ export function NewChatLandingScreen() {
   const isCloudHost =
     sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
 
-  // Sessions on the selected host that have a workspace — the narrow set
-  // the health poll needs to check for live directory conflicts. Much
-  // smaller than all 200 directorySessions (only host-matched + workspace
-  // rows), so registering them into the /health poll is cheap.
+  // Sessions on the selected host that have a workspace and aren't parked
+  // idle — the narrow set the health poll needs to check for live directory
+  // conflicts. Much smaller than all 200 directorySessions (only
+  // host-matched + workspace + working rows), so registering them into the
+  // /health poll is cheap.
   const conflictCandidates = useMemo(
     () =>
-      (directorySessions ?? []).filter((s) => s.host_id === selectedHostId && s.workspace != null),
+      (directorySessions ?? []).filter(
+        (s) => s.host_id === selectedHostId && s.workspace != null && isWorkingStatus(s.status),
+      ),
     [directorySessions, selectedHostId],
   );
   const runnerHealth = useRunnerHealthRegistration(conflictCandidates);
