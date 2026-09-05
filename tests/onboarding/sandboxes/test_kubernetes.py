@@ -869,8 +869,7 @@ def test_launch_host_threads_env_values_into_host_but_only_config_home_into_init
 ) -> None:
     core, batch = fake_clients
     _setup_pod_discovery(core)
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    before = dict(os.environ)
+    monkeypatch.setattr(os, "environ", {"UNRELATED_CONFIG": "unchanged"})
     values = {
         "SSL_CERT_FILE": "/mnt/ca/ca.crt",
         "OMNIGENT_CONFIG_HOME": "/home/omnigent/custom-config",
@@ -906,7 +905,7 @@ def test_launch_host_threads_env_values_into_host_but_only_config_home_into_init
     assert has_init_token is (repo_url is not None)
     assert any(m["mountPath"] == "/mnt/ca" for m in spec["containers"][0]["volumeMounts"])
     assert all(m["mountPath"] != "/mnt/ca" for m in init["volumeMounts"])
-    assert dict(os.environ) == before
+    assert os.environ == {"UNRELATED_CONFIG": "unchanged"}
 
 
 @pytest.mark.parametrize("launcher_cls", [KubernetesSandboxLauncher, AgentSandboxLauncher])
