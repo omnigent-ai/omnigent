@@ -61,7 +61,6 @@ _CLEANUP_TIMEOUT_S = 5.0
 
 @dataclass(frozen=True)
 class _KimiProbe:
-    launcher: Path
     payload: Path
     version: Version
     version_output: str
@@ -120,7 +119,6 @@ def _probe_kimi() -> _KimiProbe:
     except InvalidVersion as exc:
         raise RuntimeError(f"invalid Kimi Code version in {output!r}") from exc
     return _KimiProbe(
-        launcher=launcher,
         payload=payload,
         version=version,
         version_output=output,
