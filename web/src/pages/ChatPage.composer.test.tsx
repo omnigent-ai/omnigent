@@ -376,6 +376,7 @@ describe("Composer slash-command menu", () => {
     // Built-ins are inserted first, so "/compact" tops the list and is the
     // default highlight — the crux of the fix (was -1 / nothing selected).
     expect(activeRow()?.textContent).toContain("/compact");
+    expect(activeRow()?.closest(".absolute")).toHaveClass("z-20");
   });
 
   it("Tab completes the highlighted skill into the textarea", () => {
@@ -597,6 +598,38 @@ describe("Composer slash-command submit routing", () => {
 
     expect(onSendSlashCommand).not.toHaveBeenCalled();
     expect(onSend).toHaveBeenCalledWith("/not-a-real-skill", undefined);
+  });
+
+  it("floats /help output above the composer in a capped scroll panel", () => {
+    // Long skill blurbs used to dump into the composer card and grow it
+    // under the ChatHeader overlay. The listing must float, stay capped,
+    // and scroll leftovers instead of stretching the card.
+    render(<Composer {...composerProps({ onSendSlashCommand: vi.fn() })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/help" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    const output = screen.getByTestId("composer-command-output");
+    expect(output).toHaveTextContent("/help — Show available slash commands");
+    expect(output).toHaveTextContent("/deslop — Remove AI slop");
+    expect(output).toHaveClass("absolute", "z-20", "overflow-y-auto");
+    expect(ta.value).toBe("");
+    expect(output.parentElement).toHaveAttribute("data-composer-card");
+  });
+
+  it("floats the bare /model hint in the popover band and clears the draft", () => {
+    // Same band as /help — the "/model" draft must not linger in the
+    // textarea under the floating usage hint (matches /help and /context).
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    // Trailing space closes the slash menu so Enter submits (see /model tests).
+    fireEvent.change(ta, { target: { value: "/model " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    const output = screen.getByTestId("composer-command-output");
+    expect(output).toHaveTextContent("Usage: /model <name> · /model default to reset");
+    expect(output).toHaveClass("absolute", "z-20");
+    expect(ta.value).toBe("");
   });
 
   it("treats /effort as plaintext when effort controls are hidden", () => {
