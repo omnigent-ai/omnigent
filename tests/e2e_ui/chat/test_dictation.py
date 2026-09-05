@@ -27,16 +27,42 @@ A failure here means one of:
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
-from playwright.sync_api import Browser, BrowserContext, Page, expect
+from playwright.sync_api import Browser, BrowserContext, Page, Route, expect
 
 from omnigent.server.dictation import FAKE_SCRIPT as _FAKE_SCRIPT
 
 # The capability probe caches per page load; the worklet chunks audio at
 # 100 ms; CI machines are slow — a generous ceiling keeps this deflaked.
 _TRANSCRIPT_TIMEOUT_MS = 20_000
+
+_FAKE_WEB_SPEECH = """
+class FakeSpeechRecognition extends EventTarget {
+  constructor() {
+    super();
+    this.continuous = false;
+    this.interimResults = false;
+    this.lang = "en-US";
+    window.__testRecognition = this;
+  }
+  start() { this.dispatchEvent(new Event("start")); }
+  stop() { this.dispatchEvent(new Event("end")); }
+}
+window.SpeechRecognition = FakeSpeechRecognition;
+window.webkitSpeechRecognition = undefined;
+window.__emitSpeechFinal = text => {
+  const event = new Event("result");
+  event.resultIndex = 0;
+  event.results = {
+    length: 1,
+    0: { length: 1, isFinal: true, 0: { transcript: text } },
+  };
+  window.__testRecognition.dispatchEvent(event);
+};
+"""
 
 
 def _open_server_dictation_page(
@@ -65,6 +91,53 @@ def _open_server_dictation_page(
     )
     page.goto(f"{base_url}/c/{session_id}")
     return context, page
+
+
+def test_browser_speech_final_is_punctuated_before_insertion(
+    browser: Browser,
+    browser_context_args: dict[str, Any],
+    seeded_session: tuple[str, str],
+) -> None:
+    """A browser-recognized final crosses the punctuation API before display."""
+    base_url, session_id = seeded_session
+    context = browser.new_context(**browser_context_args)
+    page = context.new_page()
+    page.add_init_script(_FAKE_WEB_SPEECH)
+    punctuation_requests: list[dict[str, str]] = []
+
+    def advertise_punctuation(route: Route) -> None:
+        response = route.fetch()
+        body = response.json()
+        body["dictation_punctuation_available"] = True
+        route.fulfill(response=response, json=body)
+
+    def restore_punctuation(route: Route) -> None:
+        punctuation_requests.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"text": "你好，世界！今天怎么样？"}),
+        )
+
+    page.route("**/v1/info", advertise_punctuation)
+    page.route("**/v1/dictation/punctuation", restore_punctuation)
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        composer = page.get_by_placeholder("Send a message…")
+        expect(composer).to_be_visible()
+        composer.fill("")
+
+        mic = page.get_by_role("button", name="Voice dictation")
+        expect(mic).to_be_visible()
+        mic.click()
+        expect(mic).to_have_attribute("aria-pressed", "true")
+
+        page.evaluate("text => window.__emitSpeechFinal(text)", "你好世界今天怎么样")
+
+        expect(composer).to_have_value("你好，世界！今天怎么样？", timeout=_TRANSCRIPT_TIMEOUT_MS)
+        assert punctuation_requests == [{"text": "你好世界今天怎么样"}]
+    finally:
+        context.close()
 
 
 def test_dictation_streams_transcript_into_composer(

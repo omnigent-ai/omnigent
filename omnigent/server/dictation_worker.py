@@ -43,7 +43,7 @@ from omnigent.server.routes.dictation import create_dictation_router
 def create_worker_app() -> FastAPI:
     """Build the single-route worker app."""
     app = FastAPI(title="omnigent dictation worker")
-    app.include_router(create_dictation_router(), prefix="/v1")
+    app.include_router(create_dictation_router(include_punctuation=False), prefix="/v1")
     return app
 
 

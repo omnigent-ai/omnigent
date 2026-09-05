@@ -15,6 +15,7 @@
 // handshake, as with those sockets.
 
 import { getOmnigentHostConfig, resolveWebSocketUrl } from "@/lib/host";
+import { authenticatedFetch } from "@/lib/identity";
 import { modalHostId } from "@/lib/sessionHost";
 
 /**
@@ -65,6 +66,39 @@ export interface DictationSessionEvents {
  * not "unavailable".
  */
 export class DictationBusyError extends Error {}
+
+const PUNCTUATION_TIMEOUT_MS = 10_000;
+
+/**
+ * Restore punctuation in one completed browser Web Speech transcript.
+ *
+ * The composer treats failures as a soft degradation and inserts the original
+ * transcript, so this helper throws on every malformed or unavailable response.
+ */
+export async function restoreDictationPunctuation(text: string): Promise<string> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), PUNCTUATION_TIMEOUT_MS);
+  try {
+    const response = await authenticatedFetch("/v1/dictation/punctuation", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`punctuation request failed: ${response.status}`);
+    const body: unknown = await response.json();
+    if (typeof body !== "object" || body === null) {
+      throw new Error("punctuation response was not an object");
+    }
+    const restored = (body as { text?: unknown }).text;
+    if (typeof restored !== "string" || restored.trim() === "") {
+      throw new Error("punctuation response did not contain text");
+    }
+    return restored.trim();
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
 
 /**
  * Parse one text frame from the dictation socket into a typed event.

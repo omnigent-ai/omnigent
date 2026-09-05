@@ -186,6 +186,11 @@ export interface ServerInfo {
    * backend (Electron, Firefox/Chromium).
    */
   dictation_available: boolean;
+  /**
+   * True when completed Web Speech transcripts can be restored with the
+   * server's Chinese/English punctuation model.
+   */
+  dictation_punctuation_available?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -243,6 +248,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  dictation_punctuation_available: false,
   branding: null,
 };
 
@@ -336,6 +342,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
             : [],
           dictation_available: data.dictation_available === true,
+          dictation_punctuation_available: data.dictation_punctuation_available === true,
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;

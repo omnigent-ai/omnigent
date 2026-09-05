@@ -9,8 +9,12 @@ transcript by the number of PCM bytes they send.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import threading
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -18,6 +22,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server import dictation as dictation_engine
 from omnigent.server.dictation import FAKE_SCRIPT, MAX_STREAMS_ENV, FakeDictationEngine
 from omnigent.server.routes.dictation import create_dictation_router
@@ -34,6 +39,14 @@ class _NoIdentityAuthProvider:
         """Always return ``None`` (unauthenticated)."""
         del request
         return
+
+
+class _FakePunctuationRestorer:
+    """Deterministic punctuation model for HTTP route tests."""
+
+    def restore(self, text: str) -> str:
+        assert text == "你好世界今天怎么样"
+        return "你好，世界！今天怎么样？"
 
 
 def _fake_app(**router_kwargs: object) -> FastAPI:
@@ -66,6 +79,101 @@ async def test_info_reports_dictation_unavailable(
     resp = await client.get("/v1/info")
     assert resp.status_code == 200
     assert resp.json()["dictation_available"] is False
+
+
+async def test_info_carries_punctuation_capability(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """GET /v1/info advertises the independent final-punctuation model."""
+    model = tmp_path / "model.int8.onnx"
+    model.touch()
+    monkeypatch.setenv(dictation_engine.FINAL_PUNCT_MODEL_ENV, str(model))
+    monkeypatch.setattr(dictation_engine.importlib.util, "find_spec", lambda name: object())
+
+    resp = await client.get("/v1/info")
+
+    assert resp.status_code == 200
+    assert resp.json()["dictation_punctuation_available"] is True
+
+
+def test_punctuation_route_restores_completed_transcript() -> None:
+    """The HTTP surface returns display-ready Chinese punctuation."""
+    app = _fake_app(punctuation_provider=_FakePunctuationRestorer)
+    with TestClient(app) as tc:
+        resp = tc.post("/v1/dictation/punctuation", json={"text": "你好世界今天怎么样"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"text": "你好，世界！今天怎么样？"}
+
+
+def test_punctuation_route_bounds_transcript_size() -> None:
+    """Oversized free-form input is rejected before it reaches the CPU model."""
+    app = _fake_app(punctuation_provider=_FakePunctuationRestorer)
+    with TestClient(app) as tc:
+        resp = tc.post("/v1/dictation/punctuation", json={"text": "字" * 501})
+
+    assert resp.status_code == 422
+
+
+async def test_punctuation_route_rejects_concurrent_inference() -> None:
+    """A second request fails fast instead of occupying another worker thread."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingRestorer:
+        def restore(self, text: str) -> str:
+            entered.set()
+            assert release.wait(timeout=2)
+            return f"{text}。"
+
+    restorer = BlockingRestorer()
+    app = _fake_app(punctuation_provider=lambda: restorer)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = asyncio.create_task(
+            client.post("/v1/dictation/punctuation", json={"text": "第一句"})
+        )
+        assert await asyncio.to_thread(entered.wait, 1)
+        second = await client.post("/v1/dictation/punctuation", json={"text": "第二句"})
+        release.set()
+        first_response = await first
+
+    assert second.status_code == 429
+    assert first_response.status_code == 200
+
+
+def test_punctuation_route_requires_identity() -> None:
+    """Accounts deployments do not expose the CPU model anonymously."""
+    app = _fake_app(
+        auth_provider=_NoIdentityAuthProvider(),
+        punctuation_provider=_FakePunctuationRestorer,
+    )
+    with TestClient(app) as tc, pytest.raises(OmnigentError) as exc_info:
+        tc.post("/v1/dictation/punctuation", json={"text": "你好世界今天怎么样"})
+
+    assert exc_info.value.code == ErrorCode.UNAUTHORIZED
+
+
+def test_punctuation_route_maps_model_failure_to_service_unavailable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Model failures return a fixed 503 without exposing transcript text."""
+
+    private_text = "私密转写内容"
+
+    def unavailable() -> _FakePunctuationRestorer:
+        raise RuntimeError(f"model failed while processing {private_text}")
+
+    app = _fake_app(punctuation_provider=unavailable)
+    with caplog.at_level(logging.ERROR), TestClient(app) as tc:
+        resp = tc.post("/v1/dictation/punctuation", json={"text": private_text})
+
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "dictation punctuation unavailable"}
+    assert private_text not in resp.text
+    assert private_text not in caplog.text
 
 
 def test_stream_partial_final_stop_flow() -> None:

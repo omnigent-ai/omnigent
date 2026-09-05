@@ -15,6 +15,7 @@ from collections.abc import Iterator
 
 import pytest
 import uvicorn
+from fastapi.testclient import TestClient
 
 from omnigent.server import dictation
 
@@ -49,6 +50,16 @@ def worker_url() -> Iterator[str]:
 
 _WORD = b"\x00" * (dictation.SAMPLE_RATE * 2 // 10)  # 100 ms per fake word
 _WORDS = dictation.FAKE_SCRIPT.split()
+
+
+def test_worker_does_not_expose_browser_punctuation_route() -> None:
+    """The unauthenticated audio worker mounts only its streaming surface."""
+    from omnigent.server.dictation_worker import create_worker_app
+
+    with TestClient(create_worker_app()) as client:
+        response = client.post("/v1/dictation/punctuation", json={"text": "private words"})
+
+    assert response.status_code == 404
 
 
 def _drain_partial(handle: dictation.DictationStreamHandle, expected: str) -> None:

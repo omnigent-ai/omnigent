@@ -4,8 +4,10 @@
 // with a mocked session, and the full loop runs in the Playwright e2e test
 // against the server's fake engine.
 
-import { describe, expect, it } from "vitest";
-import { parseDictationEvent } from "./dictation";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { parseDictationEvent, restoreDictationPunctuation } from "./dictation";
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("parseDictationEvent", () => {
   it("parses the transcript event shapes", () => {
@@ -37,5 +39,35 @@ describe("parseDictationEvent", () => {
     expect(parseDictationEvent('{"type":"partial"}')).toBeNull();
     expect(parseDictationEvent('{"type":"partial","text":7}')).toBeNull();
     expect(parseDictationEvent('{"type":"error"}')).toBeNull();
+  });
+});
+
+describe("restoreDictationPunctuation", () => {
+  it("posts a completed transcript and returns display-ready text", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ text: "你好，世界！" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(restoreDictationPunctuation("你好世界")).resolves.toBe("你好，世界！");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/dictation/punctuation",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ text: "你好世界" }),
+      }),
+    );
+  });
+
+  it("rejects malformed responses so the composer can preserve raw text", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("{}", { status: 200 })),
+    );
+    await expect(restoreDictationPunctuation("你好世界")).rejects.toThrow("did not contain text");
   });
 });

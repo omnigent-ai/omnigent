@@ -1494,6 +1494,36 @@
         "title": "DailyCost",
         "type": "object"
       },
+      "DictationPunctuationRequest": {
+        "description": "One completed transcript that needs punctuation restoration.",
+        "properties": {
+          "text": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "DictationPunctuationRequest",
+        "type": "object"
+      },
+      "DictationPunctuationResponse": {
+        "description": "Display-ready transcript returned to the composer.",
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "DictationPunctuationResponse",
+        "type": "object"
+      },
       "ElicitationRequestEvent": {
         "description": "Synchronous request for a decision from upstream.\n\nEmitted by Omnigent (or, under the new contract, by a harness)\nwhen the LLM / a tool / a policy needs a verdict before\nproceeding. The consumer replies via\n`POST /v1/sessions/{session_id}/events` with\n`type == \"approval\"` and\n`omnigent.server.schemas.ElicitationResult` fields in\n`data`. This preserves MCP request/reply correlation by id\nwithout threading elicitations through PATCH.\n\nWire shape matches the existing emit at\n`omnigent/runtime/policies/approval.py:175`.",
         "properties": {
@@ -4411,6 +4441,10 @@
             "title": "Dictation Available",
             "type": "boolean"
           },
+          "dictation_punctuation_available": {
+            "title": "Dictation Punctuation Available",
+            "type": "boolean"
+          },
           "enabled_connections": {
             "items": {
               "type": "string"
@@ -4522,6 +4556,7 @@
           "harness_install_enabled",
           "installable_harnesses",
           "dictation_available",
+          "dictation_punctuation_available",
           "branding"
         ],
         "title": "ServerInfoResponse",
@@ -8794,6 +8829,54 @@
         "summary": "Branding Logo"
       }
     },
+    "/v1/dictation/punctuation": {
+      "post": {
+        "description": "Restore Chinese/English punctuation in a completed transcript.",
+        "operationId": "restore_dictation_punctuation_v1_dictation_punctuation_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DictationPunctuationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DictationPunctuationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "429": {
+            "description": "Punctuation model busy"
+          },
+          "503": {
+            "description": "Punctuation model unavailable"
+          }
+        },
+        "summary": "Restore Dictation Punctuation",
+        "tags": [
+          "dictation"
+        ]
+      }
+    },
     "/v1/extensions": {
       "get": {
         "description": "List extensions installed and enabled when the server started.\n\nV1 treats operator installation as enablement. Installing, removing, or\nupgrading a package requires a server restart to refresh this snapshot.",
@@ -9840,7 +9923,7 @@
     },
     "/v1/info": {
       "get": {
-        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`,\n`single_user`), the short sandbox provider name\n(`sandbox_provider`) the web UI labels the new-session\nsandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
+        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`,\n`dictation_punctuation_available`, `single_user`), the\nshort sandbox provider name\n(`sandbox_provider`) the web UI labels the new-session\nsandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
         "operationId": "info_v1_info_get",
         "responses": {
           "200": {

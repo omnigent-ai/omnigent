@@ -122,6 +122,11 @@ describe("resolveServerInfo sandbox_providers", () => {
 });
 
 describe("resolveServerInfo release features", () => {
+  it("treats a missing punctuation capability from an older server as unavailable", async () => {
+    const parsed = await probe({ dictation_available: true });
+    expect(parsed.dictation_punctuation_available).toBe(false);
+  });
+
   it("keeps boolean feature values and drops malformed entries", async () => {
     const parsed = await probe({
       features: { usage_page: true, harness_install: false, malformed: "yes" },

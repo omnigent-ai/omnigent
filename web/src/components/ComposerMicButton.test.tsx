@@ -34,6 +34,7 @@ let sessionStartMock: Mock<(events: DictationSessionEvents) => Promise<SessionSt
 let sessionStopMock: Mock<() => Promise<string>>;
 let sessionCancelMock: Mock<() => void>;
 let sessionEvents: DictationSessionEvents | null;
+let punctuationMock: Mock<(text: string) => Promise<string>>;
 
 vi.mock("@/lib/dictation", () => {
   class DictationBusyError extends Error {}
@@ -42,6 +43,7 @@ vi.mock("@/lib/dictation", () => {
     DictationSession: {
       start: (events: DictationSessionEvents) => sessionStartMock(events),
     },
+    restoreDictationPunctuation: (text: string) => punctuationMock(text),
   };
 });
 
@@ -104,6 +106,7 @@ function resultEvent(transcript: string) {
 beforeEach(() => {
   installSpeechRecognition();
   installDictationSession();
+  punctuationMock = vi.fn(async (text: string) => text);
   // The visualizer's getUserMedia is best-effort; reject so no AudioContext
   // (unavailable in jsdom) is ever constructed. Capture the original descriptor
   // first so afterEach can restore it — otherwise this navigator stub leaks.
@@ -200,6 +203,130 @@ describe("ComposerMicButton", () => {
 
     act(() => handlers.result?.(resultEvent("  hello world  ")));
     expect(onTranscript).toHaveBeenCalledWith("hello world");
+  });
+
+  it("restores punctuation before inserting a Web Speech transcript", async () => {
+    punctuationMock = vi.fn(async () => "你好，世界！今天怎么样？");
+    const onTranscript = vi.fn();
+    render(
+      <CapabilitiesContext.Provider value={PUNCTUATION_INFO}>
+        <ComposerMicButton onTranscript={onTranscript} />
+      </CapabilitiesContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+
+    await act(async () => handlers.result?.(resultEvent("你好世界今天怎么样")));
+
+    expect(punctuationMock).toHaveBeenCalledWith("你好世界今天怎么样");
+    expect(onTranscript).toHaveBeenCalledWith("你好，世界！今天怎么样？");
+  });
+
+  it("keeps finalized phrases in recognition order while punctuation is pending", async () => {
+    let resolveFirst: ((value: string) => void) | undefined;
+    punctuationMock = vi.fn((text: string) => {
+      if (text === "第一句") {
+        return new Promise<string>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return Promise.resolve("第二句。");
+    });
+    const onTranscript = vi.fn();
+    render(
+      <CapabilitiesContext.Provider value={PUNCTUATION_INFO}>
+        <ComposerMicButton onTranscript={onTranscript} />
+      </CapabilitiesContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+
+    act(() => {
+      handlers.result?.(resultEvent("第一句"));
+      handlers.result?.(resultEvent("第二句"));
+    });
+    await act(async () => Promise.resolve());
+    expect(punctuationMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => resolveFirst?.("第一句。"));
+
+    expect(punctuationMock).toHaveBeenNthCalledWith(2, "第二句");
+    expect(onTranscript.mock.calls).toEqual([["第一句。"], ["第二句。"]]);
+  });
+
+  it("inserts the recognized words when punctuation restoration fails", async () => {
+    punctuationMock = vi.fn(async () => {
+      throw new Error("model unavailable");
+    });
+    const onTranscript = vi.fn();
+    render(
+      <CapabilitiesContext.Provider value={PUNCTUATION_INFO}>
+        <ComposerMicButton onTranscript={onTranscript} />
+      </CapabilitiesContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+
+    await act(async () => handlers.result?.(resultEvent("保留原文")));
+
+    expect(onTranscript).toHaveBeenCalledWith("保留原文");
+  });
+
+  it("drops pending punctuation as soon as a new take is requested", async () => {
+    let resolvePending: ((value: string) => void) | undefined;
+    punctuationMock = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvePending = resolve;
+        }),
+    );
+    const onTranscript = vi.fn();
+    render(
+      <CapabilitiesContext.Provider value={PUNCTUATION_INFO}>
+        <ComposerMicButton onTranscript={onTranscript} />
+      </CapabilitiesContext.Provider>,
+    );
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(button);
+    act(() => handlers.start?.({}));
+    act(() => handlers.result?.(resultEvent("旧录音")));
+    await act(async () => Promise.resolve());
+    act(() => handlers.end?.({}));
+
+    fireEvent.click(button);
+    await act(async () => resolvePending?.("旧录音。"));
+
+    expect(onTranscript).not.toHaveBeenCalled();
+  });
+
+  it("drops pending punctuation when a stopped composer becomes disabled", async () => {
+    let resolvePending: ((value: string) => void) | undefined;
+    punctuationMock = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvePending = resolve;
+        }),
+    );
+    const onTranscript = vi.fn();
+    const { rerender } = render(
+      <CapabilitiesContext.Provider value={PUNCTUATION_INFO}>
+        <ComposerMicButton onTranscript={onTranscript} />
+      </CapabilitiesContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+    act(() => handlers.result?.(resultEvent("即将失效")));
+    await act(async () => Promise.resolve());
+    act(() => handlers.end?.({}));
+
+    rerender(
+      <CapabilitiesContext.Provider value={PUNCTUATION_INFO}>
+        <ComposerMicButton onTranscript={onTranscript} disabled />
+      </CapabilitiesContext.Provider>,
+    );
+    await act(async () => resolvePending?.("即将失效。"));
+
+    expect(onTranscript).not.toHaveBeenCalled();
   });
 
   it("does not emit a transcript while the composer is disabled", () => {
@@ -320,6 +447,11 @@ const DICTATION_INFO: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: true,
+};
+
+const PUNCTUATION_INFO: ServerInfo = {
+  ...DICTATION_INFO,
+  dictation_punctuation_available: true,
 };
 
 const NO_DICTATION_INFO: ServerInfo = {
@@ -470,6 +602,51 @@ describe("ComposerMicButton (server dictation)", () => {
     await clickMic(); // next take
     expect(startSpy).toHaveBeenCalledTimes(2);
     expect(sessionStartMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves pending Web Speech finals in order across a server fallback", async () => {
+    let resolvePending: ((value: string) => void) | undefined;
+    punctuationMock = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvePending = resolve;
+        }),
+    );
+    const onTranscript = vi.fn();
+    const onVoiceStart = vi.fn();
+    render(
+      <CapabilitiesContext.Provider value={PUNCTUATION_INFO}>
+        <ComposerMicButton onTranscript={onTranscript} onVoiceStart={onVoiceStart} />
+      </CapabilitiesContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+    act(() => handlers.result?.(resultEvent("浏览器前半句")));
+    await act(async () => Promise.resolve());
+
+    await act(async () => handlers.error?.({ error: "network" }));
+    act(() => sessionEvents?.onFinal("服务器后半句。"));
+    expect(onTranscript).not.toHaveBeenCalled();
+
+    await act(async () => resolvePending?.("浏览器前半句。"));
+
+    expect(onTranscript.mock.calls).toEqual([["浏览器前半句。"], ["服务器后半句。"]]);
+    expect(onVoiceStart).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not restart on the server after Esc discards a Web Speech take", async () => {
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    await act(async () => handlers.error?.({ error: "network" }));
+
+    expect(sessionStartMock).not.toHaveBeenCalled();
   });
 
   it("reports a busy server distinctly from a broken one", async () => {

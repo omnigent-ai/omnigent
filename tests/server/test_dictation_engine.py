@@ -7,7 +7,9 @@ itself unless the extra and a model are installed (developer machines).
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,7 +22,9 @@ def _clean_engine_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(dictation.ENGINE_ENV, raising=False)
     monkeypatch.delenv(dictation.MODEL_DIR_ENV, raising=False)
     monkeypatch.delenv(dictation.PUNCT_DIR_ENV, raising=False)
+    monkeypatch.delenv(dictation.FINAL_PUNCT_MODEL_ENV, raising=False)
     monkeypatch.delenv(dictation.MAX_STREAMS_ENV, raising=False)
+    monkeypatch.setattr(dictation, "_punctuation_restorer", None)
 
 
 def _touch_asr_files(model_dir: Path) -> None:
@@ -59,6 +63,105 @@ def test_availability_with_models(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     _touch_asr_files(tmp_path)
     monkeypatch.setenv(dictation.MODEL_DIR_ENV, str(tmp_path))
     assert dictation.engine_availability() == (True, None)
+
+
+def test_punctuation_availability_requires_extra_and_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The final-text capability is independent from the ASR model set."""
+    model = tmp_path / "model.int8.onnx"
+    monkeypatch.setenv(dictation.FINAL_PUNCT_MODEL_ENV, str(model))
+    monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: None)
+    assert dictation.punctuation_availability() == (
+        False,
+        dictation.REASON_EXTRA_NOT_INSTALLED,
+    )
+
+    monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: object())
+    assert dictation.punctuation_availability() == (
+        False,
+        dictation.REASON_PUNCTUATION_MODEL_MISSING,
+    )
+    model.touch()
+    assert dictation.punctuation_availability() == (True, None)
+
+
+def test_sherpa_punctuation_restorer_uses_offline_ct_transformer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Completed Chinese text is passed through the offline punctuation model."""
+    model = tmp_path / "model.int8.onnx"
+    model.touch()
+    observed: dict[str, object] = {}
+
+    class OfflinePunctuationModelConfig:
+        def __init__(self, **kwargs: object) -> None:
+            observed["model_config"] = kwargs
+
+    class OfflinePunctuationConfig:
+        def __init__(self, **kwargs: object) -> None:
+            observed["config"] = kwargs
+
+    class OfflinePunctuation:
+        def __init__(self, config: object) -> None:
+            observed["punctuation_config"] = config
+
+        def add_punctuation(self, text: str) -> str:
+            observed["text"] = text
+            return "你好，世界。"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sherpa_onnx",
+        SimpleNamespace(
+            OfflinePunctuationModelConfig=OfflinePunctuationModelConfig,
+            OfflinePunctuationConfig=OfflinePunctuationConfig,
+            OfflinePunctuation=OfflinePunctuation,
+        ),
+    )
+
+    restorer = dictation.SherpaPunctuationRestorer(model)
+    assert restorer.restore("  你好世界  ") == "你好，世界。"
+    assert observed["text"] == "你好世界"
+    assert observed["model_config"] == {
+        "ct_transformer": str(model),
+        "num_threads": 1,
+        "provider": "cpu",
+    }
+
+
+def test_final_punctuation_does_not_rewrite_live_partials() -> None:
+    """The sentence model runs after finalization, not on every partial update."""
+
+    class Restorer:
+        def restore(self, text: str) -> str:
+            return f"{text}。"
+
+    engine = object.__new__(dictation.SherpaDictationEngine)
+    engine._punct = None
+    engine._final_punctuation = Restorer()
+
+    assert engine._beautify("你好") == "你好"
+    assert engine._beautify_final("你好") == "你好。"
+
+
+def test_final_punctuation_failure_does_not_log_transcript(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A model failure falls back without copying dictated text into logs."""
+    private_text = "do not record this transcript"
+
+    class FailingRestorer:
+        def restore(self, text: str) -> str:
+            raise RuntimeError(f"failed while processing {text}")
+
+    engine = object.__new__(dictation.SherpaDictationEngine)
+    engine._punct = None
+    engine._final_punctuation = FailingRestorer()
+
+    with caplog.at_level("WARNING"):
+        assert engine._beautify_final(private_text) == private_text
+    assert private_text not in caplog.text
 
 
 def test_pick_model_file_prefers_int8(tmp_path: Path) -> None:

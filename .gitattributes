@@ -7,3 +7,6 @@ web/electron/icons/AppIcon.icon/** binary -merge
 # hand-editable, so its unused-import/global artifacts are expected.
 omnigent/api/**/*_pb2.py linguist-generated=true
 omnigent/api/**/*_pb2.pyi linguist-generated=true
+
+# This script is executed directly by Bash from Windows checkouts.
+scripts/fetch-dictation-models.sh text eol=lf

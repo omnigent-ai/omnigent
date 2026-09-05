@@ -88,6 +88,7 @@ _logger = logging.getLogger(__name__)
 ENGINE_ENV = "OMNIGENT_DICTATION_ENGINE"
 MODEL_DIR_ENV = "OMNIGENT_DICTATION_MODEL_DIR"
 PUNCT_DIR_ENV = "OMNIGENT_DICTATION_PUNCT_DIR"
+FINAL_PUNCT_MODEL_ENV = "OMNIGENT_DICTATION_FINAL_PUNCT_MODEL"
 MAX_STREAMS_ENV = "OMNIGENT_DICTATION_MAX_STREAMS"
 #: Worker stream URL for the ``remote`` engine, e.g.
 #: ``ws://venus:8100/v1/dictation/stream``.
@@ -113,6 +114,7 @@ REASON_EXTRA_NOT_INSTALLED = "extra_not_installed"
 REASON_MODELS_MISSING = "models_missing"
 REASON_UNKNOWN_ENGINE = "unknown_engine"
 REASON_REMOTE_URL_MISSING = "remote_url_missing"
+REASON_PUNCTUATION_MODEL_MISSING = "punctuation_model_missing"
 
 DEFAULT_MAX_STREAMS = 2
 
@@ -177,6 +179,14 @@ class DictationEngine(Protocol):
         ...
 
 
+class PunctuationRestorer(Protocol):
+    """Restore punctuation in one completed dictation transcript."""
+
+    def restore(self, text: str) -> str:
+        """Return display-ready text while preserving the recognized words."""
+        ...
+
+
 #: An engine's availability probe: ``() -> (available, reason)`` where
 #: *reason* is ``None`` when available, else a machine-readable
 #: ``REASON_*`` string. Called without loading any model.
@@ -227,6 +237,13 @@ def _asr_dir() -> Path:
 def _punct_dir() -> Path:
     default = Path.home() / ".omnigent" / "models" / "dictation" / "punct"
     return Path(os.environ.get(PUNCT_DIR_ENV) or default).expanduser()
+
+
+def _final_punct_model() -> Path:
+    default = (
+        Path.home() / ".omnigent" / "models" / "dictation" / "punct-final" / "model.int8.onnx"
+    )
+    return Path(os.environ.get(FINAL_PUNCT_MODEL_ENV) or default).expanduser()
 
 
 def max_streams() -> int:
@@ -283,6 +300,72 @@ def _sherpa_available() -> tuple[bool, str | None]:
     return True, None
 
 
+def punctuation_availability() -> tuple[bool, str | None]:
+    """Report whether final-text punctuation restoration can serve."""
+    if importlib.util.find_spec("sherpa_onnx") is None:
+        return False, REASON_EXTRA_NOT_INSTALLED
+    if not _final_punct_model().is_file():
+        return False, REASON_PUNCTUATION_MODEL_MISSING
+    return True, None
+
+
+class SherpaPunctuationRestorer:
+    """Process-wide Chinese/English CT-Transformer punctuation model."""
+
+    def __init__(self, model: Path) -> None:
+        import sherpa_onnx  # type: ignore[import-not-found]
+
+        if not model.is_file():
+            raise RuntimeError(f"dictation punctuation model missing at {model}")
+        _logger.info("Loading final dictation punctuation model from %s", model)
+        config = sherpa_onnx.OfflinePunctuationConfig(
+            model=sherpa_onnx.OfflinePunctuationModelConfig(
+                ct_transformer=str(model),
+                num_threads=1,
+                provider="cpu",
+            )
+        )
+        self._punctuation = sherpa_onnx.OfflinePunctuation(config)
+        self._lock = threading.Lock()
+
+    def restore(self, text: str) -> str:
+        """Restore punctuation without ever replacing a valid transcript with empty text."""
+        stripped = text.strip()
+        if not stripped:
+            return stripped
+        with self._lock:
+            result = self._punctuation.add_punctuation(stripped)
+        return result.strip() if isinstance(result, str) and result.strip() else stripped
+
+
+_punctuation_lock = threading.Lock()
+_punctuation_restorer: PunctuationRestorer | None = None
+
+
+def get_punctuation_restorer() -> PunctuationRestorer:
+    """Return the lazy process-wide final-text punctuation restorer."""
+    global _punctuation_restorer
+    with _punctuation_lock:
+        if _punctuation_restorer is not None:
+            return _punctuation_restorer
+        available, reason = punctuation_availability()
+        if not available:
+            raise RuntimeError(f"dictation punctuation unavailable: {reason}")
+        _punctuation_restorer = SherpaPunctuationRestorer(_final_punct_model())
+        return _punctuation_restorer
+
+
+def _optional_punctuation_restorer() -> PunctuationRestorer | None:
+    """Load the final restorer when configured; keep dictation usable otherwise."""
+    if not punctuation_availability()[0]:
+        return None
+    try:
+        return get_punctuation_restorer()
+    except Exception:  # noqa: BLE001 - punctuation must not break transcription
+        _logger.warning("final dictation punctuation failed to load", exc_info=True)
+        return None
+
+
 def _selected_engine_name() -> str:
     """Resolve the configured engine name (default: sherpa)."""
     return os.environ.get(ENGINE_ENV, "").strip() or _DEFAULT_ENGINE
@@ -337,7 +420,12 @@ def get_engine() -> DictationEngine:
 class SherpaDictationEngine:
     """Streaming sherpa-onnx transducer + optional online punctuation."""
 
-    def __init__(self, asr_dir: Path, punct_dir: Path) -> None:
+    def __init__(
+        self,
+        asr_dir: Path,
+        punct_dir: Path,
+        punctuation_restorer: PunctuationRestorer | None = None,
+    ) -> None:
         """Load models eagerly; construction is slow (seconds).
 
         :param asr_dir: Directory holding the streaming transducer.
@@ -367,6 +455,7 @@ class SherpaDictationEngine:
             provider="cpu",
         )
         self._punct: Any = None
+        self._final_punctuation = punctuation_restorer
         punct_files = _punct_files(punct_dir)
         if punct_files is not None:
             try:
@@ -392,13 +481,10 @@ class SherpaDictationEngine:
         self._lock = threading.Lock()
 
     def _beautify(self, text: str) -> str:
-        """Re-punctuate and re-case *text* for display.
-
-        Internal: the raw transducer emits lowercase, punctuation-free
-        text, so the streams call this before returning so partials/finals
-        read like sentences. Identity when no punctuation model loaded.
-        """
-        if self._punct is None or not text:
+        """Add lightweight online punctuation to an in-progress transcript."""
+        if not text:
+            return text
+        if self._punct is None:
             return text
         # The model expects lowercase, punctuation-free input.
         cleaned = _PUNCT_STRIP_RE.sub("", text.lower())
@@ -408,6 +494,17 @@ class SherpaDictationEngine:
             return result if isinstance(result, str) else text
         except Exception:  # noqa: BLE001 - never fail a take over cosmetics
             return text
+
+    def _beautify_final(self, text: str) -> str:
+        """Restore sentence punctuation after an utterance is finalized."""
+        if self._final_punctuation is not None:
+            try:
+                return self._final_punctuation.restore(text)
+            except Exception as exc:  # noqa: BLE001 - never fail a take over punctuation
+                # Model exceptions may include their input; log only the class
+                # so dictated text never enters server logs.
+                _logger.warning("final dictation punctuation failed (%s)", type(exc).__name__)
+        return self._beautify(text)
 
     def create_stream(self) -> _SherpaStream:
         """Open a recognizer stream for one connection."""
@@ -450,7 +547,7 @@ class _SherpaStream:
         # protocol stay engine-agnostic.
         return DictationUpdate(
             partial=engine._beautify(partial),
-            finalized=engine._beautify(finalized) if finalized else None,
+            finalized=engine._beautify_final(finalized) if finalized else None,
         )
 
     def finish(self) -> str:
@@ -467,7 +564,7 @@ class _SherpaStream:
             while recognizer.is_ready(self._stream):
                 recognizer.decode_stream(self._stream)
             tail = recognizer.get_result(self._stream).strip()
-        return engine._beautify(tail)
+        return engine._beautify_final(tail)
 
     def close(self) -> None:
         """No-op: the recognizer stream frees with the handle."""
@@ -646,7 +743,13 @@ def _build_remote_engine() -> RemoteDictationEngine:
     if not url:
         raise RuntimeError(f"dictation unavailable: {REASON_REMOTE_URL_MISSING}")
     fallback = (
-        (lambda: SherpaDictationEngine(_asr_dir(), _punct_dir()))
+        (
+            lambda: SherpaDictationEngine(
+                _asr_dir(),
+                _punct_dir(),
+                _optional_punctuation_restorer(),
+            )
+        )
         if _sherpa_available()[0]
         else None
     )
@@ -717,7 +820,11 @@ class _FakeStream:
 # model RAM.
 register_engine(
     ENGINE_SHERPA,
-    lambda: SherpaDictationEngine(_asr_dir(), _punct_dir()),
+    lambda: SherpaDictationEngine(
+        _asr_dir(),
+        _punct_dir(),
+        _optional_punctuation_restorer(),
+    ),
     available=_sherpa_available,
 )
 register_engine(ENGINE_REMOTE, _build_remote_engine, available=_remote_available)
