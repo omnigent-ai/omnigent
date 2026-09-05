@@ -1556,10 +1556,10 @@ async def _collect_previews_async(
 
     async def fetch_one(conv: _ConversationRow) -> tuple[str, _Preview | None]:
         try:
-            items = await client.sessions.list_items(conv.id, limit=10, order="desc")
+            page = await client.sessions.list_items(conv.id, limit=10, order="desc")
         except Exception:  # noqa: BLE001 — preview is best-effort, swallow per-conv errors
             return conv.id, None
-        return conv.id, _last_message_preview_from_dicts(items)
+        return conv.id, _last_message_preview_from_dicts(page.data)
 
     capped = conversations[:_PREVIEW_PREFETCH_CAP]
     pairs = await asyncio.gather(*(fetch_one(c) for c in capped))

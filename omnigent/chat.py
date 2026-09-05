@@ -2719,9 +2719,11 @@ async def _persisted_turn_text(
         # resumed session can have far more than the limit of history;
         # fetching ``asc`` would return the oldest items and miss this
         # turn entirely.
-        recent: _ResponseOutput = await client.sessions.list_items(
-            session_id, limit=_RECONCILE_ITEMS_LIMIT, order="desc"
-        )
+        recent: _ResponseOutput = (
+            await client.sessions.list_items(
+                session_id, limit=_RECONCILE_ITEMS_LIMIT, order="desc"
+            )
+        ).data
     except ClientOmnigentError as exc:
         # The reconcile read is itself best-effort: if the items
         # endpoint is unreachable, fall back to the original outcome
@@ -2769,9 +2771,11 @@ async def _persisted_turn_error(
     :returns: The current turn's terminal error message, or ``None``.
     """
     try:
-        recent: _ResponseOutput = await client.sessions.list_items(
-            session_id, limit=_RECONCILE_ITEMS_LIMIT, order="desc"
-        )
+        recent: _ResponseOutput = (
+            await client.sessions.list_items(
+                session_id, limit=_RECONCILE_ITEMS_LIMIT, order="desc"
+            )
+        ).data
     except ClientOmnigentError as exc:
         logger.debug("reconcile error read failed for %s: %r", session_id, exc)
         return None
@@ -3920,7 +3924,7 @@ def _spec_used_families(agent_yaml: Path | None) -> list[str]:
         from omnigent.spec import parse
 
         spec = parse(root, expand_env=False)
-    except Exception:  # noqa: BLE001 — best-effort startup-header hint: a spec parse must never break `run`
+    except Exception:  # noqa: BLE001, RUF100 — best-effort startup-header hint; a spec parse must never break `run`
         logger.debug("startup-header family parse failed for %s", agent_yaml, exc_info=True)
         return []
 
