@@ -51,8 +51,8 @@ from omnigent.onboarding.harness_install import (
     QWEN_KEY,
     READINESS_CLI_PROBE_TIMEOUT_S,
     harness_cli_installed,
-    harness_install_spec,
     required_cli_for_harness,
+    resolve_harness_cli_binary,
 )
 from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
@@ -404,15 +404,15 @@ def _installer_only_availability(install_key: str) -> HarnessAvailability:
 def _binary_availability_reason(install_key: str) -> HarnessAvailability:
     """Return the readiness reason when a CLI-backed harness can't be used.
 
-    Distinguishes a genuinely missing CLI from one that is on ``PATH`` but
-    outside the version range the native harness requires. The latter is
-    exposed to the web UI as ``"version-too-low"`` so the user sees a prompt
-    to upgrade rather than "binary-missing".
+    Distinguishes a genuinely missing CLI from one that resolves (on ``PATH``
+    or at its configured override path) but is outside the version range the
+    native harness requires. The latter is exposed to the web UI as
+    ``"version-too-low"`` so the user sees a prompt to upgrade rather than
+    "binary-missing".
     """
     if harness_cli_installed(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S):
         return True
-    spec = harness_install_spec(install_key)
-    if spec is not None and resolve_cli_binary(spec.binary) is not None:
+    if resolve_harness_cli_binary(install_key) is not None:
         return HARNESS_VERSION_TOO_LOW
     return HARNESS_BINARY_MISSING
 

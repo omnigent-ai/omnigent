@@ -52,6 +52,7 @@ from omnigent._platform import resolve_cli_binary
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
+from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.opencode_native_client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
@@ -848,6 +849,47 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     return _all_harness_install().get(key)
 
 
+# Install keys whose binary-path override id differs from the key itself:
+# claude/codex are keyed by provider family here, and agy (``gemini``) has no
+# override env var — its launch resolves via PATH/fallback dirs only.
+_PATH_OVERRIDE_IDS: dict[str, str | None] = {
+    ANTHROPIC_FAMILY: "claude",
+    OPENAI_FAMILY: "codex",
+    GEMINI_FAMILY: None,
+}
+
+
+def resolve_harness_cli_binary(key: str) -> str | None:
+    """Resolve the effective CLI binary for *key*, the way launch does.
+
+    Launch honors a per-harness executable override — the
+    ``OMNIGENT_<NAME>_PATH`` env var (:func:`resolve_harness_path`), which the
+    CLI front door also threads ``harness.<id>.command`` config into — so an
+    install that lives only at a custom path is launchable. Readiness and
+    install verdicts must consult the same override, with ``PATH`` (plus the
+    :func:`resolve_cli_binary` fallback dirs) as the fallback rather than the
+    precondition, or they report a working install as missing.
+
+    :param key: A harness family (``"anthropic"`` / ``"openai"``) or install
+        key, e.g. :data:`KIMI_KEY`.
+    :returns: Absolute path to the executable, or ``None`` when neither the
+        override nor the standard ladder resolves one (or *key* has no spec).
+    """
+    spec = harness_install_spec(key)
+    if spec is None:
+        return None
+    override_id = _PATH_OVERRIDE_IDS.get(key, key)
+    override = resolve_harness_path(override_id) if override_id else None
+    if override:
+        resolved = resolve_cli_binary(override)
+        if resolved is not None:
+            return resolved
+        # A set-but-unresolvable override falls back to the standard ladder
+        # (the same contract as resolve_cli_binary's env_var handling), so a
+        # typo'd override never hides a PATH install readiness credited before.
+    return resolve_cli_binary(spec.binary)
+
+
 def harness_cli_version_satisfies(key: str) -> bool:
     """Return whether the installed CLI for *key* satisfies its version range.
 
@@ -863,7 +905,7 @@ def harness_cli_version_satisfies(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = resolve_cli_binary(spec.binary)
+    binary = resolve_harness_cli_binary(key)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary)
@@ -872,7 +914,8 @@ def harness_cli_version_satisfies(key: str) -> bool:
 def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S) -> bool:
     """Return whether the harness's CLI is present and meets its version range.
 
-    "Installed" now means the CLI binary (:func:`resolve_cli_binary`) is
+    "Installed" now means the CLI binary (:func:`resolve_harness_cli_binary`
+    — the configured override path, then the ``PATH``/fallback-dir ladder) is
     resolvable **and**, when the harness declares ``min_version`` /
     ``max_version_exclusive`` in its install spec, the binary's
     ``--version`` output satisfies that range. This prevents an outdated
@@ -891,7 +934,7 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = resolve_cli_binary(spec.binary)
+    binary = resolve_harness_cli_binary(key)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary, timeout)
@@ -914,7 +957,7 @@ def harness_cli_version(key: str) -> tuple[str | None, str | None]:
     spec = harness_install_spec(key)
     if spec is None:
         return None, None
-    binary = resolve_cli_binary(spec.binary)
+    binary = resolve_harness_cli_binary(key)
     if binary is None:
         return None, None
     version = _harness_cli_version_string(spec, binary)
@@ -1067,13 +1110,14 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     # harness_install_command would have raised for a spec-less key, so spec is
     # non-None past this point.
     assert spec is not None
-    # Resolve the freshly-installed binary via the SAME ladder readiness uses
-    # (:func:`resolve_cli_binary` — ``PATH`` plus the nvm/npm-global/homebrew
-    # fallback dirs), so the install verdict and the readiness badge can never
-    # disagree. A bare ``shutil.which`` here would report "not found" for a
-    # binary the host daemon's frozen ``PATH`` omits but readiness still resolves
-    # via the ladder — the spurious "failed" toast next to a green "ready" tick.
-    resolved = resolve_cli_binary(spec.binary)
+    # Resolve the freshly-installed binary via the SAME resolution readiness
+    # uses (:func:`resolve_harness_cli_binary` — the configured override, then
+    # ``PATH`` plus the nvm/npm-global/homebrew fallback dirs), so the install
+    # verdict and the readiness badge can never disagree. A bare
+    # ``shutil.which`` here would report "not found" for a binary the host
+    # daemon's frozen ``PATH`` omits but readiness still resolves via the
+    # ladder — the spurious "failed" toast next to a green "ready" tick.
+    resolved = resolve_harness_cli_binary(key)
     if resolved is not None:
         # Put the resolving dir on ``PATH`` for this process so the setup
         # wizard's *later* steps — harness_login / harness_cli_logged_in /
@@ -1141,7 +1185,7 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     spec = harness_install_spec(key)
     if spec is None or spec.status_args is None:
         return False
-    binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
+    binary = resolve_harness_cli_binary(key)
     if binary is None:
         return False
     # Positive verdicts are TTL-cached (see the cache block above): logins
@@ -1152,10 +1196,9 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     with _PROBE_CACHE_LOCK:
         if time.monotonic() < _LOGIN_PROBE_CACHE.get(cache_key, 0.0):
             return True
-    argv_binary = binary if key == GEMINI_FAMILY else spec.binary
     try:
         result = subprocess.run(
-            [argv_binary, *spec.status_args],
+            [binary, *spec.status_args],
             check=False,
             timeout=timeout,
             capture_output=True,
@@ -1208,10 +1251,9 @@ def harness_login(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None or spec.login_args is None:
         return False
-    binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
+    binary = resolve_harness_cli_binary(key)
     if binary is None:
         return False
-    argv_binary = binary if key == GEMINI_FAMILY else spec.binary
     if harness_cli_logged_in(key):
         return True
     try:
@@ -1227,7 +1269,7 @@ def harness_login(key: str) -> bool:
                 tty_fd = os.open("/dev/tty", os.O_RDWR)
             except OSError:
                 tty_fd = None
-        argv = [argv_binary, *spec.login_args]
+        argv = [binary, *spec.login_args]
         try:
             if tty_fd is not None:
                 subprocess.run(
@@ -1261,10 +1303,11 @@ def harness_logout(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None or spec.logout_args is None:
         return False
-    if shutil.which(spec.binary) is None:
+    binary = resolve_harness_cli_binary(key)
+    if binary is None:
         return False
     try:
-        subprocess.run([spec.binary, *spec.logout_args], check=False, timeout=60)
+        subprocess.run([binary, *spec.logout_args], check=False, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return False
     # Drop cached logged-in verdicts so the confirmation below re-probes —
