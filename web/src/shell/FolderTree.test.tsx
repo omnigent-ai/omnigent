@@ -11,13 +11,21 @@ vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 // return; the hook returns a Map only for the paths the tree currently asks
 // for, so descending into a deeper level requires the shallower level's data
 // to already be present — exactly the incremental-widening path.
-const { lazyChildren } = vi.hoisted(() => ({ lazyChildren: new Map<string, unknown[]>() }));
+const { lazyChildren, lazyErrors } = vi.hoisted(() => ({
+  lazyChildren: new Map<string, unknown[]>(),
+  lazyErrors: new Set<string>(),
+}));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
   useWorkspaceDirectories: (_c: string | undefined, dirPaths: string[]) => {
     const map = new Map();
     for (const p of dirPaths) {
-      map.set(p, { data: lazyChildren.get(p), isLoading: !lazyChildren.has(p) });
+      const errored = lazyErrors.has(p);
+      map.set(p, {
+        data: lazyChildren.get(p),
+        isLoading: !errored && !lazyChildren.has(p),
+        isError: errored,
+      });
     }
     return map;
   },
@@ -290,7 +298,19 @@ describe("FolderTree double-click to open a folder", () => {
 });
 
 describe("FolderTree nested lazy loading", () => {
-  beforeEach(() => lazyChildren.clear());
+  beforeEach(() => {
+    lazyChildren.clear();
+    lazyErrors.clear();
+  });
+
+  it("shows an error row when a lazy directory's listing fails", async () => {
+    lazyErrors.add("src");
+    renderTree({ files: [dir("src")], conversationId: "conv_lazy_error" });
+
+    fireEvent.click(screen.getByRole("button", { name: "src/" }));
+
+    expect(await screen.findByText("Failed to load this folder.")).toBeInTheDocument();
+  });
 
   it("loads a deep lazy level on a restored multi-level expansion (no per-level clicks)", async () => {
     // Regression guard for B1. The bug only shows on RESTORE/RE-ROOT, where a

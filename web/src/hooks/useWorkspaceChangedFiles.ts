@@ -880,10 +880,11 @@ export function useWorkspaceDirectory(
   });
 }
 
-/** One expanded lazy directory's fetched children + load flag. */
+/** One expanded lazy directory's fetched children + load/error state. */
 export interface DirectoryResult {
   data: WorkspaceFile[] | undefined;
   isLoading: boolean;
+  isError: boolean;
 }
 
 /**
@@ -904,17 +905,27 @@ export function useWorkspaceDirectories(
 ): Map<string, DirectoryResult> {
   const serveable = useWorkspaceServeable(conversationId);
   const enabled = !!conversationId && serveable !== false;
-  const results = useQueries({
+  // `combine` lets TanStack memoize the assembled Map: it recomputes only when
+  // a listing's data/loading/error actually changes, returning a stable
+  // reference otherwise. Without it a fresh Map every render would re-run the
+  // tree's flatten memo and lazy-path widening effect on every unrelated render.
+  return useQueries({
     queries: dirPaths.map((dirPath) => ({
       queryKey: ["workspace-dir", conversationId, dirPath, location],
       queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath, location),
       enabled,
       staleTime: 5_000,
     })),
+    combine: (results) => {
+      const map = new Map<string, DirectoryResult>();
+      dirPaths.forEach((dirPath, i) => {
+        map.set(dirPath, {
+          data: results[i]?.data,
+          isLoading: results[i]?.isLoading ?? false,
+          isError: results[i]?.isError ?? false,
+        });
+      });
+      return map;
+    },
   });
-  const map = new Map<string, DirectoryResult>();
-  dirPaths.forEach((dirPath, i) => {
-    map.set(dirPath, { data: results[i]?.data, isLoading: results[i]?.isLoading ?? false });
-  });
-  return map;
 }
