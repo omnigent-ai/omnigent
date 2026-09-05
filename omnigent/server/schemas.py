@@ -2725,6 +2725,8 @@ class SessionUsage(BaseModel):
     other_harnesses: list[str] | None = None
     llm_model: str | None = None
     agent_name: str | None = None
+    project_id: str | None = None
+    project_name: str | None = None
 
 
 class DailyCost(BaseModel):
@@ -2766,6 +2768,51 @@ class UsageReport(BaseModel):
     total_cost_usd: float = 0.0
     daily_costs: list[DailyCost] = Field(default_factory=list)
     sessions: list[SessionUsage] = Field(default_factory=list)
+    projects: list[ProjectCost] = Field(default_factory=list)
+    alerts: list[CostAlert] = Field(default_factory=list)
+    alert_triggered: bool = False
+    forecast: UsageForecast | None = None
+
+
+class ProjectCost(BaseModel):
+    """Per-project cost aggregation for the usage report."""
+
+    project_id: str | None = None
+    project_name: str | None = None
+    cost_usd: float = 0.0
+    session_count: int = 0
+
+
+class CostAlert(BaseModel):
+    """A user-defined spending threshold."""
+
+    id: str
+    threshold_usd: float
+    period: str
+    enabled: bool = True
+    created_at: int = 0
+
+
+class CostAlertCreate(BaseModel):
+    """Request body for creating a cost alert."""
+
+    threshold_usd: float = Field(gt=0)
+    period: str = Field(pattern="^(daily|monthly)$")
+
+
+class CostAlertUpdate(BaseModel):
+    """Request body for updating a cost alert."""
+
+    enabled: bool | None = None
+    threshold_usd: float | None = Field(default=None, gt=0)
+
+
+class UsageForecast(BaseModel):
+    """Projected spend based on historical daily costs."""
+
+    projected_cost_30d: float = 0.0
+    projected_daily: list[DailyCost] = Field(default_factory=list)
+    trend: str = "stable"
 
 
 # ── Permissions ────────────────────────────────────────────────────

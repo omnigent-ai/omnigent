@@ -1,13 +1,14 @@
 import { useMemo, useState } from "react";
-import { CalendarIcon, Loader2Icon, TriangleAlertIcon } from "lucide-react";
+import { AlertTriangleIcon, CalendarIcon, Loader2Icon, TriangleAlertIcon } from "lucide-react";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { PageScroll } from "@/components/PageScroll";
 import { CostTimelineChart } from "@/components/usage/CostTimelineChart";
 import { UsageBreakdownCharts } from "@/components/usage/UsageBreakdownCharts";
 import { UsageSessionTable } from "@/components/usage/UsageSessionTable";
+import { UsageForecastCard } from "@/components/usage/UsageForecastCard";
+import { CostAlertSettings } from "@/components/usage/CostAlertSettings";
 import { useUsageReport } from "@/hooks/useUsageReport";
 import { formatSessionCostUsd } from "@/lib/formatCost";
-import type { DailyCost, SessionUsage } from "@/lib/usageApi";
 import { cn } from "@/lib/utils";
 
 type RangeKey = "7d" | "30d" | "90d" | "all" | "custom";
@@ -49,33 +50,8 @@ function rangeToWindow(
   }
 }
 
-function filterDailyCosts(
-  costs: DailyCost[],
-  since: string | null,
-  until: string | null,
-): DailyCost[] {
-  return costs.filter((d) => {
-    if (since && d.day < since) return false;
-    if (until && d.day > until) return false;
-    return true;
-  });
-}
-
-function filterSessions(
-  sessions: SessionUsage[],
-  since: string | null,
-  until: string | null,
-): SessionUsage[] {
-  if (!since && !until) return sessions;
-  const sinceEpoch = since ? new Date(since + "T00:00:00Z").getTime() / 1000 : 0;
-  const untilEpoch = until ? new Date(until + "T23:59:59Z").getTime() / 1000 : Infinity;
-  return sessions.filter((s) => s.updatedAt >= sinceEpoch && s.updatedAt <= untilEpoch);
-}
-
 export function UsagePage() {
-  const { data, isLoading, isError, refetch } = useUsageReport();
   const { trackClick } = useOmnigentAnalytics();
-
   const [rangeKey, setRangeKey] = useState<RangeKey>("30d");
   const [customStart, setCustomStart] = useState(() => daysAgoIso(30));
   const [customEnd, setCustomEnd] = useState(todayIso);
@@ -83,21 +59,14 @@ export function UsagePage() {
   const today = todayIso();
   const { since, until } = rangeToWindow(rangeKey, customStart, customEnd);
 
-  const filteredCosts = useMemo(
-    () => (data ? filterDailyCosts(data.dailyCosts, since, until) : []),
-    [data, since, until],
-  );
-
-  const filteredSessions = useMemo(
-    () => (data ? filterSessions(data.sessions, since, until) : []),
-    [data, since, until],
-  );
+  const { data, isLoading, isError, refetch } = useUsageReport({ since, until });
 
   const totalCost = useMemo(() => {
-    const fromDaily = filteredCosts.reduce((sum, d) => sum + d.costUsd, 0);
+    if (!data) return 0;
+    const fromDaily = data.dailyCosts.reduce((sum, d) => sum + d.costUsd, 0);
     if (fromDaily > 0) return fromDaily;
-    return filteredSessions.reduce((sum, s) => sum + s.costUsd, 0);
-  }, [filteredCosts, filteredSessions]);
+    return data.sessions.reduce((sum, s) => sum + s.costUsd, 0);
+  }, [data]);
 
   return (
     <PageScroll>
@@ -181,26 +150,44 @@ export function UsagePage() {
 
         {data && (
           <div className="flex flex-col gap-8">
-            <div className="rounded-lg border border-border bg-card p-4">
-              <p className="text-xs text-muted-foreground">Total cost</p>
-              <p className="mt-1 text-2xl font-semibold tabular-nums">
-                {formatSessionCostUsd(totalCost)}
-              </p>
-              <p className="mt-0.5 text-xs text-muted-foreground">
-                {filteredSessions.length} session{filteredSessions.length !== 1 && "s"}
-              </p>
+            {data.alertTriggered && (
+              <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+                <AlertTriangleIcon className="h-4 w-4 shrink-0" />
+                <p>A cost alert threshold has been exceeded</p>
+              </div>
+            )}
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="rounded-lg border border-border bg-card p-4">
+                <p className="text-xs text-muted-foreground">Total cost (selected range)</p>
+                <p className="mt-1 text-2xl font-semibold tabular-nums">
+                  {formatSessionCostUsd(totalCost)}
+                </p>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  {data.sessions.length} session{data.sessions.length !== 1 && "s"}
+                </p>
+              </div>
+
+              {data.forecast && <UsageForecastCard forecast={data.forecast} />}
             </div>
 
             <section>
               <h2 className="mb-3 text-sm font-medium text-muted-foreground">Daily cost</h2>
-              <CostTimelineChart dailyCosts={filteredCosts} />
+              <CostTimelineChart
+                dailyCosts={data.dailyCosts}
+                forecastCosts={data.forecast?.projectedDaily}
+              />
             </section>
 
-            <UsageBreakdownCharts sessions={filteredSessions} />
+            <UsageBreakdownCharts sessions={data.sessions} projects={data.projects} />
+
+            <section>
+              <CostAlertSettings alerts={data.alerts} alertTriggered={data.alertTriggered} />
+            </section>
 
             <section>
               <h2 className="mb-3 text-sm font-medium text-muted-foreground">Sessions</h2>
-              <UsageSessionTable sessions={filteredSessions} />
+              <UsageSessionTable sessions={data.sessions} />
             </section>
           </div>
         )}

@@ -1588,7 +1588,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
             return float(row.cost_usd) if row is not None else 0.0
 
-    def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
+    def sum_daily_cost(
+        self,
+        user_id: str,
+        since_day_utc: str,
+        until_day_utc: str | None = None,
+    ) -> float:
         """
         Sum a user's LLM spend over all UTC days ``>= since_day_utc``.
 
@@ -1598,23 +1603,34 @@ class SqlAlchemyConversationStore(ConversationStore):
         an empty range, coalesced to ``0.0``.
         """
         with self._session("sum_daily_cost") as session:
-            total = session.execute(
+            stmt = (
                 select(func.coalesce(func.sum(SqlUserDailyCost.cost_usd), 0.0))
                 .where(SqlUserDailyCost.workspace_id == current_workspace_id())
                 .where(SqlUserDailyCost.user_id == user_id)
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
-            ).scalar_one()
+            )
+            if until_day_utc is not None:
+                stmt = stmt.where(SqlUserDailyCost.day_utc <= until_day_utc)
+            total = session.execute(stmt).scalar_one()
             return float(total or 0.0)
 
-    def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
+    def list_daily_costs(
+        self,
+        user_id: str,
+        since_day_utc: str,
+        until_day_utc: str | None = None,
+    ) -> list[tuple[str, float]]:
         with self._session("list_daily_costs") as session:
-            rows = session.execute(
+            stmt = (
                 select(SqlUserDailyCost.day_utc, SqlUserDailyCost.cost_usd)
                 .where(SqlUserDailyCost.workspace_id == current_workspace_id())
                 .where(SqlUserDailyCost.user_id == user_id)
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
                 .order_by(SqlUserDailyCost.day_utc.asc())
-            ).all()
+            )
+            if until_day_utc is not None:
+                stmt = stmt.where(SqlUserDailyCost.day_utc <= until_day_utc)
+            rows = session.execute(stmt).all()
             return [(row.day_utc, float(row.cost_usd)) for row in rows]
 
     def get_daily_cost_state(self, user_id: str, day_utc: str) -> dict[str, float]:
@@ -1706,6 +1722,111 @@ class SqlAlchemyConversationStore(ConversationStore):
             else:
                 existing.ask_approved_usd = ask_approved_usd
                 existing.updated_at = now
+
+    # ── Cost alerts ──────────────────────────────────────────────────
+
+    def create_cost_alert(
+        self,
+        alert_id: str,
+        user_id: str,
+        threshold_usd: float,
+        period: str,
+    ) -> dict[str, Any]:
+        from omnigent.db.db_models import SqlCostAlert
+
+        now = now_epoch()
+        with self._session("create_cost_alert") as session:
+            row = SqlCostAlert(
+                id=alert_id,
+                user_id=user_id,
+                threshold_usd=threshold_usd,
+                period=period,
+                enabled=True,
+                created_at=now,
+            )
+            session.add(row)
+        return {
+            "id": alert_id,
+            "user_id": user_id,
+            "threshold_usd": threshold_usd,
+            "period": period,
+            "enabled": True,
+            "created_at": now,
+        }
+
+    def list_cost_alerts(self, user_id: str) -> list[dict[str, Any]]:
+        from omnigent.db.db_models import SqlCostAlert
+
+        with self._session("list_cost_alerts") as session:
+            rows = (
+                session.execute(
+                    select(SqlCostAlert)
+                    .where(SqlCostAlert.workspace_id == current_workspace_id())
+                    .where(SqlCostAlert.user_id == user_id)
+                    .order_by(SqlCostAlert.created_at.asc())
+                )
+                .scalars()
+                .all()
+            )
+            return [
+                {
+                    "id": r.id,
+                    "user_id": r.user_id,
+                    "threshold_usd": float(r.threshold_usd),
+                    "period": r.period,
+                    "enabled": bool(r.enabled),
+                    "created_at": r.created_at,
+                }
+                for r in rows
+            ]
+
+    def delete_cost_alert(self, alert_id: str, user_id: str) -> bool:
+        from omnigent.db.db_models import SqlCostAlert
+
+        with self._session("delete_cost_alert") as session:
+            row = session.execute(
+                select(SqlCostAlert)
+                .where(SqlCostAlert.workspace_id == current_workspace_id())
+                .where(SqlCostAlert.id == alert_id)
+                .where(SqlCostAlert.user_id == user_id)
+            ).scalar_one_or_none()
+            if row is None:
+                return False
+            session.delete(row)
+            return True
+
+    def update_cost_alert(
+        self,
+        alert_id: str,
+        user_id: str,
+        *,
+        enabled: bool | None = None,
+        threshold_usd: float | None = None,
+    ) -> dict[str, Any] | None:
+        from omnigent.db.db_models import SqlCostAlert
+
+        with self._session("update_cost_alert") as session:
+            row = session.execute(
+                select(SqlCostAlert)
+                .where(SqlCostAlert.workspace_id == current_workspace_id())
+                .where(SqlCostAlert.id == alert_id)
+                .where(SqlCostAlert.user_id == user_id)
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            if enabled is not None:
+                row.enabled = enabled
+            if threshold_usd is not None:
+                row.threshold_usd = threshold_usd
+            session.flush()
+            return {
+                "id": row.id,
+                "user_id": row.user_id,
+                "threshold_usd": float(row.threshold_usd),
+                "period": row.period,
+                "enabled": bool(row.enabled),
+                "created_at": row.created_at,
+            }
 
     def get_session_owner(self, conversation_id: str) -> str | None:
         """

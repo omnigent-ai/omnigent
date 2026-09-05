@@ -2595,6 +2595,7 @@ def create_app(
             conversation_store,
             auth_provider=auth_provider,
             feature_flags=resolved_feature_flags,
+            project_store=project_store,
         ),
         prefix="/v1",
         tags=["usage"],
