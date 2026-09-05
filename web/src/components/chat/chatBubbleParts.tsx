@@ -1152,6 +1152,9 @@ const PINNED_ANCHOR_TOP_GAP_PX = 96;
  */
 const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
 
+/** Sentinel anchor: the last assistant text section, re-resolved each measure. */
+const LAST_ASSISTANT_TEXT_ANCHOR = Symbol("last-assistant-text-anchor");
+
 /**
  * Trailing spacer that pins the initially loaded turn's anchor to the top of
  * the viewport. The anchor is captured once when the hydrated chat surface
@@ -1172,9 +1175,15 @@ export function LatestTurnSpacer({
   // the ResizeObserver. The hydration gate remounts this component on a switch.
   const blockCount = useChatStore((s) => s.blocks.length);
   const spacerRef = useRef<HTMLDivElement>(null);
-  // `undefined` means capture has not run; `null` is a completed capture with
-  // no suitable initial anchor (for example a brand-new empty conversation).
-  const initialAnchorRef = useRef<HTMLElement | null | undefined>(undefined);
+  // The anchor is stored by id, not by node reference: the transcript is
+  // windowed, so its DOM node is destroyed when the row scrolls out and a fresh
+  // node is mounted when it returns — a captured node reference would stay
+  // detached forever. `undefined` = capture not run yet; a resolved value is
+  // either a user message id, the "last assistant text" sentinel, or `null`
+  // (a settled capture with no suitable anchor, e.g. a brand-new conversation).
+  const initialAnchorRef = useRef<string | typeof LAST_ASSISTANT_TEXT_ANCHOR | null | undefined>(
+    undefined,
+  );
   const initialCommittedUserIdsRef = useRef<Set<string> | null>(null);
   if (initialCommittedUserIdsRef.current === null) {
     const ids = new Set<string>();
@@ -1197,34 +1206,53 @@ export function LatestTurnSpacer({
     if (initialAnchorRef.current === undefined) {
       // Match DOM bubbles against committed blocks so an optimistic pending
       // send visible during this first layout can never become the anchor.
+      // Defer capture until a bubble is actually mounted — on a windowed
+      // transcript the scroll element can be published a frame before the
+      // virtualizer mounts any rows, and settling on `null` then would freeze
+      // the spacer with no anchor.
       const users = scrollEl.querySelectorAll<HTMLElement>(
         '[data-role="user"][data-user-message-id]',
       );
-      let initialUser: HTMLElement | null = null;
+      let initialUserId: string | null = null;
       for (let index = users.length - 1; index >= 0; index -= 1) {
-        const candidate = users[index]!;
-        const itemId = candidate.dataset.userMessageId;
+        const itemId = users[index]!.dataset.userMessageId;
         if (itemId !== undefined && initialCommittedUserIdsRef.current!.has(itemId)) {
-          initialUser = candidate;
+          initialUserId = itemId;
           break;
         }
       }
-      const texts = scrollEl.querySelectorAll<HTMLElement>(
-        '[data-testid="assistant-text-section"]',
-      );
-      initialAnchorRef.current = initialUser ?? texts[texts.length - 1] ?? null;
+      const hasText = scrollEl.querySelector('[data-testid="assistant-text-section"]') !== null;
+      if (initialUserId === null && !hasText) {
+        const hasCommittedAnchor =
+          initialCommittedUserIdsRef.current!.size > 0 ||
+          useChatStore.getState().blocks.some((b) => b.type !== "user_message");
+        if (hasCommittedAnchor) return; // rows not mounted yet — retry on the next tick
+      }
+      initialAnchorRef.current = initialUserId ?? (hasText ? LAST_ASSISTANT_TEXT_ANCHOR : null);
     }
-    const anchor = initialAnchorRef.current;
-    if (!anchor) {
+    const anchorKey = initialAnchorRef.current;
+    if (anchorKey === null) {
       // Do not let the always-mounted sentinel become a zero-height flex item.
       spacerEl.style.display = "none";
       return;
     }
-    // The transcript is windowed, so the captured anchor can be scrolled out of
-    // the mounted set and detached from the scroll tree. A detached node reports
-    // a zeroed rect that would blow the reservation up — leave the last good
-    // height in place until the anchor re-mounts.
-    if (!scrollEl.contains(anchor)) return;
+    // Re-resolve the live node by id every measure so a windowed row that was
+    // unmounted and remounted (a new DOM node) is picked up again.
+    let anchor: HTMLElement | null;
+    if (anchorKey === LAST_ASSISTANT_TEXT_ANCHOR) {
+      const texts = scrollEl.querySelectorAll<HTMLElement>(
+        '[data-testid="assistant-text-section"]',
+      );
+      anchor = texts[texts.length - 1] ?? null;
+    } else {
+      anchor = scrollEl.querySelector<HTMLElement>(
+        `[data-role="user"][data-user-message-id="${CSS.escape(anchorKey)}"]`,
+      );
+    }
+    // The transcript is windowed, so the anchor can be scrolled out of the
+    // mounted set. A missing node would report a zeroed rect that blows the
+    // reservation up — hold the last good height until the anchor re-mounts.
+    if (!anchor) return;
     // rect diffs are scroll-invariant, and the spacer's top is fixed by the
     // content above it, so this is stable across the height we're about to set.
     const spacerRect = spacerEl.getBoundingClientRect();
