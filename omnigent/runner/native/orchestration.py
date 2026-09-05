@@ -3722,6 +3722,7 @@ async def _auto_create_kimi_terminal(
     kimi_env = build_kimi_session_home(
         bridge_dir / "kimi-code-home",
         bridge_dir=bridge_dir,
+        workspace=Path(workspace),
     )
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,

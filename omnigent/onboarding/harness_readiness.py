@@ -45,6 +45,7 @@ from omnigent.onboarding.harness_install import (
     GOOSE_KEY,
     HERMES_KEY,
     KIMI_KEY,
+    KIMI_NATIVE_KEY,
     KIRO_KEY,
     OPENCODE_KEY,
     PI_KEY,
@@ -96,6 +97,7 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
     GEMINI_FAMILY: lambda: _gemini_auth.gemini_login_detected(),
     KIMI_KEY: lambda: _kimi_auth.kimi_auth_configured(),
+    KIMI_NATIVE_KEY: lambda: _kimi_auth.kimi_auth_configured(),
 }
 
 # CLI-wrapping pi harnesses. Both the bare ``pi`` surface and the native
@@ -177,14 +179,16 @@ def _install_key(canonical: str) -> str:
         ``_HARNESS_FAMILY`` (e.g. ``"codex-native"``), ``"pi"``, or
         ``"kimi"``.
     :returns: ``"anthropic"`` / ``"openai"`` for the claude/codex CLIs,
-        :data:`~omnigent.onboarding.harness_install.KIMI_KEY` for kimi,
+        the matching Kimi install key for headless or native Kimi,
         :data:`~omnigent.onboarding.harness_install.OPENCODE_KEY` for
         opencode-native,
         :data:`~omnigent.onboarding.harness_install.QWEN_KEY` for qwen, or
         :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi.
     """
-    if canonical == KIMI_SURFACE or canonical in _KIMI_NATIVE_HARNESSES:
+    if canonical == KIMI_SURFACE:
         return KIMI_KEY
+    if canonical in _KIMI_NATIVE_HARNESSES:
+        return KIMI_NATIVE_KEY
     if canonical in _OPENCODE_HARNESSES:
         return OPENCODE_KEY
     if canonical in _QWEN_HARNESSES:

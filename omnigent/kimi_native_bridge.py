@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -22,6 +23,8 @@ from pathlib import Path
 
 from omnigent._platform import stable_user_id
 from omnigent.json_types import JsonObject as _JsonObject
+
+_logger = logging.getLogger(__name__)
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_KIMI_NATIVE_BRIDGE_DIR"
@@ -55,7 +58,7 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # from cursor-native unverified and never matched, so every injection ate the
 # whole 30s timeout — the web→TUI latency the markers were meant to avoid.)
 _INPUT_READY_MARKERS = ("context:",)
-_TRUST_MARKER = "Trust this workspace"
+_TRUST_MARKER = "Trust this folder?"
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -278,7 +281,7 @@ def _submit_needle(content: str) -> str:
 def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
     """Best-effort wait until the Kimi input box is ready to receive a paste.
 
-    Accepts the first-run "Trust this workspace" modal (sends ``a`` at most once)
+    Accepts the first-run "Trust this folder?" modal (sends Enter at most once)
     so the input box can mount, then returns as soon as the TUI chrome is present
     (see :data:`_INPUT_READY_MARKERS`). Falls through after the timeout (e.g. a
     boot that never renders) rather than raising — the paste still lands.
@@ -293,8 +296,13 @@ def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> Non
         # merely echoes the phrase can't spray repeated keystrokes into the TUI).
         if not trust_accepted and _TRUST_MARKER in pane:
             trust_accepted = True
-            with contextlib.suppress(RuntimeError):
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "a")
+            try:
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            except (RuntimeError, OSError):
+                _logger.warning(
+                    "could not accept Kimi trust modal with tmux Enter; waiting for TUI recovery",
+                    exc_info=True,
+                )
         time.sleep(_POLL_INTERVAL_S)
 
 

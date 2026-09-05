@@ -43,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import NamedTuple
 
@@ -75,6 +76,7 @@ CURSOR_KEY = "cursor"
 # Moonshot API key), not via the ambient provider config; like Cursor it ships
 # via a curl installer rather than npm, so it carries an ``install_hint``.
 KIMI_KEY = "kimi"
+KIMI_NATIVE_KEY = "kimi-native"
 
 # Kiro authenticates against its own backend and ships as a standalone native
 # installer, not an npm package managed by ``omni setup``.
@@ -111,10 +113,8 @@ KIRO_KEY = "kiro"
 #   CLI loses only smart-routing spawn gating, not the ability to launch.
 # - cursor: Cursor's CLI uses ``YYYY.MM.DD[-build]`` date versions. Default
 #   to the day after 2026-06-01 so we don't support stale pre-June builds.
-# - kimi: the harness drives Moonshot's ``kimi-code`` CLI (the ``kimi`` binary
-#   this spec installs), whose releases are a 0.x series — NOT the separate
-#   ``kimi-cli`` project, which numbers from 1.x. Its first release after
-#   2026-06-01 is 0.7.0.
+# - kimi: headless Kimi retains the supported 0.7.0 floor. Native Kimi requires
+#   0.41.0 because its bridge seeds that release's workspace-trust format.
 # - hermes: parent_session_id schema introduced in v0.17.0. Hermes reports a
 #   semver version with the build date alongside it
 #   (``Hermes Agent v0.19.1 (2026.7.30)``), so the floor is that semver.
@@ -127,6 +127,7 @@ _KIRO_MIN_VERSION = "2.10.0"
 _CLAUDE_MIN_VERSION = "2.1.161"
 _CURSOR_MIN_VERSION = "2026.06.02"
 _KIMI_MIN_VERSION = "0.7.0"
+_KIMI_NATIVE_MIN_VERSION = "0.41.0"
 _ANTIGRAVITY_MIN_VERSION = "1.1.13"
 
 # OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
@@ -313,6 +314,10 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         min_version=_HERMES_MIN_VERSION,
     ),
 }
+_HARNESS_INSTALL[KIMI_NATIVE_KEY] = replace(
+    _HARNESS_INSTALL[KIMI_KEY],
+    min_version=_KIMI_NATIVE_MIN_VERSION,
+)
 
 
 # Maps an executor *harness identifier* (the value the runtime resolves from a
@@ -357,9 +362,9 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same
     # ``goose`` CLI as the native TUI, so it gates on the same binary.
     GOOSE_KEY: GOOSE_KEY,
-    # Native Kimi TUI harness — same binary gate as the bare ``kimi`` surface.
-    "kimi-native": KIMI_KEY,
-    "native-kimi": KIMI_KEY,
+    # Native Kimi needs the 0.41 workspace-trust format; headless Kimi does not.
+    "kimi-native": KIMI_NATIVE_KEY,
+    "native-kimi": KIMI_NATIVE_KEY,
     QWEN_KEY: QWEN_KEY,
     "qwen-code": QWEN_KEY,
     # Native qwen TUI (``qwen-native``) wraps the same ``qwen`` CLI as the ACP
@@ -693,13 +698,31 @@ def harness_setup_hint(harness: str | None) -> str:
         https://cursor.com/install -fsS | bash`, then run `cursor-agent
         login`"`` for native Cursor, or the ``omni setup`` hint otherwise.
     """
-    spec = required_cli_for_harness(harness or "")
+    harness_name = harness or ""
+    install_key = _all_harness_name_to_key().get(harness_name)
+    spec = required_cli_for_harness(harness_name)
     if spec is not None and spec.package is None and spec.install_hint:
         login = ""
         if spec.login_args:
             login = f", then run `{spec.binary} {' '.join(spec.login_args)}`"
         elif spec.auth_hint:
             login = f", then {spec.auth_hint}"
+        if install_key is not None:
+            resolution_errors: list[str] = []
+            _resolve_harness_cli_binary(install_key, spec, resolution_errors=resolution_errors)
+            if resolution_errors:
+                return resolution_errors[0]
+            detected, required = harness_cli_version(install_key)
+            if (
+                detected is not None
+                and required is not None
+                and not _harness_cli_version_value_satisfies(spec, detected)
+            ):
+                return (
+                    f"upgrade the {spec.binary} CLI on that machine "
+                    f"(installed {detected}; required {required}) with "
+                    f"`{spec.install_hint}`{login}"
+                )
         return f"install the {spec.binary} CLI on that machine with `{spec.install_hint}`{login}"
     return (
         f"run `{cli_invocation(name='omni')} setup` on that machine to install "
@@ -809,6 +832,11 @@ def _harness_cli_version_satisfies(
     version = _harness_cli_version_string(spec, binary, timeout)
     if version is None:
         return False
+    return _harness_cli_version_value_satisfies(spec, version)
+
+
+def _harness_cli_version_value_satisfies(spec: HarnessInstallSpec, version: str) -> bool:
+    """Check a parsed CLI version string against *spec*'s declared range."""
     try:
         parsed = Version(version)
     except InvalidVersion:
@@ -837,6 +865,30 @@ def _harness_cli_version_satisfies(
     return True
 
 
+def _resolve_harness_cli_binary(
+    key: str,
+    spec: HarnessInstallSpec,
+    *,
+    resolution_errors: list[str] | None = None,
+) -> str | None:
+    """Resolve the executable whose version gate applies for *key*."""
+    path_binary = resolve_cli_binary(spec.binary)
+    if key != KIMI_NATIVE_KEY or path_binary is None:
+        return path_binary
+
+    # Native readiness must gate the exact executable launch will use, not PATH.
+    from click import ClickException
+
+    from omnigent.kimi_native import resolve_kimi_executable
+
+    try:
+        return resolve_kimi_executable()
+    except ClickException as exc:
+        if resolution_errors is not None:
+            resolution_errors.append(str(exc))
+        return None
+
+
 def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     """Return the install spec for a family/harness key, or ``None``.
 
@@ -863,7 +915,7 @@ def harness_cli_version_satisfies(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = resolve_cli_binary(spec.binary)
+    binary = _resolve_harness_cli_binary(key, spec)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary)
@@ -891,7 +943,7 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = resolve_cli_binary(spec.binary)
+    binary = _resolve_harness_cli_binary(key, spec)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary, timeout)
@@ -914,7 +966,7 @@ def harness_cli_version(key: str) -> tuple[str | None, str | None]:
     spec = harness_install_spec(key)
     if spec is None:
         return None, None
-    binary = resolve_cli_binary(spec.binary)
+    binary = _resolve_harness_cli_binary(key, spec)
     if binary is None:
         return None, None
     version = _harness_cli_version_string(spec, binary)

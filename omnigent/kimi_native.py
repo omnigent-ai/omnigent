@@ -139,6 +139,11 @@ def resolve_kimi_executable(
     command = _configured_kimi_command(env)
     resolved = resolve_cli_binary(command, which=which)
     if resolved is None:
+        if command != _DEFAULT_KIMI_COMMAND:
+            raise click.ClickException(
+                f"Native Kimi could not resolve configured executable {command!r}. "
+                f"Fix {_KIMI_PATH_ENV} or harness.kimi-native.command."
+            )
         raise click.ClickException(
             "Native Kimi requires the 'kimi' CLI on PATH. Install it with: "
             "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash, then "

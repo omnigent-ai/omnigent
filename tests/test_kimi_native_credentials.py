@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 import tomllib
 
+from omnigent import kimi_native_credentials
 from omnigent.kimi_native_credentials import (
     KIMI_CODE_HOME_ENV_VAR,
     build_kimi_session_home,
@@ -54,7 +56,11 @@ def test_build_session_home_preserves_user_config_and_appends_hooks(
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
 
-    env = build_kimi_session_home(session_home, bridge_dir=bridge_dir)
+    env = build_kimi_session_home(
+        session_home,
+        bridge_dir=bridge_dir,
+        workspace=tmp_path / "workspace",
+    )
 
     assert env == {KIMI_CODE_HOME_ENV_VAR: str(session_home)}
     parsed = tomllib.loads((session_home / "config.toml").read_text(encoding="utf-8"))
@@ -73,7 +79,11 @@ def test_build_session_home_symlinks_auth_but_not_config(
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
 
-    build_kimi_session_home(session_home, bridge_dir=bridge_dir)
+    build_kimi_session_home(
+        session_home,
+        bridge_dir=bridge_dir,
+        workspace=tmp_path / "workspace",
+    )
 
     # oauth is symlinked through to the user's tokens (auth keeps working) …
     oauth_link = session_home / "oauth"
@@ -91,7 +101,67 @@ def test_build_session_home_without_user_home_writes_hooks_only(
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
 
-    build_kimi_session_home(session_home, bridge_dir=bridge_dir)
+    build_kimi_session_home(
+        session_home,
+        bridge_dir=bridge_dir,
+        workspace=tmp_path / "workspace",
+    )
 
     parsed = tomllib.loads((session_home / "config.toml").read_text(encoding="utf-8"))
     assert {h["event"] for h in parsed["hooks"]} == {"PreToolUse", "PermissionRequest"}
+
+
+def test_build_session_home_seeds_kimi_041_workspace_trust_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_user_home(tmp_path, monkeypatch)
+    monkeypatch.setattr(kimi_native_credentials.time, "time_ns", lambda: 1788550264108000000)
+    session_home = tmp_path / "session-home"
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    workspace = Path("/private/tmp/Fresh Trust?! Name.ABC-with-an-extra-long-tail")
+
+    build_kimi_session_home(session_home, bridge_dir=bridge_dir, workspace=workspace)
+
+    trust_dir = session_home / "workspace-trust"
+    records = list(trust_dir.iterdir())
+    assert [record.name for record in records] == [
+        "wd_fresh-trust-name.abc-with-an-extra-long_6c704f283144"
+    ], "workspace trust filename must match Kimi 0.41's slug and SHA-256 derivation"
+    payload = json.loads(records[0].read_text(encoding="utf-8"))
+    assert payload == {
+        "root": "/private/tmp/Fresh Trust?! Name.ABC-with-an-extra-long-tail",
+        "trustedAt": 1788550264108,
+    }
+    assert isinstance(payload["root"], str)
+    assert isinstance(payload["trustedAt"], int)
+
+
+def test_build_session_home_workspace_trust_cannot_escape_to_global_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_home = _fake_user_home(tmp_path, monkeypatch)
+    user_trust_dir = user_home / "workspace-trust"
+    user_trust_dir.mkdir()
+    existing = user_trust_dir / "wd_existing_aaaaaaaaaaaa"
+    existing.write_text('{"root":"/already/trusted","trustedAt":1}', encoding="utf-8")
+    global_before = {path.name: path.read_bytes() for path in user_trust_dir.iterdir()}
+
+    session_home = tmp_path / "session-home"
+    session_home.mkdir()
+    (session_home / "workspace-trust").symlink_to(user_trust_dir, target_is_directory=True)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    build_kimi_session_home(
+        session_home,
+        bridge_dir=bridge_dir,
+        workspace=tmp_path / "never-globally-trusted",
+    )
+
+    global_after = {path.name: path.read_bytes() for path in user_trust_dir.iterdir()}
+    assert global_after == global_before, "workspace trust write escaped into the global Kimi home"
+    session_trust_dir = session_home / "workspace-trust"
+    assert not session_trust_dir.is_symlink()
+    assert not (session_trust_dir / existing.name).exists()
+    assert len(list(session_trust_dir.iterdir())) == 1
