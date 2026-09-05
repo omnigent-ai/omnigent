@@ -668,6 +668,28 @@ def test_parse_skill_non_utf8_raises_omnigent_error(agent_dir: Path) -> None:
         parse(agent_dir)
 
 
+def test_parse_skill_utf8_regardless_of_locale_encoding(agent_dir: Path) -> None:
+    """A UTF-8 SKILL.md loads even when the platform locale encoding is not UTF-8.
+
+    ``read_text()`` without an explicit encoding uses the locale encoding, which
+    on Windows is a legacy code page. Every SKILL.md containing a curly quote or
+    an em dash was then skipped as unreadable there while loading fine on Linux
+    and macOS.
+    """
+    skill_dir = agent_dir / "skills" / "smart-quotes"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: smart-quotes\ndescription: Uses “curly” quotes — and a dash.\n---\nbody",
+        encoding="utf-8",
+    )
+
+    spec = parse(agent_dir)
+
+    skill = next(s for s in spec.skills if s.name == "smart-quotes")
+    assert "“curly”" in skill.description
+    assert "—" in skill.description
+
+
 # Reproduces the exact ``argument-hint:`` line from the upstream
 # Claude Code skill at
 # https://github.com/databricks-field-eng/vibe/blob/main/plugins/fe-databricks-tools/skills/databricks-data-generation/SKILL.md
@@ -3621,6 +3643,50 @@ def test_parse_executor_auth_provider(tmp_path: Path) -> None:
     assert isinstance(spec.executor.auth, ProviderAuth)
     assert spec.executor.auth.name == "litellm"
     assert spec.executor.auth.type == "provider"
+
+
+def test_parse_executor_auth_under_config_raises(tmp_path: Path) -> None:
+    """``auth`` nested under ``executor.config`` fails loud, not silently.
+
+    ``harness`` and ``model`` live under ``config``, so authors reasonably put
+    ``auth`` there too. Config values are string-coerced, so the credential was
+    discarded without a word and the launch failed much later asking for a
+    default credential — pointing at the wrong problem entirely.
+    """
+    config = {
+        "spec_version": 1,
+        "executor": {
+            "type": "omnigent",
+            "config": {
+                "harness": "openai-agents",
+                "auth": {"type": "provider", "name": "cerebras"},
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"move the auth block up to executor\.auth"):
+        parse(tmp_path)
+
+
+def test_parse_executor_auth_at_executor_level_wins_over_config(tmp_path: Path) -> None:
+    """A correctly-placed ``executor.auth`` parses even when ``config`` also has one.
+
+    The guard must not fire when the author already supplied the real thing —
+    otherwise a spec that works today starts failing.
+    """
+    config = {
+        "spec_version": 1,
+        "executor": {
+            "type": "omnigent",
+            "config": {"harness": "openai-agents", "auth": "ignored"},
+            "auth": {"type": "provider", "name": "cerebras"},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert isinstance(spec.executor.auth, ProviderAuth)
+    assert spec.executor.auth.name == "cerebras"
 
 
 def test_parse_executor_auth_provider_missing_name_raises(tmp_path: Path) -> None:

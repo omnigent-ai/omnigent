@@ -645,6 +645,17 @@ def _parse_executor(
     # numbers round-trip as their string form (the omnigent
     # harness/profile fields are both strings in the source YAML).
     raw_config = raw.get("config")
+    if isinstance(raw_config, dict) and "auth" in raw_config and "auth" not in raw:
+        # ``harness`` and ``model`` live under ``config``, so ``auth`` looks
+        # like it belongs there too. It doesn't — it is read from the executor
+        # block itself, and ``config`` values are string-coerced below, so a
+        # misplaced credential would be silently discarded and the launch would
+        # fail much later complaining about a missing default credential.
+        raise OmnigentError(
+            "executor.config.auth is not read: move the auth block up to "
+            "executor.auth (a sibling of executor.config)",
+            code=ErrorCode.INVALID_INPUT,
+        )
     config: dict[str, object] = {}
     if isinstance(raw_config, dict):
         config = {
@@ -2459,10 +2470,14 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         ``strict=False``) can catch them uniformly.
     """
     try:
-        text = skill_md.read_text()
+        # Read as UTF-8 explicitly. Without it Python uses the platform's
+        # locale encoding, which on Windows is a legacy code page — every
+        # SKILL.md carrying a curly quote or an em dash is then skipped as
+        # unreadable on Windows while loading fine elsewhere.
+        text = skill_md.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        # UnicodeDecodeError (a non-UTF-8 SKILL.md) is a ValueError, not an
-        # OSError — funnel it through OmnigentError too so the lenient
+        # UnicodeDecodeError (a genuinely non-UTF-8 SKILL.md) is a ValueError,
+        # not an OSError — funnel it through OmnigentError too so the lenient
         # scanner in _discover_skills and the per-skill guards in the menu
         # providers catch it and skip the file instead of 500-ing the menu.
         raise OmnigentError(
