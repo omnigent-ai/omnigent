@@ -3350,6 +3350,18 @@ function ComposerImpl({
         const recalled = recallPrevious(value);
         if (recalled !== null) {
           e.preventDefault();
+          // ArrowUp on an empty composer doubles as the strip's pencil edit:
+          // if the recalled text is still queued in this chat, pull that row
+          // (text + attachments) out so re-sending can't duplicate it.
+          if (value.trim() === "") {
+            const target = queuedMessages.findLast(
+              (m) => m.conversationId === conversationId && m.text === recalled,
+            );
+            if (target !== undefined) {
+              setFiles(target.files ?? []);
+              dequeueMessage(target.queueId);
+            }
+          }
           applyRecall(ta, recalled);
         }
       } else if (e.key === "ArrowDown" && ta.selectionEnd === ta.value.length) {

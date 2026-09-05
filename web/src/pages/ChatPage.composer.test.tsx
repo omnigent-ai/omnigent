@@ -60,6 +60,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, isSubagentRoutingEligible, shouldQueueSend } from "./ChatPage";
 import type { Session } from "@/lib/types";
 import type { QueuedMessage } from "@/store/chatStore";
+import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import {
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -2048,6 +2049,89 @@ describe("Composer — queued-message flush gating", () => {
     await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
     expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["held", "agent_xyz"]);
     expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+  });
+});
+
+describe("Composer — ArrowUp edit of a queued message", () => {
+  const CONV = "conv_uparrow_edit";
+  const QUEUED_TEXT = "queued follow-up recalled for editing";
+
+  beforeEach(() => {
+    clearSessionDrafts();
+    // A running turn keeps the flush effect from draining the queue while
+    // the test drives the recall-edit journey.
+    useChatStore.setState({
+      conversationId: CONV,
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "running",
+      queuedMessages: [{ queueId: "q_1", text: QUEUED_TEXT, conversationId: CONV }],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    useChatStore.setState({ queuedMessages: [] });
+    // Drop the prompt-history keys these tests seeded.
+    for (let i = window.localStorage.length - 1; i >= 0; i--) {
+      const key = window.localStorage.key(i);
+      if (key?.startsWith("omnigent:prompt-history")) window.localStorage.removeItem(key);
+    }
+  });
+
+  // The core regression: recalling a queued message with ArrowUp must pull
+  // it out of the queue (like the strip's pencil edit does), or editing and
+  // re-sending leaves the stale original queued next to the edited copy and
+  // the idle flush delivers the message twice.
+  it("dequeues the recalled message so re-sending can't duplicate it", async () => {
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+  });
+
+  it("adopts the queued row's attachments so re-sending keeps them", async () => {
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    useChatStore.setState({
+      queuedMessages: [{ queueId: "q_1", text: QUEUED_TEXT, conversationId: CONV, files: [file] }],
+    });
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+  });
+
+  it("browsing history over a non-empty draft leaves the queued row alone", async () => {
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "half-typed draft" } });
+    ta.setSelectionRange(0, 0);
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+
+    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+  });
+
+  it("leaves another conversation's identically-worded queued row alone", async () => {
+    useChatStore.setState({
+      queuedMessages: [{ queueId: "q_other", text: QUEUED_TEXT, conversationId: "conv_other" }],
+    });
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
   });
 });
 
