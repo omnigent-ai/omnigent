@@ -35,12 +35,13 @@ class OidcLoginManagerTest {
 
     @Test
     fun `second start while in-flight returns false`() {
+        // A forever-pending poll keeps the flow deterministically in flight — an
+        // unreachable server would fail fast and race the second start() call.
+        val (origin, _) = startOrigin()
         val activity = this.activity
-        // Start a flow against an unreachable server — the background task stays
-        // in-flight until it fails or times out, but inFlight is set synchronously.
-        manager.start(activity, UNREACHABLE, {})
+        manager.start(activity, origin, {})
 
-        assertFalse(manager.start(activity, UNREACHABLE, {}))
+        assertFalse(manager.start(activity, origin, {}))
     }
 
     @Test
@@ -146,6 +147,48 @@ class OidcLoginManagerTest {
         )
     }
 
+    // -- Failure reporting: a flow that ends without a session must say so --
+
+    @Test
+    fun `flow that ends without a session reports failure to the host`() {
+        val activity = this.activity
+        drainMainLooper()
+        var failures = 0
+
+        // Unreachable server: the ticket request fails, so the flow ends with
+        // no token and must post the failure callback for the host to surface.
+        manager.start(activity, UNREACHABLE, {}, { failures++ })
+        awaitFlowFailure { failures > 0 }
+
+        assertTrue("flow failure was never reported", failures == 1)
+    }
+
+    @Test
+    fun `cancel suppresses the failure report of the abandoned flow`() {
+        val (origin, loginServed) = startOrigin()
+        val activity = this.activity
+        drainMainLooper()
+        var failures = 0
+
+        manager.start(activity, origin, {}, { failures++ })
+        awaitBrowserLaunchPosted(loginServed)
+
+        // Server switch / user cancel: the interrupted poll ends the flow with
+        // no token, but a cancelled flow must not report failure to the new
+        // context (it would cover the new server's UI with a stale error).
+        manager.cancel()
+
+        // Ordering fence: the single-thread executor runs the cancelled flow to
+        // completion before the successor, and the main looper is FIFO — so once
+        // the successor's failure fires, the cancelled flow's (suppressed) post
+        // has already executed.
+        var successorFailed = false
+        assertTrue(manager.start(activity, UNREACHABLE, {}, { successorFailed = true }))
+        awaitFlowFailure { successorFailed }
+
+        assertTrue("cancelled flow reported failure", failures == 0)
+    }
+
     @Test
     fun `a fresh login after cancel still opens the browser`() {
         val (origin, loginServed) = startOrigin()
@@ -189,6 +232,16 @@ class OidcLoginManagerTest {
         s.start()
         server = s
         return "http://127.0.0.1:${s.address.port}" to loginServed
+    }
+
+    /** Drain the paused main looper until [reported] observes the failure post. */
+    private fun awaitFlowFailure(reported: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + 10_000
+        while (!reported() && System.currentTimeMillis() < deadline) {
+            drainMainLooper()
+            Thread.sleep(5)
+        }
+        assertTrue("flow failure was never posted", reported())
     }
 
     /** Block until the background flow has posted its browser launch to the paused main looper. */

@@ -51,7 +51,11 @@ class OidcLoginManager {
     /**
      * Begin a login against [origin] (the pinned server). Opens the browser and
      * polls in the background; [onSession] is invoked on the main thread with the
-     * session JWT once the browser flow completes.
+     * session JWT once the browser flow completes. A flow that ends without a
+     * session (ticket request failed, poll timed out or was rejected) invokes
+     * [onFailure] on the main thread instead, so the host can surface it. A
+     * cancelled or superseded flow never reports failure — its report would
+     * describe an obsolete server/attempt, not the current one.
      *
      * Returns true if this call started a flow, or false if one was already in
      * flight (a second concurrent call is ignored). The caller uses the result so
@@ -61,6 +65,7 @@ class OidcLoginManager {
         activity: Activity,
         origin: String,
         onSession: (String) -> Unit,
+        onFailure: (() -> Unit)? = null,
     ): Boolean {
         if (!inFlight.compareAndSet(false, true)) return false
         sessionCallback = onSession
@@ -100,7 +105,18 @@ class OidcLoginManager {
                 val result = token
                 // sessionCallback is null once shutdown() ran — never invoke into a
                 // destroyed host.
-                if (result != null) main.post { sessionCallback?.invoke(result) }
+                if (result != null) {
+                    main.post { sessionCallback?.invoke(result) }
+                } else if (onFailure != null) {
+                    // Generation-checked at execution: a flow cancelled or
+                    // superseded (server switch, shutdown) while this post sat
+                    // in the queue must not report a stale failure. Both
+                    // cancel() and this runnable run on the main thread, so the
+                    // bumped generation is always visible here.
+                    main.post {
+                        if (generation == flowGeneration.get()) onFailure()
+                    }
+                }
             }
         return true
     }
