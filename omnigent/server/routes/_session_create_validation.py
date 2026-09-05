@@ -179,11 +179,28 @@ CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES: frozenset[str] = frozenset(
 )
 
 
-# The only harness that accepts a ``--permission-mode`` launch arg — the same
-# ``permissionMode`` capability the web dialog gates its permission control on.
-# Other native CLIs (codex / cursor / …) use different flags, so injecting
-# ``--permission-mode`` there would be an unknown flag that breaks the launch.
-_PERMISSION_MODE_HARNESS = "claude-native"
+_CLAUDE_PERMISSION_MODE_HARNESS = "claude-native"
+_CODEX_PERMISSION_MODE_HARNESS = "codex-native"
+_CODEX_BYPASS_PERMISSION_MODE = "bypassPermissions"
+_PERMISSION_MODES_BY_HARNESS: dict[str, frozenset[str]] = {
+    _CLAUDE_PERMISSION_MODE_HARNESS: CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
+    _CODEX_PERMISSION_MODE_HARNESS: frozenset({_CODEX_BYPASS_PERMISSION_MODE}),
+}
+
+
+def permission_mode_launch_args(
+    harness: str | None, permission_mode: str | None
+) -> list[str] | None:
+    """Translate a supported scheduled-task permission mode to native CLI args."""
+    if permission_mode is None or permission_mode not in _PERMISSION_MODES_BY_HARNESS.get(
+        harness or "", frozenset()
+    ):
+        return None
+    if harness == _CLAUDE_PERMISSION_MODE_HARNESS:
+        return ["--permission-mode", permission_mode]
+    if harness == _CODEX_PERMISSION_MODE_HARNESS:
+        return ["--dangerously-bypass-approvals-and-sandbox"]
+    return None
 
 
 async def validate_permission_mode_agent_support(
@@ -194,19 +211,16 @@ async def validate_permission_mode_agent_support(
 ) -> None:
     """Reject a ``permission_mode`` on an agent whose harness has no such flag.
 
-    Mirrors the web dialog's capability gate on the server so the REST endpoint
-    and agent tools enforce the same rule the UI does: only a ``claude-native``
-    agent may carry a ``permission_mode``. Without this, a task on a codex /
-    cursor agent could persist a mode the fire path would inject as an unknown
-    ``--permission-mode`` flag, breaking the launch.
+    Claude accepts its full launch vocabulary. Codex accepts only the explicit
+    ``bypassPermissions`` opt-in, translated to its own bypass flag. Other
+    harness/mode combinations fail before persistence.
 
     This is an early, friendly 4xx at persist time. A ``None`` mode is always
     allowed (nothing to gate). When the harness cannot be resolved (no bundle /
     cache / a load error), this is a no-op rather than a rejection: the value has
     already passed the vocabulary allowlist, and the fire path's launch-arg
-    derivation is itself harness-gated fail-safe (it injects ``--permission-mode``
-    ONLY for a confirmed ``claude-native`` agent, omitting it otherwise), so a
-    non-Claude mode can never actually reach the launch args regardless.
+    derivation is itself harness-gated fail-safe, so an unsupported mode can
+    never reach native CLI arguments regardless.
     """
     if permission_mode is None or agent is None:
         return
@@ -226,10 +240,10 @@ async def validate_permission_mode_agent_support(
         # don't turn an unrelated load error into a permission_mode rejection.
         _logger.exception("Failed to load agent spec for permission_mode gating")
         return
-    if harness != _PERMISSION_MODE_HARNESS:
+    allowed_modes = _PERMISSION_MODES_BY_HARNESS.get(harness) if isinstance(harness, str) else None
+    if allowed_modes is None or permission_mode not in allowed_modes:
         raise OmnigentError(
-            f"permission_mode is only supported for {_PERMISSION_MODE_HARNESS} agents, "
-            f"not {harness!r}",
+            f"permission_mode {permission_mode!r} is not supported for {harness!r} agents",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -239,9 +253,9 @@ def validate_session_permission_mode(permission_mode: str | None) -> str | None:
 
     A scheduled task fires a fresh native session each run, so the whole launch
     vocabulary is allowed (including the launch-only ``dontAsk`` /
-    ``bypassPermissions``). The value reaches the native CLI as the
-    ``--permission-mode`` argv element the fire path derives, so reject anything
-    outside the known set before a row persists it.
+    ``bypassPermissions``). The fire path translates the persisted value into
+    harness-specific native CLI arguments, so reject anything outside the known
+    union before a row persists it.
     """
     if permission_mode is None:
         return None
