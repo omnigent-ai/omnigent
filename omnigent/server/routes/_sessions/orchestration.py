@@ -2715,6 +2715,7 @@ async def _wait_for_host_bound_runner_client(
     runner_exit_reports: RunnerExitReports | None,
     host_conn: HostConnection,
     host_registry: HostRegistry,
+    alive_timeout_s: float | None = None,
 ) -> httpx.AsyncClient | None:
     """
     Wait for a host-bound runner to connect, ending early if the host
@@ -2732,12 +2733,29 @@ async def _wait_for_host_bound_runner_client(
       crashed, or lost to a host restart). That means it will never
       connect, so the wait ends immediately and the caller relaunches
       without burning the rest of the grace.
+    * An ``alive`` verdict points the other way. It does not promise the
+      tunnel is coming — only that the host still holds a running process,
+      which may yet register, or may be wedged. A cold boot can outlast the
+      short grace, and abandoning it there rotates the binding and races a
+      replacement runner, so the wait runs to ``alive_timeout_s`` instead of
+      expiring at ``timeout_s``. ``alive_timeout_s`` is what bounds a process
+      that is held but never registers. A crash report landing meanwhile
+      still ends the wait early, via the connect wait's own short-circuit.
 
-    Running the query *alongside* the wait rather than before it is what
-    keeps the query strictly a speed-up: a host that is too old to answer,
-    slow, or silent (verdict ``None`` / ``"alive"``) never shortcuts the
-    wait, so the connect grace runs its normal course with no added
-    latency.
+    Running the query *alongside* the wait rather than before it keeps its
+    cost off the fast path: a runner that registers promptly is returned by
+    the connect wait and the verdict never matters. The verdict can then
+    shorten the wait (``dead``/``unknown``) or extend it to the bounded
+    budget (``alive``), while a host that is offline, too old to answer, or
+    slow yields no verdict at all and the plain connect grace runs its
+    normal course.
+
+    The extension is per-dispatch, so its cost is paid per in-flight message
+    rather than once per session. Messages that overlap against the same
+    wedged binding each wait the full budget, because none of them observes
+    the rotated ``runner_id`` until the first relaunch has completed and
+    written it. Sequential messages do not compound this: once that relaunch
+    rotates the binding, later dispatches address the new runner.
 
     :param session_id: Session/conversation identifier.
     :param runner_router: The ``RunnerRouter`` instance, or ``None``.
@@ -2748,6 +2766,11 @@ async def _wait_for_host_bound_runner_client(
         connect wait to abort early on a reported death.
     :param host_conn: Live host connection to query for liveness.
     :param host_registry: Registry used to enqueue the query frame.
+    :param alive_timeout_s: Total seconds to allow a host-confirmed-alive
+        runner, inclusive of ``timeout_s``. ``None`` keeps the plain grace.
+        Budgeted by subtraction rather than elapsed time, so a connect wait
+        that ends early (a crash report) spends less than the full total —
+        never more.
     :returns: The runner HTTP client if it connected, otherwise ``None``
         (timed out, crash report, or host-confirmed dead/unknown).
     """
@@ -2769,17 +2792,50 @@ async def _wait_for_host_bound_runner_client(
             {connect_task, status_task},
             return_when=asyncio.FIRST_COMPLETED,
         )
-        # The connect settling is authoritative (client, timeout, or crash
-        # report) — the host's opinion no longer matters once it lands.
-        if connect_task in done:
+        # A connected runner is ground truth and always wins.
+        if connect_task in done and connect_task.result() is not None:
             return connect_task.result()
-        # Only the status query has resolved so far.
-        if status_task.result() in ("dead", "unknown"):
+        # ``asyncio.wait`` can report both tasks in the same turn, so read the
+        # verdict whenever it is available rather than only when the connect
+        # is still pending — otherwise a grace that expires alongside an
+        # ``alive`` answer would discard that answer and relaunch.
+        verdict = status_task.result() if status_task in done else None
+        if verdict in ("dead", "unknown"):
             # Host confirms the runner will never connect — stop waiting.
             return None
-        # No verdict ("alive" or an unavailable/too-old/slow host): let the
-        # connect grace run to its natural conclusion.
-        return await connect_task
+        if verdict != "alive" or alive_timeout_s is None:
+            # No usable verdict (an unavailable/too-old/slow host, or no alive
+            # budget configured): let the connect grace run its normal course.
+            return connect_task.result() if connect_task in done else await connect_task
+        # The host still holds this runner's process, so it has not been ruled
+        # out and may yet register. Let the grace finish, then spend what is
+        # left of the larger budget rather than rotating the binding and
+        # racing a replacement. A crash report arriving meanwhile still
+        # ends the wait early — ``_wait_for_runner_client`` short-circuits on
+        # it, so that case needs no separate check here.
+        if connect_task not in done:
+            client = await connect_task
+            if client is not None:
+                return client
+        remaining_s = alive_timeout_s - timeout_s
+        if remaining_s <= 0:
+            return None
+        _logger.info(
+            "Host reports runner %s alive for session %s but its tunnel is not "
+            "registered after %.1fs; waiting up to %.1fs more before relaunching",
+            runner_id,
+            session_id,
+            timeout_s,
+            remaining_s,
+        )
+        return await _wait_for_runner_client(
+            session_id,
+            runner_router,
+            tunnel_registry,
+            runner_id=runner_id,
+            timeout_s=remaining_s,
+            runner_exit_reports=runner_exit_reports,
+        )
     finally:
         outstanding = [t for t in (connect_task, status_task) if not t.done()]
         for task in outstanding:

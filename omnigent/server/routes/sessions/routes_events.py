@@ -1669,12 +1669,13 @@ def register_events_routes(
             # that wait early when the runner is not actually coming. The
             # host owns runner-process liveness (it holds the Popen), so we
             # race a ``host.runner_status`` query against the connect grace:
-            # a booting runner connects (or reads "alive") and we forward,
-            # while one that was stopped, crashed, or lost to a host restart
-            # reads "dead"/"unknown" and cuts the wait short so the relaunch
-            # below runs at once. A host that is offline, too old to answer,
-            # or slow yields no verdict and the grace runs its normal
-            # course, so the query only ever speeds up the cold path.
+            # one that was stopped, crashed, or lost to a host restart reads
+            # "dead"/"unknown" and cuts the wait short so the relaunch below
+            # runs at once, while a runner the host still holds reads "alive"
+            # and the wait stretches to the runner-online budget — a cold
+            # boot outlasting the grace must not be abandoned and replaced.
+            # A host that is offline, too old to answer, or slow yields no
+            # verdict and the grace runs its normal course.
             from omnigent.server.routes import sessions as _sf
 
             if conv.runner_id is not None and _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0:
@@ -1696,6 +1697,7 @@ def register_events_routes(
                         runner_exit_reports=runner_exit_reports,
                         host_conn=_grace_host_conn,
                         host_registry=_grace_host_reg,
+                        alive_timeout_s=_sf._HOST_BOUND_RUNNER_ALIVE_CONNECT_TIMEOUT_S,
                     )
                 else:
                     # Host tunnel absent: no one to query, so this is the
