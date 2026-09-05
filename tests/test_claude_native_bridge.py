@@ -2850,20 +2850,15 @@ def test_augment_claude_args_mirrors_launch_overrides_into_settings(
     ],
     ids=["skip-flag", "mode-spaced", "mode-joined"],
 )
-def test_augment_claude_args_preaccepts_bypass_dialog(
+def test_augment_claude_args_does_not_preaccept_bypass_dialog_without_opt_in(
     bypass_args: tuple[str, ...],
     tmp_path: Path,
 ) -> None:
     """
-    A bypass launch pre-accepts Claude's one-time bypass consent dialog.
+    A bypass launch alone cannot acknowledge Claude's dangerous-mode warning.
 
-    Claude shows a blocking "Bypass Permissions mode / 1. No, exit /
-    2. Yes, I accept" dialog before the first bypass launch. It fires no
-    PermissionRequest hook, so a host-spawned worker has nobody to answer it
-    and hangs forever producing no output. Setting
-    ``skipDangerousModePermissionPrompt`` in the invocation-local settings
-    sidecar clears the gate without touching the user's own config. Both
-    spellings that reach the CLI must be recognised.
+    Managed sandbox providers must opt in separately, so ordinary local and
+    unmanaged launches preserve Claude's confirmation gate.
     """
     args = augment_claude_args(
         bypass_args,
@@ -2872,9 +2867,9 @@ def test_augment_claude_args_preaccepts_bypass_dialog(
     )
 
     settings = _load_invocation_settings(args)
-    assert settings.get("skipDangerousModePermissionPrompt") is True, (
-        "bypass launches must set skipDangerousModePermissionPrompt; without it a "
-        f"headless worker hangs on the acceptance dialog. args={bypass_args!r}"
+    assert "skipDangerousModePermissionPrompt" not in settings, (
+        "bypass launches must preserve the confirmation gate without an explicit "
+        f"sandbox-provider opt-in. args={bypass_args!r}"
     )
 
 
@@ -2925,6 +2920,66 @@ def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
     assert settings["model"] == "claude-sonnet-5"
     assert "permissions" not in settings
     assert "effortLevel" not in settings
+
+
+@pytest.mark.parametrize(
+    ("permission_mode", "accepted", "expected"),
+    [
+        ("bypassPermissions", True, True),
+        ("bypassPermissions", False, False),
+        ("default", True, False),
+        (None, True, False),
+    ],
+)
+def test_bypass_warning_acceptance_requires_bypass_launch_and_caller_opt_in(
+    tmp_path: Path,
+    permission_mode: str | None,
+    accepted: bool,
+    expected: bool,
+) -> None:
+    """The dangerous-mode acknowledgement is never a blanket sandbox setting."""
+    claude_args = ("--permission-mode", permission_mode) if permission_mode is not None else ()
+    args = augment_claude_args(
+        claude_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        accept_bypass_permissions_warning=accepted,
+    )
+
+    settings = _load_invocation_settings(args)
+    assert (settings.get("skipDangerousModePermissionPrompt") is True) is expected
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({}, False),
+        ({"IS_SANDBOX": "1"}, False),
+        ({"OMNIGENT_CLAUDE_AUTO_ACCEPT_BYPASS_WARNING": "1"}, False),
+        (
+            {
+                "IS_SANDBOX": "1",
+                "OMNIGENT_CLAUDE_AUTO_ACCEPT_BYPASS_WARNING": "1",
+            },
+            True,
+        ),
+        (
+            {
+                "IS_SANDBOX": "true",
+                "OMNIGENT_CLAUDE_AUTO_ACCEPT_BYPASS_WARNING": "1",
+            },
+            False,
+        ),
+    ],
+)
+def test_sandbox_bypass_warning_gate_requires_two_exact_opt_ins(
+    environ: dict[str, str],
+    expected: bool,
+) -> None:
+    """Neither a generic sandbox marker nor the dedicated flag works alone."""
+    from omnigent.claude_native_bridge import sandbox_bypass_warning_acceptance_enabled
+
+    assert sandbox_bypass_warning_acceptance_enabled(environ) is expected
 
 
 def test_augment_claude_args_uses_last_repeated_launch_override(

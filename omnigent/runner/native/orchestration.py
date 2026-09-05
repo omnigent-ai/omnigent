@@ -6532,6 +6532,7 @@ async def _auto_create_claude_terminal(
         augment_claude_args,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
+        sandbox_bypass_warning_acceptance_enabled,
     )
     from omnigent.claude_native_forwarder import reset_transcript_forward_state
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -7119,6 +7120,7 @@ async def _auto_create_claude_terminal(
         # The route-turn hook is registered only when this session can
         # actually route; otherwise every submit would pay its round trip.
         turn_routing=_claude_turn_router is not None,
+        accept_bypass_permissions_warning=sandbox_bypass_warning_acceptance_enabled(),
     )
 
     # Apply the per-harness startup command/args override from config
