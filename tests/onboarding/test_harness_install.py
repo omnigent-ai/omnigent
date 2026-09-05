@@ -33,6 +33,13 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
 
+    # Binary resolution honors the per-harness executable override env vars;
+    # clear any ambient ones so a developer's real ``OMNIGENT_*_PATH`` (or a
+    # legacy ``HARNESS_*_PATH``) can't flip a ``which``-based assertion.
+    for var in list(os.environ):
+        if var.endswith("_PATH") and var.startswith(("OMNIGENT_", "HARNESS_")):
+            monkeypatch.delenv(var, raising=False)
+
     def _stub_version_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
             return subprocess.CompletedProcess(
@@ -859,8 +866,8 @@ def test_harness_login_skips_when_already_logged_in(monkeypatch: pytest.MonkeyPa
 @pytest.mark.parametrize(
     "key,expected_argv",
     [
-        (ANTHROPIC_FAMILY, ["claude", "auth", "login", "--claudeai"]),
-        (OPENAI_FAMILY, ["codex", "login"]),
+        (ANTHROPIC_FAMILY, ["/usr/bin/claude", "auth", "login", "--claudeai"]),
+        (OPENAI_FAMILY, ["/usr/bin/codex", "login"]),
         (GEMINI_FAMILY, ["/usr/bin/agy"]),
     ],
 )
@@ -1036,8 +1043,8 @@ def test_harness_login_false_for_harness_without_login(monkeypatch: pytest.Monke
 @pytest.mark.parametrize(
     "key,expected_argv",
     [
-        (ANTHROPIC_FAMILY, ["claude", "auth", "logout"]),
-        (OPENAI_FAMILY, ["codex", "logout"]),
+        (ANTHROPIC_FAMILY, ["/usr/bin/claude", "auth", "logout"]),
+        (OPENAI_FAMILY, ["/usr/bin/codex", "logout"]),
     ],
 )
 def test_harness_logout_runs_cli_logout_then_verifies(
@@ -1085,7 +1092,7 @@ def test_harness_cli_logged_in_uses_claude_json_verdict(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["claude", "auth", "status"]  # the status subcommand
+        assert argv == ["/usr/bin/claude", "auth", "status"]  # the status subcommand
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -1112,7 +1119,7 @@ def test_harness_cli_logged_in_codex_uses_exit_code(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["codex", "login", "status"]  # the status subcommand
+        assert argv == ["/usr/bin/codex", "login", "status"]  # the status subcommand
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -1143,7 +1150,7 @@ def test_harness_cli_logged_in_uses_cursor_json_verdict(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["cursor-agent", "status", "--format", "json"]
+        assert argv == ["/usr/bin/cursor-agent", "status", "--format", "json"]
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -1622,3 +1629,126 @@ def test_missing_harness_cli_flags_outdated_version(
     spec = hi.missing_harness_cli("opencode-native")
     assert spec is not None
     assert spec.binary == "opencode"
+
+
+def _write_executable(path: Path) -> str:
+    """Create an executable stub at *path* and return its string path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\necho 9.9.9\n", encoding="utf-8")
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_custom_path_only_install_counts_as_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An install reachable only via ``OMNIGENT_KIMI_PATH`` reads installed.
+
+    Launch resolves the configured executable, so a PATH-only readiness
+    predicate hid a launchable harness: the host advertised kimi as
+    ``binary-missing`` and ``omni setup`` said "Not installed" on a machine
+    where ``omnigent kimi`` works.
+    """
+    shim = _write_executable(tmp_path / "custom-tools" / "kimi")
+    # Nothing named ``kimi`` on PATH; only the override path resolves.
+    monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
+    monkeypatch.setenv("OMNIGENT_KIMI_PATH", shim)
+
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+    assert hi.resolve_harness_cli_binary(hi.KIMI_KEY) == shim
+
+
+def test_legacy_path_override_counts_as_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The deprecated ``HARNESS_KIMI_PATH`` alias is honored until removal.
+
+    Launch (``resolve_harness_path``) still reads the legacy var with a
+    deprecation warning, so readiness must credit the same install.
+    """
+    shim = _write_executable(tmp_path / "legacy-tools" / "kimi")
+    monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
+    monkeypatch.setenv("HARNESS_KIMI_PATH", shim)
+
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+
+
+def test_unresolvable_override_falls_back_to_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A typo'd override never hides a PATH install readiness credited before.
+
+    Same contract as ``resolve_cli_binary``'s env-var handling: the verdict
+    only moves toward available, so no currently-green machine regresses.
+    """
+    monkeypatch.setenv("OMNIGENT_KIMI_PATH", str(tmp_path / "nope" / "kimi"))
+    monkeypatch.setattr(
+        hi.shutil, "which", lambda name: "/usr/bin/kimi" if name == "kimi" else None
+    )
+
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+    assert hi.resolve_harness_cli_binary(hi.KIMI_KEY) == "/usr/bin/kimi"
+
+
+@pytest.mark.parametrize(
+    "key,env_var,binary",
+    [
+        (ANTHROPIC_FAMILY, "OMNIGENT_CLAUDE_PATH", "claude"),
+        (OPENAI_FAMILY, "OMNIGENT_CODEX_PATH", "codex"),
+    ],
+)
+def test_family_keys_resolve_their_cli_override_vars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key: str, env_var: str, binary: str
+) -> None:
+    """Family install keys map to their CLI's override var, not the family name.
+
+    The claude/codex specs are keyed ``anthropic``/``openai``; the override
+    var keys off the binary each spec spawns (the var launch honors).
+    """
+    shim = _write_executable(tmp_path / "override" / binary)
+    monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
+    monkeypatch.setenv(env_var, shim)
+
+    assert hi.harness_cli_installed(key) is True
+    assert hi.resolve_harness_cli_binary(key) == shim
+
+
+def test_gemini_has_no_path_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """No override var is consulted for agy — its launch is PATH/ladder only.
+
+    Honoring a speculative ``OMNIGENT_GEMINI_PATH`` would make readiness
+    credit an executable launch never uses.
+    """
+    shim = _write_executable(tmp_path / "override" / "agy")
+    monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
+    monkeypatch.setenv("OMNIGENT_GEMINI_PATH", shim)
+    monkeypatch.setenv("OMNIGENT_ANTIGRAVITY_PATH", shim)
+
+    assert hi.resolve_harness_cli_binary(GEMINI_FAMILY) is None
+    assert hi.harness_cli_installed(GEMINI_FAMILY) is False
+
+
+def test_custom_path_install_outside_version_range_reads_outdated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A too-old custom-path install is "outdated", not "missing".
+
+    ``_binary_availability_reason`` / ``_cli_absence_label`` distinguish the
+    two by whether the binary resolves at all; the override-resolved binary
+    must feed that check so the user is told to upgrade, not to install.
+    """
+    shim = _write_executable(tmp_path / "custom-tools" / "kimi")
+    monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
+    monkeypatch.setenv("OMNIGENT_KIMI_PATH", shim)
+
+    def _old_version_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="0.1.0", stderr="")
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _old_version_run)
+
+    # The version gate fails, but the binary still resolves — the pair that
+    # yields "version-too-low" / "Needs upgrade" instead of "binary-missing".
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is False
+    assert hi.resolve_harness_cli_binary(hi.KIMI_KEY) == shim
