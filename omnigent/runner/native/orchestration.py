@@ -7524,6 +7524,32 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
     )
 
 
+async def _discard_terminal_reset_mid_launch(
+    ctx: NativeLaunchContext,
+    *,
+    terminal_name: str,
+    view: SessionResourceView,
+) -> None:
+    """Drop a native terminal whose session was reset while it was starting.
+
+    Closes only the terminal this launch registered: a launch that started
+    after the reset owns whatever else the session holds by now. Then the codex
+    app-server the pane would otherwise leave running (no-op for the other
+    harnesses) and the delete event, so clients drop the pane the builder's
+    create event announced.
+    """
+    from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+
+    await ctx.resource_registry.close_terminal(ctx.session_id, view.id)
+    await teardown_codex_native_app_server(ctx.session_id)
+    _publish_terminal_deleted_event(
+        conversation_id=ctx.session_id,
+        terminal_name=terminal_name,
+        session_key="main",
+        publish_event=ctx.publish_event,
+    )
+
+
 async def _launch_native_terminal(
     harness_name: str,
     ctx: NativeLaunchContext,
@@ -7604,7 +7630,7 @@ async def _launch_native_terminal(
                 ctx = await build_context(ctx)
             elif resolve_agent_spec is not None:
                 ctx = dataclasses.replace(ctx, agent_spec=await resolve_agent_spec())
-            await adapter(ctx)
+            launched = await adapter(ctx)
             if ctx.registration_is_current is not None and not ctx.registration_is_current():
                 # A reset landed while the terminal was starting, so it carries
                 # the superseded spec. Drop it rather than leave it registered.
@@ -7613,8 +7639,11 @@ async def _launch_native_terminal(
                     agent.terminal_name,
                     ctx.session_id,
                 )
-                if registry is not None:
-                    await registry.cleanup_conversation(ctx.session_id)
+                await _discard_terminal_reset_mid_launch(
+                    ctx,
+                    terminal_name=agent.terminal_name,
+                    view=launched,
+                )
                 return False
             return True
         except Exception as exc:
@@ -7755,9 +7784,11 @@ async def _ensure_native_terminal(
                 terminal_name,
                 ctx.session_id,
             )
-            registry = ctx.resource_registry.terminal_registry
-            if registry is not None:
-                await registry.cleanup_conversation(ctx.session_id)
+            await _discard_terminal_reset_mid_launch(
+                ctx,
+                terminal_name=terminal_name,
+                view=view,
+            )
             return JSONResponse(
                 status_code=409,
                 content={
