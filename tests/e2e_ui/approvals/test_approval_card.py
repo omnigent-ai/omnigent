@@ -17,8 +17,11 @@ generous timeout, matching the other agent-driven UI suites.
 ``test_generic_native_permission_card_names_the_vendor_or_nothing`` cover the
 same card's header for harness-native prompts instead of policy asks — the
 claude hook and the vendor-agnostic one respectively. Both drive synthetic
-permission-request hooks against a seeded session (no LLM, no native CLI —
-seconds, like ``test_persistent_approval.py``), so they run on every PR.
+permission-request hooks (no LLM, no native CLI — seconds, like
+``test_persistent_approval.py``), so they run on every PR. The claude-hook
+test drives ``claude_seeded_session`` because the endpoint rejects sessions
+whose harness is not Claude; the vendor-agnostic one uses the seeded
+(openai-agents) session.
 """
 
 from __future__ import annotations
@@ -107,10 +110,10 @@ def test_approval_card_reject(
 @pytest.mark.timeout(90)
 def test_native_permission_card_names_the_harness(
     page: Page,
-    seeded_session: tuple[str, str],
+    claude_seeded_session: tuple[str, str],
 ) -> None:
     """A claude-native prompt is labeled "Claude Code", not by its internal stamp."""
-    base_url, session_id = seeded_session
+    base_url, session_id = claude_seeded_session
     result_holder: dict = {}
 
     def _post_hook() -> None:

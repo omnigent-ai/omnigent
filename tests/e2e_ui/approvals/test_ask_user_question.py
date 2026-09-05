@@ -9,8 +9,12 @@ answer and submits it, confirming the parked HTTP call drains and the verdict
 flowed back through the PermissionRequest round-trip.
 
 This approach replaces the original native Claude Code session (real LLM turn)
-with a seeded session and a synthetic hook POST — no real Claude Code needed,
-test completes in seconds rather than minutes.
+with a synthetic hook POST — no real Claude Code needed, test completes in
+seconds rather than minutes. The Claude hook only serves sessions whose
+harness is Claude, so the form test drives ``claude_seeded_session``; the
+mid-turn fold test needs a mock-LLM turn (a non-Claude harness), so it raises
+the same question through the vendor-agnostic
+``/hooks/native-permission-request`` instead.
 
 This is the structured-form counterpart to the binary approval card
 (``test_approval_card.py``): the binary card covers a policy ASK, this covers
@@ -75,7 +79,8 @@ def _post_ask_user_question(base_url: str, session_id: str, holder: dict) -> thr
     """Park an ``AskUserQuestion`` permission request on *session_id*.
 
     The call blocks server-side until the web verdict lands, so it runs on
-    its own thread; join it after answering the card.
+    its own thread; join it after answering the card. The Claude hook only
+    serves Claude-harness sessions — pass a ``claude_seeded_session`` id.
 
     :param base_url: Server base URL.
     :param session_id: Session to raise the prompt on.
@@ -110,14 +115,65 @@ def _post_ask_user_question(base_url: str, session_id: str, holder: dict) -> thr
     return thread
 
 
+def _post_native_ask_user_question(
+    base_url: str, session_id: str, holder: dict
+) -> threading.Thread:
+    """Park the same question via the vendor-agnostic permission hook.
+
+    For sessions whose harness is not Claude (the Claude hook rejects
+    those): the ``ask_user_question`` extra carries the structured
+    questions, so the SPA renders the identical form card.
+
+    :param base_url: Server base URL.
+    :param session_id: Session to raise the prompt on.
+    :param holder: Dict the thread writes ``response`` / ``error`` into.
+    :returns: The started thread.
+    """
+    import secrets
+
+    def _post() -> None:
+        try:
+            resp = httpx.post(
+                f"{base_url}/v1/sessions/{session_id}/hooks/native-permission-request",
+                json={
+                    "elicitation_id": f"elicit_native_{secrets.token_hex(16)}",
+                    "agent": "Agent",
+                    "message": "Which option do you prefer?",
+                    "operation_type": "question",
+                    "ask_user_question": {
+                        "questions": [
+                            {
+                                "question": "Which option do you prefer?",
+                                "header": "Choice",
+                                "multiSelect": False,
+                                "options": [
+                                    {"label": _OPTION_ONE, "description": "first"},
+                                    {"label": _OPTION_TWO, "description": "second"},
+                                ],
+                            }
+                        ]
+                    },
+                },
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            holder["response"] = resp
+        except Exception as exc:
+            holder["error"] = exc
+
+    thread = threading.Thread(target=_post, daemon=True)
+    thread.start()
+    return thread
+
+
 @pytest.mark.timeout(90)
 def test_ask_user_question_form_renders_and_submits(
     page: Page,
-    seeded_session: tuple[str, str],
+    claude_seeded_session: tuple[str, str],
 ) -> None:
     """Mock AskUserQuestion permission-request → web form renders → answer → prompt drains."""
-    base_url, session_id = seeded_session
-    _log.info("seeded session ready: base_url=%s session_id=%s", base_url, session_id)
+    base_url, session_id = claude_seeded_session
+    _log.info("claude session ready: base_url=%s session_id=%s", base_url, session_id)
 
     result_holder: dict = {}
     hook_thread = _post_ask_user_question(base_url, session_id, result_holder)
@@ -174,6 +230,10 @@ def test_answered_question_stays_outside_the_worked_fold(
     The card used to be grouped with the turn that asked, which folded it
     into the single "Worked for" row — hiding what the user answered behind
     a disclosure triangle, under a label claiming the agent did it.
+
+    The paused session runs the mock-LLM harness (not Claude), so the
+    question arrives through the vendor-agnostic hook — the fold behavior
+    under test is endpoint-independent.
     """
     base_url, session_id, mock_url = paused_mid_turn_session
 
@@ -188,7 +248,7 @@ def test_answered_question_stays_outside_the_worked_fold(
     _wait_for(lambda: httpx.get(f"{mock_url}/gate/pending", timeout=5.0).json()["pending"])
 
     result_holder: dict = {}
-    hook_thread = _post_ask_user_question(base_url, session_id, result_holder)
+    hook_thread = _post_native_ask_user_question(base_url, session_id, result_holder)
 
     form = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').locator(_FORM).first
     expect(form).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)

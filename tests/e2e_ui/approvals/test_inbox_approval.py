@@ -253,7 +253,7 @@ def test_pending_approval_surfaces_and_resolves_in_inbox(
 @pytest.mark.timeout(600)
 def test_reparked_elicitation_reliably_resurfaces_in_inbox(
     page: Page,
-    seeded_session: tuple[str, str],
+    claude_seeded_session: tuple[str, str],
 ) -> None:
     """A re-parked, already-approved elicitation resurfaces as an actionable card.
 
@@ -286,10 +286,12 @@ def test_reparked_elicitation_reliably_resurfaces_in_inbox(
 
     No real LLM: the hook endpoint parks elicitations directly, which is also
     the only way to deterministically re-park the *same* id (a model-driven
-    gate mints a fresh id per call). Nightly + generous timeout to match the
-    other live-server UI suites.
+    gate mints a fresh id per call). The session comes from
+    ``claude_seeded_session`` because the Claude hook rejects non-Claude
+    harnesses. Nightly + generous timeout to match the other live-server UI
+    suites.
     """
-    base_url, session_id = seeded_session
+    base_url, session_id = claude_seeded_session
 
     # One mount, kept for the whole test: the optimistic ``responded`` map is
     # in-memory page state, so a reload between retries would wash out the very

@@ -59,11 +59,11 @@ def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) ->
 @pytest.mark.timeout(90)
 def test_pending_elicitation_floats_to_bottom(
     page: Page,
-    seeded_session: tuple[str, str],
+    claude_seeded_session: tuple[str, str],
 ) -> None:
     """Pending card renders in the floated bottom slot, then returns inline once answered."""
-    base_url, session_id = seeded_session
-    _log.info("seeded session ready: base_url=%s session_id=%s", base_url, session_id)
+    base_url, session_id = claude_seeded_session
+    _log.info("claude session ready: base_url=%s session_id=%s", base_url, session_id)
 
     result_holder: dict = {}
 

@@ -54,11 +54,11 @@ def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) ->
 @pytest.mark.timeout(90)
 def test_exit_plan_mode_review_renders_and_approves(
     page: Page,
-    seeded_session: tuple[str, str],
+    claude_seeded_session: tuple[str, str],
 ) -> None:
     """Mock ExitPlanMode permission-request → review card → approve → prompt drains."""
-    base_url, session_id = seeded_session
-    _log.info("seeded session ready: base_url=%s session_id=%s", base_url, session_id)
+    base_url, session_id = claude_seeded_session
+    _log.info("claude session ready: base_url=%s session_id=%s", base_url, session_id)
 
     result_holder: dict = {}
 

@@ -18,6 +18,8 @@ from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.harness_aliases import is_claude_sdk_harness_name
+from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     get_agent_cache,
@@ -216,6 +218,31 @@ def register_hooks_routes(
         if tool_input is not None and not isinstance(tool_input, dict):
             raise OmnigentError(
                 "PermissionRequest hook body 'tool_input' must be an object when present.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # This endpoint stamps Claude's identity into the card it publishes
+        # (message + ``claude_native_permission``), so it must only serve
+        # sessions whose bound agent actually runs Claude. A stale or
+        # hand-edited hook config on another harness that still posts here
+        # would otherwise render a Claude-branded approval card on a
+        # non-Claude session. Hard 4xx: hook clients treat it as final and
+        # fall back to their own TUI prompt.
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise OmnigentError(
+                f"Session {session_id!r} not found.",
+                code=ErrorCode.NOT_FOUND,
+            )
+        native_agent = _sf._native_coding_agent_for_session(conv)
+        session_runs_claude = (
+            native_agent.harness == CLAUDE_NATIVE_CODING_AGENT.harness
+            if native_agent is not None
+            else is_claude_sdk_harness_name(_sf._resolve_harness(conv))
+        )
+        if not session_runs_claude:
+            raise OmnigentError(
+                "The Claude PermissionRequest hook only serves Claude sessions; "
+                "non-Claude harnesses must use '/hooks/native-permission-request'.",
                 code=ErrorCode.INVALID_INPUT,
             )
         # Claude Code's PermissionRequest payload carries no
