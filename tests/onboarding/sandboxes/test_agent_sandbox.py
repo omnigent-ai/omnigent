@@ -211,8 +211,7 @@ def test_start_host_carries_env_values_into_the_sandbox_manifest(
     fake_clients: tuple[_FakeCore, _FakeCustom], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     core, custom = fake_clients
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    before = dict(os.environ)
+    monkeypatch.setattr(os, "environ", {"UNRELATED_CONFIG": "unchanged"})
     values = {
         "SSL_CERT_FILE": "/mnt/ca/ca.crt",
         "OMNIGENT_CONFIG_HOME": "/home/omnigent/custom-config",
@@ -242,7 +241,7 @@ def test_start_host_carries_env_values_into_the_sandbox_manifest(
         {"name": "HOME", "value": k8s._HOME_DIR},
         {"name": "OMNIGENT_CONFIG_HOME", "value": values["OMNIGENT_CONFIG_HOME"]},
     ]
-    assert dict(os.environ) == before
+    assert os.environ == {"UNRELATED_CONFIG": "unchanged"}
 
 
 def test_sandbox_manifest_expiry_suspends_rather_than_destroys() -> None:

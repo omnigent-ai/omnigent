@@ -818,12 +818,10 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
 def test_parse_kubernetes_env_values_are_pod_only(
     provider: str, server_cert: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if server_cert is None:
-        monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    else:
-        monkeypatch.setenv("SSL_CERT_FILE", server_cert)
-    monkeypatch.setenv("PLAIN_CONFIG", "from-server")
-    before = dict(os.environ)
+    expected_env = {"PLAIN_CONFIG": "from-server"}
+    if server_cert is not None:
+        expected_env["SSL_CERT_FILE"] = server_cert
+    monkeypatch.setattr(os, "environ", expected_env.copy())
     values = {
         "SSL_CERT_FILE": "/mnt/ca/ca.crt",
         "EMPTY": "",
@@ -842,7 +840,7 @@ def test_parse_kubernetes_env_values_are_pod_only(
     assert isinstance(launcher, KubernetesSandboxLauncher)
     assert launcher.provider == provider
     assert launcher._resolve_sandbox_env() == {**values, "PLAIN_CONFIG": "from-server"}
-    assert dict(os.environ) == before
+    assert os.environ == expected_env
 
 
 @pytest.mark.parametrize("provider", ["kubernetes", "agent_sandbox"])

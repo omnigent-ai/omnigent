@@ -525,9 +525,7 @@ def test_resolve_sandbox_env_rejects_reserved_and_credential_and_missing(
 def test_env_values_are_copied_and_do_not_modify_server_environment(
     launcher_cls: type[KubernetesSandboxLauncher], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    monkeypatch.setenv("PLAIN_CONFIG", "from-server")
-    before = dict(os.environ)
+    monkeypatch.setattr(os, "environ", {"PLAIN_CONFIG": "from-server"})
     values = {"SSL_CERT_FILE": "/mnt/ca/ca.crt", "EMPTY": "", "TEXT": "  literal\ntext  "}
     launcher = launcher_cls(env=["PLAIN_CONFIG"], env_values=values)
     values["SSL_CERT_FILE"] = "/changed-after-construction"
@@ -540,7 +538,7 @@ def test_env_values_are_copied_and_do_not_modify_server_environment(
     }
     resolved["SSL_CERT_FILE"] = "/changed-after-resolution"
     assert launcher._resolve_sandbox_env()["SSL_CERT_FILE"] == "/mnt/ca/ca.crt"
-    assert dict(os.environ) == before
+    assert os.environ == {"PLAIN_CONFIG": "from-server"}
 
 
 @pytest.mark.parametrize("launcher_cls", [KubernetesSandboxLauncher, AgentSandboxLauncher])
