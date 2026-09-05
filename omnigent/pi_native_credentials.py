@@ -143,6 +143,80 @@ def _split_pi_native_model_selection(selection: str | None) -> tuple[str, str] |
     return None
 
 
+def _default_pi_global_agent_dir() -> Path:
+    """Return Pi's global agent root (``~/.pi/agent``), resolved lazily.
+
+    Same location as :data:`omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR`,
+    resolved at call time (not import time) so a redirected ``$HOME`` — the
+    convention the test suite uses for isolation — takes effect. Never a
+    managed ``PI_CODING_AGENT_DIR``.
+    """
+    return Path.home() / ".pi" / "agent"
+
+
+def _read_pi_global_models_store(
+    global_agent_dir: Path | None = None,
+) -> dict[str, list[dict[str, object]]]:
+    """Read Pi's own global ``models-store.json`` as provider → model entries.
+
+    This is the catalog Pi itself enriches from provider registries (e.g.
+    opencode's model directory). It backs the pre-launch fallback picker
+    (when Omnigent manages no Pi provider) with the models Pi can actually
+    run.
+
+    :param global_agent_dir: Pi's global agent root; defaults to
+        ``~/.pi/agent`` (never a managed ``PI_CODING_AGENT_DIR``).
+    :returns: Mapping of provider id to that provider's model entry dicts
+        (each with a string ``id``). Empty on any failure — callers treat
+        "unknown" as "no info", exactly as before.
+    """
+    store_path = (global_agent_dir or _default_pi_global_agent_dir()) / "models-store.json"
+    try:
+        raw = json.loads(store_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    stores: dict[str, list[dict[str, object]]] = {}
+    for provider_id, payload in raw.items():
+        if not isinstance(provider_id, str) or not isinstance(payload, dict):
+            continue
+        models = payload.get("models")
+        if not isinstance(models, list):
+            continue
+        entries = [
+            model
+            for model in models
+            if isinstance(model, dict) and isinstance(model.get("id"), str)
+        ]
+        if entries:
+            stores[provider_id] = entries
+    return stores
+
+
+def _pi_global_authed_providers(
+    global_agent_dir: Path | None = None,
+) -> set[str] | None:
+    """Return provider ids Pi holds credentials for, or ``None`` when unknown.
+
+    Reads Pi's global ``auth.json`` (``{provider: {...}}``). ``None`` means
+    the file was missing or unreadable — callers fail open (list everything)
+    rather than hiding all choices on a read error.
+
+    :param global_agent_dir: Pi's global agent root; defaults to
+        ``~/.pi/agent``.
+    :returns: The authenticated provider ids, or ``None`` when unknown.
+    """
+    auth_path = (global_agent_dir or _default_pi_global_agent_dir()) / "auth.json"
+    try:
+        raw = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return {provider_id for provider_id in raw if isinstance(provider_id, str)}
+
+
 class _PiProviderCompat(TypedDict, total=False):
     supportsDeveloperRole: bool
     supportsStore: bool
@@ -392,11 +466,25 @@ class PiProviderConfig:
         )
 
 
-def pi_native_model_options() -> list[dict[str, object]]:
-    """Return pre-launch Pi choices configured through ``omni setup``."""
+def pi_native_model_options(
+    global_agent_dir: Path | None = None,
+) -> list[dict[str, object]]:
+    """Return pre-launch Pi choices configured through ``omni setup``.
+
+    When Omnigent manages no Pi provider (``resolve_pi_native_provider`` is
+    ``None`` — Pi will use its own login at launch), fall back to the models
+    Pi itself knows from its global ``models-store.json`` so the picker still
+    offers the authenticated providers' models instead of a lone "Default".
+    A fallback choice is a ``provider/model`` id Pi accepts natively in
+    ``--model``; the launch passes it through when unmanaged.
+
+    :param global_agent_dir: Pi's global agent root for the fallback;
+        defaults to ``~/.pi/agent``.
+    :returns: Picker options, each ``{"id", "model", "displayName"}``.
+    """
     provider = resolve_pi_native_provider()
     if provider is None:
-        return []
+        return _pi_global_model_options(global_agent_dir)
 
     options: dict[str, dict[str, object]] = {}
     for provider_id, payload in provider.to_models_config()["providers"].items():
@@ -409,6 +497,41 @@ def pi_native_model_options() -> list[dict[str, object]]:
                 "displayName": model.get("name") or model_id,
             }
     return [options[model_id] for model_id in sorted(options)]
+
+
+def _pi_global_model_options(
+    global_agent_dir: Path | None = None,
+) -> list[dict[str, object]]:
+    """List Pi's own authenticated models as pre-launch ``provider/model`` choices.
+
+    Providers without credentials in Pi's global ``auth.json`` are skipped so
+    the picker never offers a model that can't run; an unreadable ``auth.json``
+    fails open (lists everything) rather than hiding all choices.
+
+    :param global_agent_dir: Pi's global agent root; defaults to
+        ``~/.pi/agent``.
+    :returns: Picker options, each ``{"id", "model", "displayName"}``.
+    """
+    stores = _read_pi_global_models_store(global_agent_dir)
+    if not stores:
+        return []
+    authed = _pi_global_authed_providers(global_agent_dir)
+    options: dict[str, dict[str, object]] = {}
+    for provider_id in sorted(stores):
+        if authed is not None and provider_id not in authed:
+            continue
+        for entry in stores[provider_id]:
+            model_id = entry.get("id")
+            if not isinstance(model_id, str):
+                continue
+            qualified = f"{provider_id}/{model_id}"
+            name = entry.get("name")
+            options[qualified] = {
+                "id": qualified,
+                "model": qualified,
+                "displayName": name if isinstance(name, str) and name else model_id,
+            }
+    return [options[key] for key in sorted(options)]
 
 
 # DATABRICKS-PATCH(pi-live-model-discovery)
