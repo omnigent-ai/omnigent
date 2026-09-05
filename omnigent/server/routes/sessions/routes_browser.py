@@ -77,9 +77,11 @@ def register_browser_routes(
         Mints an ``action_id``, parks a Future owned by ``session_id``, publishes
         a ``browser.action_request`` event, gives a renderer a short claim grace,
         and then awaits up to ``_BROWSER_ACTION_AWAIT_S`` for the claimed action.
-        An unclaimed request returns promptly so a non-renderer stream subscriber
-        cannot cause the full timeout. Called by the runner's ``browser_*``
-        dispatch, not the LLM.
+        Returns the no-renderer result up front when no subscriber registered
+        the browser-renderer capability (the stream route's ``browser_renderer``
+        query param) — a generic stream consumer such as a headless CLI's own
+        stream pump must not buy the claim grace for an action it can never
+        execute. Called by the runner's ``browser_*`` dispatch, not the LLM.
 
         :param request: The inbound request, used for identity extraction.
         :param session_id: Session/conversation identifier, e.g.
@@ -103,6 +105,16 @@ def register_browser_routes(
         if not isinstance(args, dict):
             args = {}
 
+        from omnigent.server.routes import sessions as _sessions_facade
+
+        # Capability check before any parking or publish: only a subscriber
+        # that registered as a browser renderer can claim the action, so a
+        # session watched merely by generic consumers (headless CLI stream
+        # pumps, plain viewers) fails immediately instead of publishing an
+        # unanswerable request and burning the claim grace.
+        if not _sessions_facade.session_stream.has_browser_renderer(session_id):
+            return _BROWSER_ACTION_NO_RENDERER_RESULT
+
         action_id = f"baction_{secrets.token_hex(16)}"
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         claimed = asyncio.Event()
@@ -116,8 +128,6 @@ def register_browser_routes(
                 action=action,
                 args=args,
             )
-            from omnigent.server.routes import sessions as _sessions_facade
-
             delivered = _sessions_facade.session_stream.publish(session_id, event.model_dump())
             if delivered == 0:
                 # Fail fast: the stream has no buffer or replay, so a

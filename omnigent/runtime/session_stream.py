@@ -63,6 +63,11 @@ _subscribers: dict[
     str,
     set[tuple[asyncio.Queue[dict[str, Any] | object], asyncio.AbstractEventLoop]],
 ] = {}
+# Renderer-capable subscriber counts: conversation_id -> number of live
+# subscribers that declared ``browser_renderer=True`` at ``subscribe`` time
+# (the desktop app's embedded-browser relay). Guarded by ``_lock`` alongside
+# ``_subscribers`` and pruned in the same ``finally`` that removes the slot.
+_browser_renderer_counts: dict[str, int] = {}
 _lock = threading.Lock()
 
 
@@ -276,6 +281,28 @@ def has_subscribers(conversation_id: str) -> bool:
         return bool(_subscribers.get(conversation_id))
 
 
+def has_browser_renderer(conversation_id: str) -> bool:
+    """
+    Return whether any live subscriber registered as a browser renderer.
+
+    :func:`has_subscribers` counts every stream consumer — REPL pumps,
+    headless CLI wrappers, plain web viewers — but only a subscriber that
+    declared ``browser_renderer=True`` at :func:`subscribe` time can claim
+    and execute embedded-browser actions. Callers deciding whether
+    ``browser_*`` tools can be served (the turn advertisement hint, the
+    browser action bridge) must check this, not mere presence: a headless
+    session driven by ``omnigent run`` keeps its own stream open the whole
+    turn, so presence alone misreports a renderer.
+
+    :param conversation_id: The conversation to check,
+        e.g. ``"conv_abc123"``.
+    :returns: ``True`` when at least one renderer-capable subscriber is
+        currently registered.
+    """
+    with _lock:
+        return _browser_renderer_counts.get(conversation_id, 0) > 0
+
+
 def close(conversation_id: str) -> None:
     """
     Broadcast an end-of-stream sentinel to every active subscriber
@@ -317,6 +344,7 @@ async def subscribe(
     ready_event: dict[str, Any] | None = None,
     pre_ready_snapshot: Callable[[], Iterable[dict[str, Any]]] | None = None,
     on_subscribed: Callable[[], Awaitable[Iterable[dict[str, Any]]]] | None = None,
+    browser_renderer: bool = False,
 ) -> AsyncIterator[dict[str, Any]]:
     """
     Subscribe to live events for a conversation.
@@ -379,6 +407,14 @@ async def subscribe(
         first guarantees no delta is dropped between snapshot and tail.
         Best-effort: exceptions are swallowed so a slow/failing snapshot
         never blocks live delivery. ``None`` skips the snapshot.
+    :param browser_renderer: ``True`` when this subscriber can claim and
+        execute embedded-browser actions (the desktop app's relay — see
+        ``useBrowserAgentRelay``). Registers the slot in the
+        renderer-capability registry consulted by
+        :func:`has_browser_renderer`; a generic consumer (REPL pump,
+        headless CLI wrapper, plain viewer) leaves the default ``False``
+        so its presence never advertises ``browser_*`` tools it cannot
+        serve.
     :returns: An async iterator of event dicts. Each event is
         yielded verbatim as it was passed to :func:`publish`,
         plus synthetic heartbeat dicts when *heartbeat_interval_s*
@@ -393,6 +429,10 @@ async def subscribe(
     entry = (queue, loop)
     with _lock:
         _subscribers.setdefault(conversation_id, set()).add(entry)
+        if browser_renderer:
+            _browser_renderer_counts[conversation_id] = (
+                _browser_renderer_counts.get(conversation_id, 0) + 1
+            )
     # Read the pre-ready snapshot synchronously here — after slot
     # registration, before the ``yield`` below suspends. On the Omnigent event
     # loop (where the relay calls ``publish``) nothing runs in between, so
@@ -464,3 +504,9 @@ async def subscribe(
                 subs.discard(entry)
                 if not subs:
                     _subscribers.pop(conversation_id, None)
+            if browser_renderer:
+                remaining = _browser_renderer_counts.get(conversation_id, 0) - 1
+                if remaining > 0:
+                    _browser_renderer_counts[conversation_id] = remaining
+                else:
+                    _browser_renderer_counts.pop(conversation_id, None)

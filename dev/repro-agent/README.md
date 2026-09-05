@@ -60,8 +60,10 @@ with `git worktree remove <path>` when done.
 ## What it does
 
 1. Reconstructs the user journey from the linked bug report.
-2. Drives the running app through that journey — browser tools for UI bugs,
-   `sys_session_*` / HTTP for backend bugs — until it observes the failure.
+2. Drives the running app through that journey — browser tools for UI bugs when
+   the desktop app has the session open, the Playwright `tests/e2e_ui/` lane on
+   headless runs, `sys_session_*` / HTTP for backend bugs — until it observes
+   the failure.
 3. Authors a durable e2e test (`tests/e2e_ui/` for UI, PTY/pexpect for CLI
    journeys, `tests/e2e/` for backend) keyed to the concrete failure, so a fix
    has a fail→pass regression guard.

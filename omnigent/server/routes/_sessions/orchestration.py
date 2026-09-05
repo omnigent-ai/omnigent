@@ -4976,11 +4976,13 @@ async def _forward_event_to_runner(
         # browser) is subscribed to this session's stream right now.
         # The runner drops the ``browser_*`` tool schemas for the turn
         # when this is False — a headless session must not advertise
-        # tools that can never be served. Presence heuristic: any stream
-        # subscriber counts (the protocol has no renderer-capability
-        # registration), so a non-renderer viewer keeps tools advertised
-        # — no worse than the pre-hint behavior.
-        "browser_renderer_available": session_stream.has_subscribers(session_id),
+        # tools that can never be served. Capability, not presence:
+        # only subscribers that registered as browser renderers (the
+        # stream route's ``browser_renderer`` query param) count, so a
+        # generic consumer — e.g. the CLI's own stream pump on a
+        # headless ``omnigent run`` — no longer keeps tools advertised
+        # that always fail with "no browser renderer is connected".
+        "browser_renderer_available": session_stream.has_browser_renderer(session_id),
         # Id of the item just persisted for this turn. On a cold runner
         # cache the runner reloads history (which includes this item in
         # PRE-resolution form) and drops it by id, appending its own

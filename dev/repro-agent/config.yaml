@@ -26,7 +26,9 @@
 # The brain runs on the Claude Agent SDK, so configure a Claude provider first
 # (`omnigent setup` — an Anthropic key, a Claude subscription, an
 # OpenAI-compatible gateway, or a Databricks workspace). It drives the app via
-# the framework browser tools (auto-registered) and sys_session_* / HTTP.
+# the framework browser tools when a renderer-capable Omnigent UI (the desktop
+# app) has the session open — a headless run has no renderer, so it uses the
+# Playwright tests/e2e_ui lane instead — and sys_session_* / HTTP.
 
 spec_version: 1
 name: repro_agent
@@ -74,7 +76,8 @@ cancellable: true
 # Declaring os_env registers sys_os_read / sys_os_write / sys_os_edit /
 # sys_os_shell. The agent uses the shell for `gh` (reading the linked GitHub
 # issue) and to write the e2e test file into this checkout; it drives the app
-# via the auto-registered browser_* tools and sys_session_* / HTTP. `cwd: .`
+# via the browser_* tools when a UI renderer is attached (Playwright when
+# headless) and sys_session_* / HTTP. `cwd: .`
 # runs in the caller's working directory — run `omnigent run dev/repro-agent`
 # from the root of your omnigent checkout so the agent lands in this repo.
 # `sandbox: none` runs unsandboxed with unrestricted network so it can reach the

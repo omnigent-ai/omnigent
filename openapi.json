@@ -14325,6 +14325,17 @@
               "title": "Idle",
               "type": "boolean"
             }
+          },
+          {
+            "description": "Renderer-capability flag: `True` when this client can claim and execute embedded-browser actions (the desktop app's SPA sets it when its `WebContentsView` bridge is present). Drives the `browser_*` tool advertisement hint and the browser action bridge's fail-fast \u2014 generic viewers and headless CLI stream pumps leave the default `False` so their presence never advertises tools they cannot serve.",
+            "in": "query",
+            "name": "browser_renderer",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Browser Renderer",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

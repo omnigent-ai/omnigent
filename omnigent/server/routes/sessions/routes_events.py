@@ -2026,6 +2026,7 @@ def register_events_routes(
         request: Request,
         session_id: str,
         idle: bool = False,
+        browser_renderer: bool = False,
     ) -> StreamingResponse:
         """
         Subscribe to the session's live SSE event stream.
@@ -2052,6 +2053,14 @@ def register_events_routes(
             at connect time (tab backgrounded ≥ its debounce). An
             idle *flip* mid-view arrives as a reconnect carrying the
             new value — there is no separate update endpoint.
+        :param browser_renderer: Renderer-capability flag: ``True``
+            when this client can claim and execute embedded-browser
+            actions (the desktop app's SPA sets it when its
+            ``WebContentsView`` bridge is present). Drives the
+            ``browser_*`` tool advertisement hint and the browser
+            action bridge's fail-fast — generic viewers and headless
+            CLI stream pumps leave the default ``False`` so their
+            presence never advertises tools they cannot serve.
         :returns: An SSE :class:`StreamingResponse`.
         :raises OmnigentError: 404 if no session exists.
         """
@@ -2183,6 +2192,7 @@ def register_events_routes(
                 # the CHILD conversation's stream, and per-conversation
                 # scoping would hide co-viewers on other agents.
                 presence_root_id=conv.root_conversation_id,
+                browser_renderer=browser_renderer,
             ),
             media_type="text/event-stream",
             headers={

@@ -929,6 +929,34 @@ describe("openSessionStream", () => {
     expect(new Headers(init.headers).get("Accept")).toBe("text/event-stream");
     expect(init.signal).toBe(signal);
   });
+
+  it("declares the browser-renderer capability via the query param", () => {
+    // The server advertises `browser_*` tools and parks browser actions
+    // only while a subscriber carrying this param is connected — dropping
+    // it would silently break the desktop app's agent browser.
+    const signal = new AbortController().signal;
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+
+    openSessionStream("conv_abc", signal, { browserRenderer: true });
+
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_abc/stream?browser_renderer=true");
+  });
+
+  it("omits the capability for plain viewers and combines it with idle", () => {
+    const signal = new AbortController().signal;
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+    openSessionStream("conv_abc", signal, { idle: true, browserRenderer: false });
+    expect((fetchMock.mock.calls[0] as [string, RequestInit])[0]).toBe(
+      "/v1/sessions/conv_abc/stream?idle=true",
+    );
+
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+    openSessionStream("conv_abc", signal, { idle: true, browserRenderer: true });
+    expect((fetchMock.mock.calls[1] as [string, RequestInit])[0]).toBe(
+      "/v1/sessions/conv_abc/stream?idle=true&browser_renderer=true",
+    );
+  });
 });
 
 describe("interrupt", () => {
