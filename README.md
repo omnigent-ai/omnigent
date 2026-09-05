@@ -29,7 +29,7 @@ Omnigent lets you:
   follow you: start in your terminal, continue in the browser, pick it up on
   your phone. Messages, sub-agents, terminals, and files stay in sync.
 
-- **🤖 Supervise multiple agents.** Mix Claude Code, Codex, Cursor, OpenCode,
+- **🤖 Supervise multiple agents at once.** Mix Claude Code, Codex, Cursor, OpenCode,
   Hermes, Pi, and custom agents (defined in YAML) together in the same
   session. Ask one agent to review another's work, or split a task across
   agents that are each good at different things.
