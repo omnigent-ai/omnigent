@@ -45,6 +45,8 @@ const TASK: api.ScheduledTask = {
   lastRunStatus: null,
   lastRunConversationId: null,
   nextRunAt: null,
+  activeRangeStart: null,
+  activeRangeEnd: null,
 };
 
 function makeWrapper() {

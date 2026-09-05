@@ -40,6 +40,13 @@ export interface ScheduleModel {
   monthDays: number[];
   /** Month 1–12 for Custom Yearly. */
   month: number;
+  /**
+   * Optional time-of-day window (inclusive, `"HH:MM"` 24-hour strings) an
+   * occurrence must land in to actually fire, or `null` when unrestricted.
+   * Only offered in the form for an hourly cadence; a sibling of the RRULE
+   * fields, not part of `buildRRule`'s output.
+   */
+  activeRange: { start: string; end: string } | null;
 }
 
 export const DEFAULT_SCHEDULE_MODEL: ScheduleModel = {
@@ -51,6 +58,7 @@ export const DEFAULT_SCHEDULE_MODEL: ScheduleModel = {
   interval: 1,
   monthDays: [1],
   month: 1,
+  activeRange: null,
 };
 
 /**
@@ -223,6 +231,18 @@ export function validateSchedule(model: ScheduleModel): string | null {
       return "Pick at least one day of the month.";
     }
   }
+
+  // Mirrors the server's `validate_active_range` rejections (active_range.py)
+  // so a bad range fails inline instead of as a 400.
+  if (model.activeRange !== null) {
+    const { start, end } = model.activeRange;
+    if (!isValidTimeOfDay24(start) || !isValidTimeOfDay24(end)) {
+      return "Enter a valid start and end time.";
+    }
+    if (start === end) {
+      return "Start and end must differ; turn off the range to always run.";
+    }
+  }
   return null;
 }
 
@@ -287,4 +307,16 @@ export function parseMinuteOfHourInput(input: string): number | null {
   if (!/^\d{1,2}$/.test(value)) return null;
   const minute = Number(value);
   return Number.isInteger(minute) && minute >= 0 && minute <= 59 ? minute : null;
+}
+
+/** Strict 24-hour `"HH:MM"`, matching the server's active-range wire format. */
+const TIME_OF_DAY_24_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+/** Format an hour/minute pair as a strict 24-hour `"HH:MM"` string, e.g. `09:00`. */
+export function formatTimeOfDay24(hour: number, minute: number): string {
+  return `${hour.toString().padStart(2, "0")}:${minute.toString().padStart(2, "0")}`;
+}
+
+function isValidTimeOfDay24(value: string): boolean {
+  return TIME_OF_DAY_24_RE.test(value);
 }

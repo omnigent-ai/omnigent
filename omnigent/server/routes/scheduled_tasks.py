@@ -34,6 +34,11 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
+from omnigent.server.scheduled.active_range import (
+    ActiveRangeValidationError,
+    assert_fires_within_range,
+    validate_active_range,
+)
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
@@ -67,6 +72,8 @@ class CreateScheduledTaskRequest(BaseModel):
     # ``UpdateScheduledTaskRequest``).
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
+    active_range_start: str | None = None
+    active_range_end: str | None = None
 
 
 class UpdateScheduledTaskRequest(BaseModel):
@@ -88,6 +95,8 @@ class UpdateScheduledTaskRequest(BaseModel):
     max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
+    active_range_start: str | None = None
+    active_range_end: str | None = None
     state: str | None = None
 
     @model_validator(mode="after")
@@ -139,6 +148,8 @@ def _to_response(
         "max_cost_usd": task.max_cost_usd,
         "workspace": task.workspace,
         "host_id": task.host_id,
+        "active_range_start": task.active_range_start,
+        "active_range_end": task.active_range_end,
         "state": task.state,
         "last_run_at": task.last_run_at,
         "last_run_status": last_run_status,
@@ -172,6 +183,27 @@ def _validate_rrule_or_400(rrule: str) -> None:
         validate_rrule(rrule)
     except RRuleValidationError as exc:
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
+
+
+def _validate_active_range_or_400(
+    start: str | None,
+    end: str | None,
+    rrule: str,
+    timezone: str,
+) -> None:
+    """Raise a 400 ``OmnigentError`` if the active-range bounds are invalid.
+
+    Beyond the bounds themselves (both set or both unset, valid ``HH:MM``,
+    distinct), also checks that the given *rrule*/*timezone* combination can
+    ever land inside the range once one is configured — an always-9am rule
+    paired with an 18:00-20:00 window would silently never fire.
+    """
+    try:
+        active_range = validate_active_range(start, end)
+        if active_range is not None:
+            assert_fires_within_range(validate_rrule(rrule), active_range, ZoneInfo(timezone))
+    except ActiveRangeValidationError as exc:
+        raise OmnigentError(f"invalid active range: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
 
 def _validate_timezone_or_400(timezone: str) -> None:
@@ -317,6 +349,9 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
+        _validate_active_range_or_400(
+            body.active_range_start, body.active_range_end, body.rrule, body.timezone
+        )
         permission_mode = validate_session_permission_mode(body.permission_mode)
         workspace, model_override, reasoning_effort = await _validate_launch_inputs(
             request,
@@ -342,6 +377,8 @@ def create_scheduled_tasks_router(
             max_cost_usd=body.max_cost_usd,
             workspace=workspace,
             host_id=body.host_id,
+            active_range_start=body.active_range_start,
+            active_range_end=body.active_range_end,
         )
         scheduler = _scheduler(request)
         if scheduler is not None:
@@ -502,6 +539,18 @@ def create_scheduled_tasks_router(
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
+        # Any of these four can change whether the active range is valid, so
+        # re-validate the MERGED effective values whenever any one of them is
+        # touched — e.g. a new rrule against an existing range, or a new
+        # one-sided range bound against the existing rrule/timezone. This
+        # prevents a PATCH from ever landing the row with only one bound set.
+        if {"rrule", "timezone", "active_range_start", "active_range_end"}.intersection(fields):
+            _validate_active_range_or_400(
+                fields.get("active_range_start", existing.active_range_start),
+                fields.get("active_range_end", existing.active_range_end),
+                fields.get("rrule", existing.rrule),
+                fields.get("timezone", existing.timezone),
+            )
         target_agent_id = fields.get("agent_id") or existing.agent_id
         agent_changed = target_agent_id != existing.agent_id
         if agent_changed:

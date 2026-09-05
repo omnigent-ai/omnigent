@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 
 from omnigent.server.scheduled.scheduler import (
     MISFIRE_GRACE_TIME_S,
@@ -35,6 +36,8 @@ class _FakeTask:
     timezone: str
     state: str
     workspace_id: int = 0
+    active_range_start: str | None = None
+    active_range_end: str | None = None
 
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -113,6 +116,8 @@ def _task(
     timezone: str = "UTC",
     state: str = "active",
     workspace_id: int = 0,
+    active_range_start: str | None = None,
+    active_range_end: str | None = None,
 ) -> _FakeTask:
     return _FakeTask(
         id=task_id,
@@ -120,6 +125,8 @@ def _task(
         timezone=timezone,
         state=state,
         workspace_id=workspace_id,
+        active_range_start=active_range_start,
+        active_range_end=active_range_end,
     )
 
 
@@ -271,6 +278,101 @@ async def test_fire_within_grace_runs() -> None:
     clock.advance(MISFIRE_GRACE_TIME_S - 1)
     await seam.fire_latest()
     assert fired.calls == [(0, "a")]
+
+
+# ── active range ─────────────────────────────────────────────────────────────
+
+
+async def test_no_range_task_arms_at_same_delay_as_before_active_range() -> None:
+    # FakeClock's default start (1_800_000_000.0) is exactly on an hour
+    # boundary (2027-01-15 08:00:00 UTC), so an hourly no-range task's next
+    # fire is exactly one hour out — the same delay this task would have
+    # armed at before active-range gating existed.
+    scheduler, _clock, seam, _fired = _make([_task("a")])
+    await scheduler.start()
+    timer = seam.live()[-1]
+    assert timer.delay == 3600.0
+
+
+async def test_daytime_range_arms_at_next_days_start() -> None:
+    clock = FakeClock(datetime(2024, 1, 2, 17, 30, tzinfo=timezone.utc).timestamp())
+    scheduler, _clock, seam, _fired = _make(
+        [
+            _task(
+                "a",
+                rrule="FREQ=HOURLY",
+                timezone="UTC",
+                active_range_start="09:00",
+                active_range_end="17:00",
+            )
+        ],
+        clock=clock,
+    )
+    await scheduler.start()
+    assert len(seam.live()) == 1
+    next_run = datetime.fromisoformat(scheduler.next_run_at("a"))
+    assert next_run == datetime(2024, 1, 3, 9, 0, tzinfo=timezone.utc)
+
+
+async def test_overnight_range_arms_across_midnight() -> None:
+    clock = FakeClock(datetime(2024, 3, 10, 6, 30, tzinfo=timezone.utc).timestamp())
+    scheduler, _clock, seam, _fired = _make(
+        [
+            _task(
+                "a",
+                rrule="FREQ=HOURLY",
+                timezone="UTC",
+                active_range_start="22:00",
+                active_range_end="06:00",
+            )
+        ],
+        clock=clock,
+    )
+    await scheduler.start()
+    assert len(seam.live()) == 1
+    next_run = datetime.fromisoformat(scheduler.next_run_at("a"))
+    assert next_run == datetime(2024, 3, 10, 22, 0, tzinfo=timezone.utc)
+
+
+async def test_range_that_never_contains_occurrence_leaves_job_unarmed() -> None:
+    # This rule always fires at exactly 12:00 UTC, so a 13:00-14:00 active
+    # range never contains an occurrence.
+    scheduler, _clock, seam, _fired = _make(
+        [
+            _task(
+                "a",
+                rrule="FREQ=DAILY;BYHOUR=12;BYMINUTE=0",
+                timezone="UTC",
+                active_range_start="13:00",
+                active_range_end="14:00",
+            )
+        ]
+    )
+    await scheduler.start()  # must not raise
+    assert scheduler.job_count == 1
+    assert scheduler.next_run_at("a") is None
+    assert len(seam.live()) == 0
+
+
+async def test_next_run_at_reflects_in_range_instant() -> None:
+    clock = FakeClock(datetime(2024, 1, 2, 17, 30, tzinfo=timezone.utc).timestamp())
+    scheduler, _clock, _seam, _fired = _make(
+        [
+            _task(
+                "a",
+                rrule="FREQ=HOURLY",
+                timezone="UTC",
+                active_range_start="09:00",
+                active_range_end="17:00",
+            )
+        ],
+        clock=clock,
+    )
+    await scheduler.start()
+    next_run = datetime.fromisoformat(scheduler.next_run_at("a"))
+    # Not the naive next hourly occurrence (18:00) — the next one gated into range.
+    assert next_run != datetime(2024, 1, 2, 18, 0, tzinfo=timezone.utc)
+    assert next_run == datetime(2024, 1, 3, 9, 0, tzinfo=timezone.utc)
 
 
 # ── CRUD sync ────────────────────────────────────────────────────────────────

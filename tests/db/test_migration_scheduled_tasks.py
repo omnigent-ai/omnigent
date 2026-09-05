@@ -67,6 +67,8 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "execution_target",
         "host_id",
         "timezone",
+        "active_range_start",
+        "active_range_end",
         "state",
         "last_run_at",
         "last_run_conversation_id",

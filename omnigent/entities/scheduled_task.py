@@ -41,6 +41,14 @@ class ScheduledTask:
     :param timezone: IANA timezone the trigger is evaluated in,
         e.g. ``"America/Los_Angeles"``.
     :param created_at: Unix epoch seconds at row creation.
+    :param active_range_start: Start of the daily time-of-day window
+        (``"HH:MM"``, 24-hour) that gates which ``rrule`` occurrences are
+        allowed to fire, evaluated in ``timezone``. ``None`` for both this and
+        ``active_range_end`` means unrestricted — the task fires on every
+        rule occurrence (today's behavior). Always set together with
+        ``active_range_end``.
+    :param active_range_end: End of the active-range window (``"HH:MM"``),
+        evaluated in ``timezone``. See ``active_range_start``.
     :param model_override: Per-task LLM model override, e.g.
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
@@ -82,6 +90,8 @@ class ScheduledTask:
     timezone: str
     created_at: int
     workspace_id: int = 0
+    active_range_start: str | None = None
+    active_range_end: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
     permission_mode: str | None = None

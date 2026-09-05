@@ -4152,6 +4152,8 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "permission_mode",
     "workspace",
     "host_id",
+    "active_range_start",
+    "active_range_end",
 )
 # Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
 _SCHEDULED_TASK_UPDATE_FIELDS = (
@@ -4166,6 +4168,8 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "max_cost_usd",
     "workspace",
     "host_id",
+    "active_range_start",
+    "active_range_end",
     "state",
 )
 _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")

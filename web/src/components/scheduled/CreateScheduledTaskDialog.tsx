@@ -206,6 +206,10 @@ export function CreateScheduledTaskDialog({
     if (open && !wasOpen.current) {
       if (editingTask) {
         const parsedSchedule = parseRRuleToScheduleModel(editingTask.rrule);
+        const activeRange =
+          editingTask.activeRangeStart != null && editingTask.activeRangeEnd != null
+            ? { start: editingTask.activeRangeStart, end: editingTask.activeRangeEnd }
+            : null;
         setName(editingTask.name);
         setPrompt(editingTask.prompt);
         setPickedAgentId(editingTask.agentId);
@@ -213,7 +217,7 @@ export function CreateScheduledTaskDialog({
         setPickedModel(editingTask.modelOverride ?? "");
         setPickedEffort(editingTask.reasoningEffort ?? "");
         setPickedPermission(editingTask.permissionMode ?? "");
-        setSchedule(parsedSchedule ?? DEFAULT_SCHEDULE_MODEL);
+        setSchedule(parsedSchedule ? { ...parsedSchedule, activeRange } : DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(parsedSchedule === null);
         setHostId(editingTask.hostId ?? "");
         setWorkspace(editingTask.workspace ?? "");
@@ -286,6 +290,18 @@ export function CreateScheduledTaskDialog({
   async function handleSubmit() {
     setError(null);
     try {
+      // An enabled range sends both bounds. A disabled range sends explicit
+      // `null`s ONLY when the edited task actually had one — so turning the
+      // range off clears it, while a plain create (or an edit that never had a
+      // range) simply omits the keys.
+      const hadActiveRange =
+        editingTask != null &&
+        (editingTask.activeRangeStart != null || editingTask.activeRangeEnd != null);
+      const activeRangeFields = schedule.activeRange
+        ? { activeRangeStart: schedule.activeRange.start, activeRangeEnd: schedule.activeRange.end }
+        : hadActiveRange
+          ? { activeRangeStart: null, activeRangeEnd: null }
+          : {};
       const input = {
         name: name.trim(),
         prompt: prompt.trim(),
@@ -293,6 +309,7 @@ export function CreateScheduledTaskDialog({
         timezone: editingTask?.timezone ?? localTimezone(),
         ...(hostId !== "" ? { hostId } : {}),
         ...(hostId !== "" && workspace.trim() !== "" ? { workspace: workspace.trim() } : {}),
+        ...activeRangeFields,
       };
       if (editingTask) {
         // Thread model/effort ONLY when the agent supports them. Each control's

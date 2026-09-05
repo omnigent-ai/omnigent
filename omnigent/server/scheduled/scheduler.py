@@ -20,6 +20,11 @@ Design notes:
   after its scheduled time (e.g. the event loop was blocked) is skipped.
 * **Long-delay safety.** A single timer is capped at :data:`_MAX_TIMER_DELAY_S`
   and re-armed on wake, so annual schedules don't rely on one multi-month timer.
+* **Active range.** A task may set an optional daily time-of-day window
+  (``active_range_start``/``active_range_end``); :meth:`_arm` only arms the
+  next rule occurrence that lands inside it, via
+  :func:`~omnigent.server.scheduled.active_range.next_fire_in_active_range`.
+  No range means unrestricted — arming is byte-identical to today's behavior.
 
 Timing seams (``now`` / ``schedule_call`` / ``cancel_call``) are injectable so
 tests can drive the scheduler with a fake clock and manual timer firing.
@@ -36,6 +41,12 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from omnigent.entities import ScheduledTask
+from omnigent.server.scheduled.active_range import (
+    ActiveRange,
+    ActiveRangeValidationError,
+    next_fire_in_active_range,
+    validate_active_range,
+)
 from omnigent.server.scheduled.rrule import (
     RRuleTrigger,
     RRuleValidationError,
@@ -78,6 +89,7 @@ class _Job:
     workspace_id: int
     trigger: RRuleTrigger
     tz: ZoneInfo
+    active_range: ActiveRange | None = None
     next_run: datetime | None = None
     next_run_epoch: float | None = None
     timer: Any = None
@@ -154,6 +166,14 @@ class ScheduledTaskScheduler:
                     task.rrule,
                     exc,
                 )
+            except ActiveRangeValidationError as exc:
+                _logger.warning(
+                    "scheduler: skipping task %s with invalid active range (%r, %r): %s",
+                    task.id,
+                    task.active_range_start,
+                    task.active_range_end,
+                    exc,
+                )
         self._started = True
         _logger.info("ScheduledTaskScheduler started with %d job(s)", len(self._jobs))
 
@@ -178,6 +198,14 @@ class ScheduledTaskScheduler:
                 "scheduler: cannot add task %s with invalid rrule %r: %s",
                 task.id,
                 task.rrule,
+                exc,
+            )
+        except ActiveRangeValidationError as exc:
+            _logger.warning(
+                "scheduler: cannot add task %s with invalid active range (%r, %r): %s",
+                task.id,
+                task.active_range_start,
+                task.active_range_end,
                 exc,
             )
 
@@ -232,14 +260,19 @@ class ScheduledTaskScheduler:
     # ── internals ────────────────────────────────────────────────────────────
 
     def _register(self, task: ScheduledTask) -> None:
-        """Validate the task's rrule and arm its timer, replacing any existing."""
+        """Validate the task's rrule and active range, then arm its timer.
+
+        Replaces any existing job for the task.
+        """
         trigger = validate_rrule(task.rrule)
+        active_range = validate_active_range(task.active_range_start, task.active_range_end)
         self.remove(task.id)  # replace_existing semantics
         job = _Job(
             task_id=task.id,
             workspace_id=task.workspace_id,
             trigger=trigger,
             tz=_resolve_tz(task.timezone),
+            active_range=active_range,
         )
         self._jobs[(task.workspace_id, task.id)] = job
         self._arm(job)
@@ -248,11 +281,20 @@ class ScheduledTaskScheduler:
         """Compute the next fire and arm a (possibly capped) timer for it."""
         now_epoch = self._now()
         after = datetime.fromtimestamp(now_epoch, tz=_UTC)
-        next_run = job.trigger.next_fire_after(after, job.tz)
+        next_run = next_fire_in_active_range(job.trigger, after, job.tz, job.active_range)
         if next_run is None:
             job.next_run = None
             job.next_run_epoch = None
             job.timer = None
+            if job.active_range is not None:
+                _logger.warning(
+                    "scheduler: task %s not armed: no rrule occurrence lands inside "
+                    "its active range %s (rule may also be exhausted)",
+                    job.task_id,
+                    job.active_range,
+                )
+            else:
+                _logger.warning("scheduler: task %s not armed: rrule exhausted", job.task_id)
             return
         job.next_run = next_run
         job.next_run_epoch = next_run.timestamp()
