@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
 
@@ -193,11 +193,26 @@ class ChatOverrides:
     harness: str | None = None
     model: str | None = None
     system_prompt: str | None = None
+    # Per-sub-agent harness, keyed by the sub-agent's declared name:
+    # ``{"gpt": "antigravity-native"}``.
+    #
+    # ``harness`` above only ever reached the TOP executor -- the
+    # orchestrator's brain -- so a multi-agent bundle's team was fixed at
+    # authoring time and changeable only by editing the bundle on disk.
+    # That is why examples/debby still fans out to Claude and GPT: it was
+    # written on 2026-06-13, eleven days before the Antigravity harness
+    # existed, and nobody revisited it. A person with a Claude and a Gemini
+    # subscription and no OpenAI account cannot use half of it.
+    #
+    # Empty dict rather than None so callers can merge without a None check.
+    sub_harness: dict[str, str] = field(default_factory=dict)
 
     @property
     def has_any(self) -> bool:
         """True when at least one override flag was supplied."""
-        return any(v is not None for v in (self.harness, self.model, self.system_prompt))
+        return bool(self.sub_harness) or any(
+            v is not None for v in (self.harness, self.model, self.system_prompt)
+        )
 
 
 @dataclass(frozen=True)
@@ -303,6 +318,7 @@ def run_chat(
     model: str | None = None,
     prompt: str | None = None,
     system_prompt: str | None = None,
+    sub_harness: tuple[str, ...] = (),
     ephemeral: bool = False,
     resume_conversation_id: str | None = None,
     resume_latest: bool = False,
@@ -398,6 +414,7 @@ def run_chat(
         harness=harness,
         model=model,
         system_prompt=system_prompt,
+        sub_harness=parse_sub_harness(sub_harness),
     )
 
     if server_url is not None and _is_url(target):
@@ -407,9 +424,7 @@ def run_chat(
         )
 
     if _is_url(target):
-        if any(
-            v is not None for v in (overrides.harness, overrides.model, overrides.system_prompt)
-        ):
+        if overrides.has_any:
             raise click.ClickException(
                 "--harness / --model / --system-prompt only apply to local "
                 "agent paths. The remote server controls its own agent registrations."
@@ -500,6 +515,7 @@ def run_prompt(
     model: str | None = None,
     prompt: str,
     system_prompt: str | None = None,
+    sub_harness: tuple[str, ...] = (),
     ephemeral: bool = False,
 ) -> None:
     """Run one prompt headlessly and print only the assistant text.
@@ -524,12 +540,11 @@ def run_prompt(
         harness=harness,
         model=model,
         system_prompt=system_prompt,
+        sub_harness=parse_sub_harness(sub_harness),
     )
 
     if _is_url(target):
-        if any(
-            v is not None for v in (overrides.harness, overrides.model, overrides.system_prompt)
-        ):
+        if overrides.has_any:
             raise click.ClickException(
                 "--harness / --model / --system-prompt only apply to local "
                 "agent paths. The remote server controls its own agent registrations."
@@ -3024,6 +3039,97 @@ async def _resolve_latest_conversation_id_async(
     return sessions[0].id
 
 
+def parse_sub_harness(values: tuple[str, ...] | list[str] | None) -> dict[str, str]:
+    """
+    Parse repeated ``--sub-harness NAME=HARNESS`` flags into a mapping.
+
+    :param values: Raw flag values, e.g. ``("gpt=antigravity-native",)``.
+    :returns: ``{"gpt": "antigravity-native"}``; empty when *values* is
+        empty or None.
+    :raises click.ClickException: On a value with no ``=``, or with an
+        empty name or harness -- a silently dropped override would look
+        like the flag worked.
+    """
+    out: dict[str, str] = {}
+    for raw in values or ():
+        name, sep, harness = str(raw).partition("=")
+        name, harness = name.strip(), harness.strip()
+        if not sep or not name or not harness:
+            raise click.ClickException(
+                f"--sub-harness expects NAME=HARNESS, got {raw!r} "
+                "(e.g. --sub-harness gpt=antigravity-native)"
+            )
+        out[name] = harness
+    return out
+
+
+def _apply_sub_harness_overrides(bundle_dir: Path, sub_harness: dict[str, str]) -> None:
+    """
+    Rewrite ``agents/<dir>/config.yaml`` for each overridden sub-agent.
+
+    Runs against the COPY in the override tempdir, never the user's source
+    tree -- the caller has already copytree'd the bundle.
+
+    Keyed by the sub-agent's declared ``name``, not its directory name,
+    because the two are allowed to differ (the parser tracks that as
+    ``AgentSpec.source_rel_dir``). So this reads each child's config to
+    learn its name rather than assuming the directory says it.
+
+    Reuses :func:`_apply_harness_override_to_executor` so a child written
+    as a flat single-file spec and one written as a ``spec_version``
+    bundle each get the override where their own format reads it.
+
+    An unknown name raises: silently ignoring it would let a typo look
+    like a working override, and the failure would surface much later as
+    "why is this still running on GPT".
+
+    :param bundle_dir: The materialized bundle root (contains
+        ``config.yaml`` and, usually, ``agents/``).
+    :param sub_harness: Declared sub-agent name -> harness id.
+    :raises click.ClickException: If ``agents/`` is missing, a child
+        config is unreadable, or a named sub-agent does not exist.
+    """
+    agents_dir = bundle_dir / "agents"
+    if not agents_dir.is_dir():
+        raise click.ClickException(
+            f"no sub-agents to override: {bundle_dir.name} has no agents/ directory"
+        )
+    by_name: dict[str, tuple[Path, _YamlMapping]] = {}
+    for child_dir in sorted(agents_dir.iterdir()):
+        config = child_dir / "config.yaml"
+        if not child_dir.is_dir() or not config.is_file():
+            continue
+        child_raw = yaml.safe_load(config.read_text())
+        if not isinstance(child_raw, dict):
+            raise click.ClickException(f"{config}: expected a YAML mapping at top level")
+        # The declared name wins; fall back to the directory only when the
+        # child omits it, which the parser also tolerates.
+        by_name[str(child_raw.get("name") or child_dir.name)] = (config, child_raw)
+
+    for name, harness in sub_harness.items():
+        entry = by_name.get(name)
+        if entry is None:
+            known = ", ".join(sorted(by_name)) or "none"
+            raise click.ClickException(
+                f"unknown sub-agent {name!r} for {bundle_dir.name}; known: {known}"
+            )
+        config, child_raw = entry
+        executor_block = child_raw.get("executor")
+        if not isinstance(executor_block, dict):
+            executor_block = {}
+            child_raw["executor"] = executor_block
+        _apply_harness_override_to_executor(child_raw, executor_block, harness)
+        # Same reasoning as the top-level override: a harness swap drops a
+        # model pin from the previous harness, which the new one would
+        # reject. Debby's gpt head pins nothing today, but polly's children
+        # are free to.
+        executor_block.pop("model", None)
+        llm_block = child_raw.get("llm")
+        if isinstance(llm_block, dict):
+            llm_block.pop("model", None)
+        config.write_text(yaml.safe_dump(child_raw, default_flow_style=False))
+
+
 def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path:
     """
     Copy *source* into a temp dir and apply CLI overrides to its YAML.
@@ -3080,6 +3186,8 @@ def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path
             )
         _apply_overrides_to_raw(raw, overrides)
         target.write_text(yaml.safe_dump(raw, default_flow_style=False))
+        if overrides.sub_harness and not source.is_file():
+            _apply_sub_harness_overrides(target.parent, overrides.sub_harness)
         materialized = target if source.is_file() else target.parent
         _MATERIALIZED_OVERRIDE_DIRS[materialized.resolve()] = tmpdir
         return materialized

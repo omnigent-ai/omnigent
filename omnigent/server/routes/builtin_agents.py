@@ -29,7 +29,13 @@ from omnigent.entities import Agent
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user as _require_user
-from omnigent.server.schemas import AgentObject, MCPServerSummary, PaginatedList, SkillSummary
+from omnigent.server.schemas import (
+    AgentObject,
+    MCPServerSummary,
+    PaginatedList,
+    SkillSummary,
+    SubAgentSummary,
+)
 from omnigent.stores import AgentStore
 
 _logger = logging.getLogger(__name__)
@@ -54,6 +60,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     skills: list[SkillSummary] = []
     terminals: list[str] = []
     harness: str | None = None
+    sub_agents: list[SubAgentSummary] = []
     # Prefer the stored entity's description; fall back to the spec's
     # top-level description when the stored value is unset (single-file
     # YAML agents don't persist it at registration today). Lets the
@@ -91,6 +98,24 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # Kind for the Add Agent picker (Codex vs Claude). Stays None
         # when the bundle can't be loaded (the except below).
         harness = loaded.spec.executor.harness_kind
+        # The delegable team. `sub_agents` is already parsed and nested by
+        # the spec parser, so this is a read, not a second disk walk. It is
+        # what lets a client show WHICH model does which job -- and, with
+        # the per-sub-agent override, let a person change it without
+        # editing the bundle's YAML by hand.
+        sub_agents = [
+            SubAgentSummary(
+                name=child.name,
+                description=child.description,
+                harness=child.executor.harness_kind,
+            )
+            # A child with no declared name is not addressable -- the override
+            # is keyed by name -- so it is skipped rather than surfaced as an
+            # entry nothing can select. Also satisfies the type: `name` is
+            # `str | None` on the spec and required on the wire.
+            for child in loaded.spec.sub_agents
+            if child.name
+        ]
     except Exception:  # noqa: BLE001 — spec load failure must not break the list
         _logger.debug(
             "Failed to load spec for agent %s; mcp_servers/skills will be empty",
@@ -105,6 +130,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         created_at=agent.created_at,
         updated_at=agent.updated_at,
         harness=harness,
+        sub_agents=sub_agents,
         mcp_servers=mcp_servers,
         mcp_servers_editable=False,
         skills=skills,

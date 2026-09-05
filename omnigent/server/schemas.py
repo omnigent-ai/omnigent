@@ -225,6 +225,29 @@ class PolicySummary(BaseModel):
     description: str | None = None
 
 
+class SubAgentSummary(BaseModel):
+    """
+    One delegable sub-agent of a multi-agent bundle.
+
+    Exposed so a client can see, and let a person change, WHICH model
+    does which job. Before this the catalog reported a single
+    ``harness`` -- the orchestrator's brain -- so a bundle like polly or
+    debby looked like one agent, and the UI's Configure dialog could
+    only offer the brain. The team was legible only by reading the
+    bundle's YAML off disk.
+
+    :param name: The sub-agent's declared name, e.g. ``"gemini"``.
+    :param description: Its declared description, or ``None``.
+    :param harness: The harness it currently runs on, e.g.
+        ``"antigravity-native"``. ``None`` when the child spec declares
+        no executor kind.
+    """
+
+    name: str
+    description: str | None = None
+    harness: str | None = None
+
+
 class AgentObject(BaseModel):
     """
     API representation of a registered agent.
@@ -294,6 +317,8 @@ class AgentObject(BaseModel):
     created_at: int
     updated_at: int | None = None
     harness: str | None = None
+    # The delegable team, in spec order. Empty for a single-agent bundle.
+    sub_agents: list[SubAgentSummary] = Field(default_factory=list)
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
     mcp_servers_editable: bool = False
     policies: list[PolicySummary] = Field(default_factory=list)
@@ -1463,6 +1488,15 @@ class _SessionCreateRequestBase(BaseModel):
         the spec's declared harness. Create-time only — there is no
         PATCH path, since the harness process spawns on the first
         turn.
+    :param sub_harness_override: Per-session harness override for the
+        bundle's SUB-agents, e.g. ``{"gpt": "antigravity-native"}``.
+        Keyed by each sub-agent's declared name. ``harness_override``
+        pins the brain and nothing pinned the heads, so a multi-agent
+        bundle's team was fixed at authoring time -- ``examples/debby``
+        fans out to a Claude head and a GPT head and predates the
+        Antigravity harness. ``None`` leaves the team as declared.
+        Rejected for a name the bound agent does not declare, so a typo
+        fails at create rather than silently running the old team.
     :param smart_routing_message: The user's first-message text, used to
         route the harness at create time. Only read on the top-level
         Smart Routing path (``harness_override: "auto"`` on a native
@@ -1494,6 +1528,11 @@ class _SessionCreateRequestBase(BaseModel):
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
+    # The bundle's heads, as ``{"name": "harness"}``. ``harness_override``
+    # above pins the brain; this pins who it delegates to. Keyed by each
+    # sub-agent's declared name. Create-time only, like its sibling: the
+    # spawn reads it, so it must be settled before the first turn.
+    sub_harness_override: dict[str, str] | None = None
     smart_routing_message: str | None = None
 
     @model_validator(mode="after")

@@ -816,6 +816,8 @@ class ConversationStore(ABC):
         _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
+        sub_harness_override: str | None = None,
+        _unset_sub_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
@@ -857,6 +859,12 @@ class ConversationStore(ABC):
             ``subagent_routing_override`` to ``None`` regardless of the
             ``subagent_routing_override`` param value. Unset reads as
             Default (the switch is two-state; nothing is inherited).
+        :param sub_harness_override: Per-session SUB-agent harnesses, as
+            the compact ``{"name":"harness"}`` JSON string stored beside
+            its siblings in ``session_overrides``. ``None`` leaves
+            unchanged.
+        :param _unset_sub_harness_override: When ``True``, clear it so the
+            session falls back to the bundle's declared team.
         :param harness_override: Per-session brain-harness override,
             e.g. ``"pi"``. ``None`` leaves unchanged. No ``_unset``
             variant — the override is set once at session create and

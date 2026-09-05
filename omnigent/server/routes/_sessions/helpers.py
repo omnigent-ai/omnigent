@@ -1875,6 +1875,81 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
     return canonical
 
 
+def _validated_sub_harness_override(
+    value: dict[str, str] | None, agent: Agent
+) -> str | None:
+    """
+    Validate a session-create ``sub_harness_override`` and pack it for storage.
+
+    Same rules as :func:`_validated_harness_override`, one level down: each
+    harness must canonicalize into ``OMNIGENT_HARNESSES``, and every KEY must
+    name a sub-agent the bound bundle actually declares. An unknown name is
+    rejected rather than ignored -- a typo that silently ran the old team
+    would surface much later as "why is this still answering on GPT", which
+    is the failure #4448 describes one level up.
+
+    :param value: Sub-agent name -> harness, e.g.
+        ``{"gpt": "antigravity-native"}``. ``None`` or empty means no
+        override.
+    :param agent: The bound agent row (already fetched by the caller).
+    :returns: A compact JSON string for ``session_overrides``, or ``None``.
+    :raises OmnigentError: ``invalid_input`` for an unknown harness, an
+        unknown sub-agent name, a non-omnigent executor type, or an
+        unloadable bundle.
+    """
+    if not value:
+        return None
+    import json as _json
+
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.runtime import get_agent_cache
+    from omnigent.spec._omnigent_compat import (
+        OMNIGENT_EXECUTOR_TYPE,
+        OMNIGENT_HARNESSES,
+    )
+
+    try:
+        loaded = get_agent_cache().load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+    except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
+        raise OmnigentError(
+            f"sub_harness_override requires a loadable agent spec; "
+            f"agent {agent.name!r} failed to load: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    executor_type = loaded.spec.executor.type
+    if executor_type != OMNIGENT_EXECUTOR_TYPE:
+        raise OmnigentError(
+            f"sub_harness_override only applies to executor.type "
+            f"{OMNIGENT_EXECUTOR_TYPE!r} agents; agent {agent.name!r} "
+            f"declares executor.type {executor_type!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    known = {child.name for child in loaded.spec.sub_agents if child.name}
+    resolved: dict[str, str] = {}
+    for name, harness in value.items():
+        if name not in known:
+            raise OmnigentError(
+                f"unknown sub-agent {name!r} for agent {agent.name!r}; "
+                f"declared sub-agents: {sorted(known) or 'none'}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        canonical = canonicalize_harness(harness) or harness
+        if canonical not in OMNIGENT_HARNESSES:
+            raise OmnigentError(
+                f"invalid sub_harness_override for {name!r}: must be one of "
+                f"{sorted(OMNIGENT_HARNESSES)}, got {harness!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        resolved[name] = canonical
+    # Stored as a string beside its string-valued siblings in
+    # ``session_overrides`` (see the store's _SESSION_OVERRIDE_KEYS), so the
+    # existing encode/decode and the column width need no change.
+    return _json.dumps(resolved, separators=(",", ":"), sort_keys=True)
+
+
 def _validated_harness_override_executor_type(agent: Agent) -> None:
     """Validate that *agent* is an ``executor.type: omnigent`` spec.
 
@@ -6619,6 +6694,12 @@ async def _dispatch_skill_slash_command_to_runner(
     # time and never forwarded verbatim.
     if conv.harness_override is not None and conv.harness_override != "auto":
         runner_body["harness_override"] = conv.harness_override
+    # Per-session SUB-agent harnesses, same lifetime as the brain override:
+    # create-time only, persisted column is the source. Forwarded as the
+    # stored JSON string; the runner parses it when it spawns a child, so a
+    # bundle whose team was never overridden sends nothing.
+    if conv.sub_harness_override:
+        runner_body["sub_harness_override"] = conv.sub_harness_override
 
     try:
         await runner_client.post(
@@ -10604,6 +10685,7 @@ __all__ = [
     "_validate_terminal_launch_args",
     "_validated_cost_control_mode_override",
     "_validated_harness_override",
+    "_validated_sub_harness_override",
     "_validated_harness_override_executor_type",
     "_validated_spec_smart_routing_harness",
     "_validated_subagent_routing_override",

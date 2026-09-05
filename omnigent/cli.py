@@ -7153,6 +7153,15 @@ def _build_resume_parts() -> list[str]:
             flag = max(param.opts, key=len)
             if param.is_flag:
                 parts.append(flag)
+            elif getattr(param, "multiple", False):
+                # A repeatable option arrives as a tuple, and str() on it
+                # yields "()" or "('a=b',)" -- neither of which parses back.
+                # Emit the flag once per value instead, and skip an empty
+                # tuple entirely: click reports it as differing from a None
+                # default, so it would otherwise resume as a literal "()".
+                for item in value:
+                    parts.append(flag)
+                    parts.append(str(item))
             else:
                 parts.append(flag)
                 parts.append(str(value))
@@ -7499,6 +7508,7 @@ def _dispatch_run(
     target: str | None,
     tools: str | None,
     harness: str | None,
+    sub_harness: tuple[str, ...] = (),
     model: str | None,
     prompt: str | None,
     system_prompt: str | None,
@@ -7636,6 +7646,7 @@ def _dispatch_run(
                 model=model,
                 prompt=prompt,
                 system_prompt=system_prompt,
+                sub_harness=sub_harness,
                 ephemeral=ephemeral,
                 resume_conversation_id=resume_conversation_id,
                 resume_latest=resume_latest,
@@ -7725,6 +7736,7 @@ def _dispatch_run(
                 model=model,
                 prompt=prompt,
                 system_prompt=system_prompt,
+                sub_harness=sub_harness,
                 ephemeral=ephemeral,
                 resume_conversation_id=resume_conversation_id,
                 resume_latest=resume_latest,
@@ -7755,6 +7767,7 @@ def _dispatch_run(
                 model=model,
                 prompt=prompt,
                 system_prompt=system_prompt,
+                sub_harness=sub_harness,
                 ephemeral=False,
                 debug_events=debug_events,
                 auto_open_conversation=auto_open_conversation,
@@ -7770,6 +7783,7 @@ def _dispatch_run(
             model=model,
             prompt=prompt,
             system_prompt=system_prompt,
+            sub_harness=sub_harness,
             ephemeral=ephemeral,
         )
         return
@@ -7784,6 +7798,7 @@ def _dispatch_run(
         model=model,
         prompt=None,
         system_prompt=system_prompt,
+        sub_harness=sub_harness,
         ephemeral=ephemeral,
         resume_conversation_id=resume_conversation_id,
         resume_latest=resume_latest,
@@ -7956,6 +7971,18 @@ def attach(
 )
 @click.option("--harness", default=None, help=_RUN_HARNESS_HELP)
 @click.option(
+    "--sub-harness",
+    "sub_harness",
+    multiple=True,
+    metavar="NAME=HARNESS",
+    help=(
+        "Run one of the agent's sub-agents on a different harness, e.g. "
+        "--sub-harness gpt=antigravity-native. Repeatable. --harness only "
+        "reaches the orchestrator's brain, so without this a bundle's team "
+        "is whatever its YAML declared."
+    ),
+)
+@click.option(
     "--smart-routing",
     "smart_routing",
     is_flag=True,
@@ -8038,6 +8065,7 @@ def run(
     target: str | None,
     tools: str | None,
     harness: str | None,
+    sub_harness: tuple[str, ...],
     smart_routing: bool,
     from_openclaw: str | None,
     model: str | None,
@@ -8200,6 +8228,7 @@ def run(
         target=target,
         tools=tools,
         harness=harness,
+        sub_harness=sub_harness,
         model=model,
         prompt=prompt,
         system_prompt=system_prompt,
