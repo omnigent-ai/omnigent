@@ -1871,6 +1871,27 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true");
   });
 
+  it("keeps peeking while the pointer rests on the header toggle that armed it", async () => {
+    // The peek card floats clear of the chat header's open-sidebar toggle
+    // (Sidebar.tsx offsets its top edge), so the pointer that armed the peek
+    // is still over the toggle — not the card — when it mounts. That spot
+    // must count as "inside", or a wobble there dismisses the card out from
+    // under the very control the user is about to click to pin it open.
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    const toggle = screen.getByRole("button", { name: /open sidebar/i });
+    fireEvent.pointerEnter(toggle);
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));
+
+    fireEvent.pointerMove(toggle);
+    await new Promise((resolve) => {
+      // Past the 200ms dismiss grace, so "still peeking" is a real result.
+      setTimeout(resolve, 350);
+    });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true");
+  });
+
   it("keeps the sidebar pinned open for the whole /settings visit", () => {
     // Repeated toggles all resolve to open while on the page: collapsing is what
     // removes the only exit, so the guard refuses that direction throughout.
