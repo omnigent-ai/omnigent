@@ -10,6 +10,7 @@ from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import (
     AuthRequiredError,
     HarnessNotConfiguredError,
+    HostType,
     HostUnavailableError,
     OmnigentError,
     ServerUnreachableError,
@@ -232,6 +233,10 @@ class FakeSlackClient:
 class FakeOmnigentClient:
     def __init__(self, final_text: str = "hello final") -> None:
         self.created: list[tuple[str, str]] = []
+        # host_type each create_session / run_turn was asked for, so a test can
+        # prove a managed session never reaches the runner-launch path.
+        self.created_host_types: list[str] = []
+        self.turn_host_types: list[str] = []
         self.bound: list[str] = []
         self.launched: list[tuple[str, str, str | None]] = []
         self.turns: list[tuple[str, str]] = []
@@ -272,8 +277,11 @@ class FakeOmnigentClient:
 
         return SessionInfo(harness=self.info_harness, agent_name=self.info_agent_name)
 
-    async def create_session(self, agent_id: str, title: str) -> str:
+    async def create_session(
+        self, agent_id: str, title: str, *, host_type: str = "external"
+    ) -> str:
         self.created.append((agent_id, title))
+        self.created_host_types.append(host_type)
         return self.next_session_id
 
     async def launch_runner(
@@ -290,8 +298,10 @@ class FakeOmnigentClient:
         *,
         workspace: str | None = None,
         host_id: str | None = None,
+        host_type: str = "external",
     ) -> AsyncIterator[dict[str, Any]]:
         self.turns.append((session_id, text))
+        self.turn_host_types.append(host_type)
         yield {"type": "response.output_text.delta", "delta": "hel"}
         yield {"type": "response.output_text.delta", "delta": "lo"}
         yield {
@@ -416,6 +426,7 @@ async def _configure_user(
     agent_id: str = "ag_1",
     workspace: str = "/tmp/workspace",
     host_id: str | None = None,
+    host_type: HostType = "external",
 ) -> None:
     await store.upsert_user_config(
         team_id,
@@ -425,6 +436,7 @@ async def _configure_user(
             agent_name="Helper",
             workspace=workspace,
             host_id=host_id,
+            host_type=host_type,
         ),
     )
 
@@ -487,6 +499,63 @@ async def test_app_mention_creates_session_and_posts_response(tmp_path: Path) ->
     # stop(); the ack was still live then and is deleted only afterwards, so the
     # thread is never empty while waiting for content.
     assert stream.ack_live_when_visible is True
+
+
+async def test_managed_session_skips_the_runner_launch(tmp_path: Path) -> None:
+    # A managed session has no host to launch a runner on when it is created —
+    # the server provisions the sandbox in the background and queues the first
+    # message until the launch settles. Creating one must go straight to the turn.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1", workspace="", host_type="managed")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hello"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    stream = await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    # The create asked for a managed host and NO runner was launched.
+    assert omnigent.created_host_types == ["managed"]
+    assert omnigent.launched == []
+    # The turn still ran and answered, and it knows it is managed — so a lost
+    # runner mid-turn won't be "fixed" by launching one on someone else's host.
+    assert omnigent.turns == [("conv_1", "hello")]
+    assert omnigent.turn_host_types == ["managed"]
+    assert stream.text == "hello final"
+    # The session is recorded as managed, so a follow-up after a restart still
+    # knows not to launch a runner for this thread.
+    record = await store.get_session(ThreadKey("T1", "C1", "100.1"))
+    assert record is not None
+    assert record.host_type == "managed"
+    assert record.host_id is None
+
+
+async def test_external_session_still_launches_a_runner(tmp_path: Path) -> None:
+    # The default path is unchanged: an external host gets its runner launched
+    # in the caller's workspace before the turn starts.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1", workspace="/tmp/ws", host_id="h1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hello"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    assert omnigent.created_host_types == ["external"]
+    assert omnigent.launched == [("conv_1", "/tmp/ws", "h1")]
 
 
 async def test_failed_handle_unclaims_event_so_it_can_retry(tmp_path: Path) -> None:
@@ -648,6 +717,7 @@ class StreamingClient(FakeOmnigentClient):
         *,
         workspace: str | None = None,
         host_id: str | None = None,
+        host_type: str = "external",
     ) -> AsyncIterator[dict[str, Any]]:
         self.turns.append((session_id, text))
         for i in range(0, len(self.final_text), 500):
@@ -680,6 +750,7 @@ class NoDeltaIdleClient(FakeOmnigentClient):
         *,
         workspace: str | None = None,
         host_id: str | None = None,
+        host_type: str = "external",
     ) -> AsyncIterator[dict[str, Any]]:
         self.turns.append((session_id, text))
         yield {"type": "session.status", "status": "running"}
@@ -735,6 +806,7 @@ class MultiMessageClient(FakeOmnigentClient):
         *,
         workspace: str | None = None,
         host_id: str | None = None,
+        host_type: str = "external",
     ) -> AsyncIterator[dict[str, Any]]:
         self.turns.append((session_id, text))
         yield {"type": "session.status", "status": "running", "response_id": "resp_1"}
@@ -822,6 +894,7 @@ async def test_turn_error_posts_separate_reply_and_keeps_answer(tmp_path: Path) 
             *,
             workspace: str | None = None,
             host_id: str | None = None,
+            host_type: str = "external",
         ) -> AsyncIterator[dict[str, Any]]:
             self.turns.append((session_id, text))
             yield {
@@ -881,6 +954,7 @@ async def test_turn_error_without_answer_finalizes_with_generic_message(tmp_path
             *,
             workspace: str | None = None,
             host_id: str | None = None,
+            host_type: str = "external",
         ) -> AsyncIterator[dict[str, Any]]:
             self.turns.append((session_id, text))
             yield {
@@ -923,6 +997,7 @@ async def test_exhausted_reconnect_shows_non_alarming_text(tmp_path: Path) -> No
             *,
             workspace: str | None = None,
             host_id: str | None = None,
+            host_type: str = "external",
         ) -> AsyncIterator[dict[str, Any]]:
             self.turns.append((session_id, text))
             raise StreamInterruptedError("stream dropped mid-turn")
@@ -1025,6 +1100,7 @@ async def test_stream_closed_then_error_continues_and_posts_failure(tmp_path: Pa
             *,
             workspace: str | None = None,
             host_id: str | None = None,
+            host_type: str = "external",
         ) -> AsyncIterator[dict[str, Any]]:
             self.turns.append((session_id, text))
             yield {"type": "response.output_text.delta", "delta": "part one "}
@@ -1270,6 +1346,7 @@ async def test_second_message_while_local_stream_active_is_deflected(tmp_path: P
             *,
             workspace: str | None = None,
             host_id: str | None = None,
+            host_type: str = "external",
         ) -> AsyncIterator[dict[str, Any]]:
             self.turns.append((session_id, text))
             await release.wait()  # hold the first turn streaming locally
@@ -1688,7 +1765,9 @@ async def test_turn_runs_against_the_fixed_operator_server(tmp_path: Path) -> No
 
 
 class ServerUnreachableClient(FakeOmnigentClient):
-    async def create_session(self, agent_id: str, title: str) -> str:
+    async def create_session(
+        self, agent_id: str, title: str, *, host_type: str = "external"
+    ) -> str:
         raise ServerUnreachableError("boom")
 
 
@@ -1700,12 +1779,16 @@ class HostUnavailableClient(FakeOmnigentClient):
 
 
 class AuthRequiredClient(FakeOmnigentClient):
-    async def create_session(self, agent_id: str, title: str) -> str:
+    async def create_session(
+        self, agent_id: str, title: str, *, host_type: str = "external"
+    ) -> str:
         raise AuthRequiredError("401")
 
 
 class ServerErrorClient(FakeOmnigentClient):
-    async def create_session(self, agent_id: str, title: str) -> str:
+    async def create_session(
+        self, agent_id: str, title: str, *, host_type: str = "external"
+    ) -> str:
         # Mirrors a 500 from POST /v1/sessions: a bare OmnigentError, NOT one of
         # the specifically-handled subclasses.
         raise OmnigentError("Omnigent request failed with 500: internal_error")
@@ -1804,6 +1887,7 @@ async def test_auth_required_mid_stream_prompts_relogin(tmp_path: Path) -> None:
             *,
             workspace: str | None = None,
             host_id: str | None = None,
+            host_type: str = "external",
         ) -> AsyncIterator[dict[str, Any]]:
             self.turns.append((session_id, text))
             raise AuthRequiredError("401 mid-stream")
@@ -2041,6 +2125,7 @@ class ApprovalClient(FakeOmnigentClient):
         *,
         workspace: str | None = None,
         host_id: str | None = None,
+        host_type: str = "external",
     ) -> AsyncIterator[dict[str, Any]]:
         self.turns.append((session_id, text))
         yield {"type": "response.output_text.delta", "delta": "work"}
@@ -2074,6 +2159,7 @@ class PreambleThenCommittedAnswerClient(FakeOmnigentClient):
         *,
         workspace: str | None = None,
         host_id: str | None = None,
+        host_type: str = "external",
     ) -> AsyncIterator[dict[str, Any]]:
         self.turns.append((session_id, text))
         # Preamble: streamed as a delta AND committed as an item.
@@ -2239,6 +2325,7 @@ async def test_idle_stream_flushes_buffered_text_before_turn_end(
             *,
             workspace: str | None = None,
             host_id: str | None = None,
+            host_type: str = "external",
         ) -> AsyncIterator[dict[str, Any]]:
             self.turns.append((session_id, text))
             # A short burst that won't fill the SDK buffer, then go quiet.
@@ -2543,6 +2630,7 @@ async def test_denied_approval_does_not_resurrect_prior_answer(tmp_path: Path) -
             *,
             workspace: str | None = None,
             host_id: str | None = None,
+            host_type: str = "external",
         ) -> AsyncIterator[dict[str, Any]]:
             self.turns.append((session_id, text))
             # Only a gated tool call, no answer text. Park until the deny is
@@ -2797,6 +2885,7 @@ class PreambleThenSilentAfterElicitationClient(FakeOmnigentClient):
         *,
         workspace: str | None = None,
         host_id: str | None = None,
+        host_type: str = "external",
     ) -> AsyncIterator[dict[str, Any]]:
         self.turns.append((session_id, text))
         yield {"type": "response.output_text.delta", "delta": "Before deleting, let me look."}
@@ -2896,6 +2985,7 @@ class EventScriptClient(FakeOmnigentClient):
         *,
         workspace: str | None = None,
         host_id: str | None = None,
+        host_type: str = "external",
     ) -> AsyncIterator[dict[str, Any]]:
         self.turns.append((session_id, text))
         for event in self._events:

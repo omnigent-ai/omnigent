@@ -19,6 +19,7 @@ from omnigent_slack.events import (
     ElicitationOption,
     ElicitationQuestion,
     ElicitationRequest,
+    HostType,
     OmnigentError,
     OutputFile,
     SessionActivity,
@@ -49,6 +50,7 @@ __all__ = [
     "ElicitationQuestion",
     "ElicitationRequest",
     "HarnessNotConfiguredError",
+    "HostType",
     "HostUnavailableError",
     "OmnigentClient",
     "OmnigentClientPool",
@@ -184,10 +186,19 @@ def _is_auth_redirect(location: str) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class ValidatedServer:
-    """Outcome of probing an Omnigent server during Slack setup."""
+    """Outcome of probing an Omnigent server during Slack setup.
+
+    ``managed_hosts`` is whether the server can provision a sandbox for a
+    session itself, so setup can offer that instead of dead-ending a user who
+    runs no host of their own. ``managed_host_provider`` names the backing
+    provider (e.g. ``"modal"``) for the menu label, and is ``None`` when the
+    server doesn't name one.
+    """
 
     agents: list[dict[str, Any]]
     online_hosts: list[dict[str, Any]]
+    managed_hosts: bool = False
+    managed_host_provider: str | None = None
 
 
 class ClientAuth:
@@ -354,23 +365,59 @@ class OmnigentClient:
         # Setup-time probe. Confirms the server is reachable (``/health``) and
         # that unauthenticated access works — ``list_agents`` hits an
         # auth-gated endpoint, so a server with auth enabled raises
-        # ``AuthRequiredError`` here. Returns the agents and online hosts that
-        # populate the setup select menus.
+        # ``AuthRequiredError`` here. Returns the agents, online hosts, and
+        # managed-sandbox support that populate the setup select menus.
         await self.check_health()
         agents = await self.list_agents()
         hosts = await self.list_hosts()
         online_hosts = [host for host in hosts if _is_host_online(host)]
-        return ValidatedServer(agents=agents, online_hosts=online_hosts)
+        managed_hosts, provider = await self.managed_host_support()
+        return ValidatedServer(
+            agents=agents,
+            online_hosts=online_hosts,
+            managed_hosts=managed_hosts,
+            managed_host_provider=provider,
+        )
 
-    async def create_session(self, agent_id: str, title: str) -> str:
+    async def managed_host_support(self) -> tuple[bool, str | None]:
+        """Whether the server provisions managed sandboxes, and which provider.
+
+        Reads ``managed_sandboxes_enabled`` / ``sandbox_provider`` off the
+        unauthenticated ``GET /v1/info`` — the same gate the web UI's
+        new-session sandbox option uses, so a server whose ``sandbox:`` config
+        is missing or can't actually launch never advertises the option.
+        Best-effort: an unreadable probe reports "not supported", so setup
+        offers a managed session only when the create would be accepted.
+        """
+        info = await self._get_json("/v1/info")
+        if info is None:
+            self._logger.info("Omnigent server info unavailable; managed sandboxes not offered")
+            return False, None
+        enabled = info.get("managed_sandboxes_enabled") is True
+        provider = info.get("sandbox_provider")
+        self._logger.debug("Omnigent managed sandboxes enabled=%s provider=%s", enabled, provider)
+        return enabled, provider if isinstance(provider, str) and provider else None
+
+    async def create_session(
+        self,
+        agent_id: str,
+        title: str,
+        *,
+        host_type: HostType = "external",
+    ) -> str:
         # Don't log the title — it embeds the user's message text; log only the
         # agent id (everywhere else we log lengths, not content).
-        self._logger.info("Creating Omnigent session agent_id=%s", agent_id)
-        response = await self._request(
-            "POST",
-            "/v1/sessions",
-            json={"agent_id": agent_id, "title": title},
+        self._logger.info(
+            "Creating Omnigent session agent_id=%s host_type=%s", agent_id, host_type
         )
+        body: dict[str, Any] = {"agent_id": agent_id, "title": title}
+        if host_type == "managed":
+            # The server picks the sandbox's host and workspace, and rejects a
+            # caller-supplied ``host_id``/path with a 422 — so send only the
+            # switch. The key is omitted for an external session so that request
+            # stays byte-identical to what the server has always received.
+            body["host_type"] = host_type
+        response = await self._request("POST", "/v1/sessions", json=body)
         await _raise_for_status(response)
         payload = response.json()
         session_id = _extract_session_id(payload)
@@ -611,6 +658,7 @@ class OmnigentClient:
         *,
         workspace: str | None = None,
         host_id: str | None = None,
+        host_type: HostType = "external",
         idle_grace_seconds: float = 600.0,
     ) -> AsyncIterator[dict[str, Any]]:
         try:
@@ -618,6 +666,16 @@ class OmnigentClient:
                 yield event
             return
         except RunnerUnavailableError:
+            if host_type == "managed":
+                # The server owns a managed session's sandbox and rebinds its
+                # runner itself; there is no host of ours to launch on, and the
+                # session has no workspace path to launch in.
+                self._logger.info(
+                    "Managed session reported no runner; leaving the relaunch to "
+                    "the server session_id=%s",
+                    session_id,
+                )
+                raise
             # No runner bound to the session — launch one and retry the turn once.
             if not workspace:
                 raise

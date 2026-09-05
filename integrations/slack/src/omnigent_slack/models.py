@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from omnigent_slack.events import HostType
+
 
 def event_is_dm(event: dict[str, object]) -> bool:
     """Whether a Slack event arrived via a 1:1 DM rather than a channel.
@@ -59,6 +61,10 @@ class UserConfig:
 
     The Omnigent server is operator-fixed (``OMNIGENT_SERVER_URL``), so it
     is not part of a user's config.
+
+    ``host_type`` picks between the two ways a session gets a host. It is
+    ``"managed"`` when the user chose a server-provisioned sandbox, and then
+    ``host_id`` and ``workspace`` are empty — the server chooses both.
     """
 
     agent_id: str
@@ -66,16 +72,23 @@ class UserConfig:
     workspace: str
     host_id: str | None = None
     host_name: str | None = None
+    host_type: HostType = "external"
 
 
 @dataclass(frozen=True, slots=True)
 class SessionRecord:
-    """A Slack thread's Omnigent session and where it runs."""
+    """A Slack thread's Omnigent session and where it runs.
+
+    ``host_type`` is recorded per session, not just per user: it decides whether
+    a later turn on this thread may launch a runner, and it must survive both a
+    bot restart and the user changing their setup mid-thread.
+    """
 
     session_id: str
     owner_user_id: str | None
     host_id: str | None
     workspace: str | None
+    host_type: HostType = "external"
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,3 +103,4 @@ class SlackTurn:
     owner_user_id: str
     workspace: str | None = None
     host_id: str | None = None
+    host_type: HostType = "external"
