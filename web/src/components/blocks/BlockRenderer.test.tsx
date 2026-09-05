@@ -11,6 +11,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { BlockRenderer } from "./BlockRenderer";
@@ -403,6 +404,139 @@ describe("BlockRenderer dispatch", () => {
     // regression that folds everything.
     expect(screen.getByText(/tool_5/)).toBeDefined();
     expect(screen.queryByText(/tool_1/)).toBeNull();
+  });
+
+  describe("user-expanded tool cards survive streaming re-layout", () => {
+    const tool = (n: number): RenderItem => ({
+      kind: "tool",
+      itemId: `fc_${n}`,
+      execution: {
+        name: `tool_${n}`,
+        arguments: { step: n },
+        argsSummary: "",
+        callId: `c_${n}`,
+        agentName: "nessie",
+        executedBy: "server",
+        output: "ok",
+      },
+      output: "ok",
+      state: "output-available",
+      startedAt: null,
+      duration: undefined,
+    });
+
+    const withProviders = (node: ReactNode) => (
+      <TooltipProvider>
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>{node}</FileViewerContext.Provider>
+      </TooltipProvider>
+    );
+
+    const expandCard = (container: HTMLElement, name: string) => {
+      const trigger = Array.from(
+        container.querySelectorAll<HTMLElement>('[data-slot="collapsible-trigger"]'),
+      ).find((el) => el.textContent?.includes(name));
+      expect(trigger).toBeDefined();
+      fireEvent.click(trigger!);
+    };
+
+    const cardFor = (container: HTMLElement, name: string) =>
+      Array.from(container.querySelectorAll<HTMLElement>('[data-slot="collapsible"]')).find(
+        (el) =>
+          el.querySelector('[data-slot="collapsible-trigger"]')?.textContent?.includes(name) ??
+          false,
+      );
+
+    it("keeps an expanded card out of the closed run fold when the next tool lands", () => {
+      // The reported mid-read collapse: with the streaming tail at 3, the
+      // 4th/5th tool landing used to re-parent the oldest row into the
+      // closed group summary — unmounting the card the user was reading.
+      // An expanded card must stay standalone (and open) instead.
+      const message: RenderItem = { kind: "text", itemId: "m0", text: "Working.", final: true };
+      const { container, rerender } = render(
+        withProviders(
+          <BlockRenderer items={[message, tool(1), tool(2), tool(3)]} sessionStatus="running" />,
+        ),
+      );
+
+      expandCard(container, "tool_1");
+      expect(screen.getAllByText("Parameters").length).toBeGreaterThan(0);
+
+      rerender(
+        withProviders(
+          <BlockRenderer
+            items={[message, tool(1), tool(2), tool(3), tool(4), tool(5)]}
+            sessionStatus="running"
+          />,
+        ),
+      );
+
+      // The expanded card's row is still visible and still open…
+      const card = cardFor(container, "tool_1");
+      expect(card).toBeDefined();
+      expect(card!.textContent).toContain("Parameters");
+      // …while an unexpanded older row folds into the group as before.
+      expect(screen.queryByText(/tool_2/)).toBeNull();
+      expect(screen.getByText("Called 1 tool")).toBeDefined();
+    });
+
+    it("remounts an expanded card open when the run re-layout re-parents it", () => {
+      // When the group summary first appears, the whole run is re-keyed
+      // under a wrapper element and every tail card REMOUNTS. The
+      // uncontrolled Collapsible would come back closed; the tracked
+      // open-state must restore it.
+      const message: RenderItem = { kind: "text", itemId: "m0", text: "Working.", final: true };
+      const { container, rerender } = render(
+        withProviders(
+          <BlockRenderer items={[message, tool(1), tool(2), tool(3)]} sessionStatus="running" />,
+        ),
+      );
+
+      expandCard(container, "tool_2");
+      expect(screen.getAllByText("Parameters").length).toBeGreaterThan(0);
+
+      // tool_4 lands: tool_1 (unexpanded) folds, creating the group wrapper
+      // that re-parents the remaining rows.
+      rerender(
+        withProviders(
+          <BlockRenderer
+            items={[message, tool(1), tool(2), tool(3), tool(4)]}
+            sessionStatus="running"
+          />,
+        ),
+      );
+
+      expect(screen.queryByText(/tool_1/)).toBeNull();
+      const card = cardFor(container, "tool_2");
+      expect(card).toBeDefined();
+      expect(card!.textContent).toContain("Parameters");
+    });
+
+    it("lets the user re-collapse a card and fold it away again", () => {
+      // Closing the card clears the exemption: the next re-layout may fold
+      // it normally — the guard tracks what the user is reading, not every
+      // card ever touched.
+      const message: RenderItem = { kind: "text", itemId: "m0", text: "Working.", final: true };
+      const { container, rerender } = render(
+        withProviders(
+          <BlockRenderer items={[message, tool(1), tool(2), tool(3)]} sessionStatus="running" />,
+        ),
+      );
+
+      expandCard(container, "tool_1");
+      expandCard(container, "tool_1"); // toggle back closed
+
+      rerender(
+        withProviders(
+          <BlockRenderer
+            items={[message, tool(1), tool(2), tool(3), tool(4), tool(5)]}
+            sessionStatus="running"
+          />,
+        ),
+      );
+
+      expect(screen.queryByText(/tool_1/)).toBeNull();
+      expect(screen.getByText("Called 2 tools")).toBeDefined();
+    });
   });
 
   describe("settled-turn process fold (Worked row)", () => {
