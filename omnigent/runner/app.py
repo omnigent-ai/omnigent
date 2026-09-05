@@ -2447,13 +2447,23 @@ def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
     Coerce a turn-failure ``error`` dict into a ``{code, message}`` shape.
 
     The ``error`` dicts passed to :func:`_on_proxy_stream_end` vary by
-    call site: most carry ``{"message": "..."}`` (and sometimes
-    ``"type"``), but a few carry only ``{"status": <http status>}``.
-    The wire ``SessionStatusEvent.error`` field (``ErrorDetail``)
-    requires both ``code`` and ``message``, so this normalizes every
-    shape into one the schema accepts, never raising on a missing key.
-    The result is what gets published on the ``failed`` status event
-    and ultimately rendered as the REPL's terminal error line.
+    call site: some carry an explicit ``{"code": ...}``, most carry
+    ``{"message": "..."}`` (and sometimes ``"type"``), and a few carry
+    only ``{"status": <http status>}``. The wire
+    ``SessionStatusEvent.error`` field (``ErrorDetail``) requires both
+    ``code`` and ``message``, so this normalizes every shape into one the
+    schema accepts, never raising on a missing key. The result is what
+    gets published on the ``failed`` status event and ultimately rendered
+    as the REPL's terminal error line.
+
+    An explicit ``code`` wins over ``type``, which is only the raised
+    exception's class name. Preferring ``type`` published transport
+    internals as failure codes (``connection_error`` as ``ReadError``,
+    ``context_length_exceeded`` as ``_ContextWindowOverflow``). This code
+    is what lands in the durable ``last_task_error``, which the web
+    rebuilds a failure card from on reconnect, and its headline is
+    ``FAILURE_CODE_DESCRIPTIONS[code]`` — so an exception class name there
+    degrades the card to a bare "Something went wrong".
 
     :param error: Raw error dict from a ``_on_proxy_stream_end`` call,
         e.g. ``{"message": "turn setup failed: ..."}`` or
@@ -2469,8 +2479,12 @@ def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
         message = f"turn failed (status {error['status']})"
     else:
         message = "turn failed"
-    raw_code = error.get("type")
-    code = raw_code if isinstance(raw_code, str) and raw_code else "runner_error"
+    code = "runner_error"
+    for key in ("code", "type"):
+        candidate = error.get(key)
+        if isinstance(candidate, str) and candidate:
+            code = candidate
+            break
     return {"code": code, "message": message}
 
 

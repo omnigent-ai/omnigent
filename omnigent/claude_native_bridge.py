@@ -160,11 +160,17 @@ _COMPOSER_MODE_GLYPHS = (_CLAUDE_PROMPT_GLYPH, _SHELL_MODE_GLYPH)
 # rule on screen is where the footer begins (see
 # :func:`_permission_mode_from_pane`). Corner glyphs are included because
 # Claude Code has framed the input box both ways across versions.
-_BOX_RULE_CHARS = frozenset("─━╭╮╰╯│┃╌╍")
+_BOX_RULE_GLYPHS = "─━╭╮╰╯│┃╌╍"
+_BOX_RULE_CHARS = frozenset(_BOX_RULE_GLYPHS)
+# Shortest leading run of rule glyphs that can open a *labelled* rule, so an
+# ordinary output line starting with one box glyph is not read as a rule.
+_MIN_TITLED_RULE_RUN = 3
 # Footer rows the permission-mode reader falls back to scanning while the
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
+_CLEAR_INPUT_TIMEOUT_S = 5.0
+_CLEAR_INPUT_KEYS = ("C-u",) * 8 + ("C-k",) * 8
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
@@ -3192,15 +3198,7 @@ def inject_user_message(
         info["tmux_target"],
         timeout_s=timeout_s,
     )
-    # Clear any leftover text in Claude's input field before typing.
-    # After Escape-cancel, Claude Code re-populates the prompt area
-    # with the previous input for re-editing. Without this clear,
-    # the new message appends to the stale buffer (e.g.
-    # "old promptnew prompt" with no separator).
-    # Ctrl-A (Home) + Ctrl-K (kill-to-end) is the safest pair —
-    # Ctrl-U only clears backwards from cursor.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-a")
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-k")
+    _clear_claude_input(info["socket_path"], info["tmux_target"])
     # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
     # Claude Code TUI treats them as user text instead of invoking a state
     # that Omnigent cannot drive. Allowed commands (``/clear``,
@@ -4048,12 +4046,26 @@ def _composer_row(pane: str) -> str | None:
     terminal), the lowest rule is the opening one and the row under it is
     the composer.
 
+    Labelled rules are opening candidates only when followed by a
+    composer row. Otherwise a divider in a multiline draft would
+    displace the real opening rule from the last two frame boundaries.
+
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: The row's text, e.g. ``"❯ fix the bug"`` or ``"!"`` in shell
         mode, or ``None`` when no input box is on screen.
     """
     non_empty = [line for line in pane.splitlines() if line.strip()]
-    rules = [idx for idx, line in enumerate(non_empty) if _is_box_rule(line)]
+    rules = [
+        idx
+        for idx, line in enumerate(non_empty)
+        if _is_box_rule(
+            line,
+            allow_label=(
+                idx + 1 < len(non_empty)
+                and non_empty[idx + 1].strip()[:1] in _COMPOSER_MODE_GLYPHS
+            ),
+        )
+    ]
     if not rules:
         return None
     candidates = [rules[-2] + 1] if len(rules) >= 2 else []
@@ -4124,7 +4136,7 @@ def _history_search_footer_shown(pane: str) -> bool:
     return " ".join(fragments).lower().startswith(_HISTORY_SEARCH_FOOTER_PREFIXES)
 
 
-def _is_box_rule(line: str) -> bool:
+def _is_box_rule(line: str, *, allow_label: bool = False) -> bool:
     """
     Return whether a line is a TUI box-drawing horizontal rule.
 
@@ -4134,11 +4146,28 @@ def _is_box_rule(line: str) -> bool:
     the rule directly above the composer, so it is the position that
     identifies the box, not the corners.
 
-    :param line: A single pane line, e.g. ``"──────────"``.
+    A labelled opening rule counts only when the caller has verified
+    that a composer row follows it. Closing rules and footer boundaries
+    stay strict so draft dividers and box-drawn content cannot move them.
+
+    :param line: A single pane line, e.g. ``"──────────"`` or
+        ``"──────── my session ─"``.
+    :param allow_label: Whether this line is an opening-rule candidate.
     :returns: ``True`` when the line is a box-drawing rule.
     """
     stripped = line.strip()
-    return len(stripped) >= 3 and all(ch in _BOX_RULE_CHARS for ch in stripped)
+    if len(stripped) < 3:
+        return False
+    if all(ch in _BOX_RULE_CHARS for ch in stripped):
+        return True
+    if not allow_label:
+        return False
+    lead = len(stripped) - len(stripped.lstrip(_BOX_RULE_GLYPHS))
+    trail = len(stripped) - len(stripped.rstrip(_BOX_RULE_GLYPHS))
+    if lead < _MIN_TITLED_RULE_RUN or trail < 1:
+        return False
+    label = stripped[lead : len(stripped) - trail]
+    return label.startswith(" ") and label.endswith(" ") and bool(label.strip())
 
 
 def _submit_needle(content: str) -> str:
@@ -4223,6 +4252,47 @@ def _format_terminal_failure_tail(pane: str) -> str:
     if len(tail) > _TERMINAL_FAILURE_TAIL_CHARS:
         tail = "…" + tail[-_TERMINAL_FAILURE_TAIL_CHARS:]
     return f" Last terminal output:\n{tail}"
+
+
+def _claude_input_empty(pane: str) -> bool:
+    """Require a blank composer row immediately followed by its closing rule."""
+    row = _composer_row(pane)
+    if row is None or row.strip() != _CLAUDE_PROMPT_GLYPH:
+        return False
+    lines = [line for line in pane.splitlines() if line.strip()]
+    row_index = max(index for index, line in enumerate(lines) if line == row)
+    if row_index + 1 >= len(lines):
+        return False
+    closing = lines[row_index + 1]
+    return _is_box_rule(closing) and len(closing) - len(closing.lstrip()) == len(row) - len(
+        row.lstrip()
+    )
+
+
+def _clear_claude_input(socket_path: str, tmux_target: str) -> None:
+    """Clear and verify the entire draft without interrupting a running turn.
+
+    Ctrl-A/Ctrl-K clears only the current logical line. Repeated Ctrl-U
+    and Ctrl-K also remove preceding and following lines from any cursor
+    position. Never paste until the closing frame proves the draft empty.
+
+    :raises RuntimeError: If the composer cannot be verified empty in time.
+    """
+    deadline = time.monotonic() + _CLEAR_INPUT_TIMEOUT_S
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        ready = _claude_prompt_rendered(pane)
+        if ready and _claude_input_empty(pane):
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Could not clear Claude Code's existing input draft. "
+                "The new message was not pasted or submitted."
+                + _format_terminal_failure_tail(pane)
+            )
+        if ready:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, *_CLEAR_INPUT_KEYS)
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
 def _wait_for_claude_prompt_ready(
