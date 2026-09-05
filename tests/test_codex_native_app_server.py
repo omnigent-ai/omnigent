@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from websockets.asyncio.client import ClientConnection
@@ -461,9 +461,11 @@ def _disable_codex_startup_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _fake_trust_policy_hooks)
 
 
+@pytest.mark.parametrize("model", [None, "system.ai.gpt-test"])
 def test_build_codex_native_server_profile_error_names_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model: str | None,
 ) -> None:
     """
     Missing Databricks profile errors identify the runner-visible profile.
@@ -488,7 +490,7 @@ def test_build_codex_native_server_profile_error_names_profile(
             socket_path=tmp_path / "codex.sock",
             codex_home=tmp_path / "codex-home",
             cwd=tmp_path,
-            model=None,
+            model=model,
             profile="oss",
             bridge_dir=tmp_path / "bridge",
             ap_server_url=None,
@@ -496,9 +498,11 @@ def test_build_codex_native_server_profile_error_names_profile(
         )
 
 
+@pytest.mark.parametrize("model", ["test-model", "system.ai.gpt-test"])
 def test_build_codex_native_server_uses_profile_host_without_static_token(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
 ) -> None:
     """
     Native Codex accepts Databricks CLI OAuth profiles without static tokens.
@@ -525,24 +529,23 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
         encoding="utf-8",
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("DATABRICKS_HOST", "https://other-workspace.example")
 
-    # This test exercises the profile-host base URL + auth command, not model
-    # resolution. Force live codex discovery offline so the build makes no
-    # model-services network call for the profile host; the explicit
-    # ``model="test-model"`` is then used as-is.
-    def _discovery_offline(_profile: str | None) -> object:
-        raise RuntimeError("model discovery is offline in this test")
-
+    resolve_credentials = Mock(side_effect=RuntimeError("model discovery is offline"))
     monkeypatch.setattr(
         "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
-        _discovery_offline,
+        resolve_credentials,
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda _host: None,
     )
 
     app_server = build_codex_native_server(
         socket_path=tmp_path / "codex.sock",
         codex_home=tmp_path / "codex-home",
         cwd=tmp_path,
-        model="test-model",
+        model=model,
         profile="oss",
         bridge_dir=tmp_path / "bridge",
         ap_server_url=None,
@@ -550,6 +553,13 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     )
 
     overrides = "\n".join(app_server.config_overrides)
+    assert app_server.env["DATABRICKS_HOST"] == "https://example.cloud.databricks.com"
+    assert app_server.pinned_model == model
+    assert f"model={json.dumps(model)}" in app_server.config_overrides
+    if model.startswith("system.ai."):
+        resolve_credentials.assert_not_called()
+    else:
+        resolve_credentials.assert_called_once_with("oss")
     assert "https://example.cloud.databricks.com/ai-gateway/codex/v1" in overrides
     assert 'databricks auth token --profile \\"oss\\"' in overrides
 
@@ -2435,7 +2445,53 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
     assert "DATABRICKS_HOST" not in env
 
 
-def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
+@pytest.mark.parametrize(
+    "requested",
+    ["system.ai.gpt-test", "system.ai.custom-model", "system.ai.gpt-999-1"],
+)
+def test_resolve_databricks_codex_model_preserves_canonical_pin_without_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    requested: str,
+) -> None:
+    """Canonical pins launch without SDK metadata/auth or model rediscovery."""
+    from omnigent.codex_native_app_server import _resolve_databricks_codex_model
+
+    resolve_credentials = Mock(side_effect=RuntimeError("SDK metadata is unreachable"))
+    discover_models = Mock(return_value=("system.ai.other-model",))
+    read_cache = Mock(return_value=None)
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        resolve_credentials,
+    )
+    monkeypatch.setattr(
+        "omnigent.databricks_model_discovery.discover_databricks_codex_models",
+        discover_models,
+    )
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", read_cache)
+
+    assert (
+        _resolve_databricks_codex_model("https://workspace.example", "prof", requested)
+        == requested
+    )
+    resolve_credentials.assert_not_called()
+    discover_models.assert_not_called()
+    read_cache.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (None, "system.ai.gpt-5-6-sol"),
+        ("", "system.ai.gpt-5-6-sol"),
+        ("databricks-gpt-5-6-luna", "system.ai.gpt-5-6-luna"),
+        ("gpt-5-6-luna", "system.ai.gpt-5-6-luna"),
+        ("databricks-gpt-9-9", "databricks-gpt-9-9"),
+    ],
+)
+def test_resolve_databricks_codex_model_matches_servable_ids(
+    requested: str | None,
+    expected: str,
+) -> None:
     """The codex launch model resolves against what the workspace serves.
 
     An unset model takes the newest servable id; a legacy ``databricks-``
@@ -2453,26 +2509,17 @@ def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
         patch(
             "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
             return_value=SimpleNamespace(token="tok"),
-        ),
+        ) as resolve_credentials,
         patch(
             "omnigent.databricks_model_discovery.discover_databricks_codex_models",
             return_value=servable,
-        ),
+        ) as discover_models,
     ):
         assert (
-            _resolve_databricks_codex_model("https://h.example.com", "prof", None)
-            == "system.ai.gpt-5-6-sol"
+            _resolve_databricks_codex_model("https://h.example.com", "prof", requested) == expected
         )
-        assert (
-            _resolve_databricks_codex_model(
-                "https://h.example.com", "prof", "databricks-gpt-5-6-luna"
-            )
-            == "system.ai.gpt-5-6-luna"
-        )
-        assert (
-            _resolve_databricks_codex_model("https://h.example.com", "prof", "databricks-gpt-9-9")
-            == "databricks-gpt-9-9"
-        )
+        resolve_credentials.assert_called_once_with("prof")
+        discover_models.assert_called_once_with("https://h.example.com", "tok")
 
 
 def test_probe_codex_home_bridges_provider_tables_and_credential(

@@ -2192,9 +2192,8 @@ def _databricks_launch_materialization(
             "with a host visible to the runner process."
         )
     host = host.rstrip("/")
-    # Resolve against what the workspace actually serves (live UC listing →
-    # ucode state → bundled catalog), never the bundled catalog alone — its
-    # legacy ``databricks-`` spellings can 501 on today's gateway.
+    # Preserve canonical pins; resolve aliases/defaults against served model IDs.
+    # Legacy ``databricks-`` spellings can 501 on today's gateway.
     resolved_model = _resolve_databricks_codex_model(host, profile, model)
     return _DatabricksLaunchMaterialization(
         config_overrides=_databricks_codex_config_overrides(
@@ -2220,10 +2219,10 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
     then ucode's cached copy of it, then the bundled catalog as the documented
     last resort.
 
-    An explicit model is matched against the servable ids, so a legacy
-    ``model_override`` persisted before this change still launches; one the
-    workspace does not serve passes through untouched, because the gateway's
-    error beats a silent substitution.
+    Canonical ``system.ai.*`` pins pass through without discovery. Other
+    explicit models are matched against the servable ids so legacy
+    ``databricks-`` overrides still launch. Unknown models pass through
+    untouched, because the gateway's error beats a silent substitution.
 
     :param host: Workspace origin, e.g. ``"https://example.com"``.
     :param profile: Databricks CLI profile backing the launch.
@@ -2231,6 +2230,11 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
         servable one.
     :returns: The model id to pin on the codex launch.
     """
+    if requested and requested.startswith("system.ai."):
+        # SDK Config can block on DNS/auth and stall startup just to rediscover this pin.
+        # Codex still authenticates through the profile-pinned auth.command.
+        return requested
+
     from omnigent.databricks_model_discovery import (
         discover_databricks_codex_models,
         select_servable_model,
