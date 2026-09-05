@@ -3033,8 +3033,10 @@ def test_augment_claude_args_injects_plugin_dir_for_bundle_with_skills(
     wiring. It fails if a deployed agent's bundled skills never reach the
     real ``claude`` CLI (the gap before this change — native ignores the
     harness ``tools``/skill plumbing, so ``--plugin-dir`` is the only
-    surface). ``skills_filter`` defaults to ``"all"``, so host skills use
-    the CLI's default sources and no ``--setting-sources`` is emitted.
+    surface). ``skills_filter`` defaults to ``"all"`` and
+    ``include_workspace_settings`` defaults to ``False``, so host skills load
+    from the user scope only (``--setting-sources user``) — never the
+    workspace scope, which an auto-trusted launch must not execute.
     """
     bundle = tmp_path / "bundle"
     (bundle / "skills" / "authoring").mkdir(parents=True)
@@ -3052,8 +3054,8 @@ def test_augment_claude_args_injects_plugin_dir_for_bundle_with_skills(
     # The plugin path is the bundle root (Claude discovers
     # <bundle>/skills/<dir>/SKILL.md under the plugin convention).
     assert args[args.index("--plugin-dir") + 1] == str(bundle)
-    # "all" → host skills via the CLI default; no explicit override.
-    assert "--setting-sources" not in args
+    # Default-deny: workspace-scoped sources are dropped, keeping user scope.
+    assert args[args.index("--setting-sources") + 1] == "user"
     # The manifest gives the plugin a stable name for clean skill labels.
     manifest = bundle / ".claude-plugin" / "plugin.json"
     assert manifest.exists()
@@ -3061,6 +3063,42 @@ def test_augment_claude_args_injects_plugin_dir_for_bundle_with_skills(
     # The skill args are appended alongside the MCP/hook injection, not in
     # place of it — both must reach the final launch command.
     assert "--mcp-config" in args
+
+
+def test_augment_claude_args_default_drops_workspace_setting_sources(
+    tmp_path: Path,
+) -> None:
+    """
+    Security regression (layer guard): the default augmentation — no
+    ``include_workspace_settings`` argument, as the host-spawned runner launch
+    passes it — restricts Claude's setting sources to ``user``.
+
+    A host-spawned launch pre-accepts Claude's workspace-trust dialog
+    (``ensure_claude_workspace_trusted``) so the terminal never hangs on it.
+    That pre-acceptance means Claude's own trust gate no longer protects the
+    workspace, so ``augment_claude_args`` must itself keep an unreviewed
+    workspace's ``.claude/settings.json`` (hooks, permissions) out of the
+    launch. It does that by dropping the workspace-scoped setting sources.
+    """
+    args = augment_claude_args((), bridge_dir=tmp_path)
+
+    assert "--setting-sources" in args
+    assert args[args.index("--setting-sources") + 1] == "user"
+
+
+def test_augment_claude_args_keeps_workspace_sources_when_opted_in(
+    tmp_path: Path,
+) -> None:
+    """
+    The local ``omnigent claude`` wrapper opts in with
+    ``include_workspace_settings=True`` because the user is at the terminal
+    and Claude's own trust dialog still gates the workspace. There, no
+    ``--setting-sources`` override is emitted — Claude keeps its default
+    sources and prompts for trust as usual.
+    """
+    args = augment_claude_args((), bridge_dir=tmp_path, include_workspace_settings=True)
+
+    assert "--setting-sources" not in args
 
 
 def test_augment_claude_args_omits_permission_hook_without_omnigent_server(

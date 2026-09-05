@@ -5910,6 +5910,10 @@ def _claude_terminal_request(
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
+        # This local wrapper never pre-seeds workspace trust: Claude's own
+        # first-run trust dialog still gates workspace settings, and the user
+        # is at this terminal to answer it. Keep the CLI's default sources.
+        include_workspace_settings=True,
     )
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by

@@ -154,6 +154,28 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     ]
 
 
+def test_claude_terminal_request_keeps_workspace_setting_sources(tmp_path, monkeypatch) -> None:
+    """
+    The local ``omnigent claude`` wrapper opts into workspace setting sources.
+
+    Unlike the host-spawned runner launch (which pre-accepts Claude's
+    workspace-trust dialog and so must drop workspace-scoped sources), this
+    wrapper runs at the user's own terminal with Claude's trust dialog still
+    intact. So it passes ``include_workspace_settings=True`` and emits no
+    ``--setting-sources`` override — Claude keeps its default sources and
+    prompts for trust itself. This pins that opt-in at the call site: a
+    regression to the default-deny value here would suppress the user's own
+    project settings on their local machine.
+    """
+    monkeypatch.chdir(tmp_path)
+    body = claude_native._claude_terminal_request(
+        ("--resume", "s"),
+        command="claude",
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+    )
+    assert "--setting-sources" not in body["spec"]["args"]
+
+
 def test_claude_terminal_request_default_launch_is_unwrapped(tmp_path, monkeypatch) -> None:
     """Without ``OMNIGENT_CLAUDE_LAUNCHER`` the command/args are unchanged."""
     monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)
