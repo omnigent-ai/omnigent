@@ -5869,7 +5869,46 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           };
         });
       }
-      finalizeCurrentActive("cancelled", event.responseId, sourceConversationId);
+      {
+        // A late interrupt that names an OLD turn must not touch the turn now
+        // in flight: neither cancel its bubble nor settle its status. (Its id
+        // is still recorded above, so the old bubble keeps its "Interrupted"
+        // decoration.) An active response with an id that disagrees with the
+        // event's marks the event stale.
+        const conv = sourceConversationId === null ? null : setterForState(sourceConversationId);
+        const activeId = conv?.activeResponse?.responseId;
+        const stale =
+          event.responseId !== undefined &&
+          activeId !== undefined &&
+          activeId !== "" &&
+          activeId !== event.responseId;
+        if (stale) return;
+        finalizeCurrentActive("cancelled", event.responseId, sourceConversationId);
+        // A terminal-backed interrupt (it names the turn via `responseId`) is
+        // a real turn end with no `session.status` idle edge guaranteed to
+        // follow, so settle the session-level status here — the "Working…"
+        // shimmer reads only `sessionStatus` and must go out with the
+        // cancelled bubble. A BARE interrupted event (no `responseId`) is the
+        // server's optimistic publish fired before delivery is known; the
+        // turn may still be running (a failed Escape), and the shimmer
+        // staying lit is the intended "the cancel didn't land" signal — leave
+        // it alone. `waiting` is also left alone: it marks background work
+        // that outlives the turn and isn't ended by a turn interrupt.
+        if (
+          sourceConversationId !== null &&
+          event.responseId !== undefined &&
+          conv?.sessionStatus === "running"
+        ) {
+          // Settle the local send lifecycle too — the shimmer also reads
+          // `status === "streaming"` (the running edge set it), and `stop()`
+          // settles both fields the same way.
+          applyToConversation({ status: "idle", sessionStatus: "idle", blockedOn: null });
+          // Keep the sidebar dot in lockstep, as `stop()` and the
+          // `session_status` handler do. The server's own status cache may
+          // lag until its idle edge lands — self-corrects on the next poll.
+          patchConversationStatusInCache(sourceConversationId, "idle");
+        }
+      }
       return;
     case "session_created":
       // Sub-agent spawn signal. Invalidate the parent's child-sessions

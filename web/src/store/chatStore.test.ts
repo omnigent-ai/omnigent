@@ -5610,6 +5610,110 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       handleSessionEvent({ type: "session_interrupted", requestedAt: 0 });
       expect(useChatStore.getState().activeResponse).toBeNull();
     });
+
+    it("settles a running sessionStatus to idle (Working indicator must clear)", () => {
+      // The interrupt is the terminal signal for the turn: no session.status
+      // idle edge is guaranteed to follow it, so the handler itself must put
+      // out the "Working…" shimmer, which reads only sessionStatus.
+      bindConversationForTest("conv_int_run", {
+        activeResponse: { responseId: "resp_int_1", state: "streaming", error: null },
+        sessionStatus: "running",
+        blockedOn: "approval",
+        interruptedResponseIds: [],
+      });
+
+      handleSessionEvent(
+        { type: "session_interrupted", requestedAt: 0, responseId: "resp_int_1" },
+        "conv_int_run",
+      );
+
+      expect(useChatStore.getState().sessionStatus).toBe("idle");
+      expect(useChatStore.getState().blockedOn).toBeNull();
+      expect(useChatStore.getState().activeResponse).toMatchObject({
+        responseId: "resp_int_1",
+        state: "cancelled",
+      });
+    });
+
+    it("leaves a running sessionStatus alone on a BARE interrupt (delivery unconfirmed)", () => {
+      // The server publishes session.interrupted without a response id
+      // optimistically, before the runner confirms delivery — a failed Escape
+      // means the turn is still running, and the shimmer staying lit is the
+      // intended "the cancel didn't land" signal.
+      bindConversationForTest("conv_int_bare", {
+        activeResponse: { responseId: "resp_int_bare", state: "streaming", error: null },
+        sessionStatus: "running",
+        interruptedResponseIds: [],
+      });
+
+      handleSessionEvent({ type: "session_interrupted", requestedAt: 0 }, "conv_int_bare");
+
+      expect(useChatStore.getState().sessionStatus).toBe("running");
+    });
+
+    it("does not idle a NEWER turn when a stale interrupt names an old response", () => {
+      // A delayed interrupt for turn A arriving after turn B started must not
+      // settle B's running status.
+      bindConversationForTest("conv_int_stale", {
+        activeResponse: { responseId: "resp_turn_b", state: "streaming", error: null },
+        sessionStatus: "running",
+        interruptedResponseIds: [],
+      });
+
+      handleSessionEvent(
+        { type: "session_interrupted", requestedAt: 0, responseId: "resp_turn_a" },
+        "conv_int_stale",
+      );
+
+      expect(useChatStore.getState().sessionStatus).toBe("running");
+      // Turn B's bubble must not be marked cancelled by turn A's interrupt.
+      expect(useChatStore.getState().activeResponse).toEqual({
+        responseId: "resp_turn_b",
+        state: "streaming",
+        error: null,
+      });
+      // The stale id is still recorded so turn A's bubble keeps its label.
+      expect(useChatStore.getState().interruptedResponseIds).toEqual(["resp_turn_a"]);
+    });
+
+    it("leaves a waiting sessionStatus alone (background work outlives the turn)", () => {
+      // `waiting` marks background shells/sub-agents that keep running after
+      // the turn ends; an interrupt ends the turn, not the background work.
+      bindConversationForTest("conv_int_wait", {
+        activeResponse: { responseId: "resp_int_2", state: "streaming", error: null },
+        sessionStatus: "waiting",
+        interruptedResponseIds: [],
+      });
+
+      handleSessionEvent(
+        { type: "session_interrupted", requestedAt: 0, responseId: "resp_int_2" },
+        "conv_int_wait",
+      );
+
+      expect(useChatStore.getState().sessionStatus).toBe("waiting");
+    });
+
+    it("settles the background conversation's status, not the visible one", () => {
+      // Delivered on a background stream: the idle settle must land on that
+      // conversation's entry, leaving the visible turn's shimmer untouched.
+      const bg = bindConversationForTest("conv_int_bg", {
+        activeResponse: { responseId: "resp_int_bg", state: "streaming", error: null },
+        sessionStatus: "running",
+        interruptedResponseIds: [],
+      });
+      bindConversationForTest("conv_int_fg", {
+        sessionStatus: "running",
+      });
+
+      handleSessionEvent(
+        { type: "session_interrupted", requestedAt: 0, responseId: "resp_int_bg" },
+        "conv_int_bg",
+      );
+
+      expect(bg.get().sessionStatus).toBe("idle");
+      // The visible conversation keeps working.
+      expect(useChatStore.getState().sessionStatus).toBe("running");
+    });
   });
 
   describe("response.completed / response.failed (context ring)", () => {
