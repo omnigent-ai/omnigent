@@ -711,6 +711,14 @@ export function ForkSessionForm({
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
   const sourceHostOnline = onlineHosts.some((h) => h.host_id === sourceHostId);
+  // The caller's own record of the source host, when that host is offline.
+  // null when the source host is online, or isn't among the caller's hosts
+  // at all (e.g. forking a shared session that ran on someone else's
+  // machine) — that case has nothing to reconnect.
+  const offlineSourceHost = useMemo(() => {
+    const src = (hosts ?? []).find((h) => h.host_id === sourceHostId) ?? null;
+    return src !== null && src.status !== "online" ? src : null;
+  }, [hosts, sourceHostId]);
   const serverUrl = getCliServerUrl();
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
@@ -841,17 +849,29 @@ export function ForkSessionForm({
   const sameFamilyAsSource = !switching || (sourceFamily !== null && sourceFamily === targetFamily);
   const sameAgentAsSource = !switching;
 
-  // Default the host = source host (when online) else the first online
-  // host, once hosts have loaded. Only fills an empty slot so an explicit
-  // pick is never overridden.
+  // Default the host once hosts have loaded: the source host when it is
+  // online, else nothing when the caller's own source host is merely
+  // offline (a cross-host clone isn't supported, so silently re-homing the
+  // clone to another machine would create it broken — the user should
+  // reconnect the source host instead), else the first online host (the
+  // source host isn't the caller's, e.g. forking a shared session, so
+  // their own host is the only possible target). Only fills an empty slot
+  // so an explicit pick is never overridden.
   useEffect(() => {
     if (!isCodingSource || selectedHostId !== null) return;
     if (sourceHostId && sourceHostOnline) {
       setSelectedHostId(sourceHostId);
-    } else if (onlineHosts.length > 0) {
+    } else if (offlineSourceHost === null && onlineHosts.length > 0) {
       setSelectedHostId(onlineHosts[0].host_id);
     }
-  }, [isCodingSource, selectedHostId, sourceHostId, sourceHostOnline, onlineHosts]);
+  }, [
+    isCodingSource,
+    selectedHostId,
+    sourceHostId,
+    sourceHostOnline,
+    offlineSourceHost,
+    onlineHosts,
+  ]);
 
   // Prefill the directory with the source's workspace — but only when staying
   // on the source host. On a different host that path is a different machine,
@@ -936,21 +956,26 @@ export function ForkSessionForm({
     }
   }, [onDifferentHost]);
 
-  // Mismatched-directory warning: the transcript's file references were
-  // grounded in the source's directory ON the source's host. A different
-  // directory — or a different host, where even an identical path is a
-  // different machine — won't resolve them, so the agent must re-orient.
   const hostMismatch =
     sourceHostId != null && selectedHostId !== null && selectedHostId !== sourceHostId;
+  // Cross-host clone warning: cloning onto a different machine than the
+  // source isn't supported today — the clone's runner may never start,
+  // leaving a broken session with only a generic failure. Flag it the
+  // moment a different host is picked, before any directory is typed.
+  const showCrossHostWarning = isCodingSource && hostMismatch;
+  // Mismatched-directory warning: the transcript's file references were
+  // grounded in the source's directory, so a different directory on the
+  // same host won't resolve them and the agent must re-orient. On a
+  // different host the cross-host warning above covers this (and more).
   const showMismatchWarning =
     isCodingSource &&
-    ((hostMismatch && workspaceTrimmed !== "") ||
-      (sourceWorkspaceNorm !== null &&
-        workspaceTrimmed !== "" &&
-        workspaceTrimmed !== sourceWorkspaceNorm &&
-        // The source's original repo (which worktree sources prefill) is
-        // the same lineage as its worktree — not a mismatch.
-        (sourceRepo === null || workspaceTrimmed !== sourceRepo)));
+    !hostMismatch &&
+    sourceWorkspaceNorm !== null &&
+    workspaceTrimmed !== "" &&
+    workspaceTrimmed !== sourceWorkspaceNorm &&
+    // The source's original repo (which worktree sources prefill) is
+    // the same lineage as its worktree — not a mismatch.
+    (sourceRepo === null || workspaceTrimmed !== sourceRepo);
 
   // Default state: a coding clone on the source host still pointed at the
   // source's directory. Drives the "reuses the original's working directory"
@@ -1145,6 +1170,37 @@ export function ForkSessionForm({
                     ))}
                   </SelectContent>
                 </Select>
+                {/* The caller's own source host is offline and nothing was
+                    auto-picked: say why, instead of silently re-homing the
+                    clone to another machine (a cross-host clone isn't
+                    supported and would be created broken). */}
+                {offlineSourceHost !== null && selectedHostId === null && (
+                  <p
+                    className="flex items-start gap-1.5 text-sm text-warning"
+                    data-testid="fork-session-source-host-offline-hint"
+                  >
+                    <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
+                    <span>
+                      The original session ran on{" "}
+                      <span className="font-mono">{offlineSourceHost.name}</span>, which is offline.
+                      Reconnect it to start the clone there — cloning onto a different host isn't
+                      supported yet, so the clone may fail to start.
+                    </span>
+                  </p>
+                )}
+                {showCrossHostWarning && (
+                  <p
+                    className="flex items-start gap-1.5 text-sm text-warning"
+                    data-testid="fork-session-cross-host-warning"
+                  >
+                    <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
+                    <span>
+                      This isn't the host the original session ran on. Cloning onto a different host
+                      isn't supported yet — the clone may fail to start, and earlier file references
+                      in the transcript won't apply.
+                    </span>
+                  </p>
+                )}
                 <button
                   type="button"
                   onClick={() => setShowConnect((v) => !v)}
