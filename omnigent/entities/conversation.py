@@ -470,6 +470,8 @@ class CompactionData(BaseModel):
         e.g. ``"openai/gpt-4o"``.
     :param token_count: Approximate token count of the summary
         text, for budget tracking, e.g. ``342``.
+    :param window_id: Opaque vendor compaction-window identifier. Codex
+        rollout formats have used both integer counters and UUID strings.
     """
 
     summary: str
@@ -477,7 +479,7 @@ class CompactionData(BaseModel):
     model: str | None = None
     token_count: int
     compacted_messages: list[dict[str, Any]] | None = None
-    window_id: int | None = None
+    window_id: int | str | None = None
 
     @field_validator("compacted_messages")
     @classmethod
