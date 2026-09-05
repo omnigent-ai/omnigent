@@ -174,6 +174,37 @@ describe("ChatHeader — workspace pane alignment", () => {
     expect(header).not.toBeNull();
     expect(header).toHaveClass("inset-x-0", "md:right-[var(--workspace-panel-offset,0px)]");
   });
+
+  it("centers the desktop breadcrumb on the pane, independent of the sidebar", () => {
+    const { container } = renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv-1",
+      conversationTitle: "Centering check",
+    });
+    const header = container.querySelector("header");
+    const breadcrumb = screen.getByRole("navigation", { name: "Conversation" });
+    const slot = breadcrumb.parentElement;
+
+    // A 1fr/auto/1fr grid pins the breadcrumb to the middle column, so its
+    // midpoint tracks the pane's center rather than the sidebar's edge.
+    expect(header).toHaveClass("md:grid", "md:grid-cols-[1fr_auto_1fr]");
+    expect(slot).toHaveClass("md:col-start-2", "md:justify-self-center", "min-w-0");
+    expect(header).not.toHaveClass("justify-between");
+  });
+
+  it("keeps the action cluster in the right grid column", () => {
+    const { container } = renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv-1",
+      conversationTitle: "Centering check",
+      canShare: true,
+    });
+    const share = screen.getByRole("button", { name: "Share session" });
+    const cluster = share.parentElement;
+
+    expect(cluster).toHaveClass("md:col-start-3", "md:justify-self-end");
+    expect(container.querySelector("header")).not.toBeNull();
+  });
 });
 
 describe("ChatHeader — open-sidebar toggle visibility", () => {
