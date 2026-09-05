@@ -5,15 +5,17 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import Engine, inspect, text
 
-from omnigent.db.utils import (
+from omnigent.db.cockroachdb import (
     _CRDB_BOOTSTRAP_MARKER_TABLE,
     _CRDB_BOOTSTRAP_MARKER_TOKEN,
     CRDB_BASELINE_REVISION,
     _crdb_server_version,
+    _prepare_crdb_schema_transaction,
+)
+from omnigent.db.utils import (
     _get_current_db_revision,
     _get_head_db_revision,
     _initialize_or_verify_schema,
-    _prepare_crdb_schema_transaction,
     get_or_create_engine,
     is_cockroachdb,
 )

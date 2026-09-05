@@ -10,7 +10,7 @@ import pytest
 from packaging.version import Version
 from sqlalchemy.exc import NoSuchModuleError
 
-from omnigent.db import utils
+from omnigent.db import cockroachdb, utils
 
 
 @pytest.mark.parametrize(
@@ -26,18 +26,18 @@ def test_parse_crdb_server_version_accepts_distribution_labels(
     raw: str,
     expected: Version,
 ) -> None:
-    assert utils._parse_crdb_server_version(raw) == expected
+    assert cockroachdb._parse_crdb_server_version(raw) == expected
 
 
 def test_parse_crdb_server_version_rejects_versions_below_minimum() -> None:
     with pytest.raises(RuntimeError, match=r"requires CockroachDB 23\.2\.28 or newer"):
-        utils._parse_crdb_server_version("CockroachDB OSS v23.2.27 (x86_64)")
+        cockroachdb._parse_crdb_server_version("CockroachDB OSS v23.2.27 (x86_64)")
 
 
 def test_parse_crdb_server_version_warns_outside_tested_matrix(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    version = utils._parse_crdb_server_version("CockroachDB CCL v26.1.0 (x86_64)")
+    version = cockroachdb._parse_crdb_server_version("CockroachDB CCL v26.1.0 (x86_64)")
 
     assert version == Version("26.1.0")
     assert "outside Omnigent's release-tested matrix" in caplog.text
@@ -64,7 +64,7 @@ def test_verify_crdb_read_committed_rejects_silent_v23_fallback() -> None:
     engine.connect.return_value = nullcontext(connection)
 
     with pytest.raises(RuntimeError, match=r"sql\.txn\.read_committed_isolation\.enabled"):
-        utils._verify_crdb_read_committed(engine, Version("23.2.28"))
+        cockroachdb._verify_crdb_read_committed(engine, Version("23.2.28"))
 
 
 def test_verify_crdb_read_committed_accepts_effective_level() -> None:
@@ -75,7 +75,7 @@ def test_verify_crdb_read_committed_accepts_effective_level() -> None:
     engine = MagicMock()
     engine.connect.return_value = nullcontext(connection)
 
-    utils._verify_crdb_read_committed(engine, Version("23.2.28"))
+    cockroachdb._verify_crdb_read_committed(engine, Version("23.2.28"))
 
 
 def test_crdb_pool_overrides_treat_blank_as_unset(
@@ -124,12 +124,12 @@ def test_prepare_crdb_schema_transaction_uses_serializable(
     connection = MagicMock()
     enabled: list[Version] = []
     monkeypatch.setattr(
-        utils,
+        cockroachdb,
         "_enable_crdb_ddl_autocommit",
         lambda _connection, version: enabled.append(version),
     )
 
-    utils._prepare_crdb_schema_transaction(connection, Version("24.3.20"))
+    cockroachdb._prepare_crdb_schema_transaction(connection, Version("24.3.20"))
 
     assert enabled == [Version("24.3.20")]
     statement = str(connection.execute.call_args.args[0])
@@ -140,7 +140,7 @@ def test_bootstrap_rejects_unknown_unversioned_tables() -> None:
     engine = MagicMock()
 
     with pytest.raises(RuntimeError, match="Use a new empty database"):
-        utils._start_or_resume_crdb_bootstrap(
+        cockroachdb._start_or_resume_crdb_bootstrap(
             engine,
             Version("25.2.10"),
             {"agents"},
@@ -153,16 +153,16 @@ def test_bootstrap_rejects_unknown_unversioned_tables() -> None:
 
 def test_bootstrap_resumes_only_with_valid_marker() -> None:
     result = MagicMock()
-    result.__iter__.return_value = iter([(utils._CRDB_BOOTSTRAP_MARKER_TOKEN, "head")])
+    result.__iter__.return_value = iter([(cockroachdb._CRDB_BOOTSTRAP_MARKER_TOKEN, "head")])
     connection = MagicMock()
     connection.execute.return_value = result
     engine = MagicMock()
     engine.connect.return_value = nullcontext(connection)
 
-    utils._start_or_resume_crdb_bootstrap(
+    cockroachdb._start_or_resume_crdb_bootstrap(
         engine,
         Version("25.2.10"),
-        {utils._CRDB_BOOTSTRAP_MARKER_TABLE, "alembic_version", "agents"},
+        {cockroachdb._CRDB_BOOTSTRAP_MARKER_TABLE, "alembic_version", "agents"},
         {"agents", "conversations"},
         "head",
     )
@@ -177,10 +177,10 @@ def test_bootstrap_rejects_invalid_marker() -> None:
     engine.connect.return_value = nullcontext(connection)
 
     with pytest.raises(RuntimeError, match="invalid Omnigent bootstrap marker"):
-        utils._start_or_resume_crdb_bootstrap(
+        cockroachdb._start_or_resume_crdb_bootstrap(
             engine,
             Version("25.2.10"),
-            {utils._CRDB_BOOTSTRAP_MARKER_TABLE, "agents"},
+            {cockroachdb._CRDB_BOOTSTRAP_MARKER_TABLE, "agents"},
             {"agents", "conversations"},
             "head",
         )
@@ -188,17 +188,17 @@ def test_bootstrap_rejects_invalid_marker() -> None:
 
 def test_bootstrap_rejects_marker_from_different_schema_head() -> None:
     result = MagicMock()
-    result.__iter__.return_value = iter([(utils._CRDB_BOOTSTRAP_MARKER_TOKEN, "older-head")])
+    result.__iter__.return_value = iter([(cockroachdb._CRDB_BOOTSTRAP_MARKER_TOKEN, "older-head")])
     connection = MagicMock()
     connection.execute.return_value = result
     engine = MagicMock()
     engine.connect.return_value = nullcontext(connection)
 
     with pytest.raises(RuntimeError, match="invalid Omnigent bootstrap marker"):
-        utils._start_or_resume_crdb_bootstrap(
+        cockroachdb._start_or_resume_crdb_bootstrap(
             engine,
             Version("25.2.10"),
-            {utils._CRDB_BOOTSTRAP_MARKER_TABLE, "agents"},
+            {cockroachdb._CRDB_BOOTSTRAP_MARKER_TABLE, "agents"},
             {"agents", "conversations"},
             "current-head",
         )
@@ -208,7 +208,7 @@ def test_bootstrap_rejects_empty_alembic_table_without_marker() -> None:
     engine = MagicMock()
 
     with pytest.raises(RuntimeError, match="Use a new empty database"):
-        utils._start_or_resume_crdb_bootstrap(
+        cockroachdb._start_or_resume_crdb_bootstrap(
             engine,
             Version("25.2.10"),
             {"alembic_version"},
@@ -251,11 +251,11 @@ def test_bootstrap_repairs_and_verifies_missing_model_indexes(
     engine = MagicMock()
     engine.connect.return_value = nullcontext(connection)
     prepare = MagicMock()
-    monkeypatch.setattr(utils, "_crdb_model_indexes", lambda: (existing, missing))
-    monkeypatch.setattr(utils, "inspect", lambda _engine: Inspector())
-    monkeypatch.setattr(utils, "_prepare_crdb_schema_transaction", prepare)
+    monkeypatch.setattr(cockroachdb, "_crdb_model_indexes", lambda: (existing, missing))
+    monkeypatch.setattr(cockroachdb, "inspect", lambda _engine: Inspector())
+    monkeypatch.setattr(cockroachdb, "_prepare_crdb_schema_transaction", prepare)
 
-    utils._repair_and_verify_crdb_model_indexes(engine, Version("25.2.10"))
+    cockroachdb._repair_and_verify_crdb_model_indexes(engine, Version("25.2.10"))
 
     assert missing.created is True
     prepare.assert_called_once_with(connection, Version("25.2.10"))
