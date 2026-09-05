@@ -116,16 +116,14 @@ class BackgroundTitleProcessManager(Protocol):
         conversation_id: str,
         harness: str,
         env: dict[str, str] | None = None,
-    ) -> httpx.AsyncClient:
-        pass
+    ) -> httpx.AsyncClient: ...
 
     async def release(
         self,
         conversation_id: str,
         *,
         only_if_idle_cutoff: float | None = None,
-    ) -> None:
-        pass
+    ) -> None: ...
 
 
 @dataclass(frozen=True)

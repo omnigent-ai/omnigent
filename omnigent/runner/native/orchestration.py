@@ -101,8 +101,7 @@ class _EnsureCommentRelay(Protocol):
         explicit_bridge_dir: Path | None = None,
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
-    ) -> None:
-        pass
+    ) -> None: ...
 
 
 def _publish_tmux_target_for_bridge(
