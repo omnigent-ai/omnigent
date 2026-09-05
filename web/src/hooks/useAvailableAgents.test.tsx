@@ -309,6 +309,36 @@ describe("useAvailableAgents", () => {
     ]);
   });
 
+  it("keeps a user native template's name and workspace hint", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          {
+            id: "ag_cos",
+            name: "Chief of Staff",
+            harness: "codex-native",
+            builtin: false,
+            workspace_hint: "C:/LunaOS/state/agents/cos",
+          },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: EMPTY_SCAN,
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data?.[0]).toMatchObject({
+      name: "Chief of Staff",
+      display_name: "Chief of Staff",
+      harness: "codex-native",
+      builtin: false,
+      workspace_hint: "C:/LunaOS/state/agents/cos",
+    });
+  });
+
   it("defaults a missing harness to null", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({

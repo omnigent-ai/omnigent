@@ -3326,6 +3326,13 @@ def _build_host_daemon_env(
 
     env.pop(DISPATCH_TRACEPARENT_ENV_VAR, None)
     env.pop(DISPATCH_TRACESTATE_ENV_VAR, None)
+    # The background host runs with redirected stdout/stderr on Windows.
+    # Python otherwise uses the ANSI code page (commonly cp1252), and a
+    # normal Unicode status message such as "✓ Connected" tears down its
+    # WebSocket tunnel. The daemon must be UTF-8 regardless of the shell that
+    # launched the CLI; the flag is harmless on POSIX.
+    if os.name == "nt":
+        env.setdefault("PYTHONUTF8", "1")
     return env
 
 
@@ -3982,6 +3989,12 @@ def server(
         # `omnigent server --background` is the canonical spelling for the
         # detached server; the deprecated ``server start`` alias routes to the
         # same helper so both spellings can never drift.
+        # The detached launcher owns the child argv. Preserve template paths
+        # so it can append them when it creates the background server.
+        if agent_dirs:
+            os.environ["OMNIGENT_LOCAL_AGENT_DIRS"] = os.pathsep.join(agent_dirs)
+        else:
+            os.environ.pop("OMNIGENT_LOCAL_AGENT_DIRS", None)
         _run_background_server()
         return
 
