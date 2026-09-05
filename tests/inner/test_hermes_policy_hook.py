@@ -22,28 +22,136 @@ def wired_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
 
 
-def _run(monkeypatch: pytest.MonkeyPatch, tool_name: str) -> tuple[dict, bool]:
-    """Run the hook with *tool_name*; return (stdout_json, server_was_called)."""
+_ALLOW_RESULT = {"result": "POLICY_ACTION_ALLOW"}
+
+
+def _invoke(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: object,
+    result: object = _ALLOW_RESULT,
+) -> tuple[dict, bool]:
+    """Run the hook; return its output and whether policy evaluation ran."""
     called = {"hit": False}
 
     def _spy(*_args, **_kwargs):
         called["hit"] = True
 
         class _R:
-            def json(self) -> dict:
-                return {"result": "POLICY_ACTION_ALLOW"}
+            def json(self) -> object:
+                return result
 
-        return _R()
+        return _R(), None
 
     monkeypatch.setattr("omnigent.native_policy_hook.post_evaluate_with_retry", _spy, raising=True)
     monkeypatch.setattr(
         "sys.stdin",
-        io.StringIO(json.dumps({"tool_name": tool_name, "tool_input": {}})),
+        io.StringIO(json.dumps(payload)),
     )
     out = io.StringIO()
     monkeypatch.setattr("sys.stdout", out)
     hermes_policy_hook.main()
     return json.loads(out.getvalue() or "{}"), called["hit"]
+
+
+def _run(monkeypatch: pytest.MonkeyPatch, tool_name: str) -> tuple[dict, bool]:
+    return _invoke(monkeypatch, {"tool_name": tool_name, "tool_input": {}})
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        ("missing_context", "Omnigent policy context is unavailable"),
+        ("malformed_input", "Malformed Hermes tool hook input"),
+        ("non_object_input", "Malformed Hermes tool hook input"),
+        ("evaluation_error", "Omnigent policy evaluation failed"),
+    ],
+)
+def test_authoritative_hook_failures_block(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    reason: str,
+) -> None:
+    monkeypatch.setenv("_OMNIGENT_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
+    payload = json.dumps({"tool_name": "terminal", "tool_input": {}})
+
+    if failure == "missing_context":
+        monkeypatch.delenv("_OMNIGENT_SESSION_ID")
+    elif failure == "malformed_input":
+        payload = "not json"
+    elif failure == "non_object_input":
+        payload = "[]"
+    else:
+
+        def _raise(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("private failure detail")
+
+        monkeypatch.setattr(
+            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            _raise,
+        )
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    out = io.StringIO()
+    monkeypatch.setattr("sys.stdout", out)
+
+    hermes_policy_hook.main()
+
+    assert json.loads(out.getvalue()) == {"decision": "block", "reason": reason}
+
+
+def test_non_object_policy_response_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    wired_env: None,
+) -> None:
+    output, _called = _invoke(
+        monkeypatch,
+        {"tool_name": "terminal", "tool_input": {}},
+        [],
+    )
+    assert output == {
+        "decision": "block",
+        "reason": "Malformed policy response",
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"tool_name": ["terminal"], "tool_input": {}},
+        {"tool_name": "", "tool_input": {}},
+        {"tool_name": "terminal"},
+        {"tool_name": "terminal", "tool_input": None},
+        {"tool_name": "terminal", "tool_input": []},
+    ],
+)
+def test_malformed_tool_fields_block(
+    monkeypatch: pytest.MonkeyPatch,
+    wired_env: None,
+    payload: dict[str, object],
+) -> None:
+    output, _called = _invoke(monkeypatch, payload)
+    assert output == {
+        "decision": "block",
+        "reason": "Malformed Hermes tool hook input",
+    }
+
+
+@pytest.mark.parametrize("result", [{}, {"result": "garbage"}, {"result": []}])
+def test_malformed_policy_action_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    wired_env: None,
+    result: dict[str, object],
+) -> None:
+    output, _called = _invoke(
+        monkeypatch,
+        {"tool_name": "terminal", "tool_input": {}},
+        result,
+    )
+    assert output == {
+        "decision": "block",
+        "reason": "Malformed policy response",
+    }
 
 
 @pytest.mark.parametrize(

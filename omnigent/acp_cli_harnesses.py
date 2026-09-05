@@ -43,6 +43,8 @@ from dataclasses import dataclass
 
 from omnigent.harness_install_spec import HarnessInstallSpec
 
+HERMES_MIN_VERSION = "0.19.1"
+
 
 @dataclass(frozen=True)
 class AcpCliHarness:
@@ -54,11 +56,15 @@ class AcpCliHarness:
     :param args: Argv appended after the binary to start the CLI's ACP stdio
         server, e.g. ``("--acp",)`` or ``("agent", "stdio")``.
     :param aliases: Accepted alternate spellings, canonicalized to the row key.
+    :param policy_hook_authoritative: The agent runs the Omnigent tool policy
+        before its own ACP permission request. The client must answer that
+        secondary consent request without evaluating policy a second time.
     """
 
     install: HarnessInstallSpec
     args: tuple[str, ...]
     aliases: tuple[str, ...] = ()
+    policy_hook_authoritative: bool = False
 
     @property
     def label(self) -> str:
@@ -114,5 +120,25 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
         ),
         args=("agent", "stdio"),
         aliases=("grok-build",),
+    ),
+    # Hermes ACP is the maintained streaming interface. Keep it separate from
+    # the existing ``hermes`` batch harness so choosing one does not silently
+    # change the other's lifecycle.
+    "hermes-acp": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "Hermes ACP",
+            "hermes",
+            None,
+            login_args=("model",),
+            install_hint="curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
+            install_command=(
+                "bash",
+                "-c",
+                "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
+            ),
+            min_version=HERMES_MIN_VERSION,
+        ),
+        args=("acp", "--accept-hooks"),
+        policy_hook_authoritative=True,
     ),
 }

@@ -36,23 +36,32 @@ import os
 import sys
 
 
+def _block(reason: str) -> None:
+    json.dump({"decision": "block", "reason": reason}, sys.stdout)
+
+
 def main() -> None:
     server_url = os.environ.get("_OMNIGENT_SERVER_URL", "")
     session_id = os.environ.get("_OMNIGENT_SESSION_ID", "")
 
     if not server_url or not session_id:
-        # No server wired -- fail open (allow).
-        json.dump({}, sys.stdout)
+        _block("Omnigent policy context is unavailable")
         return
 
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, EOFError, ValueError):
-        json.dump({}, sys.stdout)
+        _block("Malformed Hermes tool hook input")
+        return
+    if not isinstance(payload, dict):
+        _block("Malformed Hermes tool hook input")
         return
 
-    tool_name = payload.get("tool_name") or "unknown"
-    tool_input = payload.get("tool_input") or {}
+    tool_name = payload.get("tool_name")
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_name, str) or not tool_name or not isinstance(tool_input, dict):
+        _block("Malformed Hermes tool hook input")
+        return
 
     # Omnigent relay tools are already gated when the relay dispatches them back
     # through the server's tool path; gating them here too parks a duplicate approval
@@ -69,7 +78,7 @@ def main() -> None:
             "target": "",
             "data": {
                 "name": tool_name,
-                "arguments": tool_input if isinstance(tool_input, dict) else {},
+                "arguments": tool_input,
             },
             "context": {},
         },
@@ -107,8 +116,8 @@ def main() -> None:
             hook_label="hermes pre_tool_call",
             reauth=reauth,
         )
-    except Exception:  # noqa: BLE001 -- fail open on import / unexpected error
-        json.dump({}, sys.stdout)
+    except Exception:  # noqa: BLE001 -- the policy hook must fail closed
+        _block("Omnigent policy evaluation failed")
         return
 
     if resp is None:
@@ -134,9 +143,21 @@ def main() -> None:
             sys.stdout,
         )
         return
+    if not isinstance(result, dict):
+        _block("Malformed policy response")
+        return
 
-    action = result.get("result", "POLICY_ACTION_ALLOW")
+    action = result.get("result")
     reason = result.get("reason", "")
+
+    if not isinstance(action, str) or action not in {
+        "POLICY_ACTION_ALLOW",
+        "POLICY_ACTION_UNSPECIFIED",
+        "POLICY_ACTION_DENY",
+        "POLICY_ACTION_ASK",
+    }:
+        _block("Malformed policy response")
+        return
 
     if action == "POLICY_ACTION_DENY":
         out: dict[str, str] = {"decision": "block"}
@@ -157,7 +178,7 @@ def main() -> None:
             out["reason"] = f"Tool '{tool_name}' requires approval"
         json.dump(out, sys.stdout)
     else:
-        # ALLOW or UNSPECIFIED — empty JSON means no objection.
+        # ALLOW or UNSPECIFIED means no objection.
         json.dump({}, sys.stdout)
 
 
