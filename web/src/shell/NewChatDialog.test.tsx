@@ -301,6 +301,12 @@ describe("isValidWorkspace", () => {
     expect(isValidWorkspace("/")).toBe(true);
   });
 
+  it("accepts Windows drive-letter and UNC paths", () => {
+    expect(isValidWorkspace("C:\\Users\\corey\\projects\\myapp")).toBe(true);
+    expect(isValidWorkspace("D:/projects/myapp")).toBe(true);
+    expect(isValidWorkspace("\\\\server\\share\\project")).toBe(true);
+  });
+
   it("trims whitespace before checking", () => {
     // Browsers paste with stray whitespace; trim must run before
     // the shape check or "  /Users/corey  " would be rejected.
