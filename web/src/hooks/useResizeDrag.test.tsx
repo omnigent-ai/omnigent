@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { useResizeDrag } from "./useResizeDrag";
@@ -121,6 +121,16 @@ function LifecycleHandle({
 }
 
 describe("useResizeDrag lifecycle callbacks", () => {
+  it("preserves handler identity across unchanged rerenders", () => {
+    const { result, rerender } = renderHook(() => useResizeDrag({ onMove: vi.fn() }));
+    const handlers = result.current.handleProps;
+
+    rerender();
+    expect(result.current.handleProps).toBe(handlers);
+    rerender();
+    expect(result.current.handleProps).toBe(handlers);
+  });
+
   it("fires onStart at pointer down and onCommit (not onCancel) on release", () => {
     const onStart = vi.fn();
     const onCommit = vi.fn();
