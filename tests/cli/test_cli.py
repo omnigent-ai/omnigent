@@ -3439,6 +3439,104 @@ def test_preregister_agent_stored_tarball_rehydrates(tmp_path: Path) -> None:
     assert spec.name == "supervisor-probe"
 
 
+def _write_pack_with_function_policy(root: Path, *, policy_path: str) -> Path:
+    """Create ``<root>/packrepo/agents/mypack`` with a function guardrail.
+
+    Mirrors the pack layout registration receives: the pack directory
+    ships its policy module under ``policies/`` while the guardrail's
+    dotted path is written relative to the pack author's repo root.
+
+    :param root: Temp directory to build under.
+    :param policy_path: The ``function.path`` to declare.
+    :returns: The pack directory to pass to ``_preregister_agent``.
+    """
+    pack_dir = root / "packrepo" / "agents" / "mypack"
+    policies_dir = pack_dir / "policies"
+    policies_dir.mkdir(parents=True)
+    (policies_dir / "__init__.py").write_text("")
+    (policies_dir / "custom_policy.py").write_text(
+        "def my_factory(keyword='forbidden'):\n"
+        "    def policy(event):\n"
+        "        return {'result': 'ALLOW'}\n"
+        "    return policy\n",
+    )
+    _write_config(
+        pack_dir,
+        {
+            "spec_version": 1,
+            "name": "mypack",
+            "executor": {"config": {"harness": "openai-agents"}},
+            "guardrails": {
+                "policies": {
+                    "pack_guard": {
+                        "type": "function",
+                        "on": ["request"],
+                        "function": {
+                            "path": policy_path,
+                            "arguments": {"keyword": "forbidden"},
+                        },
+                    },
+                },
+            },
+        },
+    )
+    return pack_dir
+
+
+def test_preregister_agent_accepts_pack_local_policy_function(tmp_path: Path) -> None:
+    """
+    A pack whose guardrail names its OWN bundled policy module by a
+    repo-root-relative dotted path registers cleanly: registration
+    resolves the path against the materialized bundle, not just the
+    server process ``sys.path``.
+    """
+    pack_dir = _write_pack_with_function_policy(
+        tmp_path,
+        policy_path="agents.mypack.policies.custom_policy.my_factory",
+    )
+
+    agent_store = _RecordingAgentStore()
+    artifact_store = _RecordingArtifactStore()
+    agent_cache = _RecordingAgentCache()
+
+    agent_id = _preregister_agent(pack_dir, agent_store, artifact_store, agent_cache)
+
+    assert agent_id is not None
+    assert len(agent_store.created) == 1
+
+
+def test_preregister_agent_rejects_unresolvable_policy_function(tmp_path: Path) -> None:
+    """
+    A guardrail whose function path resolves neither from the server
+    environment nor from the bundle must fail REGISTRATION, loudly.
+
+    Input policies evaluate in the server process; letting this pack
+    register silently means every message on it is fail-closed denied
+    with ``Denied by policy (policy evaluation error).`` and the
+    operator gets no signal until the first turn.
+    """
+    pack_dir = _write_pack_with_function_policy(
+        tmp_path,
+        policy_path="agents.otherpack.policies.missing_module.my_factory",
+    )
+
+    agent_store = _RecordingAgentStore()
+    artifact_store = _RecordingArtifactStore()
+    agent_cache = _RecordingAgentCache()
+
+    with pytest.raises(ClickException, match=r"pack_guard") as excinfo:
+        _preregister_agent(pack_dir, agent_store, artifact_store, agent_cache)
+
+    # The message must be actionable: name the agent, policy, and path.
+    message = str(excinfo.value)
+    assert "mypack" in message
+    assert "missing_module" in message
+    # Nothing half-registered.
+    assert agent_store.created == []
+    assert artifact_store.puts == []
+
+
+
 # ── no-AGENT harness launch ───────────────────────────
 
 

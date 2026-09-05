@@ -244,6 +244,18 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         )
     compaction = _parse_compaction(raw.get("compaction"))
     guardrails = _parse_guardrails(raw.get("guardrails"), expand_env=expand_env)
+    # Stamp bundle provenance on function policies so a pack-local
+    # ``function.path`` (a policy module shipped inside this bundle)
+    # resolves in the evaluating process regardless of its cwd /
+    # ``sys.path``. Trusted loads only: ``expand_env`` is already the
+    # operator-authored discriminator (True for ``--agent`` / local
+    # runs, False for tenant-supplied bundles), and the fallback
+    # executes bundle code in the evaluating process.
+    if expand_env and guardrails is not None and guardrails.policies:
+        bundle_root = str(root.resolve())
+        for policy_spec in guardrails.policies:
+            if isinstance(policy_spec, FunctionPolicySpec):
+                policy_spec.bundle_root = bundle_root
     os_env = _parse_os_env(raw.get("os_env"))
     terminals = _parse_terminals(raw.get("terminals"))
     params = raw.get("params", {})

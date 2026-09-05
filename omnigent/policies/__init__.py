@@ -28,6 +28,7 @@ from omnigent.policies.base import Policy
 from omnigent.policies.function import (
     FunctionPolicy,
     resolve_function_policy,
+    resolve_function_target,
 )
 from omnigent.policies.schema import (
     PolicyCallable,
@@ -56,4 +57,5 @@ __all__ = [
     "PolicyResult",
     "StateUpdateEntry",
     "resolve_function_policy",
+    "resolve_function_target",
 ]

@@ -1570,6 +1570,14 @@ def _preregister_agent(  # type: ignore[explicit-any]  # agent_store / artifact_
         # than round-tripping through extract.
         spec = load(bundle_dir)
 
+        # Fail loud at startup when a guardrail function policy cannot
+        # be resolved: input policies evaluate in THIS server process,
+        # so an unresolvable path means every turn on the agent would
+        # be fail-closed denied with no signal until the first message.
+        # Runs inside the tempdir block — bundle-local resolution reads
+        # the materialized bundle.
+        _validate_spec_policy_functions(spec, agent_source)
+
     if spec.name is None:
         click.echo(f"  warning: {agent_source} has no name, skipping")
         return None
@@ -1621,6 +1629,60 @@ def _preregister_agent(  # type: ignore[explicit-any]  # agent_store / artifact_
     )
     click.echo(f"  agent: {spec.name} (from {agent_source})")
     return agent_id
+
+
+def _validate_spec_policy_functions(
+    spec: Any,  # type: ignore[explicit-any]  # AgentSpec typed Any to avoid import cycle
+    agent_source: Path,
+) -> None:
+    """
+    Resolve every guardrail function-policy path in *spec*, failing
+    startup on the first unresolvable one.
+
+    Input policies evaluate in the server process, so a dotted path
+    that resolves neither from the server environment nor from the
+    agent bundle would fail-closed deny every message on this agent
+    (``Denied by policy (policy evaluation error).``) with no signal
+    until the first turn. Surface it at ``--agent`` registration
+    instead. Walks the root spec and every sub-agent; resolves the
+    module and attribute only — factories are not invoked here.
+
+    :param spec: The loaded :class:`~omnigent.spec.types.AgentSpec`.
+    :param agent_source: The ``--agent`` path, for the error message.
+    :raises click.ClickException: When a policy's function path
+        cannot be resolved; names the agent, policy, and path.
+    """
+    from omnigent.policies.function import resolve_function_target
+    from omnigent.spec.types import FunctionPolicySpec
+
+    stack = [spec]
+    while stack:
+        current = stack.pop()
+        stack.extend(current.sub_agents or [])
+        guardrails = current.guardrails
+        if guardrails is None or not guardrails.policies:
+            continue
+        for policy_spec in guardrails.policies:
+            if not isinstance(policy_spec, FunctionPolicySpec):
+                continue
+            function_ref = policy_spec.function
+            if function_ref is None:
+                continue
+            try:
+                resolve_function_target(
+                    function_ref.path,
+                    bundle_root=policy_spec.bundle_root,
+                )
+            except Exception as exc:  # noqa: BLE001 - any resolution failure denies every turn
+                raise click.ClickException(
+                    f"--agent {agent_source}: agent {current.name!r} policy "
+                    f"{policy_spec.name!r} references {function_ref.path!r}, "
+                    f"which cannot be resolved from the server environment "
+                    f"or the agent bundle ({type(exc).__name__}: {exc}). "
+                    f"Every message on this agent would be denied "
+                    f"fail-closed; fix the policy path or ship the module "
+                    f"inside the pack."
+                ) from exc
 
 
 def _format_version() -> str:

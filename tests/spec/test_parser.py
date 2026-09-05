@@ -9,7 +9,13 @@ import yaml
 
 from omnigent.errors import OmnigentError
 from omnigent.spec.parser import _parse_skill, discover_host_skills, parse
-from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
+from omnigent.spec.types import (
+    ApiKeyAuth,
+    DatabricksAuth,
+    FunctionPolicySpec,
+    ProviderAuth,
+    SharePolicy,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -4286,3 +4292,71 @@ def test_parse_executor_reasoning_effort_absent(tmp_path: Path) -> None:
     spec = parse(tmp_path)
 
     assert spec.executor.reasoning_effort is None
+
+
+# ── Function-policy bundle provenance ─────────────────────────────
+
+
+def _guarded_config(name: str) -> dict[str, object]:
+    """Config dict with one function guardrail by pack-local dotted path."""
+    return {
+        "spec_version": 1,
+        "name": name,
+        "guardrails": {
+            "policies": {
+                "pack_guard": {
+                    "type": "function",
+                    "on": ["request"],
+                    "function": {
+                        "path": "agents.mypack.policies.custom_policy.my_factory",
+                        "arguments": {"keyword": "forbidden"},
+                    },
+                },
+            },
+        },
+    }
+
+
+def test_parse_stamps_bundle_root_on_function_policies(tmp_path: Path) -> None:
+    """A trusted parse records where the bundle lives on each function
+    policy, so a pack-local ``function.path`` (module shipped inside
+    the bundle) resolves at evaluation time regardless of the
+    evaluating process's cwd/``sys.path``."""
+    (tmp_path / "config.yaml").write_text(yaml.dump(_guarded_config("pack")))
+    spec = parse(tmp_path)
+    assert spec.guardrails is not None and spec.guardrails.policies is not None
+    policy = spec.guardrails.policies[0]
+    assert isinstance(policy, FunctionPolicySpec)
+    assert policy.bundle_root == str(tmp_path.resolve())
+
+
+def test_parse_untrusted_load_leaves_bundle_root_unset(tmp_path: Path) -> None:
+    """``expand_env=False`` marks a tenant-supplied bundle; the bundle
+    fallback executes bundle code in the evaluating process, so it
+    must stay disabled (``bundle_root=None``) for untrusted specs."""
+    (tmp_path / "config.yaml").write_text(yaml.dump(_guarded_config("pack")))
+    spec = parse(tmp_path, expand_env=False)
+    assert spec.guardrails is not None and spec.guardrails.policies is not None
+    policy = spec.guardrails.policies[0]
+    assert isinstance(policy, FunctionPolicySpec)
+    assert policy.bundle_root is None
+
+
+def test_parse_stamps_sub_agent_policies_with_their_own_root(tmp_path: Path) -> None:
+    """A sub-agent's guardrail policies resolve against the SUB-AGENT
+    directory (its own bundle root within the parent bundle), not the
+    parent's."""
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"spec_version": 1, "name": "parent"})
+    )
+    child_dir = tmp_path / "agents" / "child"
+    child_dir.mkdir(parents=True)
+    (child_dir / "config.yaml").write_text(yaml.dump(_guarded_config("child")))
+
+    spec = parse(tmp_path)
+    assert len(spec.sub_agents) == 1
+    child = spec.sub_agents[0]
+    assert child.guardrails is not None and child.guardrails.policies is not None
+    policy = child.guardrails.policies[0]
+    assert isinstance(policy, FunctionPolicySpec)
+    assert policy.bundle_root == str(child_dir.resolve())
