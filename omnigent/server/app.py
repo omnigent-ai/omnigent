@@ -1522,6 +1522,15 @@ def create_app(
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
+            # The cancelled publisher bridged its final counter deltas into
+            # the OTel instruments; force-flush so that last interval —
+            # including inline request.duration records — reaches the
+            # collector before the process exits. Uvicorn's signal path
+            # re-raises SIGTERM after serve() returns, skipping the SDK's
+            # atexit flush, so without this the tail window is dropped.
+            from omnigent.runtime import telemetry
+
+            await asyncio.to_thread(telemetry.flush_metrics)
             # Stop in-flight background managed-sandbox launches so a
             # slow provision doesn't outlive the ASGI shutdown (the
             # sandbox itself, if already provisioned, is reaped by the

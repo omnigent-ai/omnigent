@@ -1109,9 +1109,16 @@ async def publish_server_metrics_periodically(
     :param interval_seconds: Delay between OTEL snapshots in seconds,
         e.g. ``10.0``.
     """
-    while True:
-        await asyncio.sleep(interval_seconds)
+    try:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            otel_publisher.publish(metrics.snapshot())
+    except asyncio.CancelledError:
+        # Graceful shutdown cancels this task between ticks; publish one
+        # final snapshot so requests handled since the last tick still
+        # reach the exported counters instead of being dropped.
         otel_publisher.publish(metrics.snapshot())
+        raise
 
 
 def _load_average() -> SystemLoadAverage | None:
