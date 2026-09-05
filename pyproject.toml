@@ -32,8 +32,10 @@ dependencies = [
     "pyyaml>=6.0,<7",
     # OpenClaw stores its wrapped acpx registry as JSON5.
     "json5>=0.10,<1",
-    # openai-agents<0.18.2 omits a field required by openai>=2.45.
-    # Keep this cap until the websockets<15 compatibility pin can be lifted.
+    # openai-agents<0.18.2 omits a field required by openai>=2.45. The
+    # websockets<15 pin that used to block lifting this cap is gone
+    # (websockets is now >=15.0.1 with proxy=None at every client connect);
+    # the openai/openai-agents bump can now proceed on its own schedule.
     "openai>=1.0,<2.45",
     # >=14: the `e2b` extra's SDK (>=2.26) needs rich>=14 (was >=13,<14).
     "rich>=14,<15",
@@ -41,9 +43,12 @@ dependencies = [
     "mcp>=1.0,<2",
     "starlette>=1.0.1,<2",
     "uvicorn[standard]>=0.30,<1",
-    # websockets >=15 asyncio client hangs on macOS before emitting any handshake
-    # bytes; pin below 15 until upstream fixes the regression (see issue #1514).
-    "websockets>=10.4,<15",
+    # websockets 15.0 defaults connect() to proxy=True, which routes loopback
+    # tunnels through any configured system proxy on macOS and stalls the
+    # handshake (issue #1514). Every omnigent client connect() passes
+    # proxy=None to keep the pre-15 direct-connection behavior, which is what
+    # allows this floor. Capped <16 to match cognee's websockets window.
+    "websockets>=15.0.1,<16",
     "httpx>=0.27,<1",
     "ftfy>=6.0",
     # Portable zombie-aware PID liveness checks for the host daemon
@@ -261,6 +266,13 @@ hindsight = ["hindsight-client>=0.4.0"]
 # needs no client at runtime. Installing this extra is the opt-in signal that
 # surfaces both tools in the onboarding assistant's builtin list.
 nimble = ["nimble-python>=1.2.0,<2"]
+# Cognee knowledge-graph memory built-in tools (cognee_search / cognee_remember)
+# with an embedded local store under the Omnigent data dir. The tools and the
+# runtime memory gate import cognee lazily, so only users who enable a cognee
+# memory tool need this extra. Bounded to the Python versions we ship wheels
+# for: on the resolver's speculative >=3.15 split, cognee's dep tree forces
+# websockets>=16, colliding with our websockets<16 cap.
+cognee = ["cognee>=1,<2 ; python_version < '3.15'"]
 # Slack integration (`omni integration slack`). The @omnigent socket-mode bot
 # lives in the separate `omnigent-slack` package (heavy deps — slack_bolt /
 # aiohttp — kept out of the baseline install). The CLI launches it as a

@@ -4864,6 +4864,8 @@ def test_websocket_connect_sets_short_close_timeout(monkeypatch: pytest.MonkeyPa
             "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
         },
         "close_timeout": claude_native._CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
+        # Never route the attach through a system/env proxy (issue #1514).
+        "proxy": None,
     }
 
 

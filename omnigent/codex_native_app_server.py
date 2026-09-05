@@ -574,6 +574,9 @@ class CodexAppServerClient:
                 self._ws_url,
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
+                # Local app-server socket — never route through a system/env
+                # proxy (macOS does not bypass loopback; issue #1514).
+                proxy=None,
             )
         else:
             self._ws = await websockets.unix_connect(

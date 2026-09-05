@@ -833,6 +833,9 @@ async def _serve_tunnel_once(
         close_timeout=close_timeout,
         max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
         ssl=ssl_ctx,
+        # Never route through a system/env proxy: macOS does not bypass
+        # 127.0.0.1, so a configured proxy stalls the handshake (issue #1514).
+        proxy=None,
         # Protocol keepalive aligned to the server's 90 s app-level budget (not the
         # 20 s library default that drops a busy-but-healthy tunnel — issue #1116).
         # Also the runner's only liveness probe for a silently-dead server.

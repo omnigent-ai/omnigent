@@ -241,6 +241,26 @@ def test_subagent_wake_instruction_added_for_dispatching_agents(
     assert build_instructions_nullable(unauthored, None, []) == SUBAGENT_WAKE_NOTICE_INSTRUCTION
 
 
+def test_cognee_memory_instruction_rides_the_spec_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec that enables a cognee builtin gets the memory announcement.
+
+    The gating lives in ``omnigent.runtime.memory`` (builtin declared AND the
+    availability gate open); composition only has to route the hook. Force the
+    gate open so the test doesn't depend on the optional extra being installed.
+    """
+    import omnigent.runtime.memory as memory_mod
+
+    monkeypatch.setattr(memory_mod, "cognee_available", lambda: True)
+    with_memory = _spec("Agent prompt", builtins=("cognee_search",))
+    result = build_instructions(with_memory, None, [])
+    assert result == f"Agent prompt\n\n{memory_mod.COGNEE_MEMORY_INSTRUCTION}"
+
+    without_memory = _spec("Agent prompt")
+    assert build_instructions(without_memory, None, []) == "Agent prompt"
+
+
 def test_subagent_wake_notice_shape_matches_runner_notice() -> None:
     """
     The announced shape must track the notice the runner actually posts.

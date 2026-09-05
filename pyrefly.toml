@@ -22,6 +22,8 @@ ignore-missing-imports = [
     "boxlite.*",
     "blaxel",
     "blaxel.*",
+    "cognee",
+    "cognee.*",
     "copilot",
     "copilot.*",
     "cursor_sdk",

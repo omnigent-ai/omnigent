@@ -45,7 +45,7 @@ from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import FrameType
-from typing import TYPE_CHECKING, Protocol, TextIO, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Protocol, TextIO, TypeAlias, cast
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
@@ -6127,26 +6127,37 @@ def _websocket_connect(
     # whose OpenSSL default cert path is empty. ws:// passes ssl=None (the
     # library default — no TLS). See omnigent/tls.py and issue #1730.
     ssl_ctx = client_ssl_context() if attach_url.startswith("wss://") else None
-    try:
-        return cast(
-            contextlib.AbstractAsyncContextManager[_WebSocketClient],
-            websockets.connect(
-                attach_url,
-                additional_headers=handshake_headers,
-                close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
-                ssl=ssl_ctx,
-            ),
-        )
-    except TypeError:
-        return cast(
-            contextlib.AbstractAsyncContextManager[_WebSocketClient],
-            websockets.connect(
-                attach_url,
-                extra_headers=handshake_headers,
-                close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
-                ssl=ssl_ctx,
-            ),
-        )
+    # Kwarg cascade across websockets releases: >=15 (additional_headers +
+    # proxy — passed as None so a system/env proxy never stalls the loopback
+    # handshake, issue #1514), 14.x (additional_headers, no proxy kwarg),
+    # then the legacy extra_headers name.
+    kwarg_variants: list[dict[str, Any]] = [
+        {"additional_headers": handshake_headers, "proxy": None},
+        {"additional_headers": handshake_headers},
+        {"extra_headers": handshake_headers},
+    ]
+    for variant in kwarg_variants[:-1]:
+        try:
+            return cast(
+                contextlib.AbstractAsyncContextManager[_WebSocketClient],
+                websockets.connect(
+                    attach_url,
+                    close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
+                    ssl=ssl_ctx,
+                    **variant,
+                ),
+            )
+        except TypeError:
+            continue
+    return cast(
+        contextlib.AbstractAsyncContextManager[_WebSocketClient],
+        websockets.connect(
+            attach_url,
+            close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
+            ssl=ssl_ctx,
+            **kwarg_variants[-1],
+        ),
+    )
 
 
 async def _stdin_to_websocket(
