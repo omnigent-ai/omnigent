@@ -14,6 +14,24 @@
 const STORAGE_KEY = "omnigent:last-host-choice";
 const SANDBOX_PROVIDER_KEY = "omnigent:last-sandbox-provider";
 
+// Desktop builds predating the bare-hex host-id format persisted the pick as
+// "host_<32-hex>", while /v1/hosts only ever reports bare ids — so the stored
+// spelling can never match the live list and the picker would wait on it
+// forever. Matches exactly the legacy shape; anything else (including the
+// sandbox sentinel) passes through verbatim.
+const LEGACY_HOST_ID = /^host_([0-9a-f]{32})$/;
+
+/**
+ * Strip the legacy `host_` prefix from a stored host id, mirroring
+ * `localHostId()` in the Electron shell and `_validated_host_id` in
+ * omnigent/host/identity.py, so a pick persisted by a pre-migration build
+ * still matches the bare-hex ids `/v1/hosts` reports.
+ */
+function normalizeHostChoice(choice: string): string {
+  const match = LEGACY_HOST_ID.exec(choice);
+  return match ? match[1] : choice;
+}
+
 // Stored in place of a host id when the user picked the managed-sandbox option,
 // which has no host id of its own (the server provisions the host at create
 // time). A reserved sentinel so it can never collide with a real host id.
@@ -28,7 +46,8 @@ export const SANDBOX_HOST_CHOICE = "__sandbox__";
 export function readLastHostChoice(): string | null {
   if (typeof window === "undefined") return null;
   try {
-    return window.localStorage.getItem(STORAGE_KEY);
+    const stored = window.localStorage.getItem(STORAGE_KEY);
+    return stored === null ? null : normalizeHostChoice(stored);
   } catch {
     return null;
   }
