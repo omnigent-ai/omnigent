@@ -18,6 +18,7 @@ import httpx
 
 from omnigent._native_post_delivery import (
     append_dead_letter,
+    encode_bounded_session_event,
     post_external_session_status,
     post_may_have_been_delivered,
 )
@@ -4082,16 +4083,23 @@ async def _post_external_conversation_item(
             attributes={"omnigent.response_id": item.response_id},
         ),
     ):
-        resp = await client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={
+        # Bound the transfer under the managed-transport message-size quota:
+        # an oversized POST hangs at the deployment proxy, surfaces as an
+        # ambiguous ReadTimeout, and would drop the item from the web UI.
+        body = encode_bounded_session_event(
+            {
                 "type": "external_conversation_item",
                 "data": {
                     "item_type": item.item_type,
                     "item_data": item.data,
                     "response_id": item.response_id,
                 },
-            },
+            }
+        )
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            content=body,
+            headers={"Content-Type": "application/json"},
         )
         resp.raise_for_status()
 

@@ -20,8 +20,11 @@ the codex/antigravity forwarders so a single implementation is maintained.
 from __future__ import annotations
 
 import contextlib
+import copy
+import functools
 import json
 import logging
+import operator
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
@@ -168,6 +171,116 @@ def post_may_have_been_delivered(exc: httpx.HTTPError) -> bool:
     except RuntimeError:
         return False
     return True
+
+
+# The managed-deployment transport (the Databricks Apps proxy) enforces a
+# ~1 MiB per-message quota IN FRONT of the server: an oversized event POST
+# hangs at the proxy, surfaces as an ambiguous ``httpx.ReadTimeout``, and the
+# no-retry skip above then silently drops the item from the web transcript.
+# Producers must bound each event POST under that quota before sending.
+TRANSPORT_MESSAGE_QUOTA_BYTES = 1024 * 1024
+# Headroom under the quota for request headers and proxy framing.
+_EVENT_POST_HEADROOM_BYTES = 64 * 1024
+MAX_EVENT_POST_BYTES = TRANSPORT_MESSAGE_QUOTA_BYTES - _EVENT_POST_HEADROOM_BYTES
+
+# Serialized allowance for one truncation marker (text plus JSON escaping).
+_TRUNCATION_MARKER_ALLOWANCE_BYTES = 192
+# Bounding passes before giving up on a payload whose size lives in deep
+# structure rather than a few dominant text fields.
+_MAX_BOUNDING_PASSES = 16
+
+
+def _dump_event(payload: dict[str, object]) -> bytes:
+    """Serialize one session-event payload compactly for the wire."""
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _truncate_text_for_transfer(value: str, keep_bytes: int) -> str:
+    """Cap *value* to ``keep_bytes`` UTF-8 on a char boundary with an explicit marker."""
+    encoded = value.encode("utf-8")
+    kept = encoded[: max(keep_bytes, 0)].decode("utf-8", errors="ignore")
+    omitted = len(encoded) - len(kept.encode("utf-8"))
+    return (
+        f"{kept}\n\n[truncated by omnigent: {omitted} of {len(encoded)} bytes omitted to fit "
+        "the server transfer limit; the full text remains in the native session]"
+    )
+
+
+def _largest_string_leaf(
+    root: object,
+) -> tuple[Callable[[str], None], str] | None:
+    """
+    Locate the longest string leaf under *root*.
+
+    :param root: Parsed JSON payload (dicts/lists/scalars).
+    :returns: ``(replace, value)`` where ``replace`` swaps the leaf in its
+        container, or ``None`` when the payload holds no strings.
+    """
+    best: tuple[Callable[[str], None], str] | None = None
+    stack: list[object] = [root]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+                elif isinstance(value, str) and (best is None or len(value) > len(best[1])):
+                    best = (functools.partial(operator.setitem, node, key), value)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+                elif isinstance(value, str) and (best is None or len(value) > len(best[1])):
+                    best = (functools.partial(operator.setitem, node, index), value)
+    return best
+
+
+def encode_bounded_session_event(payload: dict[str, object]) -> bytes:
+    """
+    Serialize a session-event payload bounded under the transport quota.
+
+    A sub-quota payload is returned as-is. An oversized one has its
+    dominant text field(s) capped with an explicit truncation marker —
+    mirroring :func:`omnigent.runtime.tool_output.cap_tool_output`'s
+    display-mirror bound — so the item still reaches the web-visible
+    transcript instead of hanging at the deployment proxy and being
+    dropped as an ambiguous delivery. The caller's *payload* is never
+    mutated.
+
+    :param payload: Full event body, e.g. ``{"type":
+        "external_conversation_item", "data": {...}}``.
+    :returns: Compact UTF-8 JSON bytes for the POST body.
+    """
+    body = _dump_event(payload)
+    if len(body) <= MAX_EVENT_POST_BYTES:
+        return body
+    original_size = len(body)
+    bounded = copy.deepcopy(payload)
+    for _ in range(_MAX_BOUNDING_PASSES):
+        leaf = _largest_string_leaf(bounded)
+        if leaf is None:
+            break
+        replace, value = leaf
+        overage = len(body) - MAX_EVENT_POST_BYTES
+        keep = len(value.encode("utf-8")) - overage - _TRUNCATION_MARKER_ALLOWANCE_BYTES
+        replace(_truncate_text_for_transfer(value, keep))
+        body = _dump_event(bounded)
+        if len(body) <= MAX_EVENT_POST_BYTES:
+            _logger.warning(
+                "bounded an oversized session event under the transport quota: "
+                "type=%s original_bytes=%d bounded_bytes=%d",
+                payload.get("type"),
+                original_size,
+                len(body),
+            )
+            return body
+    _logger.warning(
+        "could not bound an oversized session event under the transport quota; "
+        "sending as-is: type=%s bytes=%d",
+        payload.get("type"),
+        len(body),
+    )
+    return body
 
 
 async def post_external_session_status(

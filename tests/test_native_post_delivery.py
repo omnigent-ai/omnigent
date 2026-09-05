@@ -12,9 +12,11 @@ from omnigent._native_post_delivery import (
     _DEAD_LETTER_BACKUP_FILE,
     _DEAD_LETTER_FILE,
     _DEAD_LETTER_MAX_BYTES,
+    MAX_EVENT_POST_BYTES,
     RepostResult,
     _dead_letter_record_replayable,
     append_dead_letter,
+    encode_bounded_session_event,
     post_external_session_status,
     post_may_have_been_delivered,
     replay_dead_letters,
@@ -676,3 +678,77 @@ async def test_post_external_session_status_attaches_failure_reason() -> None:
         "output": "transcript item item-1 rejected",
     }
     assert captured[1]["data"] == {"status": "idle"}
+
+
+def _item_event(item_data: dict[str, object], *, item_type: str = "message") -> dict[str, object]:
+    """Build one ``external_conversation_item`` event body around *item_data*."""
+    return {
+        "type": "external_conversation_item",
+        "data": {"item_type": item_type, "item_data": item_data, "response_id": "resp_1"},
+    }
+
+
+def test_encode_bounded_event_passes_small_payload_through() -> None:
+    """A sub-quota payload serializes unchanged and round-trips."""
+    payload = _item_event(
+        {"role": "assistant", "model": "claude", "content": [{"type": "text", "text": "hi"}]}
+    )
+    body = encode_bounded_session_event(payload)
+    assert len(body) <= MAX_EVENT_POST_BYTES
+    assert json.loads(body) == payload
+
+
+def test_encode_bounded_event_caps_oversized_message_text() -> None:
+    """An over-quota message is capped under the transport bound, keeping its head.
+
+    The managed-deployment proxy drops any event POST larger than ~1 MiB, so an
+    unbounded body would hang, surface as an ambiguous ReadTimeout, and lose
+    the whole item from the web transcript. The head of the text plus an
+    explicit truncation marker must survive instead.
+    """
+    head = "RESPONSE-HEAD-MARKER "
+    text = head + ("x" * (2 * 1024 * 1024))
+    content_block: dict[str, object] = {"type": "text", "text": text}
+    payload = _item_event({"role": "assistant", "model": "claude", "content": [content_block]})
+    body = encode_bounded_session_event(payload)
+    assert len(body) <= MAX_EVENT_POST_BYTES
+    decoded = json.loads(body)
+    bounded_text = decoded["data"]["item_data"]["content"][0]["text"]
+    assert bounded_text.startswith(head)
+    assert "[truncated by omnigent:" in bounded_text
+    # The envelope survives intact around the capped text.
+    assert decoded["type"] == "external_conversation_item"
+    assert decoded["data"]["item_type"] == "message"
+    assert decoded["data"]["response_id"] == "resp_1"
+    # The caller's payload is never mutated.
+    assert content_block["text"] == text
+
+
+def test_encode_bounded_event_caps_only_the_dominant_field() -> None:
+    """Capping targets the oversized string; sibling fields stay verbatim."""
+    payload = _item_event(
+        {"call_id": "call_abc123", "output": "y" * (2 * 1024 * 1024)},
+        item_type="function_call_output",
+    )
+    body = encode_bounded_session_event(payload)
+    assert len(body) <= MAX_EVENT_POST_BYTES
+    decoded = json.loads(body)
+    assert decoded["data"]["item_data"]["call_id"] == "call_abc123"
+    assert "[truncated by omnigent:" in decoded["data"]["item_data"]["output"]
+
+
+def test_encode_bounded_event_truncates_multibyte_text_cleanly() -> None:
+    """Truncating multibyte text lands on a char boundary and stays valid JSON."""
+    payload = _item_event(
+        {
+            "role": "assistant",
+            "model": "claude",
+            "content": [{"type": "text", "text": "日本語のテキスト" * 200_000}],
+        }
+    )
+    body = encode_bounded_session_event(payload)
+    assert len(body) <= MAX_EVENT_POST_BYTES
+    decoded = json.loads(body)
+    bounded_text = decoded["data"]["item_data"]["content"][0]["text"]
+    assert bounded_text.startswith("日本語")
+    assert "[truncated by omnigent:" in bounded_text
