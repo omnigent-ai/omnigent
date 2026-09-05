@@ -461,7 +461,7 @@ def _disable_codex_startup_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _fake_trust_policy_hooks)
 
 
-@pytest.mark.parametrize("model", [None, "system.ai.gpt-test"])
+@pytest.mark.parametrize("model", [None, "system.ai.gpt-test", "custom.catalog.model"])
 def test_build_codex_native_server_profile_error_names_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -498,7 +498,9 @@ def test_build_codex_native_server_profile_error_names_profile(
         )
 
 
-@pytest.mark.parametrize("model", ["test-model", "system.ai.gpt-test"])
+@pytest.mark.parametrize(
+    "model", ["test-model", "system.ai.gpt-test", "custom.catalog.model", "vendor/model:revision"]
+)
 def test_build_codex_native_server_uses_profile_host_without_static_token(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -556,10 +558,7 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     assert app_server.env["DATABRICKS_HOST"] == "https://example.cloud.databricks.com"
     assert app_server.pinned_model == model
     assert f"model={json.dumps(model)}" in app_server.config_overrides
-    if model.startswith("system.ai."):
-        resolve_credentials.assert_not_called()
-    else:
-        resolve_credentials.assert_called_once_with("oss")
+    resolve_credentials.assert_not_called()
     assert "https://example.cloud.databricks.com/ai-gateway/codex/v1" in overrides
     assert 'databricks auth token --profile \\"oss\\"' in overrides
 
@@ -2447,13 +2446,20 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
 
 @pytest.mark.parametrize(
     "requested",
-    ["system.ai.gpt-test", "system.ai.custom-model", "system.ai.gpt-999-1"],
+    [
+        "system.ai.gpt-test",
+        "custom.catalog.model",
+        "vendor/model:revision",
+        "opaque-model-id",
+        "databricks-gpt-test",
+        "gpt-test",
+    ],
 )
-def test_resolve_databricks_codex_model_preserves_canonical_pin_without_discovery(
+def test_resolve_databricks_codex_model_preserves_explicit_pin_without_discovery(
     monkeypatch: pytest.MonkeyPatch,
     requested: str,
 ) -> None:
-    """Canonical pins launch without SDK metadata/auth or model rediscovery."""
+    """Explicit IDs are opaque, independent of naming or catalog availability."""
     from omnigent.codex_native_app_server import _resolve_databricks_codex_model
 
     resolve_credentials = Mock(side_effect=RuntimeError("SDK metadata is unreachable"))
@@ -2478,27 +2484,11 @@ def test_resolve_databricks_codex_model_preserves_canonical_pin_without_discover
     read_cache.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("requested", "expected"),
-    [
-        (None, "system.ai.gpt-5-6-sol"),
-        ("", "system.ai.gpt-5-6-sol"),
-        ("databricks-gpt-5-6-luna", "system.ai.gpt-5-6-luna"),
-        ("gpt-5-6-luna", "system.ai.gpt-5-6-luna"),
-        ("databricks-gpt-9-9", "databricks-gpt-9-9"),
-    ],
-)
-def test_resolve_databricks_codex_model_matches_servable_ids(
+@pytest.mark.parametrize("requested", [None, ""])
+def test_resolve_databricks_codex_model_discovers_missing_default(
     requested: str | None,
-    expected: str,
 ) -> None:
-    """The codex launch model resolves against what the workspace serves.
-
-    An unset model takes the newest servable id; a legacy ``databricks-``
-    override resolves to the served ``system.ai.`` id for that same model; and a
-    model the workspace does not serve passes through untouched (the gateway's
-    error beats a silent substitution).
-    """
+    """An unset model still discovers the preferred model from the workspace."""
     from types import SimpleNamespace
     from unittest.mock import patch
 
@@ -2516,10 +2506,79 @@ def test_resolve_databricks_codex_model_matches_servable_ids(
         ) as discover_models,
     ):
         assert (
-            _resolve_databricks_codex_model("https://h.example.com", "prof", requested) == expected
+            _resolve_databricks_codex_model("https://h.example.com", "prof", requested)
+            == servable[0]
         )
         resolve_credentials.assert_called_once_with("prof")
         discover_models.assert_called_once_with("https://h.example.com", "tok")
+
+
+@pytest.mark.parametrize("credentials_fail", [False, True])
+def test_resolve_databricks_codex_model_default_uses_cache_on_discovery_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    credentials_fail: bool,
+) -> None:
+    """Default selection retains the profile-host cache fallback for SDK/listing failures."""
+    from types import SimpleNamespace
+
+    from omnigent.codex_native_app_server import _resolve_databricks_codex_model
+    from omnigent.onboarding.ucode_state import UcodeWorkspaceState
+
+    host = "https://workspace.example"
+    resolve_credentials = Mock(
+        return_value=SimpleNamespace(token="tok", host="https://ambient.example"),
+        side_effect=RuntimeError("SDK metadata is unreachable") if credentials_fail else None,
+    )
+    discover_models = Mock(side_effect=RuntimeError("listing is unavailable"))
+    read_cache = Mock(
+        return_value=UcodeWorkspaceState(
+            workspace_url=host, codex_models=["cached-model", "other-model"]
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        resolve_credentials,
+    )
+    monkeypatch.setattr(
+        "omnigent.databricks_model_discovery.discover_databricks_codex_models", discover_models
+    )
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", read_cache)
+
+    assert _resolve_databricks_codex_model(host, "prof", None) == "cached-model"
+    resolve_credentials.assert_called_once_with("prof")
+    if credentials_fail:
+        discover_models.assert_not_called()
+    else:
+        discover_models.assert_called_once_with(host, "tok")
+    read_cache.assert_called_once_with(host)
+
+
+@pytest.mark.parametrize("cache_error", [None, OSError("cache is unreadable")])
+def test_resolve_databricks_codex_model_default_uses_bundled_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    cache_error: OSError | None,
+) -> None:
+    """A missing/unreadable cache still allows the bundled default after discovery fails."""
+    from types import SimpleNamespace
+
+    from omnigent.codex_native_app_server import _resolve_databricks_codex_model
+
+    resolve_credentials = Mock(side_effect=RuntimeError("SDK metadata is unreachable"))
+    read_cache = Mock(return_value=None, side_effect=cache_error)
+    catalog_default = Mock(return_value=SimpleNamespace(model_id="bundled-model"))
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        resolve_credentials,
+    )
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", read_cache)
+    monkeypatch.setattr("omnigent.model_catalog.resolve_catalog_model", catalog_default)
+
+    assert (
+        _resolve_databricks_codex_model("https://workspace.example", "prof", None)
+        == "bundled-model"
+    )
+    read_cache.assert_called_once_with("https://workspace.example")
+    catalog_default.assert_called_once_with("databricks", family="openai")
 
 
 def test_probe_codex_home_bridges_provider_tables_and_credential(
