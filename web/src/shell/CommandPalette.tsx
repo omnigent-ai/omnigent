@@ -17,7 +17,7 @@
 // groups react to the same input.
 
 import type React from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CalendarClockIcon,
   InboxIcon,
@@ -29,6 +29,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
+import { focusComposer } from "@/lib/composerFocus";
 import { useConversations } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
@@ -60,6 +61,11 @@ interface ActionCommand {
   icon: LucideIcon;
   /** Extra terms the client-side filter matches against (beyond the label). */
   keywords: string[];
+  /** True when `run` navigates: the pre-palette element is then stale, so the
+      close-time focus restore is suppressed and the destination composer is
+      focused instead (see onCloseAutoFocus). Toggles leave it unset so focus
+      returns to where the user was. */
+  navigates?: boolean;
   run: () => void;
 }
 
@@ -108,12 +114,17 @@ export function CommandPalette({
   const isMobile = useIsMobileViewport();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
+  // Set by a navigating selection, consumed in onCloseAutoFocus below.
+  const focusDestinationRef = useRef(false);
 
-  // Reset the query when the palette closes so it reopens clean.
+  // Reset the query when the palette closes so it reopens clean. Reopening
+  // mid-close also clears a pending hand-off (its close never unmounted).
   useEffect(() => {
     if (!open) {
       setQuery("");
       setDebouncedQuery("");
+    } else {
+      focusDestinationRef.current = false;
     }
   }, [open]);
 
@@ -131,6 +142,7 @@ export function CommandPalette({
         label: "New chat",
         icon: SquarePenIcon,
         keywords: ["compose", "start", "new session"],
+        navigates: true,
         run: () => navigate("/"),
       },
       {
@@ -138,6 +150,7 @@ export function CommandPalette({
         label: "Go to Inbox",
         icon: InboxIcon,
         keywords: ["notifications", "comments", "needs response"],
+        navigates: true,
         run: () => navigate("/inbox"),
       },
       {
@@ -145,6 +158,7 @@ export function CommandPalette({
         label: "Go to Automations",
         icon: CalendarClockIcon,
         keywords: ["scheduled", "recurring", "cron", "automation", "schedule"],
+        navigates: true,
         run: () => navigate("/tasks"),
       },
       {
@@ -152,6 +166,7 @@ export function CommandPalette({
         label: "Go to Settings",
         icon: SettingsIcon,
         keywords: ["preferences", "configuration", "account"],
+        navigates: true,
         run: () => navigate("/settings"),
       },
       {
@@ -211,11 +226,13 @@ export function CommandPalette({
   }, [data, debouncedQuery]);
 
   const runAction = (action: ActionCommand): void => {
+    focusDestinationRef.current = action.navigates === true;
     close();
     action.run();
   };
 
   const goToSession = (id: string): void => {
+    focusDestinationRef.current = true;
     close();
     navigate(`/c/${id}`);
   };
@@ -249,6 +266,15 @@ export function CommandPalette({
             : undefined
         }
         showCloseButton={false}
+        // After a navigating selection the pre-palette element is stale (its
+        // page is gone): restoring focus to it would strand focus on <body>
+        // and blur the destination composer, which claims it here instead.
+        onCloseAutoFocus={(e) => {
+          if (!focusDestinationRef.current) return;
+          focusDestinationRef.current = false;
+          e.preventDefault();
+          focusComposer();
+        }}
       >
         <DialogTitle className="sr-only">Command palette</DialogTitle>
         {/* shouldFilter=false: the server filters sessions and we filter actions

@@ -6,7 +6,8 @@ import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { useState, type ReactNode } from "react";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import {
@@ -27,6 +28,7 @@ import {
   NewChatLandingScreen,
   resetLandingDraft,
 } from "./NewChatDialog";
+import { CommandPalette } from "./CommandPalette";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
@@ -767,7 +769,11 @@ function setupLandingMocks() {
   ]);
 }
 
-function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
+function renderLanding(
+  infoOverrides: Partial<ServerInfo> = {},
+  route = "/",
+  ui: ReactNode = <NewChatLandingScreen />,
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -799,9 +805,7 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
     <QueryClientProvider client={client}>
       <CapabilitiesProvider info={info}>
         <TooltipProvider>
-          <MemoryRouter initialEntries={[route]}>
-            <NewChatLandingScreen />
-          </MemoryRouter>
+          <MemoryRouter initialEntries={[route]}>{ui}</MemoryRouter>
         </TooltipProvider>
       </CapabilitiesProvider>
     </QueryClientProvider>,
@@ -5586,5 +5590,50 @@ describe("NewChatLandingScreen Smart Routing flavors are scoped separately", () 
     expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
       "Smart Routing",
     );
+  });
+});
+
+// The ⌘K → "New chat" journey: the palette (a modal dialog) is still tearing
+// down while the landing screen mounts at "/", and the dialog's close-time
+// focus handling runs after the landing's mount autofocus. The composer must
+// still end up focused, not the pre-palette element or <body>.
+function PaletteToLandingHarness() {
+  const [paletteOpen, setPaletteOpen] = useState(true);
+  const location = useLocation();
+  return (
+    <>
+      <button type="button" data-testid="pre-palette-focus">
+        previous page
+      </button>
+      {location.pathname === "/" && <NewChatLandingScreen />}
+      <CommandPalette
+        open={paletteOpen}
+        onOpenChange={setPaletteOpen}
+        onToggleLeftSidebar={() => {}}
+        onToggleRightSidebar={() => {}}
+      />
+    </>
+  );
+}
+
+describe("NewChatLandingScreen — command-palette focus hand-off", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it("focuses the landing composer when New chat is picked from the palette", async () => {
+    renderLanding({}, "/inbox", <PaletteToLandingHarness />);
+
+    fireEvent.click(screen.getByText("New chat"));
+
+    // The palette dialog fully unmounts (its focus scope settles focus then)…
+    await waitFor(() => expect(screen.queryByTestId("command-palette-input")).toBeNull());
+    // …and the landing composer — not the pre-palette element — holds focus.
+    const input = await screen.findByTestId("new-chat-landing-input");
+    await waitFor(() => expect(document.activeElement).toBe(input));
   });
 });

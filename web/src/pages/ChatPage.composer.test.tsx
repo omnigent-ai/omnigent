@@ -9,6 +9,7 @@ import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { clearSessionDrafts, hasSessionDraft } from "@/lib/sessionDrafts";
+import { focusComposer } from "@/lib/composerFocus";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 
@@ -3079,5 +3080,27 @@ describe("shouldQueueSend", () => {
     // The ordering guard outranks always-steer: draining must stay in order, so
     // a direct send can't overtake a still-queued earlier one.
     expect(shouldQueueSend("conv_a", "streaming", "running", [q("conv_a")], true)).toBe(true);
+  });
+});
+
+describe("Composer palette focus hand-off", () => {
+  afterEach(cleanup);
+
+  it("registers so the command palette can focus the textarea after it closes", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    // The palette's dialog settles focus as it unmounts, after this composer's
+    // own focus effect ran — the hand-off is how focus lands here regardless.
+    ta.blur();
+    expect(document.activeElement).not.toBe(ta);
+
+    expect(focusComposer()).toBe(true);
+    expect(document.activeElement).toBe(ta);
+  });
+
+  it("unregisters on unmount so a stale composer can't claim the hand-off", () => {
+    render(<Composer {...composerProps()} />);
+    cleanup();
+    expect(focusComposer()).toBe(false);
   });
 });

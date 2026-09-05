@@ -1,8 +1,9 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 
 import { CommandPalette } from "./CommandPalette";
+import { registerComposerFocus } from "@/lib/composerFocus";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
@@ -347,5 +348,90 @@ describe("CommandPalette — empty state", () => {
     });
 
     expect(screen.getByText("No results found")).toBeTruthy();
+  });
+});
+
+describe("CommandPalette — focus hand-off", () => {
+  // Simulates the app around the palette: an element that held focus before
+  // the palette opened (the dialog's restore target) and a stand-in for the
+  // destination page's composer.
+  function Stage({ open }: { open: boolean }) {
+    return (
+      <>
+        <button type="button" data-testid="outside">
+          outside
+        </button>
+        <textarea data-testid="composer-stub" />
+        <CommandPalette
+          open={open}
+          onOpenChange={vi.fn()}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      </>
+    );
+  }
+
+  /** Render closed, focus the outside element, then open — so the dialog
+      records the outside element as its close-time focus-restore target. */
+  function openPaletteOverOutsideFocus() {
+    const view = render(<Stage open={false} />);
+    screen.getByTestId("outside").focus();
+    view.rerender(<Stage open />);
+    return view;
+  }
+
+  it("hands focus to the registered composer after a navigating action", async () => {
+    const view = openPaletteOverOutsideFocus();
+    const stub = screen.getByTestId("composer-stub") as HTMLTextAreaElement;
+    const unregister = registerComposerFocus(() => stub.focus());
+    try {
+      fireEvent.click(screen.getByText("New chat"));
+      view.rerender(<Stage open={false} />);
+
+      // Radix must not yank focus back to the pre-palette element.
+      await waitFor(() => expect(document.activeElement).toBe(stub));
+    } finally {
+      unregister();
+    }
+  });
+
+  it("hands focus to the registered composer after a session pick", async () => {
+    setSessions([conv("c1", "Fix the parser")]);
+    const view = openPaletteOverOutsideFocus();
+    const stub = screen.getByTestId("composer-stub") as HTMLTextAreaElement;
+    const unregister = registerComposerFocus(() => stub.focus());
+    try {
+      fireEvent.click(screen.getByText("Fix the parser"));
+      view.rerender(<Stage open={false} />);
+
+      await waitFor(() => expect(document.activeElement).toBe(stub));
+    } finally {
+      unregister();
+    }
+  });
+
+  it("leaves the hand-off unused for sidebar toggles (same page, no navigation)", async () => {
+    const view = openPaletteOverOutsideFocus();
+    const stub = screen.getByTestId("composer-stub") as HTMLTextAreaElement;
+    const handOff = vi.fn(() => stub.focus());
+    const unregister = registerComposerFocus(handOff);
+    try {
+      fireEvent.click(screen.getByText("Toggle conversations sidebar"));
+      view.rerender(<Stage open={false} />);
+
+      // Wait for the dialog to unmount and its deferred close-time focus
+      // handling to run; the dialog stays in charge — no composer hand-off.
+      await waitFor(() => expect(screen.queryByTestId("command-palette-input")).toBeNull());
+      await act(async () => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 0);
+        });
+      });
+      expect(handOff).not.toHaveBeenCalled();
+      expect(document.activeElement).not.toBe(stub);
+    } finally {
+      unregister();
+    }
   });
 });
