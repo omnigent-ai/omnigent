@@ -11,10 +11,13 @@ hover-incapable md+ tablet keeps the row's controls visible without hover.
 from __future__ import annotations
 
 import time
+from typing import Literal
 
+import pytest
 from playwright.sync_api import Browser, Page, expect
 
 from tests.e2e_ui._touch import new_touch_context, touch, touch_drag
+from tests.e2e_ui.conftest import set_session_title
 
 _DESKTOP_VIEWPORT = {"width": 1280, "height": 800}
 _PHONE_VIEWPORT = {"width": 390, "height": 844}
@@ -68,58 +71,80 @@ def test_sidebar_resize_handle_supports_touch_drag(
         context.close()
 
 
+@pytest.mark.parametrize("direction", [-1, 1], ids=["left", "right"])
+@pytest.mark.parametrize("reduced_motion", ["no-preference", "reduce"])
 def test_session_row_swipe_tracks_finger(
     browser: Browser,
     seeded_session: tuple[str, str],
+    direction: int,
+    reduced_motion: Literal["no-preference", "reduce"],
 ) -> None:
-    """A horizontal swipe visually moves the row before any action commits."""
+    """The fixed-width surface and its title follow the finger in both directions."""
     base_url, session_id = seeded_session
+    set_session_title(base_url, session_id, "Swipe tracking")
     context = new_touch_context(browser, viewport=_PHONE_VIEWPORT, is_mobile=True)
     try:
         page = context.new_page()
+        page.emulate_media(reduced_motion=reduced_motion)
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
 
         row_link = page.locator(f'a[href="/c/{session_id}"]')
         expect(row_link).to_be_visible()
-
-        page.evaluate(
-            """(sessionId) => {
-                const link = document.querySelector(`a[href="/c/${sessionId}"]`);
-                const row = link.closest('li') ?? link;
-                const surface = row.querySelector('[data-testid="conversation-swipe-surface"]');
-                const probe = (element) => {
-                    const style = getComputedStyle(element);
-                    return `${style.transform}|${style.marginLeft}|${style.marginRight}`;
-                };
-                const baseline = probe(surface);
-                window.__swipeProbe = { moved: false, raf: 0 };
-                const sample = () => {
-                    if (probe(surface) !== baseline) window.__swipeProbe.moved = true;
-                    window.__swipeProbe.raf = requestAnimationFrame(sample);
-                };
-                sample();
-            }""",
-            session_id,
+        expect(row_link.locator("xpath=ancestor::li[1]")).to_have_css("touch-action", "pan-y")
+        page.wait_for_function(
+            """() => Math.abs(document.querySelector('aside[aria-label="Conversations"]')
+                .getBoundingClientRect().left) < 0.01"""
         )
+        measure = """sessionId => {
+            const link = document.querySelector(`a[href="/c/${sessionId}"]`);
+            const surface = link.closest('[data-testid="conversation-swipe-surface"]');
+            const range = document.createRange();
+            range.selectNodeContents(link.querySelector('span.truncate'));
+            const title = range.getBoundingClientRect();
+            const box = surface.getBoundingClientRect();
+            return {surfaceX: box.x, surfaceWidth: box.width,
+                titleX: title.x, titleWidth: title.width};
+        }"""
+        baseline = page.evaluate(measure, session_id)
 
         box = row_link.bounding_box()
         assert box is not None
-        start_x = box["x"] + box["width"] * 0.85
+        start_x = box["x"] + box["width"] / 2
         start_y = box["y"] + box["height"] / 2
         cdp = context.new_cdp_session(page)
         touch(cdp, "touchStart", start_x, start_y)
         try:
-            for offset_x in (-25, -35, -45):
+            for distance, travel in ((20, 20), (40, 40), (60, 60), (90, 78)):
+                offset_x = direction * distance
+                expected_travel = direction * travel
                 touch(cdp, "touchMove", start_x + offset_x, start_y)
-                page.wait_for_timeout(50)
-
-            moved = page.evaluate(
-                "() => { cancelAnimationFrame(window.__swipeProbe.raf);"
-                " return window.__swipeProbe.moved; }"
-            )
-            assert moved, "the session row never visually tracked the finger during the swipe"
+                page.wait_for_function(
+                    """([sessionId, baselineX, travel]) => {
+                        const link = document.querySelector(`a[href="/c/${sessionId}"]`);
+                        const surface = link.closest('[data-testid="conversation-swipe-surface"]');
+                        const displacement = surface.getBoundingClientRect().x - baselineX;
+                        return Math.abs(displacement - travel) < 1;
+                    }""",
+                    arg=[session_id, baseline["surfaceX"], expected_travel],
+                    timeout=2_000,
+                )
+                current = page.evaluate(measure, session_id)
+                for target in ("surface", "title"):
+                    assert current[f"{target}X"] - baseline[f"{target}X"] == pytest.approx(
+                        expected_travel, abs=1
+                    ), f"{target} did not follow the finger at {offset_x}px: {current}"
+                    assert current[f"{target}Width"] == pytest.approx(
+                        baseline[f"{target}Width"], abs=1
+                    ), f"{target} shrank during the swipe: {current}"
+            if reduced_motion == "reduce":
+                glyph = page.get_by_test_id("conversation-swipe-reveal").locator("span").first
+                assert glyph.evaluate("element => getComputedStyle(element).scale") == "none"
         finally:
-            touch(cdp, "touchEnd")
+            touch(cdp, "touchCancel")
+        if reduced_motion == "reduce":
+            surface = page.get_by_test_id("conversation-swipe-surface")
+            duration = surface.evaluate("element => getComputedStyle(element).transitionDuration")
+            assert float(duration.removesuffix("s")) <= 0.001
     finally:
         context.close()
 
