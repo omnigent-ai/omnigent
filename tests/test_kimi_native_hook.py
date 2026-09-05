@@ -143,17 +143,23 @@ def test_evaluate_policy_fails_closed_when_unreachable(
     )
 
 
-def _capture_injection(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Patch ``inject_approval_keystroke`` to record the option keys it gets."""
-    keys: list[str] = []
+def _capture_injection(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """Patch ``inject_approval_keystroke`` to record the calls it gets."""
+    calls: list[dict[str, object]] = []
 
-    def _fake_inject(bridge_dir: Path, *, key: str, timeout_s: float = 0.0) -> bool:
+    def _fake_inject(
+        bridge_dir: Path,
+        *,
+        key: str,
+        tool_input: dict[str, object] | None = None,
+        timeout_s: float = 0.0,
+    ) -> bool:
         del bridge_dir, timeout_s
-        keys.append(key)
+        calls.append({"key": key, "tool_input": tool_input})
         return True
 
     monkeypatch.setattr(kimi_native_hook, "inject_approval_keystroke", _fake_inject)
-    return keys
+    return calls
 
 
 @pytest.mark.parametrize(
@@ -170,7 +176,12 @@ def test_permission_request_injects_keystroke_for_verdict(
     bridge_dir = _governed_bridge(tmp_path)
     _feed_stdin(
         monkeypatch,
-        {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_call_id": "tc_1"},
+        {
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "tool_call_id": "tc_1",
+            "tool_input": {"command": "touch marker_a.txt"},
+        },
     )
     posted: list[dict[str, object]] = []
     monkeypatch.setattr(
@@ -178,7 +189,7 @@ def test_permission_request_injects_keystroke_for_verdict(
         "_request_web_approval",
         lambda url, headers, body: posted.append({"url": url, "body": body}) or verdict,
     )
-    keys = _capture_injection(monkeypatch)
+    calls = _capture_injection(monkeypatch)
 
     exit_code = kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)])
 
@@ -186,7 +197,9 @@ def test_permission_request_injects_keystroke_for_verdict(
     # Routed to the shared elicitation endpoint with the gated tool.
     assert posted[0]["url"].endswith("/v1/sessions/conv_abc/hooks/permission-request")
     assert posted[0]["body"]["tool_name"] == "Bash"
-    assert keys == [expected_key]
+    # The gated input rides along so the injector can pin the verdict to ITS
+    # menu instead of typing into whatever menu is currently open.
+    assert calls == [{"key": expected_key, "tool_input": {"command": "touch marker_a.txt"}}]
 
 
 def test_permission_request_no_verdict_injects_nothing(
@@ -197,10 +210,10 @@ def test_permission_request_no_verdict_injects_nothing(
     bridge_dir = _governed_bridge(tmp_path)
     _feed_stdin(monkeypatch, {"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
     monkeypatch.setattr(kimi_native_hook, "_request_web_approval", lambda *a, **k: None)
-    keys = _capture_injection(monkeypatch)
+    calls = _capture_injection(monkeypatch)
 
     assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
-    assert keys == []
+    assert calls == []
 
 
 def test_permission_request_ungoverned_no_request(
@@ -216,10 +229,10 @@ def test_permission_request_ungoverned_no_request(
         raise AssertionError("ungoverned session must not request approval")
 
     monkeypatch.setattr(kimi_native_hook, "_request_web_approval", _boom)
-    keys = _capture_injection(monkeypatch)
+    calls = _capture_injection(monkeypatch)
 
     assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
-    assert keys == []
+    assert calls == []
 
 
 @pytest.mark.parametrize(

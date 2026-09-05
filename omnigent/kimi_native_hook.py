@@ -196,7 +196,9 @@ def _main_permission_request(argv: list[str]) -> int:
        claude-native uses).
     2. On ``allow`` / ``deny``, inject the matching kimi permission-menu option
        digit + Enter into the TUI pane via :func:`inject_approval_keystroke`
-       (:data:`APPROVE_KEY` "Approve once" / :data:`DENY_KEY` "Reject").
+       (:data:`APPROVE_KEY` "Approve once" / :data:`DENY_KEY` "Reject"),
+       passing the gated ``tool_input`` so the keystroke only lands when the
+       OPEN menu is the one this verdict was raised for.
 
     Fail-safe: on no verdict (timeout / server unreachable / the prompt was
     already answered in the terminal) it injects nothing and kimi's own TUI
@@ -228,8 +230,9 @@ def _main_permission_request(argv: list[str]) -> int:
         # elicitation (mirrors the claude permission hook).
         "_omnigent_elicitation_id": f"elicit_kimi_{secrets.token_hex(16)}",
     }
-    tool_input = payload.get("tool_input")
-    if isinstance(tool_input, dict):
+    raw_tool_input = payload.get("tool_input")
+    tool_input = raw_tool_input if isinstance(raw_tool_input, dict) else None
+    if tool_input is not None:
         body["tool_input"] = tool_input
 
     url = (
@@ -242,7 +245,11 @@ def _main_permission_request(argv: list[str]) -> int:
         return 0
     key = APPROVE_KEY if verdict == "allow" else DENY_KEY
     try:
-        inject_approval_keystroke(bridge_dir, key=key, timeout_s=_SURFACE_TIMEOUT_S)
+        # ``tool_input`` pins the verdict to ITS menu: the injector refuses to
+        # type into a later, different call's menu (see inject_approval_keystroke).
+        inject_approval_keystroke(
+            bridge_dir, key=key, tool_input=tool_input, timeout_s=_SURFACE_TIMEOUT_S
+        )
     except RuntimeError as exc:
         print(
             f"omnigent kimi permission-request hook: keystroke inject failed: {exc}",

@@ -68,13 +68,91 @@ class TestRowToItem:
         assert item.text == "Let me reason about this."
         assert item.response_id == "kimi:abc123"
 
-    def test_tool_call_and_metadata_skipped(self) -> None:
+    def test_metadata_rows_skipped(self) -> None:
         for row in (
-            {"type": "context.append_loop_event", "event": {"type": "tool.call", "name": "Read"}},
             {"type": "metadata", "protocol_version": 1},
             {"type": "usage.record", "usage": {}},
             {"type": "context.append_message", "message": {"role": "user", "content": []}},
         ):
+            assert _row_to_item(0, row) is None
+
+    def test_tool_call_is_mirrored_as_function_call(self) -> None:
+        """A ``tool.call`` event carries the call identity for the web mirror.
+
+        Mirroring records the call's tool identity server-side; the matching
+        mirrored result is then what lets the server resolve a parked web
+        approval card once the user answered the menu in the terminal.
+        """
+        row = {
+            "type": "context.append_loop_event",
+            "agentId": "main",
+            "event": {
+                "type": "tool.call",
+                "uuid": "ce10b17b",
+                "turnId": "0",
+                "step": 1,
+                "toolCallId": "c1",
+                "name": "Bash",
+                "args": {"command": "touch marker_a.txt"},
+            },
+        }
+        item = _row_to_item(16, row)
+        assert item is not None
+        assert item.kind == "tool_call"
+        assert item.call_id == "c1"
+        assert item.tool_name == "Bash"
+        assert json.loads(item.arguments) == {"command": "touch marker_a.txt"}
+        assert item.response_id == "kimi:ce10b17b"
+
+    def test_tool_result_is_mirrored_as_function_call_output(self) -> None:
+        row = {
+            "type": "context.append_loop_event",
+            "agentId": "main",
+            "event": {
+                "type": "tool.result",
+                "parentUuid": "ce10b17b",
+                "toolCallId": "c1",
+                "result": {"output": "Command executed successfully."},
+            },
+        }
+        item = _row_to_item(17, row)
+        assert item is not None
+        assert item.kind == "tool_result"
+        assert item.call_id == "c1"
+        assert item.text == "Command executed successfully."
+
+    def test_rejected_tool_result_is_mirrored_too(self) -> None:
+        """A terminal-rejected call still writes a result row — mirror it.
+
+        The mirrored output is the "terminal already ruled on this call"
+        signal, and a rejection is as much a ruling as an approval: without it
+        the parked web card would stay pending after the user rejected the
+        menu in the TUI.
+        """
+        row = {
+            "type": "context.append_loop_event",
+            "event": {
+                "type": "tool.result",
+                "toolCallId": "cB",
+                "result": {
+                    "output": 'Tool "Bash" was not run because the user rejected '
+                    "the approval request.",
+                    "isError": True,
+                },
+            },
+        }
+        item = _row_to_item(37, row)
+        assert item is not None
+        assert item.kind == "tool_result"
+        assert item.call_id == "cB"
+        assert "user rejected" in item.text
+
+    def test_tool_rows_without_call_id_skipped(self) -> None:
+        for event in (
+            {"type": "tool.call", "name": "Read"},
+            {"type": "tool.result", "result": {"output": "x"}},
+        ):
+            row = {"type": "context.append_loop_event", "event": event}
             assert _row_to_item(0, row) is None
 
     def test_step_end_with_end_turn_is_turn_end(self) -> None:
