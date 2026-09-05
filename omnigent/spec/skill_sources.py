@@ -19,8 +19,15 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
+import yaml
+
 from omnigent.errors import OmnigentError
-from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
+from omnigent.spec.parser import (
+    _FRONTMATTER_RE,
+    _discover_skills,
+    _parse_skill,
+    discover_host_skills,
+)
 from omnigent.spec.types import SkillSpec
 
 _log = logging.getLogger(__name__)
@@ -273,15 +280,99 @@ def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[st
     return out
 
 
+def _parse_plugin_command(command_md: Path) -> SkillSpec | None:
+    """
+    Parse a Claude Code plugin command file into a menu :class:`SkillSpec`.
+
+    Plugin commands live at ``<plugin>/commands/<name>.md``: the command
+    name is the *file* name, the optional YAML frontmatter carries
+    ``description`` (and hints like ``argument-hint``), and the body is
+    the prompt template. Unlike ``SKILL.md``, the frontmatter and every
+    field in it are optional, so this cannot reuse ``_parse_skill``;
+    a missing description falls back to the body's first non-empty line
+    (mirroring how Claude Code labels such commands).
+
+    ``skill_dir`` is left ``None`` deliberately: sibling files in
+    ``commands/`` are other commands, not skill resources, so resource
+    listing must not pick them up on invocation.
+
+    :param command_md: The ``commands/<name>.md`` file to parse.
+    :returns: The parsed spec named by the file stem, or ``None`` when
+        the file is unreadable (best-effort discovery).
+    """
+    try:
+        text = command_md.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    description = ""
+    body = text
+    match = _FRONTMATTER_RE.match(text)
+    if match:
+        frontmatter_str, body = match.groups()
+        try:
+            frontmatter = yaml.safe_load(frontmatter_str)
+        except yaml.YAMLError:
+            frontmatter = None
+        if isinstance(frontmatter, dict):
+            raw = frontmatter.get("description")
+            if isinstance(raw, str):
+                description = raw.strip()
+    if not description:
+        description = next((line.strip() for line in body.splitlines() if line.strip()), "")
+    return SkillSpec(
+        name=command_md.stem,
+        description=description,
+        content=body.strip(),
+        skill_dir=None,
+    )
+
+
+def _discover_plugin_commands(commands_dir: Path) -> list[SkillSpec]:
+    """
+    Discover a plugin's slash commands under ``<plugin>/commands/``.
+
+    Scans top-level ``*.md`` files only — nested command namespacing has
+    its own vendor spelling, so subdirectories are left out until that
+    spelling is pinned (under-report when unsure, like the other
+    providers). Unreadable files are skipped, not fatal.
+
+    :param commands_dir: The plugin's ``commands`` directory.
+    :returns: Parsed command specs in deterministic path order; empty
+        when the directory is absent or unreadable.
+    """
+    if not commands_dir.is_dir():
+        return []
+    try:
+        entries = sorted(commands_dir.iterdir())
+    except OSError as exc:
+        _log.warning("Skipping unreadable plugin commands dir %s: %s", commands_dir, exc)
+        return []
+    out: list[SkillSpec] = []
+    for entry in entries:
+        if not entry.is_file() or entry.suffix != ".md" or entry.name.startswith("."):
+            continue
+        spec = _parse_plugin_command(entry)
+        if spec is not None:
+            out.append(spec)
+    return out
+
+
 def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
-    Enabled Claude Code plugin skills, namespaced ``<plugin>:<skill>``.
+    Enabled Claude Code plugin skills *and* slash commands, namespaced
+    ``<plugin>:<name>``.
 
-    Plugin skills are host skills, so they obey the spec's
+    A plugin surfaces user-typeable entries from two trees: ``skills/``
+    (``<dir>/SKILL.md``) and ``commands/`` (``<name>.md``). Both feed the
+    composer's ``/`` menu — walking only ``skills/`` silently loses every
+    plugin command. Skills win a same-name collision within a plugin
+    (first occurrence wins downstream).
+
+    Plugin entries are host skills, so they obey the spec's
     ``skills_filter`` exactly as :func:`discover_host_skills` does:
     ``"none"`` suppresses them entirely (hermetic), ``"all"`` surfaces
-    every skill from every enabled plugin, and a list selects by the
-    skill's own (bare) name — matching how the filter names skills,
+    everything from every enabled plugin, and a list selects by the
+    entry's own (bare) name — matching how the filter names skills,
     independent of the display namespace.
     """
     if ctx.skills_filter == "none":
@@ -296,7 +387,9 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     for key, install_path in _plugin_install_paths(ctx, enabled).items():
         plugin = key.split("@", 1)[0]
         skipped: list[str] = []
-        for spec in _discover_skills(install_path / "skills", skipped=skipped):
+        specs = _discover_skills(install_path / "skills", skipped=skipped)
+        specs += _discover_plugin_commands(install_path / "commands")
+        for spec in specs:
             if filter_names is not None and spec.name not in filter_names:
                 continue
             out.append(replace(spec, name=f"{plugin}:{spec.name}"))
@@ -308,7 +401,8 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
 
 def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
-    """Generic host walk (``~/.claude/skills`` etc.) plus enabled plugins."""
+    """Generic host walk (``~/.claude/skills`` etc.) plus enabled plugins
+    (their skills and their slash commands)."""
     return _generic_host_skills(ctx) + _claude_plugin_skills(ctx)
 
 
