@@ -3597,7 +3597,7 @@ function SessionTooltipContent({
 }
 
 function splitWorkspacePath(workspace: string): { prefix: string; tail: string } {
-  const match = /^(.*[\\/])([^\\/]+)$/.exec(workspace);
+  const match = workspace.match(/^(.*[\\/])([^\\/]+)$/);
   return match ? { prefix: match[1]!, tail: match[2]! } : { prefix: "", tail: workspace };
 }
 
