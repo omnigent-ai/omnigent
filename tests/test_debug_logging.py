@@ -200,6 +200,113 @@ def test_record_to_row_captures_stack_trace() -> None:
     assert "ValueError: boom" in (row["stack_trace"] or "")
 
 
+def test_record_to_row_auto_attributes_logged_exception() -> None:
+    """A record with exc_info gets error_category/error_impact derived from the
+    exception, so every exc_info=… log site is covered without per-site edits.
+
+    An arbitrary exception is UNKNOWN on both axes (no guessed owner); the sink
+    does not need the callsite to have classified it.
+    """
+    import sys
+
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
+        )
+    attrs = dl.record_to_row(record, source="server")["attributes"]
+    assert attrs == {"error_category": "unknown", "error_impact": "unknown"}
+
+
+def test_record_to_row_auto_attributes_omnigent_error_from_its_axes() -> None:
+    """An OmnigentError logged via exc_info carries its own code-derived axes."""
+    import sys
+
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    try:
+        raise OmnigentError("gone", code=ErrorCode.RUNNER_UNAVAILABLE)
+    except OmnigentError:
+        record = logging.LogRecord(
+            "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
+        )
+    attrs = dl.record_to_row(record, source="server")["attributes"]
+    # runner_unavailable is config-owned and self-healing.
+    assert attrs["error_category"] == "config"
+    assert attrs["error_impact"] == "transient"
+
+
+def test_record_to_row_explicit_attributes_win_over_derived() -> None:
+    """An explicit error_category/error_impact on the record is never overwritten
+    by the exception-derived fallback."""
+    import sys
+
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
+        )
+    record.attributes = {"error_category": "server", "error_impact": "blocking"}
+    attrs = dl.record_to_row(record, source="server")["attributes"]
+    assert attrs == {"error_category": "server", "error_impact": "blocking"}
+
+
+def test_phase_scope_stamps_error_phase_on_logged_exception() -> None:
+    """An error logged inside a phase_scope inherits where it failed, even when
+    the exception carries no error code."""
+    import sys
+
+    from omnigent.errors import ErrorPhase
+
+    with dl.phase_scope(ErrorPhase.HARNESS_STARTUP):
+        try:
+            raise ValueError("spawn blew up")
+        except ValueError:
+            record = logging.LogRecord(
+                "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
+            )
+        attrs = dl.record_to_row(record, source="runner")["attributes"]
+    assert attrs["error_phase"] == "harness_startup"
+    # And the arbitrary exception still auto-attributes category/impact.
+    assert attrs["error_category"] == "unknown"
+
+
+def test_coded_error_phase_wins_over_ambient_scope() -> None:
+    """A coded OmnigentError's own (concrete) phase beats the ambient scope, so
+    a harness_not_configured raised during a runner-launch scope still reads
+    harness_setup (the useful, semantic location)."""
+    import sys
+
+    from omnigent.errors import ErrorCode, ErrorPhase, OmnigentError
+
+    with dl.phase_scope(ErrorPhase.RUNNER_LAUNCH):
+        try:
+            raise OmnigentError("no harness", code=ErrorCode.HARNESS_NOT_CONFIGURED)
+        except OmnigentError:
+            record = logging.LogRecord(
+                "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
+            )
+        attrs = dl.record_to_row(record, source="server")["attributes"]
+    assert attrs["error_phase"] == "harness_setup"
+
+
+def test_no_phase_when_no_code_and_no_scope() -> None:
+    """Outside any scope, an uncoded exception gets no error_phase (we don't
+    guess a location)."""
+    import sys
+
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
+        )
+    attrs = dl.record_to_row(record, source="server")["attributes"]
+    assert "error_phase" not in attrs
+
+
 def test_debug_event_builds_extra() -> None:
     assert dl.debug_event("evt", a=1, b="x") == {
         "event_name": "evt",

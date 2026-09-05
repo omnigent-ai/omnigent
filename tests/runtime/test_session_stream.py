@@ -926,4 +926,11 @@ def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.Monke
     assert completed.attributes == {"outcome": "completed", "response_id": "resp_1"}
     failed = records[1]
     assert failed.levelno == logging.WARNING
-    assert failed.attributes == {"outcome": "failed", "error_code": "timeout"}  # no message text
+    # A failed turn is the authoritative blocking signal; error_impact rides the
+    # same row so "sessions actually blocked" is a direct query. No message text.
+    assert failed.attributes == {
+        "outcome": "failed",
+        "error_code": "timeout",
+        "error_impact": "blocking",
+        "error_phase": "turn",
+    }

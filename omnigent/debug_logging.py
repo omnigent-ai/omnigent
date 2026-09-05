@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from omnigent.errors import ErrorPhase, OmnigentError, classify_exception
 from omnigent.process_logging import redact_log_text
 from omnigent.version import VERSION
 
@@ -67,6 +68,13 @@ _user_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_user_id", defa
 # so this never changes runner attribution. An explicit ``extra`` session id
 # always wins over this ambient value.
 _session_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_session_id", default=None)
+
+# Ambient lifecycle phase for the code currently executing. Set with
+# ``phase_scope`` around each region (runner launch, harness setup/startup, turn)
+# so any error logged inside inherits where it failed. Propagates into awaited
+# coroutines and is copied into asyncio tasks at creation, so wrap the entry of a
+# background task, not the scheduler. Unset outside a scoped region.
+_phase_var: ContextVar[ErrorPhase | None] = ContextVar("omnigent_error_phase", default=None)
 
 # Request-scoped bag of extra audit attributes a handler can attach so they ride
 # the request's audit envelope end-event (e.g. POST /events' event type, a newly
@@ -279,6 +287,32 @@ def current_session_id() -> str | None:
     return _session_id_var.get() or None
 
 
+def set_current_phase(phase: ErrorPhase | None) -> None:
+    """Bind the ambient lifecycle phase for subsequently logged errors."""
+    _phase_var.set(phase)
+
+
+@contextlib.contextmanager
+def phase_scope(phase: ErrorPhase) -> Iterator[None]:
+    """Mark *phase* as active for the block, restoring the prior value on exit.
+
+    Wrap each lifecycle region (runner launch, harness setup/startup, turn) so an
+    error logged inside is located even when it carries no error code. For a
+    background task, wrap the task body, not the scheduler (the context is copied
+    at task creation).
+    """
+    token = _phase_var.set(phase)
+    try:
+        yield
+    finally:
+        _phase_var.reset(token)
+
+
+def current_phase() -> ErrorPhase | None:
+    """The ambient lifecycle phase, or ``None`` outside any ``phase_scope``."""
+    return _phase_var.get()
+
+
 def reset_request_audit_attrs() -> None:
     """Start a fresh per-request audit-attribute bag (server middleware).
 
@@ -420,11 +454,53 @@ def _stack_trace(record: logging.LogRecord) -> str | None:
 
 def _attributes(record: logging.LogRecord) -> dict[str, str]:
     raw = getattr(record, "attributes", None)
-    if not isinstance(raw, dict):
-        return {}
-    # The target column is MAP<STRING,STRING>; coerce values, redact them, and
-    # drop nulls. Event attributes share the same privacy boundary as messages.
-    return {str(k): redact_log_text(str(v)) for k, v in raw.items() if v is not None}
+    attrs: dict[str, str] = {}
+    if isinstance(raw, dict):
+        # The target column is MAP<STRING,STRING>; coerce values, redact them,
+        # and drop nulls. Event attributes share the same privacy boundary as
+        # messages.
+        attrs = {str(k): redact_log_text(str(v)) for k, v in raw.items() if v is not None}
+    _stamp_error_dimensions(attrs, record)
+    return attrs
+
+
+def _stamp_error_dimensions(attrs: dict[str, str], record: logging.LogRecord) -> None:
+    """Auto-attribute a logged exception the callsite did not classify itself.
+
+    Any record carrying ``exc_info`` gains ``error_category`` / ``error_impact``
+    derived from the exception (see :func:`omnigent.errors.classify_exception`),
+    so every ``_logger.exception`` / ``exc_info=…`` site across the codebase is
+    covered without per-site edits. Explicit callsite values always win.
+    """
+    exc = record.exc_info[1] if isinstance(record.exc_info, tuple) else None
+    if isinstance(exc, BaseException) and not (
+        "error_category" in attrs and "error_impact" in attrs
+    ):
+        category, impact = classify_exception(exc)
+        attrs.setdefault("error_category", category.value)
+        attrs.setdefault("error_impact", impact.value)
+    if "error_phase" not in attrs:
+        phase = _resolve_error_phase(exc)
+        if phase is not None:
+            attrs["error_phase"] = phase.value
+
+
+def _resolve_error_phase(exc: BaseException | None) -> ErrorPhase | None:
+    """Locate a logged error's lifecycle phase.
+
+    Precedence: a coded ``OmnigentError``'s own (concrete) phase, then the ambient
+    ``phase_scope`` for the region that was executing (covers uncoded exceptions
+    and non-exception error logs), then a coded error's UNKNOWN fallback. Returns
+    ``None`` when there is nothing to attribute (no code, no active scope), so the
+    column stays empty rather than guessing.
+    """
+    coded = exc.phase if isinstance(exc, OmnigentError) else None
+    if coded is not None and coded is not ErrorPhase.UNKNOWN:
+        return coded
+    ambient = current_phase()
+    if ambient is not None:
+        return ambient
+    return coded
 
 
 def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
