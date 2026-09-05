@@ -34,7 +34,7 @@ from pydantic import TypeAdapter
 from omnigent.server.schemas import ServerStreamEvent
 
 from ._child_status import child_summary_busy
-from ._errors import raise_for_status, require_json_object, response_body
+from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._timeouts import _SSE_TIMEOUT
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
@@ -1242,6 +1242,19 @@ async def _stream_session_events(
         if resp.status_code >= 400:
             await resp.aread()
             raise_for_status(resp.status_code, response_body(resp))
+        elif 300 <= resp.status_code < 400:
+            # Redirects are disabled on this client (httpx defaults
+            # follow_redirects=False), so a 3xx here is a proxy or gateway
+            # hop we never followed. raise_for_status is a no-op below 400,
+            # and _parse_sse_lines over the redirect's non-SSE body would
+            # complete with no events — handing the caller a silent,
+            # error-free, empty stream. Fail loud instead.
+            await resp.aread()
+            raise OmnigentError(
+                f"stream open was redirected (status {resp.status_code}); "
+                "this client does not follow redirects on a stream",
+                resp.status_code,
+            )
 
         async for event in _parse_sse_lines(resp.aiter_lines()):
             yield event
