@@ -29,6 +29,7 @@ import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { useSearchParams } from "@/lib/routing";
 import { useAppName } from "@/lib/branding";
 import { useLoginV2 } from "@/lib/useLoginV2";
+import { ElectronWindowDragStrip } from "@/components/ElectronWindowDragStrip";
 import { AuthCardShell } from "@/pages/onboarding/AuthCardShell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -230,6 +231,7 @@ export function LoginPage() {
         paddingBottom: "var(--omnigent-safe-bottom)",
       }}
     >
+      <ElectronWindowDragStrip />
       <div className="w-full max-w-sm space-y-6">{body}</div>
     </div>
   );

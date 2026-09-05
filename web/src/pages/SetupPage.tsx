@@ -23,6 +23,7 @@
  */
 
 import { useEffect, useState, type FormEvent } from "react";
+import { ElectronWindowDragStrip } from "@/components/ElectronWindowDragStrip";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { setup as setupRequest } from "@/lib/accountsApi";
@@ -73,6 +74,7 @@ export function SetupPage() {
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
+      <ElectronWindowDragStrip />
       <div className="w-full max-w-sm space-y-6">
         <div className="space-y-1 text-center">
           <h1 className="text-2xl font-semibold tracking-tight">Create the admin account</h1>

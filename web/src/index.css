@@ -575,6 +575,25 @@ aside[aria-label="Workspace"][data-maximized] {
   height: 2.25rem;
   -webkit-app-region: drag;
 }
+/* Screens mounted OUTSIDE the AppShell (login / register / first-run setup /
+ * approve) carry no chrome, so on the macOS desktop shell — native title bar
+ * hidden, the page is the window's only drag surface — they render this strip
+ * (ElectronWindowDragStrip, only on that shell). Fixed so it rides the window
+ * rather than the page scroll; spans edge to edge since these screens keep no
+ * action cluster in the title-bar band (unlike the AppShell strip above). */
+.electron-standalone-drag-strip {
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: 2.25rem;
+  -webkit-app-region: drag;
+}
+/* Drag regions are geometric (see the [data-electron-mac] counter-rule above):
+ * a tall auth card scrolled up under the strip would lose clicks on whatever
+ * lands in that band. These pages don't set data-electron-mac, so scope the
+ * same interactive-elements counter-rule to the strip's presence. */
+body:has(.electron-standalone-drag-strip) :is(a, button, input, textarea, [role="button"]) {
+  -webkit-app-region: no-drag;
+}
 /* The title-bar cluster (Search/Settings/toggle), pinned beside the traffic
  * lights and independent of the sidebar — that independence is the point: it
  * holds this exact spot whether the sidebar is open, collapsed, or peeking.
