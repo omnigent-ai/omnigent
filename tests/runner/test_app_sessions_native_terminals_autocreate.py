@@ -3791,7 +3791,18 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pin", "custom_option", "expected_launch"),
+    [
+        ("system.ai.claude-opus-4-8[1m]", None, "claude-opus-4-8[1m]"),
+        ("sonnet_5", "system.ai.claude-sonnet-5", "claude-sonnet-5"),
+    ],
+    ids=["gateway-namespace-pin", "custom-slot-pin"],
+)
 async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace_pin(
+    pin: str,
+    custom_option: str | None,
+    expected_launch: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3803,6 +3814,9 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace
     lists the same model bare (``claude-opus-4-8[1m]``). The gate must fold
     the mechanical prefix away and launch on the catalog's own spelling
     rather than refuse — the refusal bricks every session of that agent.
+    The custom picker slot (``sonnet_5``) only reaches the gateway spelling
+    through its resolved provider option, so the fold must consult the
+    resolved spelling too, and the pick must survive the launch un-reset.
     """
     from omnigent.claude_native import ClaudeNativeUcodeConfig
 
@@ -3856,17 +3870,22 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace
                 metadata={"terminal_name": "claude", "session_key": "main", "running": True},
             )
 
-    def _handle_request(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200, json={"model_override": "system.ai.claude-opus-4-8[1m]", "labels": {}}
-        )
+    patches: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
+        return httpx.Response(200, json={"model_override": pin, "labels": {}})
 
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
         transport=httpx.MockTransport(_handle_request),
     )
+    env = {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+    if custom_option is not None:
+        env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = custom_option
     config = ClaudeNativeUcodeConfig(
-        env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+        env=env,
         api_key_helper="printf %s sk-gateway",
         model="claude-sonnet-5",
     )
@@ -3882,8 +3901,11 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace
         resolve_launch_config=_resolve,
     )
     args = captured["spec"].args
-    assert args[args.index("--model") + 1] == "claude-opus-4-8[1m]", (
+    assert args[args.index("--model") + 1] == expected_launch, (
         "the gate must launch the catalog's own spelling of the pinned model"
+    )
+    assert [body for body in patches if "model_override" in body] == [], (
+        "a foldable pin must survive the launch un-reset"
     )
     await fake_client.aclose()
 

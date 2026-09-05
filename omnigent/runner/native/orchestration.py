@@ -6960,10 +6960,23 @@ async def _auto_create_claude_terminal(
             # while the launch catalog lists the same model bare; folding the
             # mechanical prefix away keeps the pick launchable on the
             # catalog's own spelling instead of falling back to the default.
-            folded_spelling = claude_catalog_launch_spelling(launch_catalog, pick)
+            def _fold_pick(rows: list[dict[str, object]]) -> str | None:
+                """
+                The rows' launch spelling for the pick's persisted or resolved id.
+                """
+                # The custom picker slot resolves to a provider-configured id
+                # (e.g. "system.ai.claude-sonnet-5"), so like _serves_pick the
+                # fold must consult both spellings.
+                return claude_catalog_launch_spelling(
+                    rows, pick
+                ) or claude_catalog_launch_spelling(rows, resolved_request)
+
+            folded_spelling = _fold_pick(launch_catalog)
             # Only rows that are fresh may retire the pick: a stale entry may
             # predate a provider change, so it is re-probed first, and a
-            # failed probe leaves no fresh rows at all.
+            # failed probe leaves no fresh rows at all. A foldable pin counts
+            # as an exact serve for staleness: it launches on the stale rows'
+            # spelling without a re-probe, like the exact-serve stale path.
             fresh_rows: list[dict[str, object]] | None = launch_catalog
             if (
                 launch_catalog_was_stale
@@ -6974,7 +6987,7 @@ async def _auto_create_claude_terminal(
                 if fresh_rows:
                     launch_catalog = fresh_rows
                     launch_catalog_was_stale = False
-                    folded_spelling = claude_catalog_launch_spelling(launch_catalog, pick)
+                    folded_spelling = _fold_pick(launch_catalog)
             if not _serves_pick(launch_catalog):
                 if folded_spelling is not None:
                     _logger.info(
