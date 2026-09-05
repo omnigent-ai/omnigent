@@ -816,12 +816,15 @@ export function AppShell() {
   // Browser-capable shells only; no-op elsewhere (the bus never fires without a relay).
   useEffect(() => {
     if (!supportsBrowser()) return;
-    return onBrowserActionRequest((evt) => {
-      if (evt.action !== "navigate") return;
-      setRightRailTab("browser");
-      setRightPanelOpen(true);
+    return onBrowserActionRequest((evt, sourceConversationId) => {
+      if (evt.action !== "navigate" || !sourceConversationId) return;
+      writeSessionWorkspaceState(sourceConversationId, { selectedBrowserId: null });
+      if (sourceConversationId === conversationId) {
+        setRightRailTab("browser");
+        setRightPanelOpen(true);
+      }
     });
-  }, []);
+  }, [conversationId]);
 
   // Design-mode submit routing. Lives here (with the hoisted relay) because the
   // in-page popup posts back via preload IPC delivered to the always-mounted
@@ -2049,6 +2052,7 @@ export function AppShell() {
               push panels below sit outside the group. */}
                 {conversationId && workspacePanelVisible && (
                   <WorkspacePanel
+                    key={conversationId}
                     conversationId={conversationId}
                     width={inlinePanelWidth}
                     inert={inlinePanelWidth === 0}
