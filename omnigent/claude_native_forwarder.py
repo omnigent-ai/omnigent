@@ -79,6 +79,12 @@ _MAX_SEEN_DELTA_KEYS = 5000
 # hook signal and drop the heuristic.
 _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 
+# Surfaced as the child's ``last_task_error`` when its quiescence edge is
+# published as ``failed`` because a transcript item was dropped.
+_SUBAGENT_DROPPED_ITEM_REASON = (
+    "sub-agent transcript incomplete: an item was permanently rejected and dropped"
+)
+
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
 # ``agent-<id>.jsonl`` transcript.
@@ -399,6 +405,11 @@ class SubagentEntry:
         sub-agent — used to dedupe so we don't spam ``running`` or
         ``idle`` events on every tick when nothing changed. ``None``
         means no status has been posted yet.
+    :param dropped_item: Whether a transcript item was permanently
+        rejected and dropped for this sub-agent. The child's mirrored
+        transcript is incomplete from then on, so its quiescence edge
+        is published as ``failed`` rather than ``idle`` — an ``idle``
+        would reach the parent as a successful empty completion.
     """
 
     subagent_id: str
@@ -407,6 +418,7 @@ class SubagentEntry:
     seen_source_ids: tuple[str, ...] = ()
     last_activity_ts: float | None = None
     last_status: str | None = None
+    dropped_item: bool = False
 
 
 @dataclass(frozen=True)
@@ -1172,6 +1184,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             seen_source_ids=tuple(seen_source_ids),
             last_activity_ts=last_activity_ts,
             last_status=last_status,
+            dropped_item=row.get("dropped_item") is True,
         )
     return SubagentForwardState(subagents=entries)
 
@@ -1193,6 +1206,7 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "seen_source_ids": list(entry.seen_source_ids),
                 "last_activity_ts": entry.last_activity_ts,
                 "last_status": entry.last_status,
+                "dropped_item": entry.dropped_item,
             }
             for entry in state.subagents.values()
         },
@@ -1556,10 +1570,9 @@ async def _forward_available_subagents(
                         delivered_ambiguous=False,
                         http_status=_http_status_for_log(exc),
                     )
-                    # Skip this item and continue — alternative is to
-                    # block the whole sub-agent forever on one poison
-                    # record. The full transcript is still on disk if
-                    # someone needs to recover it.
+                    # Skip this item rather than block the whole sub-agent on one
+                    # poison record, but mark the mirrored transcript incomplete
+                    # so quiescence reports ``failed`` (see below), not ``idle``.
                     seen.add(item.source_id)
                     seen_source_ids.append(item.source_id)
                     new_entry = SubagentEntry(
@@ -1569,6 +1582,7 @@ async def _forward_available_subagents(
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                         last_activity_ts=new_entry.last_activity_ts,
                         last_status=new_entry.last_status,
+                        dropped_item=True,
                     )
                     updated = SubagentForwardState(
                         subagents={**updated.subagents, subagent_id: new_entry}
@@ -1598,6 +1612,7 @@ async def _forward_available_subagents(
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                         last_activity_ts=new_entry.last_activity_ts,
                         last_status=new_entry.last_status,
+                        dropped_item=new_entry.dropped_item,
                     )
                     updated = SubagentForwardState(
                         subagents={**updated.subagents, subagent_id: new_entry}
@@ -1634,6 +1649,7 @@ async def _forward_available_subagents(
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now,
                 last_status=new_entry.last_status,
+                dropped_item=new_entry.dropped_item,
             )
             updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})
             await _write_subagent_forward_state_async(bridge_dir, updated)
@@ -1647,7 +1663,8 @@ async def _forward_available_subagents(
                 byte_offset=result.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now if had_item else entry.last_activity_ts,
-                last_status=entry.last_status,
+                last_status=new_entry.last_status,
+                dropped_item=new_entry.dropped_item,
             )
         elif had_item:
             # Items DID flow but a later post failed — still record
@@ -1660,7 +1677,8 @@ async def _forward_available_subagents(
                 byte_offset=entry.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now,
-                last_status=entry.last_status,
+                last_status=new_entry.last_status,
+                dropped_item=new_entry.dropped_item,
             )
 
         # Quiescence-based status. Sub-agent transcripts don't carry
@@ -1672,11 +1690,16 @@ async def _forward_available_subagents(
         if had_item:
             desired_status = "running"
         elif (
-            new_entry.last_activity_ts is not None
+            # Items are retried across polls, so a child that went quiet on
+            # failing POSTs is not quiescent; its ``idle`` would carry no
+            # ``output`` and reach the parent as a successful completion.
+            not items_failed
+            and new_entry.last_activity_ts is not None
             and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
-            and new_entry.last_status != "idle"
         ):
-            desired_status = "idle"
+            # A dropped item leaves the mirrored transcript short of what the
+            # child actually produced, so this quiet is not a clean finish.
+            desired_status = "failed" if new_entry.dropped_item else "idle"
         if desired_status is not None and desired_status != new_entry.last_status:
             retry_key = f"subagent_status:{entry.child_conversation_id}"
             if status_retry_tracker.retry_delay_s(retry_key) is None:
@@ -1685,6 +1708,9 @@ async def _forward_available_subagents(
                         client,
                         session_id=entry.child_conversation_id,
                         status=desired_status,
+                        output=(
+                            _SUBAGENT_DROPPED_ITEM_REASON if desired_status == "failed" else None
+                        ),
                     )
                 except httpx.HTTPError as exc:
                     decision = status_retry_tracker.record_failure(retry_key, exc)
@@ -1708,6 +1734,7 @@ async def _forward_available_subagents(
                         seen_source_ids=new_entry.seen_source_ids,
                         last_activity_ts=new_entry.last_activity_ts,
                         last_status=desired_status,
+                        dropped_item=new_entry.dropped_item,
                     )
 
         if new_entry is not entry:
