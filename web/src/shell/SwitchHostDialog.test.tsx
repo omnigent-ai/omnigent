@@ -23,6 +23,7 @@ vi.mock("./WorkspacePicker", () => ({
   WorkspacePicker: () => <div data-testid="mock-workspace-picker" />,
   homeFromEntries: () => null,
   isNavigablePath: () => false,
+  isUnresolvedWorkspacePath: () => false,
 }));
 vi.mock("./HostLabel", () => ({
   HostLabel: ({ host }: { host: { name: string } }) => <span>{host.name}</span>,

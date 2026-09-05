@@ -15,6 +15,7 @@ import {
   basename,
   isHostAbsolutePath,
   isNavigablePath,
+  isUnresolvedWorkspacePath,
   joinPath,
   listingFilter,
   normalizeTypedPath,
@@ -248,6 +249,29 @@ describe("isHostAbsolutePath", () => {
     expect(isHostAbsolutePath("C:\\Users\\alice")).toBe(true);
     expect(isHostAbsolutePath("~/work")).toBe(false);
     expect(isHostAbsolutePath("")).toBe(false);
+  });
+});
+
+describe("isUnresolvedWorkspacePath", () => {
+  it("is true only for navigable-but-not-absolute paths (tilde forms)", () => {
+    // The dialogs adopt the browser's resolved absolute path exactly when
+    // the committed value is one the host must expand ("~", "~/…").
+    expect(isUnresolvedWorkspacePath("~")).toBe(true);
+    expect(isUnresolvedWorkspacePath("~/git/omnigent")).toBe(true);
+    expect(isUnresolvedWorkspacePath("  ~/git/omnigent  ")).toBe(true);
+  });
+
+  it("is false for absolute paths — browsing must not rewrite a valid value", () => {
+    // Once the form value is absolute the submit is already enabled;
+    // navigating deeper in the tree browser must not silently change it.
+    expect(isUnresolvedWorkspacePath("/home/me/git/omnigent")).toBe(false);
+    expect(isUnresolvedWorkspacePath("C:\\Users\\alice\\work")).toBe(false);
+  });
+
+  it("is false for values the browser can't navigate to at all", () => {
+    expect(isUnresolvedWorkspacePath("")).toBe(false);
+    expect(isUnresolvedWorkspacePath("relative/dir")).toBe(false);
+    expect(isUnresolvedWorkspacePath("~user/work")).toBe(false);
   });
 });
 
