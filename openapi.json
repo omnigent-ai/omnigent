@@ -1474,6 +1474,42 @@
         "title": "CreatedEvent",
         "type": "object"
       },
+      "CurrentUserResponse": {
+        "description": "Authenticated identity and optional synchronized preferences.",
+        "properties": {
+          "is_admin": {
+            "title": "Is Admin",
+            "type": "boolean"
+          },
+          "preferences": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UserPreferencesEnvelope"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          }
+        },
+        "required": [
+          "user_id",
+          "is_admin"
+        ],
+        "title": "CurrentUserResponse",
+        "type": "object"
+      },
       "DailyCost": {
         "description": "One day's LLM spend for the daily timeline chart.",
         "properties": {
@@ -2819,6 +2855,7 @@
         "title": "IncompleteEvent",
         "type": "object"
       },
+      "JsonValue": {},
       "LaunchRunnerRequest": {
         "description": "Request body for `POST /v1/hosts/{host_id}/runners`.",
         "properties": {
@@ -8452,6 +8489,41 @@
         "title": "UsageReport",
         "type": "object"
       },
+      "UserPreferencesEnvelope": {
+        "additionalProperties": false,
+        "description": "Versioned, allowlisted cross-device preference payload.",
+        "properties": {
+          "settings": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "propertyNames": {
+              "enum": [
+                "keyboard_shortcuts",
+                "mobile_assistant",
+                "session_navigation",
+                "context_indicator",
+                "usage_context",
+                "agent_badges"
+              ]
+            },
+            "title": "Settings",
+            "type": "object"
+          },
+          "version": {
+            "const": 1,
+            "format": "int64",
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "settings"
+        ],
+        "title": "UserPreferencesEnvelope",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -9868,7 +9940,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/CurrentUserResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -9878,6 +9952,157 @@
         "tags": [
           "system"
         ]
+      }
+    },
+    "/v1/me/preferences": {
+      "put": {
+        "description": "Initialize the caller's full preference envelope exactly once.",
+        "operationId": "initialize_user_preferences_v1_me_preferences_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "settings": {
+                    "additionalProperties": {},
+                    "propertyNames": {
+                      "enum": [
+                        "agent_badges",
+                        "context_indicator",
+                        "keyboard_shortcuts",
+                        "mobile_assistant",
+                        "session_navigation",
+                        "usage_context"
+                      ]
+                    },
+                    "type": "object"
+                  },
+                  "version": {
+                    "const": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "version",
+                  "settings"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserPreferencesEnvelope"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "Invalid Content-Length header"
+          },
+          "401": {
+            "description": "Authentication required or account deleted"
+          },
+          "413": {
+            "description": "Request body exceeds the preferences limit"
+          },
+          "415": {
+            "description": "Request body is not application/json"
+          },
+          "422": {
+            "description": "Invalid preferences payload or namespace"
+          },
+          "429": {
+            "description": "Per-user write rate exceeded"
+          },
+          "503": {
+            "description": "Preferences persistence is unavailable"
+          }
+        },
+        "summary": "Initialize User Preferences"
+      }
+    },
+    "/v1/me/preferences/{namespace}": {
+      "patch": {
+        "description": "Atomically merge or remove one namespace for the current user.",
+        "operationId": "patch_user_preferences_namespace_v1_me_preferences__namespace__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "enum": [
+                "keyboard_shortcuts",
+                "mobile_assistant",
+                "session_navigation",
+                "context_indicator",
+                "usage_context",
+                "agent_badges"
+              ],
+              "title": "Namespace",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "value": {}
+                },
+                "required": [
+                  "value"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserPreferencesEnvelope"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "Invalid Content-Length header"
+          },
+          "401": {
+            "description": "Authentication required or account deleted"
+          },
+          "413": {
+            "description": "Request body exceeds the preferences limit"
+          },
+          "415": {
+            "description": "Request body is not application/json"
+          },
+          "422": {
+            "description": "Invalid preferences payload or namespace"
+          },
+          "429": {
+            "description": "Per-user write rate exceeded"
+          },
+          "503": {
+            "description": "Preferences persistence is unavailable"
+          }
+        },
+        "summary": "Patch User Preferences Namespace"
       }
     },
     "/v1/policies": {
