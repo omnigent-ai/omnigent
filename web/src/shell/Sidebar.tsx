@@ -69,7 +69,7 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import { useQueryClient } from "@tanstack/react-query";
-import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
+import { Link, useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
@@ -368,8 +368,8 @@ function useActiveNavItem(): {
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
 } {
-  const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
   const location = useLocation();
+  const rebasePath = useRebasePath();
   const extensions = useExtensions();
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
@@ -379,11 +379,7 @@ function useActiveNavItem(): {
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
   const isNewSessionRoute =
-    activeConversationId == null &&
-    !isInboxPage &&
-    !isTasksPage &&
-    !isUsagePage &&
-    !isExtensionRoute;
+    location.pathname.replace(/\/+$/, "") === rebasePath("/").replace(/\/+$/, "");
   const requestedProject = isNewSessionRoute
     ? new URLSearchParams(location.search).get("project")
     : null;

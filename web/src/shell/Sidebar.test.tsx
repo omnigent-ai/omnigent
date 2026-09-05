@@ -1554,6 +1554,24 @@ describe("Sidebar visibility filter (server-side mine/shared split)", () => {
 // "Sessions" list into a folder under the "Projects" group (rendered between
 // Pinned and Sessions). The project list comes from useProjects() (mocked here).
 describe("Sidebar project sections", () => {
+  it("preserves the selected project when opening settings", () => {
+    mockConversations([]);
+    projectsMock.push("Alpha");
+    localStorage.setItem(
+      NEW_SESSION_TARGET_STORAGE_KEY,
+      JSON.stringify({
+        kind: "project",
+        projectId: "p_Alpha",
+        projectName: "Alpha",
+      }),
+    );
+    renderSidebar(true, "/settings/appearance");
+    expect(JSON.parse(localStorage.getItem(NEW_SESSION_TARGET_STORAGE_KEY) ?? "null")).toEqual({
+      kind: "project",
+      projectId: "p_Alpha",
+      projectName: "Alpha",
+    });
+  });
   it("keeps a newly selected project from being overwritten by the old composer URL", async () => {
     projectsMock.push("Alpha", "Beta");
     mockConversations([]);
