@@ -92,6 +92,8 @@ describe("createSession", () => {
       agentName: null,
       runnerId: undefined,
       hostId: null,
+      hostName: null,
+      hostSandboxProvider: null,
       hostResumable: false,
       status: "idle",
       createdAt: 1704067200,

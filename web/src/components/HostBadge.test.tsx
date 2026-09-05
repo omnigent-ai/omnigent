@@ -46,13 +46,52 @@ describe("resolveHostBadge", () => {
   });
 
   it("falls back to the raw host_id when the host record is unresolved", () => {
-    // Shared session on another owner's host, or hosts not loaded yet:
-    // there's no name to show, but the session IS host-bound, so the
-    // badge must still answer "which host" with the id.
+    // Older server (no snapshot identity) or a deleted host row: there's
+    // no name to show, but the session IS host-bound, so the badge must
+    // still answer "which host" with the id.
     expect(resolveHostBadge({ hostId: "host_x9", host: undefined, online: true })).toEqual({
       label: "host_x9",
       status: "online",
     });
+  });
+
+  it("uses the snapshot-carried host name when the host list can't resolve it", () => {
+    // Shared session: /v1/hosts is owner-scoped, so the viewer's list never
+    // contains the owner's host. The snapshot's server-resolved name is what
+    // keeps the badge readable instead of the raw hex id.
+    expect(
+      resolveHostBadge({
+        hostId: "host_x9",
+        host: undefined,
+        online: true,
+        snapshotName: "alices-macbook",
+      }),
+    ).toEqual({ label: "alices-macbook", status: "online" });
+  });
+
+  it("labels a snapshot-resolved sandbox host by provider, like the owner's view", () => {
+    expect(
+      resolveHostBadge({
+        hostId: "host_sb",
+        host: undefined,
+        online: true,
+        snapshotName: "managed-abc123",
+        snapshotSandboxProvider: "lakebox",
+      }),
+    ).toEqual({ label: "Databricks Sandbox", status: "online" });
+  });
+
+  it("prefers the caller's own host-list record over the snapshot identity", () => {
+    // The owner's list entry is live (renames propagate on the 10s poll);
+    // the snapshot name is the fallback for viewers who can't list the host.
+    expect(
+      resolveHostBadge({
+        hostId: "host_a1b2",
+        host: host(),
+        online: true,
+        snapshotName: "stale-name",
+      }),
+    ).toEqual({ label: "mac-laptop", status: "online" });
   });
 
   it("reports unknown status while liveness is still settling", () => {
@@ -166,6 +205,21 @@ describe("HostBadge", () => {
     useHostsMock.mockReturnValue({ data: [] });
     render(<HostBadge sessionId="conv_1" />);
     expect(screen.getByTestId("host-badge").textContent).toContain("host_x9");
+  });
+
+  it("shows the snapshot host name for a shared session's viewer", () => {
+    // The viewer's owner-scoped /v1/hosts list can't resolve the owner's
+    // host, but the snapshot carries the server-resolved name.
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_x9", hostName: "alices-macbook" },
+      isLoading: false,
+      error: null,
+    });
+    useHostsMock.mockReturnValue({ data: [] });
+    render(<HostBadge sessionId="conv_1" />);
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.textContent).toContain("alices-macbook");
+    expect(badge.textContent).not.toContain("host_x9");
   });
 
   it("falls back to the host record's status when liveness is unobserved", () => {

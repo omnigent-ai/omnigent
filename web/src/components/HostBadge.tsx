@@ -21,8 +21,11 @@ export interface HostBadgeInfo {
  * - Not host-bound (`hostId` null/absent) → `null` (render nothing).
  * - Sandbox-backed host → the provider label ("Databricks Sandbox").
  * - Connected host → its friendly `name`.
- * - Host-bound but record unresolved (shared session / not yet loaded)
- *   → the raw `hostId`, so the badge always answers "which host".
+ * - Record not in the caller's host list (shared session — `/v1/hosts` is
+ *   owner-scoped — or the list still loading) → the snapshot-carried
+ *   `snapshotName` / `snapshotSandboxProvider`, resolved server-side.
+ * - Nothing resolved at all (older server, deleted host row) → the raw
+ *   `hostId`, so the badge always answers "which host".
  *
  * `online` is tri-stated: `true`/`false` map to online/offline; `null`
  * (not-host-bound signal) and `undefined` (not yet observed) both map to
@@ -32,14 +35,18 @@ export function resolveHostBadge(args: {
   hostId: string | null | undefined;
   host: Host | undefined;
   online: boolean | null | undefined;
+  snapshotName?: string | null;
+  snapshotSandboxProvider?: string | null;
 }): HostBadgeInfo | null {
-  const { hostId, host, online } = args;
+  const { hostId, host, online, snapshotName, snapshotSandboxProvider } = args;
   if (!hostId) return null;
   const label = host
     ? host.sandbox_provider
       ? sandboxOptionLabel(host.sandbox_provider)
       : host.name
-    : hostId;
+    : snapshotSandboxProvider
+      ? sandboxOptionLabel(snapshotSandboxProvider)
+      : (snapshotName ?? hostId);
   const status: HostBadgeStatus =
     online === true ? "online" : online === false ? "offline" : "unknown";
   return { label, status };
@@ -137,7 +144,13 @@ export function HostBadge({
         : undefined
       : liveOnline;
 
-  const badge = resolveHostBadge({ hostId, host, online });
+  const badge = resolveHostBadge({
+    hostId,
+    host,
+    online,
+    snapshotName: session?.hostName,
+    snapshotSandboxProvider: session?.hostSandboxProvider,
+  });
   if (!badge) return null;
 
   // A resumable managed host that reports offline is idle-stopped, not
