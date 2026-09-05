@@ -3879,6 +3879,70 @@ def test_parse_credential_proxy_https_env_optional(tmp_path: Path) -> None:
     assert entry.inject_env == []
 
 
+def test_parse_credential_proxy_source_refresh_interval(tmp_path: Path) -> None:
+    """A source ``refresh_interval`` parses through to the runtime spec.
+
+    Without the passthrough a rotating-source config would parse but the
+    runtime would still bake the value in once, so a long session would hit
+    proxy-injected 401s after the backing token expired.
+    """
+    config = _credential_proxy_config(
+        [
+            {
+                "type": "gh_basic",
+                "source": {"command": "gh auth token", "refresh_interval": 300},
+            }
+        ]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    entry = spec.os_env.sandbox.credential_proxy.entries[0]
+    assert entry.source.kind == "command"
+    assert entry.source.refresh_interval == 300
+
+
+def test_parse_credential_proxy_source_rejects_negative_refresh(tmp_path: Path) -> None:
+    """A negative ``refresh_interval`` fails loudly at parse time.
+
+    A negative throttle is meaningless; rejecting it up front stops a
+    nonsensical config from reaching the runtime.
+    """
+    config = _credential_proxy_config(
+        [
+            {
+                "type": "gh_basic",
+                "source": {"command": "gh auth token", "refresh_interval": -1},
+            }
+        ]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match="refresh_interval"):
+        parse(tmp_path)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_parse_credential_proxy_source_rejects_non_finite_refresh(
+    tmp_path: Path, bad: float
+) -> None:
+    """A non-finite ``refresh_interval`` fails loudly at parse time.
+
+    ``NaN`` slips past a bare ``< 0`` guard (``NaN < 0`` is false) yet would
+    re-resolve on every swap; infinity would disable refresh forever. Both
+    must be rejected up front.
+    """
+    config = _credential_proxy_config(
+        [
+            {
+                "type": "gh_basic",
+                "source": {"command": "gh auth token", "refresh_interval": bad},
+            }
+        ]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match="refresh_interval"):
+        parse(tmp_path)
+
+
 def test_parse_credential_proxy_databricks_cli(tmp_path: Path) -> None:
     """A ``databricks_cli`` entry parses into a profile-keyed policy.
 
