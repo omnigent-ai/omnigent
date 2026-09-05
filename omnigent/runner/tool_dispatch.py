@@ -1522,6 +1522,7 @@ async def _inherited_parent_model(
 
     - a sub-agent spec that pins its own ``executor.model`` keeps it — the
       worker's author chose that model deliberately;
+    - Kimi keeps the default from its CLI-owned provider catalog;
     - a child harness without model-override plumbing runs its default;
     - a parent model outside the child harness's family (e.g. a Claude
       selection dispatched to a codex worker) is not forced across vendors.
@@ -1537,6 +1538,8 @@ async def _inherited_parent_model(
     sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
     spec_model = getattr(getattr(sub_spec, "executor", None), "model", None)
     if isinstance(spec_model, str) and spec_model:
+        return None
+    if canonicalize_harness(child_harness) in {"kimi", "kimi-native"}:
         return None
     if not harness_supports_model_override(child_harness):
         return None

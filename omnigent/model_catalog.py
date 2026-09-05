@@ -21,9 +21,8 @@ Enumeration is deterministic per provider kind:
   ``"openai-compatible"``).
 - ``subscription`` → live CLI discovery for Cursor; curated static aliases for
   CLIs without a listing API (source ``"static"``, ``verified: false``).
-- ``cli-config`` → the codex curated static list (source ``"static"``,
-  ``verified: false`` — the credential lives in the CLI's own config
-  file and is resolved by the CLI at launch).
+- ``cli-config`` → the Codex static pre-launch shape, or live Kimi CLI
+  discovery (source ``"cli"``); credentials stay in each CLI's config.
 - anything unresolvable → source ``"none"`` with an explanatory note,
   which doubles as a dead-worker preflight signal.
 """
@@ -148,6 +147,7 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     "kimi-code": "kimi",
     # Native Kimi TUI harness shares the multi-provider kimi resolution path.
     "kimi-native": "kimi",
+    "native-kimi": "kimi",
     "qwen": "qwen",
     # The native agy TUI bridge resolves its provider via the SDK sibling,
     # mirroring the claude-native -> claude-sdk rule above.
@@ -237,7 +237,8 @@ class ResolvedModelProvider:
     :param auth_command: Shell command printing a bearer token, for
         providers configured with a dynamic credential.
     :param cli: ``"claude"`` / ``"codex"`` / ``"cursor-agent"`` for
-        ``kind="subscription"``; ``"codex"`` for ``kind="cli-config"``.
+        ``kind="subscription"``; ``"codex"`` / ``"kimi"`` for
+        ``kind="cli-config"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
     """
@@ -612,8 +613,18 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
             kind=NONE_KIND,
             detail=f"harness {harness or 'unknown'!r} has no model-provider resolution",
         )
-
     agent_spec = cast("AgentSpec", spec)
+    if harness_type == "kimi":
+        if agent_spec.executor.auth is not None:
+            from omnigent.runtime.workflow import _build_kimi_spawn_env
+
+            _build_kimi_spawn_env(agent_spec)
+        return ResolvedModelProvider(
+            kind=CLI_CONFIG_KIND,
+            cli="kimi",
+            detail="Kimi CLI config",
+        )
+
     entry = _resolve_provider_for_build(agent_spec, harness_type=harness_type)
     if entry is not None:
         return _provider_from_entry(entry, harness_type)
@@ -1067,7 +1078,7 @@ def _listing_for_provider(
         )
     if provider.kind == SUBSCRIPTION_KIND and provider.cli != "cursor-agent":
         return _static_subscription_listing(provider)
-    if provider.kind == CLI_CONFIG_KIND:
+    if provider.kind == CLI_CONFIG_KIND and provider.cli != "kimi":
         return _static_cli_config_listing(provider)
 
     cache_key = _listing_cache_key(provider)
@@ -1078,6 +1089,8 @@ def _listing_for_provider(
     try:
         if provider.kind == SUBSCRIPTION_KIND:
             listing = _fetch_cursor_cli_listing(provider)
+        elif provider.kind == CLI_CONFIG_KIND:
+            listing = _fetch_kimi_cli_listing(provider)
         elif provider.kind == DATABRICKS_KIND:
             listing = _fetch_databricks_listing(provider, transport=transport)
         elif provider.kind == KEY_KIND and provider.family == ANTHROPIC_FAMILY:
@@ -1094,12 +1107,13 @@ def _listing_for_provider(
         _logger.debug(
             "model enumeration failed for %s", provider.detail or provider.kind, exc_info=True
         )
-        if provider.kind == SUBSCRIPTION_KIND:
-            # A failed cursor-agent listing probe says nothing about
-            # dispatchability: the CLI brings its own stored login, so the
-            # worker still runs. Degrade to the usable pre-launch shape the
-            # other subscription CLI logins report, not the dead-worker
-            # "none" that tells orchestrators the worker cannot run here.
+        if provider.kind == SUBSCRIPTION_KIND or (
+            provider.kind == CLI_CONFIG_KIND and provider.cli == "kimi"
+        ):
+            # A failed self-managed CLI probe says nothing about dispatchability.
+            credential_source = (
+                "own provider config" if provider.cli == "kimi" else "own stored login"
+            )
             return ModelListing(
                 source="static",
                 verified=False,
@@ -1107,7 +1121,7 @@ def _listing_for_provider(
                 note=(
                     f"model listing failed for {provider.detail or provider.kind} "
                     f"({_redacted_failure_reason(exc)}); the CLI launches with its "
-                    "own stored login, so dispatches to this worker can still run"
+                    f"{credential_source}, so dispatches to this worker can still run"
                 ),
             )
         return ModelListing(
@@ -1137,6 +1151,38 @@ def _fetch_cursor_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
             for option in options
         ),
         note=f"live models advertised by the {provider.cli or 'cursor-agent'} CLI",
+    )
+
+
+def _fetch_kimi_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
+    """Build a live listing from Kimi's CLI-owned provider catalog."""
+    from omnigent.kimi_native import resolve_kimi_executable
+
+    completed = subprocess.run(
+        [resolve_kimi_executable(), "provider", "list", "--json"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=_AUTH_COMMAND_TIMEOUT_S,
+    )
+    payload = json.loads(completed.stdout)
+    raw_models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(raw_models, dict):
+        raise ValueError("Kimi CLI model listing did not contain a models object")
+    # Kimi keys this object by the full model id accepted by ``--model``.
+    model_ids = tuple(
+        model_id for model_id in raw_models if isinstance(model_id, str) and model_id
+    )
+    if not model_ids:
+        raise ValueError("Kimi CLI model listing did not contain any valid models")
+    return ModelListing(
+        source="cli",
+        verified=True,
+        models=tuple(
+            ModelEntry(id=model_id, family=model_family_token(model_id)) for model_id in model_ids
+        ),
+        note=f"live models advertised by the {provider.detail} provider catalog",
     )
 
 

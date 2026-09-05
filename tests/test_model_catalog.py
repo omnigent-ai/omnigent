@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
+import click
 import httpx
 import pytest
 from cachetools import TTLCache
@@ -373,6 +375,44 @@ def test_resolve_provider_cli_config_default(
     assert provider.cli == "codex"
     assert "codex-gateway" in provider.detail
     assert "Databricks" in provider.detail
+
+
+@pytest.mark.parametrize("harness", ["kimi", "kimi-code", "kimi-native", "native-kimi"])
+def test_resolve_provider_kimi_uses_cli_config_despite_omnigent_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """Kimi resolves through its own CLI instead of an Omnigent provider."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  openrouter:\n"
+        "    kind: gateway\n"
+        "    default: pi\n"
+        "    openai:\n"
+        "      base_url: https://openrouter.ai/api/v1\n"
+        "      api_key: $OPENROUTER_API_KEY\n",
+    )
+
+    provider = resolve_model_provider(_worker_spec(harness), harness)
+
+    assert provider.kind == "cli-config"
+    assert provider.cli == "kimi"
+    assert "Kimi CLI config" in provider.detail
+
+
+def test_resolve_provider_kimi_rejects_explicit_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Kimi discovery cannot advertise a spec its spawn path rejects."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    spec = _worker_spec("kimi-native", auth=ApiKeyAuth(api_key="unused"))
+
+    provider = resolve_model_provider(spec, "kimi-native")
+
+    assert provider.kind == "none"
+    assert "does not support per-invocation provider / auth injection" in provider.detail
 
 
 @pytest.mark.parametrize("harness", ["cursor", "cursor-native", "native-cursor"])
@@ -1147,6 +1187,101 @@ def test_cursor_listing_uses_live_cli_base_models(
     assert "live models advertised" in listing.note
 
 
+def test_kimi_listing_uses_cli_owned_model_catalog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A Kimi worker lists aliases from the CLI that owns its provider config."""
+    from omnigent import kimi_native
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    commands: list[list[str]] = []
+
+    def _run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "providers": {"litellm": {"type": "openai"}},
+                    "models": {
+                        "litellm/k3": {"provider": "litellm", "model": "k3"},
+                        "litellm/k3-256k": {
+                            "provider": "litellm",
+                            "model": "k3-256k",
+                        },
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(model_catalog.subprocess, "run", _run)
+    monkeypatch.setattr(kimi_native, "resolve_kimi_executable", lambda: "kimi")
+
+    listing = list_models_for_worker(_worker_spec("kimi-native"), "kimi-native")
+
+    assert commands == [["kimi", "provider", "list", "--json"]]
+    assert listing.source == "cli"
+    assert listing.verified is True
+    assert [model.id for model in listing.models] == ["litellm/k3", "litellm/k3-256k"]
+    assert "Kimi CLI" in listing.note
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing-binary",
+        "nonzero-exit",
+        "timeout",
+        "malformed-json",
+        "models-not-dict",
+        "empty-models",
+    ],
+)
+def test_kimi_listing_failures_degrade_without_caching(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
+) -> None:
+    """Kimi catalog failures stay usable and retry on the next listing."""
+    from omnigent import kimi_native
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    attempts = 0
+
+    def _resolve() -> str:
+        nonlocal attempts
+        if failure == "missing-binary":
+            attempts += 1
+            raise click.ClickException("kimi missing")
+        return "kimi"
+
+    def _run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal attempts
+        attempts += 1
+        if failure == "nonzero-exit":
+            raise subprocess.CalledProcessError(1, command)
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(command, 15)
+        stdout = {
+            "malformed-json": "{",
+            "models-not-dict": json.dumps({"models": []}),
+            "empty-models": json.dumps({"models": {}}),
+        }[failure]
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(kimi_native, "resolve_kimi_executable", _resolve)
+    monkeypatch.setattr(model_catalog.subprocess, "run", _run)
+
+    for _ in range(2):
+        listing = list_models_for_worker(_worker_spec("kimi-native"), "kimi-native")
+        assert listing.source == "static"
+        assert listing.verified is False
+        assert listing.models == ()
+        assert "can still run" in listing.note
+
+    assert attempts == 2
+
+
 def test_cursor_listing_failure_is_empty_and_retryable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1200,6 +1335,7 @@ def test_cursor_listing_failure_degrades_to_usable_static_row(
     assert listing.verified is False
     assert listing.models == ()
     # The note must say the worker still runs, not the dead-worker signal.
+    assert "own stored login" in listing.note
     assert "can still run" in listing.note
     assert "cannot run here" not in listing.note
 
