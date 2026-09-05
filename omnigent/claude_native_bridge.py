@@ -498,6 +498,61 @@ class TranscriptReadResult:
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    goal_state_observed: bool = False
+    latest_goal_state: str | None = None
+
+
+@dataclass(frozen=True)
+class ClaudeGoalStateSnapshot:
+    """Latest structured Goal state found in one complete transcript prefix."""
+
+    goal_state_observed: bool
+    latest_goal_state: str | None
+    byte_offset: int
+
+
+def _goal_state_from_transcript_entry(entry: _JsonObject) -> tuple[bool, str | None]:
+    """Read Claude Code's structured ``active_goal`` transcript event."""
+    if entry.get("type") != "active_goal" or "value" not in entry:
+        return False, None
+    value = entry.get("value")
+    if value is None:
+        return True, None
+    if isinstance(value, dict):
+        return True, "active"
+    return False, None
+
+
+def read_latest_transcript_goal_state(transcript_path: Path) -> ClaudeGoalStateSnapshot:
+    """Scan complete JSONL records and return the latest structured Goal state.
+
+    The scan retains only the latest matching event, so memory stays bounded
+    independently of transcript length. A trailing partial record is left for
+    the incremental reader once Claude completes it.
+    """
+    observed = False
+    latest_state: str | None = None
+    byte_offset = 0
+    with transcript_path.open("rb") as handle:
+        while raw := handle.readline():
+            if not raw.endswith(b"\n"):
+                break
+            byte_offset = handle.tell()
+            try:
+                entry = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(entry, dict):
+                continue
+            goal_observed, goal_state = _goal_state_from_transcript_entry(entry)
+            if goal_observed:
+                observed = True
+                latest_state = goal_state
+    return ClaudeGoalStateSnapshot(
+        goal_state_observed=observed,
+        latest_goal_state=latest_state,
+        byte_offset=byte_offset,
+    )
 
 
 @dataclass(frozen=True)
@@ -2403,6 +2458,8 @@ def read_transcript_items_since_with_position(
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    goal_state_observed = False
+    latest_goal_state: str | None = None
     for record in read_result.records:
         if record.text is None:
             continue
@@ -2412,6 +2469,10 @@ def read_transcript_items_since_with_position(
             continue
         if not isinstance(entry, dict):
             continue
+        observed_goal, goal_state = _goal_state_from_transcript_entry(entry)
+        if observed_goal:
+            goal_state_observed = True
+            latest_goal_state = goal_state
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -2443,6 +2504,8 @@ def read_transcript_items_since_with_position(
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
+        goal_state_observed=goal_state_observed,
+        latest_goal_state=latest_goal_state,
     )
 
 
@@ -2496,6 +2559,8 @@ def read_transcript_items_from_offset(
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    goal_state_observed = False
+    latest_goal_state: str | None = None
     for record in read_result.records:
         if record.text is None:
             continue
@@ -2505,6 +2570,10 @@ def read_transcript_items_from_offset(
             continue
         if not isinstance(entry, dict):
             continue
+        observed_goal, goal_state = _goal_state_from_transcript_entry(entry)
+        if observed_goal:
+            goal_state_observed = True
+            latest_goal_state = goal_state
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -2537,6 +2606,8 @@ def read_transcript_items_from_offset(
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
+        goal_state_observed=goal_state_observed,
+        latest_goal_state=latest_goal_state,
     )
 
 

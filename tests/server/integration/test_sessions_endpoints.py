@@ -10768,3 +10768,39 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+async def test_external_goal_state_updates_and_clears_session_list_marker(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    active = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_goal_state", "data": {"state": "active"}},
+    )
+    assert active.status_code in (200, 202), active.text
+    rows = (await client.get("/v1/sessions")).json()["data"]
+    assert next(row for row in rows if row["id"] == session["id"])["goal_state"] == "active"
+
+    cleared = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_goal_state", "data": {"state": None}},
+    )
+    assert cleared.status_code in (200, 202), cleared.text
+    rows = (await client.get("/v1/sessions")).json()["data"]
+    assert "goal_state" not in next(row for row in rows if row["id"] == session["id"])
+
+
+@pytest.mark.parametrize("data", [{"state": "complete"}, {"state": []}, {}])
+async def test_external_goal_state_rejects_unknown_value(
+    client: httpx.AsyncClient, data: dict[str, Any]
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_goal_state", "data": data},
+    )
+    assert response.status_code == 400, response.text

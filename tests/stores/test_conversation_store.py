@@ -4124,6 +4124,7 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.last_context_window": "1000000",
             # The dangerous bypass opt-in must NOT ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
+            "omnigent.goal_state": "active",
             # An ordinary, non-instance label that SHOULD carry over.
             "omnigent.wrapper": "claude-code-native-ui",
         },
@@ -4739,6 +4740,7 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
         conv_id,
         {
             instance_label: "1",
+            "omnigent.goal_state": "active",
             # DANGEROUS codex bypass opt-in: in the instance-scoped set so a
             # switch (a new agent/harness context) drops it rather than
             # silently re-arming bypass without a fresh typed confirmation.
@@ -4796,6 +4798,7 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     assert updated.labels[WRAPPER_LABEL_KEY] == CODEX_NATIVE_WRAPPER_VALUE
     assert updated.labels[FORK_CARRY_HISTORY_LABEL_KEY] == "1"
     assert updated.labels[SWITCH_PREVIOUS_BUILTIN_LABEL_KEY] == "52adb39f0c5ea92b5563da5327dac08f"
+    assert "omnigent.goal_state" not in updated.labels
     assert instance_label not in updated.labels, "instance-scoped labels must not survive a switch"
     assert "omnigent.codex_native.bypass_sandbox" not in updated.labels, (
         "the dangerous bypass opt-in must not survive a switch (re-confirm per context)"

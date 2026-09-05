@@ -462,6 +462,7 @@ function mockConversations(
     runner_id?: string | null;
     workspace?: string | null;
     created_at?: number;
+    goal_state?: "active" | "paused" | null;
   }[],
 ) {
   useConvMock.mockReturnValue({
@@ -479,6 +480,7 @@ function mockConversations(
             host_id: c.host_id ?? null,
             runner_id: c.runner_id ?? null,
             workspace: c.workspace ?? null,
+            goal_state: c.goal_state,
           })),
           first_id: null,
           last_id: null,
@@ -3960,5 +3962,29 @@ describe("Terminal-first shells — opening a shell from the mobile drawer", () 
     const probe = screen.getByTestId("view-probe");
     expect(probe).toHaveAttribute("data-view", "terminal");
     expect(probe).toHaveAttribute("data-terminal-view-key", "terminal:terminal_tui_main");
+  });
+});
+
+describe("native Goal projection", () => {
+  it.each(["active", "paused"] as const)("frames only the chat column for a %s Goal", (state) => {
+    mockConversations([{ id: "conv_goal", permission_level: 4, goal_state: state }]);
+    renderShell("/c/conv_goal");
+    const frame = screen.getByTestId("session-goal-frame");
+    expect(frame).toHaveAttribute("data-goal-state", state);
+    expect(frame).toHaveClass("pointer-events-none");
+    expect(frame).toHaveStyle({ right: "var(--workspace-panel-offset)" });
+  });
+
+  it("does not recover a cleared row from its old label", () => {
+    mockConversations([
+      {
+        id: "conv_goal",
+        permission_level: 4,
+        goal_state: null,
+        labels: { "omnigent.goal_state": "active" },
+      },
+    ]);
+    renderShell("/c/conv_goal");
+    expect(screen.queryByTestId("session-goal-frame")).not.toBeInTheDocument();
   });
 });
