@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
@@ -7004,6 +7005,93 @@ async def test_post_external_model_change_does_not_forward_to_runner(
     # ...but nothing was forwarded to the runner (no /model re-injection loop).
     assert runner_paths == [], (
         f"external_model_change must not call the runner; got {runner_paths}"
+    )
+
+
+async def test_create_session_initial_items_threads_tunnel_registry(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``POST /v1/sessions`` with ``initial_items`` must thread the real
+    ``app.state.tunnel_registry`` through to ``_dispatch_session_event_to_runner``.
+
+    This is the create-session initial-items dispatch site
+    (``omnigent/server/routes/_sessions/orchestration.py``, inside
+    ``_create_session_from_existing_agent``'s ``if body.initial_items:``
+    branch) — one of the sites found to need explicit ``tunnel_registry``
+    threading during a prior review's tunnel_registry-threading class
+    closure. Drives the REAL ``POST /v1/sessions`` route (not the inner
+    dispatch function directly) with a native-terminal agent and an
+    initial message, so session creation itself triggers the dispatch,
+    and asserts the exact ``app.state.tunnel_registry`` object — the same
+    one ``create_app()`` stamps unconditionally at construction time —
+    reaches the call.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    captured: dict[str, Any] = {}
+    real_dispatch = sessions_module._dispatch_session_event_to_runner
+
+    async def _spy_dispatch(*args: Any, **kwargs: Any) -> Any:
+        captured["tunnel_registry"] = kwargs.get("tunnel_registry")
+        return await real_dispatch(*args, **kwargs)
+
+    monkeypatch.setattr(sessions_module, "_dispatch_session_event_to_runner", _spy_dispatch)
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/terminals"):
+            return httpx.Response(200, json={"session_init_protocol_version": 2})
+        return httpx.Response(202, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    )
+
+    # Mock only the runner-CLIENT-resolution boundary: no runner is actually
+    # connected to this test's real RunnerRouter/TunnelRegistry (that would
+    # require simulating a live runner WS connection), so
+    # ``_get_runner_client`` would otherwise correctly raise/return None and
+    # the create route would take its no-runner "history-only seed" branch,
+    # never reaching dispatch at all. Everything AFTER this boundary —
+    # including the exact call site under test, which reads
+    # ``request.app.state.tunnel_registry`` inline — is the real route code.
+    async def _fake_get_runner_client(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+
+    try:
+        agent = await create_test_agent(client)
+        await _create_session(
+            client,
+            agent["id"],
+            initial_message="hello",
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "claude-code-native-ui",
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert "tunnel_registry" in captured, (
+        "_dispatch_session_event_to_runner was never called during "
+        "create-session initial-items dispatch — the trigger scenario "
+        "for this test regressed."
+    )
+    app_tunnel_registry = app.state.tunnel_registry
+    assert app_tunnel_registry is not None, (
+        "expected the real app's create_app() to have stamped a non-None "
+        "TunnelRegistry onto app.state — if this is None, create_app()'s "
+        "own unconditional tunnel_registry assignment regressed."
+    )
+    assert captured["tunnel_registry"] is app_tunnel_registry, (
+        "create-session initial-items dispatch did not thread the real "
+        "app.state.tunnel_registry through to _dispatch_session_event_to_runner "
+        "— a nested native sub-agent created with an initial message whose "
+        "terminal fails to boot would recover with no live-parent-reconnect wait."
     )
 
 

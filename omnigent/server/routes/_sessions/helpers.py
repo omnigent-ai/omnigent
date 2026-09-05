@@ -4045,7 +4045,7 @@ def _require_external_status_forward(
             f"{status!r} for sub-agent session {session_id!r}",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
-    if runner_result.status_code >= 400:
+    if not 200 <= runner_result.status_code < 300:
         detail = runner_result.body[:500]
         suffix = f": {detail}" if detail else ""
         raise OmnigentError(

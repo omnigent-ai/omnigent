@@ -118,3 +118,62 @@ async def test_lifespan_starts_periodic_metrics_otel_publisher(
 
     async with app.router.lifespan_context(app):
         await asyncio.wait_for(publisher_started.wait(), timeout=1.0)
+
+
+async def test_lifespan_threads_tunnel_registry_to_subagent_block_notifier(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The real lifespan closure must pass its ``TunnelRegistry`` to
+    ``configure_subagent_block_notifier``, not silently drop it.
+
+    Regression coverage for the outer wiring, not just the inner function:
+    ``tests/server/routes/test_subagent_block_wake.py`` already proves
+    ``configure_subagent_block_notifier`` itself threads a
+    ``tunnel_registry`` argument through to the dispatch call when given
+    one — but that test calls the function directly, so it cannot catch
+    the lifespan (``omnigent/server/app.py``) failing to pass its own
+    ``tunnel_registry`` at the call site. This drives the REAL lifespan
+    context manager (the same one the ASGI server runs on startup) and
+    asserts the object it hands to ``configure_subagent_block_notifier``
+    is the exact same ``TunnelRegistry`` instance stamped onto
+    ``app.state.tunnel_registry`` — proving the wiring at app.py's actual
+    call site, not a stand-in.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    captured: dict[str, object] = {}
+    real_configure = sessions_module.configure_subagent_block_notifier
+
+    def _spy_configure(*args: object, **kwargs: object) -> object:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return real_configure(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sessions_module, "configure_subagent_block_notifier", _spy_configure)
+
+    async with app.router.lifespan_context(app):
+        pass
+
+    assert "args" in captured, (
+        "configure_subagent_block_notifier was never called during lifespan "
+        "startup — the sub-agent block-wake notifier wiring regressed."
+    )
+    # The real call site passes tunnel_registry positionally as the 3rd
+    # argument (conversation_store, runner_router, tunnel_registry); accept
+    # either positional or keyword so this doesn't false-fail on a
+    # cosmetic refactor of the call style.
+    call_args = captured["args"]
+    call_kwargs = captured["kwargs"]
+    assert isinstance(call_args, tuple)
+    assert isinstance(call_kwargs, dict)
+    passed_tunnel_registry = (
+        call_args[2] if len(call_args) >= 3 else call_kwargs.get("tunnel_registry")
+    )
+    assert passed_tunnel_registry is app.state.tunnel_registry, (
+        "the lifespan's configure_subagent_block_notifier call did not receive "
+        "the SAME TunnelRegistry stamped onto app.state.tunnel_registry — a "
+        "nested native sub-agent's blocked-parent wake would recover with no "
+        "live-runner-reconnect wait."
+    )

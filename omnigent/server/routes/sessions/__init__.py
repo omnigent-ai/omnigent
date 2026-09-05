@@ -608,6 +608,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _child_session_summaries_from_conversations as _child_session_summaries_from_conversations,
     _create_session_from_bundle as _create_session_from_bundle,
     _create_session_from_existing_agent as _create_session_from_existing_agent,
+    _deliver_subagent_terminal_status_with_recovery as _deliver_subagent_terminal_status_with_recovery,
     _drive_terminal_resolved_elicitation as _drive_terminal_resolved_elicitation,
     _enrich_terminal_status_with_subagent_output as _enrich_terminal_status_with_subagent_output,
     _ensure_native_terminal_ready as _ensure_native_terminal_ready,
@@ -623,6 +624,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _get_session_snapshot as _get_session_snapshot,
     _handle_mcp_tools_call as _handle_mcp_tools_call,
     _heal_subagent_runner_binding_via_parent as _heal_subagent_runner_binding_via_parent,
+    _is_missing_parent_inbox_forward_result as _is_missing_parent_inbox_forward_result,
     _is_native_terminal_session as _is_native_terminal_session,
     _kick_managed_relaunch as _kick_managed_relaunch,
     _labels_for_viewer as _labels_for_viewer,
@@ -641,10 +643,11 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_skipped_kiro_pending_input as _persist_skipped_kiro_pending_input,
     _publish_and_wait_for_harness_elicitation as _publish_and_wait_for_harness_elicitation,
     _publish_subtree_cost_to_ancestors as _publish_subtree_cost_to_ancestors,
-    _recover_subagent_status_forward_via_parent as _recover_subagent_status_forward_via_parent,
+    _recover_subagent_status_forward_via_parent_impl as _recover_subagent_status_forward_via_parent_impl,
     _register_policy_elicitation as _register_policy_elicitation,
     _relay_runner_stream as _relay_runner_stream,
     _resolve_elicitation as _resolve_elicitation,
+    _resolve_subagent_parent as _resolve_subagent_parent,
     _run_managed_launch as _run_managed_launch,
     _run_managed_wake as _run_managed_wake,
     _runner_reject_detail as _runner_reject_detail,
@@ -673,6 +676,9 @@ from omnigent.server.routes._sessions.orchestration import (
 )
 from omnigent.server.routes._sessions.orchestration import (
     _publish_runner_recovered_status_impl as _publish_runner_recovered_status,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    _recover_subagent_status_forward_via_parent_impl as _recover_subagent_status_forward_via_parent,
 )
 
 # isort: on

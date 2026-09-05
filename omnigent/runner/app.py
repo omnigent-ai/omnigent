@@ -2574,6 +2574,36 @@ _session_event_queues_ref: dict[str, asyncio.Queue[_JsonObject | None]] = {}
 _session_inboxes_ref: dict[str, asyncio.Queue[_JsonObject]] = {}
 
 
+def _seed_cold_parent_delivery_queues(
+    parent_id: str,
+    session_inboxes: dict[str, asyncio.Queue[_JsonObject]],
+    session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]],
+) -> None:
+    """
+    Seed a parent's inbox + async-task map together, mirroring the pair
+    ``create_session`` installs.
+
+    Called from the terminal ``external_session_status`` branch once a
+    confirmed parent edge is recovered for a child whose delivering runner
+    never ran this parent's own ``create_session`` (e.g. the parent is
+    itself a sub-agent nested under another runner). ``setdefault`` on both
+    — never a plain assignment — so a sibling child's already-seeded queue
+    (and whatever it has already delivered into it) is never replaced.
+
+    A module-level function, not inlined at the call site, specifically so
+    it can be imported and driven directly by tests against the real
+    dicts — see ``tests/runner/test_native_subagent_inbox_delivery.py``.
+
+    :param parent_id: The parent session id to seed queues for.
+    :param session_inboxes: The runner's parent-inbox map (keyed by parent
+        session id).
+    :param session_async_tasks: The runner's per-session async-task map.
+    :returns: None.
+    """
+    session_inboxes.setdefault(parent_id, asyncio.Queue())
+    session_async_tasks.setdefault(parent_id, {})
+
+
 def get_session_agent_id(session_id: str) -> str | None:
     """
     Return the durable agent_id for a session.
@@ -8638,6 +8668,18 @@ def create_runner_app(
                 )
             if status in ("idle", "failed"):
                 recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                if recovered_entry is not None:
+                    # A confirmed parent edge means this runner is the
+                    # delivering runner for the child even when it never ran
+                    # this parent's own create_session (e.g. the parent is
+                    # itself a sub-agent nested under another runner). Seed
+                    # both queues together so the terminal delivery below
+                    # has a real inbox to push into instead of 503ing forever.
+                    _seed_cold_parent_delivery_queues(
+                        recovered_entry.parent_session_id,
+                        _session_inboxes,
+                        _session_async_tasks,
+                    )
             if status == "idle":
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,

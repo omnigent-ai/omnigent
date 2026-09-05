@@ -2483,7 +2483,79 @@ async def _heal_subagent_runner_binding_via_parent(
     return live_client
 
 
+async def _resolve_subagent_parent(
+    child_conv: Conversation,
+    conversation_store: ConversationStore,
+) -> Conversation | None:
+    """
+    Return the sub-agent's immediate parent handshake target, when it exists.
+
+    A runnerless-but-extant parent is still a valid handshake target: the
+    retained client may belong to a live root ancestor, and session-init does
+    not read the parent's ``runner_id``. Accordingly, a parent's ``None``
+    runner binding also differs from a child's non-``None`` binding wherever
+    callers compare the two.
+
+    :param child_conv: The sub-agent child conversation.
+    :param conversation_store: Store used to look up the parent.
+    :returns: The parent conversation when one exists, else ``None``.
+    """
+    parent_id = child_conv.parent_conversation_id or child_conv.root_conversation_id
+    if not parent_id or parent_id == child_conv.id:
+        return None
+    return await asyncio.to_thread(conversation_store.get_conversation, parent_id)
+
+
 async def _recover_subagent_status_forward_via_parent(
+    *args: Any, **kwargs: Any
+) -> _RunnerForwardResult | None:
+    """Call-time proxy so facade callers retain the five-argument contract."""
+    from omnigent.server.routes import sessions as _facade
+
+    return await _facade._recover_subagent_status_forward_via_parent(*args, **kwargs)
+
+
+async def _reforward_subagent_status_via_client(
+    child_conv: Conversation,
+    parent: Conversation,
+    client: httpx.AsyncClient,
+    conversation_store: ConversationStore,
+    forward_body: dict[str, Any],
+) -> _RunnerForwardResult | None:
+    """Best-effort parent init followed by a same-client status re-forward."""
+    parent_id = parent.id
+    try:
+        await _ensure_runner_session_initialized(parent_id, parent, client, conversation_store)
+    except Exception:  # noqa: BLE001 — load-bearing best-effort guard
+        # Runnerless parents and incomplete legacy rows can fail payload
+        # construction; recovery must still attempt delivery via the live client.
+        _logger.warning(
+            "Parent session-init handshake raised during sub-agent "
+            "recovery for parent=%s child=%s",
+            parent_id,
+            child_conv.id,
+            exc_info=True,
+        )
+
+    # Use the client already proven live. Re-resolving by child id could land
+    # on a different client during a router race.
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{child_conv.id}/events",
+            json=forward_body,
+            timeout=5.0,
+        )
+    except (httpx.HTTPError, ConnectionError):
+        _logger.exception(
+            "Sub-agent recovery re-forward failed for child=%s via parent=%s",
+            child_conv.id,
+            parent_id,
+        )
+        return None
+    return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
+
+
+async def _recover_subagent_status_forward_via_parent_impl(
     child_conv: Conversation,
     runner_router: RunnerRouter | None,
     tunnel_registry: TunnelRegistry | None,
@@ -2505,12 +2577,9 @@ async def _recover_subagent_status_forward_via_parent(
     :func:`_require_external_status_forward`). The parent never receives the
     child's inbox result and hangs with no timeout.
 
-    A child always runs on its parent's runner, so the live binding is the
-    parent's. This re-resolves the forward through the parent/root
-    conversation's *current* ``runner_id``: it waits briefly for that runner's
-    tunnel to (re)connect (covering the reconnect gap right after a relaunch),
-    heals the child's stale ``runner_id`` so future forwards and
-    ``_on_runner_connect`` resolve it correctly, and retries the forward.
+    Recovery names the immediate parent as the session-init target, delegates
+    ancestor walking and child rebinding to the canonical heal primitive, then
+    initializes and re-forwards through that same retained live client.
 
     :param child_conv: The sub-agent child conversation whose terminal-status
         forward could not reach its pinned runner.
@@ -2523,18 +2592,117 @@ async def _recover_subagent_status_forward_via_parent(
     :param forward_body: The ``external_session_status`` event body to re-POST.
     :returns: The retry's :class:`_RunnerForwardResult` when a live parent
         runner was resolved, or ``None`` when none could be (the caller then
-        fails the forward as before).
+        fails the forward as before). Success is determined by the caller
+        solely from this result's actual status code — never from the
+        session-init handshake's own return value, which conflates transport
+        failure, legacy runners, and a confirmed-ready terminal.
     """
+    parent = await _resolve_subagent_parent(child_conv, conversation_store)
+    if parent is None:
+        return None
     client = await _heal_subagent_runner_binding_via_parent(
-        child_conv, runner_router, tunnel_registry, conversation_store
+        child_conv,
+        runner_router,
+        tunnel_registry,
+        conversation_store,
     )
     if client is None:
         return None
-    return await _forward_session_change_to_runner(
+    return await _reforward_subagent_status_via_client(
+        child_conv,
+        parent,
+        client,
+        conversation_store,
+        forward_body,
+    )
+
+
+def _is_missing_parent_inbox_forward_result(runner_result: _RunnerForwardResult) -> bool:
+    """
+    Return whether a runner forward result is a parsed ``missing_parent_inbox`` 503.
+
+    Distinguishes the recoverable case (the runner resolved a client but has
+    no parent inbox for this child) from ``missing_work_entry`` (the runner
+    couldn't even confirm the child's own snapshot — parent init can't repair
+    that, so it stays forwarder-retry-only) and from any other rejection.
+
+    :param runner_result: The runner's HTTP result from a status forward.
+    :returns: ``True`` only for a 503 body shaped like
+        ``{"error": "subagent_delivery_not_confirmed", "reason":
+        "missing_parent_inbox"}``.
+    """
+    if runner_result.status_code != 503:
+        return False
+    try:
+        parsed = json.loads(runner_result.body)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return (
+        isinstance(parsed, dict)
+        and parsed.get("error") == "subagent_delivery_not_confirmed"
+        and parsed.get("reason") == "missing_parent_inbox"
+    )
+
+
+async def _deliver_subagent_terminal_status_with_recovery(
+    child_conv: Conversation,
+    runner_router: RunnerRouter | None,
+    tunnel_registry: TunnelRegistry | None,
+    conversation_store: ConversationStore,
+    forward_body: dict[str, Any],
+) -> _RunnerForwardResult | None:
+    """
+    Forward a sub-agent's terminal ``external_session_status`` with recovery.
+
+    The single policy both terminal-delivery call sites share (the normal
+    ``external_session_status`` event handler in ``post_event``, and
+    :func:`_forward_native_subagent_terminal_failure` for a native terminal
+    that never boots): heal through the nearest live ancestor before every
+    first forward, then initialize the immediate parent and re-forward only
+    when the runner is unreachable or reports ``missing_parent_inbox``.
+
+    :param child_conv: The sub-agent child conversation whose terminal status
+        is being delivered.
+    :param runner_router: Router used to resolve the bound runner client, or
+        ``None`` in in-process setups.
+    :param tunnel_registry: Runner-tunnel registry used to await the parent
+        runner's (re)connect, or ``None`` in setups without runner tunnels.
+    :param conversation_store: Store used to look up the parent and persist
+        the child's healed ``runner_id``.
+    :param forward_body: The ``external_session_status`` event body to POST.
+    :returns: The forward's :class:`_RunnerForwardResult`, or ``None`` if no
+        runner could be reached at all (direct or recovered).
+    """
+    preflight_client = await _heal_subagent_runner_binding_via_parent(
+        child_conv,
+        runner_router,
+        tunnel_registry,
+        conversation_store,
+    )
+    runner_result = await _forward_session_change_to_runner(
         child_conv.id,
         runner_router,
         forward_body,
     )
+    if runner_result is not None and not _is_missing_parent_inbox_forward_result(runner_result):
+        return runner_result
+    if preflight_client is None:
+        # The preflight already walked every eligible ancestor. Avoid a second
+        # reconnect wait in the same delivery attempt.
+        return runner_result
+
+    parent = await _resolve_subagent_parent(child_conv, conversation_store)
+    if parent is None:
+        # The parent can disappear between preflight and reactive recovery.
+        return runner_result
+    recovered = await _reforward_subagent_status_via_client(
+        child_conv,
+        parent,
+        preflight_client,
+        conversation_store,
+        forward_body,
+    )
+    return recovered if recovered is not None else runner_result
 
 
 def _drive_terminal_resolved_elicitation(session_id: str, persisted: ConversationItem) -> None:
@@ -4027,6 +4195,7 @@ async def _persist_native_terminal_failure(
     runner_router: RunnerRouter | None,
     *,
     created_by: str | None,
+    tunnel_registry: TunnelRegistry | None = None,
 ) -> str:
     """
     Persist a consumed user message and terminal-start error.
@@ -4098,6 +4267,8 @@ async def _persist_native_terminal_failure(
         conv,
         error,
         runner_router,
+        conversation_store,
+        tunnel_registry,
     )
     return consumed.id
 
@@ -4111,6 +4282,7 @@ async def _persist_host_launch_failure_turn(
     runner_router: RunnerRouter | None,
     *,
     created_by: str | None,
+    tunnel_registry: TunnelRegistry | None = None,
 ) -> str:
     """
     Persist a consumed user message and a host-launch failure error.
@@ -4181,7 +4353,9 @@ async def _persist_host_launch_failure_turn(
     _publish_status(session_id, "failed", ErrorDetail(code=error.code, message=error.message))
     # A host-launched sub-agent that can't configure must wake its parent,
     # the same way a boot failure does — no-ops for top-level sessions.
-    await _forward_native_subagent_terminal_failure(session_id, conv, error, runner_router)
+    await _forward_native_subagent_terminal_failure(
+        session_id, conv, error, runner_router, conversation_store, tunnel_registry
+    )
     return consumed.id
 
 
@@ -4190,6 +4364,8 @@ async def _forward_native_subagent_terminal_failure(
     conv: Conversation,
     error: ErrorData,
     runner_router: RunnerRouter | None,
+    conversation_store: ConversationStore,
+    tunnel_registry: TunnelRegistry | None = None,
 ) -> None:
     """
     Wake the parent runner when a native sub-agent fails to boot its terminal.
@@ -4198,10 +4374,18 @@ async def _forward_native_subagent_terminal_failure(
     ``failed`` branch of ``external_session_status`` in
     :func:`post_event`): forward an ``external_session_status: failed``
     edge — carrying the boot error as ``output`` so it lands in the
-    parent's inbox — to the sub-agent's own runner, then require the
-    forward to land. The runner's ``external_session_status`` handler
-    maps ``failed`` to ``mark_subagent_work_terminal(status="failed")``,
-    which marks the parent's work entry terminal and wakes the parent.
+    parent's inbox — through the same shared
+    :func:`_deliver_subagent_terminal_status_with_recovery` policy the
+    normal terminal-status path uses (universal preflight healing, then
+    parent initialization and re-forward on an unreachable runner or a
+    ``missing_parent_inbox`` 503), then requires the forward to land. The
+    runner's ``external_session_status`` handler maps ``failed`` to
+    ``mark_subagent_work_terminal(status="failed")``, which marks the
+    parent's work entry terminal and wakes the parent. Without sharing this
+    policy, a boot-failure terminal event could strand its parent exactly
+    the way the normal ``idle``/``failed`` forward no longer can (a stale
+    ``runner_id``, or a parent this runner never ran ``create_session``
+    for).
 
     No-ops for non-sub-agent sessions and for codex-internal sub-agents
     (tracked inside the same app-server thread tree, with no runner
@@ -4213,6 +4397,11 @@ async def _forward_native_subagent_terminal_failure(
     :param error: Boot error to relay to the parent as the turn result.
     :param runner_router: Router used to resolve the sub-agent's runner,
         or ``None`` (then the global client is used).
+    :param conversation_store: Store used to resolve the parent conversation
+        and heal the child's ``runner_id`` during recovery.
+    :param tunnel_registry: Runner-tunnel registry used to await the parent
+        runner's (re)connect during recovery, or ``None`` in setups without
+        runner tunnels.
     :returns: None.
     :raises OmnigentError: If the parent's runner could not be reached
         or rejected the forwarded failure status — dropping it would
@@ -4226,9 +4415,11 @@ async def _forward_native_subagent_terminal_failure(
         # (runner: ``output or "...turn failed"``); pass the real error.
         "data": {"status": "failed", "output": error.message},
     }
-    runner_result = await _forward_session_change_to_runner(
-        session_id,
+    runner_result = await _deliver_subagent_terminal_status_with_recovery(
+        conv,
         runner_router,
+        tunnel_registry,
+        conversation_store,
         forward_body,
     )
     _require_external_status_forward(session_id, "failed", runner_result)
@@ -5638,6 +5829,7 @@ async def _dispatch_session_event_to_runner_impl(
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
     host_store: HostStore | None = None,
+    tunnel_registry: TunnelRegistry | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -5710,6 +5902,12 @@ async def _dispatch_session_event_to_runner_impl(
         session's harness is AI-Gateway-backed (which router may route it).
         ``None`` reads as unknown, which counts as backed — the same posture
         an older host row gets.
+    :param tunnel_registry: Runner-tunnel registry threaded to the
+        native-terminal parent-wake recovery path (see
+        :func:`_persist_native_terminal_failure`) so a boot failure gets the
+        same live-parent-reconnect wait the main route gives a normal
+        idle/failed terminal edge. ``None`` in setups without runner
+        tunnels.
     :returns: A :class:`_SessionEventDispatchResult` carrying the
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
@@ -5737,6 +5935,7 @@ async def _dispatch_session_event_to_runner_impl(
                 ensure_outcome.error,
                 runner_router,
                 created_by=created_by,
+                tunnel_registry=tunnel_registry,
             )
             return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
         if ensure_outcome.policy_notice is not None:
@@ -7214,6 +7413,7 @@ async def _wake_parent_for_blocked_child(
     *,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    tunnel_registry: TunnelRegistry | None = None,
 ) -> bool:
     """
     Deliver a parent-wake notice when a sub-agent blocks on an approval.
@@ -7236,6 +7436,11 @@ async def _wake_parent_for_blocked_child(
     :param runner_router: Router used to resolve the parent's bound
         runner. ``None`` in in-process setups (the runtime singleton is
         consulted as a fallback).
+    :param tunnel_registry: Runner-tunnel registry threaded to the
+        boot-failure recovery path (see
+        :func:`_dispatch_session_event_to_runner`) so a nested native
+        grandparent gets the same live-runner-reconnect wait as the main
+        route. ``None`` in setups without runner tunnels.
     :returns: ``True`` when the notice was dispatched to the parent's runner;
         ``False`` when delivery could not happen (parent gone, no runner bound,
         or the forward raised a transport error).
@@ -7287,6 +7492,7 @@ async def _wake_parent_for_blocked_child(
             file_store=None,
             artifact_store=None,
             runner_router=runner_router,
+            tunnel_registry=tunnel_registry,
         )
     except (httpx.HTTPError, OmnigentError):
         _logger.warning(
@@ -7302,6 +7508,7 @@ async def _wake_parent_for_blocked_child(
 def configure_subagent_block_notifier(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    tunnel_registry: TunnelRegistry | None = None,
 ) -> Callable[[], None]:
     """
     Install the parent-wake notifier on the elicitation publish path.
@@ -7320,6 +7527,9 @@ def configure_subagent_block_notifier(
         ``parent_conversation_id`` and to persist the wake message.
     :param runner_router: Router used by the wake to reach the parent's
         bound runner. ``None`` in in-process setups.
+    :param tunnel_registry: Runner-tunnel registry threaded to the wake's
+        boot-failure recovery path. ``None`` in setups without runner
+        tunnels.
     :returns: A callable that uninstalls the observer and cancels any
         in-flight wake futures. Call from the lifespan teardown.
     """
@@ -7345,6 +7555,7 @@ def configure_subagent_block_notifier(
             notice,
             conversation_store=conversation_store,
             runner_router=runner_router,
+            tunnel_registry=tunnel_registry,
         )
 
     notifier = SubagentBlockNotifier(
@@ -8889,6 +9100,7 @@ async def _create_session_from_existing_agent(
                     created_by=_attribution_user(user_id),
                     runner_router=runner_router,
                     host_store=getattr(request.app.state, "host_store", None),
+                    tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
                 )
                 if pending_background_title is not None:
                     pending_background_title.schedule()
@@ -9953,6 +10165,7 @@ __all__ = [
     "_child_session_summaries_from_conversations",
     "_create_session_from_bundle",
     "_create_session_from_existing_agent",
+    "_deliver_subagent_terminal_status_with_recovery",
     "_detached_stop_tasks",
     "_dispatch_session_event_to_runner",
     "_drive_terminal_resolved_elicitation",
@@ -9973,6 +10186,7 @@ __all__ = [
     "_handle_mcp_tools_call",
     "_heal_subagent_runner_binding_via_parent",
     "_hold_native_ask_gate",
+    "_is_missing_parent_inbox_forward_result",
     "_is_native_terminal_session",
     "_kick_managed_relaunch",
     "_kick_managed_wake",
@@ -9995,9 +10209,11 @@ __all__ = [
     "_publish_runner_recovered_status",
     "_publish_subtree_cost_to_ancestors",
     "_recover_subagent_status_forward_via_parent",
+    "_recover_subagent_status_forward_via_parent_impl",
     "_register_policy_elicitation",
     "_relay_runner_stream",
     "_resolve_elicitation",
+    "_resolve_subagent_parent",
     "_run_managed_launch",
     "_run_managed_wake",
     "_runner_reject_detail",
