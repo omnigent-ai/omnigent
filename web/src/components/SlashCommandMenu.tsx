@@ -40,6 +40,47 @@ export function isSlashCommandText(text: string): boolean {
 }
 
 /**
+ * Sigil that also opens the skills menu on a codex-backed session. Codex's
+ * own composer splits the namespaces — ``/`` for built-in commands, ``$``
+ * for skills — so a codex session takes ``$deslop`` alongside ``/deslop``
+ * and the muscle memory carries over. Skills only: the built-ins here are
+ * Omnigent's, and codex has no ``$`` spelling for them.
+ */
+export const SKILL_SIGIL = "$";
+
+// The shape of SLASH_COMMAND_RE over the "$" sigil. Neither "/" nor "$" is
+// allowed in the name, so `$HOME/bin` and `$$x$$` don't match and prose
+// dollars stay prose.
+const SKILL_SIGIL_RE = /^\$[A-Za-z0-9][\w:-]*(\s|$)/;
+
+/**
+ * True when a draft reads as a ``$skill`` invocation. Callers gate on the
+ * session's harness being codex before consulting this — on every other
+ * harness a leading ``$`` is just prose.
+ */
+export function isSkillSigilText(text: string): boolean {
+  return SKILL_SIGIL_RE.test(text.trim());
+}
+
+/**
+ * The session's skills keyed as ``$name``, for the ``$``-triggered menu.
+ * Sigil-prefixed keys let the rest of the menu machinery
+ * (:func:`slashCommandMatches`, :func:`rankedSlashCommandNames`, the
+ * Commands/Skills section split) run unchanged — none of it reads the
+ * leading character beyond dropping it.
+ *
+ * :param skills: ``Session.skills`` from the snapshot.
+ * :returns: ``Record<"$name", description>``.
+ */
+export function buildSkillSigilCommandMap(
+  skills: readonly { name: string; description: string }[],
+): Record<string, string> {
+  const m: Record<string, string> = {};
+  for (const skill of skills) m[`${SKILL_SIGIL}${skill.name}`] = skill.description;
+  return m;
+}
+
+/**
  * True when `query` is a case-insensitive substring of the command name
  * (sans the leading `/`). Matches on the name only — not the description —
  * because the web menu never shows descriptions inline, so a

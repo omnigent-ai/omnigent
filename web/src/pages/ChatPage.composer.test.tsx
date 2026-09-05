@@ -914,6 +914,121 @@ describe("Composer slash-command submit routing", () => {
   });
 });
 
+// Codex spells a skill invocation "$name" in its own composer, reserving "/"
+// for its built-in commands. These pin that spelling for codex-backed
+// sessions: "$" opens the same suggestions menu (skills only) and submits by
+// the same route as "/", without letting prose dollars read as commands.
+describe("Composer codex $skill menu", () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_test",
+      sessionHarness: "codex-native",
+      skills: [
+        { name: "deep-research", description: "Run a deep research sweep" },
+        { name: "deslop", description: "Remove AI slop" },
+      ],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    useChatStore.setState({ sessionHarness: null });
+  });
+
+  it('opens the menu on "$" and lists skills only', () => {
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    fireEvent.change(textarea(), { target: { value: "$" } });
+    expect(screen.getByTestId("slash-menu-item-deslop")).toBeInTheDocument();
+    expect(screen.getByTestId("slash-menu-item-deep-research")).toBeInTheDocument();
+    // Built-ins are Omnigent's "/" commands — codex has no "$" spelling for
+    // them, so they stay out of this menu (they still show under "/").
+    expect(screen.queryByTestId("slash-menu-item-compact")).toBeNull();
+    expect(screen.queryByTestId("slash-menu-item-context")).toBeNull();
+  });
+
+  it("Tab completes the highlighted skill with its $ prefix", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "$des" } });
+    expect(activeRow()?.textContent).toContain("$deslop");
+    fireEvent.keyDown(ta, { key: "Tab" });
+    // Skills fill and keep focus so the user can append args — never execute.
+    expect(ta.value).toBe("$deslop ");
+  });
+
+  it("routes a known $skill through onSendSlashCommand with parsed args", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "$deslop fix the bug" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    // Same wire shape as "/deslop": the name without its sigil, plus args.
+    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("leaves prose dollars alone", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    // Command-shaped but not a skill: sent verbatim, with no overlay tint.
+    fireEvent.change(ta, { target: { value: "$5 per PR is the budget" } });
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledWith("$5 per PR is the budget", undefined);
+  });
+
+  it("treats an env-var path as plaintext, not a command", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "$HOME/bin is missing" } });
+    // The "/" inside the token keeps the menu shut, mirroring "/etc/hosts".
+    expect(screen.queryByTestId("slash-menu-item-deslop")).toBeNull();
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledWith("$HOME/bin is missing", undefined);
+  });
+
+  it("tints only the $skill token, leaving args in the default color", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "$deslop clean up ChatPage" } });
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.querySelector(".text-brand-accent")?.textContent).toBe("$deslop");
+    expect(overlay.textContent).toBe("$deslop clean up ChatPage");
+  });
+
+  it("stays inert on a non-codex session", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "$deslop" } });
+    // No menu, no tint, and the draft sends as written — "$" is codex's
+    // spelling, so elsewhere it's just prose.
+    expect(screen.queryByTestId("slash-menu-item-deslop")).toBeNull();
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledWith("$deslop", undefined);
+  });
+
+  it('still offers the built-ins and skills under "/"', () => {
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(screen.getByTestId("slash-menu-item-compact")).toBeInTheDocument();
+    expect(screen.getByTestId("slash-menu-item-deslop")).toBeInTheDocument();
+  });
+});
+
 describe("Composer model/effort label", () => {
   beforeEach(() => {
     useChatStore.setState({

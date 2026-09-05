@@ -157,8 +157,11 @@ import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
+  buildSkillSigilCommandMap,
+  isSkillSigilText,
   isSlashCommandText,
   rankedSlashCommandNames,
+  SKILL_SIGIL,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
@@ -220,6 +223,7 @@ import {
   codexApprovalModeLabel,
 } from "@/lib/codexApprovalMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
+import { isCodexHarness } from "@/lib/harnessSetup";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
@@ -290,14 +294,15 @@ export function isSubagentRoutingEligible(
 }
 
 // Leading whitespace + the command token, so the composer overlay can tint
-// just the `/skill` and leave any args in the default color.
-const SLASH_COMMAND_SPLIT_RE = /^(\s*)(\/[A-Za-z0-9][\w:-]*)/;
+// just the `/skill` (or codex's `$skill`) and leave any args in the default
+// color.
+const SLASH_COMMAND_SPLIT_RE = /^(\s*)([/$][A-Za-z0-9][\w:-]*)/;
 
 /**
  * Split a slash-command draft into the command token and the rest, for the
  * composer highlight overlay. Returns null when the text isn't a command
- * (callers gate on `isSlashCommandText`, so a returned token is the full
- * command — never a `/etc/hosts`-style path prefix).
+ * (callers gate on `isSlashCommandText` / `isSkillSigilText`, so a returned
+ * token is the full command — never a `/etc/hosts`-style path prefix).
  */
 export function splitSlashCommand(
   value: string,
@@ -2755,21 +2760,44 @@ function ComposerImpl({
     [skills, showEffort, showModel],
   );
 
+  // Codex spells a skill invocation `$name` in its own composer, so a
+  // codex-backed session takes `$` as a second trigger for the skills menu.
+  // `/` keeps working (and keeps the built-ins); `$` lists skills only,
+  // matching codex, which reserves `/` for its own commands. Empty on every
+  // other harness, which is what gates the `$` paths below.
+  const skillSigilEnabled = isCodexHarness(sessionHarness ?? "");
+  const skillSigilCommands = useMemo(
+    () => (skillSigilEnabled ? buildSkillSigilCommandMap(skills) : {}),
+    [skills, skillSigilEnabled],
+  );
+
   // Suggestions menu is open while the user is still typing the command
-  // name — i.e. the value starts with "/" with no spaces yet (once a
+  // name — i.e. the value starts with a sigil, with no spaces yet (once a
   // space appears the command name is done and args follow) and no second
-  // "/" (guards against file-path-like strings).
+  // "/" (guards against file-path-like strings, and against `$HOME/bin`).
   const trimmedValue = value.trimStart();
-  const menuOpen =
-    trimmedValue.startsWith("/") &&
-    !trimmedValue.slice(1).includes("/") &&
-    !trimmedValue.includes(" ") &&
-    files.length === 0;
-  // Query = what the user typed after the leading "/".
+  const menuSigil: "/" | typeof SKILL_SIGIL | null =
+    files.length > 0 || trimmedValue.includes(" ") || trimmedValue.slice(1).includes("/")
+      ? null
+      : trimmedValue.startsWith("/")
+        ? "/"
+        : skillSigilEnabled && trimmedValue.startsWith(SKILL_SIGIL)
+          ? SKILL_SIGIL
+          : null;
+  const menuOpen = menuSigil !== null;
+  // "$" lists the session's skills; "/" the built-ins plus the same skills.
+  const menuCommands = menuSigil === SKILL_SIGIL ? skillSigilCommands : slashCommands;
+  // Query = what the user typed after the leading sigil.
   const menuQuery = menuOpen ? trimmedValue.slice(1) : "";
   // Tint the `/skill` token blue while the draft reads as a slash command, so
-  // the command shape is signalled as the user types it.
-  const composerIsCommand = files.length === 0 && isSlashCommandText(value);
+  // the command shape is signalled as the user types it. A `$skill` draft
+  // tints only once the name matches a real skill — "$5" and "$HOME " are
+  // command-shaped but overwhelmingly prose, so shape alone would paint
+  // stray dollars blue.
+  const composerIsCommand =
+    files.length === 0 &&
+    (isSlashCommandText(value) ||
+      (isSkillSigilText(value) && (splitSlashCommand(value)?.token ?? "") in skillSigilCommands));
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -2785,7 +2813,7 @@ function ComposerImpl({
   };
   // Filtered matches — kept in sync with what SlashCommandMenu renders so
   // keyboard nav indexes into the same list.
-  const menuMatches = menuOpen ? rankedSlashCommandNames(slashCommands, menuQuery) : [];
+  const menuMatches = menuOpen ? rankedSlashCommandNames(menuCommands, menuQuery) : [];
 
   // Pre-select the first match whenever the filtered list changes — both
   // when the menu first opens (matches go [] → non-empty) and as the query
@@ -3049,7 +3077,8 @@ function ComposerImpl({
    */
   const applyMenuSelection = (cmd: string) => {
     setMenuIndex(-1);
-    if (slashCommandsWithArgs.has(cmd)) {
+    // Every `$` entry is a skill, and skills always fill rather than execute.
+    if (cmd in skillSigilCommands || slashCommandsWithArgs.has(cmd)) {
       // Fill in "cmd " and let the user type the argument.
       setValue(cmd + " ");
       dirtyRef.current = true;
@@ -3184,6 +3213,30 @@ function ComposerImpl({
         const skillArgs = trimmed.slice(parts[0].length).trim();
         appendEntry(trimmed);
         onSendSlashCommand(parts[0].slice(1), skillArgs);
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        onClearAllQuotes();
+        return;
+      }
+    }
+
+    // Codex's `$skill` spelling, on a codex session. A known skill routes
+    // exactly like `/skill`; everything else falls through to the plaintext
+    // send below — a prose dollar ("$5 per PR"), and any `$skill` on a
+    // native-terminal session, where `onSendSlashCommand` is undefined and
+    // codex's own CLI resolves the name.
+    if (
+      onSendSlashCommand &&
+      isSkillSigilText(trimmed) &&
+      files.length === 0 &&
+      mentionedItems.length === 0
+    ) {
+      const token = trimmed.split(/\s+/)[0]!;
+      if (token in skillSigilCommands) {
+        const skillArgs = trimmed.slice(token.length).trim();
+        appendEntry(trimmed);
+        onSendSlashCommand(token.slice(1), skillArgs);
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -3454,7 +3507,7 @@ function ComposerImpl({
             query={menuQuery}
             activeIndex={menuIndex}
             onSelect={applyMenuSelection}
-            commands={slashCommands}
+            commands={menuCommands}
           />
         )}
         {/* "@"-file-mention browser — native coding-agent sessions only.
