@@ -2,13 +2,13 @@
 
 For the ``omnigent setup --no-internal-beta`` first-run experience, this module
 discovers credentials a user already has — vendor API keys in the
-environment, a logged-in ``claude`` / ``codex`` CLI, or a local Ollama
+environment, a logged-in ``claude`` / ``codex`` CLI, or a local model
 server — so the setup flow can offer them as one-tap choices instead of
 asking the user to paste keys they already have.
 
 Detection is almost entirely pure standard library (``os``, ``socket``,
-``pathlib``) and performs no network I/O beyond a single non-blocking
-localhost TCP probe for Ollama. The one exception is macOS Claude detection:
+``pathlib``) and performs no network I/O beyond one non-blocking localhost
+TCP probe per local server. The one exception is macOS Claude detection:
 Claude Code stores its subscription OAuth in the macOS Keychain (not a file),
 so on macOS — and only when the file check comes up empty — Claude detection
 falls back to a ``claude auth status`` subprocess (see
@@ -59,9 +59,15 @@ _OLLAMA_HOST = "localhost"
 _OLLAMA_PORT = 11434
 _OLLAMA_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}"
 
-# Timeout (seconds) for the Ollama TCP probe — short so setup stays snappy
-# when nothing is listening.
-_OLLAMA_PROBE_TIMEOUT = 0.25
+# llmman's default endpoint. It serves the OpenAI, Ollama and Anthropic APIs
+# from one port, so the ``/v1`` surface below is reached the same way.
+_LLMMAN_HOST = "localhost"
+_LLMMAN_PORT = 17434
+_LLMMAN_URL = f"http://{_LLMMAN_HOST}:{_LLMMAN_PORT}"
+
+# Timeout (seconds) for the local-server TCP probes — short so setup stays
+# snappy when nothing is listening.
+_LOCAL_PROBE_TIMEOUT = 0.25
 
 # Claude Code's enterprise "managed settings" chain, highest precedence first.
 # An enterprise install (the shape ``isaac configure claude`` writes) configures
@@ -99,7 +105,7 @@ class DetectedProvider:
 
     :param name: The provider/source name, e.g. ``"anthropic"``,
         ``"openai"``, ``"openrouter"``, ``"gemini"``, ``"claude"``,
-        ``"codex"``, or ``"ollama"``.
+        ``"codex"``, ``"ollama"``, or ``"llmman"``.
     :param kind: How the credential authenticates — ``"key"`` (an API key
         in the environment), ``"subscription"`` (a logged-in CLI), or
         ``"local"`` (a self-hosted endpoint).
@@ -609,6 +615,21 @@ def _claude_login_detected() -> bool:
     return False
 
 
+def _tcp_reachable(host: str, port: int) -> bool:
+    """Return whether *host*:*port* accepts a TCP connection.
+
+    :param host: The host to connect to, e.g. ``"localhost"``.
+    :param port: The TCP port to connect to.
+    :returns: ``True`` when the connect succeeds, ``False`` on refusal,
+        timeout, or any socket error.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=_LOCAL_PROBE_TIMEOUT):
+            return True
+    except OSError:
+        return False
+
+
 def _ollama_reachable() -> bool:
     """Return whether a local Ollama server accepts TCP connections.
 
@@ -616,13 +637,21 @@ def _ollama_reachable() -> bool:
     in its own helper so tests can monkeypatch it without real network I/O.
 
     :returns: ``True`` when ``localhost:11434`` accepts a TCP connection,
-        ``False`` on refusal, timeout, or any socket error.
+        ``False`` otherwise.
     """
-    try:
-        with socket.create_connection((_OLLAMA_HOST, _OLLAMA_PORT), timeout=_OLLAMA_PROBE_TIMEOUT):
-            return True
-    except OSError:
-        return False
+    return _tcp_reachable(_OLLAMA_HOST, _OLLAMA_PORT)
+
+
+def _llmman_reachable() -> bool:
+    """Return whether a local llmman server accepts TCP connections.
+
+    Performs a single short-timeout connect to ``localhost:17434``. Isolated
+    in its own helper so tests can monkeypatch it without real network I/O.
+
+    :returns: ``True`` when ``localhost:17434`` accepts a TCP connection,
+        ``False`` otherwise.
+    """
+    return _tcp_reachable(_LLMMAN_HOST, _LLMMAN_PORT)
 
 
 # One-shot prewarmed detection result, produced by
@@ -688,10 +717,12 @@ def detect_providers() -> list[DetectedProvider]:
     4. A logged-in Codex CLI (``~/.codex/auth.json`` exists *and* carries a
        usable credential — see :func:`codex_auth_has_credential`).
     5. A reachable local Ollama (``localhost:11434`` TCP-connectable).
+    6. A reachable local llmman (``localhost:17434`` TCP-connectable).
 
-    No network I/O is performed except the single Ollama probe (see
-    :func:`_ollama_reachable`). On macOS, a ``claude auth status`` subprocess
-    may run as the Claude Keychain fallback (see :func:`_claude_login_detected`).
+    No network I/O is performed except the local-server probes (see
+    :func:`_ollama_reachable` and :func:`_llmman_reachable`). On macOS, a
+    ``claude auth status`` subprocess may run as the Claude Keychain fallback
+    (see :func:`_claude_login_detected`).
 
     :returns: One :class:`DetectedProvider` per credential found, in the
         priority order above. Empty when nothing is detected.
@@ -816,6 +847,17 @@ def _detect_providers_now() -> list[DetectedProvider]:
                 kind=LOCAL_KIND,
                 family=OPENAI_FAMILY,
                 source=_OLLAMA_URL,
+            )
+        )
+
+    # 6. Local llmman.
+    if _llmman_reachable():
+        detected.append(
+            DetectedProvider(
+                name="llmman",
+                kind=LOCAL_KIND,
+                family=OPENAI_FAMILY,
+                source=_LLMMAN_URL,
             )
         )
 

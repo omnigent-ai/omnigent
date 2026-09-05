@@ -216,6 +216,7 @@ Chat Completions IS the native format. Minimal translation (add model to payload
 | `xai` | `https://api.x.ai/v1` | `XAI_API_KEY` |
 | `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
 | `ollama` | `http://localhost:11434/v1` | (none) |
+| `llmman` | `http://localhost:17434/v1` | (none) |
 
 HTTP via sync `httpx` (already a project dependency).
 

@@ -242,6 +242,19 @@ def test_synthesize_local_ollama() -> None:
     assert entries["ollama"]["openai"]["base_url"] == "http://localhost:11434/v1"
 
 
+def test_synthesize_local_llmman() -> None:
+    """A reachable llmman becomes a ``local`` openai-family entry with /v1."""
+    det = DetectedProvider(
+        name="llmman", kind="local", family=OPENAI_FAMILY, source="http://localhost:17434"
+    )
+    entries = synthesize_detected_entries([det])
+    assert entries["llmman"]["kind"] == "local"
+    # The OpenAI-compatible path is appended to the detected host.
+    assert entries["llmman"]["openai"]["base_url"] == "http://localhost:17434/v1"
+    # The server ignores the key, but the family block requires a source.
+    assert entries["llmman"]["openai"]["api_key"] == "llmman"
+
+
 def test_effective_merges_and_auto_defaults_per_family() -> None:
     """Empty config + ambient creds → both merged and each its family default.
 

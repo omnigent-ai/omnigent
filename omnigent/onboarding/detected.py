@@ -1,8 +1,8 @@
 """Turn ambient-detected credentials into first-class provider entries.
 
 :mod:`omnigent.onboarding.ambient` discovers credentials already on the
-machine (env API keys, logged-in ``claude`` / ``codex`` CLIs, a local
-Ollama). This module bridges those raw detections into the kind-typed
+machine (env API keys, logged-in ``claude`` / ``codex`` CLIs, a local model
+server). This module bridges those raw detections into the kind-typed
 ``providers:`` shape consumed by :mod:`omnigent.onboarding.provider_config`,
 so they are treated as real providers everywhere — the ``/model`` readout
 names them truthfully, routing uses them, and ``configure harness`` shows
@@ -201,14 +201,14 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
         )
 
     if det.kind == "local":
-        # A self-hosted OpenAI-compatible server (Ollama). ``det.source`` is
-        # the base host (e.g. ``http://localhost:11434``); append the
-        # OpenAI-compatible ``/v1`` path. The key is a placeholder the
-        # server ignores but the family block requires a credential source.
+        # A self-hosted OpenAI-compatible server (llmman, Ollama).
+        # ``det.source`` is the base host (e.g. ``http://localhost:17434``);
+        # append the OpenAI-compatible ``/v1`` path. The key is a placeholder
+        # the server ignores but the family block requires a credential source.
         base_url = det.source.rstrip("/") + "/v1"
         return {
             "kind": LOCAL_KIND,
-            det.family: {"base_url": base_url, "api_key": "ollama"},
+            det.family: {"base_url": base_url, "api_key": det.name},
         }
 
     return None
