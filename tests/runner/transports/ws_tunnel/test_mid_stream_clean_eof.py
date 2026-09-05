@@ -236,6 +236,5 @@ async def test_dispatch_via_asgi_raise_after_clean_end_sends_single_end_frame() 
         f"{[type(f).__name__ for f in frames]}"
     )
     assert end_frames[0].error is None, (
-        f"End frame after a clean completion must not carry an error, "
-        f"got {end_frames[0].error!r}"
+        f"End frame after a clean completion must not carry an error, got {end_frames[0].error!r}"
     )
