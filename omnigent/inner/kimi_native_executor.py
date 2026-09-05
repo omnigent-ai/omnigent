@@ -15,8 +15,10 @@ stream-json`` per turn. This one types into a resident ``kimi`` TUI.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -31,9 +33,16 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
-from omnigent.kimi_native_bridge import BRIDGE_DIR_ENV_VAR, inject_user_message
+from omnigent.kimi_native_bridge import (
+    BRIDGE_DIR_ENV_VAR,
+    KimiApprovalPendingError,
+    inject_user_message,
+)
+from omnigent.llms.errors import PermanentLLMError, RetryableLLMError
 
 logger = logging.getLogger(__name__)
+_STEERING_READY_TIMEOUT_S = 30.0
+_MAX_APPROVAL_PENDING_RETRIES = 3
 
 
 class KimiNativeExecutor(Executor):
@@ -53,6 +62,7 @@ class KimiNativeExecutor(Executor):
         # against one cached executor, and injection is multi-step (clear +
         # paste + Enter) — without the lock their keystrokes interleave.
         self._inject_lock = asyncio.Lock()
+        self._approval_pending_retries = 0
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` — output is shown by the embedded terminal, not this executor."""
@@ -69,9 +79,11 @@ class KimiNativeExecutor(Executor):
         if not text:
             return False
         try:
-            async with self._inject_lock:
-                await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)
-        except RuntimeError:
+            await self._inject_message(
+                text, timeout_s=_STEERING_READY_TIMEOUT_S, turn_streaming=True
+            )
+        except RuntimeError as exc:
+            logger.warning("Kimi native steering message was not delivered: %s", exc)
             return False
         return True
 
@@ -89,12 +101,45 @@ class KimiNativeExecutor(Executor):
             yield ExecutorError(message="kimi native turn had no user text to send")
             return
         try:
-            async with self._inject_lock:
-                await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)
+            await self._inject_message(text)
+        except KimiApprovalPendingError as exc:
+            self._approval_pending_retries += 1
+            if self._approval_pending_retries > _MAX_APPROVAL_PENDING_RETRIES:
+                raise PermanentLLMError(str(exc), code="kimi_approval_pending") from exc
+            # Semantic Omnigent errors preserve retry classification through the adapter.
+            raise RetryableLLMError(str(exc), code="connection_error") from exc
         except RuntimeError as exc:
             yield ExecutorError(message=describe_exception(exc))
             return
+        self._approval_pending_retries = 0
         yield TurnComplete(response=None)
+
+    async def _inject_message(
+        self,
+        text: str,
+        *,
+        timeout_s: float | None = None,
+        turn_streaming: bool = False,
+    ) -> None:
+        cancel_event = threading.Event()
+        async with self._inject_lock:
+            injection = asyncio.create_task(
+                asyncio.to_thread(
+                    inject_user_message,
+                    self._bridge_dir,
+                    content=text,
+                    cancel_event=cancel_event,
+                    turn_streaming=turn_streaming,
+                    **({"timeout_s": timeout_s} if timeout_s is not None else {}),
+                )
+            )
+            try:
+                await asyncio.shield(injection)
+            except asyncio.CancelledError:
+                cancel_event.set()
+                with contextlib.suppress(BaseException):
+                    await injection
+                raise
 
 
 def _bridge_dir_from_env() -> Path:

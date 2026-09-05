@@ -45,6 +45,22 @@ def static_model_fallback(provider_kind: str, cli: str) -> StaticModelFallback |
     return _STATIC_MODEL_FALLBACKS.get((provider_kind, cli))
 
 
+#: Kimi model families whose API list price is pinned in
+#: ``omnigent.llms.context_window._KIMI_POSTED_PRICING`` (matched by substring
+#: against the effective model id the kimi-native forwarder reports, e.g.
+#: ``system.ai.kimi-k3`` / ``kimi-k3-databricks``). Order matters: it keys the
+#: parallel rate table.
+KIMI_PRICED_MODEL_FAMILIES = StaticModelFallback(
+    model_ids=("kimi-k3", "kimi-k2.7", "kimi-k2.6"),
+    owner="Kimi usage pricing (omnigent.llms.context_window.fetch_model_pricing)",
+    provenance="https://platform.kimi.ai/ posted API rates (retrieved 2026-08-28)",
+    discovery_gap=(
+        "the shared MLflow catalog carries no kimi entries, so kimi-native "
+        "token usage would otherwise price to nothing"
+    ),
+)
+
+
 #: Codex's launch default when nothing else names a model. The bundled
 #: OpenAI catalog's newest row is a bare family alias (``gpt-5.6``) that
 #: codex rejects, so a codex launch defaults to a concrete variant from

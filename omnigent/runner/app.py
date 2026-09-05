@@ -9400,7 +9400,7 @@ def create_runner_app(
         )
 
     async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
-        """Re-create a reaped native pane before forwarding a turn (#1349 self-heal).
+        """Re-create a reaped native pane before forwarding a turn (self-heal).
 
         The native-pane idle reaper may reclaim an idle pane while a session sits
         between turns. ``NativeServerHarness.run_turn`` forwards into the live
@@ -9409,8 +9409,12 @@ def create_runner_app(
         into a dead tmux target and lose the message. This re-ensures the pane
         first. Idempotent: a no-op when the harness is not a native CLI harness or
         the pane is already live. Reuses ``create_session_terminal``'s
-        ``ensure_native_terminal`` path, so the pane resumes via the vendor CLI's
-        own ``--resume`` (no fresh-start, no lost history).
+        ``ensure_native_terminal`` path. Healing restores a live pane, not the
+        CLI's in-context history: a harness that records a resumable chat id may
+        relaunch with its own ``--resume``, but continuity is best-effort, and a
+        harness without one (kimi — exempt from the reaper, so this only fires
+        for a crashed pane) always restarts a fresh TUI. Either way the prior
+        turns are guaranteed only in the server transcript.
 
         Detection has two layers: (1) the reaper POPPING the registry entry
         when it reaps (``registry.close()`` -> ``get()`` returns ``None``),

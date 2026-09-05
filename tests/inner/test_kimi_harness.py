@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -784,6 +786,666 @@ def test_run_turn_nonzero_exit_yields_executor_error(monkeypatch: pytest.MonkeyP
 
     errors = [e for e in events if isinstance(e, ExecutorError)]
     assert errors and "exited with code 2" in errors[0].message
+
+
+def test_run_turn_reports_wire_usage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The turn's ``usage.record`` rows sum into ``TurnComplete.usage``.
+
+    Pinned Kimi Code 0.34.0 wire schema: stream-json stdout carries no usage,
+    so the executor reads the persisted wire log after the subprocess exits.
+    ``input_tokens`` = Σ inputOther; cache reads/creation and output map to
+    their own keys; the effective model comes from ``llm.request`` (the
+    provider-resolved id, not the alias). Usage rows are written at spawn
+    time — like real kimi — so the strict turn-start time gate admits them;
+    the ``llm.request`` row carries NO ``time``, matching the pinned 0.34.0
+    schema (a fabricated ``time`` here previously masked the gate dropping
+    every real first-turn request).
+    """
+
+    def _rows() -> list[dict[str, Any]]:
+        now_ms = int(time.time() * 1000)
+        return [
+            {
+                "type": "llm.request",
+                "kind": "loop",
+                "provider": "openai",
+                "model": "system.ai.kimi-k3",
+                "modelAlias": "kimi-k3-databricks",
+                "maxTokens": 65536,
+            },
+            _usage_row(input_other=20559, output=160, time_ms=now_ms),
+            {
+                "type": "usage.record",
+                "model": "kimi-k3-databricks",
+                "usage": {
+                    "inputOther": 2975,
+                    "output": 76,
+                    "inputCacheRead": 17920,
+                    "inputCacheCreation": 8,
+                },
+                "usageScope": "turn",
+                "time": now_ms,
+            },
+        ]
+
+    events, _ex = _run_stubbed_turn(
+        monkeypatch,
+        tmp_path,
+        session_id="session_usage-1",
+        on_spawn=lambda: _write_wire(tmp_path, "session_usage-1", _rows()),
+    )
+
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage == {
+        "input_tokens": 20559 + 2975,
+        "output_tokens": 160 + 76,
+        "cache_read_input_tokens": 17920,
+        "cache_creation_input_tokens": 8,
+        # The relay path accumulates total_tokens independently (never
+        # derived), so it must be reported or the total stays 0 forever.
+        "total_tokens": 20559 + 2975 + 160 + 76 + 17920 + 8,
+        "model": "system.ai.kimi-k3",
+    }
+
+
+def test_run_turn_second_turn_counts_only_new_wire_records(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The per-session byte checkpoint makes each turn sum only its own rows."""
+    events, ex = _run_stubbed_turn(
+        monkeypatch,
+        tmp_path,
+        session_id="session_ckpt-1",
+        on_spawn=lambda: _write_wire(
+            tmp_path,
+            "session_ckpt-1",
+            [_usage_row(input_other=100, output=10, time_ms=int(time.time() * 1000))],
+        ),
+    )
+    first = next(e for e in events if isinstance(e, TurnComplete))
+    assert first.usage is not None
+    assert first.usage["input_tokens"] == 100
+
+    wire = _wire_path(tmp_path, "session_ckpt-1")
+
+    def _append_second() -> None:
+        with wire.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(_usage_row(input_other=7, output=3, time_ms=int(time.time() * 1000)))
+                + "\n"
+            )
+
+    events2 = _collect_stubbed_turn(
+        monkeypatch, ex, session_id="session_ckpt-1", on_spawn=_append_second
+    )
+    second = next(e for e in events2 if isinstance(e, TurnComplete))
+    assert second.usage is not None
+    assert second.usage["input_tokens"] == 7
+    assert second.usage["output_tokens"] == 3
+
+
+def test_run_turn_resumed_session_skips_prior_history(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The first read of a resumed (-S/-C) session's wire log is STRICTLY
+    time-gated at turn start: history written even milliseconds before the
+    resume is never re-billed; only rows stamped during the turn count."""
+    # Prewritten history, stamped one millisecond in the past — the smallest
+    # representable "before the resume". The old 10s backward allowance would
+    # have re-billed it.
+    _write_wire(
+        tmp_path,
+        "session_resume-1",
+        [_usage_row(input_other=99999, output=9999, time_ms=int(time.time() * 1000) - 1)],
+    )
+
+    def _append_current() -> None:
+        wire = _wire_path(tmp_path, "session_resume-1")
+        with wire.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(_usage_row(input_other=11, output=2, time_ms=int(time.time() * 1000)))
+                + "\n"
+            )
+
+    events, _ex = _run_stubbed_turn(
+        monkeypatch, tmp_path, session_id="session_resume-1", on_spawn=_append_current
+    )
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None
+    assert turn.usage["input_tokens"] == 11
+    assert turn.usage["output_tokens"] == 2
+
+
+def test_run_turn_known_session_seeds_checkpoint_before_spawn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A known session id with no checkpoint snapshots the wire EOF pre-spawn.
+
+    Everything already in the file predates the spawn (e.g. a prior run in
+    another process), so a turn that produces no new records reports no usage
+    instead of billing the backlog.
+    """
+    _write_wire(
+        tmp_path,
+        "session_seed-1",
+        [_usage_row(input_other=99999, output=9999, time_ms=int(time.time() * 1000))],
+    )
+    monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path))
+    ex = KimiExecutor(binary_path="kimi")
+    ex._session_id = "session_seed-1"
+
+    events = _collect_stubbed_turn(monkeypatch, ex, session_id="session_seed-1")
+
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is None
+
+
+def test_run_turn_missing_wire_log_reports_no_usage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No wire log for the session (or none yet) → usage None, never an error —
+    and the extraction recovers once the log appears on a later turn."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="omnigent.inner.kimi_executor")
+    (tmp_path / "sessions").mkdir()
+    events, ex = _run_stubbed_turn(monkeypatch, tmp_path, session_id="session_missing-1")
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is None
+    assert not [e for e in events if isinstance(e, ExecutorError)]
+    assert any("no wire log found" in r.message for r in caplog.records)
+
+    # The wire log shows up BETWEEN turns (kimi created it late), already
+    # holding a row stamped during turn 1. The next turn's checkpoint seeding
+    # must not snapshot EOF past that unbilled row: the eventual first read
+    # bills it (gated on the FIRST failed turn's floor, not this turn's
+    # start) together with the new turn's own row.
+    late_turn1_ms = int(time.time() * 1000)
+    _write_wire(
+        tmp_path,
+        "session_missing-1",
+        [_usage_row(input_other=6, output=2, time_ms=late_turn1_ms)],
+    )
+
+    def _append_turn2_row() -> None:
+        wire = _wire_path(tmp_path, "session_missing-1")
+        with wire.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(_usage_row(input_other=4, output=1, time_ms=int(time.time() * 1000)))
+                + "\n"
+            )
+
+    events2 = _collect_stubbed_turn(
+        monkeypatch,
+        ex,
+        session_id="session_missing-1",
+        on_spawn=_append_turn2_row,
+    )
+    turn2 = next(e for e in events2 if isinstance(e, TurnComplete))
+    assert turn2.usage is not None
+    # Both the late-appearing turn-1 row AND turn 2's row bill exactly once.
+    assert turn2.usage["input_tokens"] == 6 + 4
+    assert turn2.usage["output_tokens"] == 2 + 1
+
+
+def test_run_turn_malformed_wire_rows_are_skipped_whole(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Garbage lines and schema-drifted records are skipped WHOLE (never
+    partially counted) and never crash the turn; only records matching the
+    pinned 0.34.0 schema count."""
+
+    def _write_mixed() -> None:
+        now_ms = int(time.time() * 1000)
+        wire = _write_wire(
+            tmp_path,
+            "session_mal-1",
+            [
+                # Drifted: usage is not a dict.
+                {
+                    "type": "usage.record",
+                    "model": "m",
+                    "usage": "not-a-dict",
+                    "usageScope": "turn",
+                    "time": now_ms,
+                },
+                # Drifted: missing count field — must not count partially.
+                {
+                    "type": "usage.record",
+                    "model": "m",
+                    "usage": {"inputOther": 500, "output": 500, "inputCacheRead": 0},
+                    "usageScope": "turn",
+                    "time": now_ms,
+                },
+                # Drifted: missing model.
+                {
+                    "type": "usage.record",
+                    "usage": {
+                        "inputOther": 500,
+                        "output": 500,
+                        "inputCacheRead": 0,
+                        "inputCacheCreation": 0,
+                    },
+                    "usageScope": "turn",
+                    "time": now_ms,
+                },
+                # Wrong scope.
+                {
+                    "type": "usage.record",
+                    "model": "m",
+                    "usage": {
+                        "inputOther": 5,
+                        "output": 5,
+                        "inputCacheRead": 0,
+                        "inputCacheCreation": 0,
+                    },
+                    "usageScope": "aggregate",
+                    "time": now_ms,
+                },
+                # Valid.
+                _usage_row(input_other=4, output=1, time_ms=now_ms),
+            ],
+        )
+        with wire.open("a", encoding="utf-8") as fh:
+            fh.write("this is not json\n{truncated\n")
+
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="omnigent.inner.kimi_executor")
+    events, _ex = _run_stubbed_turn(
+        monkeypatch, tmp_path, session_id="session_mal-1", on_spawn=_write_mixed
+    )
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None
+    assert turn.usage["input_tokens"] == 4
+    assert turn.usage["output_tokens"] == 1
+    # Drifted records and non-JSON lines each leave a once-per-file diagnostic.
+    assert any("not matching the pinned" in r.message for r in caplog.records)
+    assert any("unparseable wire row" in r.message for r in caplog.records)
+
+
+def test_run_turn_timeless_historical_request_cannot_stamp_new_usage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A resumed log's TIMELESS historical request (real 0.34.0 shape) must
+    not attribute a later turn whose own request row is missing: its own
+    (uncounted) usage row consumed it, so the counted record's model wins."""
+
+    def _write_resumed() -> None:
+        now_ms = int(time.time() * 1000)
+        _write_wire(
+            tmp_path,
+            "session_stale-1",
+            [
+                # Yesterday's request — no ``time`` field, like real kimi.
+                {
+                    "type": "llm.request",
+                    "kind": "loop",
+                    "model": "system.ai.kimi-k3",
+                    "modelAlias": "kimi-k3-databricks",
+                },
+                # Its own usage row, pre-turn (gated out of billing).
+                _usage_row(input_other=999, output=99, time_ms=now_ms - 60_000),
+                # This turn's usage — its llm.request row went missing.
+                {
+                    "type": "usage.record",
+                    "model": "kimi-k2.7-databricks",
+                    "usage": {
+                        "inputOther": 9,
+                        "output": 1,
+                        "inputCacheRead": 0,
+                        "inputCacheCreation": 0,
+                    },
+                    "usageScope": "turn",
+                    "time": now_ms,
+                },
+            ],
+        )
+
+    events, _ex = _run_stubbed_turn(
+        monkeypatch, tmp_path, session_id="session_stale-1", on_spawn=_write_resumed
+    )
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None
+    assert turn.usage["input_tokens"] == 9
+    # The historical K3 request was consumed by ITS usage row; the counted
+    # record's own model attributes these tokens.
+    assert turn.usage["model"] == "kimi-k2.7-databricks"
+
+
+def test_run_turn_dead_writer_discards_torn_final_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """After process exit, an invalid final fragment is consumed deliberately."""
+
+    def _write_split() -> None:
+        now_ms = int(time.time() * 1000)
+        full = json.dumps(_usage_row(input_other=6, output=2, time_ms=now_ms))
+        fragment = json.dumps(_usage_row(input_other=4, output=1, time_ms=now_ms))
+        cut = len(fragment) // 2
+        _wire_path(tmp_path, "session_split-1").parent.mkdir(parents=True, exist_ok=True)
+        _wire_path(tmp_path, "session_split-1").write_text(
+            full + "\n" + fragment[:cut], encoding="utf-8"
+        )
+
+    events, ex = _run_stubbed_turn(
+        monkeypatch, tmp_path, session_id="session_split-1", on_spawn=_write_split
+    )
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None
+    # Only the complete row bills; the dead writer cannot finish its fragment.
+    assert turn.usage["input_tokens"] == 6
+    assert turn.usage["output_tokens"] == 2
+
+    def _append_next_turn_row() -> None:
+        with _wire_path(tmp_path, "session_split-1").open("a", encoding="utf-8") as fh:
+            fh.write(
+                "\n"
+                + json.dumps(_usage_row(input_other=4, output=1, time_ms=int(time.time() * 1000)))
+                + "\n"
+            )
+
+    events2 = _collect_stubbed_turn(
+        monkeypatch, ex, session_id="session_split-1", on_spawn=_append_next_turn_row
+    )
+    turn2 = next(e for e in events2 if isinstance(e, TurnComplete))
+    assert turn2.usage is not None
+    assert turn2.usage["input_tokens"] == 4
+    assert turn2.usage["output_tokens"] == 1
+
+
+@pytest.mark.parametrize("failure", ["empty", "unreadable"])
+def test_run_turn_yieldless_existing_wire_still_bills_late_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
+) -> None:
+    """An EXISTING wire that yields nothing on turn 1 behaves like a missing
+    one: the pending-first-read floor is recorded, so turn-1 rows flushed
+    after the turn still bill on turn 2 instead of failing its time gate."""
+    wire = _write_wire(tmp_path, "session_yieldless-1", [])
+    wire.write_text("", encoding="utf-8")
+    if failure == "unreadable":
+        wire.chmod(0)
+
+    events, ex = _run_stubbed_turn(monkeypatch, tmp_path, session_id="session_yieldless-1")
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is None
+
+    if failure == "unreadable":
+        wire.chmod(0o600)
+    # Turn-1's row flushes late, between the turns. The sleep pushes turn 2's
+    # start past this stamp at ms resolution, so the test discriminates: an
+    # unrecorded floor would gate this row out.
+    late_turn1_ms = int(time.time() * 1000)
+    wire.write_text(
+        json.dumps(_usage_row(input_other=6, output=2, time_ms=late_turn1_ms)) + "\n",
+        encoding="utf-8",
+    )
+    time.sleep(0.005)
+
+    def _append_turn2_row() -> None:
+        with wire.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(_usage_row(input_other=4, output=1, time_ms=int(time.time() * 1000)))
+                + "\n"
+            )
+
+    events2 = _collect_stubbed_turn(
+        monkeypatch, ex, session_id="session_yieldless-1", on_spawn=_append_turn2_row
+    )
+    turn2 = next(e for e in events2 if isinstance(e, TurnComplete))
+    assert turn2.usage is not None
+    assert turn2.usage["input_tokens"] == 6 + 4
+    assert turn2.usage["output_tokens"] == 2 + 1
+
+
+def test_run_turn_first_read_attributes_model_from_real_fixture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """First read of a real 0.34.0 wire attributes the provider-resolved model.
+
+    The sanitized real-session fixture's ``llm.request`` rows carry NO
+    ``time`` field; the first-read gate must keep them (dropping them
+    downgraded turn-1 attribution to the alias and missed catalog rates
+    keyed on the provider id). Only the ``usage.record`` timestamps are
+    re-stamped to now — the fixture predates the test run and usage rows
+    stay strictly time-gated.
+    """
+    fixture = Path(__file__).parent.parent / "fixtures" / "kimi_wire" / "completed.jsonl"
+
+    def _write_restamped() -> None:
+        # Built at spawn time so the re-stamped usage rows land inside the
+        # turn window (matching real kimi, which writes them mid-turn).
+        now_ms = int(time.time() * 1000)
+        rows: list[dict[str, Any]] = []
+        for line in fixture.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            if row.get("type") == "usage.record":
+                row["time"] = now_ms
+            rows.append(row)
+        _write_wire(tmp_path, "session_fixture-1", rows)
+
+    events, _ex = _run_stubbed_turn(
+        monkeypatch,
+        tmp_path,
+        session_id="session_fixture-1",
+        on_spawn=_write_restamped,
+    )
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None
+    # Provider-resolved id from llm.request, never the kimi-k3-databricks alias.
+    assert turn.usage["model"] == "system.ai.kimi-k3"
+    assert turn.usage["input_tokens"] > 0
+    assert turn.usage["output_tokens"] > 0
+
+
+def test_run_turn_model_falls_back_to_usage_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no usable llm.request after the checkpoint, the counted record's
+    own model still attributes the tokens."""
+    events, _ex = _run_stubbed_turn(
+        monkeypatch,
+        tmp_path,
+        session_id="session_recmodel-1",
+        on_spawn=lambda: _write_wire(
+            tmp_path,
+            "session_recmodel-1",
+            [_usage_row(input_other=9, output=1, time_ms=int(time.time() * 1000))],
+        ),
+    )
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None
+    assert turn.usage["model"] == "kimi-k3-databricks"
+
+
+def test_run_turn_historical_request_model_does_not_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A resumed log's historical llm.request must not attribute this turn:
+    only turn-window requests count, so the counted record's own model wins
+    when no current request exists."""
+    _write_wire(
+        tmp_path,
+        "session_histreq-1",
+        [
+            {
+                "type": "llm.request",
+                "kind": "loop",
+                "model": "system.ai.stale-model",
+                "modelAlias": "stale-alias",
+                "time": int(time.time() * 1000) - 1,
+            }
+        ],
+    )
+
+    def _append_current_usage() -> None:
+        wire = _wire_path(tmp_path, "session_histreq-1")
+        with wire.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(_usage_row(input_other=9, output=1, time_ms=int(time.time() * 1000)))
+                + "\n"
+            )
+
+    events, _ex = _run_stubbed_turn(
+        monkeypatch, tmp_path, session_id="session_histreq-1", on_spawn=_append_current_usage
+    )
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None
+    assert turn.usage["model"] == "kimi-k3-databricks"
+
+
+def test_run_turn_survives_homeless_environment_when_seeding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pre-spawn checkpoint seeding is best-effort: a HOME-less environment
+    (resolve_user_kimi_home → Path.home() raises RuntimeError) must not fail
+    the turn."""
+    monkeypatch.setattr(
+        kimi_executor,
+        "resolve_user_kimi_home",
+        lambda: (_ for _ in ()).throw(RuntimeError("no HOME")),
+    )
+    ex = KimiExecutor(binary_path="kimi")
+    ex._session_id = "session_nohome-1"
+
+    events = _collect_stubbed_turn(monkeypatch, ex, session_id="session_nohome-1")
+
+    assert not [e for e in events if isinstance(e, ExecutorError)]
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is None
+
+
+def test_sum_wire_usage_unreadable_file_logs_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unreadable wire log reports no usage and leaves one diagnostic."""
+    import logging
+
+    from omnigent.inner.kimi_executor import _sum_wire_usage
+
+    caplog.set_level(logging.WARNING, logger="omnigent.inner.kimi_executor")
+    unreadable = tmp_path / "wire.jsonl"
+    unreadable.mkdir()  # opening a directory as a file raises OSError
+
+    assert _sum_wire_usage(unreadable, offset=0, turn_start_ms=0) == (None, None, 0)
+    assert _sum_wire_usage(unreadable, offset=0, turn_start_ms=0) == (None, None, 0)
+
+    warnings = [r for r in caplog.records if "cannot read wire log" in r.message]
+    assert len(warnings) == 1
+
+
+def test_sum_wire_usage_counts_valid_final_row_without_newline(tmp_path: Path) -> None:
+    from omnigent.inner.kimi_executor import _sum_wire_usage
+
+    wire = tmp_path / "wire.jsonl"
+    row = _usage_row(input_other=7, output=2, time_ms=10)
+    wire.write_text(json.dumps(row), encoding="utf-8")
+
+    totals, model, offset = _sum_wire_usage(wire, offset=0, turn_start_ms=0)
+
+    assert totals is not None
+    assert totals["input_tokens"] == 7
+    assert totals["output_tokens"] == 2
+    assert model == "kimi-k3-databricks"
+    assert offset == wire.stat().st_size
+
+
+@pytest.mark.parametrize("boundary", ["turn.ended", "aggregate-usage"])
+def test_sum_wire_usage_clears_stale_request_at_nonbillable_boundary(
+    tmp_path: Path, boundary: str
+) -> None:
+    from omnigent.inner.kimi_executor import _sum_wire_usage
+
+    stale_request = {
+        "type": "llm.request",
+        "kind": "loop",
+        "model": "system.ai.stale-model",
+    }
+    if boundary == "turn.ended":
+        boundary_row: dict[str, Any] = {"type": "turn.ended", "reason": "failed"}
+    else:
+        boundary_row = _usage_row(input_other=50, output=5, time_ms=5)
+        boundary_row["usageScope"] = "aggregate"
+    current = _usage_row(input_other=7, output=2, time_ms=10)
+    wire = tmp_path / "wire.jsonl"
+    wire.write_text(
+        "\n".join(json.dumps(row) for row in (stale_request, boundary_row, current)) + "\n",
+        encoding="utf-8",
+    )
+
+    totals, model, _offset = _sum_wire_usage(wire, offset=0, turn_start_ms=0)
+
+    assert totals is not None
+    assert totals["input_tokens"] == 7
+    assert model == "kimi-k3-databricks"
+
+
+def _usage_row(*, input_other: int, output: int, time_ms: int) -> dict[str, Any]:
+    return {
+        "type": "usage.record",
+        "model": "kimi-k3-databricks",
+        "usage": {
+            "inputOther": input_other,
+            "output": output,
+            "inputCacheRead": 0,
+            "inputCacheCreation": 0,
+        },
+        "usageScope": "turn",
+        "time": time_ms,
+    }
+
+
+def _wire_path(home: Path, session_id: str) -> Path:
+    return home / "sessions" / "wd_x" / session_id / "agents" / "main" / "wire.jsonl"
+
+
+def _write_wire(home: Path, session_id: str, rows: list[dict[str, Any]]) -> Path:
+    """Create ``<home>/sessions/wd_x/<session_id>/agents/main/wire.jsonl``."""
+    wire = _wire_path(home, session_id)
+    wire.parent.mkdir(parents=True, exist_ok=True)
+    wire.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    return wire
+
+
+def _run_stubbed_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    home: Path,
+    *,
+    session_id: str,
+    on_spawn: Callable[[], object] | None = None,
+) -> tuple[list[Any], KimiExecutor]:
+    """Run one stubbed turn whose resume hint reports *session_id*."""
+    monkeypatch.setenv("KIMI_CODE_HOME", str(home))
+    ex = KimiExecutor(binary_path="kimi")
+    events = _collect_stubbed_turn(monkeypatch, ex, session_id=session_id, on_spawn=on_spawn)
+    return events, ex
+
+
+def _collect_stubbed_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    ex: KimiExecutor,
+    *,
+    session_id: str,
+    on_spawn: Callable[[], object] | None = None,
+) -> list[Any]:
+    """One stubbed turn; *on_spawn* writes wire rows at spawn time (like kimi)."""
+    fake = _FakeProcess(
+        [
+            json.dumps({"role": "assistant", "content": "done"}),
+            json.dumps({"role": "meta", "type": "session.resume_hint", "session_id": session_id}),
+        ],
+        b"",
+        returncode=0,
+    )
+
+    async def _fake_spawn(*_args: Any, **_kwargs: Any) -> _FakeProcess:
+        if on_spawn is not None:
+            on_spawn()
+        return fake
+
+    monkeypatch.setattr(kimi_executor, "_create_subprocess_exec", _fake_spawn)
+    monkeypatch.setattr(kimi_executor.shutil, "which", lambda _binary: "/usr/local/bin/kimi")
+    return asyncio.run(_collect(ex, [{"role": "user", "content": "hi"}]))
 
 
 def test_run_turn_warns_once_when_tools_declared(

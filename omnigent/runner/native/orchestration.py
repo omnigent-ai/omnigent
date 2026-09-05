@@ -3672,7 +3672,7 @@ async def _auto_create_kimi_terminal(
     )
     from omnigent.kimi_native_credentials import build_kimi_session_home
     from omnigent.kimi_native_forwarder import clear_kimi_bridge_state, supervise_kimi_forwarder
-    from omnigent.runner._entry import _make_auth_token_factory
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     bridge_dir = bridge_dir_for_session_id(session_id)
     # Stamp launch time before the TUI starts so the forwarder only adopts a kimi
@@ -3757,19 +3757,32 @@ async def _auto_create_kimi_terminal(
             "resource": session_resource_view_to_dict(terminal_view),
         },
     )
+
     # Mirror the kimi TUI transcript into the Omnigent chat: tail the per-session
     # wire.jsonl and POST each user/assistant turn, so the reply renders in the
     # web UI (not just the embedded pane). Reuses the shared auto-forwarder
-    # registry so terminal teardown / stop cancels it.
+    # registry so terminal teardown / stop cancels it. Unlike the hook's static
+    # snapshot, the forwarder gets refresh-capable auth (like qwen/claude) so
+    # its idle/failed edges survive bearer-token expiry, plus a pane-liveness
+    # probe so a mid-turn pane death posts a failed edge.
+    def _kimi_pane_alive() -> bool:
+        registry = resource_registry.terminal_registry
+        if registry is None:
+            return True
+        pane = registry.get(session_id, "kimi", "main")
+        return pane is not None and pane.running
+
     _forwarder_task = asyncio.create_task(
         supervise_kimi_forwarder(
             base_url=server_url,
-            headers=_runner_headers,
+            headers={},
             session_id=session_id,
             bridge_dir=bridge_dir,
             kimi_home=bridge_dir / "kimi-code-home",
             workspace=workspace,
             launch_epoch_ms=launch_epoch_ms,
+            auth=_RunnerDatabricksAuth(_auth_factory),
+            pane_alive=_kimi_pane_alive,
         ),
         name=f"kimi-forwarder-{session_id}",
     )

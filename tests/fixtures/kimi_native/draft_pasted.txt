@@ -1,0 +1,12 @@
+ ✦ Use Kimi K3 with High thinking effort - for the best balance between token spend and capability
+   Run /model to switch to K3 and set thinking effort to High
+
+   No session yet — one will be created on your first message.
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and
+ restart tmux.
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > literal $ and ✨ marker                                                                                          │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ system.ai.kimi-k3  <scratch>/kimi-fixture-empty
+                                                                                                     context: 0% (0/1M)

@@ -19,6 +19,7 @@ from omnigent.llms.context_window import (
     _encoded_context_window,
     compute_llm_cost,
     fetch_model_pricing,
+    find_model_context_window,
     get_model_context_window,
     resolve_effective_context_window,
 )
@@ -209,6 +210,85 @@ def test_fetch_model_pricing_parses_cache_rates(monkeypatch: pytest.MonkeyPatch)
     assert pricing.cache_write_per_token == pytest.approx(3.125e-6)
 
 
+def test_fetch_model_pricing_kimi_posted_rates_fall_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Kimi models missing from the catalog price at the posted API rates.
+
+    The kimi-native forwarder posts token usage under ids like
+    ``system.ai.kimi-k3`` / ``kimi-k3-databricks`` that the shared catalog
+    typically does not carry; without this fallback those sessions would
+    report zero cost. Rates pinned to https://platform.kimi.ai/
+    (retrieved 2026-08-28).
+    """
+    monkeypatch.setattr(context_window, "find_catalog_models", lambda _model: [])
+    for model in ("system.ai.kimi-k3", "kimi-k3-databricks", "KIMI-K3"):
+        pricing = fetch_model_pricing(model)
+        assert pricing is not None, model
+        assert pricing.input_per_token == pytest.approx(3.00e-6)
+        assert pricing.output_per_token == pytest.approx(15.00e-6)
+        assert pricing.cache_read_per_token == pytest.approx(0.30e-6)
+        assert pricing.cache_write_per_token is None
+    k27 = fetch_model_pricing("kimi-k2.7-code")
+    assert k27 is not None
+    assert k27.input_per_token == pytest.approx(0.95e-6)
+    assert k27.output_per_token == pytest.approx(4.00e-6)
+    assert k27.cache_read_per_token == pytest.approx(0.19e-6)
+    k26 = fetch_model_pricing("kimi-k2.6")
+    assert k26 is not None
+    assert k26.cache_read_per_token == pytest.approx(0.16e-6)
+    assert fetch_model_pricing("gpt-5-unknown") is None
+
+
+def test_fetch_model_pricing_catalog_beats_kimi_posted_rates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog entry for a kimi model stays authoritative over the fallback."""
+    monkeypatch.setattr(
+        context_window,
+        "find_catalog_models",
+        lambda _model: [
+            ModelInfo(
+                name="system.ai.kimi-k3",
+                provider="system.ai",
+                input_price=2.0,
+                output_price=9.0,
+            )
+        ],
+    )
+    pricing = fetch_model_pricing("system.ai.kimi-k3")
+    assert pricing is not None
+    assert pricing.input_per_token == pytest.approx(2.0e-6)
+    assert pricing.output_per_token == pytest.approx(9.0e-6)
+
+
+def test_fetch_model_pricing_ambiguous_catalog_does_not_use_kimi_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A populated but contradictory catalog is not a catalog miss."""
+    monkeypatch.setattr(
+        context_window,
+        "find_catalog_models",
+        lambda _model: [
+            ModelInfo(
+                name="system.ai.kimi-k3-a",
+                provider="system.ai",
+                input_price=2.0,
+                output_price=9.0,
+            ),
+            ModelInfo(
+                name="system.ai.kimi-k3-b",
+                provider="system.ai",
+                input_price=3.0,
+                output_price=15.0,
+            ),
+        ],
+    )
+
+    assert fetch_model_pricing("system.ai.kimi-k3") is None
+
+
 def test_fetch_model_pricing_omits_cache_rates_when_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -347,6 +427,40 @@ def test_get_model_context_window_prefers_catalog_metadata(
     )
 
     assert get_model_context_window("catalog-model") == 997_952
+
+
+def test_find_model_context_window_resolves_and_returns_none_when_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The no-default lookup resolves known models and returns ``None`` for
+    unknown ones — callers that must omit a guessed window (e.g. the
+    kimi-native forwarder's context ring) depend on the ``None``."""
+    monkeypatch.setattr(
+        context_window,
+        "find_catalog_models",
+        lambda _model: [
+            ModelInfo(name="catalog-model", provider="provider", max_input_tokens=262_144)
+        ],
+    )
+    assert find_model_context_window("catalog-model") == 262_144
+
+    monkeypatch.setattr(context_window, "find_catalog_models", lambda _model: [])
+    assert find_model_context_window("uncatalogued-model") is None
+
+
+def test_find_model_context_window_honors_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``AP_CONTEXT_WINDOW_OVERRIDE`` overrides everything, so users can fix
+    the context ring for uncatalogued models."""
+
+    def _boom(_model: str) -> list[ModelInfo]:
+        raise AssertionError("catalog lookup must not run when the override is set")
+
+    monkeypatch.setattr(context_window, "find_catalog_models", _boom)
+    monkeypatch.setenv("AP_CONTEXT_WINDOW_OVERRIDE", "555000")
+    assert find_model_context_window("uncatalogued-model") == 555_000
+    assert get_model_context_window("uncatalogued-model") == 555_000
 
 
 def test_get_model_context_window_encoded_and_offline_fallback(

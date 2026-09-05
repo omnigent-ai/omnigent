@@ -26,7 +26,7 @@ stdin, and reads the decision back from stdout as
   gated tool to ``/v1/sessions/{id}/hooks/permission-request`` (the same
   endpoint claude-native uses — the server publishes the approval card and
   long-polls for the web verdict), then types the answer back into kimi's
-  prompt via ``inject_approval_keystroke`` (option digit + Enter:
+  prompt via ``inject_approval_keystroke`` (option digit:
   :data:`~omnigent.kimi_native_bridge.APPROVE_KEY` "Approve once" /
   :data:`~omnigent.kimi_native_bridge.DENY_KEY` "Reject"). Fail-safe: on no
   verdict (timeout / unreachable / already answered in the terminal) it injects
@@ -39,6 +39,7 @@ import argparse
 import json
 import secrets
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -47,6 +48,8 @@ import httpx
 from omnigent.kimi_native_bridge import (
     APPROVE_KEY,
     DENY_KEY,
+    KimiApprovalPromptNotFoundError,
+    approval_prompt_visible,
     inject_approval_keystroke,
     read_active_session_id,
     read_hook_config,
@@ -67,10 +70,17 @@ from omnigent.native_policy_hook import (
 _EVALUATE_POLICY_TIMEOUT_S = 70.0
 # Short timeout for the keystroke-injection tmux round-trip; never delay the TUI.
 _SURFACE_TIMEOUT_S = 10.0
-# Long-poll budget for the web approval verdict — the human may take a while.
-# On timeout the server returns an empty 200 and we fall back to kimi's own TUI
-# prompt (manual approval in the terminal).
-_PERMISSION_REQUEST_TIMEOUT_S = 3600.0
+# Kimi kills command hooks at 600s; reserve time for the final keystroke.
+_KIMI_HOOK_TIMEOUT_S = 600.0
+_APPROVAL_SURFACE_BUDGET_S = 25.0
+_PERMISSION_DEADLINE_MARGIN_S = 2.0
+_PERMISSION_RETRY_WINDOW_S = (
+    _KIMI_HOOK_TIMEOUT_S
+    - _SURFACE_TIMEOUT_S
+    - _APPROVAL_SURFACE_BUDGET_S
+    - _PERMISSION_DEADLINE_MARGIN_S
+)
+_PERMISSION_REQUEST_TIMEOUT_S = _PERMISSION_RETRY_WINDOW_S
 _HARNESS = "kimi-native"
 
 
@@ -85,6 +95,13 @@ def _headers_from_config(config: dict[str, object]) -> dict[str, str]:
     if not isinstance(raw, dict):
         return {}
     return {str(key): str(value) for key, value in raw.items()}
+
+
+def _approval_still_pending(bridge_dir: Path | None) -> bool:
+    if bridge_dir is None or approval_prompt_visible(bridge_dir):
+        return True
+    time.sleep(0.1)
+    return approval_prompt_visible(bridge_dir)
 
 
 def _read_stdin_payload() -> dict[str, object] | None:
@@ -195,7 +212,7 @@ def _main_permission_request(argv: list[str]) -> int:
        approval card and long-polls for the web verdict (the very endpoint
        claude-native uses).
     2. On ``allow`` / ``deny``, inject the matching kimi permission-menu option
-       digit + Enter into the TUI pane via :func:`inject_approval_keystroke`
+       digit into the TUI pane via :func:`inject_approval_keystroke`
        (:data:`APPROVE_KEY` "Approve once" / :data:`DENY_KEY` "Reject").
 
     Fail-safe: on no verdict (timeout / server unreachable / the prompt was
@@ -236,48 +253,107 @@ def _main_permission_request(argv: list[str]) -> int:
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{_url_component(session_id)}/hooks/permission-request"
     )
-    verdict = _request_web_approval(url, headers, body)
+    deadline = time.monotonic() + _PERMISSION_RETRY_WINDOW_S
+    verdict = _request_web_approval(url, headers, body, bridge_dir=bridge_dir, deadline=deadline)
     if verdict is None:
         # No web verdict: leave kimi's own TUI prompt for manual approval.
         return 0
     key = APPROVE_KEY if verdict == "allow" else DENY_KEY
-    try:
-        inject_approval_keystroke(bridge_dir, key=key, timeout_s=_SURFACE_TIMEOUT_S)
-    except RuntimeError as exc:
-        print(
-            f"omnigent kimi permission-request hook: keystroke inject failed: {exc}",
-            file=sys.stderr,
-        )
+    for attempt in range(2):
+        try:
+            inject_approval_keystroke(bridge_dir, key=key, timeout_s=_SURFACE_TIMEOUT_S)
+            break
+        except KimiApprovalPromptNotFoundError as exc:
+            if attempt == 0 and _approval_still_pending(bridge_dir):
+                print(
+                    "omnigent kimi permission-request hook: approval injection missed; "
+                    "re-parking the same request",
+                    file=sys.stderr,
+                )
+                verdict = _request_web_approval(
+                    url, headers, body, bridge_dir=bridge_dir, deadline=deadline
+                )
+                if verdict is None:
+                    return 0
+                key = APPROVE_KEY if verdict == "allow" else DENY_KEY
+                continue
+            print(
+                f"omnigent kimi permission-request hook: keystroke inject failed: {exc}",
+                file=sys.stderr,
+            )
+            break
+        except RuntimeError as exc:
+            print(
+                f"omnigent kimi permission-request hook: keystroke inject failed: {exc}",
+                file=sys.stderr,
+            )
+            break
     return 0
 
 
 def _request_web_approval(
-    url: str, headers: dict[str, str], body: dict[str, object]
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, object],
+    *,
+    bridge_dir: Path | None = None,
+    deadline: float | None = None,
 ) -> str | None:
     """POST the approval card and long-poll for the web verdict.
 
-    :returns: ``"allow"`` / ``"deny"``, or ``None`` on timeout (server returns
-        an empty 200), transport failure, or an unparseable verdict — all of
-        which fall back to kimi's own TUI prompt.
+    :returns: ``"allow"`` / ``"deny"``, or ``None`` after the bounded re-park
+        window, a transport failure, or an unparseable verdict.
     """
-    timeout = httpx.Timeout(_PERMISSION_REQUEST_TIMEOUT_S, connect=_SURFACE_TIMEOUT_S)
-    try:
-        with httpx.Client(headers=headers, timeout=timeout) as client:
-            resp = client.post(url, json=body)
-            resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        print(
-            f"omnigent kimi permission-request hook: approval request failed: {exc}",
-            file=sys.stderr,
+    if deadline is None:
+        deadline = time.monotonic() + _PERMISSION_RETRY_WINDOW_S
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= _PERMISSION_DEADLINE_MARGIN_S:
+            print(
+                "omnigent kimi permission-request hook: approval poll budget exhausted",
+                file=sys.stderr,
+            )
+            return None
+        timeout_s = min(
+            _PERMISSION_REQUEST_TIMEOUT_S,
+            remaining - _PERMISSION_DEADLINE_MARGIN_S,
         )
-        return None
-    if not resp.content:
-        return None
-    try:
-        data = resp.json()
-    except json.JSONDecodeError:
-        return None
-    return _verdict_from_response(data)
+        connect_timeout_s = min(_SURFACE_TIMEOUT_S, timeout_s / 2)
+        timeout = httpx.Timeout(
+            timeout_s - connect_timeout_s,
+            connect=connect_timeout_s,
+        )
+        try:
+            with httpx.Client(headers=headers, timeout=timeout) as client:
+                resp = client.post(url, json=body)
+                resp.raise_for_status()
+        except httpx.TimeoutException as exc:
+            if not _approval_still_pending(bridge_dir):
+                return None
+            print(
+                f"omnigent kimi permission-request hook: approval poll ended; re-parking: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        except httpx.HTTPError as exc:
+            print(
+                f"omnigent kimi permission-request hook: approval request failed: {exc}",
+                file=sys.stderr,
+            )
+            return None
+        if not resp.content:
+            if not _approval_still_pending(bridge_dir):
+                return None
+            print(
+                "omnigent kimi permission-request hook: empty approval response; re-parking",
+                file=sys.stderr,
+            )
+            continue
+        try:
+            data = resp.json()
+        except json.JSONDecodeError:
+            return None
+        return _verdict_from_response(data)
 
 
 def _verdict_from_response(data: object) -> str | None:

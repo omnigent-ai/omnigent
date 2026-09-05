@@ -2576,3 +2576,23 @@ async def test_native_session_create_seeds_harness_compaction_anchor(
 
     assert compactions, "harness compaction was never persisted to the server"
     assert compactions[0]["data"]["last_item_id"] == "item_latest"
+
+
+def test_kimi_auto_create_clears_forwarder_state_before_supervising() -> None:
+    """Every kimi forwarder start must be preceded by a bridge-state clear.
+
+    This is the invariant that lets the forwarder discard a state file it
+    cannot parse (e.g. one written by an older build): the only path that
+    starts ``supervise_kimi_forwarder`` is ``_auto_create_kimi_terminal``,
+    which always unlinks the state file (and stamps a fresh launch epoch)
+    first, so a stale state file is never read by a new forwarder.
+    """
+    import inspect
+
+    from omnigent.runner.native import orchestration as orch
+
+    src = inspect.getsource(orch._auto_create_kimi_terminal)
+    assert "clear_kimi_bridge_state(bridge_dir)" in src
+    assert src.index("clear_kimi_bridge_state(bridge_dir)") < src.rindex(
+        "supervise_kimi_forwarder("
+    )
