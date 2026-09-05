@@ -13,6 +13,7 @@ import {
   Loader2Icon,
   Maximize2Icon,
   Minimize2Icon,
+  WrapTextIcon,
   XCircleIcon,
 } from "lucide-react";
 import type { ReactNode } from "react";
@@ -400,17 +401,45 @@ function CodePanel({
   copyText: string;
   copyLabel: string;
 }) {
+  // Soft-wrap long lines by default so the panel never needs horizontal
+  // scrolling to read; the toggle restores the scrolling view for when
+  // column alignment matters (same affordance as chat code blocks).
+  const [wrap, setWrap] = useState(true);
   return (
-    <CodeBlock code={text} language="json">
+    <CodeBlock code={text} language="json" wrap={wrap}>
       <CodeBlockHeader>
         <CodeBlockTitle className="min-w-0">
           <span className="truncate font-medium uppercase tracking-wide">{title}</span>
         </CodeBlockTitle>
         <CodeBlockActions>
+          <WrapTextButton onToggle={() => setWrap((value) => !value)} wrap={wrap} />
           <CopyTextButton label={copyLabel} text={copyText} />
         </CodeBlockActions>
       </CodeBlockHeader>
     </CodeBlock>
+  );
+}
+
+function WrapTextButton({ wrap, onToggle }: { wrap: boolean; onToggle: () => void }) {
+  const label = wrap ? "Disable word wrap" : "Enable word wrap";
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          aria-label={label}
+          aria-pressed={wrap}
+          className={cn("size-6 text-muted-foreground", wrap && "text-foreground")}
+          onClick={onToggle}
+          size="icon-xs"
+          type="button"
+          variant="ghost"
+          componentId="diagnostics.tool.toggle_wrap"
+        >
+          <WrapTextIcon className="size-3.5" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
   );
 }
 
