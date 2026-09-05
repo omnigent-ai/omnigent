@@ -3032,6 +3032,63 @@ def _native_claude_config_from_entry(
     return None
 
 
+# Refresh cadence for the broker-backed apiKeyHelper on the managed connect
+# path. The broker vends a ~1h OAuth access token; re-mint well before expiry so
+# a long session never presents an expired bearer to the gateway.
+_BROKER_APIKEY_HELPER_TTL_MS = 900_000
+
+
+def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
+    """Gateway config for a managed host connected via the credential broker.
+
+    When the owner links Databricks through the connect flow, ``omnigent host``
+    writes a host-only ``[omnigent]`` ``~/.databrickscfg`` profile (workspace
+    host, no token), a broker sidecar, and exports ``DATABRICKS_CONFIG_PROFILE``
+    — but configures no ucode / spec / global-auth provider. Without this,
+    :func:`resolve_native_claude_config` finds nothing and native Claude Code
+    falls back to its own login, never reaching the owner's workspace gateway.
+
+    Bridge it: derive the gateway base URL from the profile's workspace host and
+    mint the bearer on demand from the broker
+    (:func:`omnigent.host.databricks_credential.broker_token_command`, which
+    re-fetches the server-refreshed token each call), so Claude Code auto-connects
+    to Databricks model serving as the owner and refreshes per the helper TTL.
+    Returns ``None`` off the managed connect path (profile is not the host connect
+    profile, or no broker sidecar is present).
+    """
+    from omnigent.host.databricks_credential import (
+        HOST_DATABRICKS_PROFILE,
+        broker_token_command,
+    )
+    from omnigent.inner.databricks_executor import _read_databrickscfg_host
+
+    # Gate on the on-disk [omnigent] profile + broker sidecar, NOT on the
+    # ``DATABRICKS_CONFIG_PROFILE`` env var: that var is deliberately stripped
+    # from the runner/terminal process (a set profile makes MCP WorkspaceClients
+    # prefer its cached OAuth over their own token), so keying off it misses the
+    # very process that builds the Claude terminal. The host-only profile +
+    # sidecar that ``configure_host_databricks`` writes are the reliable
+    # managed-connect signal and survive that strip. The host-only profile holds
+    # no token, so it can't reintroduce the MCP collision the strip prevents.
+    workspace_host = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
+    if not workspace_host:
+        return None
+    api_key_helper = broker_token_command(workspace_host)
+    if not api_key_helper:
+        return None  # no broker sidecar → not a managed connect host
+    workspace_host = workspace_host.rstrip("/")
+    return ClaudeNativeUcodeConfig(
+        env={
+            _UCODE_CLAUDE_BASE_URL_ENV: f"{workspace_host}/ai-gateway/anthropic",
+            _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(_BROKER_APIKEY_HELPER_TTL_MS),
+            _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
+            _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
+        },
+        api_key_helper=api_key_helper,
+        model=model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+    )
+
+
 def resolve_native_claude_config(
     *,
     spec: AgentSpec | None,
@@ -3100,6 +3157,17 @@ def resolve_native_claude_config(
     entry = default_provider_for_harness(effective_config_with_detected(explicit), "claude-sdk")
     if entry is not None:
         return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
+    # 4. Managed connect host: no provider config, but the host linked Databricks
+    #    via the connect flow (host-only [omnigent] profile + broker sidecar).
+    #    Route Claude Code through the owner's gateway, minting via the broker.
+    broker_config = _connect_broker_claude_config()
+    if broker_config is not None:
+        log_info_once(
+            _logger,
+            "native-claude routing: managed connect host — Databricks AI gateway via the "
+            "credential broker (host-only [omnigent] profile + broker sidecar).",
+        )
+        return broker_config
     log_info_once(
         _logger,
         "native-claude routing: Claude CLI login (no provider configured for the Claude "

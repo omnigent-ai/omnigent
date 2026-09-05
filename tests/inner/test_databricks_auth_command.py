@@ -253,3 +253,67 @@ def test_without_a_recorded_command_an_unauthenticated_profile_stays_empty(
         )
         == ""
     )
+
+
+def _write_broker_sidecar(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, workspace_host: str):
+    """Point the config file at *tmp_path* and drop a broker sidecar for *workspace_host*."""
+    from omnigent.host import databricks_credential as dc
+
+    cfg_path = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    assert dc._write_sidecar(
+        cfg_path, "https://omni.example", "host-1", "host-tok", workspace_host
+    )
+
+
+def test_the_broker_sidecar_becomes_the_fallback_for_the_connected_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """In a connect sandbox, the host-only profile delegates its mint to the broker."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    _write_broker_sidecar(monkeypatch, tmp_path, "https://example.databricks.com")
+    command = databricks_bearer_token_command("https://example.databricks.com", "omnigent")
+    assert "python3 -m omnigent.host.databricks_credential token" in command
+
+
+def test_the_broker_sidecar_is_ignored_for_a_different_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A gateway pinned to a spec's own workspace must not borrow the broker token."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    _write_broker_sidecar(monkeypatch, tmp_path, "https://connected.databricks.com")
+    command = databricks_bearer_token_command("https://other.databricks.com", "myprofile")
+    assert "omnigent.host.databricks_credential" not in command
+
+
+def test_an_explicit_fallback_is_not_overridden_by_the_broker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A caller-supplied fallback (e.g. ucode's) wins over the broker default."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    _write_broker_sidecar(monkeypatch, tmp_path, "https://example.databricks.com")
+    command = databricks_bearer_token_command(
+        "https://example.databricks.com", "omnigent", fallback_command="ucode-token"
+    )
+    assert "omnigent.host.databricks_credential" not in command
+    assert "ucode-token" in command
+
+
+def test_no_sidecar_leaves_the_command_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Non-regression: with NO broker sidecar (a normal user with their own
+    Databricks profile, not a managed connect sandbox), the broker fallback adds
+    nothing — the command has no broker reference and no eval-fallback clause,
+    i.e. it is identical to the pre-change behaviour."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    cmd = databricks_bearer_token_command("https://example.databricks.com", "myprofile")
+    assert "omnigent.host.databricks_credential" not in cmd
+    # The eval-fallback clause is emitted ONLY when a fallback command is set.
+    assert "eval" not in cmd

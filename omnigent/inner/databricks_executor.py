@@ -284,6 +284,18 @@ def databricks_bearer_token_command(
         run only when the profile above yields an empty token.
     :returns: Shell command that prints a bearer token on stdout.
     """
+    # In a managed connect sandbox the owner's workspace profile is host-only
+    # (its bearer lives in the credential broker, not on disk), so
+    # ``databricks auth token`` finds no OAuth cache and yields nothing. When the
+    # caller named no other fallback and *host* is that connected workspace,
+    # default it to the broker fetch so the harness re-mints per use as them.
+    if fallback_command is None:
+        try:
+            from omnigent.host.databricks_credential import broker_token_command
+
+            fallback_command = broker_token_command(host)
+        except Exception:  # noqa: BLE001 - best-effort; no sidecar ⇒ no fallback.
+            pass
     selector = (
         f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host.rstrip('/'))}"
     )

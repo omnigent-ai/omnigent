@@ -1712,16 +1712,19 @@ def _opencode_native_profile_from_spec(
     Resolve the Databricks profile from a resolved agent spec, if any.
 
     :param agent_spec: Optional resolved agent spec.
-    :returns: The spec's ``executor.config.profile``, or ``None``.
+    :returns: The spec's ``executor.config.profile``, else the ambient
+        ``DATABRICKS_CONFIG_PROFILE`` (set by the host when the owner linked
+        Databricks), or ``None``.
     """
+    env_profile = os.environ.get("DATABRICKS_CONFIG_PROFILE") or None
     if agent_spec is None:
-        return None
+        return env_profile
     try:
         spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
         profile = spec.executor.config.get("profile")
-        return str(profile) if profile else None
+        return str(profile) if profile else env_profile
     except Exception:  # noqa: BLE001 - profile resolution is best effort.
-        return None
+        return env_profile
 
 
 def _opencode_native_mcp_servers_from_spec(

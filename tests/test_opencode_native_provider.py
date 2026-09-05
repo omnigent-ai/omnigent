@@ -154,7 +154,13 @@ def test_resolve_gateway_none_when_sdk_absent(monkeypatch: pytest.MonkeyPatch) -
     assert resolve_databricks_gateway("oss") is None
 
 
-def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch, *, host: str, token: str | None) -> None:
+def _install_fake_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    host: str,
+    token: str | None,
+    endpoints: list[tuple[str, str]] | None = None,
+) -> None:
     fake = types.ModuleType("databricks.sdk.core")
 
     class _Config:
@@ -166,9 +172,24 @@ def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch, *, host: str, token: str 
             return {"Authorization": f"Bearer {token}"} if token else {}
 
     fake.Config = _Config  # type: ignore[attr-defined]
+    sdk = types.ModuleType("databricks.sdk")
+    # Only expose WorkspaceClient (used for serving-endpoint discovery) when the
+    # test supplies endpoints; otherwise the import fails and discovery no-ops.
+    if endpoints is not None:
+
+        class _WorkspaceClient:
+            def __init__(self, *, config: object) -> None:
+                self._config = config
+
+            @property
+            def serving_endpoints(self) -> object:
+                eps = [types.SimpleNamespace(name=n, task=t) for n, t in endpoints]
+                return types.SimpleNamespace(list=lambda: eps)
+
+        sdk.WorkspaceClient = _WorkspaceClient  # type: ignore[attr-defined]
     # Ensure parent packages resolve for the dotted import.
     monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
-    monkeypatch.setitem(sys.modules, "databricks.sdk", types.ModuleType("databricks.sdk"))
+    monkeypatch.setitem(sys.modules, "databricks.sdk", sdk)
     monkeypatch.setitem(sys.modules, "databricks.sdk.core", fake)
 
 
@@ -192,6 +213,69 @@ def test_resolve_gateway_defaults_non_gateway_model(monkeypatch: pytest.MonkeyPa
 def test_resolve_gateway_none_when_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token=None)
     assert resolve_databricks_gateway("oss") is None
+
+
+def test_resolve_gateway_lists_all_chat_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Discovery lists every chat serving-endpoint (pinned default first, embeddings
+    # dropped) so opencode's in-session picker offers them all.
+    _install_fake_sdk(
+        monkeypatch,
+        host="https://ws.databricks.com",
+        token="t",
+        endpoints=[
+            ("databricks-kimi-k3", "llm/v1/chat"),
+            ("databricks-claude-sonnet-4-6", "llm/v1/chat"),
+            ("databricks-gte-large-en", "llm/v1/embeddings"),
+            ("some-other-endpoint", "llm/v1/chat"),
+        ],
+    )
+    res = resolve_databricks_gateway("oss", model_id="databricks-claude-sonnet-4-6")
+    assert res is not None
+    # pinned default first, embeddings + non-databricks dropped, de-duped
+    assert res.model_ids == ("databricks-claude-sonnet-4-6", "databricks-kimi-k3")
+    cfg = build_opencode_provider_config(res)
+    models = cfg["provider"]["databricks-gateway"]["models"]  # type: ignore[index]
+    assert set(models) == {"databricks-claude-sonnet-4-6", "databricks-kimi-k3"}
+
+
+def test_resolve_gateway_single_model_when_discovery_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No WorkspaceClient (endpoints=None) -> discovery no-ops, just the pinned model.
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    res = resolve_databricks_gateway("oss", model_id="databricks-kimi-k3")
+    assert res is not None
+    assert res.model_ids == ("databricks-kimi-k3",)
+
+
+def test_resolve_gateway_env_default_applies(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No session model pinned -> the deployment env default steers the endpoint.
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "databricks-kimi-k3")
+    res = resolve_databricks_gateway("oss")
+    assert res is not None
+    assert res.model_id == "databricks-kimi-k3"
+
+
+def test_resolve_gateway_session_model_beats_env_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "databricks-kimi-k3")
+    res = resolve_databricks_gateway("oss", model_id="databricks-gpt-5-5")
+    assert res is not None
+    assert res.model_id == "databricks-gpt-5-5"
+
+
+def test_resolve_gateway_env_default_ignored_when_not_gateway_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A non ``databricks-*`` env value is not a routable endpoint -> catalog wins.
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "kimi-k3")
+    res = resolve_databricks_gateway("oss")
+    assert res is not None
+    assert res.model_id == "catalog-databricks-claude-default"
 
 
 def test_build_mcp_block_stdio_and_http() -> None:
@@ -658,3 +742,13 @@ def test_mcp_progress_heartbeat_lifecycle() -> None:
         assert len(written_messages) == count_at_exit
     finally:
         bridge_mod._write_jsonrpc = orig_write
+
+
+def test_resolve_databricks_gateway_inert_without_profile() -> None:
+    """Non-regression: opencode's Databricks gateway is inert for a non-databricks
+    user — no profile means no gateway (None), so provider config is untouched and
+    a non-databricks opencode session is unaffected."""
+    from omnigent.opencode_native_provider import resolve_databricks_gateway
+
+    assert resolve_databricks_gateway(None) is None
+    assert resolve_databricks_gateway("") is None
