@@ -7943,15 +7943,14 @@ async def test_sys_session_share_public_allows_public_grant() -> None:
 async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() -> None:
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
-    and folds in live runner connectivity from ``GET
-    /v1/runners/{id}/status`` and host harness readiness from ``GET
-    /v1/hosts/{id}``.
+    including session liveness and host harness readiness from
+    ``GET /v1/hosts/{id}``.
 
     Proves the full runner-dispatch path: read the session snapshot,
     derive the effective model (a per-session ``model_override`` wins
     over the spec's ``llm_model``), count pending approval prompts, and
     attach ``runner_online``. If the projection regressed (dropped a
-    field, skipped the runner-status call, or picked the wrong model),
+    field, skipped session liveness, or picked the wrong model),
     the asserted values would differ. The transcript is intentionally
     absent — get_info is metadata-only (``sys_session_get_history`` returns
     items).
@@ -7961,7 +7960,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
             assert request.url.params["include_items"] == "false"
-            assert request.url.params["include_liveness"] == "false"
+            assert request.url.params["include_liveness"] == "true"
             return httpx.Response(
                 200,
                 json={
@@ -7973,6 +7972,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "updated_at": 84,
                     "title": "auth flow",
                     "runner_id": "runner_1",
+                    "runner_online": True,
                     "host_id": "host_1",
                     "reasoning_effort": "high",
                     "parent_session_id": "conv_parent",
@@ -7984,8 +7984,6 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "pending_elicitations": [{"id": "el_1"}, {"id": "el_2"}],
                 },
             )
-        if request.method == "GET" and request.url.path == "/v1/runners/runner_1/status":
-            return httpx.Response(200, json={"runner_id": "runner_1", "online": True})
         if request.method == "GET" and request.url.path == "/v1/hosts/host_1":
             return httpx.Response(
                 200,
@@ -8012,8 +8010,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     assert info["agent_id"] == "ag_xyz"
     assert info["agent_name"] == "researcher"
     assert info["runner_id"] == "runner_1"
-    # Live connectivity folded in from the runners status endpoint —
-    # None here would mean the best-effort status call was skipped.
+    # Session liveness includes runners connected to another replica.
     assert info["runner_online"] is True
     assert info["host_id"] == "host_1"
     assert info["configured_harnesses"] == {
@@ -8033,6 +8030,121 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     assert info["pending_elicitations"] == [{"id": "el_1"}, {"id": "el_2"}]
     # Metadata-only: the full transcript is never embedded.
     assert "items" not in info
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored_status,online,closed_marker,expected_status",
+    [
+        ("running", False, None, "failed"),
+        ("waiting", False, None, "failed"),
+        ("running", True, "label", "idle"),
+        ("running", False, "label", "idle"),
+        ("waiting", None, "label", "idle"),
+        ("running", True, "title", "idle"),
+        ("failed", False, "label", "failed"),
+    ],
+)
+async def test_sys_session_get_info_reconciles_inactive_sessions(
+    stored_status: str,
+    online: bool | None,
+    closed_marker: str | None,
+    expected_status: str,
+) -> None:
+    """Stale cached status and prompts must not imply a dead child is executing."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "child",
+                    "status": stored_status,
+                    "runner_id": "runner_1",
+                    "runner_online": online,
+                    "title": "worker:task:closed:child" if closed_marker == "title" else "task",
+                    "labels": {"omnigent.closed": "true"} if closed_marker == "label" else {},
+                    "pending_elicitations": [{"id": "stale_approval"}],
+                },
+            )
+        assert request.url.path == "/v1/runners/runner_1/status"
+        return httpx.Response(200, json={"online": online})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        info = json.loads(
+            await execute_tool(
+                tool_name="sys_session_get_info",
+                arguments='{"session_id": "child"}',
+                server_client=client,
+                conversation_id="parent",
+            )
+        )
+
+    assert info["status"] == expected_status
+    assert info["closed"] is (closed_marker is not None)
+    assert info["runner_online"] is online
+    assert info["status_reason"]
+    assert info["pending_elicitations"] == []
+    assert info["pending_elicitation_count"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored_status,snapshot_online,expected_online",
+    [
+        ("running", True, True),
+        ("waiting", True, True),
+        ("idle", False, False),
+        ("failed", False, False),
+        ("running", None, None),
+        ("running", "false", None),
+        ("running", [], None),
+    ],
+)
+async def test_sys_session_get_info_preserves_status_without_confirmed_interruption(
+    stored_status: str, snapshot_online: object, expected_online: bool | None
+) -> None:
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requested_paths: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.url.path == "/v1/sessions/child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "child",
+                    "status": stored_status,
+                    "runner_id": "runner_1",
+                    "runner_online": snapshot_online,
+                    "pending_elicitations": [{"id": "approval"}],
+                },
+            )
+        assert request.url.path == "/v1/runners/runner_1/status"
+        # A different replica or a shared session's runner can be hidden here.
+        return httpx.Response(200, json={"online": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        info = json.loads(
+            await execute_tool(
+                tool_name="sys_session_get_info",
+                arguments='{"session_id": "child"}',
+                server_client=client,
+                conversation_id="parent",
+            )
+        )
+
+    assert info["status"] == stored_status
+    assert info["runner_online"] is expected_online
+    assert requested_paths == ["/v1/sessions/child"]
+    if expected_online is not False:
+        assert info["pending_elicitations"] == [{"id": "approval"}]
 
 
 @pytest.mark.asyncio
