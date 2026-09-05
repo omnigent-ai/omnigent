@@ -729,13 +729,15 @@ describe("SubagentsPanel", () => {
     expect(row.querySelector('[data-icon="pi"]')).toBeNull();
   });
 
-  it("fetches child sessions without polling (push-driven via watch-set)", () => {
+  it("polls the child-sessions list at the tree's staleness-floor interval", () => {
+    // The stream only pushes ``session.child_session.updated`` for the
+    // streamed session's direct children — the rest of the tree has no
+    // live channel — so every list in the rail refetches on a poll floor.
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
 
     renderPanel({ rootSessionId: "conv_root" });
 
-    expect(useChildSessionsMock).toHaveBeenCalledWith("conv_root");
-    expect(useChildSessionsMock).not.toHaveBeenCalledWith("conv_root", expect.any(Number));
+    expect(useChildSessionsMock).toHaveBeenLastCalledWith("conv_root", 15_000);
   });
 
   it("highlights the main row when conversationId === rootSessionId (on the parent)", () => {
@@ -1510,8 +1512,8 @@ describe("SubagentsPanel", () => {
     ).toEqual(["c1", "c2", "c3"]);
     // The depth-3 row's child query is disabled (null id) instead of
     // fetching c3's children.
-    expect(useChildSessionsMock).toHaveBeenCalledWith(null);
-    expect(useChildSessionsMock).not.toHaveBeenCalledWith("c3");
+    expect(useChildSessionsMock).toHaveBeenCalledWith(null, expect.any(Number));
+    expect(useChildSessionsMock).not.toHaveBeenCalledWith("c3", expect.any(Number));
   });
 
   it("shows the router's model on a routed sub-agent row, and nothing when unrouted", () => {
