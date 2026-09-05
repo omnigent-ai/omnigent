@@ -109,6 +109,9 @@ class HostHelloFrame:
         ``omnigent.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host, or a startup probe
         that failed) — never treat it as "nothing is gateway-backed".
+    :param filesystem_roots: Whether this Host understands an empty filesystem
+        path as a request to enumerate platform roots. Older Hosts omit the
+        field and therefore decode as ``False``.
     """
 
     version: str
@@ -119,6 +122,7 @@ class HostHelloFrame:
     gateway_inference: dict[str, bool] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+    filesystem_roots: bool = False
 
 
 @dataclass
@@ -1049,6 +1053,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "gateway_inference": frame.gateway_inference,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
+                "filesystem_roots": frame.filesystem_roots,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1558,6 +1563,9 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
+        filesystem_roots=(
+            _required_bool(msg, "filesystem_roots") if "filesystem_roots" in msg else False
+        ),
     )
 
 

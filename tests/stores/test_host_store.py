@@ -76,6 +76,39 @@ def test_upsert_creates_host_on_first_connect(
     assert fetched.status == "online"
 
 
+def test_default_workspace_is_persisted_per_host(host_store: HostStore, db_uri: str) -> None:
+    host_id = "bdda8ba7e34130318b54dd872eb160af"
+    host_store.upsert_on_connect(host_id, "test-laptop", "alice@example.com")
+
+    sentinel_updated_at = now_epoch() - 10_000
+    _set_updated_at(db_uri, host_id, sentinel_updated_at)
+    before = host_store.get_host(host_id)
+    assert before is not None
+    updated = host_store.set_default_workspace(
+        host_id, "D:\\Projects", expected_user_id="alice@example.com"
+    )
+
+    assert updated is not None
+    assert updated.default_workspace == "D:\\Projects"
+    assert before.updated_at == sentinel_updated_at
+    assert updated.updated_at == sentinel_updated_at
+    assert host_store.get_host(host_id).default_workspace == "D:\\Projects"  # type: ignore[union-attr]
+
+
+def test_default_workspace_update_requires_the_current_owner(host_store: HostStore) -> None:
+    host_id = "7e86e6ce1d0e454a89098823d28cf7e0"
+    host_store.upsert_on_connect(host_id, "test-laptop", "alice@example.com")
+
+    updated = host_store.set_default_workspace(
+        host_id, "D:\\Projects", expected_user_id="bob@example.com"
+    )
+
+    assert updated is None
+    stored = host_store.get_host(host_id)
+    assert stored is not None
+    assert stored.default_workspace is None
+
+
 def test_upsert_updates_existing_host_on_reconnect(
     host_store: HostStore,
 ) -> None:
@@ -269,6 +302,11 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
         name="dev-laptop",
         user_id="dana@example.com",
     )
+    host_store.set_default_workspace(
+        "a1ed1ab71de2311e20488a989e61701c",
+        "D:\\Projects",
+        expected_user_id="dana@example.com",
+    )
     # Bind a conversation to the old host_id (workspace is required by
     # the ck_conversations_workspace_required_for_host check constraint).
     conv = conversations.create_conversation(
@@ -285,6 +323,7 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
 
     assert updated.host_id == "b1b5efd7dfc33b5a6241f1866ffb00e6"
     assert updated.status == "online"
+    assert updated.default_workspace == "D:\\Projects"
     # The binding followed the rotation — the conversation now points at
     # the new host_id, not the old (dangling) one or NULL.
     rebound = conversations.get_conversation(conv.id)
@@ -293,6 +332,9 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
         "conversation must be repointed to the rotated host_id so the "
         "session stays bound to the reconnected host"
     )
+    rotated = host_store.get_host("b1b5efd7dfc33b5a6241f1866ffb00e6")
+    assert rotated is not None
+    assert rotated.default_workspace == "D:\\Projects"
 
 
 def test_reown_host_id_across_owner_change_preserves_conversation_binding(
@@ -320,6 +362,11 @@ def test_reown_host_id_across_owner_change_preserves_conversation_binding(
         user_id="admin@example.com",
         allow_host_id_reown=True,
     )
+    host_store.set_default_workspace(
+        "a0c8ab2431b35377abb4232febeded94",
+        "/Users/admin/Projects",
+        expected_user_id="admin@example.com",
+    )
     conv = conversations.create_conversation(
         host_id="a0c8ab2431b35377abb4232febeded94", workspace="/home/me/proj"
     )
@@ -335,6 +382,7 @@ def test_reown_host_id_across_owner_change_preserves_conversation_binding(
     assert reowned.host_id == "a0c8ab2431b35377abb4232febeded94"
     assert reowned.user_id == "local"
     assert reowned.status == "online"
+    assert reowned.default_workspace == "/Users/admin/Projects"
     # The conversation binding survives the owner change (host_id unchanged).
     rebound = conversations.get_conversation(conv.id)
     assert rebound is not None

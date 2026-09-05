@@ -24,7 +24,7 @@ import {
 import { Label } from "@/components/scheduled/Label";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
-import { WorkspacePicker } from "@/shell/WorkspacePicker";
+import { HostWorkspacePicker } from "@/shell/WorkspacePicker";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
@@ -538,10 +538,11 @@ export function CreateScheduledTaskDialog({
             <div className="flex flex-col gap-1.5">
               <Label>Workspace (optional)</Label>
               <p className="text-sm text-muted-foreground">
-                Defaults to the host&apos;s home directory. Pick a directory to pin it.
+                Starts at this Host&apos;s pinned folder, then its home directory. Pick a directory
+                for this task.
               </p>
               <div className="h-56 overflow-hidden rounded-md border border-border">
-                <WorkspacePicker
+                <HostWorkspacePicker
                   hostId={hostId}
                   onNavigate={setWorkspace}
                   initialPath={workspace || undefined}

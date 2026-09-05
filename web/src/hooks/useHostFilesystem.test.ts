@@ -25,34 +25,26 @@ describe("buildHostFilesystemUrl", () => {
     expect(buildHostFilesystemUrl("host_abc", "")).toBe("/v1/hosts/host_abc/filesystem");
   });
 
-  it("strips the single leading slash (FastAPI re-adds it)", () => {
-    // The route is /filesystem/{path:path}; FastAPI strips the
-    // first "/" before passing the path through to the handler,
-    // and the handler re-adds it. So we send "Users/corey/foo"
-    // not "/Users/corey/foo" — sending the latter would result
-    // in "//Users/corey/foo" reaching the host.
+  it("sends the exact POSIX path in a query parameter", () => {
+    // The whole path is one encoded query value, so the leading slash and
+    // every separator arrive at the host unchanged.
     expect(buildHostFilesystemUrl("host_abc", "/Users/corey/foo")).toBe(
-      "/v1/hosts/host_abc/filesystem/Users/corey/foo",
+      "/v1/hosts/host_abc/filesystem?path=%2FUsers%2Fcorey%2Ffoo",
     );
   });
 
-  it("encodes special characters per segment", () => {
+  it("encodes special characters in the exact path", () => {
     // Spaces and other URL-meaningful chars must round-trip
     // through encodeURIComponent. Without encoding, a name like
     // "my project" would produce a malformed URL.
     expect(buildHostFilesystemUrl("host_abc", "/Users/c o/foo bar")).toBe(
-      "/v1/hosts/host_abc/filesystem/Users/c%20o/foo%20bar",
+      "/v1/hosts/host_abc/filesystem?path=%2FUsers%2Fc%20o%2Ffoo%20bar",
     );
   });
 
-  it("preserves slashes between segments", () => {
-    // encodeURIComponent encodes "/" to %2F; we encode per
-    // segment then rejoin with "/" so the directory hierarchy
-    // survives. Pinning this catches a regression where someone
-    // calls encodeURIComponent on the whole string at once.
+  it("encodes the complete path as one query value", () => {
     const url = buildHostFilesystemUrl("host_abc", "/a/b/c");
-    expect(url).toBe("/v1/hosts/host_abc/filesystem/a/b/c");
-    expect(url).not.toContain("%2F");
+    expect(url).toBe("/v1/hosts/host_abc/filesystem?path=%2Fa%2Fb%2Fc");
   });
 
   it("encodes the host id as well", () => {
@@ -64,19 +56,28 @@ describe("buildHostFilesystemUrl", () => {
     );
   });
 
-  it("preserves a single trailing slash for the root", () => {
+  it("distinguishes the POSIX root from home", () => {
     // Browsing exactly "/" must hit /filesystem/ (with trailing
     // slash) to match the {path:path} route. Without the trailing
     // slash we'd hit the no-path route which forwards ~ instead.
-    expect(buildHostFilesystemUrl("host_abc", "/")).toBe("/v1/hosts/host_abc/filesystem/");
+    expect(buildHostFilesystemUrl("host_abc", "/")).toBe("/v1/hosts/host_abc/filesystem?path=%2F");
   });
 
-  it("encodes a Windows drive path without prefixing a slash", () => {
+  it("preserves Windows drive and UNC paths exactly", () => {
+    expect(buildHostFilesystemUrl("host_abc", "D:\\Projects\\Omnigent")).toBe(
+      "/v1/hosts/host_abc/filesystem?path=D%3A%5CProjects%5COmnigent",
+    );
+    expect(buildHostFilesystemUrl("host_abc", "\\\\server\\share")).toBe(
+      "/v1/hosts/host_abc/filesystem?path=%5C%5Cserver%5Cshare",
+    );
+  });
+
+  it("encodes Windows drive paths as exact query values", () => {
     expect(buildHostFilesystemUrl("host_abc", "C:\\Users\\alice\\work")).toBe(
-      "/v1/hosts/host_abc/filesystem/C%3A/Users/alice/work",
+      "/v1/hosts/host_abc/filesystem?path=C%3A%5CUsers%5Calice%5Cwork",
     );
     expect(buildHostFilesystemUrl("host_abc", "C:/Users/alice/work")).toBe(
-      "/v1/hosts/host_abc/filesystem/C%3A/Users/alice/work",
+      "/v1/hosts/host_abc/filesystem?path=C%3A%2FUsers%2Falice%2Fwork",
     );
   });
 });

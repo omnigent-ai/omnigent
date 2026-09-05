@@ -50,7 +50,7 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 // stub it anyway to keep its filesystem fetch out of the test.
 vi.mock("./WorkspacePicker", async (importActual) => ({
   ...(await importActual<typeof WorkspacePickerModule>()),
-  WorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
+  HostWorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
     <button type="button" data-testid="mock-pick-workspace" onClick={() => onSelect("/picked")}>
       pick
     </button>

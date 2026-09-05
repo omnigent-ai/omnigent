@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import type * as WorkspacePickerModule from "./WorkspacePicker";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -21,8 +22,9 @@ vi.mock("./WorkspacePathField", () => ({
     />
   ),
 }));
-vi.mock("./WorkspacePicker", () => ({
-  WorkspacePicker: () => <div data-testid="mock-workspace-picker" />,
+vi.mock("./WorkspacePicker", async (importOriginal) => ({
+  ...(await importOriginal<typeof WorkspacePickerModule>()),
+  HostWorkspacePicker: () => <div data-testid="mock-workspace-picker" />,
   isNavigablePath: () => false,
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));

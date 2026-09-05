@@ -676,6 +676,34 @@ async def test_list_filesystem_forwards_pagination_params(
     assert captured == {"limit": 5, "after": "/foo/m", "before": None}
 
 
+async def test_list_filesystem_query_preserves_windows_path_and_roots(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """The no-path route transports native Windows paths and root requests exactly."""
+    app, _registry, _comm, replies, _drain = fs_setup
+    replies["D:\\Projects"] = {"entries": [], "has_more": False}
+    replies[""] = {"entries": [], "has_more": False}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        windows = await client.get(
+            f"/v1/hosts/{_HOST_ID}/filesystem",
+            params={"path": "D:\\Projects"},
+        )
+        roots = await client.get(
+            f"/v1/hosts/{_HOST_ID}/filesystem",
+            params={"roots": "true"},
+        )
+
+    assert windows.status_code == 200
+    assert roots.status_code == 200
+
+
 async def test_list_filesystem_limit_above_max_rejected(
     fs_setup: tuple[
         FastAPI,

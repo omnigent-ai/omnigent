@@ -50,7 +50,7 @@ import {
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { AgentHarnessPicker } from "./NewChatDialog";
-import { isNavigablePath, WorkspacePicker } from "./WorkspacePicker";
+import { HostWorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 
 /** Select sentinel for "no default" — Radix Select can't hold an empty value. */
 const NONE = "__none__";
@@ -250,6 +250,17 @@ export function ProjectSettingsDialog({
   const browsableHostId =
     hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE && !storedHostMissing ? hostId : null;
 
+  // A working directory belongs to one Host. When the Host changes, discard
+  // the prior Host's path; opening the browser will then start at the newly
+  // selected Host's pinned folder (or home when it has no pin).
+  const onHostChange = (nextHostId: string) => {
+    if (nextHostId !== hostId) {
+      setWorkspace("");
+      setWorkspaceOpen(false);
+    }
+    setHostId(nextHostId);
+  };
+
   // Agent picker groups, mirroring the composer's split (native harness CLIs vs
   // SDK / bundle agents). The picker takes both lists and a selection.
   // Same resolver as the composer's picker (selectableSessionAgents): the two
@@ -325,7 +336,7 @@ export function ProjectSettingsDialog({
           <Field label="Host" hint="Where new sessions run by default">
             <Select
               value={hostId}
-              onValueChange={setHostId}
+              onValueChange={onHostChange}
               onOpenChange={onDropdownOpenChange}
               disabled={isLoading}
             >
@@ -414,7 +425,7 @@ export function ProjectSettingsDialog({
                       onClick={() => setWorkspaceOpen(false)}
                     />
                     <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:border-white/10 dark:backdrop-blur-xl dark:backdrop-saturate-150 [&>[data-testid=workspace-picker]]:border-0">
-                      <WorkspacePicker
+                      <HostWorkspacePicker
                         hostId={browsableHostId}
                         initialPath={isNavigablePath(workspace) ? workspace : undefined}
                         onNavigate={setWorkspace}

@@ -34,6 +34,7 @@ vi.mock("@/hooks/useHosts", () => ({
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: () => ({ data: undefined }),
+  useHostFilesystemRoots: () => ({ data: undefined, isLoading: false, error: null }),
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
 vi.mock("@/hooks/useHostWorktrees", () => ({

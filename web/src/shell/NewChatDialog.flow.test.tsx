@@ -95,6 +95,7 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
 // always set here, so keep this inert (returns no listing).
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: () => ({ data: undefined }),
+  useHostFilesystemRoots: () => ({ data: undefined, isLoading: false, error: null }),
   // WorkspacePicker reads this on mount when the file browser opens;
   // an idle mutation keeps it inert for these tests.
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),

@@ -12,7 +12,7 @@ would bake the expected failure into the stub. Instead a **fake Windows
 host** connects over the real host WebSocket tunnel
 (``/v1/hosts/{id}/tunnel``) and answers ``host.list_dir`` /
 ``host.create_dir`` frames with faithful Windows semantics (backslash
-``os.scandir`` entry paths, ``~`` expanding to ``C:\\Users\\alice``,
+``os.scandir`` entry paths, ``~`` expanding to ``C:\\Users\\demo``,
 ``/`` resolving to the current drive root, ``/C:...`` not existing).
 The real server routes and the real SPA then do whatever they do — the
 exact production path a Windows machine exercises.
@@ -21,7 +21,7 @@ Covered facets (each is a claim from the bug report):
 
 - ``test_windows_home_child_click_navigates_into_folder`` — clicking a
   home child must list that folder's contents (bug: the request becomes
-  ``/C:\\Users\\alice\\work`` and 404s, the picker shows an error).
+  ``/C:\\Users\\demo\\work`` and 404s, the picker shows an error).
 - ``test_windows_up_from_home_child_does_not_fall_to_drive_root`` —
   Up from a home child must return to home, never the drive root (bug:
   the parent of a backslash path computes to ``/`` → ``C:\\``).
@@ -76,7 +76,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 
 _HOST_NAME = "win11-e2e"
-_WIN_HOME = "C:\\Users\\alice"
+_WIN_HOME = "C:\\Users\\demo"
 
 # Simulated Windows filesystem: directory → (name, type) children.
 # Entry paths on the wire are native backslash paths, exactly what the
@@ -85,11 +85,14 @@ _WIN_HOME = "C:\\Users\\alice"
 # into another.
 _FS_TEMPLATE: dict[str, list[tuple[str, str]]] = {
     "C:\\": [("Program Files", "directory"), ("Users", "directory"), ("Windows", "directory")],
-    "C:\\Users": [("alice", "directory")],
-    "C:\\Users\\alice": [("Documents", "directory"), ("work", "directory")],
-    "C:\\Users\\alice\\Documents": [("notes.txt", "file")],
-    "C:\\Users\\alice\\work": [("omnigent-app", "directory")],
-    "C:\\Users\\alice\\work\\omnigent-app": [("README.md", "file")],
+    "C:\\Users": [("demo", "directory")],
+    "C:\\Users\\demo": [("Documents", "directory"), ("work", "directory")],
+    "C:\\Users\\demo\\Documents": [("notes.txt", "file")],
+    "C:\\Users\\demo\\work": [("omnigent-app", "directory")],
+    "C:\\Users\\demo\\work\\omnigent-app": [("README.md", "file")],
+    "D:\\": [("Projects", "directory")],
+    "D:\\Projects": [("omnigent", "directory")],
+    "E:\\": [("Archive", "directory")],
 }
 
 
@@ -97,11 +100,11 @@ def _win_resolve(path: str) -> str:
     """Resolve a wire path the way Windows would.
 
     Mirrors ``os.path.expanduser`` + path normalization on Windows:
-    ``~`` expands against the host process owner's home, forward
+    ``~`` expands against the synthetic host owner's home, forward
     slashes are accepted as separators, and a bare ``/`` (or ``\\``)
-    means the current drive's root. A path like ``/C:/Users/alice``
+    means the current drive's root. A path like ``/C:/Users/demo``
     (the server's forced leading slash) normalizes to
-    ``\\C:\\Users\\alice`` — which does not exist, same as on a real
+    ``\\C:\\Users\\demo`` — which does not exist, same as on a real
     Windows machine.
 
     :param path: Path as received in a host frame.
@@ -125,7 +128,7 @@ def _win_resolve(path: str) -> str:
 def _win_join(parent: str, name: str) -> str:
     """Join a native Windows directory and a child name.
 
-    :param parent: Native parent path, e.g. ``"C:\\Users\\alice"``.
+    :param parent: Native parent path, e.g. ``"C:\\Users\\demo"``.
     :param name: Child name, e.g. ``"work"``.
     :returns: The joined native path.
     """
@@ -141,6 +144,24 @@ def _list_dir_reply(
     :param fs: This connection's simulated filesystem.
     :returns: The result frame a Windows host daemon would produce.
     """
+    if frame.path == "":
+        entries = [
+            HostListDirEntry(
+                name=drive,
+                path=drive,
+                type="directory",
+                bytes=None,
+                modified_at=0,
+            )
+            for drive in ("C:\\", "D:\\", "E:\\")
+        ]
+        return HostListDirResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            entries=entries[: frame.limit],
+            has_more=len(entries) > frame.limit,
+        )
+
     key = _win_resolve(frame.path)
     children = fs.get(key)
     if children is None:
@@ -280,6 +301,7 @@ async def _windows_host(base_url: str) -> AsyncIterator[str]:
                     version="0.0.0-e2e",
                     frame_protocol_version=1,
                     name=_HOST_NAME,
+                    filesystem_roots=True,
                 )
             )
         )
@@ -353,7 +375,7 @@ async def _open_picker_at_windows_home(page: Any, base_url: str, host_id: str) -
 
     Navigates to the landing screen, selects the fake Windows host from
     the host chip's dropdown, opens the picker, and waits for the home
-    listing (the entries under ``C:\\Users\\alice``) to render.
+    listing (the entries under ``C:\\Users\\demo``) to render.
 
     :param page: The Playwright page.
     :param base_url: The live server's base URL.
@@ -383,13 +405,99 @@ def test_windows_home_child_click_navigates_into_folder(live_server: str) -> Non
     """Clicking a home-directory child folder lists that folder.
 
     On a Windows host the home listing's entries carry native backslash
-    paths (``C:\\Users\\alice\\work``). Clicking one must navigate the
+    paths (``C:\\Users\\demo\\work``). Clicking one must navigate the
     picker INTO that directory — its contents become the listing. The
     reported bug: the picker fetches the entry path with a forced
-    leading slash (``/C:\\Users\\alice\\work``), which doesn't exist, so
+    leading slash (``/C:\\Users\\demo\\work``), which doesn't exist, so
     the click is rejected with an error instead of navigating.
     """
     _run_in_fresh_loop(_drive_home_child_click(live_server))
+
+
+def test_windows_computer_roots_browse_drive(live_server: str) -> None:
+    """Computer view lists native drive roots and opens the selected drive."""
+    _run_in_fresh_loop(_drive_computer_roots(live_server))
+
+
+def test_windows_pinned_workspace_persists(live_server: str) -> None:
+    """A Host-native Windows path persists as that Host's picker shortcut."""
+    _run_in_fresh_loop(_drive_pinned_workspace(live_server))
+
+
+async def _drive_computer_roots(base_url: str) -> None:
+    async with _windows_host(base_url) as host_id, async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        context = await browser.new_context(viewport={"width": 1280, "height": 800})
+        page = await context.new_page()
+        try:
+            await _open_picker_at_windows_home(page, base_url, host_id)
+            await page.get_by_test_id("workspace-picker-roots").dispatch_event("click")
+
+            for drive in ("C:\\", "D:\\", "E:\\"):
+                await expect(page.get_by_test_id(f"workspace-picker-entry-{drive}")).to_be_visible(
+                    timeout=10_000
+                )
+            await expect(page.get_by_test_id("workspace-picker-path-input")).to_be_disabled()
+
+            screenshot_path = os.environ.get("OMNI_E2E_SCREENSHOT")
+            if screenshot_path:
+                await page.screenshot(path=screenshot_path, full_page=True)
+
+            await page.get_by_test_id("workspace-picker-entry-D:\\").dispatch_event("click")
+            await expect(page.get_by_test_id("workspace-picker-entry-Projects")).to_be_visible(
+                timeout=10_000
+            )
+            await expect(page.get_by_test_id("workspace-picker-path-input")).to_have_value("D:\\")
+        finally:
+            await context.close()
+            await browser.close()
+
+
+async def _drive_pinned_workspace(base_url: str) -> None:
+    async with _windows_host(base_url) as host_id, async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        context = await browser.new_context(viewport={"width": 1280, "height": 800})
+        page = await context.new_page()
+        try:
+            await _open_picker_at_windows_home(page, base_url, host_id)
+            await page.get_by_test_id("workspace-picker-roots").dispatch_event("click")
+            await page.get_by_test_id("workspace-picker-entry-D:\\").dispatch_event("click")
+            await page.get_by_test_id("workspace-picker-entry-Projects").dispatch_event("click")
+            await expect(page.get_by_test_id("workspace-picker-path-input")).to_have_value(
+                "D:\\Projects"
+            )
+
+            await page.get_by_test_id("workspace-picker-default").dispatch_event("click")
+            await expect(page.get_by_test_id("workspace-picker-default")).to_have_attribute(
+                "aria-label",
+                f"Unpin this folder for {_HOST_NAME}. Pinning only provides quick access; "
+                "new sessions remember the last working folder.",
+            )
+
+            async with httpx.AsyncClient() as client:
+                for _ in range(50):
+                    response = await client.get(f"{base_url}/v1/hosts")
+                    host = next(
+                        item for item in response.json()["hosts"] if item["host_id"] == host_id
+                    )
+                    if host["default_workspace"] == "D:\\Projects":
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    raise AssertionError("Host pinned workspace was not persisted")
+
+            await page.get_by_test_id("workspace-picker-home").dispatch_event("click")
+            await page.get_by_test_id("workspace-picker-open-pinned").dispatch_event("click")
+            await expect(page.get_by_test_id("workspace-picker-path-input")).to_have_value(
+                "D:\\Projects"
+            )
+
+            screenshot_path = os.environ.get("OMNI_E2E_DEFAULT_SCREENSHOT")
+            if screenshot_path:
+                await page.screenshot(path=screenshot_path, full_page=True)
+        finally:
+            await context.close()
+            await browser.close()
 
 
 async def _drive_home_child_click(base_url: str) -> None:
@@ -476,11 +584,11 @@ def test_filesystem_api_addresses_drive_letter_path(live_server: str) -> None:
     """The host filesystem browse API can address a drive-letter path.
 
     ``host.list_dir`` on Windows returns native paths like
-    ``C:\\Users\\alice\\work``, and session create already accepts them
+    ``C:\\Users\\demo\\work``, and session create already accepts them
     as workspaces — so the browse API must be able to list them. The
     reported bug: ``GET /v1/hosts/{id}/filesystem/{path:path}`` always
     re-adds a leading ``/`` after FastAPI strips the URL slash, so
-    ``C:/Users/alice/work`` reaches the host as ``/C:/Users/alice/work``
+    ``C:/Users/demo/work`` reaches the host as ``/C:/Users/demo/work``
     and 404s — no Windows path is ever listable over this API.
     """
     _run_in_fresh_loop(_drive_filesystem_api(live_server))
@@ -488,9 +596,9 @@ def test_filesystem_api_addresses_drive_letter_path(live_server: str) -> None:
 
 async def _drive_filesystem_api(base_url: str) -> None:
     async with _windows_host(base_url) as host_id, httpx.AsyncClient() as client:
-        resp = await client.get(f"{base_url}/v1/hosts/{host_id}/filesystem/C:/Users/alice/work")
+        resp = await client.get(f"{base_url}/v1/hosts/{host_id}/filesystem/C:/Users/demo/work")
         assert resp.status_code == 200, (
-            f"listing C:/Users/alice/work should succeed, got HTTP {resp.status_code}: "
+            f"listing C:/Users/demo/work should succeed, got HTTP {resp.status_code}: "
             f"{resp.text[:200]}"
         )
         names = [entry["name"] for entry in resp.json()["data"]]
@@ -503,7 +611,7 @@ def test_create_directory_accepts_drive_letter_path(live_server: str) -> None:
     Backs the picker's "New folder" action. The reported bug:
     ``POST /v1/hosts/{id}/directories`` rejects any path that doesn't
     start with ``/`` or ``~``, so a folder can never be created inside
-    a Windows directory (``C:\\Users\\alice\\work\\new-app`` → 400).
+    a Windows directory (``C:\\Users\\demo\\work\\new-app`` → 400).
     """
     _run_in_fresh_loop(_drive_create_directory(live_server))
 
@@ -512,10 +620,10 @@ async def _drive_create_directory(base_url: str) -> None:
     async with _windows_host(base_url) as host_id, httpx.AsyncClient() as client:
         resp = await client.post(
             f"{base_url}/v1/hosts/{host_id}/directories",
-            json={"path": "C:\\Users\\alice\\work\\new-app"},
+            json={"path": "C:\\Users\\demo\\work\\new-app"},
         )
         assert resp.status_code == 200, (
-            f"creating C:\\Users\\alice\\work\\new-app should succeed, got HTTP "
+            f"creating C:\\Users\\demo\\work\\new-app should succeed, got HTTP "
             f"{resp.status_code}: {resp.text[:200]}"
         )
         created = resp.json()["path"]

@@ -2359,6 +2359,46 @@ class HostProcess:
         :returns: List_dir result frame with entries sorted by
             name plus a ``has_more`` flag for the page.
         """
+        if frame.path == "":
+            if os.name == "nt":
+                list_drives = getattr(os, "listdrives", None)
+                drives: list[str] = (
+                    cast(list[str], list_drives())
+                    if callable(list_drives)
+                    else [
+                        f"{letter}:\\"
+                        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                        if os.path.isdir(f"{letter}:\\")
+                    ]
+                )
+                roots = [
+                    HostListDirEntry(
+                        name=drive,
+                        path=drive,
+                        type="directory",
+                        bytes=None,
+                        modified_at=0,
+                    )
+                    for drive in drives
+                ]
+            else:
+                roots = [
+                    HostListDirEntry(
+                        name="/",
+                        path="/",
+                        type="directory",
+                        bytes=None,
+                        modified_at=0,
+                    )
+                ]
+            return _paginate_list_dir(
+                entries=roots,
+                request_id=frame.request_id,
+                limit=frame.limit,
+                after=frame.after,
+                before=frame.before,
+            )
+
         try:
             expanded = os.path.expanduser(frame.path)
         except (TypeError, ValueError) as exc:
@@ -3774,6 +3814,7 @@ class HostProcess:
             gateway_inference=self._gateway_inference,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
+            filesystem_roots=True,
         )
         try:
             encoded_hello = encode_host_frame(hello)

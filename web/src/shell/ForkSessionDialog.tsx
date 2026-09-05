@@ -74,7 +74,7 @@ import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
-import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import { HostWorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,
@@ -1355,7 +1355,7 @@ export function ForkSessionForm({
                           dropdownDisabled={browsing}
                         />
                         {browsing && (
-                          <WorkspacePicker
+                          <HostWorkspacePicker
                             key={browseNonce}
                             hostId={selectedHostId}
                             initialPath={

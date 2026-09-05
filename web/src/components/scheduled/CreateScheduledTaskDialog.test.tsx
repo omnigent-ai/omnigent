@@ -35,7 +35,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
 }));
 vi.mock("@/lib/agentLabels", () => ({ useBrainHarnessLabels: () => ({}) }));
 vi.mock("@/shell/WorkspacePicker", () => ({
-  WorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
+  HostWorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
     <button type="button" onClick={() => onNavigate?.("/home/me/repo")}>
       pick-workspace
     </button>
