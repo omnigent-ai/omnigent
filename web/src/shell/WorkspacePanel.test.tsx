@@ -33,6 +33,9 @@ vi.mock("@/components/BrowserPane/BrowserPane", () => ({
     <div data-testid="browser-pane-stub">{conversationId}</div>
   ),
 }));
+vi.mock("@/components/archive/ArchiveLibraryRail", () => ({
+  ArchiveLibraryRail: () => <div data-testid="archive-library-rail-stub" />,
+}));
 // The rail terminal view mounts a real xterm/WebSocket; stub it to a marker
 // echoing the terminal id it was asked to attach so we can prove the right
 // shell tab surfaced.
@@ -147,6 +150,13 @@ describe("WorkspacePanel surface presentation", () => {
     const panel = screen.getByRole("complementary", { name: "Workspace" });
     expect(panel).toHaveClass("md:border-l", "md:border-border");
     expect(panel).not.toHaveClass("md:m-2", "md:rounded-lg", "md:shadow-lg");
+  });
+
+  it("offers the Archive Library as a peer tab and renders its split reader", () => {
+    renderWorkspace({ rightRailTab: "archive" });
+
+    expect(screen.getByRole("tab", { name: "Archive Library" })).toBeInTheDocument();
+    expect(screen.getByTestId("archive-library-rail-stub")).toBeInTheDocument();
   });
 
   it("presents the fixed pane tabs as compact icon controls with accessible labels", () => {

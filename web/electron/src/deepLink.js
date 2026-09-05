@@ -5,6 +5,8 @@
 //
 // An `omnigent://<hostname>/c/<session_id>` URL names a server by host (with
 // port if non-default) and a conversation by the SPA's own `/c/:id` route.
+// Archive Library references use `/archive/:id?item=<item>&response=<response>`
+// so the read-only reader can land on the cited transcript window.
 // The link carries no http/https scheme — we infer it with the SAME rule the
 // setup page uses (defaultSchemeFor: http for loopback, https for remote),
 // so a deep link and a pasted URL can never disagree on scheme. The
@@ -17,13 +19,31 @@
 const { defaultSchemeFor } = require("./url");
 
 /**
- * v1 accepted SPA path. `/c/<conversationId>` — a single path segment after
- * `/c/`, with an optional trailing slash. Anything else (other routes,
+ * Accepted SPA paths. `/c/<conversationId>` and `/archive/<conversationId>` —
+ * a single path segment after the route, with an optional trailing slash.
+ * Anything else (other routes,
  * nested paths, empty id) is dropped silently: an unrecognized deep link
  * must never crash or mis-navigate, and the SPA's own router stays the
  * authority on what a valid conversation id is.
  */
-const DEEP_LINK_PATH_RE = /^\/c\/[^/]+\/?$/;
+const DEEP_LINK_PATH_RE = /^\/(?:c|archive)\/[^/]+\/?$/;
+const REFERENCE_ID_RE = /^[A-Za-z0-9_-]{1,256}$/;
+
+function archiveLocatorSearch(url) {
+  if (!url.pathname.startsWith("/archive/") || url.hash !== "") return null;
+  const entries = [...url.searchParams.entries()];
+  if (entries.length < 1 || entries.length > 2) return null;
+  if (
+    entries.some(
+      ([key, value]) => !["item", "response"].includes(key) || !REFERENCE_ID_RE.test(value),
+    )
+  ) {
+    return null;
+  }
+  if (entries.filter(([key]) => key === "item").length !== 1) return null;
+  if (entries.filter(([key]) => key === "response").length > 1) return null;
+  return url.search;
+}
 
 /**
  * Parse an `omnigent://` deep link into a server origin + an in-app path.
@@ -51,6 +71,8 @@ function parseOmnigentDeepLink(raw) {
   if (url.host === "") return null;
   const path = url.pathname;
   if (!DEEP_LINK_PATH_RE.test(path)) return null;
+  const archiveSearch = path.startsWith("/archive/") ? archiveLocatorSearch(url) : "";
+  if (archiveSearch === null) return null;
   // Infer the http(s) scheme from the host the same way the setup page does,
   // so a deep link to `localhost` is http and to a remote host is https. The
   // origin is returned in `new URL(...).origin` form (NO trailing slash) so it
@@ -64,7 +86,7 @@ function parseOmnigentDeepLink(raw) {
   } catch {
     return null;
   }
-  return { origin, path };
+  return { origin, path: `${path}${archiveSearch}` };
 }
 
 /**

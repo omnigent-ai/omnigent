@@ -37,6 +37,7 @@ from omnigent.db.utils import (
 )
 from omnigent.entities.conversation import (
     ErrorData,
+    MessageData,
     NewConversationItem,
     ResourceEventData,
     SlashCommandData,
@@ -690,6 +691,27 @@ def test_extract_search_text_for_resource_event_item() -> None:
     assert "terminal" in text
     assert "opaque" not in text
     assert "not indexed" not in text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "This session is being continued from a previous conversation with hidden context",
+        "  <task-notification><task-id>agent-1</task-id></task-notification>",
+    ],
+)
+def test_extract_search_text_excludes_legacy_hidden_messages(text: str) -> None:
+    """Archive search follows the same legacy-message visibility rules as chat rendering."""
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_hidden",
+        data=MessageData(
+            role="user",
+            content=[{"type": "input_text", "text": text}],
+        ),
+    )
+
+    assert extract_search_text(item) == ""
 
 
 @pytest.mark.parametrize(

@@ -90,6 +90,7 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
@@ -97,6 +98,7 @@ import { FileViewerContext } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
+import { ArchiveLibraryRail } from "@/components/archive/ArchiveLibraryRail";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
@@ -245,19 +247,19 @@ export function AppShell() {
   const extensionOwnsHeader = extensionId !== undefined && sidebarOpen;
   const [sidebarPeek, setSidebarPeek] = useState(false);
 
-  // The settings nav lives INSIDE the sidebar, and its "Back" row is the only
-  // way off the settings page. A collapsed sidebar therefore strands the user
-  // there — the row is still in the DOM but clipped and inert. So entering
-  // /settings pins the sidebar open (and drops any peek, which is a transient
-  // hover card, not somewhere to read a settings page from), and leaving it
-  // restores whatever the sidebar was before, so a collapsed sidebar stays a
-  // preference rather than being silently undone by a trip to settings.
+  // The settings nav lives INSIDE the sidebar. Desktop keeps it pinned open as
+  // the persistent left column; on mobile that same sidebar is a full-screen
+  // drawer, so the section content would be covered if it were pinned. Entering
+  // /settings therefore opens the nav on desktop and closes it on mobile. The
+  // header can reopen it, and choosing a settings section uses Sidebar's normal
+  // mobile navigation handler to close it again and reveal the destination.
   //
   // The pin is only needed WHILE on the page, so restoring on exit cannot
   // reintroduce the trap: by then the title-bar toggle is back and the Back row
   // is no longer the only way out. Mirrors sidebarOpenBeforeMaximizeRef, which
   // stashes and restores the same state around the maximize flow.
   const { inSettings } = useSettingsRoute();
+  const mobileViewport = useIsMobileViewport();
   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
   useEffect(() => {
     if (inSettings) {
@@ -268,7 +270,7 @@ export function AppShell() {
         if (sidebarOpenBeforeSettingsRef.current === null) {
           sidebarOpenBeforeSettingsRef.current = wasOpen;
         }
-        return true;
+        return !mobileViewport;
       });
       setSidebarPeek(false);
       return;
@@ -279,7 +281,7 @@ export function AppShell() {
       setSidebarOpen(sidebarOpenBeforeSettingsRef.current);
       sidebarOpenBeforeSettingsRef.current = null;
     }
-  }, [inSettings]);
+  }, [inSettings, mobileViewport]);
 
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.
@@ -371,6 +373,7 @@ export function AppShell() {
   const [panelInitialKey, setPanelInitialKeyState] = useState<string | null>(null);
   const [executionLogsKey, setExecutionLogsKey] = useState<string | null>(null);
   const [filesPanelOpen, setFilesPanelOpen] = useState(false);
+  const [archivePanelOpen, setArchivePanelOpen] = useState(false);
   // Mobile-only full-screen drawers for the rail tabs that have no desktop
   // push panel of their own. On desktop these are tabs in the workspace rail;
   // on a phone they open as full-screen overlays from the session-menu FAB.
@@ -774,25 +777,27 @@ export function AppShell() {
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
         subagents: true,
+        // Archive Library is session-independent data, but lives in the rail
+        // while the user works so references can be collected without leaving.
+        archive: true,
         // Shells have no nav tab — they open as closable soft tabs in the
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
       }) as const,
     [showFilesPanel, showGithubTab],
   );
-  // Whether the rail has anything at all to show. When false the workspace
-  // card doesn't mount and the header hides its collapse toggle — a
-  // no-filesystem agent with no terminals/sub-agents would otherwise
-  // render an empty white card with no way to dismiss it.
+  // Archive is a session-independent, always-available tab, so the current
+  // rail always has content. Keep this aggregate gate centralized for future
+  // capability changes and for the existing mount/toggle call sites.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
   // Keep the selected tab valid. When the current tab disappears — e.g. the
   // files panel turns off — fall back to the first still-visible tab in
-  // display order (Files · Changes · Agents · Browser). Picking
+  // display order (Files · Changes · Agents · Archive · Browser). Picking
   // the first available (rather than ping-ponging between two effects) keeps
   // this convergent even when several tabs vanish at once.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "changes", "github", "subagents", "browser"] as const).find(
+    const next = (["files", "changes", "github", "subagents", "archive", "browser"] as const).find(
       (t) => railTabsAvailable[t],
     );
     if (next) setRightRailTab(next);
@@ -960,6 +965,7 @@ export function AppShell() {
   useEffect(() => {
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
+    setArchivePanelOpen(false);
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
     setFilesPanelShowHidden(true);
@@ -1036,6 +1042,12 @@ export function AppShell() {
     // pull the rail to Files unless it's already on a files scope.
     if (nextSelected && nextTab !== "files" && nextTab !== "changes") {
       nextTab = "files";
+    }
+    if (nextTab !== null && !railTabsAvailable[nextTab]) {
+      nextTab =
+        (["files", "changes", "github", "subagents", "archive", "browser"] as const).find(
+          (tab) => railTabsAvailable[tab],
+        ) ?? null;
     }
     if (nextTab !== null) setRightRailTab(nextTab);
 
@@ -1232,13 +1244,10 @@ export function AppShell() {
   // cleared so we never leave `sidebarOpen` and `sidebarPeek` both true (a
   // floating-card layout the rest of the shell treats as a pushing panel).
   const toggleLeftSidebar = () => {
-    // On /settings the sidebar holds the only exit (the Back row), so collapsing
-    // it — by hotkey or command palette, the paths that bypass the hidden
-    // title-bar toggle — would strand the user on the page. Opening is still
-    // fine; only the collapse direction is refused. The pre-settings state stays
-    // stashed either way, so what the user had before the visit is still what
-    // gets restored on the way out.
-    if (inSettings) {
+    // Desktop settings uses the sidebar as a persistent navigation column, so
+    // refuse collapse there. Mobile settings uses it as an ordinary full-screen
+    // drawer and must allow the header/hotkey/palette to open or close it.
+    if (inSettings && !mobileViewport) {
       setSidebarOpen(true);
       setSidebarPeek(false);
       return;
@@ -1479,6 +1488,7 @@ export function AppShell() {
     clearFileViewerUrl();
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
+    setArchivePanelOpen(false); // close mobile archive drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setPanelInitialKey(key);
@@ -1627,6 +1637,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setArchivePanelOpen(false); // close mobile archive drawer
     setSubagentsPanelOpen(true);
   }
 
@@ -1641,7 +1652,19 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setArchivePanelOpen(false); // close mobile archive drawer
     setShellsPanelOpen(true);
+  }
+
+  function openArchivePanel() {
+    setSelectedFilePath(null);
+    clearFileViewerUrl();
+    setPanelInitialKey(null);
+    setExecutionLogsKey(null);
+    setFilesPanelOpen(false);
+    setSubagentsPanelOpen(false);
+    setShellsPanelOpen(false);
+    setArchivePanelOpen(true);
   }
 
   function openMainExecutionLog() {
@@ -1829,7 +1852,8 @@ export function AppShell() {
     rightPanelOpen &&
     (terminalFirst || !panelOpen) &&
     !executionLogsOpen &&
-    !filesPanelOpen,
+    !filesPanelOpen &&
+    !archivePanelOpen,
   );
 
   return (
@@ -1868,13 +1892,8 @@ export function AppShell() {
           inset-2 would drag them off the lights' centre line. The sidebar's own
           copy is hidden on mac by CSS; this one is positioned by
           .electron-sidebar-header-actions in index.css. */}
-            {/* Hidden on /settings: the settings nav replaces the session list
-          INSIDE the sidebar, and its "Back" row is the only way out. Leaving a
-          collapse toggle up here would let the user hide the one exit and strand
-          themselves on the settings page (the row exists but is clipped and
-          inert). So on /settings the sidebar is pinned open — see
-          forceSidebarOpenInSettings — and these controls step aside rather than
-          offer an action that would break the page. */}
+            {/* Hidden on desktop /settings: the settings nav is the persistent
+          left column there. Mobile uses ChatHeader's drawer trigger instead. */}
             {isMacElectronShell() && !inSettings && (
               <div className="electron-sidebar-header-actions">
                 <SidebarHeaderActions
@@ -1994,6 +2013,7 @@ export function AppShell() {
                       terminalFirst,
                       executionLogsOpen,
                       filesPanelOpen,
+                      archivePanelOpen,
                       subagentsPanelOpen,
                       shellsPanelOpen,
                       hideTerminalsTab,
@@ -2010,6 +2030,7 @@ export function AppShell() {
                       agentCount,
                       onOpenFiles: openFilesPanel,
                       onOpenChanges: openChangesPanel,
+                      onOpenArchive: openArchivePanel,
                       onOpenShells: openShellsPanel,
                       onOpenSubagents: openSubagentsPanel,
                       onOpenMainExecutionLog: openMainExecutionLog,
@@ -2050,6 +2071,8 @@ export function AppShell() {
                 {conversationId && workspacePanelVisible && (
                   <WorkspacePanel
                     conversationId={conversationId}
+                    archiveInitialProject={headerProjectName}
+                    archiveInitialHostId={livenessRow?.host_id}
                     width={inlinePanelWidth}
                     inert={inlinePanelWidth === 0}
                     handleProps={inlinePanelHandleProps}
@@ -2140,6 +2163,16 @@ export function AppShell() {
                   testId="subagents-panel-drawer"
                 >
                   <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+                </MobilePanelDrawer>
+              )}
+              {conversationId && (
+                <MobilePanelDrawer
+                  open={archivePanelOpen}
+                  title="Archive"
+                  onClose={() => setArchivePanelOpen(false)}
+                  testId="archive-panel-drawer"
+                >
+                  <ArchiveLibraryRail />
                 </MobilePanelDrawer>
               )}
               {conversationId && (

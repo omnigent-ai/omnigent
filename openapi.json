@@ -51,6 +51,18 @@
       "AgentObject": {
         "description": "API representation of a registered agent.",
         "properties": {
+          "archived_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archived At"
+          },
           "builtin": {
             "default": false,
             "description": "Whether this is a server-*seeded* built-in agent (deterministic, name-derived id) as opposed to an operator/user-registered template (random id, e.g. via `omnigent server --agent`) or a session-scoped upload. The Web UI's new-session picker uses this to decide whether a same-named `omnigent run` upload may shadow the catalog entry: seeded built-ins are protected, while a user-registered template is superseded by a newer same-named upload. Always `False` for session-scoped agents.",
@@ -168,6 +180,34 @@
           "created_at"
         ],
         "title": "AgentObject",
+        "type": "object"
+      },
+      "ArchivedSessionFacetsResponse": {
+        "description": "Compact filter values for `GET /v1/sessions/archived-facets`.",
+        "properties": {
+          "agent_names": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Agent Names",
+            "type": "array"
+          },
+          "host_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Host Ids",
+            "type": "array"
+          },
+          "projects": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Projects",
+            "type": "array"
+          }
+        },
+        "title": "ArchivedSessionFacetsResponse",
         "type": "object"
       },
       "AutomaticSessionRenameRequest": {
@@ -5363,6 +5403,63 @@
         "title": "SessionInterruptedPayload",
         "type": "object"
       },
+      "SessionItemsWindow": {
+        "description": "A bounded chronological item window centered on one stable item id.",
+        "properties": {
+          "anchor_id": {
+            "title": "Anchor Id",
+            "type": "string"
+          },
+          "data": {
+            "items": {},
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_newer": {
+            "default": false,
+            "title": "Has Newer",
+            "type": "boolean"
+          },
+          "has_older": {
+            "default": false,
+            "title": "Has Older",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "session.items.window",
+            "default": "session.items.window",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "required": [
+          "anchor_id"
+        ],
+        "title": "SessionItemsWindow",
+        "type": "object"
+      },
       "SessionLabelsResponse": {
         "description": "Lightweight response body for `GET /v1/sessions/{id}/labels`.",
         "properties": {
@@ -5458,6 +5555,18 @@
             "description": "Whether the session is archived. Archived sessions are returned by `GET /v1/sessions` only when the request passes `include_archived=true`; the sidebar groups them into a dedicated \"Archived\" section. `False` for normal sessions.",
             "title": "Archived",
             "type": "boolean"
+          },
+          "archived_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archived At"
           },
           "comments_count": {
             "default": 0,
@@ -5635,6 +5744,23 @@
             ],
             "description": "Strict runner liveness \u2014 `True` iff a runner tunnel is currently registered for this session. Matches `GET /health`'s `runner_online` value. Strict: a dead runner on a live host reads `False` here (no host-relaunch optimism folded in), unlike the legacy conflated value. `None` when the server has no runner liveness lookup wired.",
             "title": "Runner Online"
+          },
+          "search_match": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionSearchMatch"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "search_match_count": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Search Match Count",
+            "type": "integer"
           },
           "search_snippet": {
             "anyOf": [
@@ -6243,6 +6369,18 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "archived_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archived At"
+          },
           "background_task_count": {
             "anyOf": [
               {
@@ -6789,6 +6927,36 @@
           "stage"
         ],
         "title": "SessionSandboxStatusEvent",
+        "type": "object"
+      },
+      "SessionSearchMatch": {
+        "description": "Stable archive-library locator for one content-search hit.",
+        "properties": {
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "item_id": {
+            "title": "Item Id",
+            "type": "string"
+          },
+          "response_id": {
+            "title": "Response Id",
+            "type": "string"
+          },
+          "snippet": {
+            "title": "Snippet",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id",
+          "response_id",
+          "created_at",
+          "snippet"
+        ],
+        "title": "SessionSearchMatch",
         "type": "object"
       },
       "SessionSkillsEvent": {
@@ -10563,13 +10731,13 @@
             }
           },
           {
-            "description": "Column to sort on, `\"created_at\"` or `\"updated_at\"`.",
+            "description": "Column to sort on: `\"created_at\"`, `\"updated_at\"`, `\"archived_at\"`, or `\"title\"`.",
             "in": "query",
             "name": "sort_by",
             "required": false,
             "schema": {
               "default": "created_at",
-              "pattern": "^(created_at|updated_at)$",
+              "pattern": "^(created_at|updated_at|archived_at|title)$",
               "title": "Sort By",
               "type": "string"
             }
@@ -10592,6 +10760,18 @@
             }
           },
           {
+            "description": "Limit search to `\"title\"` or `\"content\"`; `\"all\"` keeps the existing combined behavior.",
+            "in": "query",
+            "name": "search_scope",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "pattern": "^(all|title|content)$",
+              "title": "Search Scope",
+              "type": "string"
+            }
+          },
+          {
             "description": "When `False` (default), archived sessions are omitted. When `True`, archived sessions are returned alongside active ones (the sidebar groups them into an \"Archived\" section). Powers the sidebar's \"Show archived\" toggle.",
             "in": "query",
             "name": "include_archived",
@@ -10600,6 +10780,168 @@
               "default": false,
               "title": "Include Archived",
               "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_only",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Archived Only",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "updated_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Updated After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "updated_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Updated Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "active_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Active After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "active_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Active Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Archived After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Archived Before"
             }
           },
           {
@@ -10695,6 +11037,217 @@
           }
         },
         "summary": "Create Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/archived-facets": {
+      "get": {
+        "description": "Return linked filter values for the visible archived-session set.\n\nThe candidate query applies search and date bounds once, then the three\nfacet sets are computed while excluding each facet's own current value.\nThis keeps Project/Host/Agent switchable while removing combinations\nthat cannot produce a result.",
+        "operationId": "list_archived_session_facets_v1_sessions_archived_facets_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "search_query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Search Query"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search_scope",
+            "required": false,
+            "schema": {
+              "default": "title",
+              "pattern": "^(title|content)$",
+              "title": "Search Scope",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "active_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Active After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "active_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Active Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Archived After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Archived Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchivedSessionFacetsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Archived Session Facets",
         "tags": [
           "sessions"
         ]
@@ -12024,6 +12577,149 @@
           }
         },
         "summary": "List Session Items",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/items/search": {
+      "get": {
+        "description": "Search committed items inside one authorized session.",
+        "operationId": "search_session_items_v1_sessions__session_id__items_search_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search_query",
+            "required": true,
+            "schema": {
+              "maxLength": 500,
+              "minLength": 1,
+              "title": "Search Query",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Session Items",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/items/window": {
+      "get": {
+        "description": "Return a bounded chronological window around one committed item.",
+        "operationId": "get_session_items_window_v1_sessions__session_id__items_window_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "anchor_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Anchor Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Before",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "After",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionItemsWindow"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Items Window",
         "tags": [
           "sessions"
         ]

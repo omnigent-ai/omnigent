@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from sqlalchemy import event, text
 
+from omnigent.db.db_models import SqlConversationItem, current_workspace_id
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
     CompactionData,
@@ -6210,3 +6211,352 @@ def test_get_conversation_keeps_distinct_query_names(
         "omnigent.conversation_store.select_conversation_metadata_by_id",
         "omnigent.conversation_store.select_conversation_labels",
     ], names
+
+
+def test_list_conversations_search_scope_and_match_count(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Title/content scope stays distinct and content results report every matching item."""
+    title_match = conversation_store.create_conversation()
+    conversation_store.update_conversation(title_match.id, title="needle runbook")
+
+    content_match = conversation_store.create_conversation()
+    conversation_store.update_conversation(content_match.id, title="General notes")
+    conversation_store.append(
+        content_match.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{index}",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"needle detail {index}"}],
+                ),
+            )
+            for index in range(2)
+        ],
+    )
+
+    title_page = conversation_store.list_conversations(
+        search_query="needle",
+        search_scope="title",
+    )
+    assert [row.id for row in title_page.data] == [title_match.id]
+    assert title_page.data[0].search_match_count == 0
+
+    content_page = conversation_store.list_conversations(
+        search_query="needle",
+        search_scope="content",
+    )
+    assert [row.id for row in content_page.data] == [content_match.id]
+    assert content_page.data[0].search_match_count == 2
+    assert content_page.data[0].search_item_id is not None
+
+
+def test_list_conversations_sorts_titles_case_insensitively(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Archive name sorting uses a stable, case-insensitive title key."""
+    for title in ("zulu", "Alpha", "bravo"):
+        conversation = conversation_store.create_conversation()
+        conversation_store.update_conversation(conversation.id, title=title)
+
+    page = conversation_store.list_conversations(sort_by="title", order="asc")
+    assert [row.title for row in page.data] == ["Alpha", "bravo", "zulu"]
+
+
+def test_list_conversations_search_excludes_meta_messages(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Framework-owned meta context is not archive-library search material."""
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_meta",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "internal archive sentinel"}],
+                    is_meta=True,
+                ),
+            ),
+        ],
+    )
+
+    page = conversation_store.list_conversations(search_query="archive sentinel")
+    assert conv.id not in {row.id for row in page.data}
+
+
+@pytest.mark.parametrize(
+    "hidden_text,query",
+    [
+        (
+            "This session is being continued from a previous conversation: private recap",
+            "private recap",
+        ),
+        (
+            "<task-notification><task-id>agent-1</task-id>private result</task-notification>",
+            "private result",
+        ),
+    ],
+)
+def test_list_conversations_search_excludes_legacy_hidden_messages(
+    conversation_store: SqlAlchemyConversationStore,
+    hidden_text: str,
+    query: str,
+) -> None:
+    """Legacy hidden prompts remain absent even if an old row retained search_text."""
+    conv = conversation_store.create_conversation()
+    [persisted] = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_hidden",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": hidden_text}],
+                ),
+            ),
+        ],
+    )
+    # Simulate a pre-fix indexed row: current writes correctly store an empty
+    # search_text, while the read predicate must still hide historical rows.
+    with conversation_store._conv_session("test_legacy_hidden_search") as session:
+        row = session.get(
+            SqlConversationItem,
+            (current_workspace_id(), conv.id, persisted.id, persisted.created_at),
+        )
+        assert row is not None
+        row.search_text = hidden_text
+
+    page = conversation_store.list_conversations(search_query=query)
+    assert conv.id not in {row.id for row in page.data}
+
+
+@pytest.mark.parametrize(
+    "literal,matching_text",
+    [("%", "progress is 100% complete"), ("_", "literal_under_score")],
+)
+def test_list_conversations_search_treats_like_wildcards_literally(
+    conversation_store: SqlAlchemyConversationStore,
+    literal: str,
+    matching_text: str,
+) -> None:
+    matching = conversation_store.create_conversation()
+    conversation_store.append(
+        matching.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_literal",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": matching_text}],
+                ),
+            )
+        ],
+    )
+    unrelated = conversation_store.create_conversation()
+    conversation_store.append(
+        unrelated.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_plain",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "ordinary archive text"}],
+                ),
+            )
+        ],
+    )
+
+    ids = {row.id for row in conversation_store.list_conversations(search_query=literal).data}
+    assert matching.id in ids
+    assert unrelated.id not in ids
+
+
+def test_active_interval_ends_at_last_committed_item_not_later_metadata_edit(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Active-date overlap follows chat activity, never mutable updated_at."""
+    clock = {"now": 100}
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch",
+        lambda: clock["now"],
+    )
+    conv = conversation_store.create_conversation(title="active interval")
+    clock["now"] = 200
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_active",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "finished work"}],
+                    agent="test-agent",
+                ),
+            )
+        ],
+    )
+    clock["now"] = 400
+    conversation_store.update_conversation(conv.id, title="renamed after completion")
+
+    overlapping = conversation_store.list_conversations(active_after=150, active_before=250)
+    after_chat_finished = conversation_store.list_conversations(
+        active_after=250,
+        active_before=450,
+    )
+
+    assert conv.id in {row.id for row in overlapping.data}
+    assert conv.id not in {row.id for row in after_chat_finished.data}
+
+
+def test_archived_at_tracks_only_archive_transitions(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conv = conversation_store.create_conversation(title="before archive")
+    created_at = conv.created_at
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch",
+        lambda: created_at + 100,
+    )
+    archived = conversation_store.update_conversation(conv.id, archived=True)
+    assert archived is not None
+    assert archived.archived_at == created_at + 100
+
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch",
+        lambda: created_at + 200,
+    )
+    renamed = conversation_store.update_conversation(conv.id, title="after archive")
+    assert renamed is not None
+    assert renamed.updated_at == created_at + 200
+    assert renamed.archived_at == created_at + 100
+
+    restored = conversation_store.update_conversation(conv.id, archived=False)
+    assert restored is not None
+    assert restored.archived_at is None
+
+
+def test_search_treats_fts_operators_and_quotes_as_literal_text(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Archive text input never becomes SQLite FTS query syntax."""
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_literal_search",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": 'release OR "rollback marker"'}],
+                ),
+            )
+        ],
+    )
+
+    assert len(conversation_store.search('release OR "rollback', conversation_id=conv.id)) == 1
+    assert conversation_store.search("release NOT missing", conversation_id=conv.id) == []
+
+
+@pytest.mark.parametrize(
+    "query,matching_text",
+    [
+        ("ploy", "deployment completed"),
+        ("%", "progress reached 100%"),
+        ("_", "literal_under_score"),
+        ('"quoted"', 'a "quoted" phrase'),
+    ],
+)
+def test_visible_item_search_uses_literal_substrings(
+    conversation_store: SqlAlchemyConversationStore,
+    query: str,
+    matching_text: str,
+) -> None:
+    """The Archive reader search is literal substring search on every dialect."""
+    conv = conversation_store.create_conversation()
+    [matching, unrelated] = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_matching",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": matching_text}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_unrelated",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "ordinary transcript text"}],
+                ),
+            ),
+        ],
+    )
+
+    results = conversation_store.search_visible_items_literal(conv.id, query, limit=10)
+
+    assert [item.id for item in results] == [matching.id]
+    assert unrelated.id not in {item.id for item in results}
+
+
+def test_visible_item_search_filters_legacy_hidden_rows_before_limit(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Internal rows cannot consume the bounded visible result window."""
+    conv = conversation_store.create_conversation()
+    persisted = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_hidden",
+                data=MessageData(
+                    role="user",
+                    is_meta=True,
+                    content=[{"type": "input_text", "text": "needle hidden"}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_visible_one",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "needle visible one"}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_visible_two",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "needle visible two"}],
+                    agent="test-agent",
+                ),
+            ),
+        ],
+    )
+    with conversation_store._conv_session("seed_legacy_hidden_archive_search") as session:
+        hidden = session.get(
+            SqlConversationItem,
+            (current_workspace_id(), conv.id, persisted[0].id, persisted[0].created_at),
+        )
+        assert hidden is not None
+        hidden.search_text = "needle hidden"
+
+    results = conversation_store.search_visible_items_literal(conv.id, "needle", limit=2)
+
+    assert [item.id for item in results] == [persisted[1].id, persisted[2].id]

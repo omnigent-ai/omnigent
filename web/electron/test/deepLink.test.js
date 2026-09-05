@@ -58,6 +58,36 @@ describe("parseOmnigentDeepLink", () => {
     assert.equal(parsed.origin, "http://localhost:8000");
   });
 
+  it("preserves validated Archive Library item and response locators", () => {
+    assert.deepEqual(
+      parseOmnigentDeepLink("omnigent://example.com/archive/conv_abc?response=resp_1&item=msg_2"),
+      {
+        origin: "https://example.com",
+        path: "/archive/conv_abc?response=resp_1&item=msg_2",
+      },
+    );
+    assert.deepEqual(parseOmnigentDeepLink("omnigent://localhost:8000/archive/x?item=msg_2"), {
+      origin: "http://localhost:8000",
+      path: "/archive/x?item=msg_2",
+    });
+  });
+
+  it("rejects incomplete or unbounded Archive Library locators", () => {
+    assert.equal(parseOmnigentDeepLink("omnigent://localhost:8000/archive/x"), null);
+    assert.equal(
+      parseOmnigentDeepLink("omnigent://localhost:8000/archive/x?response=resp_1"),
+      null,
+    );
+    assert.equal(
+      parseOmnigentDeepLink("omnigent://localhost:8000/archive/x?item=msg_1&next=/settings"),
+      null,
+    );
+    assert.equal(
+      parseOmnigentDeepLink("omnigent://localhost:8000/archive/x?item=msg_1#fragment"),
+      null,
+    );
+  });
+
   it("rejects a non-omnigent scheme", () => {
     assert.equal(parseOmnigentDeepLink("https://localhost:8000/c/x"), null);
     assert.equal(parseOmnigentDeepLink("vscode://localhost/c/x"), null);

@@ -54,6 +54,8 @@ from omnigent.db.enum_codecs import (
 )
 from omnigent.db.query_context import query_name_scope
 from omnigent.db.utils import (
+    CLAUDE_COMPACTION_SUMMARY_PREFIX,
+    CLAUDE_TASK_NOTIFICATION_MARKERS,
     _supports_fts5,
     build_search_snippet,
     delete_fts_by_conversation_ids,
@@ -91,6 +93,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
+    ArchivedConversationFacets,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -249,6 +252,7 @@ def _to_conversation(
         workspace=meta.workspace if meta else None,
         git_branch=meta.git_branch if meta else None,
         archived=row.archived,
+        archived_at=row.archived_at,
         live_status=(
             decode_session_live_status(meta.live_status)
             if meta and meta.live_status is not None
@@ -580,11 +584,39 @@ def _fetch_labels_bulk(
     return out
 
 
-def _fetch_search_snippets(
+def _literal_like_pattern(value: str) -> str:
+    """Build a SQL LIKE pattern that treats the user's query as literal text."""
+    escaped = value.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _visible_search_match_predicate(pattern: str) -> Any:
+    """Match searchable user-visible rows, including pre-fix stored data."""
+    data = SqlConversationItem.data
+    legacy_task_notification = and_(
+        *(data.like(f"%{marker}%") for marker in CLAUDE_TASK_NOTIFICATION_MARKERS),
+    )
+    return and_(
+        SqlConversationItem.search_text.ilike(pattern, escape="\\"),
+        or_(
+            SqlConversationItem.type != encode_item_type("message"),
+            and_(
+                # ``append`` serializes with json.dumps' stable ``": "`` spacing.
+                # Future hidden messages persist an empty search_text; these
+                # gates keep older indexed rows from surfacing after an upgrade.
+                data.not_like('%"is_meta": true%'),
+                data.not_like(f'%"text": "{CLAUDE_COMPACTION_SUMMARY_PREFIX}%'),
+                ~legacy_task_notification,
+            ),
+        ),
+    )
+
+
+def _fetch_search_matches(
     session: Session,
     conversation_ids: list[str],
     query: str,
-) -> dict[str, str]:
+) -> dict[str, tuple[str, str, int, str, int]]:
     """
     Build a per-conversation preview excerpt of matching chat content.
 
@@ -604,13 +636,14 @@ def _fetch_search_snippets(
     :param conversation_ids: Conversation IDs to build snippets for,
         e.g. ``["conv_a", "conv_b"]``.
     :param query: The user's search string.
-    :returns: Mapping ``{conversation_id: snippet}``. Conversations whose
+    :returns: Mapping ``{conversation_id: (item_id, response_id,
+        created_at, snippet)}``. Conversations whose
         only match was the title (no item body match) are absent — the
         caller leaves their ``search_snippet`` as ``None``.
     """
     if not conversation_ids or not query:
         return {}
-    pattern = f"%{query.lower()}%"
+    pattern = _literal_like_pattern(query)
     workspace_id = current_workspace_id()
     # workspace_id leads the (workspace_id, conversation_id, position) index.
     # Both the aggregate and the join-back below must include it or Postgres
@@ -622,7 +655,7 @@ def _fetch_search_snippets(
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        SqlConversationItem.search_text.ilike(pattern),
+        _visible_search_match_predicate(pattern),
     )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
@@ -630,6 +663,7 @@ def _fetch_search_snippets(
         select(
             SqlConversationItem.conversation_id.label("cid"),
             func.min(SqlConversationItem.position).label("pos"),
+            func.count().label("match_count"),
         )
         .where(match_pred)
         .group_by(SqlConversationItem.conversation_id)
@@ -640,7 +674,11 @@ def _fetch_search_snippets(
     rows = session.execute(
         select(
             SqlConversationItem.conversation_id,
+            SqlConversationItem.id,
+            SqlConversationItem.response_id,
+            SqlConversationItem.created_at,
             SqlConversationItem.search_text,
+            earliest.c.match_count,
         ).join(
             earliest,
             and_(
@@ -650,13 +688,13 @@ def _fetch_search_snippets(
             ),
         )
     ).all()
-    out: dict[str, str] = {}
-    for conv_id, search_text in rows:
+    out: dict[str, tuple[str, str, int, str, int]] = {}
+    for conv_id, item_id, response_id, created_at, search_text, match_count in rows:
         if not search_text:
             continue
         snippet = build_search_snippet(search_text, query)
         if snippet is not None:
-            out[conv_id] = snippet
+            out[conv_id] = (item_id, response_id, created_at, snippet, int(match_count))
     return out
 
 
@@ -1765,6 +1803,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # tsvector indexing is a future optimization (tracked in GAPS.md).
             use_fts = _supports_fts5(self._conv_engine.dialect.name)
             if use_fts:
+                # Archive search is literal user text; quote FTS operators and
+                # escape embedded quotes instead of parsing a query language.
+                query = '"' + query.replace('"', '""') + '"'
                 if conversation_id is not None:
                     stmt = text(
                         "SELECT item_id FROM conversation_items_fts "
@@ -1838,6 +1879,49 @@ class SqlAlchemyConversationStore(ConversationStore):
             ordered = sorted(rows, key=lambda r: order[r.id])
             decoded = self._decode_item_data_batch([r.data for r in ordered])
             return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
+
+    def search_visible_items_literal(
+        self,
+        conversation_id: str,
+        query: str,
+        limit: int = 20,
+    ) -> list[ConversationItem]:
+        """Search one transcript using the Archive reader's literal contract."""
+        if not query or limit <= 0:
+            return []
+        with self._conv_session("search_visible_conversation_items_literal") as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(
+                    text(f"SET LOCAL statement_timeout = {int(_SEARCH_STATEMENT_TIMEOUT_MS)}")
+                )
+            rows = (
+                session.execute(
+                    select(SqlConversationItem)
+                    .options(
+                        load_only(
+                            SqlConversationItem.id,
+                            SqlConversationItem.type,
+                            SqlConversationItem.status,
+                            SqlConversationItem.response_id,
+                            SqlConversationItem.created_at,
+                            SqlConversationItem.position,
+                            SqlConversationItem.data,
+                            SqlConversationItem.created_by,
+                        )
+                    )
+                    .where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
+                        _visible_search_match_predicate(_literal_like_pattern(query)),
+                    )
+                    .order_by(SqlConversationItem.position.asc(), SqlConversationItem.id.asc())
+                    .limit(limit)
+                )
+                .scalars()
+                .all()
+            )
+            decoded = self._decode_item_data_batch([row.data for row in rows])
+            return [_to_item(row, data) for row, data in zip(rows, decoded, strict=True)]
 
     def list_items(
         self,
@@ -2274,6 +2358,323 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversationLabel.conversation_id.in_(permission_ids))
             return [row[0] for row in ap_sess.execute(stmt).all()]
 
+    def list_archived_facets(
+        self,
+        accessible_by: str | None = None,
+        *,
+        search_query: str | None = None,
+        search_scope: str = "title",
+        project: str | None = None,
+        host_id: str | None = None,
+        agent_name: str | None = None,
+        created_after: int | None = None,
+        created_before: int | None = None,
+        active_after: int | None = None,
+        active_before: int | None = None,
+        archived_after: int | None = None,
+        archived_before: int | None = None,
+    ) -> ArchivedConversationFacets:
+        """Aggregate linked Archive facets without loading conversation entities."""
+        if search_scope not in {"title", "content"}:
+            raise ValueError(f"invalid search_scope: {search_scope!r}")
+
+        workspace_id = current_workspace_id()
+        same_database = self._conv_engine is self._engine
+        access_ids: list[str] | None = None
+        host_match_ids: list[str] | None = None
+        project_member_ids: list[str] | None = None
+        project_ids_for_name: list[str] = []
+        agent_ids_for_name: list[str] = []
+
+        with self._session("list_archived_facets_metadata_filters") as meta_sess:
+            if meta_sess.bind is not None and meta_sess.bind.dialect.name == "postgresql":
+                meta_sess.execute(
+                    text(f"SET LOCAL statement_timeout = {int(_SEARCH_STATEMENT_TIMEOUT_MS)}")
+                )
+            if accessible_by is not None and not same_database:
+                access_ids = list(
+                    meta_sess.execute(
+                        select(SqlSessionPermission.conversation_id).where(
+                            SqlSessionPermission.workspace_id == workspace_id,
+                            SqlSessionPermission.user_id == accessible_by,
+                        )
+                    ).scalars()
+                )
+                if not access_ids:
+                    return ArchivedConversationFacets(projects=[], host_ids=[], agent_ids=[])
+            if host_id is not None and not same_database:
+                host_match_ids = list(
+                    meta_sess.execute(
+                        select(SqlConversationMetadata.id).where(
+                            SqlConversationMetadata.workspace_id == workspace_id,
+                            SqlConversationMetadata.host_id == host_id,
+                        )
+                    ).scalars()
+                )
+            if project is not None:
+                project_ids_for_name = list(
+                    meta_sess.execute(
+                        select(SqlProject.id).where(
+                            SqlProject.workspace_id == workspace_id,
+                            SqlProject.user_id == accessible_by,
+                            SqlProject.name == project,
+                        )
+                    ).scalars()
+                )
+                if not same_database and project_ids_for_name:
+                    project_member_ids = list(
+                        meta_sess.execute(
+                            select(SqlConversationMetadata.id).where(
+                                SqlConversationMetadata.workspace_id == workspace_id,
+                                SqlConversationMetadata.project_id.in_(project_ids_for_name),
+                            )
+                        ).scalars()
+                    )
+            if agent_name is not None:
+                agent_ids_for_name = list(
+                    meta_sess.execute(
+                        select(SqlAgent.id).where(
+                            SqlAgent.workspace_id == workspace_id,
+                            SqlAgent.name == agent_name,
+                        )
+                    ).scalars()
+                )
+
+        permission_subquery = select(SqlSessionPermission.conversation_id).where(
+            SqlSessionPermission.workspace_id == workspace_id,
+            SqlSessionPermission.user_id == accessible_by,
+        )
+        host_subquery = select(SqlConversationMetadata.id).where(
+            SqlConversationMetadata.workspace_id == workspace_id,
+            SqlConversationMetadata.host_id == host_id,
+        )
+        project_member_subquery = select(SqlConversationMetadata.id).where(
+            SqlConversationMetadata.workspace_id == workspace_id,
+            SqlConversationMetadata.project_id.in_(project_ids_for_name),
+        )
+        label_project_subquery = select(SqlConversationLabel.conversation_id).where(
+            SqlConversationLabel.workspace_id == workspace_id,
+            SqlConversationLabel.key == PROJECT_LABEL_KEY,
+            SqlConversationLabel.value == project,
+        )
+
+        def _candidate_stmt(skip: str, scope_ids: list[str] | None = None) -> Any:
+            predicates: list[Any] = [
+                SqlConversation.workspace_id == workspace_id,
+                SqlConversation.archived.is_(True),
+                SqlConversation.parent_conversation_id.is_(None),
+                SqlConversation.agent_id.is_not(None),
+            ]
+            if scope_ids is not None:
+                predicates.append(SqlConversation.id.in_(scope_ids))
+            elif accessible_by is not None:
+                predicates.append(
+                    SqlConversation.id.in_(
+                        permission_subquery if same_database else (access_ids or [])
+                    )
+                )
+            if skip != "host" and host_id is not None:
+                predicates.append(
+                    SqlConversation.id.in_(
+                        host_subquery if same_database else (host_match_ids or [])
+                    )
+                )
+            if skip != "agent" and agent_name is not None:
+                predicates.append(SqlConversation.agent_id.in_(agent_ids_for_name))
+            if skip != "project" and project is not None:
+                first_class_match = SqlConversation.id.in_(
+                    project_member_subquery if same_database else (project_member_ids or [])
+                )
+                predicates.append(
+                    or_(
+                        first_class_match,
+                        SqlConversation.id.in_(label_project_subquery),
+                    )
+                )
+            if created_after is not None:
+                predicates.append(SqlConversation.created_at >= created_after)
+            if created_before is not None:
+                predicates.append(SqlConversation.created_at < created_before)
+            if active_before is not None:
+                predicates.append(SqlConversation.created_at < active_before)
+            if active_after is not None:
+                predicates.append(
+                    or_(
+                        SqlConversation.created_at >= active_after,
+                        select(SqlConversationItem.id)
+                        .where(
+                            SqlConversationItem.workspace_id == workspace_id,
+                            SqlConversationItem.conversation_id == SqlConversation.id,
+                            SqlConversationItem.created_at >= active_after,
+                        )
+                        .correlate(SqlConversation)
+                        .exists(),
+                    )
+                )
+            if archived_after is not None:
+                predicates.append(SqlConversation.archived_at >= archived_after)
+            if archived_before is not None:
+                predicates.append(SqlConversation.archived_at < archived_before)
+            if search_query:
+                pattern = _literal_like_pattern(search_query)
+                title_match = func.lower(SqlConversation.title).like(pattern, escape="\\")
+                content_match = (
+                    select(SqlConversationItem.id)
+                    .where(
+                        SqlConversationItem.workspace_id == workspace_id,
+                        SqlConversationItem.conversation_id == SqlConversation.id,
+                        _visible_search_match_predicate(pattern),
+                    )
+                    .correlate(SqlConversation)
+                    .exists()
+                )
+                predicates.append(title_match if search_scope == "title" else content_match)
+            return select(SqlConversation.id).where(*predicates)
+
+        # Split databases cannot embed Omnigent metadata subqueries in the AP
+        # query. Intersect those bridge ids first, then keep every SQL IN list
+        # bounded while the DISTINCT aggregates merge compact values.
+        def _scope_batches(skip: str) -> list[list[str] | None]:
+            ids = access_ids
+            if not same_database and skip != "host" and host_id is not None:
+                host_set = set(host_match_ids or [])
+                ids = (
+                    [candidate for candidate in (ids or []) if candidate in host_set]
+                    if ids is not None
+                    else list(host_set)
+                )
+            if same_database or ids is None:
+                return [None]
+            return [ids[index : index + 500] for index in range(0, len(ids), 500)]
+
+        projects: set[str] = set()
+        host_ids: set[str] = set()
+        agent_ids: set[str] = set()
+
+        with self._conv_session("list_archived_facets") as ap_sess:
+            if ap_sess.bind is not None and ap_sess.bind.dialect.name == "postgresql":
+                ap_sess.execute(
+                    text(f"SET LOCAL statement_timeout = {int(_SEARCH_STATEMENT_TIMEOUT_MS)}")
+                )
+
+            for batch in _scope_batches("project"):
+                candidates = _candidate_stmt("project", batch)
+                projects.update(
+                    value
+                    for value in ap_sess.execute(
+                        select(SqlConversationLabel.value)
+                        .where(
+                            SqlConversationLabel.workspace_id == workspace_id,
+                            SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                            SqlConversationLabel.conversation_id.in_(candidates),
+                        )
+                        .distinct()
+                    ).scalars()
+                    if value
+                )
+                if same_database:
+                    projects.update(
+                        value
+                        for value in ap_sess.execute(
+                            select(SqlProject.name)
+                            .join(
+                                SqlConversationMetadata,
+                                SqlConversationMetadata.project_id == SqlProject.id,
+                            )
+                            .where(
+                                SqlProject.workspace_id == workspace_id,
+                                SqlProject.user_id == accessible_by,
+                                SqlConversationMetadata.workspace_id == workspace_id,
+                                SqlConversationMetadata.id.in_(candidates),
+                            )
+                            .distinct()
+                        ).scalars()
+                        if value
+                    )
+                else:
+                    for candidate_batch in (
+                        ap_sess.execute(candidates.execution_options(yield_per=500))
+                        .scalars()
+                        .partitions(500)
+                    ):
+                        with self._session("list_archived_facets_project_values") as meta_sess:
+                            projects.update(
+                                value
+                                for value in meta_sess.execute(
+                                    select(SqlProject.name)
+                                    .join(
+                                        SqlConversationMetadata,
+                                        SqlConversationMetadata.project_id == SqlProject.id,
+                                    )
+                                    .where(
+                                        SqlProject.workspace_id == workspace_id,
+                                        SqlProject.user_id == accessible_by,
+                                        SqlConversationMetadata.workspace_id == workspace_id,
+                                        SqlConversationMetadata.id.in_(list(candidate_batch)),
+                                    )
+                                    .distinct()
+                                ).scalars()
+                                if value
+                            )
+
+            for batch in _scope_batches("host"):
+                candidates = _candidate_stmt("host", batch)
+                if same_database:
+                    host_ids.update(
+                        value
+                        for value in ap_sess.execute(
+                            select(SqlConversationMetadata.host_id)
+                            .where(
+                                SqlConversationMetadata.workspace_id == workspace_id,
+                                SqlConversationMetadata.host_id.is_not(None),
+                                SqlConversationMetadata.id.in_(candidates),
+                            )
+                            .distinct()
+                        ).scalars()
+                        if value
+                    )
+                else:
+                    for candidate_batch in (
+                        ap_sess.execute(candidates.execution_options(yield_per=500))
+                        .scalars()
+                        .partitions(500)
+                    ):
+                        with self._session("list_archived_facets_host_values") as meta_sess:
+                            host_ids.update(
+                                value
+                                for value in meta_sess.execute(
+                                    select(SqlConversationMetadata.host_id)
+                                    .where(
+                                        SqlConversationMetadata.workspace_id == workspace_id,
+                                        SqlConversationMetadata.host_id.is_not(None),
+                                        SqlConversationMetadata.id.in_(list(candidate_batch)),
+                                    )
+                                    .distinct()
+                                ).scalars()
+                                if value
+                            )
+
+            for batch in _scope_batches("agent"):
+                candidates = _candidate_stmt("agent", batch)
+                agent_ids.update(
+                    value
+                    for value in ap_sess.execute(
+                        select(SqlConversation.agent_id)
+                        .where(
+                            SqlConversation.workspace_id == workspace_id,
+                            SqlConversation.id.in_(candidates),
+                        )
+                        .distinct()
+                    ).scalars()
+                    if value
+                )
+
+        return ArchivedConversationFacets(
+            projects=sorted(projects),
+            host_ids=sorted(host_ids),
+            agent_ids=sorted(agent_ids),
+        )
+
     def delete_label(
         self,
         conversation_id: str,
@@ -2310,6 +2711,17 @@ class SqlAlchemyConversationStore(ConversationStore):
         order: str = "desc",
         sort_by: str = "created_at",
         search_query: str | None = None,
+        search_scope: str = "all",
+        include_search_match: bool = True,
+        host_id: str | None = None,
+        created_after: int | None = None,
+        created_before: int | None = None,
+        updated_after: int | None = None,
+        updated_before: int | None = None,
+        active_after: int | None = None,
+        active_before: int | None = None,
+        archived_after: int | None = None,
+        archived_before: int | None = None,
         accessible_by: str | None = None,
         owned_by: str | None = None,
         shared_only: bool = False,
@@ -2349,10 +2761,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``. Powers ``GET /v1/sessions`` — sessions
             always have an agent binding. ``None`` disables.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param sort_by: Column to sort on, ``"created_at"``
-            or ``"updated_at"``.
+        :param sort_by: Column to sort on: ``"created_at"``,
+            ``"updated_at"``, ``"archived_at"``, or ``"title"``.
         :param search_query: Case-insensitive substring filter on
-            the session title OR conversation item content.
+            the session title or conversation item content.
             ``None`` or empty string disables the filter;
             otherwise matches conversations where
             ``LOWER(title) LIKE %query%`` or any
@@ -2360,6 +2772,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             query. Implemented with the SQL ``LIKE`` operator
             (no FTS) so it works against both SQLite and
             Postgres without extra extensions.
+        :param search_scope: Search ``"title"``, ``"content"``, or ``"all"``
+            supported text fields. ``"all"`` also includes workspace metadata.
+        :param include_search_match: Populate the first matching item, snippet,
+            and match count. Facet scans disable this extra result query.
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
@@ -2391,6 +2807,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from omnigent.server.auth import LEVEL_OWNER
 
+        if search_scope not in {"all", "title", "content"}:
+            raise ValueError(f"invalid search_scope: {search_scope!r}")
         sort_col = self._resolve_sort_column(sort_by)
         is_desc = order == "desc"
         sort_fn = desc if is_desc else asc
@@ -2409,9 +2827,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         # (kind derived from parent-nullness, archived a real column), so they
         # are filtered directly on the AP query below. The only filters that
         # still require an Omnigent-side prefetch are the permission scopes.
-        # shared_only also needs both accessible and owned sets so it can
-        # compute the difference (accessible − owned).
-        needs_meta_filter = (accessible_by is not None) or (owned_by is not None) or shared_only
+        needs_meta_filter = (
+            (accessible_by is not None)
+            or (owned_by is not None)
+            or (host_id is not None)
+            or shared_only
+        )
 
         qualifying_ids: list[str] | None = None
         if needs_meta_filter:
@@ -2449,14 +2870,29 @@ class SqlAlchemyConversationStore(ConversationStore):
                         ).scalars()
                     )
                 if shared_only:
-                    # shared_only = accessible but NOT owned
-                    qualifying_ids = list((accessible_set or set()) - (owned_set or set()))
-                elif accessible_set is not None and owned_set is not None:
-                    qualifying_ids = list(accessible_set & owned_set)
+                    qualifying_sets = [(accessible_set or set()) - (owned_set or set())]
                 else:
-                    qualifying_ids = list(
-                        accessible_set if accessible_set is not None else owned_set or set()
+                    qualifying_sets = [
+                        candidate
+                        for candidate in (accessible_set, owned_set)
+                        if candidate is not None
+                    ]
+                if host_id is not None:
+                    qualifying_sets.append(
+                        set(
+                            meta_sess.execute(
+                                select(SqlConversationMetadata.id).where(
+                                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                                    SqlConversationMetadata.host_id == host_id,
+                                )
+                            ).scalars()
+                        )
                     )
+                if qualifying_sets:
+                    intersection = qualifying_sets[0]
+                    for candidate in qualifying_sets[1:]:
+                        intersection &= candidate
+                    qualifying_ids = list(intersection)
 
         with self._conv_session("list_conversations") as session:
             # Bound the content-search scan server-side (Postgres only). SET
@@ -2465,7 +2901,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # _SEARCH_STATEMENT_TIMEOUT_MS. A worker-thread query is not stopped
             # by a client disconnect, so this is the only server-side bound.
             is_postgres = session.bind is not None and session.bind.dialect.name == "postgresql"
-            if search_query and is_postgres:
+            if search_query and search_scope != "title" and is_postgres:
                 # Postgres SET does not accept a bind parameter, so the value is
                 # inlined. Safe from injection: it is an int module constant, not
                 # caller input — coerced through int() to keep it that way.
@@ -2492,6 +2928,37 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.archived.is_(True))
             elif not include_archived:
                 stmt = stmt.where(SqlConversation.archived.is_(False))
+
+            if created_after is not None:
+                stmt = stmt.where(SqlConversation.created_at >= created_after)
+            if created_before is not None:
+                stmt = stmt.where(SqlConversation.created_at < created_before)
+            if updated_after is not None:
+                stmt = stmt.where(SqlConversation.updated_at >= updated_after)
+            if updated_before is not None:
+                stmt = stmt.where(SqlConversation.updated_at < updated_before)
+            # Active is the interval from session creation through its newest
+            # committed item. Metadata-only updates do not extend it.
+            if active_before is not None:
+                stmt = stmt.where(SqlConversation.created_at < active_before)
+            if active_after is not None:
+                active_item_exists = (
+                    select(SqlConversationItem.id)
+                    .where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == SqlConversation.id,
+                        SqlConversationItem.created_at >= active_after,
+                    )
+                    .correlate(SqlConversation)
+                    .exists()
+                )
+                stmt = stmt.where(
+                    (SqlConversation.created_at >= active_after) | active_item_exists
+                )
+            if archived_after is not None:
+                stmt = stmt.where(SqlConversation.archived_at >= archived_after)
+            if archived_before is not None:
+                stmt = stmt.where(SqlConversation.archived_at < archived_before)
 
             if parent_conversation_id is not None:
                 stmt = stmt.where(
@@ -2525,8 +2992,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
             if search_query:
-                pattern = f"%{search_query.lower()}%"
-                title_match = func.lower(SqlConversation.title).like(pattern)
+                pattern = _literal_like_pattern(search_query)
+                title_match = func.lower(SqlConversation.title).like(pattern, escape="\\")
                 # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
                 # form is uncorrelated, so the match set is built for the WHOLE
                 # workspace before the outer query discards every row the caller
@@ -2546,11 +3013,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
                         SqlConversationItem.conversation_id == SqlConversation.id,
-                        SqlConversationItem.search_text.ilike(pattern),
+                        _visible_search_match_predicate(pattern),
                     )
                     .exists()
                 )
-                stmt = stmt.where(or_(title_match, content_match))
+                if search_scope == "title":
+                    stmt = stmt.where(title_match)
+                elif search_scope == "content":
+                    stmt = stmt.where(content_match)
+                else:
+                    stmt = stmt.where(or_(title_match, content_match))
             if project is not None:
                 # Dual-read by project NAME: a session is "in <name>" if it has
                 # EITHER the first-class membership (metadata.project_id → the
@@ -2679,8 +3151,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # match is often invisible in the title). Title-only matches keep
             # search_snippet=None — the title already shows the hit. Items
             # are AP-side, so this must run inside the conv session.
-            snippets = (
-                _fetch_search_snippets(session, row_ids, search_query) if search_query else {}
+            search_matches = (
+                _fetch_search_matches(session, row_ids, search_query)
+                if search_query and search_scope != "title" and include_search_match
+                else {}
             )
             # Build AP-only entities; metadata fetched separately below.
             ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
@@ -2707,7 +3181,16 @@ class SqlAlchemyConversationStore(ConversationStore):
         else:
             convs = []
         for conv in convs:
-            conv.search_snippet = snippets.get(conv.id)
+            match = search_matches.get(conv.id)
+            if match is None:
+                continue
+            (
+                conv.search_item_id,
+                conv.search_response_id,
+                conv.search_item_created_at,
+                conv.search_snippet,
+                conv.search_match_count,
+            ) = match
         return PagedList(
             data=convs,
             first_id=convs[0].id if convs else None,
@@ -2716,12 +3199,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
 
     @staticmethod
-    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[int]:
+    def _resolve_sort_column(sort_by: str) -> ColumnElement[Any]:
         """
         Map a ``sort_by`` string to the corresponding
         :class:`SqlConversation` column.
 
-        :param sort_by: ``"created_at"`` or ``"updated_at"``.
+        :param sort_by: ``"created_at"``, ``"updated_at"``, ``"archived_at"``,
+            or ``"title"``.
         :returns: The mapped column attribute.
         :raises ValueError: If ``sort_by`` is not a valid column
             name.
@@ -2729,17 +3213,19 @@ class SqlAlchemyConversationStore(ConversationStore):
         allowed = {
             "created_at": SqlConversation.created_at,
             "updated_at": SqlConversation.updated_at,
+            "archived_at": SqlConversation.archived_at,
+            "title": func.lower(func.coalesce(SqlConversation.title, "")),
         }
         col = allowed.get(sort_by)
         if col is None:
             raise ValueError(f"invalid sort_by: {sort_by!r}")
-        return col
+        return cast(ColumnElement[Any], col)
 
     @staticmethod
     def _apply_cursor(
         stmt: Select[tuple[SqlConversation]],
         cursor_id: str,
-        sort_col: QueryableAttribute[int],
+        sort_col: ColumnElement[Any],
         is_desc: bool,
         tiebreaker_col: ColumnElement[Any],
         forward: bool,
@@ -2753,7 +3239,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param stmt: The current SELECT statement to augment.
         :param cursor_id: The conversation ID acting as the page cursor,
             e.g. ``"conv_abc123"``.
-        :param sort_col: Primary sort column (``created_at`` or ``updated_at``).
+        :param sort_col: Primary sort expression.
         :param is_desc: ``True`` for descending, ``False`` for ascending.
         :param tiebreaker_col: Secondary sort column; must match the
             secondary ORDER BY column. See ``_tiebreaker_col`` in
@@ -2913,24 +3399,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ap_changed = True
             if archived is not None:
                 # archived lives on the AP conversations row; a visible state change.
-                # Record the archive time as a label on the false->true transition
-                # only, so a redundant re-archive PATCH can't reset the retention
-                # clock; unarchiving clears it. Same transaction as the flag, and
-                # ahead of the _fetch_labels below, so the response carries it.
-                if archived and not row.archived:
-                    _upsert_labels(
-                        ap_sess, conversation_id, {ARCHIVED_AT_LABEL_KEY: str(now)}, now
-                    )
-                elif not archived:
-                    ap_sess.execute(
-                        delete(SqlConversationLabel).where(
-                            SqlConversationLabel.workspace_id == current_workspace_id(),
-                            SqlConversationLabel.conversation_id == conversation_id,
-                            SqlConversationLabel.key == ARCHIVED_AT_LABEL_KEY,
+                if row.archived != archived:
+                    # Keep the legacy label for older clients while the real column
+                    # gives list filters and sorting a stable indexed timestamp.
+                    if archived:
+                        _upsert_labels(
+                            ap_sess, conversation_id, {ARCHIVED_AT_LABEL_KEY: str(now)}, now
                         )
-                    )
-                row.archived = archived
-                ap_changed = True
+                    else:
+                        ap_sess.execute(
+                            delete(SqlConversationLabel).where(
+                                SqlConversationLabel.workspace_id == current_workspace_id(),
+                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.key == ARCHIVED_AT_LABEL_KEY,
+                            )
+                        )
+                    row.archived = archived
+                    row.archived_at = now if archived else None
+                    ap_changed = True
             if ap_changed:
                 row.updated_at = now
             labels = _fetch_labels(ap_sess, conversation_id)

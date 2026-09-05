@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
@@ -22,7 +22,10 @@ const mocks = vi.hoisted(() => ({
   archive: vi.fn(),
   deleteConversation: vi.fn(),
   markUnread: vi.fn(),
+  showToast: vi.fn(),
 }));
+
+vi.mock("@/components/ui/toast", () => ({ showToast: mocks.showToast }));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
@@ -36,7 +39,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
     useTogglePinnedConversation: () => ({ mutate: mocks.togglePinned }),
     useRenameConversation: () => ({ mutate: mocks.rename, isPending: false }),
     useMoveToProject: () => ({ mutate: mocks.moveToProject }),
-    useArchiveConversation: () => ({ mutate: mocks.archive }),
+    useArchiveConversation: () => ({ mutateAsync: mocks.archive, isPending: false }),
     useStopAndDeleteConversation: () => ({
       mutate: mocks.deleteConversation,
       isPending: false,
@@ -68,6 +71,10 @@ const SECOND_CONVERSATION: Conversation = {
   git_branch: "feature/release-planning",
 };
 
+function LocationProbe() {
+  return <output data-testid="location-probe">{useLocation().pathname}</output>;
+}
+
 function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {}) {
   return (
     <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
@@ -78,6 +85,7 @@ function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0
         onShare={() => {}}
         {...overrides}
       />
+      <LocationProbe />
     </MemoryRouter>
   );
 }
@@ -164,15 +172,16 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.rename).toHaveBeenCalledWith({ id: "conv-1", title: "Roadmap planning" });
   });
 
-  it("runs archive and delete actions for the active session", () => {
+  it("runs archive and delete actions for the active session", async () => {
     const view = renderMenu();
 
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
-    // Just the flag: the optimistic overlay lives in the hook, and the
-    // "view archived" toast fires synchronously (navigating away unmounts this
-    // menu, so a mutate onSuccess callback wouldn't fire).
     expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true });
+    await waitFor(() => {
+      expect(screen.getByTestId("location-probe")).toHaveTextContent("/");
+      expect(mocks.showToast).toHaveBeenCalledOnce();
+    });
 
     view.unmount();
     renderMenu();
@@ -183,6 +192,18 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.deleteConversation).toHaveBeenCalledWith({
       id: "conv-1",
       deleteBranch: true,
+    });
+  });
+
+  it("archives from the distinctly labelled mobile action, then returns home", async () => {
+    mocks.isMobile = true;
+    renderMenu();
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Archive this session" }));
+    expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true });
+    await waitFor(() => {
+      expect(screen.getByTestId("location-probe")).toHaveTextContent("/");
+      expect(mocks.showToast).toHaveBeenCalledOnce();
     });
   });
 
@@ -395,7 +416,7 @@ describe("HeaderConversationMenu", () => {
       "Rename",
       "Mark as unread",
       "Add to project",
-      "Archive",
+      "Archive this session",
       "Delete",
     ]);
   });
@@ -416,7 +437,7 @@ describe("HeaderConversationMenu", () => {
       "Mark as unread",
       "Add to project",
       "Files",
-      "Archive",
+      "Archive this session",
       "Delete",
     ]);
   });

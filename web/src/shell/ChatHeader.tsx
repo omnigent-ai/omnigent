@@ -1,4 +1,5 @@
 import {
+  ArchiveIcon,
   BotIcon,
   EllipsisVerticalIcon,
   FileIcon,
@@ -56,6 +57,8 @@ interface MobileSessionMenuProps {
   executionLogsOpen: boolean;
   /** True while the mobile files drawer is open. */
   filesPanelOpen: boolean;
+  /** True while the mobile archive drawer is open. */
+  archivePanelOpen: boolean;
   /** True while the mobile agents drawer is open. */
   subagentsPanelOpen: boolean;
   /** True while the mobile shells drawer is open. */
@@ -81,6 +84,8 @@ interface MobileSessionMenuProps {
   onOpenFiles: () => void;
   /** Open the mobile files drawer pinned to the changed-files list. */
   onOpenChanges: () => void;
+  /** Open the Archive Library as a full-screen drawer. */
+  onOpenArchive: () => void;
   /** Open the mobile shells drawer. */
   onOpenShells: () => void;
   /** Open the mobile agents drawer. */
@@ -260,6 +265,7 @@ export function ChatHeader({
     (!mobileMenu.panelOpen || mobileMenu.terminalFirst) &&
     !mobileMenu.executionLogsOpen &&
     !mobileMenu.filesPanelOpen &&
+    !mobileMenu.archivePanelOpen &&
     !mobileMenu.subagentsPanelOpen &&
     !mobileMenu.shellsPanelOpen &&
     (hasRailContent || mobileMenu.debugMode) ? (
@@ -273,6 +279,13 @@ export function ChatHeader({
             Files
           </DropdownMenuItem>
         )}
+        <DropdownMenuItem
+          onSelect={mobileMenu.onOpenArchive}
+          className="gap-2.5 px-2.5 py-2 text-ui"
+        >
+          <ArchiveIcon className="size-4" />
+          Archive Library
+        </DropdownMenuItem>
         {showFilesPanel && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenChanges}

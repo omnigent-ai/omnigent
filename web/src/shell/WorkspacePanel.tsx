@@ -1,5 +1,6 @@
 import {
   BotIcon,
+  ArchiveIcon,
   FileIcon,
   FolderTreeIcon,
   FileDiffIcon,
@@ -37,6 +38,7 @@ import {
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
+import { ArchiveLibraryRail } from "@/components/archive/ArchiveLibraryRail";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
@@ -555,6 +557,9 @@ function RailTerminalView({
 interface WorkspacePanelProps {
   /** Active session id — panels read the workspace against it. */
   conversationId: string;
+  /** Project and Host from the active session seed the Archive Library filters. */
+  archiveInitialProject?: string | null;
+  archiveInitialHostId?: string | null;
   /** Current rail width (px), driven by the resize handle. */
   width: number;
   /** Whether the panel is closed/collapsed (hides it from keyboard nav + assistive tech). */
@@ -667,6 +672,8 @@ interface WorkspacePanelProps {
  */
 function WorkspacePanelImpl({
   conversationId,
+  archiveInitialProject,
+  archiveInitialHostId,
   width,
   handleProps,
   inert,
@@ -858,6 +865,16 @@ function WorkspacePanelImpl({
                 </span>
               </TabsTrigger>
             </WorkspaceTabTooltip>
+            <WorkspaceTabTooltip label="Archive Library">
+              <TabsTrigger
+                value="archive"
+                aria-label="Archive Library"
+                className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+              >
+                <ArchiveIcon />
+                <span className="sr-only">Archive Library</span>
+              </TabsTrigger>
+            </WorkspaceTabTooltip>
             {showBrowserTab && (
               <WorkspaceTabTooltip label="Browser">
                 <TabsTrigger
@@ -977,6 +994,12 @@ function WorkspacePanelImpl({
             permissionLevel={permissionLevel}
             onCommentsOpenChange={onCommentsOpenChange}
             sort={filesPanelSort}
+          />
+        ) : rightRailTab === "archive" ? (
+          <ArchiveLibraryRail
+            activeConversationId={conversationId}
+            initialProject={archiveInitialProject}
+            initialHostId={archiveInitialHostId}
           />
         ) : rightRailTab === "browser" && showBrowserTab ? (
           // Embedded browser (Electron only) — BrowserPane self-gates and

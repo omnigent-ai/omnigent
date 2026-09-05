@@ -303,6 +303,12 @@ export interface Session {
    */
   backgroundTasks?: BackgroundTaskInfo[];
   createdAt: number;
+  /** Last persisted session activity timestamp. */
+  updatedAt?: number;
+  /** Stable timestamp of the current transition into the archive. */
+  archivedAt?: number | null;
+  /** Whether the snapshot currently belongs to the archive. */
+  archived?: boolean;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent (the spawn tool seeds this) or a user-supplied string

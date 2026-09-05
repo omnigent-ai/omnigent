@@ -871,12 +871,22 @@ class SqlConversation(ConversationBase):
     archived: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
+    # Timestamp of the most recent transition into archived state. Unlike
+    # updated_at, later title/model/label edits do not move this value.
+    archived_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         # No bare created_at/updated_at indexes: the sessions list is ACL-scoped
         # (id IN (...)) and resolves via the PK; the default sidebar (archived=
         # false, updated_at DESC) is served by the archived_updated index below.
         Index("ix_conversations_archived_updated", "workspace_id", "archived", "updated_at", "id"),
+        Index(
+            "ix_conversations_archived_archived_at",
+            "workspace_id",
+            "archived",
+            "archived_at",
+            "id",
+        ),
         Index(
             "ix_conversations_root_conversation_id",
             "workspace_id",
