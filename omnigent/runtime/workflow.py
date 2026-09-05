@@ -1564,6 +1564,8 @@ def _build_acp_cli_spawn_env(
         "HARNESS_ACP_COMMAND": shlex.join([executable, *row.args]),
         "HARNESS_ACP_NAME": row.label,
     }
+    if row.env_passthrough:
+        env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(row.env_passthrough)
     # Session workspace (selected working folder). ``None`` lets the wrap fall
     # back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
     if cwd is not None:
