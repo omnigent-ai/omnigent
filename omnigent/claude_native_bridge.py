@@ -182,6 +182,17 @@ _SUBMIT_VERIFY_TIMEOUT_S = 10.0
 # (so a slow-but-successful first Enter isn't double-tapped), short
 # enough that a swallowed Enter is retried promptly.
 _SUBMIT_RETRY_INTERVAL_S = 1.0
+# How long to watch for Claude Code's "Unknown command" rejection after a
+# message leading with an unrecognized slash command was submitted
+# unescaped. The rejection prints within ~1s of the swallowed submit and
+# stays in scrollback; a recognized skill just starts its turn and the
+# watch lapses.
+_UNKNOWN_COMMAND_WATCH_TIMEOUT_S = 3.0
+# The line Claude Code prints when it drops input whose leading ``/name``
+# it does not recognize as a built-in, plugin command, or skill. The
+# command name is appended at the call site so a rejection of an older
+# message cannot match a different name.
+_UNKNOWN_COMMAND_REJECTION_PREFIX = "Unknown command: "
 # Claude Code collapses large pastes into this placeholder in the
 # input box instead of rendering the text itself.
 _PASTED_PLACEHOLDER_PREFIX = "[Pasted text"
@@ -3169,6 +3180,15 @@ def inject_user_message(
     the box — re-sending Enter while it hasn't — and raises if the
     message never submits.
 
+    A message leading with an *unknown* slash command passes through
+    unescaped on the guess that it names a skill. When Claude Code
+    rejects that guess ("Unknown command: /<name>") it drops the whole
+    message without calling the model, so after such a submit the pane
+    is watched briefly for the rejection and the message is re-delivered
+    escaped (zero-width prefix) as plain user text — the message is never
+    silently swallowed. A recognized skill prints no rejection and runs
+    exactly as before.
+
     :param bridge_dir: Bridge directory path.
     :param content: User text from the Omnigent web UI. Must be non-empty.
     :param timeout_s: Seconds to wait for each readiness gate
@@ -3192,6 +3212,85 @@ def inject_user_message(
         info["tmux_target"],
         timeout_s=timeout_s,
     )
+    # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
+    # Claude Code TUI treats them as user text instead of invoking a state
+    # that Omnigent cannot drive. Allowed commands (``/clear``,
+    # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
+    injected_text = _escape_unsupported_slash_command(content)
+    needle = _submit_needle(content)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    # A leading ``/name`` that is neither allowed nor known-dropped passes
+    # through on the assumption it is a skill. Claude Code is the only
+    # authority on that guess: when it does NOT recognize the name it
+    # rejects the whole message ("Unknown command: /<name>") without ever
+    # calling the model, silently swallowing the user's text. Baseline the
+    # rejection count before submitting so a stale rejection already in
+    # scrollback (same name, earlier message) cannot masquerade as this
+    # message's rejection.
+    unknown_name = _passthrough_slash_command_name(content)
+    rejection_needle: str | None = None
+    rejection_baseline = 0
+    if unknown_name is not None:
+        rejection_needle = f"{_UNKNOWN_COMMAND_REJECTION_PREFIX}/{unknown_name}"
+        rejection_baseline = _count_unknown_command_rejections(
+            _capture_pane(socket_path, tmux_target), rejection_needle
+        )
+    _paste_and_submit(bridge_dir, socket_path, tmux_target, text=injected_text, needle=needle)
+    if rejection_needle is None:
+        return
+    if not _unknown_command_rejection_appeared(
+        socket_path,
+        tmux_target,
+        needle=rejection_needle,
+        baseline=rejection_baseline,
+    ):
+        # No rejection: Claude Code accepted the command (a real skill or
+        # custom command) and the turn is underway.
+        return
+    # Claude Code dropped the message. Re-deliver it escaped so the text
+    # reaches the model as a regular user message instead of vanishing.
+    _logger.info(
+        "claude-native: Claude Code rejected unknown command /%s; "
+        "re-delivering the message escaped as plain text",
+        unknown_name,
+    )
+    _paste_and_submit(
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        text=_escape_slash_command_text(content),
+        needle=needle,
+    )
+
+
+def _paste_and_submit(
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    *,
+    text: str,
+    needle: str,
+) -> None:
+    r"""
+    Deliver *text* into Claude's input box as one paste plus a verified Enter.
+
+    The delivery core of :func:`inject_user_message` (see its docstring for
+    the full hazard notes): clear any leftover draft, bracketed-paste the
+    payload via ``load-buffer`` + ``paste-buffer -p``, wait for the draft to
+    visibly commit, submit, and verify the draft left the box — re-sending
+    Enter while it verifiably hasn't.
+
+    :param bridge_dir: Bridge directory path (hosts the paste temp file).
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param text: Exact text to paste (already escaped as needed).
+    :param needle: Draft marker from :func:`_submit_needle`; empty skips
+        draft-visibility verification (blind submit).
+    :returns: None.
+    :raises RuntimeError: If a ``tmux`` invocation fails, or if the draft
+        never leaves the input box after repeated submit Enters.
+    """
     # Clear any leftover text in Claude's input field before typing.
     # After Escape-cancel, Claude Code re-populates the prompt area
     # with the previous input for re-editing. Without this clear,
@@ -3199,13 +3298,8 @@ def inject_user_message(
     # "old promptnew prompt" with no separator).
     # Ctrl-A (Home) + Ctrl-K (kill-to-end) is the safest pair —
     # Ctrl-U only clears backwards from cursor.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-a")
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-k")
-    # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
-    # Claude Code TUI treats them as user text instead of invoking a state
-    # that Omnigent cannot drive. Allowed commands (``/clear``,
-    # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
-    injected_text = _escape_unsupported_slash_command(content)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -3217,19 +3311,19 @@ def inject_user_message(
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
-        paste_file.write(_paste_payload_bytes(injected_text + "\n"))
+        paste_file.write(_paste_payload_bytes(text + "\n"))
         paste_path = paste_file.name
     try:
-        _run_tmux(info["socket_path"], "load-buffer", "-b", "omnigent-paste", paste_path)
+        _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
         _run_tmux(
-            info["socket_path"],
+            socket_path,
             "paste-buffer",
             "-p",  # bracketed-paste markers — the TUI keeps newlines as data
             "-d",  # drop the buffer after pasting (no stale copies server-side)
             "-b",
             "omnigent-paste",
             "-t",
-            info["tmux_target"],
+            tmux_target,
         )
     finally:
         with contextlib.suppress(OSError):
@@ -3243,16 +3337,15 @@ def inject_user_message(
     # when the draft never becomes identifiable (e.g. whitespace-only
     # first line, custom statusline containing the glyph), fall through
     # after the timeout and submit blind, matching the old behavior.
-    needle = _submit_needle(content)
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
-        if _draft_in_input_box(_capture_pane(info["socket_path"], info["tmux_target"]), needle):
+        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if not draft_seen:
         # The draft was never observed, so its absence proves nothing —
         # verification would trivially "pass". Submit blind as before.
@@ -3267,16 +3360,79 @@ def inject_user_message(
     last_enter = time.monotonic()
     while time.monotonic() < deadline:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        pane = _capture_pane(info["socket_path"], info["tmux_target"])
+        pane = _capture_pane(socket_path, tmux_target)
         if not _draft_in_input_box(pane, needle):
             return
         if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-            _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = time.monotonic()
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
     )
+
+
+def _count_unknown_command_rejections(pane: str, needle: str) -> int:
+    """
+    Count rejections of one command name in a captured pane.
+
+    Claude Code's TUI reflows the rejection at the pane width — on a
+    narrow pane "Unknown command:" and the ``/<name>`` land on separate
+    lines (a long name can even hard-wrap mid-word) — so the match must
+    ignore line structure and whitespace entirely: composer rows (any line
+    carrying the prompt glyph — the live draft and transcript echoes of
+    submitted messages both render behind it) are dropped so a user
+    message merely *containing* the rejection words cannot count, then the
+    rest is collapsed to a whitespace-free string and searched for the
+    equally collapsed needle.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :param needle: The exact rejection text, e.g.
+        ``"Unknown command: /my-cmd"``.
+    :returns: Number of rejections for this name currently visible.
+    """
+    lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH not in line]
+    collapsed = "".join("".join(line.split()) for line in lines)
+    target = "".join(needle.split())
+    if not target:
+        return 0
+    return collapsed.count(target)
+
+
+def _unknown_command_rejection_appeared(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    needle: str,
+    baseline: int,
+) -> bool:
+    """
+    Watch the pane for a fresh "Unknown command" rejection of *needle*.
+
+    Claude Code prints the rejection within about a second of the submit
+    when it does not recognize the leading slash command; a recognized
+    skill starts its turn and never prints one, so the watch lapses. A
+    fresh rejection means the count of rejection lines rose above
+    *baseline* — a stale rejection of the same name already in scrollback
+    keeps the count at the baseline and does not count. (If new output
+    scrolls a stale occurrence off while the fresh one prints, the count
+    stays flat and the miss degrades to the pre-watch behavior.)
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param needle: The exact rejection text to look for, e.g.
+        ``"Unknown command: /my-cmd"``.
+    :param baseline: Rejection-line count captured before the submit.
+    :returns: ``True`` when a fresh rejection appeared within
+        :data:`_UNKNOWN_COMMAND_WATCH_TIMEOUT_S`.
+    """
+    deadline = time.monotonic() + _UNKNOWN_COMMAND_WATCH_TIMEOUT_S
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _count_unknown_command_rejections(pane, needle) > baseline:
+            return True
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    return False
 
 
 def inject_interrupt(
@@ -6121,6 +6277,31 @@ def _escape_unsupported_slash_command(content: str) -> str:
         # Unknown name: likely a skill; let Claude Code handle it.
         return content
     return _escape_slash_command_text(content)
+
+
+def _passthrough_slash_command_name(content: str) -> str | None:
+    """
+    Name the leading slash command that passes through as a *guessed* skill.
+
+    Returns the command name only when :func:`_escape_unsupported_slash_command`
+    forwards *content* verbatim on the "unknown name: likely a skill"
+    assumption — the one case where Claude Code may reject the whole
+    message ("Unknown command: /<name>") instead of running it. Allowed
+    commands and known-dropped (escaped) commands return ``None``: their
+    outcome is already decided bridge-side.
+
+    :param content: User text from the Omnigent web UI.
+    :returns: The unvalidated command name, e.g. ``"my-skill"``, or
+        ``None`` when no rejection watch is needed.
+    """
+    name = _first_slash_command_name(content)
+    if name is None:
+        return None
+    if name in _CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS:
+        return None
+    if name in _CLAUDE_CLI_DROPPED_COMMANDS:
+        return None
+    return name
 
 
 @dataclass(frozen=True)
