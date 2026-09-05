@@ -815,6 +815,60 @@ aside[aria-label="Workspace"][data-maximized] {
   }
 }
 
+/* Terminal extra-keys row for soft keyboards: fixed 2×7 grid in normal flow
+ * under the xterm mount, terminal-card chrome; columns widen, never wrap. */
+.terminal-extra-keys {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 0.25rem;
+  flex: none;
+  padding: 0.375rem 0.25rem calc(0.25rem + var(--omnigent-safe-bottom));
+  border-top: 1px solid var(--border);
+  background: var(--card);
+  font-family: var(--font-mono);
+  /* Default terminal font size; keys clip rather than wrap in a narrow rail. */
+  font-size: 0.8125rem;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* The mobile drawer and the iOS terminal-first surface already reserve the
+   bottom inset (drawer padding / native bar spacer); don't add it twice. */
+:is([data-ios-native], [data-android-native]) .mobile-panel-drawer .terminal-extra-keys,
+[data-ios-native] .main-terminal-view .terminal-extra-keys {
+  padding-bottom: 0.25rem;
+}
+
+.terminal-extra-keys > button {
+  min-width: 0;
+  min-height: 44px;
+  padding: 0 0.125rem;
+  border: 1px solid transparent;
+  border-radius: 0.375rem;
+  background: var(--muted);
+  color: var(--foreground);
+  white-space: nowrap;
+  overflow: hidden;
+  touch-action: manipulation;
+}
+
+.terminal-extra-keys > button:active {
+  background: var(--accent);
+}
+
+.terminal-extra-keys > button[data-modifier-state="armed"] {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.terminal-extra-keys > button[data-modifier-state="locked"] {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
 /* Liquid glass for the mobile sidebar's two floating chips (Search at the top
  * of the header row, Settings over the bottom of the session list) — the iOS
  * control idiom.

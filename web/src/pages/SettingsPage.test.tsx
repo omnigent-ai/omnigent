@@ -340,6 +340,50 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
   });
 
+  it("renders the Extra keys row select next to Terminal theme, defaulting to Auto", () => {
+    renderPage("/settings/appearance");
+    const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
+    expect(select.value).toBe("auto");
+    expect(screen.getByText("Auto (touch devices)")).toBeInTheDocument();
+    expect(screen.getByText("Always")).toBeInTheDocument();
+    expect(screen.getByText("Never")).toBeInTheDocument();
+    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBeNull();
+
+    // Sits with the terminal controls: after Terminal theme, before Color theme.
+    const terminal = screen.getByText("Terminal theme");
+    const extraKeys = screen.getByText("Extra keys row");
+    const color = screen.getByText("Color theme");
+    expect(
+      terminal.compareDocumentPosition(extraKeys) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      extraKeys.compareDocumentPosition(color) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("persists Always / Never for the extra keys row and clears the key for Auto", () => {
+    renderPage("/settings/appearance");
+    const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
+
+    fireEvent.change(select, { target: { value: "on" } });
+    expect(select.value).toBe("on");
+    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBe("on");
+
+    fireEvent.change(select, { target: { value: "off" } });
+    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBe("off");
+
+    fireEvent.change(select, { target: { value: "auto" } });
+    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBeNull();
+  });
+
+  it("reflects a stored extra keys row preference on mount", () => {
+    localStorage.setItem("omnigent:terminal-extra-keys", "off");
+    renderPage("/settings/appearance");
+    expect((screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement).value).toBe(
+      "off",
+    );
+  });
+
   it("defaults transcripts to Chat and persists a Terminal default", () => {
     renderPage("/settings/appearance");
 
@@ -551,6 +595,9 @@ describe("SettingsPage", () => {
     mocks.theme = "dark";
     fireEvent.click(screen.getByTestId("theme-dark"));
     fireEvent.click(screen.getByTestId("terminal-theme-dark"));
+    fireEvent.change(screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement, {
+      target: { value: "on" },
+    });
     fireEvent.change(screen.getByTestId("color-theme-select") as HTMLSelectElement, {
       target: { value: "github" },
     });
@@ -571,6 +618,7 @@ describe("SettingsPage", () => {
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
+    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBe("on");
     expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
@@ -599,8 +647,13 @@ describe("SettingsPage", () => {
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
     expect(document.documentElement.getAttribute("data-theme")).toBeNull();
 
-    // Terminal theme, transcript view, workspace panel, and harness visibility are restored.
+    // Terminal theme, extra keys row, transcript view, workspace panel, and
+    // harness visibility are restored.
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
+    expect((screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement).value).toBe(
+      "auto",
+    );
+    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBeNull();
     expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
       "aria-checked",
       "true",

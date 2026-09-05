@@ -11,6 +11,7 @@
 import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { useTerminalExtraKeysVisibility } from "@/hooks/useTerminalExtraKeysVisibility";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { copyText } from "@/lib/clipboard";
@@ -32,6 +33,7 @@ import {
   TerminalSession,
   WS_CLOSE_WRONG_REPLICA,
 } from "./TerminalSession";
+import { TerminalExtraKeys, type ExtraKeysTarget } from "./TerminalExtraKeys";
 
 /**
  * Backoff schedule for automatic re-attach after a transport-level
@@ -212,6 +214,20 @@ export function TerminalView({
   const isDarkRef = useRef(isDark);
   isDarkRef.current = isDark;
   const sessionRef = useRef<TerminalSession | null>(null);
+  // Extra-keys row (touch devices). The row keeps its sticky-modifier rewrite
+  // here so a re-dialed session inherits it; the target resolves the live
+  // session at event time, so it is created once and never re-renders the row.
+  const showExtraKeys = useTerminalExtraKeysVisibility(readOnly);
+  const extraKeysTransformRef = useRef<((data: string) => string) | null>(null);
+  const [extraKeysTarget] = useState<ExtraKeysTarget>(() => ({
+    send: (data) => sessionRef.current?.sendInput(data),
+    focus: () => sessionRef.current?.focus(),
+    applicationCursor: () => sessionRef.current?.applicationCursorKeys() ?? false,
+    setTransform: (fn) => {
+      extraKeysTransformRef.current = fn;
+      sessionRef.current?.setInputTransform(fn);
+    },
+  }));
   // Stable refs so callback prop changes never recreate the WS session.
   const onStateChangeRef = useRef(onStateChange);
   onStateChangeRef.current = onStateChange;
@@ -586,6 +602,7 @@ export function TerminalView({
           focusOnConnectRef.current,
         );
         sessionRef.current = terminalSession;
+        terminalSession.setInputTransform(extraKeysTransformRef.current);
         // Relay-connected with a direct URL on offer: negotiate the
         // loopback upgrade in the background. In Chrome this is what
         // raises the Local Network Access prompt; the probe socket
@@ -757,6 +774,9 @@ export function TerminalView({
       <div className="min-h-0 flex-1 overflow-hidden p-1">
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
       </div>
+      {/* Not rendered at all (rather than hidden) off touch devices, so the
+          desktop terminal DOM and refit behaviour are unchanged. */}
+      {showExtraKeys && <TerminalExtraKeys target={extraKeysTarget} />}
       {state.kind !== "connected" && (
         <StatusOverlay
           state={state}

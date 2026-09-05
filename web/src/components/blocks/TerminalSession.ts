@@ -16,6 +16,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import { SHIFT_ENTER_CSI_U } from "./terminalExtraKeysModel";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -185,8 +186,8 @@ export type TerminalActivityListener = () => void;
 /** Listener for user keyboard input sent to the terminal. */
 export type TerminalInputListener = () => void;
 
-/** Kitty Keyboard Protocol / CSI-u encoding for Shift+Enter. */
-export const SHIFT_ENTER_CSI_U = "\x1b[13;2u";
+// The constant lives with the pure key model; re-exported for existing callers.
+export { SHIFT_ENTER_CSI_U };
 
 /**
  * Return the terminal bytes to send for a browser key event.
@@ -510,6 +511,13 @@ export class TerminalSession {
   private focusOnConnect: boolean;
   /** ``performance.now()`` of the last keystroke; gates clipboard writes. */
   private lastUserInputAt = 0;
+  private readonly onInput?: TerminalInputListener;
+  /**
+   * Rewrites each ``onData`` chunk before it is sent (the extra-keys row's
+   * sticky Ctrl/Alt/Shift). ``null`` while no modifier is active, so the idle
+   * hot path is a single null check.
+   */
+  private inputTransform: ((data: string) => string) | null = null;
   /** Guards {@link dispose} so calling it twice is a safe no-op. */
   private disposed = false;
   /**
@@ -554,6 +562,7 @@ export class TerminalSession {
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
     this.onClipboardRequest = onClipboardRequest;
+    this.onInput = onInput;
     // Read the user's code-font preference (Settings → Appearance) at
     // construction; a mid-session change is applied live via setFont(). The
     // xterm.js defaults (15px, no theme) feel out of place inside the app
@@ -670,13 +679,11 @@ export class TerminalSession {
       { signal },
     );
 
+    // One onData chunk = one WS frame = one tmux `send-keys -H`. The harness
+    // tells Esc from Alt+key by that read boundary, so never split, merge or
+    // defer chunks here (no timers): a lone "\x1b" must stay its own frame.
     this.dataDispose = this.term.onData((d) => {
-      onInput?.();
-      // Stamp before the readyState guard so clipboard trust still reflects
-      // local input during a momentary WebSocket hiccup.
-      this.lastUserInputAt = performance.now();
-      if (this.ws.readyState !== WebSocket.OPEN) return;
-      this.ws.send(INPUT_ENCODER.encode(d));
+      this.sendInput(this.inputTransform ? this.inputTransform(d) : d);
     });
 
     this.term.attachCustomKeyEventHandler((e) => {
@@ -687,11 +694,7 @@ export class TerminalSession {
       // the CSI-u sequence once, on keydown.
       if (e.type === "keydown") {
         e.preventDefault();
-        onInput?.();
-        this.lastUserInputAt = performance.now();
-        if (this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(INPUT_ENCODER.encode(payload));
-        }
+        this.sendInput(payload);
       }
       return false;
     });
@@ -699,9 +702,9 @@ export class TerminalSession {
     // Replace xterm's lossy wheel→mouse-report conversion (trackpad deltas
     // are damped and capped to one report per event, which reads as
     // "scrolling doesn't work" on macOS trackpads) with the accumulating
-    // synthesis in wheelReportPayload. term.input routes the reports
-    // through the normal onData path above, so they hit the WS send and
-    // the input-activity bookkeeping like any keystroke.
+    // synthesis in wheelReportPayload. Reports go straight to sendInput —
+    // not through term.input/onData — so a sticky modifier never rewrites
+    // or gets consumed by a mouse report.
     this.term.attachCustomWheelEventHandler((e) => {
       const result = wheelReportPayload(
         e,
@@ -714,7 +717,7 @@ export class TerminalSession {
       );
       this.wheelPartialLines = result.partial;
       if (!result.consume) return true;
-      if (result.data) this.term.input(result.data, true);
+      if (result.data) this.sendInput(result.data);
       e.preventDefault();
       return false;
     });
@@ -747,6 +750,33 @@ export class TerminalSession {
    */
   focus(): void {
     this.term.focus();
+  }
+
+  /**
+   * Install (or clear with ``null``) a rewrite applied to every ``onData``
+   * chunk before it is sent. Used by the extra-keys row to turn a typed
+   * ``c`` into Ctrl-C while a modifier is armed or locked.
+   */
+  setInputTransform(fn: ((data: string) => string) | null): void {
+    this.inputTransform = fn;
+  }
+
+  /**
+   * Send raw input as exactly one binary frame, bypassing the input transform
+   * (row keys and mouse reports must never be rewritten by a sticky modifier).
+   */
+  sendInput(data: string): void {
+    this.onInput?.();
+    // Stamp before the readyState guard so clipboard trust still reflects
+    // local input during a momentary WebSocket hiccup.
+    this.lastUserInputAt = performance.now();
+    if (this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(INPUT_ENCODER.encode(data));
+  }
+
+  /** Whether the program enabled application cursor keys (DECCKM). */
+  applicationCursorKeys(): boolean {
+    return this.term.modes.applicationCursorKeysMode;
   }
 
   /**

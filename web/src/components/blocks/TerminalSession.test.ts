@@ -752,6 +752,131 @@ describe("TerminalSession", () => {
     expect(socket.closed).toBe(false);
   });
 
+  describe("sendInput / setInputTransform (extra-keys row seams)", () => {
+    function binaryFrames(socket: FakeWebSocket): Uint8Array[] {
+      // TextEncoder output comes from Node's realm, so `instanceof Uint8Array`
+      // is false under jsdom; strings are the only other frame type.
+      return socket.sent.filter((m): m is Uint8Array => typeof m !== "string");
+    }
+
+    it("sends a lone Esc as exactly one single-byte frame", () => {
+      // WHY: the harness distinguishes Esc from Alt+key by the read boundary
+      // (one WS frame = one tmux send-keys), so Esc must be its own frame —
+      // never merged with a following key or split.
+      const onInput = vi.fn();
+      const { socket, session } = makeSession(undefined, onInput);
+      socket.open();
+      const before = binaryFrames(socket).length;
+
+      session.sendInput("\x1b");
+
+      const frames = binaryFrames(socket).slice(before);
+      expect(frames).toHaveLength(1);
+      expect(Array.from(frames[0])).toEqual([0x1b]);
+      expect(onInput).toHaveBeenCalledTimes(1);
+      session.dispose();
+    });
+
+    it("sends Alt+x as one two-byte frame", () => {
+      const { socket, session } = makeSession();
+      socket.open();
+      const before = binaryFrames(socket).length;
+
+      session.sendInput("\x1bx");
+
+      const frames = binaryFrames(socket).slice(before);
+      expect(frames).toHaveLength(1);
+      expect(Array.from(frames[0])).toEqual([0x1b, 0x78]);
+      session.dispose();
+    });
+
+    it("applies the input transform to typed data but not to sendInput", () => {
+      // WHY: a sticky Ctrl rewrites the next typed character; row keys go out
+      // via sendInput and must bypass the rewrite (no double-application).
+      const { socket, session } = makeSession();
+      const term = (session as unknown as { term: Terminal }).term;
+      socket.open();
+      const before = binaryFrames(socket).length;
+
+      const transform = vi.fn((d: string) => (d === "c" ? "\x03" : d));
+      session.setInputTransform(transform);
+      term.input("c", true);
+      session.sendInput("c");
+
+      const frames = binaryFrames(socket).slice(before);
+      expect(frames.map((f) => Array.from(f))).toEqual([[0x03], [0x63]]);
+      expect(transform).toHaveBeenCalledTimes(1);
+
+      // Clearing the transform restores the passthrough path.
+      session.setInputTransform(null);
+      term.input("c", true);
+      expect(Array.from(binaryFrames(socket).at(-1)!)).toEqual([0x63]);
+      session.dispose();
+    });
+
+    it("routes wheel mouse reports around the transform so they neither consume nor inherit it", async () => {
+      // Capture the custom wheel handler at construction and drive it
+      // directly — jsdom has no layout, so a dispatched WheelEvent never
+      // reaches xterm's own listener.
+      let wheelHandler: ((e: WheelEvent) => boolean) | undefined;
+      vi.spyOn(Terminal.prototype, "attachCustomWheelEventHandler").mockImplementation(function (
+        this: Terminal,
+        handler,
+      ) {
+        wheelHandler = handler;
+      });
+      const { socket, session } = makeSession();
+      const term = (session as unknown as { term: Terminal }).term;
+      socket.open();
+      // Any-motion mouse tracking with SGR encoding — the mode set a
+      // mouse-aware TUI (Claude Code, OpenCode) uses.
+      await new Promise<void>((resolve) => {
+        term.write("\x1b[?1003h\x1b[?1006h", resolve);
+      });
+      vi.spyOn(
+        session as unknown as { sgrMouseEncodingActive: () => boolean },
+        "sgrMouseEncodingActive",
+      ).mockReturnValue(true);
+      vi.spyOn(
+        session as unknown as { screenMetrics: () => unknown },
+        "screenMetrics",
+      ).mockReturnValue({ left: 0, top: 0, cellWidth: 8, cellHeight: 16, cols: 80, rows: 24 });
+      const transform = vi.fn((d: string) => `T${d}`);
+      session.setInputTransform(transform);
+      const before = binaryFrames(socket).length;
+
+      expect(wheelHandler).toBeDefined();
+      const consumed = wheelHandler!({
+        deltaY: -32,
+        deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+        shiftKey: false,
+        clientX: 4,
+        clientY: 4,
+        preventDefault: () => {},
+      } as unknown as WheelEvent);
+
+      expect(consumed).toBe(false);
+      const frames = binaryFrames(socket).slice(before);
+      expect(frames).toHaveLength(1);
+      // Two whole lines → two raw SGR wheel-up reports, no "T" prefix.
+      expect(new TextDecoder().decode(frames[0])).toBe("\x1b[<64;1;1M\x1b[<64;1;1M");
+      expect(transform).not.toHaveBeenCalled();
+      session.dispose();
+    });
+
+    it("sends nothing while the socket is not open", () => {
+      // WHY: a reconnecting attach must not queue or throw.
+      const onInput = vi.fn();
+      const { socket, session } = makeSession(undefined, onInput);
+
+      session.sendInput("\x1b");
+
+      expect(socket.sent).toHaveLength(0);
+      expect(onInput).toHaveBeenCalledTimes(1);
+      session.dispose();
+    });
+  });
+
   it("observes the container for resize", () => {
     // WHY: layout changes (window resize, font load) must propagate a resize
     // frame, so the session must register a ResizeObserver on its container.
