@@ -4,8 +4,15 @@
  * truth without importing back through `AppShell` (a cycle).
  */
 
-/** The selectable tabs in the right workspace rail, in display order. */
-export type RightRailTab = "files" | "changes" | "github" | "subagents" | "browser";
+/**
+ * The selectable tabs in the right workspace rail, in display order. The
+ * runtime list is the single source of truth (the type derives from it) so
+ * consumers that validate or iterate tabs — e.g. the persisted-state
+ * sanitizer — can never drift behind a newly added tab.
+ */
+export const RIGHT_RAIL_TABS = ["files", "changes", "github", "subagents", "browser"] as const;
+
+export type RightRailTab = (typeof RIGHT_RAIL_TABS)[number];
 
 /**
  * Count/status badge geometry. Fixed height with min-width == height keeps a

@@ -103,6 +103,19 @@ describe("sessionWorkspaceState", () => {
     expect(readSessionWorkspaceState("101")).toEqual({ open: true });
   });
 
+  it("round-trips every selectable rail tab, including tabs added after the store shipped", () => {
+    // The sanitizer validates rightRailTab against a runtime allowlist. If that
+    // list drifts behind the RightRailTab union (as happened when the GitHub
+    // tab shipped), the persisted tab is silently dropped on read and a session
+    // switch can't restore it — the rail falls back to whatever tab was last
+    // shown. Round-trip each selectable tab to pin the allowlist to the union.
+    const tabs = ["files", "changes", "github", "subagents", "browser"] as const;
+    for (const tab of tabs) {
+      writeSessionWorkspaceState(`conv_${tab}`, { rightRailTab: tab });
+      expect(readSessionWorkspaceState(`conv_${tab}`).rightRailTab).toBe(tab);
+    }
+  });
+
   it("drops invalid fields and corrupt storage without throwing", () => {
     // A non-array payload (the pre-array on-disk shape, or any corruption) must
     // read as empty rather than crashing the panel on boot.

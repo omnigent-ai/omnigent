@@ -118,7 +118,7 @@ import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
-import type { RightRailTab } from "./railTabs";
+import { RIGHT_RAIL_TABS, type RightRailTab } from "./railTabs";
 
 /**
  * Top-level layout. The sidebar and right panels are responsive:
@@ -787,14 +787,12 @@ export function AppShell() {
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
   // Keep the selected tab valid. When the current tab disappears — e.g. the
   // files panel turns off — fall back to the first still-visible tab in
-  // display order (Files · Changes · Agents · Browser). Picking
-  // the first available (rather than ping-ponging between two effects) keeps
-  // this convergent even when several tabs vanish at once.
+  // display order. Picking the first available (rather than ping-ponging
+  // between two effects) keeps this convergent even when several tabs vanish
+  // at once.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "changes", "github", "subagents", "browser"] as const).find(
-      (t) => railTabsAvailable[t],
-    );
+    const next = RIGHT_RAIL_TABS.find((t) => railTabsAvailable[t]);
     if (next) setRightRailTab(next);
   }, [railTabsAvailable, rightRailTab]);
 
