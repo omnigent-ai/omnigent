@@ -70,10 +70,11 @@ the latest uploaded TestFlight build and uploads `fastlane/metadata` plus
 ## Other commands
 
 - `bundle exec fastlane tests` — run the `OmnigentTests` unit suite.
-- `bundle exec fastlane screenshots` — build and capture App Store screenshots
-  into `fastlane/screenshots` using the `OmnigentUITests` snapshot target. The
-  lane rebuilds the web UI, starts an isolated local Omnigent server via `uv` on
-  a non-6767 port, and connects the simulator to that server automatically.
+- `bundle exec fastlane screenshots` — build and capture iPhone and iPad App
+  Store screenshots into `fastlane/screenshots` using the `OmnigentUITests`
+  snapshot target. The lane rebuilds the web UI, starts an isolated local
+  Omnigent server via `uv` on a non-6767 port, and connects each simulator to
+  that server automatically.
 - `bundle exec fastlane release` — upload a new binary to App Store Connect
   without submitting it for review. Prefer `prod` after a TestFlight build is
   already uploaded.

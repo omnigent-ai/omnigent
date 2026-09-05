@@ -12,10 +12,13 @@ For AI-written descriptions:
 
 <!--
 Link the issue this PR addresses with a closing keyword so GitHub auto-links it
-(and closes it on merge): e.g. `Closes #123`. One issue per PR. If an older,
-still-open community PR already closes the same issue, the newer one may be
-auto-closed as a duplicate (maintainer PRs are exempt). Use `N/A` for
-chores/docs with no associated issue.
+(and closes it on merge): e.g. `Closes #123`. One issue per PR. Linking also
+gives this PR the issue's priority in the review queue. If an older, still-open
+community PR already closes the same issue, the newer one may be auto-closed as
+a duplicate (maintainer PRs are exempt).
+
+If this is either a `Refactor / chore`, `Docs`, or `Test / CI` *Type of change* 
+below, then no issue is required to be associated. 
 -->
 
 Closes #
@@ -31,11 +34,13 @@ Closes #
 ## Demo
 
 <!--
-Video or images demonstrating the change. Drag-and-drop a screenshot or screen
-recording, or paste a link. Expected for UI / frontend changes (check the
-"UI / frontend change" box below) — show the new behaviour. Optional otherwise;
-use `N/A` for non-visual changes.
+Choose the evidence format that applies. UI / frontend changes require video or
+images. For non-visual changes, put reproducible evidence here or in Test Plan.
 -->
+
+- [ ] Visual demo attached below
+- [ ] Non-visual evidence provided below or in Test Plan
+- [ ] Not applicable — no behavioral change
 
 ## Type of change
 

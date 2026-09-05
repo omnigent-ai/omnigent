@@ -26,10 +26,23 @@ def _isolate_global_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     this file so the developer's real ``~/.omnigent/config.yaml`` (e.g.
     a default provider) cannot hijack the legacy-profile path under test.
 
+    ``HOME`` is redirected there too. An empty omnigent config is not enough
+    isolation on its own: ambient provider detection also reads
+    ``~/.codex/config.toml`` and ``~/.databrickscfg``, so a developer whose
+    codex config pins a Databricks gateway has pi consume that detected
+    cli-config provider and stall in databricks-sdk workspace lookups.
+    ``USERPROFILE`` is the Windows spelling of the same home.
+
     :param monkeypatch: Pytest monkeypatch fixture.
-    :param tmp_path: Temporary directory for the isolated config.
+    :param tmp_path: Temporary directory for the isolated config and home.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_catalog_default_model",
+        lambda provider_name, family, *, context: f"catalog-{provider_name}-{family}-default",
+    )
 
 
 def _make_spec(*, model: str | None = None, profile: str | None = None) -> AgentSpec:
@@ -141,7 +154,7 @@ def test_ucode_state_without_model_falls_back_to_databricks_default(
 
     assert env["HARNESS_PI_GATEWAY"] == "true"
     # The verified routable gateway endpoint name, not pi's own default.
-    assert env["HARNESS_PI_MODEL"] == "databricks-claude-opus-4-8"
+    assert env["HARNESS_PI_MODEL"] == "catalog-databricks-claude-default"
 
 
 def test_ucode_state_with_model_is_not_overridden_by_default(

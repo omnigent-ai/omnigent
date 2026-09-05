@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -14,9 +15,13 @@ from email.message import Message
 from typing import Any
 
 LABEL = "waiting-on-author"
+# The other half of the cycle. `waiting-on-author` alone can only say "stalled";
+# this says "back in the reviewer's queue", which is what a maintainer filters on.
+REVIEW_LABEL = "waiting-for-review"
 WAITING_DAYS = 7
 CANONICAL_REPO = "omnigent-ai/omnigent"
 MAX_CLOSURES_PER_RUN = 30
+REVIEW_EVENTS = {"pull_request_review", "pull_request_review_comment"}
 
 
 def label_names(item: dict[str, Any]) -> list[str]:
@@ -53,13 +58,21 @@ def latest_waiting_label_at(timeline: list[dict[str, Any]]) -> str | None:
 
 
 def close_message(label_applied_at: str) -> str:
+    # Point at `/reopen` (reopen-pr.yml), not GitHub's Reopen button: reopening
+    # needs Triage+ on the base repo, which a fork contributor does not have, so
+    # telling them to reopen it themselves is advice they cannot act on.
     return "\n".join(
         [
             f"Closing this PR because it has been labeled `{LABEL}` for "
             f"{WAITING_DAYS} days without an author reply or new commit.",
             "",
-            f"The label was last applied on {label_applied_at}. If you are "
-            "ready to continue, please reopen this PR or open a new one.",
+            f"The label was last applied on {label_applied_at}. This isn't a "
+            "judgement on the merit of the PR -- it's how we keep the review "
+            "queue readable.",
+            "",
+            "If you're ready to continue, comment `/reopen` and this PR comes "
+            "back, as long as its source branch still exists. If the branch is "
+            "gone, push it again and open a fresh PR referencing this one.",
         ]
     )
 
@@ -102,6 +115,16 @@ class GitHubAPI:
         pull, _ = self.request("GET", f"/repos/{self.repo}/pulls/{pull_number}")
         return pull
 
+    def get_review(self, pull_number: int, review_id: int) -> dict[str, Any]:
+        review, _ = self.request(
+            "GET", f"/repos/{self.repo}/pulls/{pull_number}/reviews/{review_id}"
+        )
+        return review
+
+    def get_review_comment(self, comment_id: int) -> dict[str, Any]:
+        comment, _ = self.request("GET", f"/repos/{self.repo}/pulls/comments/{comment_id}")
+        return comment
+
     def remove_label(self, issue_number: int, label: str) -> bool:
         quoted = urllib.parse.quote(label, safe="")
         try:
@@ -131,6 +154,56 @@ class GitHubAPI:
     def list_commits(self, pull_number: int) -> list[dict[str, Any]]:
         return self.paginated(f"/repos/{self.repo}/pulls/{pull_number}/commits?per_page=100")
 
+    def has_write_access(self, login: str) -> bool:
+        """True when the user can push to the repo, i.e. is a maintainer here.
+
+        Checked via the collaborator permission API rather than the event's
+        `author_association`, which reads CONTRIBUTOR for a maintainer whose org
+        membership is private.
+        """
+        try:
+            data, _ = self.request(
+                "GET", f"/repos/{self.repo}/collaborators/{urllib.parse.quote(login)}/permission"
+            )
+        except urllib.error.HTTPError as error:
+            # 403/404 = not a collaborator, or we cannot see. Fail closed: no
+            # label, so a stranger's comment never moves the PR's state.
+            if error.code in (403, 404):
+                return False
+            raise
+        return (data or {}).get("permission") in {"admin", "write", "maintain"}
+
+    def add_label(self, issue_number: int, label: str) -> None:
+        self.request(
+            "POST", f"/repos/{self.repo}/issues/{issue_number}/labels", {"labels": [label]}
+        )
+
+    def request_review(self, pull_number: int, reviewers: list[str]) -> int:
+        """Re-request each reviewer, returning how many were queued.
+
+        One request per reviewer: GitHub rejects the whole batch when any single
+        login is invalid (a 422 for a non-collaborator), which would silently drop
+        the reviewers who are still valid.
+        """
+        queued = 0
+        for reviewer in reviewers:
+            try:
+                self.request(
+                    "POST",
+                    f"/repos/{self.repo}/pulls/{pull_number}/requested_reviewers",
+                    {"reviewers": [reviewer]},
+                )
+                queued += 1
+            except urllib.error.HTTPError as error:
+                if error.code in (403, 422):
+                    print(
+                        f"::warning::Could not re-request @{reviewer} on "
+                        f"#{pull_number}: {error.code}"
+                    )
+                    continue
+                raise
+        return queued
+
     def close_pull(self, pull_number: int) -> None:
         self.request("PATCH", f"/repos/{self.repo}/pulls/{pull_number}", {"state": "closed"})
 
@@ -156,6 +229,38 @@ def remove_waiting_label(api: GitHubAPI, issue_number: int, reason: str) -> bool
     else:
         print(f"#{issue_number} no longer has {LABEL}; nothing to remove.")
     return removed
+
+
+def hand_off_to_reviewer(api: GitHubAPI, pull: dict[str, Any], reason: str) -> None:
+    """Move a PR from the author's court back into the reviewer's.
+
+    The label is what maintainers filter on; the review request is what actually
+    surfaces the PR in their GitHub review queue. GitHub clears the request when a
+    review is submitted, so it has to be re-made here or the reply is invisible.
+    """
+    number = pull["number"]
+    labels = label_names(pull)
+    if REVIEW_LABEL not in labels:
+        api.add_label(number, REVIEW_LABEL)
+        print(f"Added {REVIEW_LABEL} to #{number}: {reason}")
+
+    author = (pull.get("user") or {}).get("login", "").lower()
+    # Assignees are the durable owner record; requested_reviewers empties out on
+    # every submitted review. Never re-request the author's own review.
+    owners = [
+        login
+        for login in (
+            (person or {}).get("login")
+            for person in (pull.get("assignees") or []) + (pull.get("requested_reviewers") or [])
+        )
+        if login and login.lower() != author
+    ]
+    queued = api.request_review(number, sorted(set(owners))) if owners else 0
+    if not queued:
+        # The label says "ready for a reviewer", so an empty queue makes it a lie
+        # to whoever filters on it. Auto-assign normally populates assignees, so
+        # this means something upstream skipped the PR.
+        print(f"::warning::#{number} is {REVIEW_LABEL} with no reviewer queued")
 
 
 def user_login(item: dict[str, Any]) -> str | None:
@@ -198,6 +303,106 @@ def author_activity_since_label(api: GitHubAPI, pull: dict[str, Any], since: str
     return None
 
 
+def clear_review_label_on_waiting(payload: dict[str, Any], api: GitHubAPI) -> bool:
+    """The two labels are mutually exclusive: applying one drops the other.
+
+    Fires when a maintainer (or the review-submitted path) sets waiting-on-author,
+    so a PR never advertises both states at once.
+    """
+    label = (payload.get("label") or {}).get("name")
+    pull = payload.get("pull_request") or {}
+    if label != LABEL or not pull:
+        return False
+    if REVIEW_LABEL not in label_names(pull):
+        return False
+    removed = api.remove_label(pull["number"], REVIEW_LABEL)
+    if removed:
+        print(f"Removed {REVIEW_LABEL} from #{pull['number']}: now {LABEL}")
+    return removed
+
+
+# A comment whose first non-space token is a slash command (`/review`, `/reopen`,
+# `/merge`, ...). These drive automation rather than ask the author for anything,
+# so they must not flip a PR back to waiting-on-author.
+SLASH_COMMAND = re.compile(r"^[ \t]*/[a-z][\w-]*", re.I)
+
+
+def is_slash_command(body: str | None) -> bool:
+    return bool(SLASH_COMMAND.match(body or ""))
+
+
+def apply_waiting_on_maintainer_activity(
+    event_name: str, payload: dict[str, Any], api: GitHubAPI
+) -> bool:
+    """Put a PR back in the author's court when a maintainer engages with it.
+
+    Any non-approving review, review-thread comment, or PR comment from someone
+    with write access means the author has something to act on -- not just a
+    formal "request changes". Deliberately excluded: approvals (nothing is owed),
+    slash commands (they drive automation), bots, and the author themselves.
+    """
+    if event_name == "issue_comment":
+        if "pull_request" not in payload.get("issue", {}):
+            return False
+        pull_number = payload["issue"]["number"]
+        comment = payload.get("comment") or {}
+        actor = (comment.get("user") or {}).get("login")
+        if is_slash_command(comment.get("body")):
+            print(f"#{pull_number}: slash command, not a request to the author.")
+            return False
+        reason = "a maintainer commented"
+    elif event_name == "pull_request_review_comment":
+        if not payload.get("pull_request"):
+            return False
+        pull_number = payload["pull_request"]["number"]
+        comment = payload.get("comment") or {}
+        actor = (comment.get("user") or {}).get("login")
+        if is_slash_command(comment.get("body")):
+            return False
+        reason = "a maintainer left a review comment"
+    elif event_name == "pull_request_review":
+        if not payload.get("pull_request"):
+            return False
+        pull_number = payload["pull_request"]["number"]
+        review = payload.get("review") or {}
+        actor = (review.get("user") or {}).get("login")
+        review_state = (review.get("state") or "").lower()
+        # An approval asks nothing of the author; it means the PR is ready.
+        if review_state == "approved":
+            print(f"#{pull_number}: approving review, leaving the label alone.")
+            return False
+        if review_state not in {"commented", "changes_requested"}:
+            print(f"#{pull_number}: {review_state or 'unknown'} review, leaving the label alone.")
+            return False
+        if is_slash_command(review.get("body")):
+            return False
+        reason = "a maintainer reviewed"
+    else:
+        return False
+
+    if not actor or actor.endswith("[bot]"):
+        return False
+
+    pull = api.get_pull(pull_number)
+    if pull.get("state") != "open":
+        return False
+    author = (pull.get("user") or {}).get("login", "")
+    if actor.lower() == author.lower():
+        return False
+    if LABEL in label_names(pull):
+        return False
+    if not api.has_write_access(actor):
+        print(f"#{pull_number}: @{actor} has no write access; not a maintainer signal.")
+        return False
+
+    api.add_label(pull_number, LABEL)
+    print(f"Added {LABEL} to #{pull_number}: {reason} (@{actor})")
+    if REVIEW_LABEL in label_names(pull):
+        if api.remove_label(pull_number, REVIEW_LABEL):
+            print(f"Removed {REVIEW_LABEL} from #{pull_number}: now {LABEL}")
+    return True
+
+
 def clear_on_author_activity(event_name: str, payload: dict[str, Any], api: GitHubAPI) -> bool:
     pull_number: int | None = None
     actor: str | None = None
@@ -205,6 +410,8 @@ def clear_on_author_activity(event_name: str, payload: dict[str, Any], api: GitH
     author_activity = False
 
     if event_name in {"pull_request", "pull_request_target"} and payload.get("pull_request"):
+        if payload.get("action") == "labeled":
+            return clear_review_label_on_waiting(payload, api)
         if payload.get("action") != "synchronize":
             return False
         pull_number = payload["pull_request"]["number"]
@@ -237,7 +444,10 @@ def clear_on_author_activity(event_name: str, payload: dict[str, Any], api: GitH
 
     if not author_activity:
         return False
-    return remove_waiting_label(api, pull_number, reason)
+    removed = remove_waiting_label(api, pull_number, reason)
+    if removed:
+        hand_off_to_reviewer(api, pull, reason)
+    return removed
 
 
 def close_stale_waiting_prs(api: GitHubAPI, now: datetime | None = None) -> int:
@@ -261,7 +471,8 @@ def close_stale_waiting_prs(api: GitHubAPI, now: datetime | None = None) -> int:
             pull = api.get_pull(issue["number"])
             reason = author_activity_since_label(api, pull, label_applied_at)
             if reason:
-                remove_waiting_label(api, issue["number"], reason)
+                if remove_waiting_label(api, issue["number"], reason):
+                    hand_off_to_reviewer(api, pull, reason)
                 continue
 
             if days_between(label_applied_at, now) < WAITING_DAYS:
@@ -275,6 +486,42 @@ def close_stale_waiting_prs(api: GitHubAPI, now: datetime | None = None) -> int:
             print(f"::warning::Could not close #{issue['number']}: {error}")
     print(f"Closed {closed} PR(s) labeled {LABEL}.")
     return closed
+
+
+def relay_integer(record: dict[str, Any], field: str) -> int:
+    value = record.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"Relay field {field!r} must be a positive integer")
+    return value
+
+
+def hydrate_relay_event(
+    record: dict[str, Any], api: GitHubAPI, repo: str, expected_event: str
+) -> tuple[str, dict[str, Any]]:
+    event_name = record.get("event_name")
+    if event_name not in REVIEW_EVENTS:
+        raise ValueError(f"Unsupported relayed event: {event_name!r}")
+    if event_name != expected_event:
+        raise ValueError(
+            f"Relayed event {event_name!r} does not match workflow event {expected_event!r}"
+        )
+
+    pull_number = relay_integer(record, "pull_number")
+    activity_id = relay_integer(record, "activity_id")
+    pull = api.get_pull(pull_number)
+    base_repo = ((pull.get("base") or {}).get("repo") or {}).get("full_name") or ""
+    if base_repo.lower() != repo.lower():
+        raise ValueError(f"Relayed PR #{pull_number} targets {base_repo!r}, not {repo!r}")
+
+    if event_name == "pull_request_review":
+        review = api.get_review(pull_number, activity_id)
+        return event_name, {"pull_request": pull, "review": review}
+
+    comment = api.get_review_comment(activity_id)
+    expected_url = f"https://api.github.com/repos/{repo}/pulls/{pull_number}"
+    if comment.get("pull_request_url") != expected_url:
+        raise ValueError(f"Review comment {activity_id} does not belong to PR #{pull_number}")
+    return event_name, {"pull_request": pull, "comment": comment}
 
 
 def run(
@@ -292,11 +539,14 @@ def run(
         close_stale_waiting_prs(api, now=now)
         return
 
-    clear_on_author_activity(event_name, payload, api)
+    # Author activity wins: the same event cannot be both, and clearing the label
+    # is the cheaper check (it exits immediately unless the label is set).
+    if clear_on_author_activity(event_name, payload, api):
+        return
+    apply_waiting_on_maintainer_activity(event_name, payload, api)
 
 
-def load_event_payload() -> dict[str, Any]:
-    path = os.environ.get("GITHUB_EVENT_PATH")
+def load_json(path: str | None) -> dict[str, Any]:
     if not path:
         return {}
     with open(path, encoding="utf-8") as handle:
@@ -309,8 +559,15 @@ def main() -> int:
     if not token:
         print("GITHUB_TOKEN is required", file=sys.stderr)
         return 1
-    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
-    run(event_name, load_event_payload(), GitHubAPI(token, repo), repo)
+    api = GitHubAPI(token, repo)
+    relay_path = os.environ.get("WAITING_ON_AUTHOR_RELAY_PATH")
+    if relay_path:
+        expected_event = os.environ.get("WAITING_ON_AUTHOR_RELAY_EVENT", "")
+        event_name, payload = hydrate_relay_event(load_json(relay_path), api, repo, expected_event)
+    else:
+        event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+        payload = load_json(os.environ.get("GITHUB_EVENT_PATH"))
+    run(event_name, payload, api, repo)
     return 0
 
 

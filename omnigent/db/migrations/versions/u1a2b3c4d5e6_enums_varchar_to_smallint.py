@@ -30,6 +30,8 @@ migrations/env.py) rebuilds the SQLite table so the constraint swap lands.
 
 from __future__ import annotations
 
+from typing import Literal
+
 import sqlalchemy as sa
 from alembic import op
 
@@ -113,7 +115,7 @@ def _swap_to_int(
     tmp = f"{column}_int"
     op.add_column(table, sa.Column(tmp, sa.SmallInteger(), nullable=True))
     op.execute(f"UPDATE {table} SET {tmp} = {_case_sql(column, mapping)}")
-    recreate = "always" if _is_sqlite() else "auto"
+    recreate: Literal["always", "auto"] = "always" if _is_sqlite() else "auto"
     with op.batch_alter_table(table, recreate=recreate) as batch_op:
         if check_name is not None:
             batch_op.drop_constraint(check_name, type_="check")
@@ -141,7 +143,7 @@ def _swap_to_string(
     tmp = f"{column}_str"
     op.add_column(table, sa.Column(tmp, sa.String(length=length), nullable=True))
     op.execute(f"UPDATE {table} SET {tmp} = {_case_sql_reverse(column, mapping)}")
-    recreate = "always" if _is_sqlite() else "auto"
+    recreate: Literal["always", "auto"] = "always" if _is_sqlite() else "auto"
     with op.batch_alter_table(table, recreate=recreate) as batch_op:
         batch_op.drop_constraint(check_name or f"ck_{table}_{column}", type_="check")
         batch_op.drop_column(column)

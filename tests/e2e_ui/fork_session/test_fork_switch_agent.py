@@ -128,7 +128,7 @@ def test_fork_switch_agent_carries_history(
     # One marked turn so the fork has content AND an assistant bubble to
     # anchor the "Fork from here" action. Forking from the LAST response is
     # a full clone (no truncation), isolating the agent-switch behavior.
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill(f"Reply with one short word. Marker: {_MARKER}")
     page.get_by_role("button", name="Send", exact=True).click()
@@ -225,7 +225,7 @@ def test_fork_into_pi_labels_model_picker_pi(
     page.goto(f"{base_url}/c/{session_id}")
 
     # One turn so the fork has an assistant bubble to anchor "Fork from here".
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill(f"Reply with one short word. Marker: {_MARKER}")
     page.get_by_role("button", name="Send", exact=True).click()

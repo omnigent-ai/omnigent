@@ -10,7 +10,7 @@ import { PauseCircleIcon } from "lucide-react";
  */
 export function RunnerAsleepHint() {
   return (
-    <div className="flex flex-col items-start gap-1 px-2 py-1.5 text-muted-foreground text-xs">
+    <div className="flex flex-col items-start gap-1 px-2 py-1.5 text-muted-foreground text-sm">
       <span className="flex items-center gap-1.5 font-medium text-foreground">
         <PauseCircleIcon className="size-3.5 shrink-0" />
         Agent is asleep

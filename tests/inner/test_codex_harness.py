@@ -488,7 +488,7 @@ def test_bundle_dir_and_agent_name_env_vars_thread_through(
     executor.
 
     The bundle dir lets the executor source bundled skills from
-    ``<bundle>/skills/<name>/`` in addition to host-installed
+    ``<bundle>/skills/<dir>/`` in addition to host-installed
     ``~/.codex/skills/``.
     """
     from pathlib import Path

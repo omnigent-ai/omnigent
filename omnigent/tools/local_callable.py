@@ -44,7 +44,7 @@ import json
 import logging
 from typing import Any
 
-from omnigent.spec.types import LocalToolInfo
+from omnigent.spec.types import LocalToolInfo, ToolRuntime
 from omnigent.tools.base import Tool, ToolContext
 
 _logger = logging.getLogger(__name__)
@@ -73,8 +73,11 @@ class LocalCallableTool(Tool):
     """
 
     def __init__(self, info: LocalToolInfo) -> None:
+        if info.path is None:
+            raise ValueError(f"local-callable tool {info.name!r} has no server-side path")
         self._info = info
         self._name = info.name
+        self._path = info.path
         self._callable: Any = None
         self._description: str = ""
         self._parameters: dict[str, Any] = info.parameters or {
@@ -101,7 +104,7 @@ class LocalCallableTool(Tool):
         :returns: Dotted import path, e.g.
             ``"examples._shared.tool_functions.calculate"``.
         """
-        return self._info.path
+        return self._path
 
     @classmethod
     def description(cls) -> str:
@@ -193,7 +196,7 @@ class LocalCallableTool(Tool):
         """
         if self._callable is not None:
             return
-        path = self._info.path
+        path = self._path
         module_name, _, attr_name = path.rpartition(".")
         if not module_name or not attr_name:
             raise ImportError(
@@ -241,16 +244,11 @@ def load_local_callable_tools(
         entry. Empty list when none are present (which is the
         case for native Omnigent specs).
     """
-    from omnigent.spec.types import ToolRuntime
-
     result: list[LocalCallableTool] = []
     for info in local_tools:
         if info.language != _OMNIGENT_CALLABLE_LANGUAGE:
             continue
-        # UC function tools have path=None and are dispatched by
-        # the runner via the SQL Statement Execution API — they
-        # are not in-process callables and must not be wrapped.
-        if info.runtime == ToolRuntime.UC_FUNCTION:
+        if info.runtime != ToolRuntime.SERVER:
             continue
         result.append(LocalCallableTool(info))
     return result

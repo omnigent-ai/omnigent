@@ -312,7 +312,12 @@ def resolve_matching_text(conversation_id: str, text: str) -> MatchedDrain:
         match_index: int | None = None
         for index, (_pending_id, entry) in enumerate(ordered):
             entry_text = _normalize_text(_content_text(entry.content))
-            if entry_text and (needle == entry_text or needle.endswith(entry_text)):
+            # Exact match only: an unanchored suffix check ("noyes".endswith("yes"))
+            # can pick an unrelated queued entry whenever its text happens to trail
+            # a different accepted prompt, handing that entry's file attachments to
+            # the wrong persisted message. A miss falls through to "no match" below,
+            # the same fail-safe path already used for terminal-typed text.
+            if entry_text and needle == entry_text:
                 match_index = index
                 break
         if match_index is None:
@@ -327,6 +332,21 @@ def resolve_matching_text(conversation_id: str, text: str) -> MatchedDrain:
             matched=_drained_input(matched_entry),
             skipped=[_drained_input(entry) for _pending_id, entry in skipped_entries],
         )
+
+
+def has_pending(conversation_id: str) -> bool:
+    """
+    Report whether a session still holds an un-consumed message.
+
+    Cheap check for the session list: while a message waits for its runner
+    to boot, the session is working even though no turn has started yet.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :returns: ``True`` iff at least one non-stale pending entry exists.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        return bool(_pending.get(conversation_id))
 
 
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:

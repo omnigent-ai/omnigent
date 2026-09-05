@@ -61,8 +61,8 @@ fi
 # The gate runs under GitHub Actions, where the plugin rewrites a mismatching
 # baseline IN PLACE under snapshots/ (and creates a missing one there); passing
 # baselines are left untouched. The artifact carries that whole snapshots/ tree,
-# so just restore it over the committed one -- git add then stages exactly the
-# baselines that drifted. (Reconstructing paths from snapshot_failures/ instead
+# so replace the committed tree with it; this also removes stale baselines for
+# deleted or renamed stories. (Reconstructing paths from snapshot_failures/ instead
 # is fragile: that tree keys subdirs by <test>[browser][platform], not the
 # baseline's <test>, so it would write a parallel, never-read duplicate.)
 src_root=$(find "$TMP" -type d -name snapshots | head -1)
@@ -70,16 +70,17 @@ if [ -z "$src_root" ]; then
   echo "error: artifact has no snapshots/ tree -- nothing to restore." >&2
   exit 1
 fi
-cp -R "$src_root/." "$SNAP_ROOT/"
+rm -rf "$SNAP_ROOT"
+cp -R "$src_root" "$SNAP_ROOT"
 
-if git diff --quiet -- "$SNAP_ROOT"; then
+if [ -z "$(git status --porcelain -- "$SNAP_ROOT")" ]; then
   echo "No baseline drift in the artifact -- the gate render already matches the committed baselines. Nothing to update." >&2
   exit 0
 fi
 
 echo
 echo "Updated baseline(s) from the gate render:"
-git --no-pager diff --stat -- "$SNAP_ROOT" || true
+git status --short -- "$SNAP_ROOT"
 echo
 echo "Next: review the image(s), then commit + push:"
 echo "  git add \"$SNAP_ROOT\" && git commit -m 'test(ui-snapshot): update visual baselines' && git push"

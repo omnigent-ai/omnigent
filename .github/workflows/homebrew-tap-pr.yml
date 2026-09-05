@@ -14,13 +14,18 @@ name: Homebrew tap PR
 # We trigger on `release: published` (not the tag push) for the same reason as
 # publish-changelog.yml: that's the moment the version is installable from PyPI
 # — the secure-release repo publishes to PyPI before the GitHub Release goes
-# public (see RELEASING.md), so the sdist we pin the formula to actually exists.
+# public (see the maintainer release runbook), so the sdist we pin the formula to actually exists.
 #
 # Cross-repo writes can't use the workflow's own GITHUB_TOKEN (scoped to this
 # repo), so we mint a short-lived token from the omnigent-ci GitHub App scoped to
 # homebrew-tap — the same App used by publish-changelog.yml / doc-sync.yml. One
 # prerequisite: the omnigent-ci App must be installed on omnigent-ai/homebrew-tap
 # with contents:write + pull-requests:write.
+#
+# This is the only workflow that touches the tap. It replaced update-homebrew.yml,
+# which regenerated resources with `brew update-python-resources` and asserted on
+# hand-maintained stanzas this template no longer emits, so it failed on every
+# run while racing this workflow on the same `release: published` event.
 
 on:
   release:
@@ -86,8 +91,29 @@ jobs:
       TAP_REPO: ${{ github.repository_owner }}/homebrew-tap
       BRANCH: auto/formula/${{ needs.resolve.outputs.tag }}
     steps:
+      - name: Require admin/maintain role (manual dispatches)
+        # The release-event path is already gated by the tag checks above; only a
+        # human dispatch needs an actor-role check, since workflow_dispatch is
+        # runnable by anyone with write access.
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          role="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR}/permission" --jq .role_name)"
+          case "$role" in
+            admin|maintain)
+              echo "Dispatcher ${ACTOR} has role ${role} — authorized." ;;
+            *)
+              echo "::error::Release workflows require the admin or maintain role (dispatcher ${ACTOR} has '${role}')."
+              exit 1 ;;
+          esac
+
       - name: Checkout omnigent (template + generator)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0

@@ -3,9 +3,11 @@ name: Discord watch rotation - maintain schedule
 # Monthly housekeeping for rotation_schedule.json: prune elapsed dates and
 # extend the horizon ~3 months out. Opens a PR rather than pushing to main, so
 # the change is reviewable and no write to a protected branch is needed.
+# Schedule paused: runs only on manual dispatch for now.
+# To resume, restore the `schedule:` block below.
+#   schedule:
+#     - cron: "0 8 1 * *" # 08:00 UTC on the 1st of each month
 on:
-  schedule:
-    - cron: "0 8 1 * *" # 08:00 UTC on the 1st of each month
   workflow_dispatch: {} # manual "Run workflow" button
 
 # Needs to push a branch and open a PR; no other write scope.

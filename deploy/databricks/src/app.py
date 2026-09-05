@@ -12,9 +12,50 @@ import sys
 import threading
 import time
 import traceback
+from pathlib import Path as _Path
+
+from web_ui_archive import extract_web_ui_archive as _extract_web_ui_archive
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
 logger = logging.getLogger("omnigent-app")
+
+# ── Web UI location ────────────────────────────────────────
+#
+# The deploy ships the SPA outside the wheel as one archive beside this entry
+# point. Extract it before importing omnigent.server.app, which binds the
+# static-file directory at module import time. A loose directory is supported
+# for compatibility with deployments made by the earlier packaging scheme.
+
+
+def _prepare_web_ui() -> None:
+    import shutil as _shutil
+    import tarfile as _tarfile
+    import tempfile as _tempfile
+
+    here = _Path(__file__).resolve().parent
+    archive = here / "web-ui.tar.gz"
+    loose = here / "web-ui"
+    if loose.is_dir() and not archive.is_file():
+        os.environ.setdefault("OMNIGENT_WEB_UI_DIST", str(loose))
+        logger.info("Web UI: serving legacy loose assets from %s", loose)
+        return
+    if not archive.is_file():
+        logger.info("Web UI: no archive at %s; using packaged assets", archive)
+        return
+
+    extracted = _Path(_tempfile.mkdtemp(prefix="omnigent-web-ui-"))
+    try:
+        _extract_web_ui_archive(archive, extracted)
+    except (OSError, ValueError, _tarfile.TarError) as exc:
+        _shutil.rmtree(extracted, ignore_errors=True)
+        logger.warning("Web UI: failed to extract %s: %s; using packaged assets", archive, exc)
+        return
+
+    os.environ.setdefault("OMNIGENT_WEB_UI_DIST", str(extracted))
+    logger.info("Web UI: serving extracted assets from %s", extracted)
+
+
+_prepare_web_ui()
 
 # ── Lakebase token cache ──────────────────────────────────
 #
@@ -120,7 +161,6 @@ try:
     # ── Start omnigent ─────────────────────────────────────
 
     import tempfile
-    from pathlib import Path
 
     import uvicorn
 
@@ -129,7 +169,7 @@ try:
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.app import create_app
-    from omnigent.server.auth import create_auth_provider
+    from omnigent.server.auth import create_auth_provider, warn_if_single_user_exposed
 
     # OTel: the Databricks Apps platform auto-injects
     # OTEL_EXPORTER_OTLP_ENDPOINT when `telemetry_export_destinations`
@@ -153,13 +193,16 @@ try:
         SqlAlchemyPermissionStore,
     )
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.project_store.sqlalchemy_store import (
+        SqlAlchemyProjectStore,
+    )
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
 
     DB_URI = f"postgresql+psycopg://{PGUSER}@{PGHOST}:{PGPORT}/{PGDATABASE}"
     ARTIFACT_URI = f"dbfs:{VOLUME_PATH}"
-    CACHE_DIR = Path(tempfile.mkdtemp(prefix="ap_cache_"))
+    CACHE_DIR = _Path(tempfile.mkdtemp(prefix="ap_cache_"))
 
     logger.info("DB_URI: %s", DB_URI[:80])
     logger.info("ARTIFACT_URI: %s", ARTIFACT_URI)
@@ -167,13 +210,23 @@ try:
     # The app SP owns the tables — run any pending Alembic upgrades
     # before the stores boot, since the verify-schema check refuses
     # to start a stale DB. Idempotent: a no-op when the DB is at head.
-    from omnigent.db.utils import _run_migrations as _run_alembic_upgrade
+    #
+    # Lakebase endpoints suspend after an idle window (default 24h). A
+    # boot that lands while the endpoint is cold/resuming raises a
+    # transient OperationalError, which the module-level catch-all below
+    # would turn into a fatal exit — the container then crash-loops and
+    # the app "doesn't load" until a manual redeploy happens to hit a
+    # warm endpoint. run_migrations_with_retry retries the connect+migrate
+    # with linear backoff so a cold start self-heals; a genuinely broken
+    # DB still fails after the attempts are exhausted. Both knobs are
+    # env-overridable (defaults: 8 attempts, 3s×attempt, ~84s budget).
+    from omnigent.db.utils import run_migrations_with_retry
 
-    _migration_engine = sqlalchemy.create_engine(DB_URI)
-    try:
-        _run_alembic_upgrade(_migration_engine, DB_URI)
-    finally:
-        _migration_engine.dispose()
+    run_migrations_with_retry(
+        DB_URI,
+        max_attempts=int(os.environ.get("AP_MIGRATE_MAX_ATTEMPTS", "8")),
+        backoff_seconds=float(os.environ.get("AP_MIGRATE_BACKOFF_SECONDS", "3")),
+    )
 
     agent_store = SqlAlchemyAgentStore(DB_URI)
     file_store = SqlAlchemyFileStore(DB_URI)
@@ -182,6 +235,7 @@ try:
     file_comment_store = SqlAlchemyCommentStore(DB_URI)
     permission_store = SqlAlchemyPermissionStore(DB_URI)
     policy_store = SqlAlchemyPolicyStore(DB_URI)
+    project_store = SqlAlchemyProjectStore(DB_URI)
     host_store = HostStore(DB_URI)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(DB_URI)
 
@@ -205,6 +259,12 @@ try:
     # OMNIGENT_AUTH_ENABLED in the deploy env (an explicit
     # provider always wins over the enable switch).
     os.environ.setdefault("OMNIGENT_AUTH_PROVIDER", "header")
+
+    # A single-user marker here would serve un-proxied requests as "local".
+    _exposure = warn_if_single_user_exposed("0.0.0.0")
+    if _exposure:
+        logger.warning("%s", _exposure)
+
     auth_provider = create_auth_provider()
     app = create_app(
         agent_store=agent_store,
@@ -215,6 +275,7 @@ try:
         comment_store=file_comment_store,
         permission_store=permission_store,
         policy_store=policy_store,
+        project_store=project_store,
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,

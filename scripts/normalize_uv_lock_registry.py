@@ -1,4 +1,4 @@
-"""Normalize the package index in ``uv.lock`` to the public PyPI URL.
+"""Normalize package indexes in ``uv.lock`` to public PyPI.
 
 Local ``uv`` runs resolve against whatever index is configured on the
 developer's machine (e.g. the Databricks PyPI proxy via ``UV_INDEX_URL``
@@ -9,7 +9,7 @@ PyPI (``https://pypi.org/simple``) so the lock is reproducible for
 contributors who don't have the proxy — CI already pins
 ``UV_INDEX_URL: https://pypi.org/simple`` for the same reason.
 
-This is a pre-commit *fixer*: it rewrites the registry URL in place and
+This is a pre-commit *fixer*: it rewrites the lockfile in place and
 exits non-zero when it changed anything, so the commit aborts and the
 developer re-stages the normalized lockfile (mirroring
 ``end-of-file-fixer`` and friends). Only ``registry`` sources are
@@ -54,8 +54,8 @@ _DIRECT_URL_RE = re.compile(
 )
 
 
-def non_canonical_registries(text: str) -> list[str]:
-    """Return the registry URLs and direct-URL hosts in *text* that are not canonical.
+def non_canonical_entries(text: str) -> list[str]:
+    """Return the non-canonical registry URLs and direct-URL hosts in *text*.
 
     :param text: Full contents of a ``uv.lock`` file.
     :returns: Each non-canonical URL, in order, with duplicates preserved.
@@ -70,15 +70,13 @@ def non_canonical_registries(text: str) -> list[str]:
 
 
 def normalize_text(text: str) -> str:
-    """Return *text* with every registry and direct wheel/sdist URL rewritten to canonical hosts.
+    """Return *text* with registry and distribution URLs rewritten to canonical hosts.
 
     :param text: Full contents of a ``uv.lock`` file.
     :returns: The normalized text.
     """
-    return _DIRECT_URL_RE.sub(
-        rf"\g<1>{_CANONICAL_FILES_HOST}/packages/\g<3>",
-        _REGISTRY_RE.sub(rf"\g<1>{_CANONICAL_INDEX}\g<2>", text),
-    )
+    text = _REGISTRY_RE.sub(rf"\g<1>{_CANONICAL_INDEX}\g<2>", text)
+    return _DIRECT_URL_RE.sub(rf"\g<1>{_CANONICAL_FILES_HOST}/packages/\g<3>", text)
 
 
 def main(argv: list[str]) -> int:
@@ -89,7 +87,7 @@ def main(argv: list[str]) -> int:
     :returns: In fix mode, ``1`` when a file was modified (so the commit
         aborts and the change is re-staged) else ``0``. In ``--check``
         mode, ``1`` when any file is not already canonical (printing the
-        offending URLs) else ``0``; no file is written.
+        offenders) else ``0``; no file is written.
     """
     check = "--check" in argv
     files = [a for a in argv if a != "--check"]
@@ -97,13 +95,13 @@ def main(argv: list[str]) -> int:
     if check:
         ok = True
         for name in files:
-            offenders = non_canonical_registries(Path(name).read_text())
+            offenders = non_canonical_entries(Path(name).read_text())
             if offenders:
                 ok = False
                 unique = sorted(set(offenders))
                 print(
-                    f"{name}: {len(offenders)} non-canonical registry "
-                    f"source(s) (expected {_CANONICAL_INDEX}): {', '.join(unique)}"
+                    f"{name}: {len(offenders)} non-canonical registry source(s) "
+                    f"(expected {_CANONICAL_INDEX}): {', '.join(unique)}"
                 )
                 print(
                     "Fix with: python scripts/normalize_uv_lock_registry.py "

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import TypeGuard
 
 _CODEX_ELICITATION_ID_DIGEST_LENGTH = 32
 
 
-def is_codex_request_id(value: Any) -> bool:
+def is_codex_request_id(value: object) -> TypeGuard[int | str]:
     """
     Return whether *value* is a supported Codex JSON-RPC request id.
 

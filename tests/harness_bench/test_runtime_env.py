@@ -189,3 +189,55 @@ def test_skip_reason_when_profile_hostless(monkeypatch: pytest.MonkeyPatch) -> N
     reason = bench_creds_skip_reason("typo-profile")
     assert reason is not None
     assert "typo-profile" in reason
+
+
+def test_skip_reason_none_when_gateway_not_required() -> None:
+    """An own_auth native never skips for missing gateway creds — its model
+    auth is self-contained, so no Databricks/OpenAI credential is needed."""
+    assert bench_creds_skip_reason(None, require_gateway=False) is None
+
+
+def test_resolve_env_tolerates_missing_creds_when_gateway_optional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``require_gateway=False`` and no resolvable creds, the env is built
+    without ``OPENAI_*`` instead of raising — the server boots and an own_auth
+    native drives its own model."""
+
+    def _no_creds(profile: str | None) -> _Creds:
+        raise OSError("no databricks credentials")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", _no_creds
+    )
+    env = resolve_bench_env(None, require_gateway=False)
+    assert isinstance(env, BenchRuntimeEnv)
+    assert "OPENAI_API_KEY" not in env.base_env
+    assert "OPENAI_BASE_URL" not in env.base_env
+
+
+def test_resolve_env_still_raises_when_gateway_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default (``require_gateway=True``) still fails loud on no creds, so
+    omnigent-credential harnesses skip cleanly rather than boot keyless."""
+
+    def _no_creds(profile: str | None) -> _Creds:
+        raise OSError("no databricks credentials")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", _no_creds
+    )
+    with pytest.raises(OSError):
+        resolve_bench_env(None)
+
+
+def test_resolve_env_uses_creds_when_present_even_if_optional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``require_gateway=False`` still uses a resolvable gateway when one exists,
+    so a configured contributor gets the server's incidental model too."""
+    _stub_resolver(monkeypatch, "https://ws.example.com", "tok-xyz")
+    env = resolve_bench_env("oss", require_gateway=False)
+    assert env.base_env["OPENAI_API_KEY"] == "tok-xyz"
+    assert env.base_env["OPENAI_BASE_URL"] == "https://ws.example.com/serving-endpoints"

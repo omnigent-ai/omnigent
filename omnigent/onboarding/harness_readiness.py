@@ -29,10 +29,13 @@ import os
 from collections.abc import Callable
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
+import omnigent.onboarding.kimi_auth as _kimi_auth
 from omnigent._platform import resolve_cli_binary
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.harness_availability import (
     CODEX_CANONICAL_HARNESSES,
+    HARNESS_BINARY_MISSING,
+    HARNESS_VERSION_TOO_LOW,
     HarnessAvailability,
 )
 from omnigent.harness_plugins import harness_install_keys, valid_harnesses
@@ -46,12 +49,15 @@ from omnigent.onboarding.harness_install import (
     OPENCODE_KEY,
     PI_KEY,
     QWEN_KEY,
+    READINESS_CLI_PROBE_TIMEOUT_S,
     harness_cli_installed,
+    harness_install_spec,
     required_cli_for_harness,
 )
 from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
     _HARNESS_FAMILY,
+    ANTHROPIC_FAMILY,
     GEMINI_FAMILY,
     OPENAI_FAMILY,
     PI_SURFACE,
@@ -67,23 +73,29 @@ from omnigent.onboarding.provider_config import (
 # / ``agents_sdk``) and the ``claude`` alias normalize onto these first.
 # ``antigravity`` is the in-process Gemini SDK harness (its key resolves at
 # runtime), distinct from the CLI-wrapping ``antigravity-native`` (``agy``)
-# harness gated below on its binary plus a file-based OAuth credential.
+# harness gated below on its binary plus an API key or OAuth credential.
 _logger = logging.getLogger(__name__)
 
 _SDK_HARNESSES: frozenset[str] = frozenset(
     {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity"}
 )
 
-# Families whose CLIs authenticate via file-based credentials rather than a CLI
-# login command. For these, ``harness_is_configured`` checks BOTH the binary
-# (via ``harness_cli_installed``) AND the credential (via the callable here).
-# The ``anthropic`` / ``openai`` families authenticate via subscription provider
-# config and do not appear here. The lambda resolves through the module at call
-# time so a test can monkeypatch
-# ``omnigent.onboarding.gemini_auth.gemini_login_detected`` and have the patch
-# take effect without this dict caching the old function object.
+# Families/harnesses whose CLIs authenticate via file-based credentials rather
+# than a CLI login-status command. For these, ``harness_is_configured`` checks
+# BOTH the binary (via ``harness_cli_installed``) AND the credential (via the
+# callable here). ``agy`` accepts ``GEMINI_API_KEY`` or writes an OAuth token on
+# its first interactive run; ``kimi login`` writes
+# ``~/.kimi-code/credentials/kimi-code.json``, and pay-per-use users instead set
+# an API key in ``~/.kimi-code/config.toml`` (kimi has no login-status probe) —
+# ``kimi_auth_configured`` accepts either. The ``anthropic`` / ``openai``
+# families authenticate via subscription provider config and do not appear here.
+# Each lambda resolves through its module at call time so a test can monkeypatch
+# ``…gemini_auth.gemini_login_detected`` / ``…kimi_auth.kimi_auth_configured``
+# and have the patch take effect without this dict caching the old function
+# object.
 _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
     GEMINI_FAMILY: lambda: _gemini_auth.gemini_login_detected(),
+    KIMI_KEY: lambda: _kimi_auth.kimi_auth_configured(),
 }
 
 # CLI-wrapping pi harnesses. Both the bare ``pi`` surface and the native
@@ -180,23 +192,19 @@ def _install_key(canonical: str) -> str:
     return _HARNESS_FAMILY.get(canonical) or PI_KEY
 
 
-def harness_is_configured(harness: str) -> bool:
-    """Return whether *harness* can be launched on this machine.
+def _harness_availability_core(harness: str) -> HarnessAvailability:
+    """Return the detailed availability state for *harness*.
 
-    Only CLI-wrapping harnesses are assessed (native Claude/Codex/Kiro and
-    ``pi`` / ``pi-native``): they cannot run without their binary on
-    ``PATH``, and that is the one thing the daemon can check reliably and
-    locally. SDK harnesses and unknown harnesses always return ``True`` —
-    their readiness depends on runtime/ambient credentials the daemon
-    can't enumerate, so blocking them would risk false negatives that
-    break working launches.
+    Mirrors :func:`harness_is_configured` but preserves the distinction
+    between "CLI missing", "CLI present but version too old", and other
+    structured states so the web UI and setup dialogs can show actionable
+    copy.
 
     :param harness: A harness id, e.g. ``"claude-native"``, ``"codex"``,
         ``"openai-agents"``, ``"agents_sdk"``, ``"kiro-native"``, ``"pi"``,
         ``"pi-native"``, ``"qwen"``, or ``"qwen-code"``.
-    :returns: ``True`` when launchable (CLI installed, or a harness the
-        daemon doesn't gate); ``False`` only when a CLI-wrapping
-        harness's binary is missing from ``PATH``.
+    :returns: A :data:`HarnessAvailability` value.``True`` when launchable;
+        ``False`` or a reason string otherwise.
     """
     canonical = _canonical_harness(harness)
     if canonical == "acp":
@@ -214,26 +222,16 @@ def harness_is_configured(harness: str) -> bool:
         return True
     if canonical in _CURSOR_NATIVE_HARNESSES:
         # Native Cursor (``omni cursor``) wraps the ``cursor-agent`` CLI — gate
-        # on that binary, like ``claude-native`` / ``codex-native``. (Login
-        # state surfaces at run time; the daemon gates only on binary presence,
-        # mirroring the other native harnesses.)
-        return harness_cli_installed(CURSOR_KEY)
+        # on that binary. Keep the missing-binary case as the historical bare
+        # ``False`` sentinel, surfacing an outdated version only as
+        # ``"version-too-low"``.
+        return _installer_only_availability(CURSOR_KEY)
     if canonical in _KIRO_NATIVE_HARNESSES:
-        return harness_cli_installed(KIRO_KEY)
+        return _installer_only_availability(KIRO_KEY)
     if canonical in _GOOSE_NATIVE_HARNESSES or canonical == GOOSE_KEY:
-        # Goose — both the native TUI (``goose-native`` / ``native-goose``, via
-        # ``omni goose``) and the headless ACP harness (``goose``, drives
-        # ``goose acp``) — wraps the ``goose`` CLI, so gate on that binary.
-        # Auth/provider state surfaces at run time via Goose's own config; the
-        # daemon gates only on binary presence.
-        return harness_cli_installed(GOOSE_KEY)
+        return _installer_only_availability(GOOSE_KEY)
     if canonical in _HERMES_NATIVE_HARNESSES or canonical == HERMES_KEY:
-        # Hermes — both the native TUI (``hermes-native`` / ``native-hermes``,
-        # via ``omni hermes``) and the headless subprocess harness (``hermes``)
-        # — wraps the ``hermes`` CLI (installed via a curl script from Nous
-        # Research). Auth/provider config surfaces at run time via Hermes' own
-        # ``hermes model`` flow; gate only on binary presence.
-        return harness_cli_installed(HERMES_KEY)
+        return _installer_only_availability(HERMES_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -261,12 +259,18 @@ def harness_is_configured(harness: str) -> bool:
         # the environment. A bad / Copilot-less token surfaces at run time.
         from omnigent.onboarding.copilot_auth import (
             COPILOT_TOKEN_ENV_VARS,
+            copilot_github_host,
             copilot_github_token_configured,
+            gh_cli_github_token,
         )
 
-        return copilot_github_token_configured() or any(
+        if copilot_github_token_configured() or any(
             os.environ.get(var) for var in COPILOT_TOKEN_ENV_VARS
-        )
+        ):
+            return True
+        # A ``gh auth login`` session is a usable Copilot credential, so a
+        # logged-in user is ready without pasting a token into setup.
+        return gh_cli_github_token(copilot_github_host()) is not None
     if (
         canonical not in _HARNESS_FAMILY
         and canonical not in _PI_HARNESSES
@@ -283,12 +287,13 @@ def harness_is_configured(harness: str) -> bool:
         # version skew).
         return True
     install_key = _install_key(canonical)
-    if not harness_cli_installed(install_key):
-        return False
+    availability = _installer_only_availability(install_key)
     # Families that authenticate via file-based credentials (not a CLI login
     # command) require both the binary AND a stored credential. The ``agy`` CLI
     # falls into this category: it has no ``agy login`` subcommand and writes
     # OAuth creds on the first interactive browser run instead.
+    if availability is not True:
+        return availability
     credential_check = _FAMILY_CREDENTIAL_CHECK.get(install_key)
     if credential_check is not None:
         return credential_check()
@@ -306,10 +311,15 @@ def harness_is_configured(harness: str) -> bool:
 # an omnigent-managed provider). Qwen is absent on purpose: its key lives in the
 # harness's own env / interactive ``/auth``, which the daemon can't reduce to a
 # provider check, so it reports binary presence only.
+# Cursor native is included here too: ``cursor-agent`` has its own login command,
+# so the picker can distinguish "not installed" from "installed but not signed
+# in", while the launch gate stays binary-only.
 _AUTH_AWARE_NATIVE_HARNESSES: dict[str, str] = {
     "claude-native": "anthropic",
     "native-claude": "anthropic",
     "opencode-native": OPENCODE_KEY,
+    "cursor-native": CURSOR_KEY,
+    "native-cursor": CURSOR_KEY,
 }
 
 
@@ -351,15 +361,73 @@ def _family_provider_configured(harness: str) -> bool:
     return provider is not None and provider.kind != SUBSCRIPTION_KIND
 
 
+def _claude_managed_gateway_configured() -> bool:
+    """Whether Claude Code's own settings chain carries a usable credential.
+
+    The structural companion to :func:`_family_provider_configured` (which sees
+    only omnigent's ``providers:`` config). An enterprise install configures
+    Claude Code directly — a gateway ``ANTHROPIC_BASE_URL`` + ``apiKeyHelper`` in
+    its managed settings — and Claude Code applies that at its own launch, so
+    the harness is genuinely usable with nothing in ``config.yaml`` and no CLI
+    subscription login. Crediting it here is what stops an enterprise host from
+    reading "needs-auth" (the "Claude Code isn't configured on <host>" banner).
+
+    Local, synchronous, side-effect free (one JSON file read) and never raises:
+    any error fails to ``False`` so readiness falls through to the CLI status
+    probe rather than crashing the refresh.
+
+    :returns: ``True`` when Claude Code's managed settings deliver a credential.
+    """
+    try:
+        from omnigent.onboarding.ambient import claude_managed_gateway
+
+        return claude_managed_gateway()[1]
+    except Exception:
+        _logger.debug("readiness: claude managed-settings check failed", exc_info=True)
+        return False
+
+
+def _installer_only_availability(install_key: str) -> HarnessAvailability:
+    """Return availability for a binary-gated harness without login commands.
+
+    Mirrors :func:`_binary_availability_reason` but keeps the historical bare
+    ``False`` shape for a missing binary, so existing web/clients that expect a
+    simple boolean get that and only learn about structured reasons when the
+    binary is present but on an unsupported version.
+    """
+    state = _binary_availability_reason(install_key)
+    if state == HARNESS_BINARY_MISSING:
+        return False
+    return state
+
+
+def _binary_availability_reason(install_key: str) -> HarnessAvailability:
+    """Return the readiness reason when a CLI-backed harness can't be used.
+
+    Distinguishes a genuinely missing CLI from one that is on ``PATH`` but
+    outside the version range the native harness requires. The latter is
+    exposed to the web UI as ``"version-too-low"`` so the user sees a prompt
+    to upgrade rather than "binary-missing".
+    """
+    if harness_cli_installed(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S):
+        return True
+    spec = harness_install_spec(install_key)
+    if spec is not None and resolve_cli_binary(spec.binary) is not None:
+        return HARNESS_VERSION_TOO_LOW
+    return HARNESS_BINARY_MISSING
+
+
 def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailability:
     """Two-step availability for a login-command CLI harness.
 
     :returns: ``"binary-missing"`` when the CLI isn't installed,
+        ``"version-too-low"`` when the CLI is present but too old,
         ``"needs-auth"`` when installed but neither a configured provider
         credential nor a CLI login is present, else ``True``.
     """
-    if not harness_cli_installed(install_key):
-        return "binary-missing"
+    binary_state = _binary_availability_reason(install_key)
+    if binary_state is not True:
+        return binary_state
     if install_key == OPENCODE_KEY:
         from omnigent.onboarding.opencode_auth import opencode_auth_summary
 
@@ -374,7 +442,19 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
 
     if _family_provider_configured(canonical):
         return True
-    return True if harness_cli_logged_in(install_key) else "needs-auth"
+    # Claude Code's own managed settings can carry a complete gateway credential
+    # (enterprise ``ANTHROPIC_BASE_URL`` + ``apiKeyHelper``) that omnigent's
+    # config knows nothing about, and that is what a claude-native launch
+    # actually routes through. Credit it structurally (one local file read, no
+    # subprocess) before the status probe, so an enterprise host reads ready
+    # without depending on the probe resolving the CLI on PATH.
+    if install_key == ANTHROPIC_FAMILY and _claude_managed_gateway_configured():
+        return True
+    return (
+        True
+        if harness_cli_logged_in(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
+        else "needs-auth"
+    )
 
 
 def _harness_availability(canonical: str) -> HarnessAvailability:
@@ -385,16 +465,62 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
         return _codex_auth_unavailable_reason() or True
     install_key = _AUTH_AWARE_NATIVE_HARNESSES.get(canonical)
     if install_key is not None:
+        # Cursor is auth-aware like the other native CLI harnesses, so a missing
+        # binary surfaces as the structured ``"binary-missing"`` reason — not the
+        # bare ``False`` it historically reported. That keeps the picker badge /
+        # warning copy uniform across every CLI-backed native harness.
         return _cli_family_availability(canonical, install_key)
     if canonical in _PI_HARNESSES:
-        # pi has no CLI login — its only credential is an omnigent-managed
-        # provider (an API key / gateway, incl. one set from the UI). So the
-        # two-step signal is binary + provider: installed-but-no-provider is
-        # the yellow "needs-auth" state the setup dialog acts on.
-        if not harness_cli_installed(PI_KEY):
-            return "binary-missing"
-        return True if _family_provider_configured(PI_SURFACE) else "needs-auth"
-    return harness_is_configured(canonical)
+        # pi has no CLI login — its only credential is either an omnigent-managed
+        # provider (an API key / gateway) or a pi-subscription ("Pi original auth",
+        # which signals "use Pi's own ~/.pi/agent as-is"). So the two-step signal
+        # is binary + provider: installed-but-no-provider is the yellow "needs-auth"
+        # state the setup dialog acts on.
+        binary_state = _binary_availability_reason(PI_KEY)
+        if binary_state is not True:
+            return binary_state
+        if _family_provider_configured(PI_SURFACE):
+            return True
+        # A pi subscription (original auth) is also a valid configured state —
+        # it means Pi will use its own ~/.pi/agent credentials, no omnigent
+        # provider needed.
+        try:
+            provider = default_provider_for_harness(load_config(), PI_SURFACE)
+            if (
+                provider is not None
+                and provider.kind == SUBSCRIPTION_KIND
+                and provider.cli == "pi"
+            ):
+                return True
+        except Exception:
+            pass
+        return "needs-auth"
+    return _harness_availability_core(canonical)
+
+
+def harness_is_configured(harness: str) -> bool:
+    """Return whether *harness* can be launched on this machine.
+
+    Only CLI-wrapping harnesses are assessed (native Claude/Codex/Kiro and
+    ``pi`` / ``pi-native``): they cannot run without their binary on
+    ``PATH``, and that is the one thing the daemon can check reliably and
+    locally. SDK harnesses and unknown harnesses always return ``True`` —
+    their readiness depends on runtime/ambient credentials the daemon
+    can't enumerate, so blocking them would risk false negatives that
+    break working launches.
+
+    The check is binary-only: an installed-but-not-logged-in CLI still
+    returns ``True`` because auth failures surface at run time rather than
+    blocking dispatch.
+
+    :param harness: A harness id, e.g. ``"claude-native"``, ``"codex"``,
+        ``"openai-agents"``, ``"agents_sdk"``, ``"kiro-native"``, ``"pi"``,
+        ``"pi-native"``, ``"qwen"``, or ``"qwen-code"``.
+    :returns: ``True`` when launchable (CLI installed, or a harness the
+        daemon doesn't gate); ``False`` when the binary is missing or on
+        an unsupported version.
+    """
+    return _harness_availability_core(harness) is True
 
 
 def _is_codex_family_harness(canonical: str) -> bool:

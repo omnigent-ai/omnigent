@@ -58,7 +58,7 @@ export function useScheduledTasks() {
  * One task's run history (most-recent-first). `enabled` gates the fetch so an
  * unexpanded row costs nothing.
  */
-export function useScheduledTaskRuns(id: string, enabled: boolean = true) {
+export function useScheduledTaskRuns(id: string, enabled = true) {
   return useQuery<ScheduledTaskRun[]>({
     queryKey: scheduledTaskRunsKey(id),
     queryFn: () => listScheduledTaskRuns(id),

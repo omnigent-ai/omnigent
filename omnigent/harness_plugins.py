@@ -7,11 +7,13 @@ packages contribute additional harnesses through the
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import importlib.metadata
 import logging
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TypeVar, cast
 
 from omnigent._wrapper_labels import (
     ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
@@ -29,16 +31,20 @@ from omnigent._wrapper_labels import (
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
 )
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_capabilities import (
     AuthModel,
     EffortFamily,
     Elicitation,
+    ForkHistory,
     HarnessCapabilities,
+    InstructionDelivery,
     IntegrationMode,
     ModelFamily,
     Resume,
 )
 from omnigent.harness_install_spec import HarnessInstallSpec
+from omnigent.inner.devin import DEVIN_ACP_EXTENSION
 
 _logger = logging.getLogger(__name__)
 
@@ -76,6 +82,35 @@ class BackgroundTitleGeneratorSpec:
 
 
 @dataclass(frozen=True)
+class NativeHarnessProvider:
+    """Import paths for a native harness's lifecycle hooks.
+
+    ``NativeCodingAgent`` is pure identity data; behavior lives here as a
+    sibling row keyed by the same ``key``. Every value is a dotted import path
+    (``module:attr`` or ``module.attr``) resolved lazily at dispatch time via
+    :mod:`omnigent.native_dispatch`, so building the registry never imports the
+    runner / CLI / native-harness stack. Optional hooks are ``None`` when the
+    behavior is not yet a module-level function the resolver can reach (e.g.
+    interrupt/stop handlers that are still runner closures, or the inline
+    spawn-env dispatch); those hubs migrate onto the seam in later phases.
+    """
+
+    key: str  # matches NativeCodingAgent.key
+    run_native: str  # CLI + resume launch entry point
+    auto_create_terminal: str  # runner terminal builder
+    spawn_env_builder: str | None = None
+    # Session-label key carrying this harness's bridge id, when its spawn-env
+    # builder takes a ``bridge_id=`` kwarg resolved from session labels
+    # (codex/opencode/antigravity). ``None`` for bare builders and for harnesses
+    # whose bridge id resolves through a different path (e.g. claude).
+    bridge_id_label_key: str | None = None
+    interrupt_handler: str | None = None
+    stop_handler: str | None = None
+    materialize_agent_spec: str | None = None  # built-in agent seeding
+    bridge_dir: str | None = None  # cost-popup bridge-dir lookup
+
+
+@dataclass(frozen=True)
 class HarnessContribution:
     """One package's harness registry contribution."""
 
@@ -85,6 +120,7 @@ class HarnessContribution:
     aliases: dict[str, str] = field(default_factory=dict)
     native_harnesses: frozenset[str] = frozenset()
     native_agents: tuple[NativeCodingAgent, ...] = ()
+    native_providers: tuple[NativeHarnessProvider, ...] = ()
     install_specs: dict[str, HarnessInstallSpec] = field(default_factory=dict)
     harness_install_keys: dict[str, str] = field(default_factory=dict)
     model_env_keys: dict[str, str] = field(default_factory=dict)
@@ -210,6 +246,60 @@ HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
 )
 
 
+# Native harnesses whose spawn-env builder takes a ``bridge_id=`` resolved from
+# a session label. Their label key follows the uniform
+# ``omnigent.<key>_native.bridge_id`` pattern (pinned against the real bridge
+# constants in tests/test_harness_plugins.py). Claude also carries a bridge id
+# but resolves it through a runner helper with a server-side fallback, so it is
+# handled as a spawn-env special case rather than a plain label read.
+_BRIDGE_ID_LABEL_HARNESSES: frozenset[str] = frozenset({"codex", "opencode", "antigravity"})
+
+
+def _builtin_native_provider(key: str) -> NativeHarnessProvider:
+    """Build a built-in provider row from the ``omnigent.<key>_native`` module.
+
+    The built-in native harnesses follow a uniform module layout: each exports
+    ``run_<key>_native`` (CLI + resume launch) and ``_materialize_<key>_agent_spec``
+    (agent seeding), exposes a ``_launch_<key>`` terminal adapter in
+    ``omnigent.runner.native``, and exposes ``build_<key>_native_spawn_env`` in
+    ``omnigent.<key>_native_bridge``. The remaining hooks (interrupt, stop,
+    bridge-dir) are still runner-local closures / inline dispatch, so they stay
+    ``None`` until those hubs migrate onto the seam.
+    """
+    module = f"omnigent.{key}_native"
+    return NativeHarnessProvider(
+        key=key,
+        run_native=f"{module}:run_{key}_native",
+        auto_create_terminal=f"omnigent.runner.native:_launch_{key}",
+        spawn_env_builder=f"{module}_bridge:build_{key}_native_spawn_env",
+        bridge_id_label_key=(f"{module}.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None),
+        materialize_agent_spec=f"{module}:_materialize_{key}_agent_spec",
+    )
+
+
+# Behavior side-channel for the built-in native agents. One row per
+# NativeCodingAgent above, keyed by the same ``key``; resolved lazily so this
+# module stays import-light. See designs/harness-modular-registry-proposal.md
+# (Phase 1). Populated uniformly because every built-in native harness shares
+# the omnigent.<key>_native module layout.
+_BUILTIN_NATIVE_PROVIDERS: tuple[NativeHarnessProvider, ...] = tuple(
+    _builtin_native_provider(agent.key)
+    for agent in (
+        CLAUDE_NATIVE_CODING_AGENT,
+        CODEX_NATIVE_CODING_AGENT,
+        PI_NATIVE_CODING_AGENT,
+        OPENCODE_NATIVE_CODING_AGENT,
+        CURSOR_NATIVE_CODING_AGENT,
+        KIRO_NATIVE_CODING_AGENT,
+        GOOSE_NATIVE_CODING_AGENT,
+        ANTIGRAVITY_NATIVE_CODING_AGENT,
+        QWEN_NATIVE_CODING_AGENT,
+        KIMI_NATIVE_CODING_AGENT,
+        HERMES_NATIVE_CODING_AGENT,
+    )
+)
+
+
 # Declared capabilities for the built-in harnesses. Each value is backed by the
 # module that implements it; the derivable axes (model_family, subagents) are
 # asserted against their source in tests/test_harness_capabilities.py so the
@@ -221,6 +311,15 @@ _RS = Resume
 _EF = EffortFamily
 _MF = ModelFamily
 _AU = AuthModel
+_FH = ForkHistory
+_ID = InstructionDelivery
+
+# Bench shell-tool provocation prompts (moved off the bench's hardcoded
+# _NATIVE_TOOL_PROVOCATION table): the generic variant, and a Bash-specific one
+# for harnesses whose exec tool is literally "Bash". Both keep the
+# "omnigent-bench-ok" placeholder the bench token-swaps per allow/deny probe.
+_SHELL_PROMPT = "Use your shell/terminal tool to run this exact command: echo omnigent-bench-ok"
+_BASH_PROMPT = "Use the Bash tool to run this exact command: echo omnigent-bench-ok"
 
 # Trailing two bools are (interrupt, streaming). Only the four P0 SDK harnesses
 # (claude-sdk, codex, pi, openai-agents) have these verified live by the harness
@@ -238,6 +337,10 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.REBUILD,
+        shell_tool_name="Bash",
+        shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     "codex-native": _C(
         _IM.NATIVE_TUI,
@@ -249,6 +352,10 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.REBUILD,
+        shell_tool_name="shell",
+        shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     # streaming is declared True unless a live bench run proves a harness does
     # NOT emit token-level deltas. Only kiro-native is so proven (0 deltas over
@@ -260,12 +367,16 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _IM.NATIVE_TUI,
         _EL.NONE,
         _RS.WARM_REATTACH,
-        _EF.NONE,
+        _EF.PI,
         _MF.MULTI,
         _AU.SESSION_SCOPED_CONFIG,
         subagents=False,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.REBUILD,
+        shell_tool_name="Bash",
+        shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "cursor-native": _C(
@@ -278,6 +389,10 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=False,
+        fork_history=_FH.PREAMBLE,
+        # No shell-tool provocation: cursor-native was intentionally absent from
+        # the bench's table (its tool probe is skipped), so leave shell_tool_* None.
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # kiro_native_permissions.py: "TUI ACP recorder -> web elicitation".
     # streaming=False is LIVE-VERIFIED: a full SSE capture recorded 0 text
@@ -292,6 +407,10 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=False,
+        fork_history=_FH.NONE,
+        shell_tool_name="shell",
+        shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "antigravity-native": _C(
         _IM.NATIVE_TUI,
@@ -303,6 +422,10 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.NONE,
+        shell_tool_name="run_command",
+        shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "goose-native": _C(
         _IM.NATIVE_TUI,
@@ -314,6 +437,10 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.NONE,
+        shell_tool_name="developer__shell",
+        shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "qwen-native": _C(
@@ -326,6 +453,10 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=False,
+        fork_history=_FH.REBUILD,
+        shell_tool_name="run_shell_command",
+        shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "kimi-native": _C(
         _IM.NATIVE_TUI,
@@ -337,6 +468,10 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.NONE,
+        shell_tool_name="Bash",
+        shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "opencode-native": _C(
         _IM.NATIVE_SERVER,
@@ -348,6 +483,10 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.PREAMBLE,
+        # NATIVE_SERVER, not driven by the bench's native-tui tool probe, so
+        # shell_tool_* stay None.
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "hermes-native": _C(
         _IM.NATIVE_TUI,
@@ -359,6 +498,10 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.REBUILD,
+        shell_tool_name="terminal",
+        shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # SDK / subprocess harnesses (run the vendor model directly). The first four
     # are bench-verified interrupt=streaming=True.
@@ -372,6 +515,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_SESSION_SNAPSHOT,
     ),
     "codex": _C(
         _IM.CLI_SUBPROCESS,
@@ -383,17 +527,19 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "pi": _C(
         _IM.CLI_SUBPROCESS,
         _EL.NONE,
         _RS.COLD_ONLY,
-        _EF.NONE,
+        _EF.PI,
         _MF.MULTI,
         _AU.OMNIGENT_CREDENTIAL,
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "openai-agents": _C(
         _IM.SDK_IN_PROCESS,
@@ -405,6 +551,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "cursor": _C(
         _IM.SDK_IN_PROCESS,
@@ -416,6 +563,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "antigravity": _C(
         _IM.SDK_IN_PROCESS,
@@ -427,6 +575,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     # Generic ACP harness — drives any user-configured ACP agent command. Same
     # profile as goose/qwen (own-auth, cold resume, SSE permission), but its
@@ -441,6 +590,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "goose": _C(
         _IM.ACP_SUBPROCESS,
@@ -452,6 +602,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "qwen": _C(
         _IM.ACP_SUBPROCESS,
@@ -463,6 +614,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "kimi": _C(
         _IM.CLI_SUBPROCESS,
@@ -474,6 +626,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "hermes": _C(
         _IM.CLI_SUBPROCESS,
@@ -485,6 +638,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "copilot": _C(
         _IM.SDK_IN_PROCESS,
@@ -496,6 +650,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     # open-responses is resolved via an alternate path, but its executor
     # (omnigent/inner/open_responses_sdk.py) is concrete: interrupt_session()
@@ -512,8 +667,23 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
 }
+
+# Builtin ACP CLI harnesses (omnigent/acp_cli_harnesses.py) run through the
+# same generic wrap as the "acp" harness, so they share its declared profile.
+for _acp_cli_name in ACP_CLI_HARNESSES:
+    _BUILTIN_CAPABILITIES[_acp_cli_name] = _BUILTIN_CAPABILITIES["acp"]
+
+# Devin is the one row that diverges: its own wrap injects a vendor extension
+# (omnigent.inner.devin), so it surfaces the agent's sub-agents as child sessions
+# where a generic ACP agent cannot. Derived from the extension so this declared
+# capability cannot drift from the dialect that implements it.
+_BUILTIN_CAPABILITIES["devin"] = dataclasses.replace(
+    _BUILTIN_CAPABILITIES["acp"],
+    subagents=DEVIN_ACP_EXTENSION.surfaces_subagents,
+)
 
 
 _BUILTIN_CONTRIBUTION = HarnessContribution(
@@ -545,9 +715,17 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "qwen",
             "qwen-native",
         }
+        # Builtin ACP CLI harnesses derive from the declarative catalog; a new
+        # vendor CLI is one row there, not another entry in each set below.
+        | set(ACP_CLI_HARNESSES)
     ),
     harness_modules={
+        # Every catalog row runs the shared generic ACP wrap...
+        **dict.fromkeys(ACP_CLI_HARNESSES, "omnigent.inner.acp_harness"),
         "acp": "omnigent.inner.acp_harness",
+        # ...except a row with vendor behavior, which runs its own thin wrap to
+        # inject an AcpExtension into the same shared executor.
+        "devin": "omnigent.inner.devin.harness",
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
         "claude-native": "omnigent.inner.claude_native_harness",
@@ -572,11 +750,14 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "qwen-native": "omnigent.inner.qwen_native_harness",
     },
     aliases={
+        **{alias: name for name, row in ACP_CLI_HARNESSES.items() for alias in row.aliases},
         "agy": "antigravity",
+        "agy-native": "antigravity-native",
         "claude": "claude-sdk",
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",
         "kimi-code": "kimi",
+        "native-agy": "antigravity-native",
         "native-antigravity": "antigravity-native",
         "native-goose": "goose-native",
         "native-hermes": "hermes-native",
@@ -591,6 +772,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     },
     native_harnesses=frozenset(
         {
+            "agy-native",
             "antigravity-native",
             "claude-native",
             "codex-native",
@@ -599,6 +781,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "hermes-native",
             "kimi-native",
             "kiro-native",
+            "native-agy",
             "native-antigravity",
             "native-claude",
             "native-codex",
@@ -628,6 +811,15 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
     ),
+    native_providers=_BUILTIN_NATIVE_PROVIDERS,
+    # Catalog rows gate readiness on their vendor binary; the install spec also
+    # feeds setup steps and (for npm rows) the one-click install path.
+    install_specs={name: row.install for name, row in ACP_CLI_HARNESSES.items()},
+    harness_install_keys={
+        spelling: name
+        for name, row in ACP_CLI_HARNESSES.items()
+        for spelling in (name, *row.aliases)
+    },
     model_env_keys={
         "acp": "HARNESS_ACP_MODEL",
         "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
@@ -636,6 +828,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "HARNESS_COPILOT_MODEL",
         "cursor": "HARNESS_CURSOR_MODEL",
         "goose": "HARNESS_GOOSE_MODEL",
+        "hermes": "HARNESS_HERMES_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
         "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
         "pi": "HARNESS_PI_MODEL",
@@ -662,10 +855,12 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "Codex",
         "copilot": "Copilot",
         "cursor": "Cursor",
+        "hermes": "Hermes",
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
         "pi": "Pi",
+        **{name: row.label for name, row in ACP_CLI_HARNESSES.items()},
     },
     capabilities=_BUILTIN_CAPABILITIES,
 )
@@ -677,7 +872,11 @@ def _entry_points() -> tuple[importlib.metadata.EntryPoint, ...]:
     discovered = importlib.metadata.entry_points()
     if hasattr(discovered, "select"):
         return tuple(discovered.select(group=COMMUNITY_ENTRY_POINT_GROUP))
-    return tuple(discovered.get(COMMUNITY_ENTRY_POINT_GROUP, ()))
+    legacy = cast(
+        Mapping[str, Iterable[importlib.metadata.EntryPoint]],
+        discovered,
+    )
+    return tuple(legacy.get(COMMUNITY_ENTRY_POINT_GROUP, ()))
 
 
 def _module_part(import_path: str) -> str:
@@ -843,28 +1042,35 @@ def reset_plugin_state_for_tests() -> None:
     _state = None
 
 
-def _merge_dict(attr: str) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
+_Value = TypeVar("_Value")
+
+
+def _merge_dict(
+    getter: Callable[[HarnessContribution], Mapping[str, _Value]],
+) -> dict[str, _Value]:
+    merged: dict[str, _Value] = {}
     for contribution in plugin_state().contributions:
-        merged.update(getattr(contribution, attr))
+        merged.update(getter(contribution))
     return merged
 
 
-def _merge_set(attr: str) -> frozenset[str]:
+def _merge_set(
+    getter: Callable[[HarnessContribution], Iterable[str]],
+) -> frozenset[str]:
     merged: set[str] = set()
     for contribution in plugin_state().contributions:
-        merged.update(getattr(contribution, attr))
+        merged.update(getter(contribution))
     return frozenset(merged)
 
 
 def valid_harnesses() -> frozenset[str]:
     """Return canonical harness ids accepted by installed contributions."""
-    return _merge_set("valid_harnesses")
+    return _merge_set(lambda contribution: contribution.valid_harnesses)
 
 
 def harness_aliases() -> dict[str, str]:
     """Return alias-to-canonical harness ids."""
-    return _merge_dict("aliases")
+    return _merge_dict(lambda contribution: contribution.aliases)
 
 
 def accepted_harnesses() -> frozenset[str]:
@@ -874,7 +1080,7 @@ def accepted_harnesses() -> frozenset[str]:
 
 def native_harnesses() -> frozenset[str]:
     """Return native CLI harness ids and native aliases."""
-    return _merge_set("native_harnesses")
+    return _merge_set(lambda contribution: contribution.native_harnesses)
 
 
 def native_agents() -> tuple[NativeCodingAgent, ...]:
@@ -885,9 +1091,25 @@ def native_agents() -> tuple[NativeCodingAgent, ...]:
     return tuple(agents)
 
 
+def native_providers() -> tuple[NativeHarnessProvider, ...]:
+    """Return native-harness behavior provider rows, merged across contributions."""
+    providers: list[NativeHarnessProvider] = []
+    for contribution in plugin_state().contributions:
+        providers.extend(contribution.native_providers)
+    return tuple(providers)
+
+
+def native_provider_for_key(key: str) -> NativeHarnessProvider | None:
+    """Return the provider row whose ``key`` matches, or ``None``."""
+    for provider in native_providers():
+        if provider.key == key:
+            return provider
+    return None
+
+
 def harness_modules() -> dict[str, str]:
     """Return runtime harness module mapping, aliases included."""
-    modules = _merge_dict("harness_modules")
+    modules = _merge_dict(lambda contribution: contribution.harness_modules)
     for alias, canonical in harness_aliases().items():
         module = modules.get(canonical)
         if module is not None:
@@ -897,37 +1119,37 @@ def harness_modules() -> dict[str, str]:
 
 def model_env_keys() -> dict[str, str]:
     """Return harness-to-model-env-var mapping."""
-    return _merge_dict("model_env_keys")
+    return _merge_dict(lambda contribution: contribution.model_env_keys)
 
 
 def spawn_env_builders() -> dict[str, str]:
     """Return harness-to-spawn-env-builder import paths."""
-    return _merge_dict("spawn_env_builders")
+    return _merge_dict(lambda contribution: contribution.spawn_env_builders)
 
 
 def background_title_generators() -> dict[str, BackgroundTitleGeneratorSpec]:
     """Return harness-to-background-title-generator registrations."""
-    return _merge_dict("background_title_generators")
+    return _merge_dict(lambda contribution: contribution.background_title_generators)
 
 
 def install_specs() -> dict[str, HarnessInstallSpec]:
     """Return plugin-provided install specs."""
-    return _merge_dict("install_specs")
+    return _merge_dict(lambda contribution: contribution.install_specs)
 
 
 def harness_install_keys() -> dict[str, str]:
     """Return harness/alias to install-spec key mappings."""
-    return _merge_dict("harness_install_keys")
+    return _merge_dict(lambda contribution: contribution.harness_install_keys)
 
 
 def missing_install_packages() -> dict[str, str]:
     """Return optional harness spellings to package names."""
-    return _merge_dict("missing_install_package")
+    return _merge_dict(lambda contribution: contribution.missing_install_package)
 
 
 def harness_labels() -> dict[str, str]:
     """Return labels for non-native harness picker/catalog rows."""
-    return _merge_dict("harness_labels")
+    return _merge_dict(lambda contribution: contribution.harness_labels)
 
 
 def harness_capabilities() -> dict[str, HarnessCapabilities]:
@@ -937,10 +1159,10 @@ def harness_capabilities() -> dict[str, HarnessCapabilities]:
     capabilities). This is the single source of truth for "what can this
     harness do?".
     """
-    return _merge_dict("capabilities")
+    return _merge_dict(lambda contribution: contribution.capabilities)
 
 
-def harness_catalog() -> list[dict[str, Any]]:
+def harness_catalog() -> list[dict[str, object]]:
     """Return stable JSON-serializable harness catalog rows.
 
     Each row carries ``id`` and ``label``; rows for harnesses with declared
@@ -959,11 +1181,11 @@ def harness_catalog() -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001 — a broken onboarding import must not break the catalog
         _logger.debug("setup-step metadata unavailable", exc_info=True)
         ui_setup_steps = None  # type: ignore[assignment]
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, object]] = []
     for harness in sorted(labels, key=lambda key: labels[key].lower()):
         if harness not in valid_harnesses():
             continue
-        row: dict[str, Any] = {"id": harness, "label": labels[harness]}
+        row: dict[str, object] = {"id": harness, "label": labels[harness]}
         capability = capabilities.get(harness)
         if capability is not None:
             row["capabilities"] = capability.as_dict()
@@ -981,7 +1203,7 @@ def harness_catalog() -> list[dict[str, Any]]:
         from omnigent.onboarding.acp_auth import acp_agents
 
         for agent in acp_agents():
-            acp_row: dict[str, Any] = {"id": f"acp:{agent.slug}", "label": agent.name}
+            acp_row: dict[str, object] = {"id": f"acp:{agent.slug}", "label": agent.name}
             if acp_capability is not None:
                 acp_row["capabilities"] = acp_capability.as_dict()
             rows.append(acp_row)
@@ -990,7 +1212,7 @@ def harness_catalog() -> list[dict[str, Any]]:
     return rows
 
 
-def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, Any]]]:
+def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, str | None]]]:
     """Map every harness spelling to its ordered UI setup steps.
 
     The web setup dialog looks steps up by the harness a *session* declares —
@@ -1018,7 +1240,7 @@ def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, Any]]]:
     }
 
 
-def load_object(import_path: str) -> Any:
+def load_object(import_path: str) -> object:
     """Load ``module:attribute`` or ``module.attribute``."""
     if ":" in import_path:
         module_name, attr = import_path.split(":", 1)

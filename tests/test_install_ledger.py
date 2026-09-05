@@ -29,6 +29,25 @@ def test_install_ledger_round_trip_and_mode(tmp_path: Path, monkeypatch) -> None
     assert loaded.entries.profiles[0].path == str(profile)
 
 
+def test_load_ledger_rejects_non_object_json(tmp_path: Path) -> None:
+    path = tmp_path / "install_ledger.json"
+    path.write_text("[]")
+
+    assert install_ledger.load_ledger(path) is None
+
+
+def test_load_ledger_rejects_malformed_nested_shapes(tmp_path: Path) -> None:
+    path = tmp_path / "install_ledger.json"
+    malformed_payloads = [
+        {"schema_version": True},
+        {"schema_version": install_ledger.SCHEMA_VERSION, "entries": []},
+    ]
+
+    for payload in malformed_payloads:
+        path.write_text(json.dumps(payload))
+        assert install_ledger.load_ledger(path) is None
+
+
 def test_backfill_requires_anchor_signal(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
@@ -176,3 +195,45 @@ def test_deep_backfill_observes_external_config_and_launch_agents(
     assert ledger.entries.launch_agents[0].path == str(launch_agent)
     assert cursor_config.exists()
     assert launch_agent.exists()
+
+
+def test_record_and_remove_launch_agent_preserves_other_entries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    state = home / ".omnigent"
+    state.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
+
+    ledger = install_ledger.new_ledger(source="installer", strategy="install", deep=False)
+    unrelated = install_ledger.LaunchAgentEntry(
+        kind="launchd",
+        path=str(home / "Library/LaunchAgents/other.plist"),
+        label="ai.example.other",
+    )
+    stale = install_ledger.LaunchAgentEntry(
+        kind="launchd",
+        path=str(home / "Library/LaunchAgents/old.plist"),
+        label="ai.omnigent.host",
+    )
+    ledger.entries.launch_agents = [unrelated, stale]
+    install_ledger.write_ledger(ledger)
+
+    current = install_ledger.LaunchAgentEntry(
+        kind="launchd",
+        path=str(home / "Library/LaunchAgents/ai.omnigent.host.plist"),
+        label="ai.omnigent.host",
+        confidence="certain",
+    )
+    install_ledger.record_launch_agent(current)
+
+    recorded = install_ledger.load_ledger(install_ledger.ledger_path())
+    assert recorded is not None
+    assert recorded.entries.launch_agents == [unrelated, current]
+
+    install_ledger.remove_launch_agent(kind="launchd", label="ai.omnigent.host")
+
+    removed = install_ledger.load_ledger(install_ledger.ledger_path())
+    assert removed is not None
+    assert removed.entries.launch_agents == [unrelated]

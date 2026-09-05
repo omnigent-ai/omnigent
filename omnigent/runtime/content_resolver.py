@@ -269,6 +269,89 @@ def attachment_text_type_for_extension(filename: str | None) -> str | None:
     return "text/plain"
 
 
+# ── Text-attachment extraction for input-phase policy scanning ─────────
+
+
+def _is_text_like_attachment(content_type: str, filename: str | None) -> bool:
+    """Whether an attachment's content is text the policy layer can scan.
+
+    :param content_type: Resolved MIME, e.g. ``"text/csv"``.
+    :param filename: Original filename, used as an extension fallback.
+    :returns: ``True`` for ``text/*`` and known text-bearing
+        ``application/*`` types (or a text-like extension).
+    """
+    if content_type.startswith("text/"):
+        return True
+    if content_type in _TEXT_LIKE_APPLICATION_MIMES:
+        return True
+    return attachment_text_type_for_extension(filename) is not None
+
+
+def extract_text_attachments(
+    content: list[dict[str, Any]],
+    file_store: FileStore,
+    artifact_store: ArtifactStore,
+    *,
+    session_id: str | None = None,
+) -> list[dict[str, str]]:
+    """Decode text-like ``input_file`` attachments into structured entries.
+
+    Used by the request-phase policy gate so that PII (and other) policies
+    scan the *content* of an attached text file — not just the typed
+    message. Attachments arrive as ``input_file`` blocks that are base64-
+    inlined straight to the model (see :func:`resolve_content_references`),
+    so without this an attached CSV of card numbers reaches the LLM
+    unscanned. Non-text attachments (images, PDFs, binaries) are skipped;
+    text files are decoded in full (uploads are already bounded — text ≤
+    :data:`MAX_TEXT_UPLOAD_BYTES`, 10 MB). Best-effort: a missing/foreign file
+    or a fetch error is skipped, never raised, so a scan failure can't break
+    message delivery.
+
+    :param content: The message's content blocks (``body.data["content"]``).
+    :param file_store: Store for file metadata (``content_type`` / ``filename``).
+    :param artifact_store: Store for the file's binary content.
+    :param session_id: Owning session id, to enforce file ownership.
+    :returns: A list of ``{"filename", "content_type", "text"}`` entries — one
+        per scannable text attachment, in order — or ``[]`` when there are none.
+    """
+    attachments: list[dict[str, str]] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "input_file":
+            continue
+        file_id = block.get("file_id")
+        if not isinstance(file_id, str):
+            continue
+        try:
+            file_meta = file_store.get(file_id)
+        except Exception:  # best-effort scan; never break message delivery
+            continue
+        if file_meta is None:
+            continue
+        if (
+            file_meta.session_id is not None
+            and session_id is not None
+            and file_meta.session_id != session_id
+        ):
+            continue
+        content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
+        if not _is_text_like_attachment(content_type, file_meta.filename):
+            continue
+        try:
+            raw = artifact_store.get(file_id)
+        except Exception:  # best-effort scan; never break message delivery
+            continue
+        if not raw:
+            continue
+        attachments.append(
+            {
+                "filename": file_meta.filename or "",
+                "content_type": content_type,
+                "text": raw.decode("utf-8", errors="replace"),
+            }
+        )
+    return attachments
+
+
 def resolve_content_references(
     items: list[ConversationItem],
     file_store: FileStore,

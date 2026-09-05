@@ -21,7 +21,10 @@ describe("harnessFamily", () => {
     ["agents_sdk", "openai"],
     ["antigravity-native", "gemini"],
     ["native-antigravity", "gemini"],
+    ["agy-native", "gemini"],
+    ["native-agy", "gemini"],
     ["antigravity", "gemini"],
+    ["agy", "gemini"],
   ])("maps %s → %s", (harness, family) => {
     expect(harnessFamily(harness)).toBe(family);
   });
@@ -48,6 +51,8 @@ describe("isNativeHarness", () => {
     // NATIVE_HARNESSES (the in-process `antigravity` SDK harness is NOT).
     ["antigravity-native", true],
     ["native-antigravity", true],
+    ["agy-native", true],
+    ["native-agy", true],
     // qwen-native rebuilds qwen's on-disk chat recording from the copied
     // Omnigent items, so it carries fork/switch history (both spellings).
     ["qwen-native", true],
@@ -60,6 +65,7 @@ describe("isNativeHarness", () => {
     ["pi", false],
     // The in-process Antigravity SDK harness is likewise not native.
     ["antigravity", false],
+    ["agy", false],
     [null, false],
   ])("classifies %s as native=%s", (harness, expected) => {
     expect(isNativeHarness(harness as string | null)).toBe(expected);
@@ -78,6 +84,7 @@ describe("forkTargetCarriesHistory", () => {
     ["agents_sdk"],
     // antigravity is the Gemini-family SDK target.
     ["antigravity"],
+    ["agy"],
   ])("SDK target %s carries history", (target) => {
     expect(forkTargetCarriesHistory(target)).toBe(true);
   });
@@ -110,6 +117,8 @@ describe("forkTargetCarriesHistory", () => {
     ["native-pi"],
     ["antigravity-native"],
     ["native-antigravity"],
+    ["agy-native"],
+    ["native-agy"],
     // qwen-native rebuilds qwen's on-disk recording from the copied items.
     ["qwen-native"],
     ["native-qwen"],

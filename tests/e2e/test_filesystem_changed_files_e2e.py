@@ -482,6 +482,48 @@ def test_filesystem_listing_shape(
         )
 
 
+@pytest.mark.min_server_version("0.13.0")
+@pytest.mark.min_runner_version("0.13.0")
+def test_filesystem_download_returns_complete_file_past_read_cap(
+    http_client: httpx.Client,
+    live_runner_id: str,
+    databricks_workspace_host: str | None,
+) -> None:
+    """``?download=true`` streams a file larger than the read cap intact.
+
+    The runner runs on this machine, so the workspace root the listing
+    reports is writable here: drop a file one byte over the cap into it,
+    confirm the viewer read truncates it, then download it through the
+    server (and the runner tunnel) and compare every byte.
+
+    :param http_client: HTTP client pointed at the live server.
+    :param live_runner_id: Runner id registered by the live server.
+    :param databricks_workspace_host: Workspace host URL when the
+        test suite routes LLM calls through Databricks model serving.
+    """
+    from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
+
+    session_id = _create_bound_session(
+        http_client,
+        live_runner_id=live_runner_id,
+        databricks_workspace_host=databricks_workspace_host,
+    )
+    listing = http_client.get(_fs_root_url(session_id))
+    listing.raise_for_status()
+    payload = os.urandom(_MAX_READ_BYTES + 1)
+    (Path(listing.json()["base"]) / "big.bin").write_bytes(payload)
+
+    read = http_client.get(_fs_file_url(session_id, "big.bin"))
+    read.raise_for_status()
+    assert read.json()["truncated"] is True
+
+    resp = http_client.get(_fs_file_url(session_id, "big.bin"), params={"download": "true"})
+    resp.raise_for_status()
+    assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
+    assert resp.headers["content-length"] == str(len(payload))
+    assert resp.content == payload
+
+
 def test_filesystem_user_write_put_round_trip(
     http_client: httpx.Client,
     live_runner_id: str,

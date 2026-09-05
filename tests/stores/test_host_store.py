@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlHost
+from omnigent.db.db_models import SqlHost, workspace_scope
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.stores.host_store import (
     HOST_LIVENESS_TTL_S,
@@ -815,6 +815,7 @@ def test_managed_columns_survive_connect(db_uri: str) -> None:
         host_id="d55a61010459cea88ed2af0fe916139b",
         name="managed-m4",
         user_id="alice@example.com",
+        managed_token="raw-launch-token-4",
     )
 
     assert connected.status == "online"
@@ -853,6 +854,271 @@ def test_delete_host_removes_row_and_revokes_token(db_uri: str) -> None:
     assert store.list_hosts("alice@example.com") == []
     # Second delete is a no-op, not an error.
     store.delete_host("dcf4eb5fc0b04985ec45f79cfda95566")
+
+
+def test_managed_sandbox_reaper_queries_and_compare_clear_span_workspaces(
+    db_uri: str,
+) -> None:
+    """The reaper discovers workspaces, scopes stale reads, and clears one generation."""
+    store = HostStore(db_uri)
+    host_11 = "d6cb45e67d3d4bdbbff1b45d5c408e11"
+    host_22 = "60a41477758b4b4c9f3072dd47009522"
+    with workspace_scope(11):
+        store.register_managed_host(
+            host_id=host_11,
+            name="managed-11",
+            user_id="alice@example.com",
+            token="token-11",
+            provider="modal",
+            sandbox_id="sb-11",
+            token_expires_at=now_epoch() + 3600,
+        )
+    with workspace_scope(22):
+        store.register_managed_host(
+            host_id=host_22,
+            name="managed-22",
+            user_id="bob@example.com",
+            token="token-22",
+            provider="e2b",
+            sandbox_id="sb-22",
+            token_expires_at=now_epoch() + 3600,
+        )
+
+    assert store.list_managed_sandbox_workspace_ids() == [11, 22]
+    with workspace_scope(11):
+        assert store.list_stale_managed_sandbox_hosts(0) == []
+        listed = store.list_stale_managed_sandbox_hosts(now_epoch() + 1)
+        assert [host.host_id for host in listed] == [host_11]
+        last_seen_at = listed[0].updated_at
+        assert (
+            store.detach_stale_managed_sandbox(
+                host_11,
+                sandbox_id="sb-other",
+                expected_updated_at=last_seen_at,
+            )
+            is False
+        )
+        assert (
+            store.detach_stale_managed_sandbox(
+                host_11,
+                sandbox_id="sb-11",
+                expected_updated_at=last_seen_at,
+            )
+            is True
+        )
+        detached = store.get_host(host_11)
+        assert detached is not None
+        assert detached.status == "offline"
+        assert detached.updated_at == last_seen_at
+        assert detached.sandbox_provider == "modal"
+        assert detached.sandbox_id is None
+        assert detached.terminating_sandbox_id == "sb-11"
+        assert store.resolve_launch_token(host_11, "token-11") is None
+        assert store.list_managed_sandbox_workspace_ids() == [11, 22]
+        assert (
+            store.mark_terminating_sandbox_terminated(
+                host_11,
+                sandbox_id="sb-other",
+            )
+            is False
+        )
+        assert (
+            store.mark_terminating_sandbox_terminated(
+                host_11,
+                sandbox_id="sb-11",
+            )
+            is True
+        )
+        reaped = store.get_host(host_11)
+        assert reaped is not None
+        assert reaped.sandbox_id is None
+        assert reaped.terminating_sandbox_id is None
+
+    assert store.list_managed_sandbox_workspace_ids() == [22]
+    with workspace_scope(22):
+        listed = store.list_stale_managed_sandbox_hosts(now_epoch() + 1)
+        assert [host.host_id for host in listed] == [host_22]
+
+
+def test_detach_and_resume_rearm_are_atomic_competitors(db_uri: str) -> None:
+    store = HostStore(db_uri)
+    host_id = "2bc4d1fa28934f579ae62b6d40b23e53"
+    store.register_managed_host(
+        host_id=host_id,
+        name="managed-race",
+        user_id="alice@example.com",
+        token="old-token",
+        provider="modal",
+        sandbox_id="sb-race",
+        token_expires_at=now_epoch() + 3600,
+    )
+    _set_updated_at(db_uri, host_id, 100)
+    stale = store.get_host(host_id)
+    assert stale is not None
+
+    armed = store.rearm_managed_host(
+        host_id,
+        sandbox_id="sb-race",
+        expected_updated_at=stale.updated_at,
+        token="resume-token",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert armed is not None
+    assert armed.status == "offline"
+    assert (
+        store.detach_stale_managed_sandbox(
+            host_id,
+            sandbox_id="sb-race",
+            expected_updated_at=stale.updated_at,
+        )
+        is False
+    )
+    assert store.resolve_launch_token(host_id, "resume-token") is not None
+
+    current = store.get_host(host_id)
+    assert current is not None
+    assert (
+        store.detach_stale_managed_sandbox(
+            host_id,
+            sandbox_id="sb-race",
+            expected_updated_at=current.updated_at,
+        )
+        is True
+    )
+    assert (
+        store.rearm_managed_host(
+            host_id,
+            sandbox_id="sb-race",
+            expected_updated_at=current.updated_at,
+            token="too-late-token",
+            token_expires_at=now_epoch() + 3600,
+        )
+        is None
+    )
+    assert store.resolve_launch_token(host_id, "too-late-token") is None
+
+
+def test_pending_cleanup_rejects_reused_active_sandbox_id(db_uri: str) -> None:
+    store = HostStore(db_uri)
+    host_id = "97d1c9ac65124fb8ba452f6ba5269d0c"
+    registered = store.register_managed_host(
+        host_id=host_id,
+        name="managed-reused-id",
+        user_id="alice@example.com",
+        token="old-generation-token",
+        provider="blaxel",
+        sandbox_id="managed-reused-id",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert store.detach_stale_managed_sandbox(
+        host_id,
+        sandbox_id="managed-reused-id",
+        expected_updated_at=registered.updated_at,
+    )
+
+    with pytest.raises(ValueError, match="still pending termination"):
+        store.register_managed_host(
+            host_id=host_id,
+            name="managed-reused-id",
+            user_id="alice@example.com",
+            token="new-generation-token",
+            provider="blaxel",
+            sandbox_id="managed-reused-id",
+            token_expires_at=now_epoch() + 3600,
+        )
+
+    current = store.get_host(host_id)
+    assert current is not None
+    assert current.sandbox_id is None
+    assert current.terminating_sandbox_id == "managed-reused-id"
+    assert store.resolve_launch_token(host_id, "new-generation-token") is None
+
+
+def test_pending_cleanup_does_not_block_rearming_new_generation(db_uri: str) -> None:
+    store = HostStore(db_uri)
+    host_id = "ae83022f168b4897a72933734a2d0c3d"
+    old = store.register_managed_host(
+        host_id=host_id,
+        name="managed-rearm-new",
+        user_id="alice@example.com",
+        token="old-generation-token",
+        provider="modal",
+        sandbox_id="sb-old",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert store.detach_stale_managed_sandbox(
+        host_id,
+        sandbox_id="sb-old",
+        expected_updated_at=old.updated_at,
+    )
+    current = store.register_managed_host(
+        host_id=host_id,
+        name="managed-rearm-new",
+        user_id="alice@example.com",
+        token="new-generation-token",
+        provider="modal",
+        sandbox_id="sb-new",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    rearmed = store.rearm_managed_host(
+        host_id,
+        sandbox_id="sb-new",
+        expected_updated_at=current.updated_at,
+        token="resume-new-generation-token",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    assert rearmed is not None
+    assert rearmed.sandbox_id == "sb-new"
+    assert rearmed.terminating_sandbox_id == "sb-old"
+    assert store.resolve_launch_token(host_id, "resume-new-generation-token") is not None
+
+
+def test_managed_connect_revalidates_token_after_detach(db_uri: str) -> None:
+    store = HostStore(db_uri)
+    host_id = "769e5fd3b45a47a79cadad2dfeab3c8c"
+    registered = store.register_managed_host(
+        host_id=host_id,
+        name="managed-connect-race",
+        user_id="alice@example.com",
+        token="old-connect-token",
+        provider="modal",
+        sandbox_id="sb-connect-old",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert store.detach_stale_managed_sandbox(
+        host_id,
+        sandbox_id="sb-connect-old",
+        expected_updated_at=registered.updated_at,
+    )
+
+    with pytest.raises(ValueError, match="no longer valid"):
+        store.upsert_on_connect(
+            host_id=host_id,
+            name="managed-connect-race",
+            user_id="alice@example.com",
+            managed_token="old-connect-token",
+        )
+
+    store.register_managed_host(
+        host_id=host_id,
+        name="managed-connect-race",
+        user_id="alice@example.com",
+        token="new-connect-token",
+        provider="modal",
+        sandbox_id="sb-connect-new",
+        token_expires_at=now_epoch() + 3600,
+    )
+    connected = store.upsert_on_connect(
+        host_id=host_id,
+        name="managed-connect-race",
+        user_id="alice@example.com",
+        managed_token="new-connect-token",
+    )
+    assert connected.status == "online"
+    assert connected.sandbox_id == "sb-connect-new"
+    assert connected.terminating_sandbox_id == "sb-connect-old"
 
 
 def test_revoke_launch_token_keeps_row_but_stops_resolution(db_uri: str) -> None:

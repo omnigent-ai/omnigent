@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 
 def _patch_session_as_polly_codex(page: Page, session_id: str) -> None:
     """Expose the seeded session as top-level Polly on Codex."""
@@ -17,7 +19,7 @@ def _patch_session_as_polly_codex(page: Page, session_id: str) -> None:
             route.continue_()
             return
 
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         payload["agent_name"] = "polly"
         payload["harness"] = "codex"

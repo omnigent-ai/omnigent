@@ -7,10 +7,13 @@ name: Nightly Failure Monitor
 # the maintainer; it comments-and-closes that issue when a later nightly is
 # green. A single flake (one red run) is ignored -- the real-LLM legs are
 # 429-sensitive -- so only a sustained break pages.
+#
+# Nightly Release is watched for the same reason: it is fully unattended, so a
+# broken cut blocks nobody and consumers just silently stop getting new builds.
 
 on:
   workflow_run:
-    workflows: ["E2E Tests", "E2E UI Tests"]
+    workflows: ["E2E Tests", "E2E UI Tests", "Nightly Release"]
     types: [completed]
 
 permissions:

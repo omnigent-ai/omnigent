@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { NodeTypes, NodeProps, Node } from "@xyflow/react";
-import { ReactFlow, Background, Position, Handle } from "@xyflow/react";
-import { Link, useLocation } from "@/lib/routing";
+import { ReactFlow, Background, Position, Handle, useReactFlow } from "@xyflow/react";
+import { useLocation, useNavigate } from "@/lib/routing";
 import { RunningDot } from "@/components/RunningDot";
 import { Badge } from "@/components/ui/badge";
+import { ZoomInIcon, ZoomOutIcon, Maximize2Icon } from "lucide-react";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { cn } from "@/lib/utils";
@@ -51,16 +52,9 @@ function NodeStatusDot({ activity }: { activity: AgentActivity }) {
 function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
   const { label, activity, statusLabel, isActive, preview } = data;
   const tint = ACTIVITY_TINT[activity];
-  const location = useLocation();
-  const search = useMemo(() => {
-    const params = new URLSearchParams(location.search);
-    for (const key of ["file", "diff", "comment", "view"]) params.delete(key);
-    const next = params.toString();
-    return next ? `?${next}` : "";
-  }, [location.search]);
 
   return (
-    <Link to={{ pathname: `/c/${data.sessionId}`, search }} className="block">
+    <>
       <Handle
         type="target"
         position={Position.Top}
@@ -76,7 +70,7 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
         style={{ width: NODE_WIDTH }}
       >
         <div className="flex items-center gap-1.5">
-          <span className="truncate text-xs font-medium leading-tight">{label}</span>
+          <span className="truncate text-sm font-medium leading-tight">{label}</span>
           <span className="flex-1" />
           <NodeStatusDot activity={activity} />
         </div>
@@ -92,7 +86,41 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
         position={Position.Bottom}
         className="!bg-muted-foreground/40 !w-1.5 !h-1.5 !border-0"
       />
-    </Link>
+    </>
+  );
+}
+
+function ZoomControls() {
+  const { zoomIn, zoomOut, fitView } = useReactFlow();
+  const btnClass =
+    "flex items-center justify-center size-7 rounded-md border bg-card text-muted-foreground shadow-sm hover:bg-accent hover:text-accent-foreground transition-colors";
+  return (
+    <div className="absolute bottom-3 right-3 z-10 flex flex-col gap-1">
+      <button
+        type="button"
+        className={btnClass}
+        onClick={() => zoomIn({ duration: 200 })}
+        aria-label="Zoom in"
+      >
+        <ZoomInIcon className="size-4" />
+      </button>
+      <button
+        type="button"
+        className={btnClass}
+        onClick={() => zoomOut({ duration: 200 })}
+        aria-label="Zoom out"
+      >
+        <ZoomOutIcon className="size-4" />
+      </button>
+      <button
+        type="button"
+        className={btnClass}
+        onClick={() => fitView({ duration: 200, padding: 0.3 })}
+        aria-label="Fit view"
+      >
+        <Maximize2Icon className="size-4" />
+      </button>
+    </div>
   );
 }
 
@@ -181,6 +209,21 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
     [rootSessionId, rootLabel, rootActivity, rootStatusLabel, childrenMap, conversationId],
   );
 
+  const navigate = useNavigate();
+  const location = useLocation();
+  const handleNodeClick = useCallback(
+    (_event: React.MouseEvent, node: Node<AgentNodeData>) => {
+      const params = new URLSearchParams(location.search);
+      for (const key of ["file", "diff", "comment", "view"]) params.delete(key);
+      const search = params.toString();
+      navigate({
+        pathname: `/c/${node.data.sessionId}`,
+        search: search ? `?${search}` : "",
+      });
+    },
+    [navigate, location.search],
+  );
+
   return (
     <div
       data-workspace-panel-surface
@@ -191,6 +234,7 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
           nodes={layoutNodes}
           edges={layoutEdges}
           nodeTypes={nodeTypes}
+          onNodeClick={handleNodeClick}
           fitView
           fitViewOptions={{ padding: 0.3 }}
           panOnDrag
@@ -200,10 +244,11 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
           nodesConnectable={false}
           elementsSelectable={false}
           proOptions={{ hideAttribution: true }}
-          minZoom={0.3}
-          maxZoom={1.5}
+          minZoom={0.1}
+          maxZoom={3}
         >
           <Background bgColor="var(--card)" />
+          <ZoomControls />
         </ReactFlow>
       </div>
       {rootChildren.map((child) => (

@@ -1,13 +1,14 @@
 name: Discord watch rotation
 
-# Wakes up only at the UTC times that are ~08:00 in an assignee's timezone.
+# Schedule paused: the rotation ping only runs on manual dispatch for now.
+# To resume, restore the `schedule:` block below.
+#   schedule:
+#     - cron: "0 0 * * *" # 08:00 Asia/Singapore (UTC+8, no daylight saving)
+#     - cron: "0 15 * * *" # 08:00 SF in summer (PDT); 07:00 in winter (PST)
 # Note: a single fixed UTC time can't track San Francisco's daylight saving,
 # so the SF ping lands at 08:00 in summer (PDT) and 07:00 in winter (PST).
 on:
-  schedule:
-    - cron: "0 0 * * *" # 08:00 Asia/Singapore (UTC+8, no daylight saving)
-    - cron: "0 15 * * *" # 08:00 SF in summer (PDT); 07:00 in winter (PST)
-  workflow_dispatch: {} # manual "Run workflow" button for testing
+  workflow_dispatch: {} # manual "Run workflow" button
 
 # Only needs to check out the repo; nothing is written back.
 permissions:

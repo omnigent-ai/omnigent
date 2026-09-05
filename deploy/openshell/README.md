@@ -404,6 +404,6 @@ upload, foreground streaming, attach, terminate, env passthrough, error handling
 and the managed-config parsing:
 
 ```bash
-uv pip install -e '.[openshell,dev]'
-pytest tests/onboarding/sandboxes/test_openshell.py tests/server/test_managed_hosts.py
+uv sync --extra openshell --group test
+uv run --no-sync pytest tests/onboarding/sandboxes/test_openshell.py tests/server/test_managed_hosts.py
 ```

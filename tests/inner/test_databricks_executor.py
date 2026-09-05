@@ -3,10 +3,13 @@
 import asyncio
 import json
 import sys
+import threading
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import databricks.sdk.config as _sdk_config_mod
 
@@ -574,17 +577,27 @@ class TestDatabricksExecutorConfig(unittest.TestCase):
         _run(_t())
 
     def test_default_model(self):
-        """When no model is specified, falls back to databricks-claude-sonnet-4-6."""
+        """Catalog default resolution does not block the event-loop thread."""
 
         async def _t():
             chunks = _make_text_stream("ok")
             client = FakeClient(chunks)
             executor = DatabricksExecutor(client=client)
+            event_loop_thread = threading.get_ident()
 
-            [e async for e in executor.run_turn([], [], "", config=ExecutorConfig())]
+            def _resolve_model(provider_name: str, *, family: str) -> SimpleNamespace:
+                self.assertNotEqual(threading.get_ident(), event_loop_thread)
+                self.assertEqual((provider_name, family), ("databricks", "claude"))
+                return SimpleNamespace(model_id="catalog-databricks-claude-default")
+
+            with patch(
+                "omnigent.model_catalog.resolve_catalog_model",
+                side_effect=_resolve_model,
+            ):
+                [e async for e in executor.run_turn([], [], "", config=ExecutorConfig())]
             self.assertEqual(
                 client.chat.completions.last_kwargs["model"],
-                "databricks-claude-sonnet-4-6",
+                "catalog-databricks-claude-default",
             )
 
         _run(_t())
@@ -701,6 +714,8 @@ from omnigent.inner.databricks_executor import (  # noqa: E402
     _read_databrickscfg,
     _read_databrickscfg_file_fallback,
     _read_databrickscfg_host,
+    databrickscfg_workspace_id_for_host,
+    databrickscfg_workspace_id_for_profile,
 )
 
 _AUTH_ENV_VARS: tuple[str, ...] = (
@@ -756,6 +771,7 @@ def pat_only_cfg(
     monkeypatch.setattr(
         "databricks.sdk.config.get_host_metadata",
         _raise_offline_host_metadata,
+        raising=False,
     )
     contents = textwrap.dedent(
         """
@@ -920,6 +936,7 @@ def test_databricks_gateway_host_missing_profile_falls_back_to_ambient(
     monkeypatch.setattr(
         "databricks.sdk.config.get_host_metadata",
         _raise_offline_host_metadata,
+        raising=False,
     )
     cfg_path = tmp_path / "databrickscfg"
     cfg_path.write_text("# no matching profile\n")
@@ -1768,6 +1785,141 @@ def test_resolve_auth_for_host_prefers_matching_profile(
     assert constructed == [{"profile": "my-ws"}]
 
 
+def test_resolve_auth_for_host_uses_profile_cli_when_sdk_is_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SDK profile auth can still hit ambiguous host lookup for CLI profiles."""
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[expired]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = databricks-cli\n"
+        "[fresh]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = databricks-cli\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    attempts: list[tuple[str, object]] = []
+
+    def _ambiguous_sdk_config(**kwargs: str) -> object:
+        attempts.append(("sdk", kwargs))
+        raise ValueError(
+            "databricks-cli: expired and fresh match "
+            "https://example.databricks.com. Use --profile to specify which profile to use"
+        )
+
+    def _run_databricks(args: list[str], **kwargs: object) -> SimpleNamespace:
+        attempts.append(("cli", args))
+        assert "--host" not in args
+        profile = args[args.index("--profile") + 1]
+        if profile == "expired":
+            return SimpleNamespace(returncode=1, stdout="", stderr="expired")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"access_token": "fresh-token"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(databricks_executor, "_sdk_config", _ambiguous_sdk_config)
+    monkeypatch.setattr(databricks_executor.shutil, "which", lambda name: "/usr/bin/databricks")
+    monkeypatch.setattr(databricks_executor.subprocess, "run", _run_databricks)
+
+    auth, host = databricks_executor._resolve_databricks_auth(
+        host="https://example.databricks.com"
+    )
+
+    assert auth.current_token() == "fresh-token"
+    assert auth.current_token() == "fresh-token"
+    assert host == "https://example.databricks.com"
+    assert attempts == [
+        ("sdk", {"profile": "expired"}),
+        (
+            "cli",
+            [
+                "/usr/bin/databricks",
+                "auth",
+                "token",
+                "--profile",
+                "expired",
+                "--output",
+                "json",
+            ],
+        ),
+        ("sdk", {"profile": "fresh"}),
+        (
+            "cli",
+            [
+                "/usr/bin/databricks",
+                "auth",
+                "token",
+                "--profile",
+                "fresh",
+                "--output",
+                "json",
+            ],
+        ),
+    ]
+
+
+def test_profile_cli_auth_config_caches_until_token_nears_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The profile CLI fallback does not re-shell for every auth header."""
+    from omnigent.inner import databricks_executor
+
+    calls = 0
+    timestamps = iter([1000.0, 1001.0, 1020.0])
+
+    def _run_databricks(args: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"access_token": f"token-{calls}", "expires_in": 100}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(databricks_executor.time, "time", lambda: next(timestamps))
+    monkeypatch.setattr(databricks_executor.shutil, "which", lambda name: "/usr/bin/databricks")
+    monkeypatch.setattr(databricks_executor.subprocess, "run", _run_databricks)
+
+    cfg = databricks_executor._DatabricksCliProfileAuthConfig(
+        profile="fresh",
+        host="https://example.databricks.com",
+    )
+
+    assert cfg.authenticate() == {"Authorization": "Bearer token-1"}
+    assert cfg.authenticate() == {"Authorization": "Bearer token-1"}
+    assert cfg.authenticate() == {"Authorization": "Bearer token-2"}
+    assert calls == 2
+
+
+def test_profile_cli_token_error_does_not_include_stdout_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-zero CLI exit never reports stdout, which may contain a token."""
+    from omnigent.inner import databricks_executor
+
+    def _run_databricks(args: list[str], **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=1,
+            stdout=json.dumps({"access_token": "secret-token"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(databricks_executor.shutil, "which", lambda name: "/usr/bin/databricks")
+    monkeypatch.setattr(databricks_executor.subprocess, "run", _run_databricks)
+
+    with pytest.raises(ValueError) as exc:
+        databricks_executor._databricks_cli_profile_token("fresh")
+
+    assert "secret-token" not in str(exc.value)
+    assert str(exc.value) == "databricks auth token --profile fresh failed"
+
+
 def test_resolve_auth_for_host_falls_back_to_cli_when_no_profile_matches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1861,3 +2013,74 @@ def test_stream_ended_without_finish_reason_with_content_completes() -> None:
         assert turn_events[0].response == "partial"
 
     _run(_t())
+
+
+def test_databrickscfg_workspace_id_for_host_reads_matching_profile(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """The workspace id is read from the ~/.databrickscfg profile matching the host.
+
+    ``databricks auth login`` records the resolved workspace id per profile;
+    matching is scheme-insensitive and trailing-slash tolerant, so a bare-host
+    cfg entry matches an ``https://`` query.
+    """
+    cfg = tmp_path / "databrickscfg"
+    cfg.write_text(
+        textwrap.dedent(
+            """
+            [acme]
+            host = https://acme.databricks.com
+            workspace_id = 1965859176160743
+            auth_type = databricks-cli
+
+            [no-ws]
+            host = https://plain.databricks.com
+            auth_type = databricks-cli
+            """
+        ).lstrip()
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    assert databrickscfg_workspace_id_for_host("https://acme.databricks.com") == "1965859176160743"
+    # A profile without the field, and an unknown host, both resolve to None.
+    assert databrickscfg_workspace_id_for_host("https://plain.databricks.com") is None
+    assert databrickscfg_workspace_id_for_host("https://other.databricks.com") is None
+
+
+def test_databrickscfg_workspace_id_for_profile_reads_exact_profile(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """Profile-based workspace lookup does not pick another matching host."""
+    cfg = tmp_path / "databrickscfg"
+    cfg.write_text(
+        textwrap.dedent(
+            """
+            [DEFAULT]
+            workspace_id = default-ws
+
+            [expired]
+            host = https://acme.databricks.com
+            workspace_id = workspace-a
+            auth_type = databricks-cli
+
+            [fresh]
+            host = https://acme.databricks.com
+            workspace_id = workspace-b
+            auth_type = databricks-cli
+            """
+        ).lstrip()
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    assert databrickscfg_workspace_id_for_profile("fresh") == "workspace-b"
+    assert databrickscfg_workspace_id_for_profile("expired") == "workspace-a"
+    assert databrickscfg_workspace_id_for_profile("DEFAULT") == "default-ws"
+    assert databrickscfg_workspace_id_for_profile("missing") is None
+
+
+def test_databrickscfg_workspace_id_for_host_missing_file_returns_none(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """A missing ~/.databrickscfg never raises — it resolves to None."""
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "absent"))
+    assert databrickscfg_workspace_id_for_host("https://acme.databricks.com") is None

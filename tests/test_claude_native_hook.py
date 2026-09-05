@@ -280,7 +280,7 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -463,7 +463,7 @@ def test_fork_session_start_hook_forks_before_printing_conversation_url(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -591,7 +591,7 @@ def test_resume_session_start_without_branch_marker_does_not_fork(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FailingHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FailingHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -727,7 +727,7 @@ def test_permission_request_hook_posts_to_active_session_from_bridge_config(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -866,7 +866,7 @@ def test_permission_request_hook_retries_transport_cut_with_same_id(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FlakyHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FlakyHttpxClient)
     # Zero backoff keeps the retry loop instant in tests; production
     # waits between attempts.
     monkeypatch.setattr(claude_native_hook, "_PERMISSION_RETRY_INITIAL_BACKOFF_S", 0.0)
@@ -959,7 +959,7 @@ def test_permission_request_hook_does_not_retry_rejections(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _RejectingHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RejectingHttpxClient)
     monkeypatch.setattr(claude_native_hook, "_PERMISSION_RETRY_INITIAL_BACKOFF_S", 0.0)
     bridge_dir = _prepare_permission_bridge(tmp_path, "conv_reject")
     payload = {"hook_event_name": "PermissionRequest", "tool_name": "Bash"}
@@ -1059,11 +1059,12 @@ def test_build_hook_settings_registers_message_display_hook(
 
     Without this entry, Claude never invokes the deltas-appender and live
     token streaming silently does nothing (the web UI falls back to the
-    whole-message-on-completion behavior). It must route to the dedicated
-    stdlib-only module — NOT the heavier observer hook — so the per-chunk
-    hot path stays cheap, and it must NOT depend on ``ap_server_url``
-    (streaming works for local servers too). Fails if the registration
-    is dropped or pointed at the wrong module.
+    whole-message-on-completion behavior). It must be the /bin/sh
+    one-liner appending to ``message_deltas.jsonl`` — never an
+    interpreter spawn, since Claude blocks on it once per streamed
+    chunk — and it must NOT depend on ``ap_server_url`` (streaming
+    works for local servers too). Fails if the registration is dropped
+    or pointed at something heavier.
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
@@ -1076,11 +1077,11 @@ def test_build_hook_settings_registers_message_display_hook(
         "MessageDisplay hook not registered — live token streaming is dead"
     )
     command = hooks["MessageDisplay"][0]["hooks"][0]["command"]
-    # Routes to the dedicated lightweight module with this bridge dir...
-    assert "omnigent.claude_native_message_display_hook" in command
+    # Appends straight to this bridge dir's deltas file from shell...
+    assert "message_deltas.jsonl" in command
     assert str(bridge_dir) in command
-    # ...and NOT through the heavier observer/policy subcommands (which
-    # would import claude_native_bridge on every streamed chunk).
+    # ...with no interpreter or server dependency on the per-chunk path.
+    assert "python" not in command
     assert "evaluate-policy" not in command
     assert "permission-request" not in command
 
@@ -1275,7 +1276,7 @@ def test_evaluate_policy_stamps_live_model_from_context_json(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
@@ -1365,7 +1366,7 @@ def test_evaluate_policy_post_tool_use_converts_and_returns_context(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
         bridge_id="bridge_shared",
@@ -1467,7 +1468,7 @@ def test_ask_user_question_hook_noop_in_non_bypass_mode(
                 "PermissionRequest hook should own the elicitation instead"
             )
 
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _RaisesIfCalled)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RaisesIfCalled)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="b1", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_abc")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
@@ -1577,7 +1578,7 @@ def test_ask_user_question_hook_posts_and_returns_pre_tool_use_output_in_bypass_
                 request=_httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir("conv_bypass", bridge_id="b2", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_bypass")
     build_hook_settings(
@@ -1693,7 +1694,7 @@ def test_ask_user_question_hook_returns_deny_without_updated_input(
                 request=_httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir("conv_deny", bridge_id="b3", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_deny")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
@@ -1735,7 +1736,7 @@ def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client(mode))
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client(mode))
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
@@ -1770,7 +1771,7 @@ def test_evaluate_policy_user_prompt_submit_fails_closed_on_error(
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client("connect_error"))
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
@@ -1802,7 +1803,7 @@ def test_evaluate_policy_post_tool_use_fails_open_on_error(
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client("connect_error"))
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
@@ -2196,7 +2197,7 @@ def test_reattach_bounds_consecutive_hard_failures(monkeypatch: pytest.MonkeyPat
     ``None`` (caller fails-ask) — not spin until the day-long budget.
     """
     client = _scripted_client(script=[("connect", 0.0)], monkeypatch=monkeypatch)
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2218,7 +2219,7 @@ def test_reattach_5xx_counts_as_hard_failure(monkeypatch: pytest.MonkeyPatch) ->
     unreachable one, so it must hit the same cap.
     """
     client = _scripted_client(script=[("5xx", 0.0)], monkeypatch=monkeypatch)
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2243,7 +2244,7 @@ def test_reattach_cap_is_env_overridable(monkeypatch: pytest.MonkeyPatch) -> Non
     reloaded = importlib.reload(claude_native_hook)
     try:
         client = _scripted_client(script=[("connect", 0.0)], monkeypatch=monkeypatch)
-        monkeypatch.setattr(reloaded.httpx, "Client", client)
+        monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
         resp = reloaded._post_hook_with_reattach(
             url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2318,7 +2319,7 @@ def test_reattach_proxy_severed_held_poll_never_caps(monkeypatch: pytest.MonkeyP
                 raise httpx.RemoteProtocolError("proxy severed idle poll", request=req)
             return httpx.Response(200, json={"ok": True}, request=req)
 
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _SeverThenAnswerClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _SeverThenAnswerClient)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2344,7 +2345,7 @@ def test_reattach_fast_flapping_connection_is_hard_failure(
     tight loop is still bounded (it must not masquerade as a parked poll).
     """
     client = _scripted_client(script=[("severed", 0.0)], monkeypatch=monkeypatch)
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2411,7 +2412,7 @@ def test_reattach_never_resolving_severs_are_bounded_by_deadline(
     # stop it. Fake clock advances 15s per attempt + 30s backoff.
     held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 5.0  # 15s: a held sever
     client = _scripted_client(script=[("severed", held)], monkeypatch=monkeypatch)
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2461,7 +2462,7 @@ def test_reattach_returns_response_on_success(monkeypatch: pytest.MonkeyPatch) -
             type(self).calls += 1
             return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _OkClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _OkClient)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2473,3 +2474,479 @@ def test_reattach_returns_response_on_success(monkeypatch: pytest.MonkeyPatch) -
     assert resp is not None
     assert resp.status_code == 200
     assert _OkClient.calls == 1
+
+
+# ── route-turn (first-message model routing) ────────────────────────
+
+
+def _turn_routing_bridge_dir(tmp_path: Path) -> Path:
+    """
+    Create a bridge dir whose active session is ``conv_active``.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: The bridge directory.
+    """
+    bridge_dir = prepare_bridge_dir("conv_active", bridge_id="bridge_turn", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    return bridge_dir
+
+
+def _advertise_turn_router(bridge_dir: Path, *, session_id: str | None = "conv_active") -> None:
+    """
+    Write a live ``turn_router.json`` advertisement into *bridge_dir*.
+
+    :param bridge_dir: The session's bridge directory.
+    :param session_id: Session id to advertise, or ``None`` to omit it so
+        the hook has to fall back to the bridge's active session.
+    :returns: None.
+    """
+    import os
+
+    from omnigent.runner.turn_routing import ADVERTISEMENT_FILE
+
+    payload: dict[str, object] = {
+        "url": "http://127.0.0.1:54321",
+        "token": "turn-token",
+        "pid": os.getpid(),
+    }
+    if session_id is not None:
+        payload["session_id"] = session_id
+    (bridge_dir / ADVERTISEMENT_FILE).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _run_route_turn(
+    bridge_dir: Path, payload: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> int:
+    """
+    Feed *payload* on stdin and run the ``route-turn`` subcommand.
+
+    :param bridge_dir: The session's bridge directory.
+    :param payload: The claude ``UserPromptSubmit`` hook payload.
+    :param monkeypatch: pytest monkeypatch fixture.
+    :returns: The hook process exit code.
+    """
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    return claude_native_hook.main(
+        ["route-turn", "--bridge-dir", str(bridge_dir), "--harness", "claude-native"]
+    )
+
+
+def test_route_turn_fast_skips_on_the_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A consumed marker short-circuits before any network call.
+
+    This is the re-entrancy guard the replayed prompt relies on: the replay
+    re-fires ``UserPromptSubmit``, and a second block would erase it.
+    """
+    from omnigent.runner.turn_routing import write_turn_routing_marker
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    write_turn_routing_marker(bridge_dir, session_id="conv_active", decision_id="d1")
+
+    def _boom(*args: object, **kwargs: object) -> dict[str, object]:
+        raise AssertionError("the marker must skip the route-turn round trip")
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _boom)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_blocks_on_a_routed_verdict_without_touching_the_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A routed verdict writes the marker and blocks — and switches nothing.
+
+    Claude's pane is frozen waiting on this very subprocess, so keystrokes
+    sent from here would queue behind the block. The runner owns the switch;
+    the hook's only job is the marker (its "you owe me a replay" handshake)
+    and the block itself.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    # The live model is read from the statusLine snapshot, never a config file.
+    (bridge_dir / "context.json").write_text(
+        json.dumps({"model": "databricks-claude-opus-4-8", "context_window_size": 200000}),
+        encoding="utf-8",
+    )
+    sent: dict[str, object] = {}
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> dict[str, object]:
+        sent.update({"url": url, "token": token, "body": body, "timeout": timeout})
+        return {
+            "action": "route",
+            "model": "databricks-claude-sonnet-5",
+            "rationale": "short lookup",
+            "terminal": True,
+        }
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _post)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "inject_slash_command",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("the hook must not drive tmux")),
+        raising=False,
+    )
+
+    exit_code = _run_route_turn(
+        bridge_dir,
+        {"hook_event_name": "UserPromptSubmit", "prompt": "what test runner is this?"},
+        monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert sent["url"] == "http://127.0.0.1:54321/v1/sessions/conv_active/route-turn"
+    assert sent["token"] == "turn-token"
+    assert sent["body"] == {
+        "harness": "claude-native",
+        "prompt": "what test runner is this?",
+        # Claude's payload carries no turn id, and a blocked prompt starts
+        # no turn for the replay to wait out.
+        "turn_id": None,
+        "model": "databricks-claude-opus-4-8",
+    }
+    assert (bridge_dir / MARKER_FILE).exists()
+    result = json.loads(captured.out)
+    assert result["decision"] == "block"
+    assert "databricks-claude-sonnet-5" in result["reason"]
+
+
+def test_route_turn_marks_a_terminal_allow_so_it_stops_asking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A terminal ``allow`` consumes the marker but never blocks the prompt.
+
+    That is the already-routed / already-pinned session: nothing will route
+    it again, so later prompts should not pay for the round trip.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_route_turn_post",
+        lambda *a, **k: {"action": "allow", "terminal": True, "rationale": "already routed"},
+    )
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+    assert (bridge_dir / MARKER_FILE).exists()
+
+
+def test_route_turn_keeps_asking_after_a_non_terminal_allow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-terminal ``allow`` leaves no marker.
+
+    Routing being off is not permanent — it can be toggled on before the
+    next prompt — so the hook must keep asking.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_route_turn_post",
+        lambda *a, **k: {"action": "allow", "terminal": False, "rationale": "routing is off"},
+    )
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
+def test_route_turn_does_not_block_when_the_marker_cannot_be_written(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    Without a marker on disk the prompt must run, not be blocked.
+
+    The marker is what tells the runner to replay. Blocking without one
+    would drop the user's prompt entirely.
+    """
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_route_turn_post",
+        lambda *a, **k: {"action": "route", "model": "databricks-claude-sonnet-5"},
+    )
+    monkeypatch.setattr(claude_native_hook, "_write_turn_routing_marker", lambda *_args: False)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_falls_back_to_the_bridges_active_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An advertisement with no session id uses the bridge's active session.
+
+    Claude's hook payload carries claude's own session id, never omnigent's,
+    so the bridge is the only other place the id can come from.
+    """
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir, session_id=None)
+    urls: list[str] = []
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> None:
+        urls.append(url)
+        return
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _post)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert urls == ["http://127.0.0.1:54321/v1/sessions/conv_active/route-turn"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"prompt": "   "},
+        {"prompt": 42},
+        {},
+    ],
+)
+def test_route_turn_no_ops_without_a_usable_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: dict[str, object],
+) -> None:
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_route_turn_post",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no prompt, no round trip")),
+    )
+
+    assert _run_route_turn(bridge_dir, payload, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_no_ops_without_an_advertisement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    No advertised endpoint means routing is not installed — fail open.
+    """
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_no_ops_when_the_endpoint_is_unreachable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A dead loopback endpoint lets the prompt run on the current model.
+
+    The real ``_route_turn_post`` is exercised here (nothing is listening on
+    the advertised port), so the fail-open path is the transport's own.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
+def test_route_turn_falls_open_on_the_ladders_own_request_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    The hook waits ``HOOK_REQUEST_TIMEOUT_S`` for a verdict, and no longer.
+
+    The user-visible cost of a wedged router: the typed prompt sits in the pane
+    until this expires. Asserted against the constant rather than a wall clock,
+    so the test pins the ladder instead of timing the machine it runs on.
+    """
+    from omnigent.runner.turn_routing import HOOK_REQUEST_TIMEOUT_S, MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    seen: list[float] = []
+
+    def _timed_out(url: str, token: str, body: object, timeout: float) -> None:
+        del url, token, body
+        seen.append(timeout)
+        return
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _timed_out)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert seen == [HOOK_REQUEST_TIMEOUT_S]
+    # Single digits: a fail-open the user waits half a minute for is blocking
+    # in practice, whatever the code path says.
+    # Must outlast a healthy route (catalog prep + router call), capped at the
+    # owner's 15s ceiling.
+    assert HOOK_REQUEST_TIMEOUT_S <= 15.0
+    # Nothing blocked and nothing marked, so the prompt ran.
+    assert capsys.readouterr().out == ""
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
+def test_build_hook_settings_registers_the_route_turn_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``UserPromptSubmit`` carries the ``route-turn`` command.
+
+    Without it a bare ``omnigent claude --smart-routing`` launch never routes:
+    nothing else can see a prompt typed straight into the TUI. It must ride
+    the same bridge dir the runner advertises into, name the harness, and
+    carry the timeout ladder's outermost budget.
+    """
+    from omnigent.runner.turn_routing import HARNESS_HOOK_TIMEOUT_S
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_rt", workspace=tmp_path)
+
+    settings = build_hook_settings(bridge_dir, turn_routing=True)
+    entries = [
+        hook
+        for group in settings["hooks"]["UserPromptSubmit"]
+        for hook in group["hooks"]
+        if "route-turn" in hook["command"]
+    ]
+    assert len(entries) == 1, "route-turn must be registered exactly once"
+    command = entries[0]["command"]
+    assert "omnigent.claude_native_hook" in command
+    assert str(bridge_dir) in command
+    assert "claude-native" in command
+    assert entries[0]["timeout"] == HARNESS_HOOK_TIMEOUT_S
+    # The spike scaffolding this replaced must be gone.
+    assert "spike-userprompt" not in json.dumps(settings)
+
+
+def test_route_turn_ignores_a_marker_another_session_left_in_the_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``/clear`` rotation hands this bridge dir to a NEW conversation.
+
+    ``_create_clear_replacement_session`` re-keys the superseded session onto
+    ``{id}-cleared`` and gives the new one the same live dir, which
+    ``prepare_bridge_dir`` does not wipe the marker from. A bare marker
+    therefore stopped every later conversation in the pane from routing its
+    first message.
+    """
+    from omnigent.runner.turn_routing import turn_routing_marker_session, write_turn_routing_marker
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    write_turn_routing_marker(bridge_dir, session_id="conv_superseded", decision_id="d0")
+    asked: list[str] = []
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> dict[str, object]:
+        del token, body, timeout
+        asked.append(url)
+        return {"action": "allow", "rationale": "already pinned", "terminal": True}
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _post)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert asked == ["http://127.0.0.1:54321/v1/sessions/conv_active/route-turn"]
+    # The terminal answer re-keys the marker onto THIS session, so its own
+    # later prompts still fast-skip.
+    assert turn_routing_marker_session(bridge_dir) == "conv_active"
+
+
+def test_build_hook_settings_omits_the_route_turn_hook_when_routing_is_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A session that cannot route registers no first-message routing hook.
+
+    Registered unconditionally, every submit of every claude-native session
+    paid the hook's routing round trip (25s worst case on a degraded server)
+    only to be told the session does not route. The forwarder's status hook and
+    the request-phase policy gate stay on ``UserPromptSubmit`` either way.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_off", bridge_id="bridge_off", workspace=tmp_path)
+
+    settings = build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+
+    commands = [
+        hook["command"]
+        for group in settings["hooks"]["UserPromptSubmit"]
+        for hook in group["hooks"]
+    ]
+    assert not any("route-turn" in command for command in commands)
+    assert any("evaluate-policy" in command for command in commands)
+    assert commands, "the forwarder's own UserPromptSubmit hooks must survive"
+
+
+def test_route_turn_follows_a_clear_rotation_onto_the_new_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    After ``/clear`` the hook asks — and marks — as the NEW conversation.
+
+    ``turn_router.json`` is written once at launch, so its session id goes
+    stale the moment ``_create_clear_replacement_session`` re-keys the pane.
+    Reading it made the replacement conversation ask (and fast-skip) under the
+    superseded session's id, so the marker the old session wrote silenced it
+    and its routing — had any happened — would have been pinned on the wrong
+    conversation. The bridge's active session is the live source, exactly as
+    the permission hook reads it.
+    """
+    from omnigent.runner.turn_routing import turn_routing_marker_session, write_turn_routing_marker
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir, session_id="conv_active")
+    # What the /clear rotation leaves behind: the old session's marker, and the
+    # bridge pointed at the replacement conversation.
+    write_turn_routing_marker(bridge_dir, session_id="conv_active", decision_id="d0")
+    write_active_session_id(bridge_dir, "conv_replacement")
+    urls: list[str] = []
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> dict[str, object]:
+        del token, body, timeout
+        urls.append(url)
+        return {"action": "allow", "rationale": "already pinned", "terminal": True}
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _post)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert urls == ["http://127.0.0.1:54321/v1/sessions/conv_replacement/route-turn"]
+    assert turn_routing_marker_session(bridge_dir) == "conv_replacement"

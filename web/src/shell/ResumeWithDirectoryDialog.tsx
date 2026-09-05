@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangleIcon, MonitorCloudIcon, GitBranchIcon, MonitorIcon } from "lucide-react";
+import { AlertTriangleIcon, GitBranchIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -20,72 +20,48 @@ import {
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { CliCommandBlock } from "./CliCommandBlock";
+import { HostLabel } from "./HostLabel";
 import { buildReconnectCommand } from "./ReconnectSessionDialog";
 import {
   isValidWorkspace,
   normalizeWorkspacePath,
   sessionsSharingDirectory,
 } from "./NewChatDialog";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { useHosts } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
 
 /**
- * Compact host label for the Select item — mirrors NewChatDialog's
- * HostOption (which is private to that module).
- */
-function HostLabel({ host }: { host: Host }) {
-  const isOnline = host.status === "online";
-  return (
-    <span className="flex items-center gap-2">
-      {host.name.toLowerCase().includes("cloud") ? (
-        <MonitorCloudIcon className="size-4 text-muted-foreground" />
-      ) : (
-        <MonitorIcon className="size-4 text-muted-foreground" />
-      )}
-      <span className="font-mono text-xs">{host.name}</span>
-      <span
-        className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${
-          isOnline ? "text-green-600" : "text-muted-foreground"
-        }`}
-      >
-        <span
-          className={`inline-block size-1.5 rounded-full ${isOnline ? "bg-green-500" : "bg-muted-foreground"}`}
-        />
-        {host.status}
-      </span>
-    </span>
-  );
-}
-
-/**
- * Dialog surfaced when the user tries to chat with an unbound *coding*
- * clone (a fork of a session that had a working directory — it carries
- * the ``omnigent.fork.source_id`` label). Unlike ``ResumeChatDialog``
- * (which only prints a CLI command), this binds the clone to a host +
- * directory in-app via ``POST /v1/hosts/{id}/runners`` (``launchRunner``)
- * and lets the runner start, after which ChatPage replays the queued
- * message.
+ * Dialog that binds an *unbound* session to a host + directory in-app via
+ * ``POST /v1/hosts/{id}/runners`` (``launchRunner``) and lets the runner
+ * start, after which ChatPage replays any queued message. Unlike
+ * ``ResumeChatDialog`` (which only prints a CLI command), this resumes the
+ * session from the browser. Serves two unbound cases:
  *
- * The picker prefills from the *source* session (same-user CUJ 1):
- * the source's host is the default, its workspace the default directory,
- * and — when the source used a git worktree — a branch is suggested so
- * the clone diverges onto its own worktree rather than fighting the
- * original over the same files.
+ * - **Fork clone** (``sourceSessionId`` set): a fork of a session that had a
+ *   working directory (``omnigent.fork.source_id`` label). Prefills from the
+ *   *source* session — its host is the default, its workspace the default
+ *   directory, and when it used a git worktree a branch is suggested so the
+ *   clone diverges onto its own worktree. When the source's host is offline
+ *   there's nothing to launch on, so it falls back to the CLI reconnect
+ *   command — the escape hatch ``ResumeChatDialog`` shows.
  *
- * When the source's host is offline there is no runner to launch, so the
- * dialog falls back to the CLI reconnect command (``omnigent connect``)
- * — the same escape hatch ``ResumeChatDialog`` shows.
+ * - **Host-less session** (no ``sourceSessionId``): an imported session with
+ *   no host/runner of its own. Prefills from ``prefill`` (the session's own
+ *   recorded workspace/host) and defaults the host to the caller's current
+ *   online machine, so the common case is one click.
  *
  * @param open - Whether the dialog is visible.
  * @param onOpenChange - Radix-controlled visibility setter.
- * @param sessionId - The unbound clone to bind, e.g. ``"conv_clone"``.
- * @param sourceSessionId - The source the clone was forked from
- *   (``omnigent.fork.source_id``); read for host/dir/branch prefill.
+ * @param sessionId - The unbound session to bind, e.g. ``"conv_abc"``.
+ * @param sourceSessionId - Fork source (``omnigent.fork.source_id``) read for
+ *   host/dir/branch prefill; ``null``/absent for a host-less session.
+ * @param prefill - Defaults for the host-less case (the session's own
+ *   host/workspace/branch). Ignored when ``sourceSessionId`` is set.
  * @param serverUrl - Origin for the CLI fallback command.
- * @param wrapper - The clone's ``omnigent.wrapper`` label (CLI fallback).
+ * @param wrapper - The session's ``omnigent.wrapper`` label (CLI fallback).
  * @param onBound - Called after a successful bind so the caller can
  *   replay the message the user was trying to send.
  */
@@ -94,6 +70,7 @@ export function ResumeWithDirectoryDialog({
   onOpenChange,
   sessionId,
   sourceSessionId,
+  prefill,
   serverUrl,
   wrapper,
   onBound,
@@ -101,19 +78,24 @@ export function ResumeWithDirectoryDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   sessionId: string;
-  sourceSessionId: string;
+  sourceSessionId?: string | null;
+  prefill?: { hostId?: string | null; workspace?: string | null; gitBranch?: string | null };
   serverUrl: string;
   wrapper?: string | null;
   onBound?: () => void;
 }) {
   const queryClient = useQueryClient();
 
+  // A fork clone prefills from its source session; a host-less session has no
+  // source and prefills from its own recorded fields instead.
+  const hasSource = sourceSessionId != null && sourceSessionId !== "";
+
   // Source session prefill (host/workspace/git_branch). Only fetch while
-  // the dialog is open.
+  // the dialog is open and we actually have a source.
   const { data: source, isLoading: sourceLoading } = useQuery({
     queryKey: ["session", sourceSessionId],
-    queryFn: () => getSessionSlim(sourceSessionId),
-    enabled: open,
+    queryFn: () => getSessionSlim(sourceSessionId as string),
+    enabled: open && hasSource,
   });
   const { data: hosts } = useHosts({ enabled: open });
 
@@ -124,6 +106,19 @@ export function ResumeWithDirectoryDialog({
   );
   const sourceHostOnline = sourceHost?.status === "online";
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
+
+  // Unified prefill: a fork reads its source session; a host-less session
+  // reads the ``prefill`` its own snapshot supplied.
+  const prefillWorkspace = hasSource ? source?.workspace : prefill?.workspace;
+  const prefillBranch = hasSource ? source?.gitBranch : prefill?.gitBranch;
+  // Default host: the source's host (fork, only if online — otherwise the CLI
+  // fallback fires) or, for a host-less session, its own recorded host when
+  // still online, else the caller's current (most-recent) online machine.
+  const defaultHostId = useMemo(() => {
+    if (hasSource) return sourceHostOnline ? sourceHostId : null;
+    const preferred = onlineHosts.find((h) => h.host_id === prefill?.hostId);
+    return (preferred ?? onlineHosts[0])?.host_id ?? null;
+  }, [hasSource, sourceHostOnline, sourceHostId, onlineHosts, prefill?.hostId]);
 
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState("");
@@ -136,27 +131,27 @@ export function ResumeWithDirectoryDialog({
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
-  // Prefill host = source host (when it is online) once both load.
+  // Prefill the host selection once the hosts (and source, if any) load.
   useEffect(() => {
-    if (open && selectedHostId === null && sourceHostId && sourceHostOnline) {
-      setSelectedHostId(sourceHostId);
+    if (open && selectedHostId === null && defaultHostId) {
+      setSelectedHostId(defaultHostId);
     }
-  }, [open, selectedHostId, sourceHostId, sourceHostOnline]);
+  }, [open, selectedHostId, defaultHostId]);
 
-  // Prefill the directory with the source's workspace.
+  // Prefill the directory with the session's recorded workspace.
   useEffect(() => {
-    if (open && workspace === "" && source?.workspace) {
-      setWorkspace(source.workspace);
+    if (open && workspace === "" && prefillWorkspace) {
+      setWorkspace(prefillWorkspace);
     }
-  }, [open, workspace, source?.workspace]);
+  }, [open, workspace, prefillWorkspace]);
 
   // When the source used a worktree, default the base ref to that branch
   // so the clone branches off where the original left work.
   useEffect(() => {
-    if (open && baseBranch === "" && source?.gitBranch) {
-      setBaseBranch(source.gitBranch);
+    if (open && baseBranch === "" && prefillBranch) {
+      setBaseBranch(prefillBranch);
     }
-  }, [open, baseBranch, source?.gitBranch]);
+  }, [open, baseBranch, prefillBranch]);
 
   // Reset transient state when the dialog closes.
   function handleOpenChange(next: boolean): void {
@@ -254,25 +249,36 @@ export function ResumeWithDirectoryDialog({
   // flashing the CLI fallback for an online source host would be wrong.
   const hostsLoaded = hosts !== undefined;
   const showCliFallback = !sourceLoading && hostsLoaded && source != null && !sourceHostOnline;
+  const loading = (hasSource && sourceLoading) || !hostsLoaded;
+  // Host-less sessions have no source host to reconnect, so there's no CLI
+  // fallback: when the caller owns no online machine, say so plainly.
+  const noOnlineHosts = !hasSource && hostsLoaded && onlineHosts.length === 0;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent data-testid="resume-dir-dialog" className="flex flex-col gap-4 sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Resume this session</DialogTitle>
+          <DialogTitle>{hasSource ? "Resume this session" : "Resume on a machine"}</DialogTitle>
           <DialogDescription>
-            This clone hasn't picked a working directory yet. Choose a host and directory to
-            continue the conversation against your files.
+            {hasSource
+              ? "This clone hasn't picked a working directory yet. Choose a host and directory to continue the conversation against your files."
+              : "This session isn't running on any machine. Pick one of your machines and a directory to continue the conversation against your files."}
           </DialogDescription>
         </DialogHeader>
 
-        {sourceLoading || !hostsLoaded ? (
-          <p className="text-xs text-muted-foreground" data-testid="resume-dir-loading">
-            Loading the original session's directory…
+        {loading ? (
+          <p className="text-sm text-muted-foreground" data-testid="resume-dir-loading">
+            {hasSource ? "Loading the original session's directory…" : "Loading your machines…"}
+          </p>
+        ) : noOnlineHosts ? (
+          <p className="text-sm text-muted-foreground" data-testid="resume-dir-no-hosts">
+            None of your machines are online. Start one with{" "}
+            <code className="rounded bg-muted px-1 py-0.5 font-mono">omnigent host</code> from your
+            terminal, then reopen this dialog.
           </p>
         ) : showCliFallback ? (
           <div className="flex flex-col gap-2" data-testid="resume-dir-cli-fallback">
-            <p className="text-xs text-muted-foreground">
+            <p className="text-sm text-muted-foreground">
               The original session's host is offline, so there's nothing to launch a runner on.
               Reconnect it from your terminal — then send your message again to pick a directory.
             </p>
@@ -293,9 +299,9 @@ export function ResumeWithDirectoryDialog({
         ) : (
           <>
             <div className="flex flex-col gap-2">
-              <span className="text-xs font-medium text-muted-foreground">Host</span>
+              <span className="text-sm font-medium text-muted-foreground">Host</span>
               <Select value={selectedHostId ?? ""} onValueChange={(v) => setSelectedHostId(v)}>
-                <SelectTrigger className="w-full text-xs" data-testid="resume-dir-host-select">
+                <SelectTrigger className="w-full text-sm" data-testid="resume-dir-host-select">
                   <SelectValue placeholder="Select a host" />
                 </SelectTrigger>
                 <SelectContent>
@@ -313,7 +319,7 @@ export function ResumeWithDirectoryDialog({
             </div>
 
             <div className="flex flex-col gap-2">
-              <span className="text-xs font-medium text-muted-foreground">Working directory</span>
+              <span className="text-sm font-medium text-muted-foreground">Working directory</span>
               {selectedHostId ? (
                 <>
                   <WorkspacePathField
@@ -339,7 +345,7 @@ export function ResumeWithDirectoryDialog({
                   )}
                   {showConflictHint && (
                     <p
-                      className="flex items-start gap-1.5 text-xs text-warning"
+                      className="flex items-start gap-1.5 text-sm text-warning"
                       data-testid="resume-dir-conflict-hint"
                     >
                       <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
@@ -354,7 +360,7 @@ export function ResumeWithDirectoryDialog({
                   )}
                   {showMismatchWarning && (
                     <p
-                      className="flex items-start gap-1.5 text-xs text-warning"
+                      className="flex items-start gap-1.5 text-sm text-warning"
                       data-testid="resume-dir-mismatch-warning"
                     >
                       <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
@@ -366,7 +372,7 @@ export function ResumeWithDirectoryDialog({
                   )}
                 </>
               ) : (
-                <p className="text-xs text-muted-foreground">
+                <p className="text-sm text-muted-foreground">
                   Select a host to choose a directory.
                 </p>
               )}
@@ -375,7 +381,7 @@ export function ResumeWithDirectoryDialog({
             <div className="flex flex-col gap-1">
               <label
                 htmlFor="resume-dir-branch"
-                className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"
+                className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground"
               >
                 <GitBranchIcon className="size-3.5" />
                 Git worktree (optional)
@@ -387,7 +393,7 @@ export function ResumeWithDirectoryDialog({
                 onChange={(e) => setBranchName(e.target.value)}
                 placeholder="feature/my-branch"
                 data-testid="resume-dir-branch-input"
-                className="rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
+                className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
               />
               {branchName.trim() !== "" && (
                 <input
@@ -398,10 +404,10 @@ export function ResumeWithDirectoryDialog({
                   placeholder="Base branch (defaults to the current branch)"
                   aria-label="Base branch"
                   data-testid="resume-dir-base-branch-input"
-                  className="rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
+                  className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
                 />
               )}
-              <p className="text-xs text-muted-foreground">
+              <p className="text-sm text-muted-foreground">
                 Creates a git worktree for a new branch in an isolated directory — keeps the clone
                 from fighting the original over the same files. Leave blank to start in the picked
                 directory.
@@ -409,7 +415,7 @@ export function ResumeWithDirectoryDialog({
             </div>
 
             {error !== null && (
-              <p className="text-xs text-destructive" data-testid="resume-dir-error">
+              <p className="text-sm text-destructive" data-testid="resume-dir-error">
                 {error}
               </p>
             )}
@@ -417,10 +423,11 @@ export function ResumeWithDirectoryDialog({
             <DialogFooter>
               <Button
                 data-testid="resume-dir-bind-button"
-                disabled={!selectedHostId || !workspaceValid || submitting}
+                loading={submitting}
+                disabled={!selectedHostId || !workspaceValid}
                 onClick={handleBind}
               >
-                {submitting ? "Starting…" : "Start session"}
+                Start session
               </Button>
             </DialogFooter>
           </>

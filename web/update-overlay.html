@@ -14,6 +14,12 @@
         background: transparent;
         overflow: hidden;
       }
+
+      /* Keep the card and its shadow off the transparent window boundary.
+         Empty overlays stay at zero height so the shell remains click-through. */
+      #update-overlay-root:not(:empty) {
+        padding: 12px;
+      }
     </style>
   </head>
   <body>

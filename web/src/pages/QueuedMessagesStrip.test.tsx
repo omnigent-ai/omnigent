@@ -5,6 +5,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { QueuedMessage } from "@/store/chatStore";
 import { QueuedMessagesStrip } from "./QueuedMessagesStrip";
 
@@ -78,18 +79,46 @@ describe("QueuedMessagesStrip", () => {
   it("calls onSteer with the row's queueId when its steer button is clicked", () => {
     const onSteer = vi.fn();
     render(
-      <QueuedMessagesStrip
-        messages={[msg("q_1", "first"), msg("q_2", "second")]}
-        onDelete={vi.fn()}
-        onEdit={vi.fn()}
-        onSteer={onSteer}
-      />,
+      <TooltipProvider>
+        <QueuedMessagesStrip
+          messages={[msg("q_1", "first"), msg("q_2", "second")]}
+          onDelete={vi.fn()}
+          onEdit={vi.fn()}
+          onSteer={onSteer}
+        />
+      </TooltipProvider>,
     );
     const buttons = screen.getAllByRole("button", { name: "Send queued message now" });
     expect(buttons).toHaveLength(2);
     fireEvent.click(buttons[1]!);
     expect(onSteer).toHaveBeenCalledTimes(1);
     expect(onSteer).toHaveBeenCalledWith("q_2");
+  });
+
+  it("gives every row action a 44px mobile tap target with a larger icon", () => {
+    render(
+      <TooltipProvider>
+        <QueuedMessagesStrip
+          messages={[msg("q_1", "first")]}
+          onDelete={vi.fn()}
+          onEdit={vi.fn()}
+          onSteer={vi.fn()}
+          onReorder={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+    for (const name of [
+      "Reorder queued message",
+      "Send queued message now",
+      "Edit queued message",
+      "Remove queued message",
+    ]) {
+      const button = screen.getByRole("button", { name });
+      // Mobile branch: a >=44px hit area (size-11) around a bigger icon, so
+      // the control is reliably tappable on a phone.
+      expect(button, name).toHaveClass("max-md:size-11");
+      expect(button.querySelector("svg"), name).toHaveClass("max-md:size-5");
+    }
   });
 
   it("shows a drag handle per row only when onReorder is provided", () => {

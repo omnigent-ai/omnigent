@@ -12,13 +12,20 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, TypedDict
 
 from omnigent.llms.adapters._content import parse_data_uri
 from omnigent.llms.adapters.base import BaseAdapter
 
 # Default connect timeout: 30s to establish TCP connection.
 _BOTO_CONNECT_TIMEOUT = 30
+
+
+class _BotoClientKwargs(TypedDict, total=False):
+    region_name: str
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_session_token: str
 
 
 # Bedrock Converse API ``document.format`` accepts a fixed enum:
@@ -90,15 +97,16 @@ def _boto_config(
     """
     from botocore.config import Config
 
-    retries = (
-        {"max_attempts": max_retries, "mode": "adaptive"}
-        if max_retries is not None
-        else {"max_attempts": 0}
-    )
+    if max_retries is not None:
+        return Config(
+            connect_timeout=_BOTO_CONNECT_TIMEOUT,
+            read_timeout=read_timeout,
+            retries={"max_attempts": max_retries, "mode": "adaptive"},
+        )
     return Config(
         connect_timeout=_BOTO_CONNECT_TIMEOUT,
         read_timeout=read_timeout,
-        retries=retries,
+        retries={"max_attempts": 0},
     )
 
 
@@ -132,7 +140,7 @@ class BedrockAdapter(BaseAdapter):
         """
         import boto3
 
-        boto_kwargs: dict[str, str] = {}
+        boto_kwargs: _BotoClientKwargs = {}
         if connection_params:
             if region := connection_params.get("aws_region"):
                 boto_kwargs["region_name"] = region

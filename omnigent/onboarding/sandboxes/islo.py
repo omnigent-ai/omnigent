@@ -45,6 +45,7 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxLauncher,
     host_image_wheel_install_command,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 API_BASE_URL_ENV_VAR: str = "ISLO_BASE_URL"
 """Optional Islo API base URL override. Defaults to
@@ -182,6 +183,19 @@ def _load_islo_sdk() -> _IsloSDK:
 
 class _IsloClient:
     """Small synchronous adapter around the Islo Python SDK."""
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            cli_bootstrap=True,
+            managed_launch=True,
+            local_port_forward=False,
+            resume_stopped=True,
+            programmatic_terminate=True,
+            file_copy=True,
+            streaming_exec=True,
+            foreground_exec=True,
+        )
 
     def __init__(self, *, base_url: str, api_key: str) -> None:
         sdk = _load_islo_sdk()
@@ -524,6 +538,7 @@ class IsloSandboxLauncher(SandboxLauncher):
         repo_url: str | None = None,
         repo_branch: str | None = None,
         repo_name: str | None = None,
+        host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """Stop any memory-preserved host daemon, then start with a fresh token."""
@@ -537,6 +552,7 @@ class IsloSandboxLauncher(SandboxLauncher):
             repo_url=repo_url,
             repo_branch=repo_branch,
             repo_name=repo_name,
+            host_config=host_config,
             on_stage=on_stage,
         )
 

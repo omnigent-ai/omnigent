@@ -4,6 +4,7 @@ import {
   readDefaultWorkspacePanelOpen,
   readWorkspacePanelDefault,
   WORKSPACE_PANEL_DEFAULT,
+  writeDefaultWorkspacePanelOpen,
   writeWorkspacePanelDefault,
 } from "./workspacePanelPreferences";
 
@@ -16,6 +17,16 @@ afterEach(() => {
 describe("workspacePanelPreferences — read/write", () => {
   it("returns open when nothing is stored", () => {
     expect(readWorkspacePanelDefault()).toBe(WORKSPACE_PANEL_DEFAULT);
+    expect(readDefaultWorkspacePanelOpen()).toBe(true);
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  it("records the rail's visibility from the collapse/expand toggle", () => {
+    writeDefaultWorkspacePanelOpen(false);
+    expect(readDefaultWorkspacePanelOpen()).toBe(false);
+    expect(localStorage.getItem(STORAGE_KEY)).toBe("collapsed");
+
+    writeDefaultWorkspacePanelOpen(true);
     expect(readDefaultWorkspacePanelOpen()).toBe(true);
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
   });

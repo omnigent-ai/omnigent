@@ -8,8 +8,16 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from omnigent.server.smart_routing import RoutingClient
+    from omnigent.server.routing_backend import RoutingBackends
+    from omnigent.server.smart_routing import RoutingClient, RoutingSettings
     from omnigent.spec.types import LLMConfig, PolicySpec
+
+
+def _default_routing_settings() -> RoutingSettings:
+    """Build the default :class:`RoutingSettings` (imported lazily)."""
+    from omnigent.server.smart_routing import RoutingSettings
+
+    return RoutingSettings()
 
 
 @dataclass
@@ -56,6 +64,21 @@ class RuntimeCaps:
         LLM call is billed to the request caller rather than a
         static service-level credential. ``None`` falls back to the
         ``llm``-config-resolved connection.
+    :param routing_client: This deployment's primary/default routing
+        client — the same object as ``routing_backends.any()`` when both
+        are set. Every legacy consumer reads it, so it stays the single
+        answer to "is routing configured at all".
+    :param routing_backends: The external and built-in routing clients
+        as a pair, so a call whose harness is not AI-Gateway-backed can
+        still be served by the built-in judge
+        (:func:`~omnigent.server.routing_backend.select_router`).
+        Managed deployments that supply their own client should set this
+        explicitly: absent it the pair is derived from
+        :attr:`routing_client` by ``isinstance``, which classifies an
+        unrecognized client as the OSS judge. That default is safe — it
+        costs only a badge on the decision chip, whereas claiming a
+        custom client is gateway-backed would promise reachability
+        nobody verified.
     """
 
     execution_timeout: int = 7200
@@ -78,3 +101,13 @@ class RuntimeCaps:
     # Managed deployments can supply a different implementation (e.g.
     # a rules engine or remote service).  ``None`` disables routing.
     routing_client: RoutingClient | None = None
+    # Both routing backends, so each call can pick the one that can serve it:
+    # the external client's picks are AI-Gateway catalog ids, so it only serves
+    # gateway-backed harnesses, while the built-in judge serves any. ``None``
+    # derives the pair from ``routing_client`` by type.
+    routing_backends: RoutingBackends | None = None
+    # Routing knobs parsed from the ``routing:`` block of the server --config
+    # YAML (router name, extraction model, scenario menus, subagent fail mode).
+    # Always present so consumers read one value object instead of re-parsing
+    # config; the defaults describe an unconfigured deployment.
+    routing_settings: RoutingSettings = field(default_factory=_default_routing_settings)

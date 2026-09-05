@@ -1,3 +1,5 @@
+import type * as GoalApiModule from "@/lib/goalApi";
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GoalDialog, parseGoalBudget } from "./GoalDialog";
@@ -5,7 +7,7 @@ import type { Goal } from "@/lib/goalApi";
 import { clearGoal, getGoal, setGoal, updateGoalStatus } from "@/lib/goalApi";
 
 vi.mock("@/lib/goalApi", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/goalApi")>();
+  const actual = await importOriginal<typeof GoalApiModule>();
   return {
     ...actual,
     clearGoal: vi.fn(),

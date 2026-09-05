@@ -44,7 +44,7 @@ export function SystemMessageView({ message }: SystemMessageViewProps) {
 
   return (
     <div
-      className="my-1 flex flex-col items-center gap-1 text-muted-foreground text-xs"
+      className="my-1 flex flex-col items-center gap-1 text-muted-foreground text-sm"
       data-testid="system-message"
       data-system-kind={message.kind}
     >
@@ -72,7 +72,7 @@ export function SystemMessageView({ message }: SystemMessageViewProps) {
         </div>
       )}
       {hasBody && open && (
-        <div className="mt-0.5 max-h-64 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-muted px-3 py-2 text-left text-xs text-muted-foreground">
+        <div className="mt-0.5 max-h-64 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-muted px-3 py-2 text-left text-sm text-muted-foreground">
           {message.body}
         </div>
       )}

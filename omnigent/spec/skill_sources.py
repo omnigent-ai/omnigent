@@ -17,7 +17,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import cast
 
 from omnigent.errors import OmnigentError
 from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
@@ -25,7 +25,12 @@ from omnigent.spec.types import SkillSpec
 
 _log = logging.getLogger(__name__)
 
-_SKILL_FAMILIES = frozenset({"claude", "codex", "cursor", "pi"})
+_SKILL_FAMILIES = frozenset({"claude", "codex", "cursor", "pi", "antigravity"})
+
+# The bare ``antigravity`` harness is the in-process Gemini SDK executor, NOT the
+# agy CLI. It never launches agy, so ~/.gemini plugin/builtin skills are not its
+# skills — it keeps the generic walk, whose skills omnigent resolves+injects.
+_ANTIGRAVITY_SDK_HARNESS = "antigravity"
 
 
 def _harness_family(harness: str | None) -> str | None:
@@ -49,9 +54,16 @@ def _harness_family(harness: str | None) -> str | None:
     # SDK harness flows in as ``claude_sdk`` (canonicalize_harness leaves it
     # unchanged), and without this it would miss the ``claude`` family and
     # silently lose plugin slash-commands.
-    parts = harness.replace("_", "-").split("-")
+    normalized = harness.replace("_", "-")
+    parts = normalized.split("-")
     base = parts[1] if parts[0] == "native" and len(parts) > 1 else parts[0]
-    return base if base in _SKILL_FAMILIES else None
+    if base not in _SKILL_FAMILIES:
+        return None
+    # Unlike claude (where SDK and native share ~/.claude), antigravity's two
+    # harnesses are different runtimes: only the agy CLI reads ~/.gemini.
+    if base == _ANTIGRAVITY_SDK_HARNESS and normalized == _ANTIGRAVITY_SDK_HARNESS:
+        return None
+    return base
 
 
 @dataclass(frozen=True)
@@ -118,13 +130,15 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
     return [s for s in _dedup(provider(ctx)) if s.user_invocable]
 
 
-def _read_json(path: Path) -> dict[str, Any] | None:
-    """Best-effort JSON read; ``None`` on missing/unreadable/non-dict."""
+def _read_json(path: Path) -> dict[str, object] | None:
+    """Best-effort JSON read; ``None`` unless it is a string-keyed object."""
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict) or not all(isinstance(key, str) for key in data):
+        return None
+    return cast(dict[str, object], data)
 
 
 def _enabled_plugin_settings_files(ctx: SkillSourceContext) -> list[Path]:
@@ -373,6 +387,121 @@ def cursor_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return out
 
 
+def _agy_skill_dirs(ctx: SkillSourceContext) -> list[tuple[Path, str | None]]:
+    """
+    agy's skill directories with their namespace, in discovery order.
+
+    The five sources agy's own ``/skills`` panel lists (live-verified, agy
+    1.1.9 — the panel prints these paths verbatim)::
+
+        <workspace>/.agents/skills/<skill>/SKILL.md          "Workspace"
+        ~/.gemini/antigravity-cli/skills/<skill>/SKILL.md    "Global"
+        ~/.gemini/skills/<skill>/SKILL.md                    "Shared"
+        ~/.gemini/config/plugins/<plugin>/skills/<skill>/…   imported plugins
+        ~/.gemini/antigravity-cli/builtin/skills/<skill>/…   shipped builtins
+
+    Only plugin skills are namespaced — agy registers them as
+    ``<plugin>:<skill>`` and its TUI accepts only that spelling; every other
+    source is bare. The workspace source is ``.agents/skills`` (vendor-neutral),
+    NOT ``.claude/skills``: that is the one directory the old generic fallback
+    got right for agy.
+
+    A plugin is ENABLED iff it still carries ``plugin.json``: ``agy plugin
+    disable`` renames that file to ``plugin.json.disabled`` and changes nothing
+    else — ``config/import_manifest.json`` keeps listing the plugin (so does
+    ``agy plugin list``) and the ``skills/`` tree stays on disk. The manifest is
+    therefore NOT a usable enabled-signal; the manifest file's name is.
+
+    :param ctx: Session discovery context. ``home`` is the real user home, which
+        is truthful for every source above even though agy runs under a
+        bridge-owned ``--gemini_dir``: the plugin, Global and Shared trees are
+        linked back to the real home by ``_seed_isolated_agy_plugins`` /
+        ``_seed_isolated_agy_skills``; the workspace tree is not under the Gemini
+        dir at all; and agy recreates its builtins in whatever Gemini dir it is
+        launched with. Anything listed here therefore resolves in-session — a
+        menu entry agy could not expand would just fail, since a native session
+        sends ``/name`` to the CLI as plaintext.
+    :returns: ``(directory, namespace)`` pairs; ``namespace`` is ``None`` for
+        every source except plugins.
+    """
+    gemini = ctx.home / ".gemini"
+    dirs: list[tuple[Path, str | None]] = []
+    for root in ctx.roots:
+        workspace_skills = root / ".agents" / "skills"
+        if workspace_skills.is_dir():
+            dirs.append((workspace_skills, None))
+    for bare in (
+        gemini / "antigravity-cli" / "skills",
+        gemini / "skills",
+    ):
+        if bare.is_dir():
+            dirs.append((bare, None))
+    plugins_root = gemini / "config" / "plugins"
+    try:
+        plugins = sorted(plugins_root.iterdir()) if plugins_root.is_dir() else []
+    except OSError as exc:
+        # An unreadable plugins dir must not 500 the /skills endpoint.
+        _log.warning("Skipping unreadable agy plugins dir %s: %s", plugins_root, exc)
+        plugins = []
+    for plugin in plugins:
+        if not (plugin / "plugin.json").is_file():
+            continue  # absent or renamed to plugin.json.disabled
+        skills_dir = plugin / "skills"
+        if skills_dir.is_dir():
+            dirs.append((skills_dir, plugin.name))
+    builtin = gemini / "antigravity-cli" / "builtin" / "skills"
+    if builtin.is_dir():
+        dirs.append((builtin, None))
+    return dirs
+
+
+def antigravity_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+    """
+    agy's own skills: enabled ``~/.gemini`` plugins plus shipped builtins.
+
+    agy owns a host-skill mechanism (a ``/skills`` TUI listing backed by
+    :func:`_agy_skill_dirs`), and unlike Pi's that mechanism is enumerable — so
+    agy gets a real provider rather than a no-op. It deliberately does NOT
+    compose with :func:`_generic_host_skills` (the way ``claude`` does): the
+    generic walk sources ``~/.claude/skills``, which are Claude's, not agy's.
+    The menu lists what this agent actually has, matching codex/cursor.
+
+    Honors ``skills_filter`` (``"none"`` hermetic, ``"all"`` everything, a list
+    selecting by the surfaced name). Names match what agy's TUI accepts —
+    ``<plugin>:<skill>`` for plugin skills, bare elsewhere — because a native
+    session's ``/name`` is sent to the vendor CLI as plaintext for it to expand
+    (there is no server-side resolve+inject on this path), so a label agy does
+    not recognise would simply fail.
+
+    :param ctx: Session discovery context.
+    :returns: Parsed skills; unparseable ones are skipped (best-effort).
+    """
+    if ctx.skills_filter == "none":
+        return []
+    filter_names: set[str] | None = (
+        set(ctx.skills_filter) if isinstance(ctx.skills_filter, list) else None
+    )
+    out: list[SkillSpec] = []
+    for skills_dir, namespace in _agy_skill_dirs(ctx):
+        try:
+            children = sorted(skills_dir.iterdir())
+        except OSError as exc:
+            _log.warning("Skipping unreadable agy skills dir %s: %s", skills_dir, exc)
+            continue
+        for child in children:
+            if not child.is_dir() or not (child / "SKILL.md").is_file():
+                continue
+            try:
+                spec = _parse_skill(child / "SKILL.md")
+            except (OmnigentError, OSError):  # best-effort discovery
+                continue
+            name = spec.name if namespace is None else f"{namespace}:{spec.name}"
+            if filter_names is not None and name not in filter_names:
+                continue
+            out.append(spec if namespace is None else replace(spec, name=name))
+    return out
+
+
 def pi_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
     Pi exposes no *extra* discoverable skills to the menu.
@@ -402,14 +531,25 @@ def pi_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
 
 # Keyed by harness family (see _harness_family). A harness with no entry
-# (antigravity, qwen, openai-agents, …) falls through to _generic_host_skills
-# in resolve_harness_skills — the unchanged pre-existing ~/.claude/skills walk,
-# whose skills omnigent resolves+injects regardless of vendor. Pi is the one
-# harness that needs an explicit no-op (see pi_host_skills) because it owns a
-# host-skill mechanism omnigent can't enumerate.
+# (qwen, openai-agents, the in-process antigravity SDK, …) falls through to
+# _generic_host_skills in resolve_harness_skills — the ~/.claude/skills walk,
+# whose skills omnigent resolves+injects regardless of vendor.
+#
+# The dividing line is whether the harness owns a host-skill mechanism, and if
+# so whether omnigent can enumerate it:
+#
+#   no mechanism            -> generic walk (omnigent injects the skill text)
+#   mechanism, enumerable   -> dedicated provider listing what the agent has
+#                              (claude, codex, cursor, antigravity/agy)
+#   mechanism, unenumerable -> explicit no-op (pi) — listing anything would
+#                              risk surfacing a command the harness can't run
+#
+# agy moved from the first row to the second when it gained plugin + builtin
+# skills; it is enumerable (see antigravity_host_skills), so it lists its own.
 _SKILL_SOURCES: dict[str | None, SkillSource] = {
     "claude": claude_host_skills,
     "codex": codex_host_skills,
     "cursor": cursor_host_skills,
     "pi": pi_host_skills,
+    "antigravity": antigravity_host_skills,
 }

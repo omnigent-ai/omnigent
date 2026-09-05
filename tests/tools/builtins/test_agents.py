@@ -94,7 +94,8 @@ class TestSysAgentListTool:
         func = schema["function"]
         assert func["name"] == "sys_agent_list"
         params = func["parameters"]
-        assert params["properties"] == {}
+        assert "default" not in params["properties"]["limit"]
+        assert params["properties"]["cursor"]["type"] == "string"
         assert params.get("additionalProperties") is False
 
     def test_invoke_raises(self) -> None:

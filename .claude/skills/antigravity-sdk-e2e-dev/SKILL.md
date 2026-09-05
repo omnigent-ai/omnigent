@@ -146,7 +146,7 @@ streaming, harness.
 
 ```bash
 # Unit tests (use --frozen; the cwsandbox extra is unsatisfiable on public PyPI here)
-uv run --frozen --extra dev python -m pytest \
+uv run --frozen --group test python -m pytest \
   tests/inner/test_antigravity_executor.py \
   tests/inner/test_antigravity_harness.py \
   tests/runtime/test_antigravity_spawn_env.py \

@@ -54,29 +54,29 @@ function writeSeenMap(map: SeenMap): void {
 // getSnapshot returns a referentially-equal Set while the stored value
 // is unchanged (useSyncExternalStore requires a stable snapshot), yet
 // self-heals when storage changes underneath (another tab, test reset).
-let _cachedRaw: string | null = null;
-let _cachedSet: ReadonlySet<string> = new Set();
-const _listeners = new Set<() => void>();
+let cachedRaw: string | null = null;
+let cachedSet: ReadonlySet<string> = new Set();
+const listeners = new Set<() => void>();
 
 /** Current set of seen comment ids, as persisted in localStorage. */
 export function getSeenCommentIds(): ReadonlySet<string> {
-  if (typeof window === "undefined") return _cachedSet;
+  if (typeof window === "undefined") return cachedSet;
   let raw: string | null = null;
   try {
     raw = window.localStorage.getItem(STORAGE_KEY);
   } catch {
     // Access errors (e.g. disabled storage) fall through to the cache.
   }
-  if (raw !== _cachedRaw) {
-    _cachedRaw = raw;
-    _cachedSet = new Set(Object.keys(readSeenMap()));
+  if (raw !== cachedRaw) {
+    cachedRaw = raw;
+    cachedSet = new Set(Object.keys(readSeenMap()));
   }
-  return _cachedSet;
+  return cachedSet;
 }
 
 function subscribe(listener: () => void): () => void {
-  _listeners.add(listener);
-  // Same-tab writes notify through _listeners (markCommentsSeen).
+  listeners.add(listener);
+  // Same-tab writes notify through listeners (markCommentsSeen).
   // Writes from OTHER tabs only surface as the window `storage` event
   // (the browser fires it in every tab except the writer) — without
   // this, an inbox tab keeps listing a comment that a second tab's
@@ -88,7 +88,7 @@ function subscribe(listener: () => void): () => void {
   };
   window.addEventListener("storage", onStorage);
   return () => {
-    _listeners.delete(listener);
+    listeners.delete(listener);
     window.removeEventListener("storage", onStorage);
   };
 }
@@ -117,7 +117,7 @@ export function markCommentsSeen(commentIds: string[]): void {
   } else {
     writeSeenMap(map);
   }
-  _listeners.forEach((listener) => listener());
+  listeners.forEach((listener) => listener());
 }
 
 /** Reactive set of seen comment ids (current tab + persisted). */

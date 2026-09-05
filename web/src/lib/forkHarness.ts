@@ -39,12 +39,15 @@ export function harnessFamily(
     case "openai-agents-sdk":
     case "agents_sdk":
       return "openai";
-    // Antigravity is Gemini-family: the native CLI (`antigravity-native`)
-    // and the in-process SDK (`antigravity`, plus reversed spellings) all
+    // Antigravity is Gemini-family: the native CLI (`antigravity-native`, `agy-native`)
+    // and the in-process SDK (`antigravity`, `agy`, plus reversed spellings) all
     // consume Gemini models.
     case "antigravity-native":
     case "native-antigravity":
+    case "agy-native":
+    case "native-agy":
     case "antigravity":
+    case "agy":
       return "gemini";
     default:
       return null;
@@ -59,7 +62,7 @@ export function harnessFamily(
  * server gates in `_FORK_HISTORY_NATIVE_HARNESSES` /
  * `_CURSOR_FORK_HISTORY_HARNESSES` (`server/routes/sessions.py`). A native
  * harness that always starts fresh (e.g. goose-native) is intentionally absent
- * so the picker doesn't promise history it would drop. Both native-antigravity
+ * so the picker doesn't promise history it would drop. All native-antigravity
  * spellings are included (the in-process `antigravity` SDK harness is NOT
  * native); qwen-native rebuilds qwen's on-disk chat recording from the copied
  * Omnigent items (see `write_qwen_session_recording`).
@@ -76,6 +79,8 @@ export function isNativeHarness(harness: string | null | undefined): boolean {
     harness === "native-pi" ||
     harness === "antigravity-native" ||
     harness === "native-antigravity" ||
+    harness === "agy-native" ||
+    harness === "native-agy" ||
     harness === "qwen-native" ||
     harness === "native-qwen"
   );

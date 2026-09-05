@@ -121,7 +121,46 @@ def test_dispatch_by_runtime_claude_native_remote_routes_to_wrapper(
     # Trailing slash stripped — the wrapper expects a bare base URL.
     assert captured["server"] == "https://example.com"
     # No leaking claude args; the wrapper builds its own.
-    assert captured["claude_args"] == ()
+    assert captured["extra_args"] == ()
+
+
+def test_dispatch_by_runtime_opencode_native_routes_to_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opencode-native resume routes through the seam to ``run_opencode_native``.
+
+    Regression for the seam's coverage expansion: the old hand-written
+    ``if native_agent.key == "<x>"`` chain covered 10 harnesses but *not*
+    ``opencode``, so an opencode-native resume fell through to the Omnigent
+    REPL and double-posted each turn (the same latent bug the chat-redirect
+    path had). Routing through ``resolve_hook_for_key`` covers all 11; this
+    pins that opencode now reaches its wrapper.
+    """
+    monkeypatch.setattr(
+        resume_dispatch,
+        "_read_wrapper_label_remote",
+        lambda *, server, conv_id: "opencode-native-ui",
+    )
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> None:
+        """
+        Record the kwargs ``run_opencode_native`` was called with.
+
+        :param kwargs: Wrapper kwargs.
+        """
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.opencode_native.run_opencode_native", _capture)
+
+    resume_dispatch._dispatch_by_runtime(
+        target="4e92b5a0c0ee6db3f874f9c4a3f855a5",
+        server="https://example.com/",
+    )
+
+    assert captured["session_id"] == "4e92b5a0c0ee6db3f874f9c4a3f855a5"
+    assert captured["server"] == "https://example.com"
+    assert captured["extra_args"] == ()
 
 
 def test_dispatch_by_runtime_codex_native_remote_routes_to_wrapper(
@@ -158,7 +197,7 @@ def test_dispatch_by_runtime_codex_native_remote_routes_to_wrapper(
 
     assert captured["session_id"] == "4e92b5a0c0ee6db3f874f9c4a3f855a5"
     assert captured["server"] == "https://example.com"
-    assert captured["codex_args"] == ()
+    assert captured["extra_args"] == ()
 
 
 def test_dispatch_by_runtime_codex_native_local_routes_to_wrapper(
@@ -195,7 +234,7 @@ def test_dispatch_by_runtime_codex_native_local_routes_to_wrapper(
 
     assert captured["session_id"] == "415c9954e2fe4b9276083a4d2c66f689"
     assert captured["server"] is None
-    assert captured["codex_args"] == ()
+    assert captured["extra_args"] == ()
 
 
 def test_dispatch_by_runtime_kiro_native_remote_routes_to_wrapper(
@@ -221,7 +260,7 @@ def test_dispatch_by_runtime_kiro_native_remote_routes_to_wrapper(
 
     assert captured["session_id"] == "823dbd1aab969b5a813fac59bb977a77"
     assert captured["server"] == "https://example.com"
-    assert captured["kiro_args"] == ()
+    assert captured["extra_args"] == ()
 
 
 def test_dispatch_by_runtime_antigravity_native_remote_routes_to_wrapper(
@@ -262,7 +301,7 @@ def test_dispatch_by_runtime_antigravity_native_remote_routes_to_wrapper(
 
     assert captured["session_id"] == "a8bcbee631c58ddb98fb5e3f54a1592a"
     assert captured["server"] == "https://example.com"
-    assert captured["antigravity_args"] == ()
+    assert captured["extra_args"] == ()
 
 
 def test_dispatch_by_runtime_antigravity_native_local_routes_to_wrapper(
@@ -299,7 +338,7 @@ def test_dispatch_by_runtime_antigravity_native_local_routes_to_wrapper(
 
     assert captured["session_id"] == "e85224ee39457def1d20bcce5b74ed8c"
     assert captured["server"] is None
-    assert captured["antigravity_args"] == ()
+    assert captured["extra_args"] == ()
 
 
 def test_dispatch_by_runtime_claude_native_local_still_routes_to_wrapper(
@@ -336,7 +375,145 @@ def test_dispatch_by_runtime_claude_native_local_still_routes_to_wrapper(
 
     assert captured["session_id"] == "64a784c3aa907d1774f44313546947c6"
     assert captured["server"] is None
-    assert captured["claude_args"] == ()
+    assert captured["extra_args"] == ()
+
+
+@pytest.mark.parametrize(
+    "pasted",
+    [
+        "7e52264a6dc51b019fc572f221c81e72.",  # sentence-final period
+        "`7e52264a6dc51b019fc572f221c81e72`",  # markdown backticks
+        "'7e52264a6dc51b019fc572f221c81e72',",  # quoted list element
+        "(7e52264a6dc51b019fc572f221c81e72)",  # parenthesized
+    ],
+)
+def test_dispatch_by_runtime_accepts_id_with_paste_punctuation(
+    monkeypatch: pytest.MonkeyPatch,
+    pasted: str,
+) -> None:
+    """
+    An id pasted with surrounding punctuation resolves — the lookup and
+    the wrapper both receive the bare id it contains. Rejecting it (or
+    worse, the raw ``StatementError`` traceback the ``Uuid16`` bind used
+    to raise) would fail a command the user copied in good faith.
+    """
+    seen: dict[str, str] = {}
+
+    def _label(*, conv_id: str) -> str:
+        """Record the id the store lookup receives."""
+        seen["conv_id"] = conv_id
+        return "codex-native-ui"
+
+    monkeypatch.setattr(resume_dispatch, "_read_wrapper_label_local", _label)
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> None:
+        """Record the kwargs ``run_codex_native`` was called with."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.codex_native.run_codex_native", _capture)
+
+    resume_dispatch._dispatch_by_runtime(target=pasted, server=None)
+
+    assert seen["conv_id"] == "7e52264a6dc51b019fc572f221c81e72"
+    assert captured["session_id"] == "7e52264a6dc51b019fc572f221c81e72"
+
+
+def test_dispatch_by_runtime_malformed_id_raises_before_any_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An argument containing no valid conv id (here: truncated) surfaces
+    a short ``ClickException`` — and never reaches a store or server
+    lookup, where the ``Uuid16`` bind would raise a raw
+    ``StatementError`` traceback at the user.
+    """
+
+    def _fail_if_called(**kwargs: Any) -> None:
+        """Marker — fails the test if any lookup is reached."""
+        del kwargs
+        raise AssertionError("lookup reached with a malformed conv id")
+
+    monkeypatch.setattr(resume_dispatch, "_read_wrapper_label_local", _fail_if_called)
+    monkeypatch.setattr(resume_dispatch, "_read_wrapper_label_remote", _fail_if_called)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        resume_dispatch._dispatch_by_runtime(
+            target="7e52264a",
+            server=None,
+        )
+
+    assert excinfo.value.message == "Invalid session id."
+
+
+def test_dispatch_by_runtime_legacy_prefixed_id_canonicalized_to_bare_hex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A legacy ``conv_<hex>`` spelling still resolves — and is
+    canonicalized to bare hex before lookup and wrapper dispatch, so
+    downstream consumers that key sessions on the bare spelling never
+    see the prefixed form.
+    """
+    seen: dict[str, str] = {}
+
+    def _label(*, conv_id: str) -> str:
+        """Record the id the store lookup receives."""
+        seen["conv_id"] = conv_id
+        return "codex-native-ui"
+
+    monkeypatch.setattr(resume_dispatch, "_read_wrapper_label_local", _label)
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> None:
+        """Record the kwargs ``run_codex_native`` was called with."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.codex_native.run_codex_native", _capture)
+
+    resume_dispatch._dispatch_by_runtime(
+        target="conv_415c9954e2fe4b9276083a4d2c66f689",
+        server=None,
+    )
+
+    assert seen["conv_id"] == "415c9954e2fe4b9276083a4d2c66f689"
+    assert captured["session_id"] == "415c9954e2fe4b9276083a4d2c66f689"
+
+
+def test_dispatch_by_runtime_remote_forwards_non_uuid_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A remote server owns its id space, so a non-uuid id (e.g. a managed
+    deployment's numeric node id) must reach the lookup and wrapper
+    unchanged. Forcing the local uuid rule on the remote path would
+    reject a valid id before the server — the one thing the server is
+    there to resolve — ever sees it.
+    """
+    seen: dict[str, str] = {}
+
+    def _label(*, server: str, conv_id: str) -> str:
+        """Record the id the remote lookup receives."""
+        seen["conv_id"] = conv_id
+        return "claude-code-native-ui"
+
+    monkeypatch.setattr(resume_dispatch, "_read_wrapper_label_remote", _label)
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> None:
+        """Record the kwargs ``run_claude_native`` was called with."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.claude_native.run_claude_native", _capture)
+
+    resume_dispatch._dispatch_by_runtime(
+        target="2048200000527758",
+        server="https://example.com",
+    )
+
+    # The raw non-uuid id flows through untouched — not rejected, not reshaped.
+    assert seen["conv_id"] == "2048200000527758"
+    assert captured["session_id"] == "2048200000527758"
 
 
 def test_dispatch_by_runtime_non_wrapper_local_raises_with_hint(
@@ -473,7 +650,7 @@ def test_read_wrapper_label_remote_returns_label_when_present(
     monkeypatch.setattr(httpx, "get", _fake_get)
     monkeypatch.setattr(
         "omnigent.chat._remote_headers",
-        lambda *, server_url: {},
+        lambda *, server_url, host_id=None: {},
     )
 
     result = resume_dispatch._read_wrapper_label_remote(
@@ -510,7 +687,7 @@ def test_read_wrapper_label_remote_returns_none_when_label_missing(
     monkeypatch.setattr(httpx, "get", _fake_get)
     monkeypatch.setattr(
         "omnigent.chat._remote_headers",
-        lambda *, server_url: {},
+        lambda *, server_url, host_id=None: {},
     )
 
     result = resume_dispatch._read_wrapper_label_remote(
@@ -539,7 +716,7 @@ def test_read_wrapper_label_remote_raises_on_404(
     monkeypatch.setattr(httpx, "get", _fake_get)
     monkeypatch.setattr(
         "omnigent.chat._remote_headers",
-        lambda *, server_url: {},
+        lambda *, server_url, host_id=None: {},
     )
 
     with pytest.raises(click.ClickException) as excinfo:
@@ -549,3 +726,96 @@ def test_read_wrapper_label_remote_raises_on_404(
         )
     assert "5eca720dc2bc6cdc3a99028d7bd0f917" in excinfo.value.message
     assert "not found" in excinfo.value.message
+
+
+# ── _resolve_current_user_id ──────────────────────────────
+
+
+def test_resolve_current_user_id_returns_user_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Happy path: ``GET /v1/me`` answers 200 with a ``user_id`` → return it.
+
+    The cross-agent picker feeds this to its owner filter so ``omnigent
+    resume`` lists only the caller's own sessions.
+    """
+
+    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
+        """Return a canned ``GET /v1/me`` identity."""
+        del headers, timeout
+        assert url.endswith("/v1/me"), url
+        return httpx.Response(200, json={"user_id": "alice@example.com", "is_admin": False})
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = resume_dispatch._resolve_current_user_id(
+        base_url="https://example.com",
+        headers={},
+    )
+    assert result == "alice@example.com"
+
+
+def test_resolve_current_user_id_none_when_server_has_no_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A permissionless single-user server answers ``user_id: null`` → ``None``.
+
+    There is no sharing on such a server, so the picker must fall back to
+    listing everything (no owner filter) rather than hiding all rows.
+    """
+
+    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
+        """Return the unauthenticated-identity shape."""
+        del url, headers, timeout
+        return httpx.Response(200, json={"user_id": None, "is_admin": False})
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = resume_dispatch._resolve_current_user_id(
+        base_url="https://example.com",
+        headers={},
+    )
+    assert result is None
+
+
+def test_resolve_current_user_id_none_on_non_200(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A non-200 (e.g. OIDC 401 with a ``login_url``) yields ``None`` — the
+    picker lists everything rather than failing. Resume stays usable even
+    when identity can't be resolved.
+    """
+
+    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
+        """Return a 401 login-required response."""
+        del url, headers, timeout
+        return httpx.Response(401, json={"user_id": None, "login_url": "/login"})
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = resume_dispatch._resolve_current_user_id(
+        base_url="https://example.com",
+        headers={},
+    )
+    assert result is None
+
+
+def test_resolve_current_user_id_none_on_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A transport failure must NEVER break resume — it degrades to ``None``
+    (no owner filter), same as any other unresolved-identity case.
+    """
+
+    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
+        """Raise the network error the picker must swallow."""
+        del url, headers, timeout
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = resume_dispatch._resolve_current_user_id(
+        base_url="https://example.com",
+        headers={},
+    )
+    assert result is None

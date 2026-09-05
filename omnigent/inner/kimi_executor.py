@@ -46,7 +46,7 @@ Env-var contract (read once at construction by
 
 Per-invocation provider routing (``--config-file`` / ``--mcp-config-file``
 / gateway env vars) is **not** wired: upstream kimi has no per-spawn
-config override. Provider configuration lives in ``~/.kimi/config.toml``
+config override. Provider configuration lives in ``~/.kimi-code/config.toml``
 and is managed out-of-band via ``kimi provider add`` (Omnigent-side
 provider injection is a deferred follow-up).
 """
@@ -61,11 +61,11 @@ import os
 import re
 import shutil
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any
 
 from omnigent.harness_startup_config import resolve_harness_path
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -240,7 +240,13 @@ class KimiExecutor(Executor):
         ``HARNESS_KIMI_*`` knobs are read on the wrap side and
         translated into CLI flags.
         """
-        return os.environ.copy()
+        # Deny-by-default: base + kimi's own families + the spec's
+        # env_passthrough. Keeps the documented ambient KIMI_/MOONSHOT_ auth
+        # while no longer handing the CLI every other provider's key (#3445).
+        return clean_agent_env(
+            allow_prefixes=("KIMI_", "MOONSHOT_"),
+            extra_allowed=declared_passthrough(self._os_env),
+        )
 
     def _sandbox_launch_path(self, spawn_env_names: Sequence[str]) -> str:
         """Return the path to spawn for kimi — sandbox launcher or bare binary.
@@ -283,12 +289,16 @@ class KimiExecutor(Executor):
             if not sandbox.active:
                 return self._binary_path
             # kimi is a curl-installed single binary: it must read its own
-            # install dir and write its config dir (~/.kimi) and /tmp, or it
-            # can't start inside the jail.
+            # install dir and write its config dir ($KIMI_CODE_HOME, default
+            # ~/.kimi-code) and /tmp, or it can't start inside the jail.
+            from omnigent.kimi_native_credentials import resolve_user_kimi_home
+
             resolved_bin = shutil.which(self._binary_path) or self._binary_path
             bin_dir = Path(resolved_bin).resolve(strict=False).parent
             sandbox = with_additional_read_roots(sandbox, [bin_dir])
-            sandbox = with_additional_write_roots(sandbox, [Path.home() / ".kimi", Path("/tmp")])
+            sandbox = with_additional_write_roots(
+                sandbox, [resolve_user_kimi_home(), Path("/tmp")]
+            )
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(resolved_bin, sandbox)
         except (OSError, ImportError, NotImplementedError) as exc:
@@ -329,7 +339,7 @@ class KimiExecutor(Executor):
         argv.extend(["-p", prompt_text])
         return argv
 
-    def _translate_event(self, payload: dict[str, Any]) -> list[ExecutorEvent]:
+    def _translate_event(self, payload: Mapping[str, object]) -> list[ExecutorEvent]:
         """Translate one kimi stream-json line into Omnigent events.
 
         Upstream emits whole messages (not deltas). Roles seen:
@@ -588,8 +598,14 @@ class KimiExecutor(Executor):
 
 
 async def _create_subprocess_exec(
-    *args: Any,  # type: ignore[explicit-any]
-    **kwargs: Any,  # type: ignore[explicit-any]
+    program: str,
+    *args: str,
+    stdin: int,
+    stdout: int,
+    stderr: int,
+    cwd: str | None,
+    env: Mapping[str, str],
+    limit: int,
 ) -> asyncio.subprocess.Process:
     """Indirection point so tests can stub subprocess creation.
 
@@ -597,4 +613,13 @@ async def _create_subprocess_exec(
     tricky because asyncio caches the bound method. Tests patch this
     module-level helper instead.
     """
-    return await asyncio.create_subprocess_exec(*args, **kwargs)
+    return await asyncio.create_subprocess_exec(
+        program,
+        *args,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        cwd=cwd,
+        env=env,
+        limit=limit,
+    )

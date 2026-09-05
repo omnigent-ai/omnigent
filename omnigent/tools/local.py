@@ -50,7 +50,7 @@ from typing import Any
 from omnigent_client.tools import ToolMetadata, get_tool_metadata
 
 from omnigent.runner.identity import strip_runner_auth_secrets
-from omnigent.spec.types import LocalToolInfo, SandboxConfig
+from omnigent.spec.types import LocalToolInfo, SandboxConfig, ToolRuntime
 from omnigent.tools._pep723 import parse_inline_metadata
 from omnigent.tools._srt import wrap_with_srt
 from omnigent.tools.base import Tool, ToolContext
@@ -458,6 +458,7 @@ class LocalPythonTool(Tool):
             "``self._sandbox_config.container_image is not None``"
         )
         runtime = self._sandbox_config.container_runtime
+        assert runtime is not None, "SandboxConfig must resolve container_runtime"
         return [
             runtime,
             "run",
@@ -662,9 +663,14 @@ def load_local_python_tools(
     discovered: dict[str, _DiscoveredTool] = {}
 
     for info in local_tools:
-        if info.language != "python":
+        if info.language != "python" or info.runtime != ToolRuntime.SERVER:
             continue
-        tool_path = Path(info.path)
+        path = info.path
+        if path is None:
+            raise LocalToolLoadError(
+                f"Agent {effective_agent_name!r}: server tool {info.name!r} has no source path."
+            )
+        tool_path = Path(path)
         if not tool_path.is_absolute():
             tool_path = workdir / tool_path
         if not tool_path.is_file():

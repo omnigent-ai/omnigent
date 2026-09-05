@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,12 +38,17 @@ from unittest.mock import patch
 
 import pytest
 
+from omnigent.inner import bwrap_sandbox
 from omnigent.inner.bwrap_sandbox import (
     _ALLOWED_SOCKET_FAMILIES,
     _CLONE_NEW_FLAG_BITS,
     _DEFAULT_CWD_ALLOW_HIDDEN,
+    _HOST_SANDBOX_BACKEND_ENV,
+    _PROC_BIND_HOST_BACKENDS,
     BwrapSandboxBackend,
     _bwrap_extra_seccomp_rules,
+    _detect_host_sandbox_backend,
+    _should_bind_host_proc,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
@@ -89,6 +96,8 @@ def _make_policy(
     read_roots: list[Path] | None = None,
     cwd_hidden_scan_max_entries: int | None = None,
     cwd_hidden_scan_overflow: str | None = None,
+    cwd_hidden_scan_recursive: bool | None = None,
+    mask_paths: list[Path] | None = None,
 ) -> SandboxPolicy:
     """
     Build a :class:`SandboxPolicy` directly without going through the
@@ -111,6 +120,11 @@ def _make_policy(
         cwd scan cap; ``None`` keeps the dataclass default (50000).
     :param cwd_hidden_scan_overflow: Override for the overflow mode;
         ``None`` keeps the dataclass default (``"error"``).
+    :param cwd_hidden_scan_recursive: Override for the recursive-walk
+        flag; ``None`` keeps the dataclass default (``False``,
+        top-level only).
+    :param mask_paths: Explicit absolute paths to mask; ``None`` keeps
+        the dataclass default (no explicit masks).
     :returns: A populated :class:`SandboxPolicy`.
     """
     kwargs: dict[str, object] = {
@@ -126,6 +140,10 @@ def _make_policy(
         kwargs["cwd_hidden_scan_max_entries"] = cwd_hidden_scan_max_entries
     if cwd_hidden_scan_overflow is not None:
         kwargs["cwd_hidden_scan_overflow"] = cwd_hidden_scan_overflow
+    if cwd_hidden_scan_recursive is not None:
+        kwargs["cwd_hidden_scan_recursive"] = cwd_hidden_scan_recursive
+    if mask_paths is not None:
+        kwargs["mask_paths"] = mask_paths
     return SandboxPolicy(**kwargs)  # type: ignore[arg-type]
 
 
@@ -412,6 +430,28 @@ def test_wrap_launcher_argv_includes_required_mounts_and_chdir(
     assert argv[chdir_idx + 1] == str(tmp_path.resolve(strict=False))
 
 
+def test_wrap_launcher_argv_binds_etc_alternatives(tmp_path: Path) -> None:
+    """
+    ``/etc/alternatives`` is bound read-only by default.
+
+    Tools invoked by generic name (awk, python3, editor, ...) resolve
+    through ``/usr/bin/<name> -> /etc/alternatives/<name> -> real
+    binary``. Without the ``/etc/alternatives`` dir bind the middle
+    symlink node is missing inside the jail and the lookup fails with
+    "command not found", even though the real binary under ``/usr`` is
+    mounted.
+    """
+    backend = _make_backend()
+    policy = _make_policy(tmp_path)
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+    assert "/etc/alternatives" in argv
+    # Emitted as ``--ro-bind-try <src> <dest>`` with src == dest, like the
+    # other default /etc dir binds; never read-write.
+    idx = argv.index("/etc/alternatives")
+    assert argv[idx - 1] == "--ro-bind-try"
+    assert argv[idx + 1] == "/etc/alternatives"
+
+
 @pytest.mark.parametrize(
     "allow_network,should_unshare",
     [(True, False), (False, True)],
@@ -480,6 +520,59 @@ def test_wrap_launcher_argv_cwd_read_only_by_default(tmp_path: Path) -> None:
     bind_verbs = [argv[i - 1] for i in cwd_indices if argv[i - 1] in {"--bind", "--ro-bind"}]
     assert "--ro-bind" in bind_verbs
     assert "--bind" not in bind_verbs
+
+
+def test_wrap_launcher_argv_write_grant_wins_exact_read_overlap(
+    tmp_path: Path,
+) -> None:
+    """An exact read/write overlap emits only the authoritative RW mount."""
+    backend = _make_backend()
+    root = tmp_path.resolve(strict=False)
+    policy = _make_policy(tmp_path, read_roots=[root], write_roots=[root])
+
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    mounts = [
+        argv[i]
+        for i in range(len(argv) - 2)
+        if argv[i + 1] == str(root) and argv[i + 2] == str(root)
+    ]
+    assert mounts == ["--bind"]
+
+
+def test_wrap_launcher_argv_deduplicates_read_only_cwd(tmp_path: Path) -> None:
+    """An explicit read grant for read-only cwd does not duplicate its mount."""
+    backend = _make_backend()
+    root = tmp_path.resolve(strict=False)
+    policy = _make_policy(tmp_path, read_roots=[root])
+
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    mounts = [
+        argv[i]
+        for i in range(len(argv) - 2)
+        if argv[i + 1] == str(root) and argv[i + 2] == str(root)
+    ]
+    assert mounts == ["--ro-bind"]
+
+
+def test_wrap_launcher_argv_nested_write_mount_follows_read_parent(
+    tmp_path: Path,
+) -> None:
+    """A writable child overlays its read-only parent rather than vice versa."""
+    backend = _make_backend()
+    parent = (tmp_path / "parent").resolve(strict=False)
+    child = parent / "child"
+    child.mkdir(parents=True)
+    policy = _make_policy(tmp_path, read_roots=[parent], write_roots=[child])
+
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    read_index = _index_of_triple(argv, "--ro-bind-try", str(parent), str(parent))
+    write_index = _index_of_triple(argv, "--bind-try", str(child), str(child))
+    assert read_index is not None
+    assert write_index is not None
+    assert read_index < write_index
 
 
 def test_wrap_launcher_argv_masks_denied_unix_socket_after_write_root(
@@ -880,6 +973,124 @@ def test_wrap_launcher_argv_reexposes_interpreter_under_masked_dotdir(
 
 
 # ---------------------------------------------------------------------------
+# Nested-sandbox /proc handling (lakebox proc bind)
+# ---------------------------------------------------------------------------
+
+
+def _clear_host_backend_signals(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    Neutralise every host-backend signal so detection returns ``None``.
+
+    Removes the declaration env var and repoints the lakebox marker at a
+    path that does not exist, isolating the test from the machine it runs
+    on — which must not be assumed to be (or not to be) a lakebox microVM.
+    """
+    monkeypatch.delenv(_HOST_SANDBOX_BACKEND_ENV, raising=False)
+    monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", tmp_path / "no-such-marker")
+
+
+def test_detect_host_backend_none_without_signals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    With no env declaration and no marker, no outer backend is detected,
+    so the proc bind stays off (fresh procfs is kept everywhere by
+    default).
+    """
+    _clear_host_backend_signals(monkeypatch, tmp_path)
+    assert _detect_host_sandbox_backend() is None
+    assert _should_bind_host_proc() is False
+
+
+def test_detect_host_backend_env_declaration_is_normalised(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    ``OMNIGENT_HOST_SANDBOX_BACKEND`` is the explicit, authoritative
+    signal; it is trimmed and lower-cased so callers don't have to match
+    an exact casing, and ``lakebox`` is on the proc-bind allow-list.
+    """
+    _clear_host_backend_signals(monkeypatch, tmp_path)
+    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "  LakeBox  ")
+    assert _detect_host_sandbox_backend() == "lakebox"
+    assert _should_bind_host_proc() is True
+
+
+def test_detect_host_backend_env_non_lakebox_keeps_fresh_proc(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A declared backend that is NOT on :data:`_PROC_BIND_HOST_BACKENDS`
+    must not trigger the proc downgrade — even if the lakebox marker
+    happens to exist — because the explicit declaration is authoritative.
+    """
+    marker = tmp_path / "run-lakebox"
+    marker.mkdir()
+    monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", marker)
+    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "modal")
+    assert _detect_host_sandbox_backend() == "modal"
+    assert "modal" not in _PROC_BIND_HOST_BACKENDS
+    assert _should_bind_host_proc() is False
+
+
+def test_detect_host_backend_marker_autodetects_lakebox(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    When no env var is set, the ``/run/lakebox`` marker directory
+    autodetects lakebox. This is the prune-proof fallback the re-exec
+    launcher path relies on (the env var may be stripped by the spawn
+    allow-list, but the filesystem marker survives).
+    """
+    marker = tmp_path / "run-lakebox"
+    marker.mkdir()
+    monkeypatch.delenv(_HOST_SANDBOX_BACKEND_ENV, raising=False)
+    monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", marker)
+    assert _detect_host_sandbox_backend() == "lakebox"
+    assert _should_bind_host_proc() is True
+
+
+def test_wrap_launcher_argv_fresh_proc_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    On an ordinary host the wrap emits ``--proc /proc`` (a fresh procfs
+    tied to the new PID namespace) and never binds the host ``/proc``.
+    """
+    _clear_host_backend_signals(monkeypatch, tmp_path)
+    backend = _make_backend()
+    policy = _make_policy(tmp_path)
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+    assert _has_pair_single_dest(argv, "--proc", "/proc")
+    assert not _has_pair(argv, "--bind", "/proc", "/proc")
+
+
+def test_wrap_launcher_argv_binds_proc_on_lakebox(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    On a lakebox host the wrap binds the existing ``/proc`` instead of
+    mounting a fresh procfs (lakebox's masked ``/proc`` overmounts make
+    the fresh mount fail under ``--unshare-pid``). ``/dev`` and ``/tmp``
+    are unaffected.
+    """
+    _clear_host_backend_signals(monkeypatch, tmp_path)
+    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "lakebox")
+    backend = _make_backend()
+    policy = _make_policy(tmp_path)
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+    assert _has_pair(argv, "--bind", "/proc", "/proc"), (
+        "lakebox host must bind the existing /proc; got no `--bind /proc /proc`."
+    )
+    assert not _has_pair_single_dest(argv, "--proc", "/proc"), (
+        "lakebox host must NOT also mount a fresh procfs — the two would "
+        "conflict at the same mountpoint."
+    )
+    assert _has_pair_single_dest(argv, "--dev", "/dev")
+    assert "--tmpfs" in argv
+
+
+# ---------------------------------------------------------------------------
 # Dotfile masking + symlink defense
 # ---------------------------------------------------------------------------
 
@@ -929,6 +1140,351 @@ def test_dotfile_masking_hides_disallowed_dotfiles(tmp_path: Path) -> None:
     # Non-dotfile is untouched.
     assert not _argv_mentions(argv, regular_path, after_token="--tmpfs")
     assert not _argv_mentions(argv, regular_path, after_token="--bind-try")
+
+
+def test_dotfile_masking_non_recursive_default_leaves_nested_dotfiles(
+    tmp_path: Path,
+) -> None:
+    """
+    With the production default (``cwd_hidden_scan_recursive=False``)
+    the bwrap masker hides top-level dotfiles but leaves a nested
+    dotfile visible — no mask triple is emitted for it.
+    """
+    (tmp_path / ".env").write_text("TOP=secret")
+    nested = tmp_path / "services" / "api"
+    nested.mkdir(parents=True)
+    (nested / ".env").write_text("DB=secret")
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    cwd = tmp_path.resolve(strict=False)
+    top_env = str(cwd / ".env")
+    nested_env = str(cwd / "services" / "api" / ".env")
+
+    assert _has_pair(argv, "--bind-try", "/dev/null", top_env), (
+        "Top-level .env should still be masked in non-recursive mode."
+    )
+    assert not _argv_mentions(argv, nested_env, after_token="--bind-try"), (
+        "Non-recursive default must NOT descend into subdirectories; "
+        "nested .env should stay visible."
+    )
+
+
+def test_dotfile_masking_recursive_opt_in_masks_nested_dotfiles(
+    tmp_path: Path,
+) -> None:
+    """
+    Opting into ``cwd_hidden_scan_recursive=True`` restores the deep
+    walk: a nested dotfile is masked with ``--bind-try /dev/null``.
+    """
+    nested = tmp_path / "services" / "api"
+    nested.mkdir(parents=True)
+    (nested / ".env").write_text("DB=secret")
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"], cwd_hidden_scan_recursive=True)
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    nested_env = str(tmp_path.resolve(strict=False) / "services" / "api" / ".env")
+    assert _has_pair(argv, "--bind-try", "/dev/null", nested_env), (
+        "Recursive opt-in should mask the nested .env."
+    )
+
+
+def test_mask_paths_hides_explicit_file_and_dir(tmp_path: Path) -> None:
+    """
+    Explicit ``mask_paths`` entries are masked regardless of name or
+    depth: a plain (non-dot) file becomes ``--bind-try /dev/null`` and
+    a directory becomes ``--tmpfs``.
+    """
+    secret_file = tmp_path / "config" / "production.key"
+    secret_file.parent.mkdir(parents=True)
+    secret_file.write_text("KEY")
+    secret_dir = tmp_path / "private"
+    secret_dir.mkdir()
+    (secret_dir / "data").write_text("x")
+
+    backend = _make_backend()
+    policy = _make_policy(
+        tmp_path,
+        allow_hidden=[".venv"],
+        mask_paths=[secret_file.resolve(strict=False), secret_dir.resolve(strict=False)],
+    )
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _has_pair(argv, "--bind-try", "/dev/null", str(secret_file.resolve(strict=False))), (
+        "Explicit mask_paths file must be masked with --bind-try /dev/null."
+    )
+    assert _has_pair_single_dest(argv, "--tmpfs", str(secret_dir.resolve(strict=False))), (
+        "Explicit mask_paths directory must be masked with --tmpfs."
+    )
+
+
+def test_write_paths_root_dotfiles_are_masked(tmp_path: Path) -> None:
+    """
+    A ``write_paths`` root outside cwd gets the same dotfile masking as
+    a ``read_paths`` root: its top-level ``.env`` / ``.aws`` are hidden
+    even though the grant is for writing, not reading. Without scanning
+    write roots the helper could read (and overwrite) secrets living in
+    a writable directory outside cwd.
+    """
+    external = tmp_path / "shared"
+    external.mkdir()
+    (external / ".env").write_text("SECRET=1")
+    (external / ".aws").mkdir()
+    (external / ".aws" / "credentials").write_text("[default]")
+    (external / "notes.txt").write_text("ok")  # non-dotfile stays visible
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    policy = _make_policy(
+        cwd,
+        write_roots=[external.resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    ext = external.resolve(strict=False)
+    assert _has_pair(argv, "--bind-try", "/dev/null", str(ext / ".env")), (
+        ".env under a write_paths root must be masked — write grants are scanned too."
+    )
+    assert _has_pair_single_dest(argv, "--tmpfs", str(ext / ".aws")), (
+        ".aws/ under a write_paths root must be tmpfs-masked."
+    )
+    assert not _argv_mentions(argv, str(ext / "notes.txt"), after_token="--bind-try"), (
+        "Non-dotfiles under a write_paths root must stay visible."
+    )
+
+
+def test_read_write_overlap_scanned_once(tmp_path: Path) -> None:
+    """
+    A path granted as BOTH a read and a write root is walked once —
+    ``merge_scan_roots`` dedupes the grant lists, so the ``.env`` mask
+    triple is emitted a single time, not once per grant list.
+    """
+    external = tmp_path / "shared"
+    external.mkdir()
+    (external / ".env").write_text("SECRET=1")
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    ext = external.resolve(strict=False)
+
+    backend = _make_backend()
+    policy = _make_policy(
+        cwd,
+        read_roots=[ext],
+        write_roots=[ext],
+        allow_hidden=[".venv"],
+    )
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    target = str(ext / ".env")
+    count = sum(
+        1
+        for i in range(len(argv) - 2)
+        if argv[i] == "--bind-try" and argv[i + 1] == "/dev/null" and argv[i + 2] == target
+    )
+    assert count == 1, f"Expected a single .env mask across overlapping grants, got {count}."
+
+
+def test_write_root_missing_on_host_is_created(tmp_path: Path) -> None:
+    """
+    Regression: a ``write_paths`` root that doesn't exist on the
+    host yet must be created before the ``--bind-try`` is emitted.
+
+    ``--bind-try`` silently skips a missing source, so without this the
+    grant would bind to nothing and the agent's first write would fail
+    with a bare "Read-only file system" error, well after the policy
+    layer already approved the write.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    missing_root = cwd / "docs" / "specs"
+    assert not missing_root.exists()
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, write_roots=[missing_root])
+    backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    assert missing_root.is_dir(), "write_paths root must be created so bind-try has a real source"
+
+
+def test_write_root_missing_on_host_logs_loudly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Regression: creating a missing write_paths root must be
+    logged at a visible level, and the log must state the path and the
+    permissions it ended up with, not create it silently.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    missing_root = cwd / "docs" / "specs"
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, write_roots=[missing_root])
+    with caplog.at_level(logging.WARNING):
+        backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    matching = [r for r in caplog.records if str(missing_root) in r.getMessage()]
+    all_messages = [r.getMessage() for r in caplog.records]
+    assert matching, f"Expected a warning naming {missing_root}, got: {all_messages}"
+    message = matching[0].getMessage()
+    assert "did not exist" in message
+    assert re.search(r"permissions\s+0o[0-7]+", message), (
+        f"Expected the log to state the created directory's permissions, got: {message!r}"
+    )
+
+
+def test_write_root_already_present_is_not_touched(tmp_path: Path) -> None:
+    """
+    A write_paths root that already exists on the host must not be
+    recreated or logged about — the fallback only applies to the
+    genuinely-missing case.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    existing_root = tmp_path / "shared"
+    existing_root.mkdir()
+    before_mtime = existing_root.stat().st_mtime_ns
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, write_roots=[existing_root])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    assert existing_root.stat().st_mtime_ns == before_mtime
+    assert "--bind-try" in argv
+    assert str(existing_root) in argv
+
+
+def test_write_root_uncreatable_warns_instead_of_failing(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A missing write_paths root whose creation fails (e.g. an unwritable
+    parent) must not abort the whole sandbox wrap: merged-in optional
+    write roots (harness-internal dirs under an unwritable ``/home``)
+    would otherwise degrade the helper to running unwrapped. The wrap
+    keeps the old skip-the-bind behavior for that root and warns loudly.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    uncreatable_root = tmp_path / "locked" / "child" / "grandchild"
+
+    real_mkdir = Path.mkdir
+
+    def _mkdir(self: Path, *args: object, **kwargs: object) -> None:
+        # Simulate an unwritable parent regardless of runner privileges
+        # (mode-based enforcement doesn't hold when tests run as root).
+        if self == uncreatable_root:
+            raise PermissionError(13, "Permission denied", str(self))
+        real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", _mkdir)
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, write_roots=[uncreatable_root])
+    with caplog.at_level(logging.WARNING):
+        argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    assert not uncreatable_root.exists()
+    matching = [r for r in caplog.records if str(uncreatable_root) in r.getMessage()]
+    assert matching, "Expected a warning about the uncreatable write root"
+    assert "could not be created" in matching[0].getMessage()
+    # The full bind triple is still emitted; bwrap's --bind-try skips
+    # the missing source safely instead of failing the spawn.
+    triples = [
+        (argv[i], argv[i + 1], argv[i + 2])
+        for i, a in enumerate(argv)
+        if a == "--bind-try" and i + 2 < len(argv)
+    ]
+    assert ("--bind-try", str(uncreatable_root), str(uncreatable_root)) in triples, (
+        f"expected a --bind-try triple for {uncreatable_root}, got {triples}"
+    )
+
+
+def test_nested_grant_masked_in_non_recursive_default(tmp_path: Path) -> None:
+    """
+    Regression: a ``write_paths`` grant nested below a ``read_paths``
+    root must still have its top-level dotfiles masked in the default
+    (non-recursive) mode. A non-recursive walk of the parent only masks
+    the parent's immediate children, so the nested grant must be walked
+    in its own right — it must NOT be dropped as "subsumed".
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    a = tmp_path / "a"
+    (a / "deep" / "nested").mkdir(parents=True)
+    (a / ".env").write_text("SECRET_A")
+    (a / "deep" / "nested" / ".env").write_text("SECRET_NESTED")
+
+    backend = _make_backend()
+    policy = _make_policy(
+        cwd,
+        read_roots=[a.resolve(strict=False)],
+        write_roots=[(a / "deep" / "nested").resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    top_env = str(a.resolve(strict=False) / ".env")
+    nested_env = str((a / "deep" / "nested").resolve(strict=False) / ".env")
+    assert _has_pair(argv, "--bind-try", "/dev/null", top_env), (
+        "Top-level .env of the read_paths root must be masked."
+    )
+    assert _has_pair(argv, "--bind-try", "/dev/null", nested_env), (
+        "Nested write_paths grant's .env must be masked in non-recursive mode; "
+        "dropping the nested root as subsumed would leak it."
+    )
+
+
+def test_framework_write_root_dotfiles_not_masked(tmp_path: Path) -> None:
+    """
+    Regression: a framework write root added via
+    ``with_additional_write_roots`` (the per-helper scratch tmpdir) is
+    excluded from the dotfile scan, so the egress ``.egress.sock`` living
+    in it is NOT masked. Masking that socket ``--bind-try /dev/null``'d
+    the relay endpoint and reset every egress connection (the inner-rest
+    ``test_egress_e2e`` failures). A genuine user write root is still
+    scanned.
+    """
+    from omnigent.inner.sandbox import with_additional_write_roots
+
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    scratch = tmp_path / "scratch"  # framework runtime dir
+    scratch.mkdir()
+    (scratch / ".egress.sock").write_text("")  # dotfile the sandbox needs
+    user_root = tmp_path / "shared"  # real user write grant
+    user_root.mkdir()
+    (user_root / ".env").write_text("SECRET=1")
+
+    backend = _make_backend()
+    policy = _make_policy(
+        cwd,
+        write_roots=[user_root.resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    # Mirror the real launch: the parent folds the scratch tmpdir in as a
+    # framework write root just before building the argv.
+    policy = with_additional_write_roots(policy, [scratch])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    sock = str(scratch.resolve(strict=False) / ".egress.sock")
+    assert not _has_pair(argv, "--bind-try", "/dev/null", sock), (
+        "The framework scratch tmpdir must be excluded from the dotfile scan; "
+        "masking .egress.sock breaks the egress relay."
+    )
+    # The real user write grant is still scanned and masked.
+    user_env = str(user_root.resolve(strict=False) / ".env")
+    assert _has_pair(argv, "--bind-try", "/dev/null", user_env), (
+        "A genuine user write root must still have its dotfiles masked."
+    )
 
 
 def test_dotfile_masking_skips_target_that_vanished_after_scan(
@@ -1124,6 +1680,70 @@ def test_s5_read_paths_dedup_skips_paths_under_cwd(tmp_path: Path) -> None:
 pytestmark_bwrap = pytest.mark.skipif(
     not BWRAP_AVAILABLE, reason="bwrap not installed on this host"
 )
+
+
+@pytestmark_bwrap
+def test_overlapping_read_write_root_remains_writable(tmp_path: Path) -> None:
+    """End-to-end: an exact read/write overlap keeps the shared root writable."""
+    root = (tmp_path / "shared").resolve(strict=False)
+    root.mkdir()
+    output = root / "created.txt"
+    policy = _make_policy(tmp_path, read_roots=[root], write_roots=[root])
+    probe = f"from pathlib import Path; Path({str(output)!r}).write_text('ok'); print('WROTE')"
+
+    result = _run_helper_probe(tmp_path, probe, policy=policy)
+
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == "WROTE"
+    assert output.read_text() == "ok"
+
+
+@pytestmark_bwrap
+def test_read_only_root_rejects_writes(tmp_path: Path) -> None:
+    """End-to-end: a root without a write grant remains read-only."""
+    root = (tmp_path / "readonly").resolve(strict=False)
+    root.mkdir()
+    output = root / "blocked.txt"
+    policy = _make_policy(tmp_path, read_roots=[root])
+    probe = (
+        "import errno; from pathlib import Path; "
+        f"p=Path({str(output)!r}); "
+        "\ntry: p.write_text('bad')\n"
+        "except OSError as exc: print(exc.errno)\n"
+        "else: print('WROTE')"
+    )
+
+    result = _run_helper_probe(tmp_path, probe, policy=policy)
+
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == str(errno.EROFS)
+    assert not output.exists()
+
+
+@pytestmark_bwrap
+def test_nested_write_root_overlays_read_only_parent(tmp_path: Path) -> None:
+    """End-to-end: a child write grant stays scoped within a read-only parent."""
+    parent = (tmp_path / "parent").resolve(strict=False)
+    child = parent / "child"
+    child.mkdir(parents=True)
+    parent_output = parent / "blocked.txt"
+    child_output = child / "created.txt"
+    policy = _make_policy(tmp_path, read_roots=[parent], write_roots=[child])
+    probe = (
+        "import errno; from pathlib import Path; "
+        f"parent=Path({str(parent_output)!r}); child=Path({str(child_output)!r}); "
+        "child.write_text('ok'); "
+        "\ntry: parent.write_text('bad')\n"
+        "except OSError as exc: print(exc.errno)\n"
+        "else: print('PARENT_WROTE')"
+    )
+
+    result = _run_helper_probe(tmp_path, probe, policy=policy)
+
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == str(errno.EROFS)
+    assert child_output.read_text() == "ok"
+    assert not parent_output.exists()
 
 
 @pytestmark_bwrap

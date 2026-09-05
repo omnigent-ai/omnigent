@@ -1,0 +1,7 @@
+resources:
+  volumes:
+    issue_priority_artifacts:
+      catalog_name: ${var.catalog}
+      schema_name: ${var.schema}
+      name: ${var.artifact_volume_name}
+      volume_type: MANAGED

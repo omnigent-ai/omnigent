@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 
 from omnigent_slack.models import ThreadKey
 from omnigent_slack.omnigent import OutputFile
@@ -218,5 +219,19 @@ class SlackNotifier:
         # Link to the session's conversation page in the Omnigent web UI, where a
         # user can continue a thread that's mid-turn in Slack (the web UI accepts
         # concurrent input and shows any pending actions).
-        base = self._server_url.rstrip("/")
+        #
+        # A Databricks workspace-hosted server is configured by its API proxy
+        # mount (``https://<ws>/api/2.0/omnigent``), but the web UI lives on the
+        # workspace SPA mount (``https://<ws>/omnigent``) — linking to the API
+        # mount answers JSON, not the UI. Map the path and keep any ``?o=<org>``
+        # workspace selector from the configured URL so multi-workspace (SPOG)
+        # hosts open in the right workspace. (This bot is standalone — it can't
+        # import ``omnigent.server_url`` — so the mount mapping is mirrored
+        # here.)
+        parts = urlsplit(self._server_url.rstrip("/"))
+        if parts.path == "/api/2.0/omnigent":
+            return urlunsplit(
+                (parts.scheme, parts.netloc, f"/omnigent/c/{session_id}", parts.query, "")
+            )
+        base = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
         return f"{base}/c/{session_id}"

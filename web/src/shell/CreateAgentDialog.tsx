@@ -194,12 +194,14 @@ export function CreateAgentDialog({
           <DialogTitle>Create custom agent</DialogTitle>
         </DialogHeader>
 
-        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
+        {/* px-1/-mx-1 give the fields' 3px focus ring room to paint:
+            overflow-y-auto also clips horizontally at the padding box. */}
+        <div className="-mx-1 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-1">
           {/* Name */}
           <div className="flex flex-col gap-1.5">
             <label
               htmlFor="create-agent-name"
-              className="text-xs font-medium text-muted-foreground"
+              className="text-sm font-medium text-muted-foreground"
             >
               Name <span className="text-destructive">*</span>
             </label>
@@ -217,7 +219,7 @@ export function CreateAgentDialog({
           <div className="flex flex-col gap-1.5">
             <label
               htmlFor="create-agent-description"
-              className="text-xs font-medium text-muted-foreground"
+              className="text-sm font-medium text-muted-foreground"
             >
               Description
             </label>
@@ -232,10 +234,15 @@ export function CreateAgentDialog({
 
           {/* Harness */}
           <div className="flex flex-col gap-1.5">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label className="text-sm font-medium text-muted-foreground">
               Harness <span className="text-destructive">*</span>
             </label>
-            <Select value={harness} onValueChange={setHarness}>
+            <Select
+              value={harness}
+              onValueChange={setHarness}
+              componentId="create_agent.harness"
+              valueHasNoPii
+            >
               <SelectTrigger data-testid="create-agent-harness" className="w-full">
                 <SelectValue />
               </SelectTrigger>
@@ -253,7 +260,7 @@ export function CreateAgentDialog({
           <div className="flex flex-col gap-1.5">
             <label
               htmlFor="create-agent-model"
-              className="text-xs font-medium text-muted-foreground"
+              className="text-sm font-medium text-muted-foreground"
             >
               Model <span className="text-destructive">*</span>
             </label>
@@ -270,7 +277,7 @@ export function CreateAgentDialog({
           <div className="flex flex-col gap-1.5">
             <label
               htmlFor="create-agent-instructions"
-              className="text-xs font-medium text-muted-foreground"
+              className="text-sm font-medium text-muted-foreground"
             >
               System instructions
             </label>
@@ -281,20 +288,21 @@ export function CreateAgentDialog({
               onChange={(e) => setInstructions(e.target.value)}
               placeholder="You are a helpful assistant that..."
               className="min-h-[120px]"
+              componentId="create_agent.instructions"
             />
           </div>
 
           {/* MCP Servers */}
           <div className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-muted-foreground">MCP Tools</span>
+              <span className="text-sm font-medium text-muted-foreground">MCP Tools</span>
               <Button
                 type="button"
                 variant="ghost"
                 size="sm"
                 onClick={addMCPServer}
                 data-testid="create-agent-add-mcp"
-                className="h-6 gap-1 px-2 text-xs text-muted-foreground"
+                className="h-6 gap-1 px-2 text-sm text-muted-foreground"
               >
                 <PlusIcon className="size-3" />
                 Add server
@@ -350,6 +358,8 @@ function MCPServerRow({
         <Select
           value={entry.transport}
           onValueChange={(v: "http" | "stdio") => onChange({ transport: v })}
+          componentId="create_agent.mcp_transport"
+          valueHasNoPii
         >
           <SelectTrigger data-testid="create-agent-mcp-transport" className="w-24">
             <SelectValue />
@@ -390,7 +400,7 @@ function MCPServerRow({
             value={entry.env}
             onChange={(e) => onChange({ env: e.target.value })}
             placeholder={"Environment variables (KEY=VALUE per line)\ne.g. GITHUB_TOKEN=ghp_..."}
-            className="min-h-[60px] font-mono text-xs"
+            className="min-h-[60px] font-mono text-sm"
           />
         </>
       ) : (
@@ -406,7 +416,7 @@ function MCPServerRow({
             value={entry.headers}
             onChange={(e) => onChange({ headers: e.target.value })}
             placeholder={"HTTP headers (one per line)\ne.g. Authorization: Bearer tok_..."}
-            className="min-h-[60px] font-mono text-xs"
+            className="min-h-[60px] font-mono text-sm"
           />
         </>
       )}

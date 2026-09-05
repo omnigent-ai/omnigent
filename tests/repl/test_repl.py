@@ -11,6 +11,7 @@ tab) or an unrelated tool result to skip.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 from prompt_toolkit.document import Document
@@ -1847,6 +1848,10 @@ def test_build_startup_header_creds_line_hints_first_available(tmp_path, monkeyp
         "    kind: databricks\n"
         "    profile: gtm-ws\n"
     )
+    # Hermetic: ignore a dev machine's ambient providers. A running local Ollama
+    # (TCP-probed at localhost:11434) serves openai and would outrank the
+    # Databricks fallback under test, so pin detection to none.
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
     header = _build_startup_header(
         "claude-sdk", "Two-headed brainstorming partner.", ["anthropic", "openai"]
     )
@@ -2424,7 +2429,7 @@ def test_render_history_item_renders_slash_command_metadata() -> None:
     assert "/grill-me review this plan" in rendered
 
 
-class _StubSkillSession:
+class _StubSkillSession(_SessionsChatReplAdapter):
     """Session stub that records structured skill slash-command sends."""
 
     model = "agent"
@@ -2604,15 +2609,16 @@ async def test_new_command_resets_session_without_clearing_screen(
     )
 
 
-class _StubSessionsModeSession:
+class _StubSessionsModeSession(_SessionsChatReplAdapter):
     """``_StubSession`` plus the async ``start_new_conversation`` hook the
     sessions-mode adapter exposes. Used to assert the slash-command
     handlers prefer the new async method over sync ``reset()``."""
 
+    model = "agent"
+
     def __init__(self, *, raise_on_start: Exception | None = None) -> None:
         self.reset_calls = 0
         self.start_new_calls = 0
-        self.model = "agent"
         self._raise_on_start = raise_on_start
 
     def reset(self) -> None:
@@ -2817,6 +2823,166 @@ def test_sessions_adapter_session_id_surfaces_as_conversation_id() -> None:
     assert result == "conv_sess_abc123", (
         f"Expected adapter session_id to take precedence, got {result!r}."
     )
+
+
+@pytest.mark.asyncio
+async def test_sessions_adapter_retries_transient_elicitation_resolution() -> None:
+    """A transient resolve POST failure must not escape the event task.
+
+    The verdict may already have reached the server when the HTTP response
+    connection drops. Retrying is safe: a second successful POST completes
+    the elicitation, while an already-resolved response is handled by the
+    existing ``not_found`` branch.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import httpx
+    from omnigent_client import StreamHooks
+
+    client = MagicMock()
+    client.sessions.resolve_elicitation = AsyncMock(
+        side_effect=[httpx.ConnectError("connection dropped"), None],
+    )
+    adapter = _SessionsChatReplAdapter(
+        client=client,
+        agent_name="test-agent",
+        hooks=StreamHooks(on_elicitation_request=AsyncMock(return_value=True)),
+        session_id="conv_abc",
+    )
+    event = SimpleNamespace(
+        elicitation_id="elicit_abc",
+        message="approve?",
+        requested_schema={},
+        mode="form",
+        phase="tool_call",
+        policy_name="test-policy",
+        content_preview="",
+        url=None,
+    )
+
+    await adapter._handle_elicitation("conv_abc", event)
+
+    assert client.sessions.resolve_elicitation.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_sessions_adapter_contains_repeated_elicitation_transport_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Exhausted transport retries must not crash the REPL event loop."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import httpx
+    from omnigent_client import StreamHooks
+
+    client = MagicMock()
+    client.sessions.resolve_elicitation = AsyncMock(
+        side_effect=httpx.ConnectError("connection dropped"),
+    )
+    adapter = _SessionsChatReplAdapter(
+        client=client,
+        agent_name="test-agent",
+        hooks=StreamHooks(on_elicitation_request=AsyncMock(return_value=True)),
+        session_id="conv_abc",
+    )
+    event = SimpleNamespace(
+        elicitation_id="elicit_abc",
+        message="approve?",
+        requested_schema={},
+        mode="form",
+        phase="tool_call",
+        policy_name="test-policy",
+        content_preview="",
+        url=None,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="omnigent.repl._repl"):
+        await adapter._handle_elicitation("conv_abc", event)
+
+    assert client.sessions.resolve_elicitation.await_count == 3
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert [r.getMessage() for r in warnings] == [
+        "Could not resolve elicitation after transport retries"
+    ]
+    # No traceback on the WARNING: the REPL configures no handlers, so
+    # exc_info would reach ``logging.lastResort`` and paint ~15 lines over
+    # the TUI frame. The postmortem belongs on the DEBUG sibling.
+    assert warnings[0].exc_info is None
+    assert any(r.levelno == logging.DEBUG and r.exc_info is not None for r in caplog.records), (
+        "expected the traceback to survive on a DEBUG record"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sessions_adapter_surfaces_undeliverable_elicitation_verdict() -> None:
+    """An undeliverable verdict must reach the user, not just the log.
+
+    Exhausted retries leave the elicitation parked server-side, so the turn
+    waits on an answer that will never arrive. Without a rendered error the
+    user sits at an apparently live prompt with no idea their approval was
+    dropped.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import httpx
+    from omnigent_client import StreamHooks
+
+    client = MagicMock()
+    client.sessions.resolve_elicitation = AsyncMock(
+        side_effect=httpx.ConnectError("connection dropped"),
+    )
+    adapter = _SessionsChatReplAdapter(
+        client=client,
+        agent_name="test-agent",
+        hooks=StreamHooks(on_elicitation_request=AsyncMock(return_value=True)),
+        session_id="conv_abc",
+    )
+    rendered: list[object] = []
+    adapter._on_event = rendered.append
+    event = SimpleNamespace(
+        elicitation_id="elicit_abc",
+        message="approve?",
+        requested_schema={},
+        mode="form",
+        phase="tool_call",
+        policy_name="test-policy",
+        content_preview="",
+        url=None,
+    )
+
+    await adapter._handle_elicitation("conv_abc", event)
+
+    assert len(rendered) == 1, f"expected one rendered error event, got {rendered}"
+    emitted = rendered[0]
+    assert emitted.type == "response.error"
+    assert emitted.error.code == "elicitation_resolve_failed"
+    # Names the surface that can still answer: the terminal prompt is gone
+    # by now, so pointing the user back at it would be a dead end.
+    assert "web UI" in emitted.error.message
+    assert "still waiting" in emitted.error.message
+
+
+def test_is_recoverable_sse_transport_error_for_write_errors() -> None:
+    """A peer dropping the connection mid-request-send is transient too.
+
+    An aborted connection can surface on the write side (the request
+    body was still being sent) rather than the read side. Both are the
+    same transient interruption; write errors must classify as
+    recoverable so the elicitation-resolve retry covers them.
+    """
+    import httpcore
+    import httpx
+
+    assert _is_recoverable_sse_transport_error(httpx.WriteError("connection reset")), (
+        "httpx.WriteError must classify as recoverable — a mid-send "
+        "connection drop is the write-side twin of a read-side drop."
+    )
+    assert _is_recoverable_sse_transport_error(httpcore.WriteError("connection reset"))
+    assert _is_recoverable_sse_transport_error(httpx.WriteTimeout("write stalled"))
+    assert _is_recoverable_sse_transport_error(httpcore.WriteTimeout("write stalled"))
 
 
 def test_legacy_session_falls_back_to_conversation_id() -> None:
@@ -3047,3 +3213,96 @@ def test_resume_hint_appends_resume_flag_to_invocation_parts() -> None:
         "--harness claude-sdk "
         "--resume conv_abc"
     )
+
+
+def _openai_key_default_config() -> dict[str, object]:
+    """A config whose openai key default the unmapped fallback used to fabricate."""
+    return {
+        "providers": {
+            "openai": {
+                "kind": "key",
+                "default": "openai",
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "$OPENAI_API_KEY",
+                    "models": {"default": "gpt-5.5"},
+                },
+            }
+        }
+    }
+
+
+def test_model_readout_own_auth_acp_harness_reports_agent_not_provider() -> None:
+    """
+    Own-auth ACP harnesses must not report an Omnigent provider credential.
+
+    ``acp``/``acp:<slug>`` and ``goose`` spawn without any Omnigent provider
+    wiring, but ``default_provider_for_harness`` used to fall through to the
+    configured key/gateway default for them (the unmapped pi-style fallback),
+    so the readout named a model and credential the session never touches.
+    A failure here means that fabrication is back.
+    """
+    from omnigent.repl._repl import _build_model_readout_lines
+
+    config = _openai_key_default_config()
+    for harness in ("acp", "acp:droid", "goose"):
+        lines = _build_model_readout_lines(config, harness, None)
+        assert any("ACP agent" in line for line in lines), (harness, lines)
+        assert not any("API Key" in line for line in lines), (harness, lines)
+        assert not any("gpt-5.5" in line for line in lines), (harness, lines)
+
+
+def test_model_readout_own_auth_acp_harness_shows_live_override() -> None:
+    """
+    An in-session ``/model`` override is real state and must stay visible.
+
+    The runner forwards it to these harnesses (``model_env_keys()`` covers
+    acp/goose; goose applies it as ``GOOSE_MODEL``), so the readout may not
+    hide it or claim the model can't be changed.
+    """
+    from omnigent.repl._repl import _build_model_readout_lines
+
+    config = _openai_key_default_config()
+    for harness in ("acp", "goose"):
+        lines = _build_model_readout_lines(config, harness, "qwen3-coder-plus")
+        assert any("qwen3-coder-plus" in line for line in lines), (harness, lines)
+        assert not any("does not reach" in line for line in lines), (harness, lines)
+
+
+def test_model_readout_qwen_still_names_routed_provider() -> None:
+    """
+    qwen is provider-routed, so its readout keeps naming the openai default.
+
+    ``_build_qwen_spawn_env`` injects the configured openai-family default
+    into the qwen subprocess (see ``test_qwen_uses_openai_global_default``),
+    so for qwen — unlike acp/goose — the credential readout is truthful and
+    must not be declined as "own auth".
+    """
+    from omnigent.repl._repl import _build_model_readout_lines
+
+    lines = _build_model_readout_lines(_openai_key_default_config(), "qwen", None)
+    assert any("OpenAI API Key" in line for line in lines), lines
+    assert not any("ACP agent" in line for line in lines), lines
+
+
+def test_describe_active_credential_declines_own_auth_acp_harnesses() -> None:
+    """
+    The resolver, not just the readout, must decline own-auth ACP harnesses.
+
+    ``_resolve_startup_header`` calls ``describe_active_credential``
+    independently of the ``/model`` readout, so fixing only the readout
+    would leave the startup banner naming the same wrong credential. The
+    config uses a key-kind default — the kind the unmapped fallback actually
+    fabricated (a subscription default was already skipped, so it can't pin
+    this fix).
+    """
+    from omnigent.onboarding.provider_config import describe_active_credential
+
+    config = _openai_key_default_config()
+    for harness in ("acp", "acp:droid", "goose"):
+        assert describe_active_credential(config, harness) is None, harness
+    # Provider-routed harnesses on the same config still resolve, proving the
+    # short-circuit is scoped to own-auth ACP spawns and didn't blank the
+    # resolver: qwen consumes the openai family at spawn.
+    qwen_cred = describe_active_credential(config, "qwen")
+    assert qwen_cred is not None and qwen_cred.provider_name == "openai"

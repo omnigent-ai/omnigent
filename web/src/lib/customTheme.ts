@@ -1,9 +1,13 @@
 import {
   isThemePalette,
+  PALETTE_TOKEN_CSS_NAMES,
+  PALETTES,
   type PaletteMeta,
   type PaletteSwatch,
+  type PaletteTokens,
   type ThemePalette,
 } from "./themePalette";
+import { getStyleRoot, getThemeRoots } from "./host";
 
 const STORAGE_KEY = "omnigent:custom-theme";
 const HEX_COLOR = /^#[0-9a-f]{6}$/i;
@@ -11,15 +15,19 @@ const HEX_COLOR = /^#[0-9a-f]{6}$/i;
 export interface CustomTheme {
   basePalette: ThemePalette;
   accent: string;
+  darkAccent: string;
   tint: string;
+  darkTint: string;
   contrast: number;
   translucentSidebar: boolean;
 }
 
 export const DEFAULT_CUSTOM_THEME: CustomTheme = {
   basePalette: "omni",
-  accent: "#df3c85",
-  tint: "#f3e9f4",
+  accent: "#11171c",
+  darkAccent: "#e8ecf0",
+  tint: "#ffffff",
+  darkTint: "#0e1013",
   contrast: 50,
   translucentSidebar: false,
 };
@@ -30,23 +38,7 @@ interface Rgb {
   b: number;
 }
 
-export interface DerivedThemeVariant {
-  background: string;
-  foreground: string;
-  card: string;
-  cardSolid: string;
-  primary: string;
-  primaryForeground: string;
-  secondary: string;
-  muted: string;
-  mutedForeground: string;
-  codeBackground: string;
-  accent: string;
-  border: string;
-  borderStrong: string;
-  sidebar: string;
-  shellBackground: string;
-}
+export type DerivedThemeVariant = PaletteTokens;
 
 export interface DerivedCustomTheme {
   light: DerivedThemeVariant;
@@ -77,7 +69,15 @@ function normalizeTheme(value: unknown): CustomTheme | null {
   return {
     basePalette: candidate.basePalette,
     accent: candidate.accent.toLowerCase(),
+    darkAccent: isHexColor(candidate.darkAccent)
+      ? candidate.darkAccent.toLowerCase()
+      : (PALETTES.find((palette) => palette.id === candidate.basePalette)?.tokens.dark.primary ??
+        DEFAULT_CUSTOM_THEME.darkAccent),
     tint: candidate.tint.toLowerCase(),
+    darkTint: isHexColor(candidate.darkTint)
+      ? candidate.darkTint.toLowerCase()
+      : (PALETTES.find((palette) => palette.id === candidate.basePalette)?.tokens.dark.background ??
+        DEFAULT_CUSTOM_THEME.darkTint),
     contrast: Math.round(clamp(candidate.contrast, 0, 100)),
     translucentSidebar: candidate.translucentSidebar,
   };
@@ -108,8 +108,10 @@ export function writeCustomTheme(theme: CustomTheme): void {
 export function createCustomThemeFromPalette(palette: PaletteMeta): CustomTheme {
   return {
     basePalette: palette.id,
-    accent: palette.light.accent.toLowerCase(),
-    tint: palette.light.bg.toLowerCase(),
+    accent: palette.tokens.light.primary.toLowerCase(),
+    darkAccent: palette.tokens.dark.primary.toLowerCase(),
+    tint: palette.tokens.light.background.toLowerCase(),
+    darkTint: palette.tokens.dark.background.toLowerCase(),
     contrast: 50,
     translucentSidebar: false,
   };
@@ -140,11 +142,6 @@ function mix(first: string, second: string, secondWeight: number): string {
     g: firstRgb.g * (1 - weight) + secondRgb.g * weight,
     b: firstRgb.b * (1 - weight) + secondRgb.b * weight,
   });
-}
-
-function rgba(hex: string, alpha: number): string {
-  const color = hexToRgb(hex);
-  return `rgba(${color.r}, ${color.g}, ${color.b}, ${alpha})`;
 }
 
 function luminance(hex: string): number {
@@ -191,11 +188,92 @@ function readableForeground(background: string): "#111318" | "#ffffff" {
   return darkContrast >= lightContrast ? "#111318" : "#ffffff";
 }
 
-export function deriveCustomTheme(theme: CustomTheme): DerivedCustomTheme {
+type GeneratedThemeVariant = Pick<
+  PaletteTokens,
+  | "background"
+  | "foreground"
+  | "card"
+  | "cardSolid"
+  | "primary"
+  | "primaryForeground"
+  | "secondary"
+  | "muted"
+  | "mutedForeground"
+  | "codeBackground"
+  | "accent"
+  | "border"
+  | "borderStrong"
+  | "sidebar"
+>;
+
+interface GeneratedCustomTheme {
+  light: GeneratedThemeVariant;
+  dark: GeneratedThemeVariant;
+}
+
+interface CssColor extends Rgb {
+  alpha: number;
+}
+
+function parseCssColor(value: string): CssColor | null {
+  const hex = /^#([0-9a-f]{6})([0-9a-f]{2})?$/i.exec(value);
+  if (hex) {
+    return {
+      ...hexToRgb(`#${hex[1]}`),
+      alpha: hex[2] ? Number.parseInt(hex[2], 16) / 255 : 1,
+    };
+  }
+  const rgb = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)$/i.exec(
+    value,
+  );
+  if (!rgb) return null;
+  return {
+    r: Number(rgb[1]),
+    g: Number(rgb[2]),
+    b: Number(rgb[3]),
+    alpha: rgb[4] ? Number(rgb[4]) : 1,
+  };
+}
+
+function formatCssColor(color: CssColor, template: string): string {
+  const rgb = rgbToHex(color);
+  if (template.startsWith("#") && color.alpha === 1) return rgb;
+  if (template.length === 9) {
+    const alpha = Math.round(clamp(color.alpha, 0, 1) * 255)
+      .toString(16)
+      .padStart(2, "0");
+    return `${rgb}${alpha}`;
+  }
+  return `rgba(${Math.round(clamp(color.r, 0, 255))}, ${Math.round(clamp(color.g, 0, 255))}, ${Math.round(clamp(color.b, 0, 255))}, ${Math.round(clamp(color.alpha, 0, 1) * 1000) / 1000})`;
+}
+
+function rebaseColor(base: string, reference: string, current: string): string {
+  if (current === reference) return base;
+  const baseColor = parseCssColor(base);
+  const referenceColor = parseCssColor(reference);
+  const currentColor = parseCssColor(current);
+  if (!baseColor || !referenceColor || !currentColor) return base;
+  return formatCssColor(
+    {
+      r: baseColor.r + currentColor.r - referenceColor.r,
+      g: baseColor.g + currentColor.g - referenceColor.g,
+      b: baseColor.b + currentColor.b - referenceColor.b,
+      alpha: baseColor.alpha,
+    },
+    base,
+  );
+}
+
+function setAlpha(color: string, alpha: number): string {
+  const parsed = parseCssColor(color);
+  return parsed ? formatCssColor({ ...parsed, alpha }, "rgba") : color;
+}
+
+function generateCustomTheme(theme: CustomTheme): GeneratedCustomTheme {
   const normalized = normalizeTheme(theme) ?? DEFAULT_CUSTOM_THEME;
   const contrast = normalized.contrast / 100;
   const lightBackground = mix(normalized.tint, "#fffdff", 0.79 - contrast * 0.15);
-  const darkBackground = mix(normalized.tint, "#0b0b13", 0.72 + contrast * 0.1);
+  const darkBackground = normalized.darkTint;
 
   const lightCard = mix(lightBackground, "#ffffff", 0.72 + contrast * 0.16);
   const darkCard = mix(darkBackground, "#ffffff", 0.05 + contrast * 0.08);
@@ -233,16 +311,15 @@ export function deriveCustomTheme(theme: CustomTheme): DerivedCustomTheme {
       accent: mix(lightBackground, normalized.accent, 0.09 + contrast * 0.06),
       border: lightBorder,
       borderStrong: mix(lightBackground, lightForeground, 0.18 + contrast * 0.12),
-      sidebar: normalized.translucentSidebar ? rgba(lightSidebar, 0.72) : lightSidebar,
-      shellBackground: `linear-gradient(155deg, ${lightCard} 0%, ${lightBackground} 62%, ${mix(lightBackground, normalized.accent, 0.06)} 100%)`,
+      sidebar: lightSidebar,
     },
     dark: {
       background: darkBackground,
       foreground: darkForeground,
       card: darkCard,
       cardSolid: darkCard,
-      primary: normalized.accent,
-      primaryForeground: readableForeground(normalized.accent),
+      primary: normalized.darkAccent,
+      primaryForeground: readableForeground(normalized.darkAccent),
       secondary: darkMuted,
       muted: darkMuted,
       mutedForeground: darkMutedForeground,
@@ -250,9 +327,119 @@ export function deriveCustomTheme(theme: CustomTheme): DerivedCustomTheme {
       accent: mix(darkBackground, normalized.accent, 0.14 + contrast * 0.08),
       border: darkBorder,
       borderStrong: mix(darkBackground, darkForeground, 0.2 + contrast * 0.12),
-      sidebar: normalized.translucentSidebar ? rgba(darkSidebar, 0.72) : darkSidebar,
-      shellBackground: `radial-gradient(ellipse at 18% 24%, ${rgba(normalized.accent, 0.12)} 0%, transparent 52%), linear-gradient(155deg, ${darkCard} 0%, ${darkBackground} 68%, ${mix(darkBackground, "#000000", 0.16)} 100%)`,
+      sidebar: darkSidebar,
     },
+  };
+}
+
+function rebaseVariant(
+  base: PaletteTokens,
+  reference: GeneratedThemeVariant,
+  current: GeneratedThemeVariant,
+  primary: string,
+  translucentSidebar: boolean,
+): DerivedThemeVariant {
+  const primaryChanged = primary !== base.primary.toLowerCase();
+  const foreground = rebaseColor(base.foreground, reference.foreground, current.foreground);
+  const card = rebaseColor(base.card, reference.card, current.card);
+  const cardSolid = rebaseColor(base.cardSolid, reference.cardSolid, current.cardSolid);
+  const accent = rebaseColor(base.accent, reference.accent, current.accent);
+  const accentForeground = rebaseColor(
+    base.accentForeground,
+    reference.foreground,
+    current.foreground,
+  );
+  const border = rebaseColor(base.border, reference.border, current.border);
+  const sidebar = rebaseColor(base.sidebar, reference.sidebar, current.sidebar);
+
+  return {
+    background: rebaseColor(base.background, reference.background, current.background),
+    foreground,
+    card,
+    cardSolid,
+    cardForeground: rebaseColor(base.cardForeground, reference.foreground, current.foreground),
+    tray: rebaseColor(base.tray, reference.card, current.card),
+    popover: rebaseColor(base.popover, reference.cardSolid, current.cardSolid),
+    popoverForeground: rebaseColor(
+      base.popoverForeground,
+      reference.foreground,
+      current.foreground,
+    ),
+    primary: primaryChanged ? primary : base.primary,
+    primaryForeground: primaryChanged ? readableForeground(primary) : base.primaryForeground,
+    secondary: rebaseColor(base.secondary, reference.secondary, current.secondary),
+    secondaryForeground: rebaseColor(
+      base.secondaryForeground,
+      reference.foreground,
+      current.foreground,
+    ),
+    muted: rebaseColor(base.muted, reference.muted, current.muted),
+    mutedForeground: rebaseColor(
+      base.mutedForeground,
+      reference.mutedForeground,
+      current.mutedForeground,
+    ),
+    codeBackground: rebaseColor(
+      base.codeBackground,
+      reference.codeBackground,
+      current.codeBackground,
+    ),
+    accent,
+    accentForeground,
+    border,
+    borderStrong: rebaseColor(base.borderStrong, reference.borderStrong, current.borderStrong),
+    buttonBorder: rebaseColor(base.buttonBorder, reference.border, current.border),
+    input: rebaseColor(base.input, reference.border, current.border),
+    ring: primaryChanged ? primary : base.ring,
+    brandAccent: primaryChanged ? primary : base.brandAccent,
+    sidebar: translucentSidebar ? setAlpha(sidebar, 0.72) : sidebar,
+    sidebarForeground: rebaseColor(
+      base.sidebarForeground,
+      reference.foreground,
+      current.foreground,
+    ),
+    sidebarPrimary: primaryChanged ? primary : base.sidebarPrimary,
+    sidebarPrimaryForeground: primaryChanged
+      ? readableForeground(primary)
+      : base.sidebarPrimaryForeground,
+    sidebarAccent: rebaseColor(base.sidebarAccent, reference.accent, current.accent),
+    sidebarAccentForeground: rebaseColor(
+      base.sidebarAccentForeground,
+      reference.foreground,
+      current.foreground,
+    ),
+    sidebarBorder: rebaseColor(base.sidebarBorder, reference.border, current.border),
+    sidebarRing: primaryChanged ? primary : base.sidebarRing,
+    sidebarActive: base.sidebarActive,
+    sidebarActiveForeground: base.sidebarActiveForeground,
+    sidebarBackground: base.sidebarBackground,
+    shellBackground: base.shellBackground,
+  };
+}
+
+export function deriveCustomTheme(theme: CustomTheme): DerivedCustomTheme {
+  const normalized = normalizeTheme(theme) ?? DEFAULT_CUSTOM_THEME;
+  const palette =
+    PALETTES.find((candidate) => candidate.id === normalized.basePalette) ?? PALETTES[0];
+  const referenceTheme = createCustomThemeFromPalette(palette);
+  const reference = generateCustomTheme(referenceTheme);
+  const current = generateCustomTheme({ ...normalized, translucentSidebar: false });
+
+  return {
+    light: rebaseVariant(
+      palette.tokens.light,
+      reference.light,
+      current.light,
+      normalized.accent,
+      normalized.translucentSidebar,
+    ),
+    dark: rebaseVariant(
+      palette.tokens.dark,
+      reference.dark,
+      current.dark,
+      normalized.darkAccent,
+      normalized.translucentSidebar,
+    ),
   };
 }
 
@@ -260,56 +447,49 @@ export function customThemeSwatches(theme: CustomTheme): {
   light: PaletteSwatch;
   dark: PaletteSwatch;
 } {
-  const variants = deriveCustomTheme(theme);
+  const normalized = normalizeTheme(theme) ?? DEFAULT_CUSTOM_THEME;
+  const palette =
+    PALETTES.find((candidate) => candidate.id === normalized.basePalette) ?? PALETTES[0];
+  const reference = generateCustomTheme(createCustomThemeFromPalette(palette));
+  const current = generateCustomTheme({ ...normalized, translucentSidebar: false });
+
+  const swatch = (
+    base: PaletteSwatch,
+    referenceVariant: GeneratedThemeVariant,
+    currentVariant: GeneratedThemeVariant,
+  ): PaletteSwatch => ({
+    bg: rebaseColor(base.bg, referenceVariant.background, currentVariant.background),
+    card: rebaseColor(base.card, referenceVariant.cardSolid, currentVariant.cardSolid),
+    accent:
+      currentVariant.primary === referenceVariant.primary ? base.accent : currentVariant.primary,
+    border: rebaseColor(base.border, referenceVariant.border, currentVariant.border),
+    text: rebaseColor(base.text, referenceVariant.foreground, currentVariant.foreground),
+  });
+
   return {
-    light: {
-      bg: variants.light.background,
-      card: variants.light.cardSolid,
-      accent: variants.light.primary,
-      border: variants.light.border,
-      text: variants.light.foreground,
-    },
-    dark: {
-      bg: variants.dark.background,
-      card: variants.dark.cardSolid,
-      accent: variants.dark.primary,
-      border: variants.dark.border,
-      text: variants.dark.foreground,
-    },
+    light: swatch(palette.light, reference.light, current.light),
+    dark: swatch(palette.dark, reference.dark, current.dark),
   };
 }
 
-const TOKEN_MAP = {
-  background: "background",
-  foreground: "foreground",
-  card: "card",
-  cardSolid: "card-solid",
-  primary: "primary",
-  primaryForeground: "primary-foreground",
-  secondary: "secondary",
-  muted: "muted",
-  mutedForeground: "muted-foreground",
-  codeBackground: "code-bg",
-  accent: "accent",
-  border: "border",
-  borderStrong: "border-strong",
-  sidebar: "sidebar",
-  shellBackground: "shell-background",
-} as const;
-
 export function applyCustomTheme(theme: CustomTheme): void {
-  if (typeof document === "undefined") return;
+  // The `--custom-*` variables go on the style root (embedded, the scope root;
+  // else the document root); the `data-custom-translucent-sidebar` attribute
+  // goes on every theme root so both the light `:root[...]` and dark `.dark[...]`
+  // selectors match. Standalone both are the document root, so behavior is the
+  // same as before.
+  const styleRoot = getStyleRoot();
+  if (!styleRoot) return;
   const normalized = normalizeTheme(theme) ?? DEFAULT_CUSTOM_THEME;
   const variants = deriveCustomTheme(normalized);
-  const style = document.documentElement.style;
-  document.documentElement.toggleAttribute(
-    "data-custom-translucent-sidebar",
-    normalized.translucentSidebar,
-  );
+  const style = styleRoot.style;
+  for (const root of getThemeRoots()) {
+    root.toggleAttribute("data-custom-translucent-sidebar", normalized.translucentSidebar);
+  }
   for (const mode of ["light", "dark"] as const) {
-    for (const [key, token] of Object.entries(TOKEN_MAP) as [
+    for (const [key, token] of Object.entries(PALETTE_TOKEN_CSS_NAMES) as [
       keyof DerivedThemeVariant,
-      (typeof TOKEN_MAP)[keyof typeof TOKEN_MAP],
+      (typeof PALETTE_TOKEN_CSS_NAMES)[keyof typeof PALETTE_TOKEN_CSS_NAMES],
     ][]) {
       style.setProperty(`--custom-${mode}-${token}`, variants[mode][key]);
     }

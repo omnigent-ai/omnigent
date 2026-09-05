@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use notify::RecursiveMode;
+use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::new_debouncer;
 use tokio::sync::mpsc;
 
@@ -43,6 +43,12 @@ pub fn spawn(
             let mut changed = 0usize;
             for event in &events {
                 for path in &event.paths {
+                    if !is_mutating(&event.kind) {
+                        if debug {
+                            log_watch(&shared, &repo_root, path, "skip (non-mutating event)");
+                        }
+                        continue;
+                    }
                     match classify(path, &ignore) {
                         Ok(()) => {
                             changed += 1;
@@ -70,6 +76,13 @@ pub fn spawn(
         .with_context(|| format!("watching {}", omnigent_dir.display()))?;
 
     Ok(debouncer)
+}
+
+/// Only filesystem mutations should reload the backend. In particular, Python
+/// imports emit access/open events on Linux; treating those as changes creates
+/// a restart loop where each new backend immediately reloads itself.
+fn is_mutating(kind: &EventKind) -> bool {
+    kind.is_create() || kind.is_modify() || kind.is_remove()
 }
 
 /// Build a gitignore matcher from the repo's root `.gitignore` and
@@ -114,6 +127,7 @@ fn log_watch(shared: &Arc<Mutex<Shared>>, repo_root: &Path, path: &Path, what: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::event::{AccessKind, CreateKind, ModifyKind, RemoveKind};
 
     fn ignore_with(line: &str) -> Gitignore {
         let mut b = GitignoreBuilder::new("/repo");
@@ -125,6 +139,18 @@ mod tests {
     fn plain_python_file_triggers_reload() {
         let ig = ignore_with("omnigent/_build_info.py");
         assert_eq!(classify(Path::new("/repo/omnigent/cli.py"), &ig), Ok(()));
+    }
+
+    #[test]
+    fn mutating_events_trigger_reload() {
+        assert!(is_mutating(&EventKind::Create(CreateKind::Any)));
+        assert!(is_mutating(&EventKind::Modify(ModifyKind::Any)));
+        assert!(is_mutating(&EventKind::Remove(RemoveKind::Any)));
+    }
+
+    #[test]
+    fn access_events_do_not_trigger_reload() {
+        assert!(!is_mutating(&EventKind::Access(AccessKind::Any)));
     }
 
     #[test]

@@ -11,7 +11,7 @@
 # oss-publish-images.yml) hangs off the tag push.
 #
 # PyPI publishing does NOT happen here — after this run, dispatch the secure
-# release repo on the tag (see RELEASING.md). Everything here is idempotent:
+# release repo on the tag (see the maintainer release runbook). Everything here is idempotent:
 # re-dispatch with identical inputs after any failure and it converges
 # (branch exists -> reused; version stamped -> no new commit; tag at the
 # converged commit -> no-op; tag anywhere else -> loud failure).
@@ -164,7 +164,7 @@ jobs:
               echo "Tag ${TAG} already at the converged release commit ${base_sha} — nothing to do." \
                 | tee -a "$GITHUB_STEP_SUMMARY"
             else
-              echo "::error::Tag ${TAG} already exists at ${tag_sha} (stamped version: ${stamped:-unknown}), which is not the converged branch head ${base_sha}. Delete the tag first if this is recovery (see RELEASING.md)."
+              echo "::error::Tag ${TAG} already exists at ${tag_sha} (stamped version: ${stamped:-unknown}), which is not the converged branch head ${base_sha}. Delete the tag first if this is recovery (see the maintainer release runbook)."
               exit 1
             fi
           fi
@@ -283,7 +283,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync
 
       - name: Find previous stable release tag
         id: prev
@@ -308,7 +308,7 @@ jobs:
         if: steps.prev.outputs.found == 'true'
         run: |
           git checkout "${{ steps.prev.outputs.tag }}"
-          uv sync --extra dev
+          uv sync
           uv run --no-sync dev/benchmarks/omnigent/seed.py \
             --database-uri "sqlite:///bench.db" \
             --sessions 5000 --items-per-session 200
@@ -362,7 +362,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync
 
       - name: Run baseline benchmark
         run: |
@@ -413,7 +413,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync
 
       # The seeded bench.db is at the previous release's schema head. The
       # candidate (newer code) auto-migrates on server boot, but the z7
@@ -473,7 +473,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync
 
       - name: Download results
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -600,6 +600,10 @@ jobs:
             uv run --no-project --python 3.12 --with packaging \
               python scripts/update_versions.py pre-release --new-version "$VERSION"
             uv lock
+            # uv may emit non-canonical lockfile fields (e.g. size on file
+            # entries); normalize like the pre-commit fixer, then hard-verify.
+            python3 scripts/normalize_uv_lock_registry.py uv.lock || true
+            python3 scripts/normalize_uv_lock_registry.py --check uv.lock
           fi
           uv run --no-project --python 3.12 --with packaging \
             python scripts/update_versions.py check --expect "$VERSION"
@@ -615,8 +619,10 @@ jobs:
           git config user.name "omnigent-ci[bot]"
           git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
 
-          git add pyproject.toml sdks/python-client/pyproject.toml sdks/ui/pyproject.toml \
-            omnigent/version.py uv.lock
+          # Stage everything the stamp touched: update_versions.py owns the
+          # file set, and a hand-kept path list here goes stale whenever a
+          # package joins the lockstep (bump-version.yml stages the same way).
+          git add -A
           if git diff --cached --quiet; then
             echo "No version changes to commit (already stamped)."
           else
@@ -639,15 +645,18 @@ jobs:
           {
             echo "## Next steps"
             echo ""
-            echo "1. Dispatch the secure-release repo on this tag:"
+            # Run summaries are world-readable on a public repo, so the
+            # secure-release repo is a placeholder here; the runbook names it.
+            echo "1. Dispatch the secure-release repo on this tag. Substitute the repo"
+            echo "   name from the maintainer release runbook, then run:"
             echo '   ```'
-            echo "   gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \\"
+            echo "   gh workflow run omnigent.yml --repo <secure-release-repo> \\"
             echo "     -f ref=${TAG} -f destination=pypi -f dry-run=true    # gates rehearsal"
-            echo "   gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \\"
+            echo "   gh workflow run omnigent.yml --repo <secure-release-repo> \\"
             echo "     -f ref=${TAG} -f destination=pypi -f dry-run=false   # real publish"
             echo '   ```'
             if [ "$PRERELEASE" = "true" ]; then
-              echo "2. Validate the rc from PyPI (see RELEASING.md). No GitHub release is created for rc tags (rcs live on PyPI only) — skip straight to the next rc or the final cut."
+              echo "2. Validate the rc from PyPI (see the maintainer release runbook). No GitHub release is created for rc tags (rcs live on PyPI only) — skip straight to the next rc or the final cut."
             else
               echo "2. Merge the CHANGELOG PR, curate the ${TAG} draft notes, then dispatch finalize-release.yml (tag=${TAG})."
             fi
@@ -657,7 +666,10 @@ jobs:
   # never re-freezes and doc-sync keeps deriving the right X.Y-docs branch.
   bump-main:
     needs: [authorize, plan, cut]
-    if: ${{ !inputs.dry_run && needs.plan.outputs.branch_exists == 'false' }}
+    # The benchmark chain is skipped on most cuts, and a default `success()`
+    # gate inherits that skip through `cut`, so this job silently vanished on
+    # every cut but one. Depend on `cut` succeeding, not on the whole closure.
+    if: ${{ !cancelled() && needs.cut.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -667,8 +679,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.plan.outputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          BRANCH_EXISTS: ${{ needs.plan.outputs.branch_exists }}
         run: |
           set -euo pipefail
+          # Gate in shell, not a job-level `if`: a CLI/API dispatch delivers
+          # boolean inputs as the STRING "false", which is truthy in an
+          # expression, so `!inputs.dry_run` silently skipped this job at the
+          # v0.7.0 cut. Shell string comparison is dispatch-channel-proof and
+          # logs its decision instead of vanishing from the run.
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run — not dispatching the main bump." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$BRANCH_EXISTS" != "false" ]; then
+            echo "Release branch pre-existed (not the first cut of this cycle) — main bump not needed." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           # A cut below main's current line (a throwaway rehearsal rc, or
           # resurrecting an old series for a backport) must not walk main's
           # version backwards.

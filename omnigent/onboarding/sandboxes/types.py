@@ -77,6 +77,16 @@ class SandboxCapabilities:
         inside the sandbox.
     :param foreground_exec: Provider supports a foreground exec that
         inherits local stdio.
+    :param classifies_runner_by_agent: Provider stamps the session's
+        resolved built-in agent onto the managed runner as platform
+        metadata a policy can select on (the Kubernetes runner Pod's
+        ``omnigent.ai/agent`` label). When set, the managed launch path
+        threads ``agent_name`` into ``start_host``; providers that leave
+        it ``False`` never receive the keyword.
+    :param snapshot_restore: Resuming a stopped sandbox restores a
+        suspend-time snapshot (dependencies installed, caches warm)
+        rather than cold-starting it. Only meaningful alongside
+        ``resume_stopped``.
     """
 
     cli_bootstrap: bool = False
@@ -87,6 +97,10 @@ class SandboxCapabilities:
     file_copy: bool = False
     streaming_exec: bool = False
     foreground_exec: bool = False
+    classifies_runner_by_agent: bool = False
+    # New fields append at the end to preserve positional-constructor
+    # compatibility for out-of-tree providers.
+    snapshot_restore: bool = False
 
 
 @dataclass(frozen=True)

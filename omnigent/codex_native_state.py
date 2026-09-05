@@ -20,6 +20,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from omnigent.process_logging import data_dir
+
 _STATE_ROOT_ENV_VAR = "OMNIGENT_CODEX_NATIVE_STATE_DIR"
 _logger = logging.getLogger(__name__)
 _LAUNCH_FILE = "launch.json"
@@ -44,14 +46,15 @@ def _codex_native_state_root() -> Path:
     Return the root directory for persistent codex-native state.
 
     Honors :data:`_STATE_ROOT_ENV_VAR` for tests and advanced local
-    setups. Production defaults to ``~/.omnigent/codex-native``.
+    setups. Otherwise follows ``OMNIGENT_DATA_DIR``, falling back to
+    ``~/.omnigent/codex-native``.
 
     :returns: Absolute path to the state root.
     """
     override = os.environ.get(_STATE_ROOT_ENV_VAR)
     if override:
         return Path(override)
-    return Path.home() / ".omnigent" / "codex-native"
+    return data_dir() / "codex-native"
 
 
 def _state_dir_for_conversation_id(conversation_id: str) -> Path:

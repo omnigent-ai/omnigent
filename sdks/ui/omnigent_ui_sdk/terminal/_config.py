@@ -2,8 +2,9 @@
 
 The UI SDK keeps this intentionally small: TUI preferences are persisted
 under the ``tui:`` table of the shared Omnigent YAML config file
-(``$HOME/.omnigent/config.yaml``). Today that means the persisted
-light/dark theme selection.
+(``$OMNIGENT_CONFIG_HOME/config.yaml`` when configured, otherwise
+``$HOME/.omnigent/config.yaml``). Today that means the persisted light/dark
+theme selection.
 
 The same file is also written by the ``omnigent`` CLI (top-level keys
 such as ``default_agent`` and ``profile``). Reads and writes here are
@@ -12,6 +13,7 @@ scoped to ``tui:`` so sibling CLI keys round-trip unchanged.
 
 from __future__ import annotations
 
+import os
 import pathlib
 from collections.abc import Mapping
 from contextlib import suppress
@@ -25,6 +27,8 @@ from ._theme import TerminalThemeName, get_theme
 
 _CONFIG_FILENAME = "config.yaml"
 _STATE_DIRNAME = ".omnigent"
+_DATA_DIR_ENV_VAR = "OMNIGENT_DATA_DIR"
+_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _TUI_KEY = "tui"
 
 
@@ -49,27 +53,35 @@ DEFAULT_USER_CONFIG = UserConfig()
 def state_dir() -> pathlib.Path:
     """Return the shared Omnigent per-user state directory.
 
-    The directory is currently ``$HOME/.omnigent``. Callers that only need
-    to compute a path can use this without causing filesystem side effects;
-    writers create the directory when saving.
+    Honors ``OMNIGENT_DATA_DIR`` so worktrees and dev pods can isolate runtime
+    state without replacing ``HOME``. Callers that only compute a path cause
+    no filesystem side effects; writers create the directory when saving.
 
-    :returns: The per-user terminal state directory, e.g.
+    :returns: ``$OMNIGENT_DATA_DIR`` when set, else
         ``Path.home() / ".omnigent"``.
     """
 
-    return pathlib.Path.home() / _STATE_DIRNAME
+    value = os.environ.get(_DATA_DIR_ENV_VAR)
+    return pathlib.Path(value).expanduser() if value else pathlib.Path.home() / _STATE_DIRNAME
 
 
 def user_config_path(root: str | pathlib.Path | None = None) -> pathlib.Path:
     """Return the path to the YAML user config file.
 
-    :param root: Optional explicit state directory. Defaults to
-        :func:`state_dir`, i.e. ``$HOME/.omnigent``.
-    :returns: The config file path, e.g.
+    ``OMNIGENT_CONFIG_HOME`` isolates configuration independently from runtime
+    state. An explicit *root* takes precedence over the environment.
+
+    :param root: Optional explicit config directory.
+    :returns: ``$OMNIGENT_CONFIG_HOME/config.yaml`` when set, else
         ``Path.home() / ".omnigent" / "config.yaml"``.
     """
 
-    base = state_dir() if root is None else pathlib.Path(root).expanduser()
+    if root is not None:
+        base = pathlib.Path(root).expanduser()
+    elif value := os.environ.get(_CONFIG_HOME_ENV_VAR):
+        base = pathlib.Path(value).expanduser()
+    else:
+        base = pathlib.Path.home() / _STATE_DIRNAME
     return base / _CONFIG_FILENAME
 
 

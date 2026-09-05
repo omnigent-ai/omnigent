@@ -115,6 +115,19 @@ All capabilities are **required** for a complete harness integration:
 - [ ] Unit tests cover tool bridging, auth, model routing
 - [ ] Mock LLM tests cover the happy path without real API calls
 
+### Shortcut: ACP CLI harnesses are one catalog row
+
+If the vendor CLI speaks the Agent Client Protocol on stdio (the
+`goose acp` / `qwen --acp` family), do NOT write a new inner module, registry
+entries, or a spawn-env builder. Add one row to `ACP_CLI_HARNESSES` in
+`omnigent/acp_cli_harnesses.py` (label, binary, ACP argv, aliases, install
+hint or npm package, vendor login command) plus docs. Validity, module
+routing, picker label, capabilities, install spec, readiness, setup steps,
+spawn env, and the live e2e-matrix exclusion all derive from the row;
+`tests/test_acp_cli_harnesses.py` asserts the wiring per row automatically.
+These rows run through `omnigent/inner/acp_harness.py` and `AcpExecutor`, own
+their auth and model selection, and reject `/model` overrides up front.
+
 ---
 
 ## Part 2 — Native harnesses

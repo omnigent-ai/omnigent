@@ -6,6 +6,8 @@ import json
 import stat
 from pathlib import Path
 
+import pytest
+
 from omnigent import pi_native_bridge
 
 
@@ -330,3 +332,94 @@ def test_refresh_config_auth_headers_preserves_launch_written_headers(tmp_path: 
     assert payload["authHeaders"]["Authorization"] == "Bearer fresh"
     # Tunnel token written at launch is preserved across the bearer rotation.
     assert payload["authHeaders"]["X-Omnigent-Runner-Tunnel-Token"] == "tunnel-tok"
+
+
+def test_inject_relay_into_config_writes_relay_fields(tmp_path: Path) -> None:
+    """inject_relay_into_config writes relayUrl and relayToken into config.json."""
+    from omnigent import pi_native_bridge
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_test",
+        server_url="http://127.0.0.1:6767",
+        conversation_url="http://127.0.0.1:6767/c/conv_test",
+        auth_headers={"Authorization": "Bearer old"},
+    )
+
+    updated = pi_native_bridge.inject_relay_into_config(
+        bridge_dir, "http://127.0.0.1:9999", "relay-tok"
+    )
+
+    assert updated is True
+    payload = json.loads(pi_native_bridge.config_path(bridge_dir).read_text(encoding="utf-8"))
+    assert payload["relayUrl"] == "http://127.0.0.1:9999"
+    assert payload["relayToken"] == "relay-tok"
+    # Existing fields are preserved.
+    assert "serverUrl" in payload
+
+
+def test_inject_relay_into_config_noops_when_config_absent(tmp_path: Path) -> None:
+    """inject_relay_into_config returns False when config.json is missing."""
+    from omnigent import pi_native_bridge
+
+    bridge_dir = tmp_path / "missing"
+    bridge_dir.mkdir()
+    assert pi_native_bridge.inject_relay_into_config(bridge_dir, "http://x", "tok") is False
+
+
+# ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
+
+
+def test_prepare_bridge_dir_writes_owner_pid_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prepare_bridge_dir records the creating pid so the periodic sweep can
+    prune the dir only when its owner is provably dead."""
+    import os
+
+    from omnigent.pi_native_bridge import prepare_bridge_dir
+
+    monkeypatch.setattr("omnigent.pi_native_bridge._BRIDGE_ROOT", tmp_path / "pi-native")
+
+    bridge_dir = prepare_bridge_dir("conv_owner_marker")
+
+    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
+    import os
+    import subprocess
+    import sys
+
+    from omnigent.pi_native_bridge import prune_orphaned_bridge_dirs
+
+    root = tmp_path / "pi-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.pi_native_bridge._BRIDGE_ROOT", root)
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    dead_dir = root / "deadowner"
+    dead_dir.mkdir()
+    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+
+    live_dir = root / "liveowner"
+    live_dir.mkdir()
+    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    unmarked_dir = root / "unmarked"
+    unmarked_dir.mkdir()
+
+    pruned = prune_orphaned_bridge_dirs()
+
+    assert pruned == 1
+    assert not dead_dir.exists()
+    assert live_dir.exists()
+    assert unmarked_dir.exists()

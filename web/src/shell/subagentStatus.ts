@@ -12,14 +12,7 @@ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 // runner dropped its tunnel or exited; the task did NOT genuinely fail, so
 // it renders a quiet, non-destructive grey dot rather than the red "Failed".
 export type AgentActivity =
-  | "launching"
-  | "working"
-  | "awaiting"
-  | "done"
-  | "failed"
-  | "disconnected"
-  | "idle"
-  | "other";
+  "launching" | "working" | "awaiting" | "done" | "failed" | "disconnected" | "idle" | "other";
 
 export interface AgentStatus {
   activity: AgentActivity;

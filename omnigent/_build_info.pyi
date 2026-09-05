@@ -1,0 +1,2 @@
+BUILD_TIME_EPOCH: int
+COMMIT_SHA: str

@@ -203,7 +203,7 @@ side effects.
 
 ```bash
 # Existing pytest e2e for polly (mock-LLM) — complementary to this skill:
-uv run --frozen --extra dev python -m pytest \
+uv run --frozen --group test python -m pytest \
   tests/e2e/test_polly_e2e.py \
   tests/e2e/test_polly_cost_advisor_e2e.py \
   tests/e2e/test_polly_subagent_model_e2e.py -q

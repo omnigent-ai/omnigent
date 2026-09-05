@@ -15,12 +15,14 @@ import pytest
 from omnigent.llms import context_window
 from omnigent.llms.context_window import (
     ModelPricing,
-    _registry_context_window,
+    _catalog_context_window,
+    _encoded_context_window,
     compute_llm_cost,
     fetch_model_pricing,
     get_model_context_window,
     resolve_effective_context_window,
 )
+from omnigent.onboarding.providers import ModelInfo
 
 
 def test_resolve_effective_context_window_prefers_declared_window(
@@ -185,22 +187,19 @@ def test_fetch_model_pricing_parses_cache_rates(monkeypatch: pytest.MonkeyPatch)
     cache-accurate. A failure means the cache rates were dropped and
     cost would fall back to the derived input-ratio default.
     """
-    # Catalog lookup is disabled globally in tests (conftest); re-enable
-    # for this one and stub the network fetch with a cache-priced entry.
-    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
     monkeypatch.setattr(
         context_window,
-        "_fetch_mlflow_provider_catalog",
-        lambda provider: {
-            "claude-x": {
-                "pricing": {
-                    "input_per_million_tokens": 2.5,
-                    "output_per_million_tokens": 10.0,
-                    "cache_read_per_million_tokens": 0.25,
-                    "cache_write_per_million_tokens": 3.125,
-                }
-            }
-        },
+        "find_catalog_models",
+        lambda _model: [
+            ModelInfo(
+                name="catalog-model",
+                provider="provider",
+                input_price=2.5,
+                output_price=10.0,
+                cache_read_price=0.25,
+                cache_write_price=3.125,
+            )
+        ],
     )
     pricing = fetch_model_pricing("anthropic/claude-x")
     assert pricing is not None
@@ -221,18 +220,17 @@ def test_fetch_model_pricing_omits_cache_rates_when_absent(
     the standard ratios. If these came back as ``0.0`` instead of ``None``,
     cache tokens would be billed free.
     """
-    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
     monkeypatch.setattr(
         context_window,
-        "_fetch_mlflow_provider_catalog",
-        lambda provider: {
-            "gpt-x": {
-                "pricing": {
-                    "input_per_million_tokens": 1.25,
-                    "output_per_million_tokens": 10.0,
-                }
-            }
-        },
+        "find_catalog_models",
+        lambda _model: [
+            ModelInfo(
+                name="catalog-model",
+                provider="provider",
+                input_price=1.25,
+                output_price=10.0,
+            )
+        ],
     )
     pricing = fetch_model_pricing("openai/gpt-x")
     assert pricing is not None
@@ -254,31 +252,18 @@ def test_fetch_model_pricing_databricks_alias_falls_back_to_base_model(
     gateway (which defaults to ``databricks-claude-opus-4-8``) would show
     "unpriced" — the exact gap reported for the debbie/debby supervisors.
     """
-    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
-
-    def _catalog(provider: str) -> dict[str, Any] | None:
-        """Databricks catalog lacks opus; the base (anthropic) catalog prices it."""
-        if provider == "databricks":
-            # Has some databricks models, but NOT the opus alias under test.
-            return {
-                "databricks-claude-sonnet-4-6": {
-                    "pricing": {
-                        "input_per_million_tokens": 3.0,
-                        "output_per_million_tokens": 15.0,
-                    }
-                }
-            }
-        # The underlying provider (anthropic) prices the de-prefixed base.
-        return {
-            "claude-opus-4-8": {
-                "pricing": {
-                    "input_per_million_tokens": 15.0,
-                    "output_per_million_tokens": 75.0,
-                }
-            }
-        }
-
-    monkeypatch.setattr(context_window, "_fetch_mlflow_provider_catalog", _catalog)
+    monkeypatch.setattr(
+        context_window,
+        "find_catalog_models",
+        lambda _model: [
+            ModelInfo(
+                name="catalog-model",
+                provider="anthropic",
+                input_price=15.0,
+                output_price=75.0,
+            )
+        ],
+    )
 
     pricing = fetch_model_pricing("databricks-claude-opus-4-8")
     assert pricing is not None, (
@@ -291,122 +276,85 @@ def test_fetch_model_pricing_databricks_alias_falls_back_to_base_model(
     assert pricing.output_per_token == pytest.approx(75e-6)
 
 
-def test_provider_catalog_is_cached_across_calls(
+def test_catalog_context_window_uses_max_input_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    The per-provider catalog is downloaded once, then served from cache.
+    """Context sizing uses the catalog's normalized max-input field."""
+    monkeypatch.setattr(
+        context_window,
+        "find_catalog_models",
+        lambda _model: [
+            ModelInfo(
+                name="catalog-model",
+                provider="provider",
+                max_input_tokens=997_952,
+                max_output_tokens=65_536,
+            )
+        ],
+    )
 
-    This pins the perf fix: the response builder calls
-    ``get_model_context_window`` on every ``GET /v1/sessions/{id}``
-    snapshot, and each call used to re-issue a ~490ms GitHub fetch.
-    With the TTL cache, repeated lookups for the same provider must hit
-    the network exactly once. A regression (cache removed) would show as
-    a download count > 1. Asserting the resolved window also proves the
-    cached payload still flows through the resolver unchanged.
-    """
-    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
-    # Clear any residue from earlier tests so the count starts clean.
-    context_window._catalog_cache.clear()
-    calls: list[str] = []
-
-    def _fake_download(provider: str) -> dict[str, Any]:
-        """Record each network hit and return a one-model catalog."""
-        calls.append(provider)
-        return {"claude-z": {"context_window": {"max_input": 200_000, "max_output": 8_192}}}
-
-    monkeypatch.setattr(context_window, "_download_mlflow_provider_catalog", _fake_download)
-
-    # litellm resolves many real names; force the catalog path by using a
-    # name it won't know, so the fetch is exercised deterministically.
-    first = context_window.get_model_context_window("claude-z")
-    second = context_window.get_model_context_window("claude-z")
-    assert first == 208_192  # max_input + max_output from the stub
-    assert second == 208_192
-    # Exactly one network download despite two resolver calls.
-    assert calls == ["anthropic"]
+    assert _catalog_context_window("catalog-model") == 997_952
 
 
-def test_provider_catalog_caches_fetch_failure(
+def test_catalog_context_window_rejects_ambiguous_family_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A failed download (``None``) is cached too, not retried every call.
+    """A family fallback is used only when every catalog entry agrees."""
+    monkeypatch.setattr(
+        context_window,
+        "find_catalog_models",
+        lambda _model: [
+            ModelInfo(name="family-a", provider="provider", max_input_tokens=100_000),
+            ModelInfo(name="family-b", provider="provider", max_input_tokens=200_000),
+        ],
+    )
 
-    A transient GitHub outage returns ``None``; without caching that
-    result, every subsequent snapshot would re-pay the 5s timeout for an
-    hour. Pinning that ``None`` is cached keeps a single failure from
-    amplifying into per-request latency. The caller still falls back to
-    the 128K default, which this also checks.
-    """
-    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
-    context_window._catalog_cache.clear()
-    calls: list[str] = []
-
-    def _fail(provider: str) -> None:
-        """Record the hit and simulate a network/parse failure (returns None)."""
-        calls.append(provider)
-
-    monkeypatch.setattr(context_window, "_download_mlflow_provider_catalog", _fail)
-    first = context_window.get_model_context_window("claude-z")
-    second = context_window.get_model_context_window("claude-z")
-    assert first == 128_000  # _DEFAULT_CONTEXT_WINDOW fallback
-    assert second == 128_000
-    assert calls == ["anthropic"]
+    assert _catalog_context_window("family-new") is None
 
 
-# ---------------------------------------------------------------------------
-# Omnigent's authoritative context-window registry (supersedes litellm/catalog)
-# ---------------------------------------------------------------------------
-
-
-def test_registry_context_window_normalizes_id() -> None:
-    """The registry strips provider prefixes and ``:tag`` suffixes before matching."""
-    assert _registry_context_window("qwen3-coder-plus") == 1_048_576
-    assert _registry_context_window("qwen/qwen3-coder") == 262_144
-    assert _registry_context_window("qwen3-coder:free") == 262_144
-    assert _registry_context_window("openrouter/qwen/qwen3-coder:free") == 262_144
-    assert _registry_context_window("QWEN3-CODER-PLUS") == 1_048_576  # case-insensitive
-    # A model the registry doesn't own → None (caller falls back to litellm).
-    assert _registry_context_window("qwen-nonexistent-xyz") is None
-    assert _registry_context_window("gpt-5.4") is None
-
-
-def test_registry_resolves_anthropic_1m_beta_suffix() -> None:
-    """The Anthropic ``[1m]`` beta marker resolves to a 1M window via the registry.
+def test_encoded_context_window_resolves_anthropic_1m_beta_suffix() -> None:
+    """The Anthropic ``[1m]`` beta marker resolves to a 1M window.
 
     The suffix *is* the window — we read it, not strip it — so any
     ``<model>[1m]`` resolves to 1,000,000 while the bare base defers to the
     upstream backends (which may size it differently).
     """
-    assert _registry_context_window("claude-opus-4-8[1m]") == 1_000_000
-    assert _registry_context_window("anthropic/claude-opus-4-8[1m]") == 1_000_000
-    assert _registry_context_window("claude-sonnet-4-6[1m]") == 1_000_000
-    assert _registry_context_window("CLAUDE-OPUS-4-8[1M]") == 1_000_000  # case-insensitive
+    assert _encoded_context_window("claude-opus-4-8[1m]") == 1_000_000
+    assert _encoded_context_window("anthropic/claude-opus-4-8[1m]") == 1_000_000
+    assert _encoded_context_window("claude-sonnet-4-6[1m]") == 1_000_000
+    assert _encoded_context_window("CLAUDE-OPUS-4-8[1M]") == 1_000_000
     # Databricks-hosted Claude (contains "claude") also resolves.
-    assert _registry_context_window("databricks-claude-opus-4-8[1m]") == 1_000_000
-    # Without the suffix the registry defers (None → caller uses litellm/catalog).
-    assert _registry_context_window("claude-opus-4-8") is None
+    assert _encoded_context_window("databricks-claude-opus-4-8[1m]") == 1_000_000
+    # Without the suffix the encoded path defers to catalog metadata.
+    assert _encoded_context_window("claude-opus-4-8") is None
     # The rule is Claude-scoped: a non-Claude id ending in [1m] is NOT forced to
     # 1M (it defers to litellm/catalog), so custom/self-hosted ids are safe.
-    assert _registry_context_window("my-local-model[1m]") is None
-    assert _registry_context_window("gpt-5.4[1m]") is None
+    assert _encoded_context_window("my-local-model[1m]") is None
+    assert _encoded_context_window("gpt-5.4[1m]") is None
 
 
-def test_get_model_context_window_uses_registry_first(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Registry-curated ids resolve to their window with NO network.
-
-    Catalog lookup is disabled to prove hermeticity: the registry is consulted
-    before litellm and the catalog, so qwen models and the Anthropic ``[1m]``
-    beta resolve correctly even offline (the meter / overflow-threshold
-    bug was that these collapsed to the 128K default).
-    """
-    monkeypatch.setenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
+def test_get_model_context_window_prefers_catalog_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dynamic catalog metadata replaces the removed exact-id registry."""
     monkeypatch.delenv("AP_CONTEXT_WINDOW_OVERRIDE", raising=False)
-    # Anthropic 1M beta: resolves via the registry, not the 128K default.
+    monkeypatch.setattr(
+        context_window,
+        "find_catalog_models",
+        lambda _model: [
+            ModelInfo(name="catalog-model", provider="provider", max_input_tokens=997_952)
+        ],
+    )
+
+    assert get_model_context_window("catalog-model") == 997_952
+
+
+def test_get_model_context_window_encoded_and_offline_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Encoded metadata remains available offline; unknown ids stay conservative."""
+    monkeypatch.delenv("AP_CONTEXT_WINDOW_OVERRIDE", raising=False)
+    monkeypatch.setattr(context_window, "find_catalog_models", lambda _model: [])
     assert get_model_context_window("claude-opus-4-8[1m]") == 1_000_000
     assert get_model_context_window("anthropic/claude-opus-4-8[1m]") == 1_000_000
-    # Qwen: curated window, not the default.
-    assert get_model_context_window("qwen3-coder-plus") == 1_048_576
-    # A model the registry doesn't own still falls back to the conservative default.
-    assert get_model_context_window("qwen-nonexistent-xyz") == 128_000
+    assert get_model_context_window("uncatalogued-model") == 128_000

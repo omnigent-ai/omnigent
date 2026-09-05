@@ -44,6 +44,47 @@ def test_hello_round_trip() -> None:
     assert decoded.frame_protocol_version == 1
     assert decoded.harnesses == ["claude-sdk", "codex"]
     assert decoded.envs == ["os_sandbox"]
+    assert decoded.direct_attach_port is None
+    assert decoded.direct_attach_token is None
+
+
+def test_hello_round_trip_with_direct_attach_advert() -> None:
+    f = HelloFrame(
+        runner_version="0.1.2",
+        frame_protocol_version=1,
+        direct_attach_port=54321,
+        direct_attach_token="tok_abc",
+    )
+    decoded = decode_frame(encode_frame(f))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.direct_attach_port == 54321
+    assert decoded.direct_attach_token == "tok_abc"
+
+
+def test_hello_without_advert_omits_direct_attach_keys_on_wire() -> None:
+    """Advert-less hellos keep the pre-advert wire shape byte-compatible."""
+    wire = json.loads(encode_frame(HelloFrame(runner_version="0.1.2", frame_protocol_version=1)))
+    assert "direct_attach_port" not in wire
+    assert "direct_attach_token" not in wire
+
+
+def test_hello_decode_drops_half_present_direct_attach_advert() -> None:
+    """Port and token only mean anything together; a lone field is noise."""
+    wire = json.loads(
+        encode_frame(
+            HelloFrame(
+                runner_version="0.1.2",
+                frame_protocol_version=1,
+                direct_attach_port=54321,
+                direct_attach_token="tok_abc",
+            )
+        )
+    )
+    del wire["direct_attach_token"]
+    decoded = decode_frame(json.dumps(wire))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.direct_attach_port is None
+    assert decoded.direct_attach_token is None
 
 
 def test_request_round_trip_with_body_and_query_string() -> None:

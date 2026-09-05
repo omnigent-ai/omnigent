@@ -44,6 +44,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import httpx
 
@@ -289,9 +290,9 @@ def _chat_claimed_by_other(bridge_dir: Path, store_path: Path, my_launch_ms: int
 def _get_current_rowid(store_path: Path) -> int:
     """Return the highest rowid currently in *store_path*, or 0 on any error."""
     sql = "SELECT MAX(rowid) FROM blobs"
-    for uri, kw in ((f"file:{store_path}?mode=ro", {"uri": True}), (str(store_path), {})):
+    for uri, use_uri in ((f"file:{store_path}?mode=ro", True), (str(store_path), False)):
         try:
-            con = sqlite3.connect(uri, timeout=5.0, **kw)
+            con = sqlite3.connect(uri, timeout=5.0, uri=use_uri)
         except sqlite3.Error:
             continue
         try:
@@ -490,13 +491,16 @@ def _read_blob_rows(store_path: Path, last_rowid: int) -> list[tuple[int, str, o
     (only SELECTs are issued).
     """
     sql = "SELECT rowid, id, data FROM blobs WHERE rowid > ? ORDER BY rowid"
-    for uri, kw in ((f"file:{store_path}?mode=ro", {"uri": True}), (str(store_path), {})):
+    for uri, use_uri in ((f"file:{store_path}?mode=ro", True), (str(store_path), False)):
         try:
-            con = sqlite3.connect(uri, timeout=5.0, **kw)
+            con = sqlite3.connect(uri, timeout=5.0, uri=use_uri)
         except sqlite3.Error:
             continue
         try:
-            return con.execute(sql, (last_rowid,)).fetchall()
+            return cast(
+                list[tuple[int, str, object]],
+                con.execute(sql, (last_rowid,)).fetchall(),
+            )
         except sqlite3.Error:
             continue
         finally:
@@ -509,9 +513,9 @@ def _read_last_used_model(store_path: Path) -> str | None:
 
     cursor records the active model in the ``meta`` table under key ``"0"`` as a
     hex-encoded JSON blob carrying ``lastUsedModel`` — the *base* model id (e.g.
-    ``"gpt-5.2"``, ``"claude-opus-4-6"``), the same namespace the curated picker
-    catalog (:func:`omnigent.cursor_native.cursor_base_model_options`) and the
-    ``/model`` picker use, so a mirrored value matches a picker option. It
+    ``"gpt-5.2"``, ``"claude-opus-4-6"``), the same namespace the live CLI
+    catalog parser and the ``/model`` picker use, so a mirrored value matches a
+    picker option. It
     updates in place whenever the user switches model in the TUI, so polling it
     is how the web picker learns of a terminal-side switch (the reverse of
     :func:`omnigent.cursor_native_bridge.inject_model_command`).
@@ -524,9 +528,9 @@ def _read_last_used_model(store_path: Path) -> str | None:
         not yet written, or malformed.
     """
     sql = "SELECT value FROM meta"
-    for uri, kw in ((f"file:{store_path}?mode=ro", {"uri": True}), (str(store_path), {})):
+    for uri, use_uri in ((f"file:{store_path}?mode=ro", True), (str(store_path), False)):
         try:
-            con = sqlite3.connect(uri, timeout=5.0, **kw)
+            con = sqlite3.connect(uri, timeout=5.0, uri=use_uri)
         except sqlite3.Error:
             continue
         try:
@@ -665,17 +669,17 @@ def _blob_to_item(rowid: int, blob_id: str, data: object, agent_name: str) -> _M
     response_id = f"cursor:{blob_id}"[:_RESPONSE_ID_MAX_LEN]
     if role == "user":
         content = obj.get("content")
-        # cursor writes the post-/summarize history rollup as a user blob with a
-        # plain-string content (real user turns are a ``[{type:text}]`` list).
-        # Surface it as a compaction-completed signal, not a chat bubble, so the
-        # forwarder can tell the web UI the compaction actually finished.
-        if isinstance(content, str) and content.startswith(_COMPACTION_SUMMARY_PREFIX):
-            return _MirrorItem(
-                rowid=rowid,
-                item_type="compaction_completed",
-                item_data={},
-                response_id=response_id,
-            )
+        if isinstance(content, str):
+            # Cursor stores lifecycle notifications and compaction rollups as
+            # strings; real user turns use a ``[{type:text}]`` content list.
+            if content.startswith(_COMPACTION_SUMMARY_PREFIX):
+                return _MirrorItem(
+                    rowid=rowid,
+                    item_type="compaction_completed",
+                    item_data={},
+                    response_id=response_id,
+                )
+            return None
         prompt = _unwrap_user_query(_content_text(content))
         if not prompt:
             return None

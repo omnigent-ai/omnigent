@@ -72,7 +72,10 @@ table](../kubernetes/overlays/sandbox-runners/README.md#configuration-sandbox-co
 for the shape.
 
 `provider` + `server_url` is a complete config: the image defaults to
-the official prebaked host image and boxes run locally.
+the official prebaked host image and boxes run locally. To bake extra
+harness CLIs into that image (e.g. `goose`, `jcode`), build it with the
+`EXTRA_HARNESS_CLIS` build-arg and point `boxlite.image:` at your copy —
+see [deploy/docker](../docker/README.md#baking-in-extra-harness-clis).
 
 ### Cloud (remote `boxlite serve` pool)
 
@@ -83,6 +86,7 @@ sandbox:
   boxlite:
     image: docker.io/me/omnigent-host:latest     # optional, shared; default: official
     env: [OPENAI_API_KEY, GIT_TOKEN]             # optional, shared; SERVER env var NAMES
+    disk_size_gb: 100                            # optional, shared; default: SDK default
     cloud:
       endpoint: https://boxlite.example.com:8100 # selects CLOUD mode
 ```

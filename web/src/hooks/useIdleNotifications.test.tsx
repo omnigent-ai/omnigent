@@ -24,7 +24,7 @@ vi.mock("@/lib/nativeBridge", () => ({
   // Returns an unsubscribe fn; tests that exercise native click routing
   // capture the registered callback via this mock's calls.
   onNativeNotificationActivated: vi.fn().mockReturnValue(() => {}),
-  // Deep-link routing reuses the same navigate; tests don't assert on it,
+  // In-app routing reuses the same navigate; tests don't assert on it,
   // but the hook calls it on mount, so it must be a no-op fn (not undefined).
   onOpenPath: vi.fn().mockReturnValue(() => {}),
 }));
@@ -47,7 +47,7 @@ import {
 import { isNativeShell, onNativeNotificationActivated, setBadgeCount } from "@/lib/nativeBridge";
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
 import {
-  __resetReadStateForTests,
+  resetReadStateForTests,
   markConversationSeen,
   seedReadState,
 } from "@/hooks/useUnseenConversations";
@@ -139,7 +139,7 @@ beforeEach(() => {
   // NOT mocked); start each test with a clean slate, and seed an empty list
   // to flip `hydrated` so markConversationSeen writes (it is gated until the
   // first seed to avoid the reload-clobber race).
-  __resetReadStateForTests();
+  resetReadStateForTests();
   seedReadState([]);
 });
 

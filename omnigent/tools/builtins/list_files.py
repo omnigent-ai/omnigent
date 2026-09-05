@@ -112,6 +112,10 @@ class ListFilesTool(Tool):
         if after is not None and not isinstance(after, str):
             return json.dumps({"error": "'after' must be a string"})
 
+        conversation_id = ctx.conversation_id
+        if conversation_id is None:
+            return json.dumps({"error": "list_files requires a conversation_id"})
+
         from omnigent.runtime import get_file_store
 
         file_store = get_file_store()
@@ -125,7 +129,7 @@ class ListFilesTool(Tool):
             after=after,
             before=None,
             order="desc",
-            session_id=ctx.conversation_id,
+            session_id=conversation_id,
             include_unscoped=True,
         )
 

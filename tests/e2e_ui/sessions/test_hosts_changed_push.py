@@ -44,7 +44,10 @@ import json
 import re
 from urllib.parse import urlparse
 
+import pytest
 from playwright.sync_api import Page, Request, WebSocketRoute, expect
+
+from tests.e2e_ui.conftest import fetch_with_retry
 
 _FAKE_HOST_ID = "host_push_e2e"
 _OLD_CREATED_AT = 1_700_000_000  # far in the past → outside the host-asleep grace window
@@ -79,7 +82,7 @@ def _patch_session_snapshot(page: Page, session_id: str) -> None:
         if req.method != "GET" or urlparse(req.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        resp = route.fetch()
+        resp = fetch_with_retry(route)
         payload = resp.json()
         payload["host_id"] = _FAKE_HOST_ID
         payload["host_resumable"] = True
@@ -101,7 +104,7 @@ def _patch_session_list(page: Page, session_id: str) -> None:
         if req.method != "GET" or urlparse(req.url).path != "/v1/sessions":
             route.continue_()
             return
-        resp = route.fetch()
+        resp = fetch_with_retry(route)
         payload = resp.json()
         rows = payload.get("data") if isinstance(payload, dict) else None
         if isinstance(rows, list):
@@ -139,7 +142,7 @@ def _patch_health_drops_session(page: Page, session_id: str) -> None:
         if req.method != "GET" or urlparse(req.url).path != "/health":
             route.continue_()
             return
-        resp = route.fetch()
+        resp = fetch_with_retry(route)
         payload = resp.json()
         sessions = payload.get("sessions") if isinstance(payload, dict) else None
         if isinstance(sessions, dict):
@@ -231,7 +234,9 @@ def test_hosts_changed_frame_updates_host_badge(
 
     badge = page.get_by_test_id("host-badge")
     expect(badge).to_be_visible(timeout=15_000)
-    expect(badge).to_have_attribute("title", "Host push-e2e-host, online", timeout=15_000)
+    expect(badge).to_have_attribute(
+        "title", "Host push-e2e-host, online — click to switch", timeout=15_000
+    )
 
     # Flip the stub to "offline" before pushing the invalidation frame.
     # The client will re-fetch /v1/hosts on invalidation and see the new value.
@@ -244,9 +249,12 @@ def test_hosts_changed_frame_updates_host_badge(
     # KEY ASSERTION: badge reflects the new status well below the 60 s fallback.
     # Only the WS-push → invalidate → refetch path delivers this fast; a dead
     # push path would leave the badge stale and time out here.
-    expect(badge).to_have_attribute("title", "Host push-e2e-host, offline", timeout=15_000)
+    expect(badge).to_have_attribute(
+        "title", "Host push-e2e-host, offline — click to switch", timeout=15_000
+    )
 
 
+@pytest.mark.nightly
 def test_host_badge_not_polled_frequently(
     page: Page,
     seeded_session: tuple[str, str],

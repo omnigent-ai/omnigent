@@ -209,3 +209,110 @@ def test_openapi_json_matches_generator_output() -> None:
             generated_spec=generated_spec,
         ),
     )
+
+
+def test_annotate_number_formats_stamps_formatless_nodes_only() -> None:
+    """Formatless number/integer schemas get double/int64; existing formats stay.
+
+    Production breakage that causes this to fail: ``_annotate_number_formats``
+    stopped using ``setdefault``, overwrote a model-authored format, or
+    walked ``example``/``enum`` payloads and stamped ``format`` onto values.
+    """
+    dump_module = _load_dump_openapi_module()
+    components: dict[str, Any] = {
+        "schemas": {
+            "Cost": {
+                "type": "object",
+                "properties": {
+                    "total_cost_usd": {"type": "number", "default": 0.0},
+                    "already_double": {"type": "number", "format": "double"},
+                    "count": {"type": "integer"},
+                    "already_int32": {"type": "integer", "format": "int32"},
+                    "when": {
+                        "anyOf": [{"type": "integer"}, {"type": "null"}],
+                    },
+                    "by_model": {"type": "object", "additionalProperties": {"type": "number"}},
+                    "default": {"type": "integer"},
+                },
+                "example": {"total_cost_usd": 1.5, "count": 3},
+            },
+        },
+    }
+    dump_module._annotate_number_formats(components)
+    props = components["schemas"]["Cost"]["properties"]
+    assert props["total_cost_usd"]["format"] == "double"
+    assert props["already_double"]["format"] == "double"
+    assert props["count"]["format"] == "int64"
+    assert props["already_int32"]["format"] == "int32"
+    assert props["when"]["anyOf"][0]["format"] == "int64"
+    assert props["by_model"]["additionalProperties"]["format"] == "double"
+    # A property literally NAMED "default" is still a schema node — only
+    # payload VALUES under a schema's own default/example/enum are skipped.
+    assert props["default"]["format"] == "int64"
+    assert "format" not in components["schemas"]["Cost"]["example"]
+
+
+def test_openapi_json_numeric_schemas_declare_width_format() -> None:
+    """Committed openapi.json stamps int64/double on every numeric schema node.
+
+    Without ``format``, generators map integers to int32 and numbers to
+    float32, which cannot hold microsecond timestamps or Python floats.
+    ``dump_openapi.py`` must keep those annotations in the checked-in
+    artifact. No component field declares a narrower explicit format
+    today; if one ever intentionally does (e.g. ``int32``), exempt it
+    here rather than widening it.
+    """
+    assert _OPENAPI_JSON_PATH.exists(), (
+        f"openapi.json not found at {_OPENAPI_JSON_PATH}. "
+        f"Run `.venv/bin/python scripts/dump_openapi.py` to generate it."
+    )
+    spec = json.loads(_OPENAPI_JSON_PATH.read_text())
+    schemas = spec["components"]["schemas"]
+    comments = schemas["SessionListItem"]["properties"]["comments_updated_at"]
+    integer_branch = next(b for b in comments["anyOf"] if b.get("type") == "integer")
+    assert integer_branch.get("format") == "int64", (
+        "SessionListItem.comments_updated_at must declare format=int64 so "
+        "generated clients decode microsecond timestamps as 64-bit ints."
+    )
+
+    formatless_number: list[str] = []
+    formatless_integer: list[str] = []
+
+    def walk(node: Any, path: str, *, keys_are_names: bool = False) -> None:
+        # ``keys_are_names``: map keys are schema/property names, so a
+        # property literally named "default"/"enum" is still a schema.
+        if isinstance(node, dict):
+            if not keys_are_names:
+                t = node.get("type")
+                fmt = node.get("format")
+                if t == "number" and fmt != "double":
+                    formatless_number.append(path)
+                elif t == "integer" and fmt != "int64":
+                    formatless_integer.append(path)
+            for key, value in node.items():
+                if not keys_are_names and key in {
+                    "default",
+                    "example",
+                    "examples",
+                    "const",
+                    "enum",
+                }:
+                    continue
+                walk(
+                    value,
+                    f"{path}.{key}",
+                    keys_are_names=(
+                        not keys_are_names and key in ("properties", "patternProperties")
+                    ),
+                )
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                walk(item, f"{path}[{i}]")
+
+    walk(schemas, "components.schemas", keys_are_names=True)
+    assert not formatless_number, "formatless or non-double number schemas: " + ", ".join(
+        formatless_number[:12]
+    )
+    assert not formatless_integer, "formatless or non-int64 integer schemas: " + ", ".join(
+        formatless_integer[:12]
+    )

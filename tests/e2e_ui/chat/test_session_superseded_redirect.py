@@ -19,7 +19,7 @@ import re
 import httpx
 from playwright.sync_api import Page, expect
 
-_COMPOSER_PLACEHOLDER = "Ask the agent anything…"
+_COMPOSER_PLACEHOLDER = "Send a message…"
 
 
 def _publish_superseded(base_url: str, old_session_id: str, new_session_id: str) -> None:

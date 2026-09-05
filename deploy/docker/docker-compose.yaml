@@ -62,6 +62,9 @@ services:
       ARTIFACT_DIR: /data/artifacts
       HOST: 0.0.0.0
       PORT: "8000"
+      # Comma-separated deployment-wide release features. Empty means all
+      # release features are off; see .env.example for the known keys.
+      OMNIGENT_FEATURES: "${OMNIGENT_FEATURES:-}"
       # Anchor the server's data dir on the persistent volume so
       # file-backed operator config survives container restarts:
       # the admin roster (/data/admins) and allowed-domains file

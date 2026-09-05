@@ -39,6 +39,7 @@ Env vars read at construction:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -48,6 +49,7 @@ import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -267,6 +269,9 @@ class HermesExecutor(Executor):
         self._session_map: dict[str, str] = {}
         # Per-session HERMES_HOME with policy hook config.
         self._hermes_home: Path | None = None
+        # Active per-turn subprocess; promoted from a local so the Stop
+        # button can interrupt it. None outside a running turn.
+        self._proc: asyncio.subprocess.Process | None = None
         self._setup_hermes_home()
 
     def _setup_hermes_home(self) -> None:
@@ -339,7 +344,8 @@ class HermesExecutor(Executor):
 
         :param messages: Conversation history from Omnigent.
         :param tools: Tool schemas (Hermes uses its own tools internally).
-        :param system_prompt: System prompt (used by Hermes internally).
+        :param system_prompt: Composed instructions; prepended to the first
+            user turn of a fresh session.
         :param config: Per-turn config (model override, etc.).
         :yields: ``TextChunk`` and ``TurnComplete`` events.
         :yields: ``ExecutorError`` on subprocess failure or timeout.
@@ -365,6 +371,10 @@ class HermesExecutor(Executor):
         session_key = self._session_key(messages)
         hermes_sid = self._hermes_session_id(session_key)
 
+        # Prefix instructions on the first turn only; --resume prevents re-prefixing.
+        if hermes_sid is None and system_prompt:
+            user_text = f"{system_prompt}\n\n{user_text}"
+
         # Build the command-line arguments
         args = _build_hermes_args(
             hermes_path=self._hermes_path,
@@ -374,16 +384,11 @@ class HermesExecutor(Executor):
             skills_filter=self._skills_filter,
         )
 
-        # Build subprocess env with per-session HERMES_HOME for policy hooks.
-        proc_env: dict[str, str] | None = None
-        if self._hermes_home is not None:
-            proc_env = {**os.environ, "HERMES_HOME": str(self._hermes_home)}
-            _logger.info("Hermes using per-session HERMES_HOME=%s", self._hermes_home)
-        else:
-            _logger.warning("Hermes running WITHOUT per-session HERMES_HOME (no policy hooks)")
+        proc_env = self._build_spawn_env()
 
         _logger.debug("Hermes subprocess: %s", " ".join(args))
 
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
@@ -392,6 +397,7 @@ class HermesExecutor(Executor):
                 cwd=self._cwd,
                 env=proc_env,
             )
+            self._proc = proc
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(),
@@ -420,6 +426,21 @@ class HermesExecutor(Executor):
                 retryable=True,
             )
             return
+        finally:
+            self._proc = None
+            # Reap a subprocess that outlived the turn (turn timeout, or a
+            # CLI that ignored interrupt_session's SIGTERM), mirroring the
+            # kimi executor's terminate -> wait -> kill escalation.
+            if proc is not None and proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    with contextlib.suppress(Exception):
+                        await proc.wait()
 
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
@@ -451,6 +472,34 @@ class HermesExecutor(Executor):
 
         yield TurnComplete(response=response_text or None)
 
+    def _build_spawn_env(self) -> dict[str, str]:
+        """The env handed to the hermes subprocess.
+
+        Deny-by-default: base + hermes's own ``HERMES_`` family + the spec's
+        ``env_passthrough`` (#3445). Previously the ``hermes_home`` branch merged
+        the whole of ``os.environ``, and the else branch passed ``env=None`` —
+        which inherits everything, so the no-policy-hooks path leaked the most.
+
+        ``DATABRICKS_*`` is deliberately NOT allowlisted. ``hermes_native_bridge``
+        copies ``auth.json`` and ``.env`` under the per-session ``HERMES_HOME``,
+        so hermes's real auth is file-based; that family is exactly the one this
+        change exists to stop leaking, and a spec that genuinely needs it should
+        declare it via ``os_env.sandbox.env_passthrough``.
+
+        Kept as a named builder so the spawn-env canary can drive the real thing
+        rather than a hand-copied prefix list.
+        """
+        proc_env = clean_agent_env(
+            allow_prefixes=("HERMES_",),
+            extra_allowed=declared_passthrough(self._os_env),
+        )
+        if self._hermes_home is not None:
+            proc_env["HERMES_HOME"] = str(self._hermes_home)
+            _logger.info("Hermes using per-session HERMES_HOME=%s", self._hermes_home)
+        else:
+            _logger.warning("Hermes running WITHOUT per-session HERMES_HOME (no policy hooks)")
+        return proc_env
+
     def _session_key(self, messages: list[Message]) -> str:
         """
         Derive a stable Omnigent session key from the message list.
@@ -477,6 +526,24 @@ class HermesExecutor(Executor):
         """
         self._session_map.pop(session_key, None)
         await super().close_session(session_key)
+
+    async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002
+        """Terminate the active hermes subprocess to cancel the running turn.
+
+        Escalates to SIGKILL when the CLI ignores SIGTERM, so Stop cannot be
+        defeated by a child that traps the signal.
+        """
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return False
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+        return True
 
     async def close(self) -> None:
         """Release executor-wide resources."""

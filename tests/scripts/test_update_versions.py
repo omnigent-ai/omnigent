@@ -44,7 +44,7 @@ _VERSION_PY = "omnigent/version.py"
 
 @pytest.fixture
 def repo_copy(tmp_path: Path) -> Path:
-    """Copy the real pyproject.toml files + version.py into a temp repo root."""
+    """Copy the real version-carrying files into a temp repo root."""
     root = tmp_path / "repo"
     for rel in (*_PYPROJECTS, _VERSION_PY):
         dst = root / rel
@@ -55,7 +55,7 @@ def repo_copy(tmp_path: Path) -> Path:
 
 def test_set_version_rewrites_every_location(repo_copy: Path) -> None:
     changed = update_versions.set_version(repo_copy, "9.9.9")
-    # Four pyprojects plus omnigent/version.py.
+    # Four pyprojects and omnigent/version.py.
     assert len(changed) == 5
     # root: version line + three sibling pins (client, ui-sdk, slack);
     # client/ui SDKs: version line + one pin; slack: version line only.

@@ -263,6 +263,11 @@ for managed launches.)
 ### Server-managed sandboxes
 
 With managed hosts, the server does all of the above per session.
+When the server runs outside Modal, use
+`ghcr.io/omnigent-ai/omnigent-server-modal:latest`; this variant includes
+the Modal SDK required to provision sandboxes. For a custom server image,
+build with `--build-arg OMNIGENT_EXTRAS=modal`.
+
 Add a `sandbox:` section to the server config (`omnigent server -c
 config.yaml`, or `<data_dir>/config.yaml`):
 

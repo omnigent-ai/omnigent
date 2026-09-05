@@ -34,10 +34,9 @@ import httpx
 import pytest
 
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.native_coding_agents import OPENCODE_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
-
-_OPENCODE_NATIVE_AGENT_NAME = "opencode-native-ui"
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("OMNIGENT_E2E_OPENCODE_NATIVE") != "1" or shutil.which("opencode") is None,
@@ -112,7 +111,7 @@ def test_opencode_native_multiturn_item_order(
     resp = http_client.get("/v1/agents")
     resp.raise_for_status()
     agent_id = next(
-        (a["id"] for a in resp.json()["data"] if a["name"] == _OPENCODE_NATIVE_AGENT_NAME), None
+        (a["id"] for a in resp.json()["data"] if a["name"] == OPENCODE_NATIVE_AGENT_NAME), None
     )
     assert agent_id is not None
     workspace = tmp_path / "ws"
@@ -211,9 +210,9 @@ def test_opencode_native_builtin_registered_at_startup(http_client: httpx.Client
     resp = http_client.get("/v1/agents")
     resp.raise_for_status()
     names = {a["name"] for a in resp.json()["data"]}
-    assert _OPENCODE_NATIVE_AGENT_NAME in names, (
-        f"Expected {_OPENCODE_NATIVE_AGENT_NAME!r} in built-ins {names}; "
-        "_ensure_default_opencode_agent did not run."
+    assert OPENCODE_NATIVE_AGENT_NAME in names, (
+        f"Expected {OPENCODE_NATIVE_AGENT_NAME!r} in built-ins {names}; "
+        "_ensure_default_native_agents did not run."
     )
 
 
@@ -239,7 +238,7 @@ def test_opencode_native_host_session_auto_creates_terminal(
     resp = http_client.get("/v1/agents")
     resp.raise_for_status()
     agent_id = next(
-        (a["id"] for a in resp.json()["data"] if a["name"] == _OPENCODE_NATIVE_AGENT_NAME), None
+        (a["id"] for a in resp.json()["data"] if a["name"] == OPENCODE_NATIVE_AGENT_NAME), None
     )
     assert agent_id is not None, "opencode-native-ui agent not seeded"
 

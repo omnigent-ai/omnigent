@@ -39,6 +39,27 @@ Reset everything (drops the DB and the artifact store):
 docker compose down -v
 ```
 
+## Release features
+
+Release features are deployment-wide and off by default. Enable one or more
+with the comma-separated `OMNIGENT_FEATURES` variable in `.env`, then recreate
+the server container:
+
+```dotenv
+OMNIGENT_FEATURES=usage_page
+```
+
+```bash
+docker compose up -d
+curl -s http://localhost:8000/v1/info | jq '.features'
+```
+
+Known keys and their lifecycle are documented in
+[`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md). Unknown keys fail
+server startup so a typo cannot silently produce the wrong rollout. To roll
+back, remove the key (or empty the variable), run `docker compose up -d` again,
+and reload the web app.
+
 ## Multi-user mode (accounts — default)
 
 Built-in accounts auth: no IdP to register, no proxy to host.
@@ -267,6 +288,34 @@ Build it locally from the repo root:
 docker build -t omnigent-host:latest --target host \
              -f deploy/docker/Dockerfile .
 ```
+
+### Baking in extra harness CLIs
+
+A harness whose CLI isn't in the image fails closed with
+`harness_not_configured` when a managed-sandbox session tries to launch
+it. To bake in additional harness CLIs without forking the Dockerfile,
+pass `EXTRA_HARNESS_CLIS` at build time — space-separated harness names
+with an optional `@version` pin, whether the CLI ships on npm or via a
+vendor installer:
+
+```bash
+docker build -t omnigent-host:latest --target host \
+             -f deploy/docker/Dockerfile \
+             --build-arg EXTRA_HARNESS_CLIS="goose jcode opencode" .
+```
+
+Supported names (`opencode`, `qwen`, `goose`, `agy`, `jcode`, `cursor`,
+`kimi`), the install method behind each, and the `npm:<pkg-spec>` escape
+hatch live in [`install-harness-cli.sh`](./install-harness-cli.sh). Empty by
+default — the shipped CLI set is unchanged.
+
+Supply-chain note: the `agy` row is pinned to an immutable per-arch release
+asset with a sha256 check (the same control kiro-cli gets in the default
+image); the other vendor-installer rows run the harness's own `curl | bash`
+off mutable refs and are verified only with a `--version` check (cursor's
+installer cannot be pinned at all). `npm:<pkg-spec>` entries get no binary
+smoke check — confirm the binary yourself. UBI has no baked `agy`; use
+`EXTRA_HARNESS_CLIS=agy` there.
 
 ### Using it with the Modal sandbox provider
 

@@ -23,6 +23,7 @@ def test_capabilities_defaults() -> None:
     assert caps.managed_launch is False
     assert caps.local_port_forward is False
     assert caps.resume_stopped is False
+    assert caps.snapshot_restore is False
     assert caps.programmatic_terminate is False
     assert caps.file_copy is False
     assert caps.streaming_exec is False

@@ -1,4 +1,4 @@
-import { type ComposerAttachment } from "@/store/chatStore";
+import type { ComposerAttachment } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 
 /**

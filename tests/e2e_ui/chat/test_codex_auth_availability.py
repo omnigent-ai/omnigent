@@ -335,7 +335,7 @@ async def _drive_codex_badge(base_url: str) -> None:
             await _open_entry_config(page, "ag_polly_e2e")
             badge = page.get_by_test_id("new-chat-landing-harness-warning-codex").first
             await expect(badge).to_be_visible(timeout=30_000)
-            # This test doesn't enable OMNIGENT_HARNESS_INSTALL_ENABLED, so the
+            # This test doesn't enable harness_install in OMNIGENT_FEATURES, so the
             # picker runs on the feature-OFF default — where the badge keeps the
             # original per-reason text ("needs auth"). (With the feature ON the
             # badge collapses to a single "needs setup" and the reason moves into

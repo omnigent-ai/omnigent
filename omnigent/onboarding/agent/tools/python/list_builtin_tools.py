@@ -37,6 +37,32 @@ def _hindsight_available() -> bool:
     return importlib.util.find_spec("hindsight_client") is not None
 
 
+def _nimble_available() -> bool:
+    """Return True when the optional ``nimble-python`` SDK is installed."""
+    import importlib.util
+
+    return importlib.util.find_spec("nimble_python") is not None
+
+
+# Both Nimble tools need a Nimble account and API key, so the `nimble` extra
+# is the opt-in signal for the pair: advertised only when it is installed, so
+# the assistant never recommends a tool the author cannot use. Runtime is
+# unaffected: a spec may still enable either by name.
+if _nimble_available():
+    _TOOL_CLASSES.update(
+        {
+            "nimble_extract": (
+                "omnigent.tools.builtins.nimble_extract",
+                "NimbleExtractTool",
+            ),
+            "nimble_research": (
+                "omnigent.tools.builtins.nimble_research",
+                "NimbleResearchTool",
+            ),
+        }
+    )
+
+
 # Hindsight memory tools (optional ``hindsight`` extra). Advertised only when
 # the SDK is installed, so the assistant never recommends unusable tools.
 if _hindsight_available():

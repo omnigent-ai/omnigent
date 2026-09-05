@@ -23,6 +23,9 @@ from pathlib import Path
 from setuptools import setup
 from setuptools.command.build_py import build_py
 
+_MINIMUM_NODE_VERSION = (22, 13, 0)
+_MINIMUM_NODE_VERSION_TEXT = ".".join(str(part) for part in _MINIMUM_NODE_VERSION)
+
 
 class _GenerateBuildInfo(build_py):
     """Subclass of ``build_py`` that writes ``_build_info.py``.
@@ -97,37 +100,54 @@ class _GenerateBuildInfo(build_py):
         The server mounts that directory at ``/`` when present
         (``omnigent/server/app.py``); when absent it serves an
         API-only JSON landing page and the web UI is unreachable.
-        The bundle is npm-build output, not tracked in git, so a
+        The bundle is Vite build output, not tracked in git, so a
         plain ``pip install .`` / ``uv tool install`` from a checkout
         would otherwise ship no UI — the single most common "the web
         UI doesn't load" report.
+
+        ``web/`` is a package in a pnpm workspace (``pnpm-workspace.yaml``
+        and ``pnpm-lock.yaml`` at the repo root, ``packageManager:
+        pnpm@11.15.1`` in the root ``package.json``), so the install and
+        build run against the **workspace root** with ``--filter web``,
+        matching ``deploy/databricks/build.sh`` and the CI workflows.
+        Running ``pnpm install`` from inside ``web/`` would miss the
+        committed lockfile and resolve against ``package.json`` alone —
+        the legacy npm path that hit peer-dependency conflicts.
 
         Build policy, chosen to fix that case without slowing the
         backend-only dev loop or breaking node-less CI:
 
         - Skip if ``web/`` is absent (sdists that don't vendor it).
         - Skip if ``OMNIGENT_SKIP_WEB_UI=true``. The hardened CI
-          runners ship a system ``npm`` but have no fast registry
-          mirror configured for the lint/test shards, so ``npm
-          install`` crawls against the public registry and hits the
-          600s timeout — 10 wasted minutes per ``uv sync`` for a
-          bundle those jobs never serve. They set this env var to opt
-          out.
+          runners ship pnpm but have no fast registry mirror
+          configured for the lint/test shards, so ``pnpm install``
+          crawls against the public registry and hits the 600s
+          timeout — 10 wasted minutes per ``uv sync`` for a bundle
+          those jobs never serve. They set this env var to opt out.
         - Skip if the bundle already exists, UNLESS
           ``OMNIGENT_BUILD_WEB_UI=1`` forces a rebuild. This keeps
           repeat ``uv sync`` fast for backend devs (build once, reuse)
           while letting release builds force a fresh bundle.
-        - Otherwise the build MUST succeed: a missing ``npm`` or a
-          failing ``npm install`` / ``npm run build`` aborts the
-          install with an actionable error. Omnigent needs Node +
-          npm at runtime anyway (the Claude / Codex / Pi harness
-          CLIs are npm packages), so a node-less machine would get a
-          broken install either way — failing here, with a message
-          that says how to fix it, beats a silent API-only install
-          that surfaces later as "the web UI doesn't load".
+        - Otherwise the build MUST succeed: a Node.js older than 22.13
+          (or absent), a missing pnpm, or a failing ``pnpm install`` /
+          ``pnpm --filter web run build`` aborts the install with an
+          actionable error. Omnigent needs Node 22 LTS + pnpm at
+          runtime anyway (the Claude / Codex / Pi harness CLIs are
+          npm packages, and the web UI is a pnpm workspace), so a
+          node-less machine would get a broken install either way —
+          failing here, with a message that says how to fix it, beats
+          a silent API-only install that surfaces later as "the web
+          UI doesn't load".
 
-        :raises SystemExit: If ``npm`` is not on PATH or the web UI
-            build fails, and no skip condition applies.
+        The pnpm commands run with ``COREPACK_ENABLE_DOWNLOAD_PROMPT=0``
+        and no stdin: corepack (whether reached via its ``pnpm`` shim or
+        as ``corepack pnpm``) otherwise blocks on an interactive
+        confirmation before downloading the pinned pnpm, which a
+        non-interactive install can never answer.
+
+        :raises SystemExit: If the on-PATH Node.js is older than 22.13
+            (or absent), pnpm is not on PATH (and corepack can't supply
+            it), or the web UI build fails, and no skip condition applies.
         """
         import os
         import shutil
@@ -150,26 +170,69 @@ class _GenerateBuildInfo(build_py):
         )
         if bundle.is_file() and not force:
             return
-        npm = shutil.which("npm")
-        if npm is None:
+        # pnpm 11.15.1 requires Node 22.13 and is stricter than Vite 8 and
+        # oxlint. Enforce the effective toolchain floor before invoking pnpm.
+        node_version = _require_supported_node()
+
+        # pnpm first; fall back to corepack (bundled with Node 22+),
+        # which downloads the pnpm version pinned by the root
+        # package.json's ``packageManager`` field on first use.
+        pnpm = shutil.which("pnpm")
+        if pnpm is not None:
+            pnpm_cmd = [pnpm]
+        else:
+            corepack = shutil.which("corepack")
+            if corepack is not None:
+                pnpm_cmd = [corepack, "pnpm"]
+            else:
+                pnpm_cmd = None
+        if pnpm_cmd is None:
             raise SystemExit(
-                "omnigent build: npm not found on PATH, so the web UI "
+                "omnigent build: pnpm not found on PATH, so the web UI "
                 "cannot be built. Omnigent requires Node.js 22 LTS or "
-                "newer with npm (the Claude / Codex / Pi harness CLIs are "
-                "npm packages). Install it from "
-                "https://nodejs.org/en/download and rerun the install. "
-                "To deliberately install without the web UI (API-only "
-                "server), set OMNIGENT_SKIP_WEB_UI=true."
+                "newer with pnpm (the web UI is a pnpm workspace; the "
+                "Claude / Codex / Pi harness CLIs are npm packages). "
+                "Install Node from https://nodejs.org/en/download and "
+                "enable pnpm with `corepack enable` (or `npm install -g "
+                "pnpm`), then rerun the install. To deliberately install "
+                "without the web UI (API-only server), set "
+                "OMNIGENT_SKIP_WEB_UI=true."
             )
+        # A ``pnpm`` on PATH is often a corepack shim, which asks "Do you
+        # want to continue? [Y/n]" before fetching the pinned pnpm. That
+        # prompt is invisible under a build backend, so the install looks
+        # hung; "0" downloads without asking (shims default it to "1").
+        env = {**os.environ, "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
         try:
-            subprocess.run([npm, "install"], cwd=web_src, check=True, timeout=600)
-            subprocess.run([npm, "run", "build"], cwd=web_src, check=True, timeout=600)
+            # Workspace root, not ``web/``: the lockfile and workspace
+            # manifest live at the repo root. ``--frozen-lockfile``
+            # matches CI and guarantees the build is reproducible from
+            # the committed ``pnpm-lock.yaml``. No stdin, so nothing in
+            # the toolchain can block on input we can never deliver.
+            subprocess.run(
+                [*pnpm_cmd, "install", "--frozen-lockfile", "--filter", "web"],
+                cwd=root,
+                check=True,
+                timeout=600,
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+            subprocess.run(
+                [*pnpm_cmd, "--filter", "web", "run", "build"],
+                cwd=root,
+                check=True,
+                timeout=600,
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
         except (subprocess.SubprocessError, OSError) as exc:
             raise SystemExit(
-                f"omnigent build: web UI build failed ({exc}). Fix the "
-                "failure above (it usually means Node.js is older than the "
-                "required 22 LTS, or `npm install` could not reach the npm "
-                "registry) and rerun the install. To deliberately install "
+                f"omnigent build: web UI build failed on Node.js {node_version} "
+                f"({_subprocess_failure_details(exc)}). Fix the failure above "
+                "and rerun the install. If "
+                "this Node.js release is incompatible with pnpm or Vite, "
+                f"upgrade to Node.js {_MINIMUM_NODE_VERSION_TEXT} or newer and "
+                "retry. To deliberately install "
                 "without the web UI (API-only server), set "
                 "OMNIGENT_SKIP_WEB_UI=true."
             ) from exc
@@ -184,6 +247,7 @@ class _GenerateBuildInfo(build_py):
         any later non-build code path that does ``from omnigent
         import _build_info`` works without re-running the build.
         """
+        # Keep generated names and types aligned with omnigent/_build_info.pyi.
         target = Path(__file__).resolve().parent / "omnigent" / "_build_info.py"
         commit = _git_sha()
         # Use repr() for the SHA so quoting is always correct, even
@@ -203,6 +267,80 @@ class _GenerateBuildInfo(build_py):
             f"BUILD_TIME_EPOCH: int = {int(time.time())}\n"
             f"COMMIT_SHA: str = {commit!r}\n"
         )
+
+
+def _require_supported_node() -> str:
+    """Return the Node.js version or abort when it is older than 22.13.
+
+    The pinned pnpm 11.15.1 requires Node 22.13. Newer Node releases
+    remain valid.
+
+    :returns: The normalized Node.js version string.
+    :raises SystemExit: If ``node`` is missing, ``node --version`` fails,
+        or the reported version is older than 22.13.
+    """
+    import shutil
+
+    node = shutil.which("node")
+    if node is None:
+        raise SystemExit(
+            "omnigent build: Node.js not found on PATH, so the web UI "
+            f"cannot be built. Node.js {_MINIMUM_NODE_VERSION_TEXT} or newer "
+            "is required. Install it from https://nodejs.org/en/download and "
+            "retry, or run with OMNIGENT_SKIP_WEB_UI=true to skip the web UI "
+            "build."
+        )
+    try:
+        result = subprocess.run(
+            [node, "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise SystemExit(
+            f"omnigent build: could not determine the Node.js version "
+            f"(`node --version` failed: {exc}). Node.js "
+            f"{_MINIMUM_NODE_VERSION_TEXT} or newer is required. Install it "
+            "from https://nodejs.org/en/download and retry, or run with "
+            "OMNIGENT_SKIP_WEB_UI=true to skip the web UI build."
+        ) from exc
+    # ``node --version`` prints ``v22.14.0``.
+    version_str = result.stdout.strip().lstrip("v")
+    try:
+        version_parts = tuple(int(part) for part in version_str.split(".")[:3])
+        if len(version_parts) != 3:
+            raise ValueError
+    except ValueError:
+        raise SystemExit(
+            f"omnigent build: could not parse Node.js version "
+            f"{version_str or 'unknown'}. Node.js "
+            f"{_MINIMUM_NODE_VERSION_TEXT} or newer is required. Install it "
+            "from https://nodejs.org/en/download and retry, or run with "
+            "OMNIGENT_SKIP_WEB_UI=true to skip the web UI build."
+        ) from None
+    if version_parts < _MINIMUM_NODE_VERSION:
+        raise SystemExit(
+            f"omnigent build: Node.js {_MINIMUM_NODE_VERSION_TEXT} or newer "
+            f"is required but found Node.js {version_str}. Upgrade from "
+            "https://nodejs.org/en/download and retry, or run with "
+            "OMNIGENT_SKIP_WEB_UI=true to skip the web UI build."
+        )
+    return version_str
+
+
+def _subprocess_failure_details(exc: BaseException) -> str:
+    """Return an actionable subprocess failure summary, including stderr."""
+    details = str(exc)
+    stderr = getattr(exc, "stderr", None)
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    if isinstance(stderr, str):
+        stderr = stderr.strip()
+        if stderr and stderr not in details:
+            details = f"{details}; stderr: {stderr}"
+    return details
 
 
 def _git_sha() -> str:

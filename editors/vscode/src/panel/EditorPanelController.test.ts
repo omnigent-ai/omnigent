@@ -4,6 +4,7 @@
  * the iframe render path is taken (the only path in this build).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import type { Mock } from "vitest";
 import * as vscode from "vscode";
 import { EditorPanelController } from "./EditorPanelController";
 import type { ServerTarget } from "../config";
@@ -43,12 +44,12 @@ function makeController() {
 
 describe("EditorPanelController", () => {
   let fake: ReturnType<typeof makeFakePanel>;
-  let createSpy: ReturnType<typeof vi.fn<unknown[], unknown>>;
+  let createSpy: Mock<() => ReturnType<typeof makeFakePanel>["panel"]>;
 
   beforeEach(() => {
     fake = makeFakePanel();
     const win = vscode.window as unknown as Record<string, unknown>;
-    createSpy = vi.fn<unknown[], unknown>(() => fake.panel);
+    createSpy = vi.fn(() => fake.panel);
     win.createWebviewPanel = createSpy;
   });
 

@@ -272,6 +272,57 @@ def test_create_worktree_existing_branch_no_worktree_fails(git_repo: Path) -> No
     assert "preexisting" in exc.value.message
 
 
+def test_create_worktree_existing_branch_recreates_after_dir_deleted(git_repo: Path) -> None:
+    """A branch whose worktree directory was deleted can be checked back out.
+
+    Simulates the deleted-worktree fork: the directory is rm'd from disk
+    (leaving a stale registration), then ``existing_branch=True`` prunes
+    the stale entry and adds a fresh worktree for the same branch.
+    """
+    import shutil
+
+    created = create_worktree(repo_path=str(git_repo), branch_name="fix-1")
+    shutil.rmtree(created.worktree_path)
+    recreated = create_worktree(repo_path=str(git_repo), branch_name="fix-1", existing_branch=True)
+    assert recreated.branch == "fix-1"
+    assert Path(recreated.worktree_path).is_dir()
+    assert _current_branch(Path(recreated.worktree_path)) == "fix-1"
+
+
+def test_create_worktree_existing_branch_missing_branch_fails(git_repo: Path) -> None:
+    """``existing_branch=True`` for a branch that doesn't exist fails loud."""
+    with pytest.raises(WorktreeError) as exc:
+        create_worktree(repo_path=str(git_repo), branch_name="ghost", existing_branch=True)
+    assert "does not exist" in exc.value.message
+    assert _worktree_count(git_repo) == 1
+
+
+def test_create_worktree_existing_branch_live_worktree_fails(git_repo: Path) -> None:
+    """``existing_branch=True`` refuses a branch checked out in a LIVE worktree.
+
+    Two sessions must never share one working tree; only a stale (deleted-
+    from-disk) registration is pruned, a live one aborts.
+    """
+    create_worktree(repo_path=str(git_repo), branch_name="busy")
+    with pytest.raises(WorktreeError) as exc:
+        create_worktree(repo_path=str(git_repo), branch_name="busy", existing_branch=True)
+    assert "already checked out" in exc.value.message
+    assert _worktree_count(git_repo) == 2
+
+
+def test_create_worktree_existing_branch_rejects_base_branch(git_repo: Path) -> None:
+    """``existing_branch`` + ``base_branch`` is contradictory and rejected."""
+    _git(git_repo, "branch", "have")
+    with pytest.raises(WorktreeError) as exc:
+        create_worktree(
+            repo_path=str(git_repo),
+            branch_name="have",
+            base_branch="main",
+            existing_branch=True,
+        )
+    assert "base_branch" in exc.value.message
+
+
 def test_create_worktree_non_repo_fails(tmp_path: Path) -> None:
     """A directory that isn't a git repo is rejected."""
     plain = tmp_path / "plain"

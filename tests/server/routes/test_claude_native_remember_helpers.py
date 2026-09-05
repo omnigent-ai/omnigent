@@ -14,10 +14,25 @@ tests pin the gating and URL-parsing edge cases directly.
 
 from __future__ import annotations
 
+from omnigent.policies.builtins.safety import NATIVE_WRITE_TOOLS
+from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_EDIT_TOOLS
 from omnigent.server.routes.sessions import (
     _allow_remember_eligible,
     _claude_native_remember_host,
 )
+
+
+def test_policy_write_tool_set_matches_server() -> None:
+    """
+    The policy layer's write-tool set must equal the server's.
+
+    These two lists drifted before: the approval (``ask_on_os_tools``) and
+    report-only (``read_only_os``) policies missed ``MultiEdit`` /
+    ``NotebookEdit`` while the server already treated them as edit tools, so
+    writes went through un-gated. Fails loudly if either side gains a tool
+    the other doesn't know about.
+    """
+    assert NATIVE_WRITE_TOOLS == _CLAUDE_NATIVE_EDIT_TOOLS
 
 
 class TestAllowRememberEligible:

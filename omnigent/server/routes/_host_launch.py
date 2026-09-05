@@ -23,11 +23,12 @@ from dataclasses import dataclass
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.stores import ConversationStore
-from omnigent.stores.host_store import Host, HostStore
+from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 
@@ -79,6 +80,30 @@ def resolve_host_owner(
     return host
 
 
+def host_absent_error(host: Host) -> OmnigentError:
+    """Classify a "host not on this replica" miss for a host-scoped route.
+
+    Every route that reaches a host over its live tunnel looks it up in the
+    local (this-replica) ``HostRegistry``. When replicas are sharded by host, a
+    request keyed to ``host_id`` can land on a replica that doesn't hold the
+    tunnel — the same wrong-replica case ``RunnerRouter`` handles for runner
+    dispatch. Tell the two apart from the host record the caller already loaded:
+
+    - still **live** (online + fresh heartbeat) → up on some replica, just not
+      here → :data:`~ErrorCode.WRONG_REPLICA` (400) so the client re-addresses
+      WITHOUT the key.
+    - otherwise → genuinely offline → ``CONFLICT`` (409).
+
+    :param host: The host's persistent record (owner-checked by the caller).
+    :returns: The ``OmnigentError`` to raise; the global handler maps its code
+        to the HTTP status and the ``{"error": {"code": ...}}`` body the
+        client's re-address matches on.
+    """
+    if host_is_live(host):
+        return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
+    return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
+
+
 def resolve_host_launch(
     *,
     user_id: str | None,
@@ -115,7 +140,10 @@ def resolve_host_launch(
     :raises HTTPException: 404 if the host or session is missing (or the
         session is not owned by the caller — 404, not 403, so other
         users' sessions aren't enumerable); 403 if the host is owned by
-        a different user; 409 if the host is offline.
+        a different user.
+    :raises OmnigentError: 409 (CONFLICT) if the host is genuinely offline,
+        or 400 (WRONG_REPLICA) if it is live but its tunnel is on another
+        replica (a wrong-replica landing — the caller re-addresses keyless).
     """
     host = resolve_host_owner(
         user_id=user_id,
@@ -125,7 +153,7 @@ def resolve_host_launch(
 
     conn = host_registry.get(host_id)
     if conn is None:
-        raise HTTPException(status_code=409, detail="host is offline")
+        raise host_absent_error(host)
 
     conv = conversation_store.get_conversation(session_id)
     if conv is None:

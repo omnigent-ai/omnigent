@@ -2,6 +2,11 @@ import SwiftUI
 
 /// The native Chat/Terminal switcher rendered over the bottom of the web view.
 ///
+/// Legacy: current SPAs render the switcher in their header and always push
+/// this bar hidden; it stays only so older servers' SPAs (which still drive it
+/// via `setViewMode`) keep a switcher. Remove once those are out of support
+/// (target 0.15).
+///
 /// On iOS 26+ the capsule uses the system Liquid Glass material; on iOS 18–25 it
 /// falls back to `.ultraThinMaterial`, matching the look of `ServerSwitcher`.
 struct ChatTerminalBar: View {

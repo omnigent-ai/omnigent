@@ -128,12 +128,12 @@ that works, the full stack is good: key, egress, bridge, harness.
 
 ```bash
 # Unit tests (use --frozen; the cwsandbox extra is unsatisfiable on public PyPI here)
-uv run --frozen --extra dev python -m pytest \
+uv run --frozen --group test python -m pytest \
   tests/inner/test_cursor_executor.py \
   tests/runtime/test_cursor_spawn_env.py \
   tests/onboarding/test_cursor_auth.py -q
 # Gated end-to-end harness test
-uv run --frozen --extra dev python -m pytest tests/e2e/omnigent/test_per_harness_cursor.py -q
+uv run --frozen --group test python -m pytest tests/e2e/omnigent/test_per_harness_cursor.py -q
 ```
 
 ## Bug-bash (fan out)

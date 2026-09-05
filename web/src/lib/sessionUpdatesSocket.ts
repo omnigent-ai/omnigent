@@ -16,7 +16,8 @@
 // id list is NEVER trusted from the client for authorization — the server
 // access-checks every watched id against the connection's user.
 
-import { resolveWebSocketUrl } from "@/lib/host";
+import { getOmnigentHostConfig, resolveWebSocketUrl } from "@/lib/host";
+import { modalHostId } from "@/lib/sessionHost";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 /** A frame pushed by the server over the updates stream. */
@@ -61,10 +62,32 @@ function nextReconnectDelay(failedAttempts: number): number {
  * (whether served by the Omnigent server directly or through the Vite dev proxy),
  * and an embedding host rebases it onto its proxied WS surface.
  *
+ * When a host fetcher is installed, append `?omnigent_slice_key=<frozen modal
+ * host>`. A browser WebSocket handshake can't set request headers, so the
+ * routing key rides the query string (the same seam the terminal-attach WS
+ * uses). This WS watches sessions across MANY hosts, so no single key is
+ * "correct" — it's a NICE-TO-HAVE load/perf lever: keying by the modal host
+ * (the one backing most of the user's sessions) lands the standing rescan on
+ * the replica most likely holding their sessions' tunnels, so the per-session
+ * status read hits that replica's warm relay cache instead of the cross-replica
+ * fallback, and spreads the standing connections finer than per-tenant.
+ * Correctness is unaffected (the rescan reads are replica-safe).
+ *
+ * The key comes from {@link modalHostId}, which is resolved once and never
+ * changes for the page — so every auto-reconnect rebuilds the identical URL and
+ * never re-keys (no connection churn). The provider only calls `start()` once
+ * the modal host is resolved (see `isModalHostResolved`), so this reads a
+ * settled value. Omitted on an unsharded server and when no host was picked.
+ *
  * @returns The fully-qualified WebSocket URL.
  */
 function buildUpdatesUrl(): string {
-  return resolveWebSocketUrl("/v1/sessions/updates");
+  const path = "/v1/sessions/updates";
+  if (!getOmnigentHostConfig().fetcher) return resolveWebSocketUrl(path);
+  const sliceKey = modalHostId();
+  return resolveWebSocketUrl(
+    sliceKey ? `${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}` : path,
+  );
 }
 
 /**
@@ -102,7 +125,10 @@ class SessionUpdatesSocket {
     this.ws = null;
     if (ws) {
       // Drop handlers first so the close doesn't schedule a reconnect.
-      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
       ws.close();
     }
     this.setConnected(false);
@@ -261,3 +287,46 @@ class SessionUpdatesSocket {
 
 /** Shared transport instance for the current tab. */
 export const sessionUpdatesSocket = new SessionUpdatesSocket();
+
+/**
+ * Resolve with the first pushed session row matching `match`.
+ *
+ * The server announces a session on this stream as soon as its row is
+ * written — well before a `POST /v1/sessions` that waits on a host runner
+ * launch answers with the same id. A caller that knows what it just asked
+ * for can use this to learn its own session's id early and open the chat
+ * without waiting for the create.
+ *
+ * The stream carries EVERY session that becomes visible to this user —
+ * created in another tab, started by a scheduled task, or just shared with
+ * them — and restates rows already on screen on each snapshot. So `match`
+ * must identify one specific expected session; "anything new" would hand
+ * back somebody else's.
+ *
+ * @param match - Predicate over each row of a snapshot/changed frame.
+ * @param signal - Stops listening when aborted, resolving `null` so the
+ *   caller can fall back to its own result.
+ * @returns The first matching row, or `null` if aborted before one arrived.
+ */
+export function nextPushedSession(
+  match: (item: SessionListWireItem) => boolean,
+  signal: AbortSignal,
+): Promise<SessionListWireItem | null> {
+  if (signal.aborted) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let unsubscribe = () => {};
+    const onAbort = () => {
+      unsubscribe();
+      resolve(null);
+    };
+    unsubscribe = sessionUpdatesSocket.subscribe((frame) => {
+      if (frame.type !== "snapshot" && frame.type !== "changed") return;
+      const found = frame.items.find(match);
+      if (found === undefined) return;
+      unsubscribe();
+      signal.removeEventListener("abort", onAbort);
+      resolve(found);
+    });
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}

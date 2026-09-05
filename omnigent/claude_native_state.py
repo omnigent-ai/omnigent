@@ -47,6 +47,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from omnigent.process_logging import data_dir
+
 # Env-var override for the persistent state root. Reserved for tests
 # (and for advanced users who want to put state on a non-default
 # volume). When unset, the module falls back to
@@ -91,8 +93,8 @@ def _claude_native_state_root() -> Path:
 
     Honors the :data:`_STATE_ROOT_ENV_VAR` override so tests can
     point the state tree at a per-test ``tmp_path`` without
-    clobbering the user's real home directory. Production callers
-    leave the env unset and get the default
+    clobbering the user's state. Otherwise the root follows
+    ``OMNIGENT_DATA_DIR``, falling back to
     ``~/.omnigent/claude-native``.
 
     Lazy: created on first write, never on read (the resume / picker
@@ -105,7 +107,7 @@ def _claude_native_state_root() -> Path:
     override = os.environ.get(_STATE_ROOT_ENV_VAR)
     if override:
         return Path(override)
-    return Path.home() / ".omnigent" / "claude-native"
+    return data_dir() / "claude-native"
 
 
 def _state_dir_for_conversation_id(conversation_id: str) -> Path:

@@ -1,0 +1,78 @@
+name: Waiting on Author Review Run
+
+# Privileged half of the fork-review relay. The artifact contains numeric IDs
+# only; the script re-fetches the PR and review/comment from GitHub before using
+# actor identity, review state, or comment content. No PR code is checked out.
+
+on:
+  workflow_run:
+    workflows: [Waiting on Author Review]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: waiting-on-author-review-run-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  hygiene:
+    if: >-
+      github.repository == 'omnigent-ai/omnigent'
+      && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Download recorded review event IDs
+        id: download
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const arts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner, repo, run_id: context.payload.workflow_run.id,
+            });
+            const art = arts.data.artifacts.find(
+              a => a.name === 'waiting-on-author-review-event'
+            );
+            if (!art) {
+              core.info('No fork-review artifact; the direct review job handled this event.');
+              core.setOutput('found', 'false');
+              return;
+            }
+            const dl = await github.rest.actions.downloadArtifact({
+              owner, repo, artifact_id: art.id, archive_format: 'zip',
+            });
+            fs.writeFileSync(
+              `${process.env.RUNNER_TEMP}/waiting-on-author-review.zip`,
+              Buffer.from(dl.data)
+            );
+            core.setOutput('found', 'true');
+
+      - name: Check out trusted .github
+        if: steps.download.outputs.found == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github
+          persist-credentials: false
+
+      - name: Apply relayed waiting-on-author state
+        if: steps.download.outputs.found == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELAY_ZIP: ${{ runner.temp }}/waiting-on-author-review.zip
+          RELAY_DIR: ${{ runner.temp }}/waiting-on-author-review
+          WAITING_ON_AUTHOR_RELAY_EVENT: ${{ github.event.workflow_run.event }}
+          WAITING_ON_AUTHOR_RELAY_PATH: ${{ runner.temp }}/waiting-on-author-review/event.json
+        run: |
+          mkdir -p "$RELAY_DIR"
+          unzip -q "$RELAY_ZIP" -d "$RELAY_DIR"
+          python3 .github/scripts/waiting_on_author.py

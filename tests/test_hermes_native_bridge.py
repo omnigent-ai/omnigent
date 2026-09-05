@@ -480,3 +480,49 @@ def test_mint_hermes_session_id_returns_uuid() -> None:
     # Should be a valid UUID4 string.
     parsed = uuid.UUID(sid, version=4)
     assert str(parsed) == sid
+
+
+def test_inject_relay_into_policy_hook_rewrites_wrapper(tmp_path: Path) -> None:
+    """inject_relay_into_policy_hook rewrites omnigent-policy-hook.sh with relay env vars."""
+    from omnigent.hermes_native_bridge import inject_relay_into_policy_hook
+
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir(mode=0o700)
+    wrapper = hermes_home / "omnigent-policy-hook.sh"
+    wrapper.write_text("#!/bin/sh\nexport _OMNIGENT_AUTH_HEADERS=old\nexec python hook.py\n")
+    wrapper.chmod(0o700)
+
+    bridge_dir = tmp_path
+    # put hermes_home under bridge_dir/_HERMES_HOME_SUBDIR
+    import omnigent.hermes_native_bridge as _b
+
+    (bridge_dir / _b._HERMES_HOME_SUBDIR).mkdir(parents=True, exist_ok=True)
+    real_wrapper = bridge_dir / _b._HERMES_HOME_SUBDIR / "omnigent-policy-hook.sh"
+    real_wrapper.write_text("#!/bin/sh\n")
+    real_wrapper.chmod(0o700)
+
+    updated = inject_relay_into_policy_hook(
+        bridge_dir,
+        relay_url="http://127.0.0.1:9999",
+        relay_token="relay-tok",
+        server_url="http://ap",
+        session_id="conv_h",
+    )
+
+    assert updated is True
+    text = real_wrapper.read_text()
+    assert "_OMNIGENT_RELAY_URL" in text
+    assert "http://127.0.0.1:9999" in text
+    assert "_OMNIGENT_RELAY_TOKEN" in text
+    assert "relay-tok" in text
+    # Original server vars still present for fallback path.
+    assert "_OMNIGENT_SERVER_URL" in text
+
+
+def test_inject_relay_into_policy_hook_returns_false_when_wrapper_absent(
+    tmp_path: Path,
+) -> None:
+    """inject_relay_into_policy_hook returns False when wrapper script is missing."""
+    from omnigent.hermes_native_bridge import inject_relay_into_policy_hook
+
+    assert inject_relay_into_policy_hook(tmp_path, "http://x", "tok", "http://ap", "sid") is False

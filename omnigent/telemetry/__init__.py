@@ -13,4 +13,8 @@ from __future__ import annotations
 
 from omnigent.telemetry.client import emit, init_client, is_disabled
 
-__all__ = ["emit", "init_client", "is_disabled"]
+__all__ = [
+    "emit",
+    "init_client",
+    "is_disabled",
+]

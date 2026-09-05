@@ -133,12 +133,14 @@ jobs:
               --ignore=tests/runner
               --ignore=tests/stores
             dist: worksteal
-          # Databricks-coupled tests (Lakebase token engine, psycopg). This is
-          # the only lane that installs the `databricks` extra; the
-          # @pytest.mark.databricks marker keeps these tests off the lean lanes
-          # (which run -m "not databricks") and selects them here.
+          # Databricks-coupled tests (Lakebase token engine, psycopg, the
+          # router's ambient workspace-credential chain). This is the only lane
+          # that installs the `databricks` extra; the @pytest.mark.databricks
+          # marker keeps these tests off the lean lanes (which run
+          # -m "not databricks") and selects them here. Paths carrying marked
+          # tests must be listed here or those tests run nowhere.
           - group: databricks
-            paths: tests/db tests/deploy
+            paths: tests/db tests/deploy tests/server/test_smart_routing.py
             extra: databricks
             markexpr: databricks
           # Slack integration (integrations/slack). Its tests live outside the
@@ -186,7 +188,7 @@ jobs:
       - name: Install dependencies
         # matrix.extra (e.g. "databricks") adds an extra for lanes that need it;
         # empty for the default lanes.
-        run: uv sync --locked --extra all --extra dev ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
+        run: uv sync --locked --extra all --group test ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
 
       - name: Run pytest
         shell: bash
@@ -264,7 +266,7 @@ jobs:
         with:
           enable-cache: true
       - name: Install dependencies
-        run: uv sync --locked --extra all --extra dev --extra databricks
+        run: uv sync --locked --extra all --group test --extra databricks
       - name: Run store + DB tests against PostgreSQL
         env:
           OMNIGENT_TEST_DB_URI: postgresql+psycopg://postgres:omnigent@localhost:5432/omnigent_root
@@ -312,7 +314,7 @@ jobs:
       - name: Install system MySQL client library
         run: sudo apt-get update -qq && sudo apt-get install -y -q libmysqlclient-dev
       - name: Install dependencies
-        run: uv sync --locked --extra all --extra dev --extra databricks && uv pip install mysqlclient
+        run: uv sync --locked --extra all --group test --extra databricks && uv pip install mysqlclient
       - name: Run store + DB tests against MySQL
         env:
           OMNIGENT_TEST_DB_URI: mysql+mysqldb://root:omnigent@127.0.0.1:3306/omnigent_root
@@ -370,14 +372,14 @@ jobs:
           path: .tmp-codex-parity-target/debug/codex-parity-sidecar
           key: codex-parity-bin-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
 
-      - name: Set up Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
-        with:
-          node-version: 20
+      - name: Set up pnpm
+        uses: ./.github/actions/setup-pnpm
 
       - name: Install codex CLI
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          npm install --ignore-scripts --prefix .github/ci-deps
+          pnpm install --frozen-lockfile --ignore-scripts --filter e2e-ci-deps
           echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Cache virtualenv
@@ -387,7 +389,7 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
-        run: uv sync --locked --extra all --extra dev
+        run: uv sync --locked --extra all --group test
 
       - name: Build parity sidecar
         if: steps.sidecar-cache.outputs.cache-hit != 'true'

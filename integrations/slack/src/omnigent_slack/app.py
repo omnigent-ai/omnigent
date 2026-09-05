@@ -180,7 +180,12 @@ def _register_error_handler(app: AsyncApp, logger: logging.Logger) -> None:
 
     @app.error
     async def _on_error(error: Exception, body: dict[str, Any]) -> None:
-        logger.exception("Unhandled Slack listener error; body_type=%s", body.get("type"))
+        logger.error(
+            "Unhandled Slack listener error: %s; body_type=%s",
+            error,
+            body.get("type"),
+            exc_info=(type(error), error, error.__traceback__),
+        )
 
 
 def register_handlers(app: AsyncApp, service: SlackOmnigentService) -> None:

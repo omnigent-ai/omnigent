@@ -38,14 +38,14 @@ def test_appearance_reset_restores_defaults(page: Page, seeded_session: tuple[st
     terminal_dark = page.get_by_test_id("terminal-theme-dark")
 
     # Fresh context: the defaults are applied and nothing is persisted yet.
-    expect(font_size_input).to_have_value("16")
+    expect(font_size_input).to_have_value("13")
     expect(page.get_by_test_id("terminal-theme-auto")).to_have_attribute("aria-checked", "true")
     stored_font_size = page.evaluate("() => window.localStorage.getItem('omnigent:ui-font-size')")
     assert stored_font_size is None, "expected no persisted font size on a fresh load"
 
     # Change two unrelated appearance preferences away from their defaults.
-    font_size_inc.click()
-    font_size_inc.click()
+    for _ in range(5):
+        font_size_inc.click()
     expect(font_size_input).to_have_value("18")
     terminal_dark.click()
     expect(page.get_by_test_id("terminal-theme-dark")).to_have_attribute("aria-checked", "true")
@@ -60,7 +60,7 @@ def test_appearance_reset_restores_defaults(page: Page, seeded_session: tuple[st
     page.get_by_test_id("reset-appearance-confirm").click()
 
     # Both choices are back to the product defaults.
-    expect(font_size_input).to_have_value("16")
+    expect(font_size_input).to_have_value("13")
     expect(page.get_by_test_id("terminal-theme-auto")).to_have_attribute("aria-checked", "true")
     assert page.evaluate("() => window.localStorage.getItem('omnigent:ui-font-size')") is None
     assert page.evaluate("() => window.localStorage.getItem('omnigent:terminal-theme')") is None

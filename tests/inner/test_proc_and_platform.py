@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -189,6 +190,19 @@ def test_process_alive_is_a_nondestructive_probe() -> None:
 def test_process_alive_false_for_bogus_pid() -> None:
     assert _proc.process_alive(2_000_000_000) is False
     assert _proc.process_alive(-1) is False
+
+
+def test_killpg_refuses_the_broadcast_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A target pgid of 1 must never be signalled.
+
+    ``killpg(1, sig)`` is ``kill(-1, sig)`` -- a broadcast to every process
+    the user can signal (a mocked pid that coerces to 1 killed the CI runner).
+    """
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(_proc, "_getpgid_fn", lambda pid: 1 if pid else 54321)
+    monkeypatch.setattr(_proc, "_killpg_fn", lambda pgid, sig: sent.append((pgid, sig)))
+    assert _proc._killpg(1, signal.SIGTERM) is False
+    assert sent == []
 
 
 def test_terminate_tree_stops_the_process() -> None:
@@ -453,3 +467,43 @@ def test_cli_fallback_dirs_no_nvm_dir_is_safe(monkeypatch, tmp_path):
     monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
     dirs = _platform._cli_fallback_dirs()
     assert tmp_path / ".local" / "bin" in dirs
+
+
+def test_malloc_tuning_env_empty_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Off Linux the tuning helper is a no-op so callers need no platform branch."""
+    monkeypatch.setattr(_proc, "IS_LINUX", False)
+    assert _proc.malloc_tuning_env() == {}
+
+
+def test_malloc_tuning_env_defaults_on_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Linux the helper caps arenas and sets a trim threshold by default."""
+    monkeypatch.setattr(_proc, "IS_LINUX", True)
+    monkeypatch.delenv("OMNIGENT_RUNNER_MALLOC_ARENA_MAX", raising=False)
+    monkeypatch.delenv("OMNIGENT_RUNNER_MALLOC_TRIM_THRESHOLD", raising=False)
+    assert _proc.malloc_tuning_env() == {
+        "MALLOC_ARENA_MAX": "2",
+        "MALLOC_TRIM_THRESHOLD_": "134217728",
+    }
+
+
+def test_malloc_tuning_env_arena_max_zero_disables_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_RUNNER_MALLOC_ARENA_MAX=0`` drops the arena cap (revert knob)."""
+    monkeypatch.setattr(_proc, "IS_LINUX", True)
+    monkeypatch.setenv("OMNIGENT_RUNNER_MALLOC_ARENA_MAX", "0")
+    monkeypatch.delenv("OMNIGENT_RUNNER_MALLOC_TRIM_THRESHOLD", raising=False)
+    env = _proc.malloc_tuning_env()
+    assert "MALLOC_ARENA_MAX" not in env
+    assert env["MALLOC_TRIM_THRESHOLD_"] == "134217728"
+
+
+def test_malloc_tuning_env_honors_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Operator overrides flow through to the child env values."""
+    monkeypatch.setattr(_proc, "IS_LINUX", True)
+    monkeypatch.setenv("OMNIGENT_RUNNER_MALLOC_ARENA_MAX", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_MALLOC_TRIM_THRESHOLD", "65536")
+    assert _proc.malloc_tuning_env() == {
+        "MALLOC_ARENA_MAX": "1",
+        "MALLOC_TRIM_THRESHOLD_": "65536",
+    }

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  getServerPicker,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
@@ -8,10 +9,15 @@ import {
   nativeNotify,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
+  PRE_MANIFEST_BASELINE,
+  type ServerManifest,
+  serverManifestOf,
   setBadgeCount as bridgeSetBadge,
   setNativeServerSwitcherHidden,
   setThemeSource,
+  supportsNativeServerPicker,
   supportsBrowser,
+  switchServer,
 } from "./nativeBridge";
 
 // The Electron preload bridge mock, installed on window.omnigentDesktop.
@@ -30,6 +36,8 @@ const iosOnSidebarDragUnsubscribe = vi.fn();
 const iosOnSidebarDrag = vi.fn().mockReturnValue(iosOnSidebarDragUnsubscribe);
 const iosSetServerSwitcherHidden = vi.fn();
 const iosSetSidebarOpen = vi.fn();
+const iosGetServerPicker = vi.fn();
+const iosSwitchServer = vi.fn().mockResolvedValue(undefined);
 
 // The Android WebView bridge mock, installed on window.omnigentNative. The MVP
 // Android shell exposes the shell-agnostic subset (notifications + badge); the
@@ -68,8 +76,13 @@ function setElectron(on: boolean, withClickRouting = true, withBrowser = false):
   }
 }
 
-/** Simulate running inside / outside the iOS shell via the WKWebView bridge. */
-function setIOS(on: boolean, withClickRouting = true): void {
+/**
+ * Simulate running inside / outside the iOS shell via the WKWebView bridge.
+ * `withServerPicker` toggles the optional server-picker trio so tests can also
+ * exercise a shell too old to host the sidebar picker (which then keeps its
+ * own floating pill).
+ */
+function setIOS(on: boolean, withClickRouting = true, withServerPicker = false): void {
   if (on) {
     (window as unknown as Record<string, unknown>).omnigentNative = {
       kind: "ios",
@@ -81,6 +94,13 @@ function setIOS(on: boolean, withClickRouting = true): void {
       ...(withClickRouting
         ? {
             onNotificationActivated: (...args: unknown[]) => iosOnNotificationActivated(...args),
+          }
+        : {}),
+      ...(withServerPicker
+        ? {
+            getServerPicker: (...args: unknown[]) => iosGetServerPicker(...args),
+            switchServer: (...args: unknown[]) => iosSwitchServer(...args),
+            openServerSetup: () => {},
           }
         : {}),
     };
@@ -199,6 +219,66 @@ describe("supportsBrowser", () => {
   it("is false under a non-Electron native shell (iOS)", () => {
     setIOS(true);
     expect(supportsBrowser()).toBe(false);
+  });
+});
+
+describe("serverManifestOf", () => {
+  it("returns the baseline off-shell (no picker payload at all)", () => {
+    expect(serverManifestOf(null)).toEqual(PRE_MANIFEST_BASELINE);
+  });
+
+  it("returns the baseline when an older shell omits the manifest", () => {
+    // A shell that predates the manifest still sends currentOrigin/recents —
+    // it just has no serverManifest field. That must read as "pre-manifest",
+    // not crash or yield undefined, so a new SPA runs on an old shell.
+    const info = {
+      currentOrigin: "http://localhost:6767",
+      recentServers: ["http://localhost:6767/"],
+    };
+    expect(serverManifestOf(info)).toEqual(PRE_MANIFEST_BASELINE);
+    expect(serverManifestOf(info).manifestVersion >= 1).toBe(false);
+  });
+
+  it("passes through a manifest the shell forwarded", () => {
+    const manifest = {
+      manifestVersion: 1,
+      serverVersion: "0.6.0",
+      minDesktopVersion: null,
+      ui: { server_picker: "sidebar" },
+    };
+    expect(
+      serverManifestOf({
+        currentOrigin: "http://localhost:6767",
+        recentServers: [],
+        serverManifest: manifest,
+      }),
+    ).toBe(manifest);
+  });
+
+  it("keeps a newer envelope usable (gates are >=, never ===)", () => {
+    const result = serverManifestOf({
+      currentOrigin: "http://localhost:6767",
+      recentServers: [],
+      serverManifest: {
+        manifestVersion: 99,
+        serverVersion: "9.9.9",
+        minDesktopVersion: null,
+        ui: { server_picker: "some-future-shape" },
+      },
+    });
+    expect(result.manifestVersion >= 1).toBe(true);
+    expect(result.ui.server_picker).toBe("some-future-shape");
+  });
+
+  it("falls back to the baseline on a malformed manifest", () => {
+    // Crosses an IPC boundary from a shell of unknown vintage, so a bad
+    // manifestVersion degrades instead of producing NaN comparisons.
+    const result = serverManifestOf({
+      currentOrigin: "http://localhost:6767",
+      recentServers: [],
+      serverManifest: { manifestVersion: "1" } as unknown as ServerManifest,
+    });
+    expect(result).toEqual(PRE_MANIFEST_BASELINE);
   });
 });
 
@@ -456,5 +536,60 @@ describe("setNativeServerSwitcherHidden", () => {
       throw new Error("bridge down");
     });
     expect(() => setNativeServerSwitcherHidden(true)).not.toThrow();
+  });
+});
+
+describe("supportsNativeServerPicker", () => {
+  it("is false in a plain browser", () => {
+    expect(supportsNativeServerPicker()).toBe(false);
+  });
+
+  it("is false on an iOS shell without the picker bridge (floating-pill era)", () => {
+    setIOS(true);
+    expect(supportsNativeServerPicker()).toBe(false);
+  });
+
+  it("is true on an iOS shell exposing the picker bridge", () => {
+    setIOS(true, true, true);
+    expect(supportsNativeServerPicker()).toBe(true);
+  });
+
+  it("is false when a version-skewed shell exposes only part of the trio", () => {
+    setIOS(true, true, true);
+    delete (window as unknown as { omnigentNative: Record<string, unknown> }).omnigentNative
+      .openServerSetup;
+    expect(supportsNativeServerPicker()).toBe(false);
+  });
+});
+
+describe("getServerPicker / switchServer over the iOS bridge", () => {
+  it("resolves the iOS shell's picker payload", async () => {
+    setIOS(true, true, true);
+    const info = {
+      currentOrigin: "https://ios.example.test",
+      managedServers: [],
+      recentServers: ["https://ios.example.test/", "https://other.example.test/"],
+    };
+    iosGetServerPicker.mockResolvedValue(info);
+
+    await expect(getServerPicker()).resolves.toEqual(info);
+  });
+
+  it("resolves null on an iOS shell without the picker bridge", async () => {
+    setIOS(true);
+    await expect(getServerPicker()).resolves.toBeNull();
+    expect(iosGetServerPicker).not.toHaveBeenCalled();
+  });
+
+  it("routes a switch request through the iOS bridge", async () => {
+    setIOS(true, true, true);
+    await switchServer("https://other.example.test/");
+    expect(iosSwitchServer).toHaveBeenCalledWith("https://other.example.test/");
+  });
+
+  it("resolves null when the iOS picker bridge rejects", async () => {
+    setIOS(true, true, true);
+    iosGetServerPicker.mockRejectedValueOnce(new Error("bridge down"));
+    await expect(getServerPicker()).resolves.toBeNull();
   });
 });

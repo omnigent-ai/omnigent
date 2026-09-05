@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import signal
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -245,3 +248,41 @@ def test_registry_lock_serializes_read_modify_write(tmp_path: Path) -> None:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
             registry.os.close(fd)
+
+
+def test_reap_state_dir_kills_matching_app_server_and_spares_others(tmp_path: Path) -> None:
+    """
+    Reaping by state dir kills only processes carrying dir + "app-server".
+
+    The stale-holder incident shape: an app-server from a dead runner still
+    runs with the session state dir in its command line. A process carrying
+    the dir WITHOUT the "app-server" marker (e.g. the pytest process's own
+    tree) must survive.
+    """
+    state_dir = tmp_path / "deadbeefdeadbeefdeadbeefdeadbeef"
+    sleeper = "import time; time.sleep(300)"
+    victim = subprocess.Popen(
+        [sys.executable, "-c", sleeper, str(state_dir), "app-server"],
+        start_new_session=True,
+    )
+    bystander = subprocess.Popen(
+        [sys.executable, "-c", sleeper, str(state_dir)],
+        start_new_session=True,
+    )
+    try:
+        reaped = registry.reap_codex_native_processes_for_state_dir(state_dir, grace_s=1.0)
+        assert reaped == 1, f"expected exactly the victim to match, got {reaped}"
+        # SIGTERM (or the SIGKILL escalation) must actually end the process.
+        victim.wait(timeout=5.0)
+        assert bystander.poll() is None, "process without the app-server marker was killed"
+    finally:
+        for proc in (victim, bystander):
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5.0)
+
+
+def test_reap_state_dir_without_matches_is_a_noop(tmp_path: Path) -> None:
+    """A state dir no live process references reaps nothing."""
+    assert registry.reap_codex_native_processes_for_state_dir(tmp_path / "no-match") == 0

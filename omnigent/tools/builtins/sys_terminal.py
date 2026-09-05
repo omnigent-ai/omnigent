@@ -1046,7 +1046,8 @@ class SysTerminalCloseTool(Tool):
         :returns: JSON-encoded result. Success: ``{"terminal",
             "session", "status": "closed" | "not_found"}``.
         """
-        if ctx.conversation_id is None:
+        conversation_id = ctx.conversation_id
+        if conversation_id is None:
             return json.dumps({"error": "sys_terminal_close requires a conversation_id"})
 
         parsed = _parse_arguments(arguments)
@@ -1065,12 +1066,12 @@ class SysTerminalCloseTool(Tool):
         # never races with a tmux op already in progress. ``None``
         # means the instance was already closed (or never launched);
         # registry.close() returns False in that case anyway.
-        lock = self._registry.get_instance_lock(ctx.conversation_id, terminal_name, session_key)
+        lock = self._registry.get_instance_lock(conversation_id, terminal_name, session_key)
 
         def _do_close() -> bool:
             try:
                 return asyncio.run(
-                    self._registry.close(ctx.conversation_id, terminal_name, session_key)
+                    self._registry.close(conversation_id, terminal_name, session_key)
                 )
             except (RuntimeError, OSError) as exc:
                 # tmux teardown can raise when the server is already

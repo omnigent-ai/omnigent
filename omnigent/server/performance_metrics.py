@@ -1161,6 +1161,6 @@ def _current_rss_bytes() -> int:
             return int(usage.ru_maxrss)
         return int(usage.ru_maxrss) * 1024
 
-    import psutil
+    import psutil  # type: ignore[import-untyped]
 
     return int(psutil.Process().memory_info().rss)

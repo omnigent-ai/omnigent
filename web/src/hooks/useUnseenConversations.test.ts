@@ -1,3 +1,5 @@
+import type * as UseUnseenConversationsModule from "./useUnseenConversations";
+
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -8,7 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const { authFetch } = vi.hoisted(() => ({ authFetch: vi.fn() }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: authFetch }));
 
-type Mod = typeof import("./useUnseenConversations");
+type Mod = typeof UseUnseenConversationsModule;
 
 /**
  * The module keeps its read-state mirror in module-level singletons
@@ -234,6 +236,22 @@ describe("useMarkConversationSeen", () => {
 
     expect(mod.isConversationUnseen("conv-1", 4_000, "idle")).toBe(false);
     expect(lastPutBody()).toEqual({ last_seen: 5_000, unread: false });
+  });
+
+  it("anchors the baseline to the viewed updated_at when the server clock leads the client", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    setWindowFocused(true);
+    // Client wall clock (5000) lags the server updated_at (6000) the user is
+    // reading — clock skew between the hosted server and the desktop app.
+    vi.useFakeTimers({ now: 5_000_000 });
+
+    renderHook(() => mod.useMarkConversationSeen("conv-1", 6_000));
+
+    // The just-read idle turn must not reappear as unseen, and the synced
+    // baseline is the viewed updated_at, not the lagging wall clock.
+    expect(mod.isConversationUnseen("conv-1", 6_000, "idle")).toBe(false);
+    expect(lastPutBody()).toEqual({ last_seen: 6_000, unread: false });
   });
 
   it("does NOT mark seen while the window is blurred", async () => {

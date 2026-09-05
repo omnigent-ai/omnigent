@@ -425,6 +425,43 @@ class _WedgedFastHeartbeatHarness(HarnessApp):
         await asyncio.Event().wait()  # never set; hang until the watchdog fires
 
 
+class _ParkingElicitFastHeartbeatHarness(HarnessApp):
+    """
+    Parks on ``ctx.elicit`` while fast heartbeats fire, then echoes
+    the reply action.
+
+    Used to reproduce the human-wait watchdog bug: a turn blocked on a human approval
+    only emits heartbeats (not progress events), so the idle watchdog
+    can fire before the human replies and fail the turn with
+    ``response.failed`` even though the turn is legitimately waiting.
+
+    Overrides ``_heartbeat_loop`` to fire every 0.2s (vs 15s in
+    production) so the watchdog interaction surfaces in a short test.
+    After the elicitation is answered, emits the reply action as a
+    text delta and returns normally.
+    """
+
+    async def _heartbeat_loop(self, ctx: TurnContext) -> None:
+        from omnigent.server.schemas import HeartbeatEvent
+
+        while True:
+            await asyncio.sleep(0.2)
+            ctx.emit(HeartbeatEvent(type="response.heartbeat"))
+
+    async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+        del request
+        result = await ctx.elicit(
+            elicitation_id="elicit_pending_1",
+            params=ElicitationRequestParams(mode="form", message="waiting for human..."),
+        )
+        ctx.emit(
+            OutputTextDeltaEvent(
+                type="response.output_text.delta",
+                delta=f"action:{result.action}",
+            )
+        )
+
+
 _FIXTURES: dict[str, type[HarnessApp]] = {
     "echo": _EchoHarness,
     "wedged": _WedgedHarness,
@@ -440,6 +477,7 @@ _FIXTURES: dict[str, type[HarnessApp]] = {
     "unclassified_exception": _UnclassifiedExceptionHarness,
     "slow_stream": _SlowStreamHarness,
     "shutdown_tracking": _ShutdownTrackingHarness,
+    "parking_elicit_fast_heartbeat": _ParkingElicitFastHeartbeatHarness,
 }
 
 

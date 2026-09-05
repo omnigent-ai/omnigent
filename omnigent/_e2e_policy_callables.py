@@ -17,7 +17,7 @@ their own policy callables via pip-installed packages.
 
 from __future__ import annotations
 
-from omnigent.policies.schema import PolicyEvent, PolicyResponse
+from omnigent.policies.schema import PolicyEvent, PolicyResponse, request_user_text
 from omnigent.policies.types import PolicyResult
 from omnigent.spec.types import PolicyAction
 
@@ -36,13 +36,14 @@ def block_on_sentinel(event: PolicyEvent) -> PolicyResponse:
     """
     DENY any INPUT containing the sentinel token.
 
-    :param event: Event dict. On INPUT phase,
-        ``event["data"]`` is the user message text (str).
+    :param event: Event dict. On the REQUEST phase the web input gate
+        passes ``event["data"]`` as ``{"user_content", "attachments"}``;
+        ``request_user_text`` reads the typed text from that dict (and
+        still accepts a bare string from the native/terminal path).
     :returns: Decision dict — DENY if the sentinel
         appears in the text, ALLOW otherwise.
     """
-    content = event.get("data")
-    if isinstance(content, str) and _SENTINEL in content:
+    if _SENTINEL in request_user_text(event.get("data")):
         return {
             "result": "DENY",
             "reason": f"contains reserved token {_SENTINEL!r}",
@@ -66,12 +67,14 @@ def taint_on_banana(event: PolicyEvent) -> PolicyResult:
     because label writes (``set_labels``) require the
     PolicyResult shape — the decision dict does not carry labels.
 
-    :param event: Event dict.
+    :param event: Event dict. On the REQUEST phase the web input gate
+        passes ``event["data"]`` as ``{"user_content", "attachments"}``;
+        ``request_user_text`` reads the typed text from that dict (and
+        still accepts a bare string from the native/terminal path).
     :returns: Always ALLOW; carries ``set_labels={"tainted": "1"}``
         when the trigger token appears.
     """
-    content = event.get("data")
-    if isinstance(content, str) and _BANANA_TRIGGER in content:
+    if _BANANA_TRIGGER in request_user_text(event.get("data")):
         return PolicyResult(
             action=PolicyAction.ALLOW,
             set_labels={"tainted": "1"},

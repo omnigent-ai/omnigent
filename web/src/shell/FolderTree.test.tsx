@@ -1,10 +1,19 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 import { RunnerOfflineError, type WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  ROW_ACTION_SIZE_CLASS,
+  ROW_META_SLOT_CLASS,
+  ROW_STATUS_SLOT_CLASS,
+} from "./fileStatusUtils";
 import { FolderTree } from "./FolderTree";
 
 afterEach(cleanup);
+beforeEach(() => copyTextMock.mockClear());
 
 /** Render FolderTree (the "All" files tab) with defaults, overriding per test.
  *  Wrapped in a QueryClientProvider because rendered rows call
@@ -144,11 +153,13 @@ describe("FolderTree file size / download alignment", () => {
     expect(slot).toContainElement(overlay);
   });
 
-  it("renders the dirty-directory dot in a fixed-width slot matching the download column", () => {
-    // The directory status dot must align with the file rows' download button
-    // column, so it lives in a fixed-width (w-[22px]) centered container.
+  it("puts a folder's dirty dot and a file's status letter in one shared column", () => {
+    // The two git-status markers must land in the same x down the tree. Each
+    // sized to its own content instead put them ~4px apart: the dot had a
+    // fixed 22px box while the letter was a variable-width badge centred on
+    // itself. Both now centre in ROW_STATUS_SLOT_CLASS.
     renderTree({
-      files: [dir("src")],
+      files: [dir("src"), file("app.ts")],
       changedFiles: [
         {
           path: "src/app.ts",
@@ -159,11 +170,102 @@ describe("FolderTree file size / download alignment", () => {
           lines_added: null,
           lines_removed: null,
         },
+        {
+          path: "app.ts",
+          name: "app.ts",
+          status: "created",
+          bytes: 1,
+          modified_at: null,
+          lines_added: null,
+          lines_removed: null,
+        },
       ],
     });
 
-    const dot = screen.getByText("●");
-    const slot = dot.parentElement;
-    expect(slot).toHaveClass("w-[22px]");
+    const dotSlot = screen.getByText("●").parentElement;
+    const letterSlot = screen.getByTitle("Added").parentElement;
+    for (const slot of [dotSlot, letterSlot]) {
+      expect(slot).toHaveClass(ROW_STATUS_SLOT_CLASS);
+      expect(slot).toHaveClass("justify-center");
+    }
+  });
+});
+
+describe("FolderTree trailing column", () => {
+  it("gives folders and files alike the same fixed-width trailing slot", () => {
+    // The size label is variable width ("985 B" vs "463 KB"). Letting it size
+    // the column dragged the copy button, the download button and the status
+    // marker to a different x on every row (~16px of measured drift). Every
+    // row -- including folders, which show no size at all -- now renders the
+    // same fixed slot, so those controls line up in one column.
+    renderTree({ files: [file("tiny.txt", 985), file("huge.json", 474_000), dir("src")] });
+
+    const copyButtons = screen.getAllByRole("button", { name: /^Copy (path|folder path):/ });
+    expect(copyButtons).toHaveLength(3);
+    for (const button of copyButtons) {
+      // The copy button lives inside the fixed-width trailing column...
+      const slot = button.closest(`.${ROW_META_SLOT_CLASS}`);
+      expect(slot, "every row's copy button must sit in the trailing column").not.toBeNull();
+      // ...paired with the download button on its LEFT (copy is the rightmost
+      // control), or with a spacer standing in for the download where there is
+      // none (folders, deleted files) so the pair keeps one x on every row.
+      const beside = button.previousElementSibling;
+      expect(beside, "the copy button must be preceded by its pair").not.toBeNull();
+      const isDownload = beside?.getAttribute("aria-label")?.startsWith("Download");
+      const isReservedSpacer = beside?.classList.contains(ROW_ACTION_SIZE_CLASS);
+      expect(
+        isDownload || isReservedSpacer,
+        "copy must sit immediately right of the download button (or its reserved footprint)",
+      ).toBe(true);
+    }
+  });
+
+  it("offers a copy button on directory rows, not just files", () => {
+    // Directories are paths worth copying too. The row used to be a single
+    // <button>, so a copy control could not be nested inside it at all --
+    // hence the wrapper-div restructure.
+    renderTree({ files: [dir("src")] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy folder path: src" }));
+
+    expect(copyTextMock).toHaveBeenCalledWith("src");
+  });
+});
+
+describe("FolderTree double-click to open a folder", () => {
+  it("re-roots onto the folder on double click, but only expands on a single click", () => {
+    // Finder's contract. A single click must keep working as the expand
+    // toggle -- if double click stole it, the tree would be unusable.
+    const onNavigateDir = vi.fn();
+    renderTree({ files: [dir("src"), file("README.md")], onNavigateDir });
+
+    const folder = screen.getByRole("button", { name: "src/" });
+
+    fireEvent.click(folder);
+    expect(onNavigateDir, "a single click must not re-root").not.toHaveBeenCalled();
+
+    fireEvent.doubleClick(folder);
+    expect(onNavigateDir).toHaveBeenCalledWith("src");
+  });
+
+  it("passes the path relative to the browsed root, not the bare folder name", () => {
+    // Nested rows must report their full path from the current root, or
+    // re-rooting from a deep row would land in the wrong directory.
+    const onNavigateDir = vi.fn();
+    renderTree({ files: [file("src/components/Button.tsx")], onNavigateDir });
+
+    fireEvent.doubleClick(screen.getByRole("button", { name: "components/" }));
+
+    expect(onNavigateDir).toHaveBeenCalledWith("src/components");
+  });
+
+  it("leaves folders inert when no navigate handler is supplied", () => {
+    // The prop is optional; without it the row must still expand normally.
+    renderTree({ files: [dir("src")] });
+
+    const folder = screen.getByRole("button", { name: "src/" });
+    fireEvent.doubleClick(folder);
+
+    expect(folder).toBeInTheDocument();
   });
 });

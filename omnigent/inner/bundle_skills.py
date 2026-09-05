@@ -3,7 +3,7 @@ Shared helpers for exposing an agent bundle's skills to a Claude harness.
 
 Both the Claude Agent SDK executor (in-process, ``claude_sdk_executor``)
 and the ``claude-native`` CLI launch path expose a bundle's
-``skills/<name>/SKILL.md`` files to Claude Code through its plugin
+``skills/<dir>/SKILL.md`` files to Claude Code through its plugin
 convention (``--plugin-dir <bundle>``). This module centralizes the two
 pieces that wiring needs so the SDK and native paths stay in lockstep:
 writing the bundle's ``.claude-plugin/plugin.json`` manifest, and
@@ -71,7 +71,7 @@ def claude_native_skill_args(
     This is the native-CLI mirror of the SDK's
     ``_resolve_skills_option`` + plugin wiring in
     ``claude_sdk_executor``. The real ``claude`` binary discovers a
-    bundle's ``skills/<name>/SKILL.md`` files as plugin skills when the
+    bundle's ``skills/<dir>/SKILL.md`` files as plugin skills when the
     bundle is passed via ``--plugin-dir``, and gates host skills
     (``~/.claude/skills/``, project ``.claude/skills/``) via
     ``--setting-sources``. ``skills_filter`` maps the same way the SDK

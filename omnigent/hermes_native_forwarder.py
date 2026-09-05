@@ -236,9 +236,19 @@ class _ForwardState:
 
     :param hermes_session_id: The resolved Hermes ``sessions.id`` being tailed, or
         ``None`` before one is discovered.
-    :param last_id: Highest ``messages.id`` already processed (forwarded or
-        skipped). ``messages.id`` is autoincrement, so the high-water mark is
-        sufficient dedup with O(1) state.
+    :param last_id: Highest **fully** processed ``messages.id``: every item the row
+        expanded to was forwarded, or the row was skipped. ``messages.id`` is
+        autoincrement, so the high-water mark is sufficient dedup with O(1) state.
+    :param partial_row_id: The ``messages.id`` of a row whose mirroring failed
+        partway, or ``0`` when none is pending. One row expands to several items
+        (reasoning, prose, a call per tool call), so ``last_id`` cannot advance until
+        the last of them lands, or the row is skipped next poll and its undelivered
+        items are lost. Named explicitly (rather than implied as "the row after
+        ``last_id``") because compaction can soft-delete the row before the retry,
+        in which case the offset must not be applied to some other row.
+    :param partial_row_items: How many of *partial_row_id*'s items already posted.
+        The row is re-read whole and this many leading items are dropped rather than
+        posted twice.
     :param launch_epoch_s: This session's launch time (Unix seconds), used to
         scope discovery and to break ties when two sessions discover the same row:
         the earlier-launched (established) session keeps it. ``0.0`` for cold.
@@ -254,6 +264,8 @@ class _ForwardState:
 
     hermes_session_id: str | None = None
     last_id: int = 0
+    partial_row_id: int = 0
+    partial_row_items: int = 0
     launch_epoch_s: float = 0.0
     heartbeat_ms: int = 0
     active_turn_id: str | None = None
@@ -268,12 +280,25 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
         return _ForwardState()
     sid = data.get("hermes_session_id")
     last_id = data.get("last_id")
+    partial_id = data.get("partial_row_id")
+    partial_items = data.get("partial_row_items")
+    # Both or neither: a partial row id without a positive item count (or vice
+    # versa) is meaningless, and honoring half of it would drop or duplicate items.
+    if not (
+        isinstance(partial_id, int)
+        and partial_id > 0
+        and isinstance(partial_items, int)
+        and partial_items > 0
+    ):
+        partial_id, partial_items = 0, 0
     launch_epoch_s = data.get("launch_epoch_s")
     heartbeat_ms = data.get("heartbeat_ms")
     active_turn_id = data.get("active_turn_id")
     return _ForwardState(
         hermes_session_id=sid if isinstance(sid, str) else None,
         last_id=last_id if isinstance(last_id, int) else 0,
+        partial_row_id=partial_id,
+        partial_row_items=partial_items,
         launch_epoch_s=float(launch_epoch_s) if isinstance(launch_epoch_s, (int, float)) else 0.0,
         heartbeat_ms=heartbeat_ms if isinstance(heartbeat_ms, int) else 0,
         active_turn_id=active_turn_id
@@ -296,6 +321,8 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> bool:
                 {
                     "hermes_session_id": state.hermes_session_id,
                     "last_id": state.last_id,
+                    "partial_row_id": state.partial_row_id,
+                    "partial_row_items": state.partial_row_items,
                     "launch_epoch_s": state.launch_epoch_s,
                     "active_turn_id": state.active_turn_id,
                     # Stamp the heartbeat at persist time so every poll refreshes
@@ -366,12 +393,30 @@ def _connect_ro(db_path: Path) -> sqlite3.Connection | None:
     via the ``-shm``; a plain connection is the fallback for the rare window where
     ``-shm`` is momentarily absent. Only SELECTs are issued.
     """
-    for uri, kw in ((f"file:{db_path}?mode=ro", {"uri": True}), (str(db_path), {})):
+    for uri, use_uri in ((f"file:{db_path}?mode=ro", True), (str(db_path), False)):
         try:
-            return sqlite3.connect(uri, timeout=5.0, **kw)
+            if use_uri:
+                return sqlite3.connect(uri, timeout=5.0, uri=True)
+            return sqlite3.connect(uri, timeout=5.0)
         except sqlite3.Error:
             continue
     return None
+
+
+def _table_columns(con: sqlite3.Connection, table: str) -> frozenset[str]:
+    """Return the set of column names on *table*, or empty on any error.
+
+    Hermes' ``state.db`` schema drifts across versions (e.g. schema_version 11
+    dropped ``sessions.cwd`` and ``messages.active`` / ``messages.compacted``
+    that older builds carried). The forwarder introspects the live schema and
+    adapts its SELECTs instead of assuming a fixed column set — otherwise a
+    single ``no such column`` error aborts discovery / mirroring and the chat
+    goes silent even though Hermes itself is working (visible in the terminal).
+    """
+    try:
+        return frozenset(str(r[1]) for r in con.execute(f"PRAGMA table_info({table})"))
+    except sqlite3.Error:
+        return frozenset()
 
 
 def _discover_session_id(
@@ -401,11 +446,25 @@ def _discover_session_id(
     if con is None:
         return None
     floor_s = launch_epoch_s - _DISCOVERY_SKEW_S
+    # Newer Hermes (schema_version >= 11) no longer records ``sessions.cwd``.
+    # Select it only when present; otherwise treat every row as cwd-less and
+    # rely on the started_at-since-launch fallback below (the newest lone
+    # session started after this terminal launched is this terminal's session).
+    has_cwd = "cwd" in _table_columns(con, "sessions")
     try:
-        rows = con.execute(
-            "SELECT id, cwd FROM sessions WHERE started_at >= ? ORDER BY started_at DESC",
-            (floor_s,),
-        ).fetchall()
+        if has_cwd:
+            rows = con.execute(
+                "SELECT id, cwd FROM sessions WHERE started_at >= ? ORDER BY started_at DESC",
+                (floor_s,),
+            ).fetchall()
+        else:
+            rows = [
+                (sid, None)
+                for (sid,) in con.execute(
+                    "SELECT id FROM sessions WHERE started_at >= ? ORDER BY started_at DESC",
+                    (floor_s,),
+                ).fetchall()
+            ]
     except sqlite3.Error as exc:
         _warn_sqlite_once("session discovery", exc)
         return None
@@ -621,12 +680,24 @@ def _read_new_items(
     con = _connect_ro(db_path)
     if con is None:
         return []
+    # ``messages.active`` (compaction soft-delete flag) was dropped in newer
+    # Hermes schemas; only filter on it when present.
+    cols = _table_columns(con, "messages")
+    active_filter = " AND active = 1" if "active" in cols else ""
+    # ``reasoning_content`` / ``reasoning`` were added in newer schemas; SELECT
+    # them only when present so a v11 (or other older) DB does not raise
+    # ``no such column``.
+    reasoning_cols = ""
+    if "reasoning_content" in cols:
+        reasoning_cols += ", reasoning_content"
+    if "reasoning" in cols:
+        reasoning_cols += ", reasoning"
     try:
         rows = con.execute(
-            "SELECT id, role, content, tool_calls, tool_call_id, tool_name, "
-            "reasoning_content, reasoning "
+            "SELECT id, role, content, tool_calls, tool_call_id, tool_name "
+            f"{reasoning_cols} "
             "FROM messages "
-            "WHERE session_id = ? AND id > ? AND active = 1 ORDER BY id",
+            f"WHERE session_id = ? AND id > ?{active_filter} ORDER BY id",
             (hermes_session_id, last_id),
         ).fetchall()
     except sqlite3.Error as exc:
@@ -635,16 +706,12 @@ def _read_new_items(
     finally:
         con.close()
     items: list[_MirrorItem] = []
-    for (
-        msg_id,
-        role,
-        content,
-        tool_calls_json,
-        tool_call_id,
-        tool_name_val,
-        reasoning_content,
-        reasoning,
-    ) in rows:
+    for row in rows:
+        # The trailing reasoning_content / reasoning columns are present
+        # only when the live schema carries them; unpack positionally.
+        msg_id, role, content, tool_calls_json, tool_call_id, tool_name_val = row[:6]
+        reasoning_content = row[6] if len(row) > 6 and "reasoning_content" in cols else None
+        reasoning = row[-1] if len(row) > 6 and "reasoning" in cols else None
         converted = _message_to_items(
             msg_id,
             role,
@@ -674,6 +741,33 @@ def _read_new_items(
     return items
 
 
+def _drop_delivered_prefix(
+    items: list[_MirrorItem], row_id: int, delivered: int
+) -> list[_MirrorItem]:
+    """Drop the *delivered* leading items of row *row_id* from a re-read batch.
+
+    A row whose mirroring failed partway is re-read whole so its undelivered items
+    still land; its already-posted prefix is removed here so they are not mirrored
+    twice. Items of other rows pass through untouched, so if *row_id* is gone from
+    the batch (compaction soft-deleted it before the retry) this is a no-op rather
+    than trimming some other row.
+    """
+    kept: list[_MirrorItem] = []
+    seen = 0
+    for it in items:
+        if it.msg_id != row_id:
+            kept.append(it)
+            continue
+        # Count position within the row rather than compare items: two items of one
+        # row can be equal (identical repeated tool calls), so identity is the index.
+        # A row shorter than the recorded offset (schema/parse change) drops entirely:
+        # re-posting a delivered item duplicates it, which no later poll can undo.
+        if seen >= delivered:
+            kept.append(it)
+        seen += 1
+    return kept
+
+
 @dataclass
 class _TurnAction:
     """One ordered step when mirroring a poll batch.
@@ -681,7 +775,9 @@ class _TurnAction:
     ``kind`` is ``"running"`` (POST a ``running`` status edge) or ``"item"`` (POST
     a mirrored conversation item). ``turn_id_after`` is the turn id still active
     once this step is applied — persisted after each step so a turn that spans
-    polls (or a forwarder restart mid-turn) keeps its id.
+    polls (or a forwarder restart mid-turn) keeps its id. ``last_of_row`` marks the
+    final item of a ``msg_id`` group, the only point at which the row is fully
+    mirrored and the cursor may advance past it.
     """
 
     kind: str
@@ -689,6 +785,7 @@ class _TurnAction:
     turn_id_after: str | None
     response_id: str | None = None
     item: _MirrorItem | None = None
+    last_of_row: bool = False
 
 
 def _mirror_item_role(item: _MirrorItem) -> str | None:
@@ -748,10 +845,18 @@ def _annotate_turn_actions(
                 _TurnAction("running", msg_id, active_turn_id, response_id=active_turn_id)
             )
 
-        for it in group:
+        for ix, it in enumerate(group):
             if active_turn_id is not None:
                 it.response_id = active_turn_id
-            actions.append(_TurnAction("item", msg_id, active_turn_id, item=it))
+            actions.append(
+                _TurnAction(
+                    "item",
+                    msg_id,
+                    active_turn_id,
+                    item=it,
+                    last_of_row=ix == len(group) - 1,
+                )
+            )
 
         if terminal:
             active_turn_id = None
@@ -887,6 +992,11 @@ def _has_new_compaction(db_path: Path, hermes_session_id: str) -> bool:
     con = _connect_ro(db_path)
     if con is None:
         return False
+    # ``messages.compacted`` was dropped in newer Hermes schemas; without it we
+    # cannot detect a compaction boundary here (safe: no boundary item posted).
+    if "compacted" not in _table_columns(con, "messages"):
+        con.close()
+        return False
     try:
         row = con.execute(
             "SELECT 1 FROM messages WHERE session_id = ? AND compacted = 1 LIMIT 1",
@@ -918,10 +1028,10 @@ async def _persist_hermes_compaction_item(
     compacted_messages = None
     con = _connect_ro(db_path)
     if con is not None:
+        _active = " AND active = 1" if "active" in _table_columns(con, "messages") else ""
         try:
             rows = con.execute(
-                "SELECT role, content FROM messages "
-                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                f"SELECT role, content FROM messages WHERE session_id = ?{_active} ORDER BY id",
                 (hermes_session_id,),
             ).fetchall()
             msgs = []
@@ -995,6 +1105,11 @@ async def forward_hermes_store_to_session(
     persisted = _read_state(bridge_dir)
     hermes_session_id: str | None = persisted.hermes_session_id
     last_id = persisted.last_id if hermes_session_id is not None else 0
+    # A row whose mirroring failed partway, and how many of its items already
+    # posted; both ``0`` when ``last_id`` is a clean fully-mirrored high-water mark.
+    # Only meaningful alongside ``last_id``, so all three reset together.
+    partial_row_id = persisted.partial_row_id if hermes_session_id is not None else 0
+    partial_row_items = persisted.partial_row_items if hermes_session_id is not None else 0
     # The turn currently in flight (its shared ``response_id``), threaded through
     # every ``_write_state`` so it survives polls / a restart. Reset whenever the
     # tailed hermes session changes (discovery, claim-yield, compaction re-pin).
@@ -1005,9 +1120,9 @@ async def forward_hermes_store_to_session(
     # Omnigent server so we do it at most once per forwarder lifetime.
     _external_id_synced = False
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         usage_tracker = _HermesUsageTracker(client, session_id, bridge_dir)
         compaction_persisted = False
         while True:
@@ -1020,9 +1135,10 @@ async def forward_hermes_store_to_session(
                         _session_claimed_by_other, bridge_dir, resolved, launch_epoch_s
                     ):
                         hermes_session_id = resolved
-                        last_id = (
-                            persisted.last_id if persisted.hermes_session_id == resolved else 0
-                        )
+                        resuming = persisted.hermes_session_id == resolved
+                        last_id = persisted.last_id if resuming else 0
+                        partial_row_id = persisted.partial_row_id if resuming else 0
+                        partial_row_items = persisted.partial_row_items if resuming else 0
                         # Discovery only (re)binds on a cold start or a
                         # claim-yield / compaction re-pin reacquire — never the
                         # mid-turn restart-resume case, which keeps its session
@@ -1035,6 +1151,8 @@ async def forward_hermes_store_to_session(
                             _ForwardState(
                                 hermes_session_id=resolved,
                                 last_id=last_id,
+                                partial_row_id=partial_row_id,
+                                partial_row_items=partial_row_items,
                                 launch_epoch_s=launch_epoch_s,
                                 active_turn_id=active_turn_id,
                             ),
@@ -1072,9 +1190,20 @@ async def forward_hermes_store_to_session(
                         hermes_session_id = None
                         active_turn_id = None
                     else:
+                        # ``last_id`` is the last row whose items ALL posted, so a row
+                        # that failed partway is re-read here. Drop the items of it
+                        # that already posted: the item POST carries no idempotency
+                        # key, so a replay would duplicate them in the conversation.
                         items = await asyncio.to_thread(
                             _read_new_items, db, hermes_session_id, last_id, agent_name
                         )
+                        # Dropping every item leaves the cursor parked until a newer
+                        # row lands, which is correct: there is nothing left to
+                        # deliver for it, and the next row restarts the count.
+                        if partial_row_id:
+                            items = _drop_delivered_prefix(
+                                items, partial_row_id, partial_row_items
+                            )
                         # Assign a per-turn response_id and interleave ``running``
                         # edges at turn starts; items are re-stamped in place so
                         # the turn's tool-call cards render live on the web.
@@ -1129,12 +1258,34 @@ async def forward_hermes_store_to_session(
                                 and action.item.response_id
                             ):
                                 closed_turn_id = action.item.response_id
-                            last_id = action.msg_id
+                            # A row expands to several items, so the cursor may only
+                            # advance once the LAST one lands. Until then record how
+                            # far into the row we got: a POST that fails on a later
+                            # item then resumes inside the row on the next poll,
+                            # instead of ``last_id`` moving past it and the rest of
+                            # its items being skipped forever.
+                            if action.last_of_row:
+                                last_id = action.msg_id
+                                partial_row_id = 0
+                                partial_row_items = 0
+                            else:
+                                # Count from 1 on a row we were not already inside.
+                                # A partial row can disappear before its retry
+                                # (compaction soft-deletes it, and the re-pin that
+                                # resets these is skipped when the session has no
+                                # child), so carrying its count into the next row
+                                # would over-drop that row's items as delivered.
+                                if partial_row_id != action.msg_id:
+                                    partial_row_items = 0
+                                partial_row_id = action.msg_id
+                                partial_row_items += 1
                             _write_state(
                                 bridge_dir,
                                 _ForwardState(
                                     hermes_session_id=hermes_session_id,
                                     last_id=last_id,
+                                    partial_row_id=partial_row_id,
+                                    partial_row_items=partial_row_items,
                                     launch_epoch_s=launch_epoch_s,
                                     active_turn_id=action.turn_id_after,
                                 ),
@@ -1172,6 +1323,8 @@ async def forward_hermes_store_to_session(
                                 ):
                                     hermes_session_id = child
                                     last_id = 0
+                                    partial_row_id = 0
+                                    partial_row_items = 0
                                     active_turn_id = None
                                     compaction_persisted = False
                                     _external_id_synced = False
@@ -1195,6 +1348,8 @@ async def forward_hermes_store_to_session(
                                         _ForwardState(
                                             hermes_session_id=child,
                                             last_id=0,
+                                            partial_row_id=0,
+                                            partial_row_items=0,
                                             launch_epoch_s=launch_epoch_s,
                                             active_turn_id=None,
                                         ),
@@ -1242,6 +1397,8 @@ async def forward_hermes_store_to_session(
                             _ForwardState(
                                 hermes_session_id=hermes_session_id,
                                 last_id=last_id,
+                                partial_row_id=partial_row_id,
+                                partial_row_items=partial_row_items,
                                 launch_epoch_s=launch_epoch_s,
                                 active_turn_id=active_turn_id,
                             ),

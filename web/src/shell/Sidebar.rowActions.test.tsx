@@ -8,12 +8,14 @@
 
 import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
+import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 
 // Controllable rename mutation so the double-click test can assert the
 // committed title was forwarded to the PATCH. `isMobile` toggles the mocked
@@ -44,12 +46,19 @@ const mocks = vi.hoisted(() => {
     },
   };
   return {
-    rename: { mutate: vi.fn() },
+    // `isSuccess`/`isError` drive the row's hold-the-committed-name logic:
+    // it keeps showing the new title until the PATCH settles.
+    rename: { mutate: vi.fn(), isSuccess: false, isError: false },
     isMobile: false,
     // Projects surfaced by the picker + the move-to-project mutation, so the
     // mobile in-place project view test can assert both the list and the pick.
     projects: [] as string[],
+    projectIcons: {} as Record<string, string | null | undefined>,
     moveToProject: { mutate: vi.fn() },
+    leave: { mutate: vi.fn(), isPending: false },
+    // The signed-in viewer. Rows with no `owner` read as owned by them; a row
+    // owned by someone else is the shared case Leave applies to.
+    viewerId: "viewer@example.com" as string | null,
     conversations: [] as unknown[],
     pinnedStore,
   };
@@ -92,12 +101,20 @@ vi.mock("@/hooks/useConversations", () => ({
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => mocks.rename,
+  useLeaveSession: () => mocks.leave,
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: mocks.projects.map((name: string) => ({ id: `p_${name}`, name })) }),
+  useProjects: () => ({
+    data: mocks.projects.map((name: string) => ({
+      id: `p_${name}`,
+      name,
+      icon: mocks.projectIcons[name],
+    })),
+  }),
   // A non-empty `useProjects` renders a project folder, which queries its
   // sessions — return the collapsed (disabled) shape so the folder is inert
   // (this suite keeps its test row unfiled; the picker only needs the name).
@@ -129,9 +146,18 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 // jsdom's default loopback origin would otherwise read as single-user and hide
 // the tabs the shared-session row actions rely on.
 vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
+// Pin "who am I": ownership (and therefore Leave, which revokes the viewer's
+// own grant) is derived from this id. Unmocked it resolves to null in jsdom,
+// which reads as "not the owner" for shared rows but leaves Leave with no id
+// to revoke.
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  getCurrentUserId: () => mocks.viewerId,
+  resolveIdentity: () => Promise.resolve(mocks.viewerId),
+}));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
-import { __resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
+import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -183,10 +209,13 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
+    features: {},
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -200,31 +229,44 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
 // server sharing policy via CapabilitiesProvider (default "loading" → on).
 function renderSidebar(activeId?: string, info?: ServerInfo) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
-  const tree = (
-    <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
-          {activeId ? (
-            <Routes>
-              <Route path="/c/:conversationId" element={sidebar} />
-            </Routes>
-          ) : (
-            sidebar
-          )}
-        </MemoryRouter>
-      </TooltipProvider>
-    </QueryClientProvider>
-  );
-  // No explicit info → CapabilitiesContext default ("loading"), matching every
-  // pre-existing test (sharing treated as on).
-  return render(info ? <CapabilitiesProvider info={info}>{tree}</CapabilitiesProvider> : tree);
+  // Build a FRESH element tree per render: re-rendering the identical element
+  // reference lets React bail out without re-invoking the sidebar, which
+  // would swallow a `mockConversations` swap applied mid-test.
+  const makeUi = () => {
+    const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
+    const tree = (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
+            {activeId ? (
+              <Routes>
+                <Route path="/c/:conversationId" element={sidebar} />
+              </Routes>
+            ) : (
+              sidebar
+            )}
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    // No explicit info → CapabilitiesContext default ("loading"), matching
+    // every pre-existing test (sharing treated as on).
+    return info ? <CapabilitiesProvider info={info}>{tree}</CapabilitiesProvider> : tree;
+  };
+  const view = render(makeUi());
+  // Re-render so a test can apply a new `mockConversations` list mid-flight
+  // (e.g. simulating a reorder pushed between user clicks).
+  return Object.assign(view, { rerenderSidebar: () => view.rerender(makeUi()) });
 }
 
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
+  mocks.rename.isSuccess = false;
+  mocks.rename.isError = false;
   mocks.moveToProject.mutate.mockReset();
+  mocks.leave.mutate.mockReset();
   mocks.projects = [];
+  mocks.projectIcons = {};
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
   useConvMock.mockReset();
@@ -233,7 +275,7 @@ beforeEach(() => {
   mocks.pinnedStore.set([]);
   // The read-state mirror is module-level (in-memory), so reset it between
   // tests to avoid a mark-unread leaking into later rows.
-  __resetReadStateForTests();
+  resetReadStateForTests();
   mockConversations([CONV]);
 });
 
@@ -270,11 +312,11 @@ describe("quick pin/unpin hover button", () => {
     renderSidebar();
 
     const rowLink = screen.getByRole("link", { name: "My Session" });
-    expect(rowLink).not.toHaveClass("md:pr-14");
+    expect(rowLink).not.toHaveClass("md:pr-20");
 
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
 
-    expect(rowLink).toHaveClass("md:pr-14");
+    expect(rowLink).toHaveClass("md:pr-20");
   });
 
   it("sizes the project-folder header controls to match the session-row kebab", () => {
@@ -285,25 +327,71 @@ describe("quick pin/unpin hover button", () => {
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
-    expect(screen.getByTestId("project-actions")).toHaveClass("size-6");
-    expect(screen.getByTestId("project-actions")).not.toHaveClass("size-7");
-    expect(screen.getByTestId("project-new-session")).toHaveClass("size-6");
-    expect(screen.getByTestId("project-new-session")).not.toHaveClass("size-7");
+    const projectActions = screen.getByTestId("project-actions");
+    const projectNewSession = screen.getByTestId("project-new-session");
+    for (const button of [projectActions, projectNewSession]) {
+      expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
+      expect(button).not.toHaveClass("size-7");
+      expect(button.querySelector("svg")).toHaveClass("size-3.5");
+      expect(button.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
+    }
     // Same compact size as the session-row kebab it aligns with.
     expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6");
   });
 
   it("sizes the Projects group-header controls to the same compact icon", () => {
-    // The "New project" / "Expand all" controls share the right-edge column
-    // with the folder + session kebabs, so they use the same compact `icon-xs`
+    // The "New project" button and the list-actions kebab (expand-all /
+    // select-sessions live inside it) share the right-edge column with the
+    // folder + session kebabs, so they use the same compact `icon-xs`
     // (size-6), not the larger `icon-sm` (size-7).
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
-    expect(screen.getByTestId("new-project")).toHaveClass("size-6");
-    expect(screen.getByTestId("new-project")).not.toHaveClass("size-7");
-    expect(screen.getByTestId("expand-all-projects")).toHaveClass("size-6");
-    expect(screen.getByTestId("expand-all-projects")).not.toHaveClass("size-7");
+    for (const button of [
+      screen.getByTestId("new-project"),
+      screen.getByTestId("project-list-actions"),
+    ]) {
+      expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
+      expect(button).not.toHaveClass("size-7");
+    }
+  });
+
+  it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
+    // The "New project" (+) button is the only way to create a project, so its
+    // group-header wrapper must stay visible wherever hover is unavailable —
+    // phones AND touch tablets at `md`+ widths — rather than fade out like the
+    // desktop-only session-header controls. jsdom doesn't evaluate media
+    // queries, so assert the responsive classes: base `flex` (shown at every
+    // breakpoint) with the fade + hover/focus reveals gated on hover
+    // capability, not just the `md` width.
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    const wrapper = screen.getByTestId("new-project").closest(".transition-opacity");
+    expect(wrapper).not.toBeNull();
+    // Visible without hover: base display is `flex`, never `hidden`, and the
+    // fade is not applied by viewport width alone.
+    expect(wrapper).toHaveClass("flex");
+    expect(wrapper).not.toHaveClass("hidden");
+    expect(wrapper).not.toHaveClass("md:opacity-0");
+    // Hover-capable desktop: fades out until the header is hovered / focused /
+    // a menu opens.
+    expect(wrapper).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100",
+    );
+  });
+
+  it("hides the Projects list-actions kebab when there are no projects", () => {
+    // With no projects, the kebab has nothing to offer (no expand/collapse, no
+    // sessions to select) and would open empty — so it's hidden entirely,
+    // leaving just the "New project" button.
+    mocks.projects = [];
+    renderSidebar();
+
+    expect(screen.queryByTestId("project-list-actions")).toBeNull();
+    expect(screen.getByTestId("new-project")).toBeInTheDocument();
   });
 
   it("toggles the pin without opening the kebab menu, moving the row under Pinned", () => {
@@ -313,6 +401,13 @@ describe("quick pin/unpin hover button", () => {
     expect(screen.queryByText("Pinned")).toBeNull();
     const pinButton = screen.getByTestId("quick-pin-conversation");
     expect(pinButton).toHaveAttribute("aria-label", "Pin conversation");
+    expect(pinButton).toHaveClass("text-muted-foreground", "hover:text-foreground");
+    expect(pinButton.querySelector("svg")).toHaveClass("size-3.5");
+    expect(pinButton.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
+    const actionsButton = screen.getByTestId("conversation-actions");
+    expect(actionsButton).toHaveClass("text-muted-foreground", "hover:text-foreground");
+    expect(actionsButton.querySelector("svg")).toHaveClass("size-3.5");
+    expect(actionsButton.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
 
     fireEvent.click(pinButton);
 
@@ -395,6 +490,19 @@ describe("quick pin/unpin hover button", () => {
     expect(quickButton).toHaveClass("md:inline-flex");
     expect(quickButton).not.toHaveClass("md:block");
   });
+
+  it("drops the row kebab on mobile, revealing it only from md up", () => {
+    // The per-row "..." menu is desktop-only: on mobile the chat page's own
+    // header menu covers these per-session actions, so the row kebab is hidden
+    // (`hidden`) and only surfaces from `md` up (`md:inline-flex`). It reveals
+    // like the quick-pin button — flex, not block — so its glyph stays
+    // centered.
+    renderSidebar();
+
+    const kebab = screen.getByTestId("conversation-actions");
+    expect(kebab).toHaveClass("hidden", "md:inline-flex");
+    expect(kebab).not.toHaveClass("md:block");
+  });
 });
 
 describe("double-click to rename", () => {
@@ -416,6 +524,43 @@ describe("double-click to rename", () => {
     // the kebab's Rename item.
     expect(mocks.rename.mutate).toHaveBeenCalledTimes(1);
     expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_1", title: "Renamed Session" });
+  });
+
+  it("shows the committed title the moment the editor closes, before the list updates", () => {
+    // The rename mutation writes the new name into the list cache, but that
+    // reaches the row as a prop from the list above it, which re-renders a
+    // tick after the row's own state change. The row must not fall back to
+    // the pre-rename prop in between — that gap painted the old name for one
+    // frame as the input disappeared. The mocked mutation never updates the
+    // list, so the prop still says "My Session" throughout.
+    renderSidebar();
+
+    fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Renamed Session" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    expect(screen.getByRole("link", { name: /Renamed Session/ })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /My Session/ })).toBeNull();
+  });
+
+  it("drops the committed title once a failed rename rolls the cache back", () => {
+    // The hook reverts the optimistic overlay when the PATCH fails, so the row
+    // has to stop showing the name the server rejected.
+    const { rerenderSidebar } = renderSidebar();
+
+    fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Renamed Session" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("link", { name: /Renamed Session/ })).toBeTruthy();
+
+    mocks.rename.isError = true;
+    rerenderSidebar();
+
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /Renamed Session/ })).toBeNull();
   });
 
   it("does not commit the rename when Enter confirms an active IME composition", () => {
@@ -455,6 +600,54 @@ describe("double-click to rename", () => {
     expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_1", title: "Renamed" });
   });
 
+  it("ignores a double-click whose first click landed on a different row", () => {
+    // A native double-click delivers click, click, dblclick to one element.
+    // If the list reorders between the two clicks (a session's updated_at
+    // bump pushes rows around under the cursor), the second click and the
+    // dblclick land on whichever row slid into place — which must NOT enter
+    // rename, or the user renames a session they never aimed at.
+    const convA: Conversation = {
+      ...CONV,
+      id: "conv_a",
+      title: "Session A",
+      updated_at: 1_700_000_200,
+    };
+    const convB: Conversation = {
+      ...CONV,
+      id: "conv_b",
+      title: "Session B",
+      updated_at: 1_700_000_100,
+    };
+    mockConversations([convA, convB]);
+    const view = renderSidebar();
+
+    // Click #1 of the user's double-click lands on session A (the top row).
+    fireEvent.click(screen.getByRole("link", { name: /Session A/ }));
+
+    // Before click #2, session B's updated_at bumps and the list reorders —
+    // B now occupies the screen position where A was.
+    mockConversations([{ ...convB, updated_at: 1_700_000_300 }, convA]);
+    view.rerenderSidebar();
+
+    // Click #2 and the dblclick land on B, the row now under the cursor.
+    const rowB = screen.getByRole("link", { name: /Session B/ });
+    fireEvent.click(rowB);
+    fireEvent.dblClick(rowB);
+
+    // B saw only the second click, so it must not enter rename.
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    expect(mocks.rename.mutate).not.toHaveBeenCalled();
+
+    // A clean double-click on B — both clicks on the row — still renames it.
+    fireEvent.click(rowB);
+    fireEvent.click(rowB);
+    fireEvent.dblClick(rowB);
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Renamed B" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_b", title: "Renamed B" });
+  });
+
   it("does not enter rename on double-click for a viewer-only row", () => {
     // Rename is owner-only now, so a session owned by another user has its
     // kebab Rename item disabled and double-click must be inert too. A
@@ -463,12 +656,136 @@ describe("double-click to rename", () => {
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar();
     // Radix Tabs triggers activate on mousedown (primary button), not click.
-    fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
 
     fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
 
     expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
     expect(mocks.rename.mutate).not.toHaveBeenCalled();
+  });
+});
+
+describe("leave a shared session", () => {
+  // Every other row action is owner-only, so "Leave session" is the one thing
+  // a shared-with viewer can actually do: drop the session from their own
+  // sidebar without touching the owner's copy.
+
+  /** Switch to the "Shared with me" tab, where non-owned rows live. */
+  function openSharedTab() {
+    // Radix Tabs triggers activate on mousedown (primary button), not click.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+  }
+
+  it("offers Leave on a shared row and calls the mutation after confirming", () => {
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar();
+    openSharedTab();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.click(screen.getByTestId("leave-conversation"));
+
+    // Destructive, and the row vanishes on success — so it confirms first.
+    expect(mocks.leave.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("confirm-leave-conversation"));
+    // Leaving revokes the VIEWER's own grant, so the mutation carries their id
+    // — not the owner's. Sending the owner's id would be a revoke attempt the
+    // server rejects for lack of manage access.
+    expect(mocks.leave.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", viewerId: "viewer@example.com" },
+      expect.anything(),
+    );
+  });
+
+  it("shows Delete instead of Leave on a row the viewer owns", () => {
+    // The owner grant is what keeps the session reachable — leaving would
+    // orphan it, so the owner deletes instead. One slot, not two items.
+    mockConversations([CONV]);
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("leave-conversation")).toBeNull();
+  });
+
+  it("replaces the once-dead disabled Delete rather than adding an item", () => {
+    // The point of reusing the slot: a non-owner used to get Delete rendered
+    // disabled ("only the owner can delete"), a row that could never do
+    // anything. Leave takes that slot — so exactly ONE destructive item shows,
+    // and it is never a disabled Delete.
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar();
+    openSharedTab();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("leave-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("delete-conversation")).toBeNull();
+  });
+
+  it("keeps the plain owner Delete in single-user mode, where nothing is shared", () => {
+    // Single-user mode has one identity and no sharing, so an unowned-looking
+    // row must not offer Leave — it falls back to Delete.
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar(undefined, serverInfo({ single_user: true }));
+
+    // The default filter is "My sessions", which scopes out this owner:other
+    // row; the single-user menu still offers "All sessions", so switch to it to
+    // surface the row this test is about.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-all"));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.queryByTestId("leave-conversation")).toBeNull();
+    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+  });
+});
+
+describe("quick-archive owner gate", () => {
+  // Archive is owner-only: the kebab renders its Archive item disabled for
+  // non-owners ("Only the session owner can archive this session"). The hover
+  // quick button must enforce the same gate — so a non-owner never gets the
+  // affordance the menu deliberately blocks.
+  it("hides the quick-archive button on a shared row the viewer doesn't own", () => {
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar();
+    // Non-owned rows live on the "Shared with me" tab (activates on mousedown).
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
+    expect(screen.queryByTestId("quick-archive-conversation")).toBeNull();
+
+    // The kebab still carries the (disabled) Archive item — the gate hides only
+    // the quick button, not the explanatory menu entry.
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("archive-conversation")).toHaveAttribute("data-disabled");
+  });
+
+  it("shows the quick-archive button on a row the viewer owns", () => {
+    mockConversations([CONV]);
+    renderSidebar();
+
+    expect(screen.getByTestId("quick-archive-conversation")).toBeInTheDocument();
   });
 });
 
@@ -499,11 +816,10 @@ describe("pinned row project flyout", () => {
     expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
     const flyoutTitle = within(flyout).getByText("My Session");
     expect(flyoutTitle).toBeInTheDocument();
-    // The flyout title is sized to match the sidebar row name (fixed
-    // --sidebar-font-size via `sidebar-compact-text`), not the rem-based
-    // `text-sm` that scaled with the UI font-size setting.
+    // The flyout title matches sidebar row names through the shared compact
+    // class, which resolves to the same text-ui step as Appearance content.
     expect(flyoutTitle).toHaveClass("sidebar-compact-text");
-    expect(flyoutTitle).not.toHaveClass("text-sm");
+    expect(flyoutTitle).not.toHaveClass("text-ui");
     expect(within(flyout).getByTestId("pinned-project-flyout-branch")).toHaveTextContent(
       "fix/sidebar-row-height",
     );
@@ -571,7 +887,7 @@ describe("mobile in-place project picker", () => {
     // actions are gone, and the picker (search + project list) plus a Back
     // control are shown.
     fireEvent.click(moveItem);
-    expect(screen.getByPlaceholderText("Search projects")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Search or create project")).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /Sprint 42/ })).toBeInTheDocument();
     expect(screen.getByTestId("project-picker-back")).toBeInTheDocument();
     // The main actions are no longer rendered — the body was replaced, not
@@ -584,7 +900,7 @@ describe("mobile in-place project picker", () => {
     fireEvent.click(screen.getByTestId("project-picker-back"));
     expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
     expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
-    expect(screen.queryByPlaceholderText("Search projects")).toBeNull();
+    expect(screen.queryByPlaceholderText("Search or create project")).toBeNull();
   });
 
   it("moves the session into a picked project just like desktop", () => {
@@ -601,6 +917,106 @@ describe("mobile in-place project picker", () => {
       id: "conv_1",
       project: "Sprint 42",
     });
+  });
+
+  it("creates a project from a typed name that matches nothing", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    fireEvent.change(screen.getByPlaceholderText("Search or create project"), {
+      target: { value: "Roadmap" },
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: /Create Roadmap/ }));
+
+    // The move resolves-or-creates the project id server-side, so filing into a
+    // brand-new name uses the same mutation contract as picking an existing one.
+    expect(mocks.moveToProject.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      project: "Roadmap",
+    });
+  });
+
+  it("offers no create row when the typed name already exists", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    fireEvent.change(screen.getByPlaceholderText("Search or create project"), {
+      target: { value: "sprint 42" },
+    });
+    expect(screen.queryByRole("menuitem", { name: /Create/ })).toBeNull();
+  });
+
+  it("orders decorative project icons and a folder fallback before their names", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42", "Legacy project"];
+    mocks.projectIcons = { "Sprint 42": "🚀" };
+    mockConversations([{ ...CONV, labels: { omni_project: "Sprint 42" } }]);
+    mocks.pinnedStore.set([CONV.id]);
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    const iconRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    const emoji = iconRow.firstElementChild;
+    expect(emoji).toHaveAttribute("data-testid", "project-icon");
+    expect(emoji).toHaveAttribute("aria-hidden", "true");
+    expect(emoji).toHaveTextContent("🚀");
+    expect(emoji?.nextElementSibling).toHaveTextContent("Sprint 42");
+
+    const fallback = screen.getByRole("menuitem", { name: "Legacy project" }).firstElementChild;
+    expect(fallback?.tagName.toLowerCase()).toBe("svg");
+    expect(fallback).toHaveAttribute("aria-hidden", "true");
+    expect(fallback?.nextElementSibling).toHaveTextContent("Legacy project");
+
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    expect(removeItem.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(removeItem.firstElementChild).toHaveTextContent("🚀");
+  });
+
+  it("uses project names and the Remove label for desktop picker typeahead", async () => {
+    mocks.projects = ["Alpha", "Sprint 42"];
+    mocks.projectIcons = { "Sprint 42": "🚀" };
+    mockConversations([{ ...CONV, labels: { omni_project: "Sprint 42" } }]);
+    mocks.pinnedStore.set([CONV.id]);
+    const view = renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const moveTrigger = screen.getByTestId("move-to-project");
+    moveTrigger.focus();
+    fireEvent.keyDown(moveTrigger, { key: "ArrowRight" });
+
+    const alphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const sprintRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    expect(alphaRow.firstElementChild?.tagName.toLowerCase()).toBe("svg");
+    expect(alphaRow.firstElementChild).toHaveAttribute("aria-hidden", "true");
+    expect(alphaRow.firstElementChild?.nextElementSibling).toHaveTextContent("Alpha");
+    expect(sprintRow.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(sprintRow.firstElementChild?.nextElementSibling).toHaveTextContent("Sprint 42");
+    await waitFor(() => expect(alphaRow).toHaveFocus());
+    fireEvent.keyDown(alphaRow, { key: "s" });
+    await waitFor(() => expect(sprintRow).toHaveFocus());
+
+    view.unmount();
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const freshMoveTrigger = screen.getByTestId("move-to-project");
+    freshMoveTrigger.focus();
+    fireEvent.keyDown(freshMoveTrigger, { key: "ArrowRight" });
+
+    const freshAlphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    await waitFor(() => expect(freshAlphaRow).toHaveFocus());
+    fireEvent.keyDown(freshAlphaRow, { key: "r" });
+    await waitFor(() => expect(removeItem).toHaveFocus());
   });
 
   it("keeps the desktop side-flyout submenu (no in-place swap)", () => {
@@ -698,6 +1114,127 @@ describe("right-click context menu", () => {
     fireEvent.click(screen.getByTestId("rename-conversation"));
     expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
   });
+
+  it("holds the list order under the pointer so a right-click rename hits the aimed row", () => {
+    // A right-click is a single event, so nothing can cross-check it like the
+    // double-click guard does — if the list reorders in the instant before
+    // the click lands, the row that slid under the cursor opens its (visually
+    // identical) menu and gets renamed. The fix is upstream: while the
+    // pointer is inside the list, every row's sort key is frozen so rows
+    // can't move under the cursor at all.
+    const convA: Conversation = {
+      ...CONV,
+      id: "conv_a",
+      title: "Session A",
+      updated_at: 1_700_000_200,
+    };
+    const convB: Conversation = {
+      ...CONV,
+      id: "conv_b",
+      title: "Session B",
+      updated_at: 1_700_000_100,
+    };
+    mockConversations([convA, convB]);
+    const view = renderSidebar();
+
+    // The pointer moves over the list, aiming at session A (the top row).
+    fireEvent.mouseOver(screen.getByTestId("sidebar-conversation-list"));
+
+    // Session B's updated_at bumps past A before the right-click lands.
+    mockConversations([{ ...convB, updated_at: 1_700_000_300 }, convA]);
+    view.rerenderSidebar();
+
+    // The order holds: A is still the top row, exactly where the user aims.
+    const links = screen.getAllByRole("link", { name: /^Session/ });
+    expect(links[0]).toHaveAccessibleName(/Session A/);
+
+    // Right-click the top row and rename it — the PATCH targets session A.
+    fireEvent.contextMenu(links[0]);
+    fireEvent.click(screen.getByTestId("rename-conversation"));
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    expect(input).toHaveAttribute("maxLength", String(USER_SESSION_TITLE_MAX_CHARS));
+    fireEvent.change(input, { target: { value: "Renamed A" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_a", title: "Renamed A" });
+  });
+
+  it("keeps the order held while a rename edit is open even after the pointer leaves", () => {
+    // The pointer naturally drifts out of the sidebar while typing a new
+    // title. If that released the freeze, background updated_at churn would
+    // shuffle rows around the open input — and moving the input's DOM node
+    // blurs it, committing a half-typed title. An open rename edit must hold
+    // the order on its own; the snap-back happens once the edit ends.
+    const convA: Conversation = {
+      ...CONV,
+      id: "conv_a",
+      title: "Session A",
+      updated_at: 1_700_000_200,
+    };
+    const convB: Conversation = {
+      ...CONV,
+      id: "conv_b",
+      title: "Session B",
+      updated_at: 1_700_000_100,
+    };
+    mockConversations([convA, convB]);
+    const view = renderSidebar();
+
+    // Open the rename input on session A via right-click → Rename.
+    fireEvent.mouseOver(screen.getByTestId("sidebar-conversation-list"));
+    fireEvent.contextMenu(screen.getByRole("link", { name: /Session A/ }));
+    fireEvent.click(screen.getByTestId("rename-conversation"));
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+
+    // The pointer leaves the list mid-edit; then session B's updated_at bumps.
+    fireEvent.mouseOut(screen.getByTestId("sidebar-conversation-list"), {
+      relatedTarget: document.body,
+    });
+    mockConversations([{ ...convB, updated_at: 1_700_000_300 }, convA]);
+    view.rerenderSidebar();
+
+    // The edit row still holds the top slot (the edit input replaces A's link,
+    // so B — below it — must still be the only link, not the first row).
+    expect(screen.getByTestId("rename-conversation-input")).toBe(input);
+    const listEl = screen.getByTestId("sidebar-conversation-list");
+    const rowB = screen.getByRole("link", { name: /Session B/ });
+    expect(input.compareDocumentPosition(rowB) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(listEl).toContainElement(rowB);
+
+    // Committing the rename targets session A and releases the hold: the
+    // order snaps to reality (B first).
+    fireEvent.change(input, { target: { value: "Renamed A" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_a", title: "Renamed A" });
+    const after = screen.getAllByRole("link", { name: /^Session/ });
+    expect(after[0]).toHaveAccessibleName(/Session B/);
+  });
+
+  it("snaps the order back to reality when the pointer leaves the list", () => {
+    const convA: Conversation = {
+      ...CONV,
+      id: "conv_a",
+      title: "Session A",
+      updated_at: 1_700_000_200,
+    };
+    const convB: Conversation = {
+      ...CONV,
+      id: "conv_b",
+      title: "Session B",
+      updated_at: 1_700_000_100,
+    };
+    mockConversations([convA, convB]);
+    const view = renderSidebar();
+
+    fireEvent.mouseOver(screen.getByTestId("sidebar-conversation-list"));
+    mockConversations([{ ...convB, updated_at: 1_700_000_300 }, convA]);
+    view.rerenderSidebar();
+    expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session A/);
+
+    fireEvent.mouseOut(screen.getByTestId("sidebar-conversation-list"), {
+      relatedTarget: document.body,
+    });
+    expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session B/);
+  });
 });
 
 describe("sharing kill switch", () => {
@@ -748,5 +1285,54 @@ describe("sharing kill switch", () => {
 
     expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
     expect(screen.getByTestId("share-conversation")).not.toHaveAttribute("data-disabled");
+  });
+});
+
+describe("peek mode row menu", () => {
+  // Peek render variant: the menu content portals OUTSIDE the <aside>, so
+  // moving the pointer from the kebab into the open menu fires the aside's
+  // onPointerLeave. The grace-period close must hold while a menu is open.
+  function renderPeek() {
+    const onClose = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter>
+            <Sidebar open={false} peek onClose={onClose} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    return { onClose };
+  }
+
+  beforeEach(() => vi.useFakeTimers({ shouldAdvanceTime: true }));
+  afterEach(() => vi.useRealTimers());
+
+  it("holds the peek open while a row's kebab menu is open", () => {
+    const { onClose } = renderPeek();
+
+    // Open the row's kebab (Radix opens on pointerdown) — its content portals
+    // outside the aside, so the pointer entering it leaves the aside.
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+
+    const aside = screen.getByRole("complementary", { name: "Conversations" });
+    fireEvent.pointerLeave(aside);
+
+    // Grace period elapses, but the open menu holds the peek — no close.
+    vi.advanceTimersByTime(1000);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("closes once the menu is gone and the pointer is away", () => {
+    const { onClose } = renderPeek();
+
+    const aside = screen.getByRole("complementary", { name: "Conversations" });
+    // No menu open: a plain pointer-leave closes after the grace period.
+    fireEvent.pointerLeave(aside);
+    vi.advanceTimersByTime(1000);
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

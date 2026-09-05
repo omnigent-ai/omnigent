@@ -57,6 +57,8 @@ from omnigent.native_policy_hook import (
     hook_payload_to_evaluation_request,
     policy_hook_reauth,
     post_evaluate_with_retry,
+    read_relay_policy_config,
+    relay_policy_evaluate_url,
 )
 
 # PreToolUse evaluations are normally a quick request/reply. (Unlike
@@ -121,27 +123,16 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     session_id = read_active_session_id(bridge_dir)
     if not session_id:
         return 0  # not a governed session — no opinion
-    config = read_hook_config(bridge_dir)
-    ap_server_url = config.get("ap_server_url")
-    if not isinstance(ap_server_url, str) or not ap_server_url:
-        return 0
-    headers = _headers_from_config(config)
 
     hook_event = payload.get("hook_event_name", "")
     if not isinstance(hook_event, str):
         return 0
     eval_request = hook_payload_to_evaluation_request(hook_event, payload)
     if eval_request is None:
-        # Unrecognized event or an mcp__omnigent__* tool already gated on the
-        # relay path — no policy to evaluate here.
         return 0
 
-    # hook_payload_to_evaluation_request always returns an event with a
-    # "context" dict; index it directly (fail loud if that contract changes).
     context = eval_request["event"]["context"]
     context["harness"] = _HARNESS
-
-    reauth = policy_hook_reauth(ap_server_url, headers)
 
     def _fail_closed(detail: str | None = None) -> int:
         out = fail_closed_hook_output(hook_event, detail)
@@ -149,18 +140,36 @@ def _main_evaluate_policy(argv: list[str]) -> int:
             sys.stdout.write(json.dumps(out))
         return 0
 
-    url = f"{ap_server_url.rstrip('/')}/v1/sessions/{_url_component(session_id)}/policies/evaluate"
+    # Prefer the relay; fall back to direct server call.
+    relay = read_relay_policy_config(bridge_dir)
+    if relay:
+        relay_url, relay_token, _sid = relay
+        url = relay_policy_evaluate_url(relay_url)
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {relay_token}",
+        }
+        reauth = None
+    else:
+        config = read_hook_config(bridge_dir)
+        ap_server_url = config.get("ap_server_url")
+        if not isinstance(ap_server_url, str) or not ap_server_url:
+            return 0
+        headers = _headers_from_config(config)
+        session_component = _url_component(session_id)
+        url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
+        reauth = policy_hook_reauth(ap_server_url, headers)
+
     resp, api_error = post_evaluate_with_retry(
         url,
         headers,
         eval_request,
         _EVALUATE_POLICY_TIMEOUT_S,
         "kimi evaluate-policy hook",
-        # Re-mint the baked one-shot token if it lapses mid-session.
         reauth=reauth,
     )
     if resp is None or not resp.content:
-        return _fail_closed(api_error or reauth.failure_reason)
+        return _fail_closed(api_error or (reauth.failure_reason if reauth else None))
     try:
         eval_response = resp.json()
     except json.JSONDecodeError:

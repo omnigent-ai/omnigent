@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -160,41 +161,111 @@ async def test_cursor_cold_resume_pins_model(
     ]
 
 
-def test_cursor_base_model_options_shape() -> None:
-    """The curated base catalog yields id/displayName/isDefault/isCurrent dicts."""
+_CURSOR_MODELS_OUTPUT = """Available models
 
-    models = cursor_native.cursor_base_model_options()
-
-    assert models, "catalog must be non-empty"
-    assert all(set(m) == {"id", "displayName", "isDefault", "isCurrent"} for m in models)
-    # Exactly one default (composer-2.5 is the cursor account default), never current.
-    assert [m["id"] for m in models if m["isDefault"]] == ["composer-2.5"]
-    assert all(m["isCurrent"] is False for m in models)
-
-
-def test_cursor_base_model_options_uses_base_id_namespace() -> None:
-    """Ids are base ids (round-trip across launch / inject / mirror), not compound.
-
-    Pins the namespace contract: the compound ``--list-models`` ids
-    (``gpt-5.2-high``) and the ``--list-models`` claude spelling
-    (``claude-4.6-opus``) do NOT inject via ``/model``; the base ids
-    (``claude-opus-4-6``) do and are what ``meta.lastUsedModel`` reports.
-    """
-    ids = {m["id"] for m in cursor_native.cursor_base_model_options()}
-
-    assert {"claude-opus-4-6", "gpt-5.2", "composer-2.5"} <= ids
-    # No flattened effort variants and no --list-models claude reordering.
-    assert not any("-high" in i or "-low" in i or "-xhigh" in i for i in ids)
-    assert "claude-4.6-opus" not in ids
+auto - Auto (default)
+gpt-5.3-codex-low - Codex 5.3 Low
+gpt-5.3-codex-high-fast - Codex 5.3 High Fast
+gpt-5.1-high - GPT-5.1 High
+claude-4.6-opus-high - Opus 4.6 1M
+claude-4.6-opus-high-thinking - Opus 4.6 1M Thinking
+claude-4-sonnet-thinking - Sonnet 4 Thinking
+composer-2.5 - Composer 2.5 (current)
+"""
 
 
-def test_cursor_base_model_options_returns_fresh_copies() -> None:
-    """Callers may mutate the returned dicts without corrupting the catalog."""
+def test_parse_cursor_cli_model_options_normalizes_base_ids() -> None:
+    """Live compound variants collapse to injectable base ids in CLI order."""
+    models = cursor_native.parse_cursor_cli_model_options(_CURSOR_MODELS_OUTPUT)
 
-    first = cursor_native.cursor_base_model_options()
-    first[0]["displayName"] = "MUTATED"
-    second = cursor_native.cursor_base_model_options()
-    assert second[0]["displayName"] != "MUTATED"
+    assert models == [
+        {"id": "auto", "displayName": "Auto", "isDefault": True, "isCurrent": False},
+        {
+            "id": "gpt-5.3-codex",
+            "displayName": "Codex 5.3",
+            "isDefault": False,
+            "isCurrent": False,
+        },
+        {
+            "id": "gpt-5.1",
+            "displayName": "GPT-5.1",
+            "isDefault": False,
+            "isCurrent": False,
+        },
+        {
+            "id": "claude-opus-4-6",
+            "displayName": "Opus 4.6",
+            "isDefault": False,
+            "isCurrent": False,
+        },
+        {
+            "id": "composer-2.5",
+            "displayName": "Composer 2.5",
+            "isDefault": False,
+            "isCurrent": True,
+        },
+    ]
+
+
+def test_parse_cursor_cli_model_options_keeps_one_default_and_current() -> None:
+    """Conflicting CLI tags resolve deterministically in catalog order."""
+    models = cursor_native.parse_cursor_cli_model_options(
+        """Available models
+first-high - First High (default, current)
+second-low - Second Low (default, current)
+"""
+    )
+
+    assert [model["id"] for model in models if model["isDefault"]] == ["first"]
+    assert [model["id"] for model in models if model["isCurrent"]] == ["first"]
+
+
+def test_parse_cursor_cli_model_options_logs_unmapped_claude_ids(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reversed Claude ids that cannot round-trip never reach the picker."""
+    models = cursor_native.parse_cursor_cli_model_options(_CURSOR_MODELS_OUTPUT)
+
+    assert all(model["id"] != "claude-4-sonnet" for model in models)
+    assert "Skipping non-injectable Cursor model id 'claude-4-sonnet'" in caplog.text
+
+
+def test_parse_cursor_cli_model_options_rejects_empty_catalog() -> None:
+    """Malformed CLI output is retryable rather than cached as an empty picker."""
+    with pytest.raises(ValueError, match="did not contain any valid models"):
+        cursor_native.parse_cursor_cli_model_options("Available models\n")
+
+
+def test_list_cursor_cli_model_options_runs_configured_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery invokes the resolved CLI and parses its stdout."""
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        cursor_native,
+        "resolve_cursor_executable",
+        lambda **_: "/opt/cursor-agent",
+    )
+
+    def run(command: list[str], **kwargs: Any) -> SimpleNamespace:
+        calls.append({"command": command, **kwargs})
+        return SimpleNamespace(stdout=_CURSOR_MODELS_OUTPUT)
+
+    monkeypatch.setattr(cursor_native.subprocess, "run", run)
+
+    models = cursor_native.list_cursor_cli_model_options(env={"HOME": "/tmp/home"}, timeout_s=3.0)
+
+    assert models[0]["id"] == "auto"
+    assert calls == [
+        {
+            "command": ["/opt/cursor-agent", "models"],
+            "check": True,
+            "capture_output": True,
+            "text": True,
+            "timeout": 3.0,
+            "env": {"HOME": "/tmp/home"},
+        }
+    ]
 
 
 async def _async_noop(*_: object, **__: object) -> None:

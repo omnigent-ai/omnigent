@@ -349,3 +349,47 @@ async def test_create_session_accepts_multipart_bundled_create(
     # The bundled-create response carries the new session id → multipart
     # routed to the bundled-create branch, not rejected at the gate.
     assert "session_id" in resp.json()
+
+
+async def test_multipart_managed_create_reaches_managed_launch(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Multipart ``host_type: "managed"`` routes to the managed-launch path.
+
+    The default test app has no ``sandbox_config``, so a managed multipart
+    create must fail with the "managed hosts are not configured" error —
+    which proves the handler took the new managed branch (and reached
+    ``_schedule_managed_launch``) rather than silently creating an external
+    session. On a server WITH a ``sandbox:`` config this same request would
+    provision a sandbox for the uploaded session-scoped agent.
+    """
+    bundle = build_agent_bundle(name="managed-multipart-agent")
+    resp = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"host_type": "managed", "sandbox_provider": "lakebox"})},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    # Reached the managed branch → the not-configured guard fires.
+    assert resp.status_code >= 400, resp.text
+    assert "managed hosts are not configured" in resp.text
+
+
+async def test_multipart_managed_rejects_path_workspace(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Multipart ``host_type: "managed"`` + a filesystem-path workspace is
+    rejected at metadata validation (a managed workspace is a git repository
+    URL), before any bundle/session work — mirrors the JSON path's contract.
+    The multipart metadata parser surfaces the schema ValueError as a 400
+    invalid_input (the JSON path returns 422; both name the URL requirement).
+    """
+    bundle = build_agent_bundle(name="managed-badws-agent")
+    resp = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"host_type": "managed", "workspace": "/tmp/w"})},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert resp.status_code >= 400, resp.text
+    assert "git repository URL" in resp.text

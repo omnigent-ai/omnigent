@@ -14,10 +14,10 @@ interface SpeechRecognitionLike {
   continuous: boolean;
   interimResults: boolean;
   lang: string;
-  start(): void;
-  stop(): void;
-  addEventListener(type: string, listener: (event: Event) => void): void;
-  removeEventListener(type: string, listener: (event: Event) => void): void;
+  start: () => void;
+  stop: () => void;
+  addEventListener: (type: string, listener: (event: Event) => void) => void;
+  removeEventListener: (type: string, listener: (event: Event) => void) => void;
 }
 
 interface SpeechRecognitionEventLike extends Event {
@@ -47,8 +47,17 @@ const getRecognitionCtor = (): SpeechRecognitionCtor | null => {
   return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
 };
 
+const getDefaultDictationLang = (): string => {
+  if (typeof navigator === "undefined") return "en-US";
+  try {
+    return navigator.language || "en-US";
+  } catch {
+    return "en-US";
+  }
+};
+
 // FFT bin ranges per bar, weighted toward voice frequencies (~100Hz–3kHz).
-const BAR_BINS: ReadonlyArray<readonly [number, number]> = [
+const BAR_BINS: readonly (readonly [number, number])[] = [
   [1, 3],
   [3, 6],
   [6, 10],
@@ -57,7 +66,7 @@ const BAR_BINS: ReadonlyArray<readonly [number, number]> = [
 
 const BAR_BASELINE = 0.2;
 
-export type ComposerMicButtonProps = {
+export interface ComposerMicButtonProps {
   onTranscript: (text: string) => void;
   /**
    * Streaming partial transcripts (server dictation only): called with the
@@ -79,7 +88,7 @@ export type ComposerMicButtonProps = {
   /** Fired when Esc ends dictation. The parent should restore the text it
    *  snapshotted in {@link onVoiceStart}, discarding what was dictated. */
   onVoiceDiscard?: () => void;
-};
+}
 
 /** getUserMedia permission failures, distinct from transport failures. */
 const isPermissionError = (error: unknown): boolean =>
@@ -90,7 +99,7 @@ export const ComposerMicButton = ({
   onTranscript,
   onInterim,
   disabled,
-  lang = "en-US",
+  lang = getDefaultDictationLang(),
   enableHotkey = false,
   onVoiceStart,
   onVoiceDiscard,
@@ -507,7 +516,7 @@ export const ComposerMicButton = ({
           <SquareIcon className="absolute size-3 fill-current opacity-0 transition-opacity group-hover/button:opacity-100 group-focus-visible/button:opacity-100" />
         </span>
       ) : (
-        <MicIcon className="size-4" />
+        <MicIcon className="size-4" data-icon-size="16" />
       )}
     </Button>
   );

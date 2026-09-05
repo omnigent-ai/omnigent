@@ -26,10 +26,23 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO, Any, Protocol
+from typing import TYPE_CHECKING, Protocol, TextIO
+
+if TYPE_CHECKING:
+    from omnigent_client import OmnigentClient
+    from omnigent_client._sessions import SessionListItem
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.key_binding.key_processor import KeyPressEvent
+    from prompt_toolkit.styles import Style
+    from rich.console import Console
+    from rich.text import Text
+
+    from omnigent.entities.conversation import ConversationItem
+    from omnigent.stores.conversation_store import ConversationStore
 
 from omnigent._terminal_picker_theme import (
     PICKER_ACCENT as _ACCENT,
@@ -62,6 +75,12 @@ from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 # Small enough that a 24-line terminal shows the whole page; big enough
 # that a typical user finds their conversation in the first page.
 _PAGE_SIZE = 10
+
+# Backoff schedule for transient 429s on the picker's session-list
+# call. Two short retries keep a momentary rate-limit invisible to the
+# user; a persistent one still surfaces (as a typed error the caller
+# renders concisely, never a raw traceback).
+_SESSION_LIST_RETRY_DELAYS_S: tuple[float, ...] = (0.5, 1.0)
 
 _CANCEL_TOKEN = "cancel"
 
@@ -126,7 +145,7 @@ class _PageRowRender:
     :param lines: Rich-renderable lines printed for one conversation.
     """
 
-    lines: list[Any]
+    lines: list[Text]
 
 
 class _ConversationRow(Protocol):
@@ -155,10 +174,22 @@ class _ConversationRow(Protocol):
         "no wrapper" and falls through to ``[chat]``.
     """
 
-    id: str
-    title: str | None
-    created_at: int
-    labels: dict[str, str] | None
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def title(self) -> str | None: ...
+
+    @property
+    def created_at(self) -> int: ...
+
+    @property
+    def labels(self) -> Mapping[str, str] | None: ...
+
+
+class _LaunchState(Protocol):
+    @property
+    def working_directory(self) -> str: ...
 
 
 def _runtime_badge(row: _ConversationRow) -> str:
@@ -183,7 +214,7 @@ def _runtime_badge(row: _ConversationRow) -> str:
         without raising.
     """
     labels = getattr(row, "labels", None)
-    if isinstance(labels, dict):
+    if isinstance(labels, Mapping):
         native_agent = native_coding_agent_for_wrapper_label(
             labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
         )
@@ -193,14 +224,14 @@ def _runtime_badge(row: _ConversationRow) -> str:
 
 
 def pick_conversation(
-    conversations: list[_ConversationRow],
+    conversations: Sequence[_ConversationRow],
     *,
     agent_name: str,
     previews: dict[str, _Preview | None] | None = None,
     show_runtime: bool = False,
     show_workspace: bool = False,
-    out: IO[str] | None = None,
-    in_: IO[str] | None = None,
+    out: TextIO | None = None,
+    in_: TextIO | None = None,
 ) -> str | None:
     """
     Run the interactive picker over a pre-fetched conversation list.
@@ -248,8 +279,8 @@ def pick_conversation(
     :returns: The selected ``conversation_id``, or ``None`` when
         the user cancels (q / Esc / EOF).
     """
-    out_stream: IO[str] = out if out is not None else sys.stderr
-    in_stream: IO[str] = in_ if in_ is not None else sys.stdin
+    out_stream: TextIO = out if out is not None else sys.stderr
+    in_stream: TextIO = in_ if in_ is not None else sys.stdin
 
     if not conversations:
         _print_empty(agent_name, out_stream)
@@ -277,14 +308,14 @@ def pick_conversation(
 
 
 def _pick_conversation_line_buffered(
-    conversations: list[_ConversationRow],
+    conversations: Sequence[_ConversationRow],
     *,
     agent_name: str,
     previews: dict[str, _Preview | None] | None,
     show_runtime: bool,
     show_workspace: bool,
-    out: IO[str],
-    in_: IO[str],
+    out: TextIO,
+    in_: TextIO,
 ) -> str | None:
     """
     Run the resume picker with line-buffered input.
@@ -378,7 +409,7 @@ class _PromptToolkitPickerState:
     :param selected_index: Zero-based selected conversation index.
     """
 
-    conversations: list[_ConversationRow]
+    conversations: Sequence[_ConversationRow]
     agent_name: str
     previews: dict[str, _Preview | None] | None
     show_runtime: bool
@@ -396,7 +427,7 @@ class _PromptToolkitPickerState:
         return _page_start_for_selection(self.selected_index)
 
     @property
-    def page(self) -> list[_ConversationRow]:
+    def page(self) -> Sequence[_ConversationRow]:
         """
         Visible conversation slice for the current selection.
 
@@ -443,14 +474,14 @@ class _PromptToolkitPickerState:
 
 
 def _pick_conversation_prompt_toolkit(
-    conversations: list[_ConversationRow],
+    conversations: Sequence[_ConversationRow],
     *,
     agent_name: str,
     previews: dict[str, _Preview | None] | None,
     show_runtime: bool,
     show_workspace: bool,
-    out: IO[str],
-    in_: IO[str],
+    out: TextIO,
+    in_: TextIO,
 ) -> str | None:
     """
     Run the interactive TTY picker using prompt-toolkit.
@@ -524,7 +555,7 @@ def _has_running_event_loop() -> bool:
     return True
 
 
-def _prompt_toolkit_key_bindings(state: _PromptToolkitPickerState) -> Any:
+def _prompt_toolkit_key_bindings(state: _PromptToolkitPickerState) -> KeyBindings:
     """
     Build keybindings for the prompt-toolkit picker.
 
@@ -537,7 +568,7 @@ def _prompt_toolkit_key_bindings(state: _PromptToolkitPickerState) -> Any:
     key_bindings = KeyBindings()
 
     @key_bindings.add("up")
-    def _move_up(event: Any) -> None:
+    def _move_up(event: KeyPressEvent) -> None:
         """
         Move the picker selection one row upward.
 
@@ -548,7 +579,7 @@ def _prompt_toolkit_key_bindings(state: _PromptToolkitPickerState) -> Any:
         event.app.invalidate()
 
     @key_bindings.add("down")
-    def _move_down(event: Any) -> None:
+    def _move_down(event: KeyPressEvent) -> None:
         """
         Move the picker selection one row downward.
 
@@ -560,7 +591,7 @@ def _prompt_toolkit_key_bindings(state: _PromptToolkitPickerState) -> Any:
 
     @key_bindings.add("n")
     @key_bindings.add("right")
-    def _next_page(event: Any) -> None:
+    def _next_page(event: KeyPressEvent) -> None:
         """
         Move the picker selection to the next page.
 
@@ -572,7 +603,7 @@ def _prompt_toolkit_key_bindings(state: _PromptToolkitPickerState) -> Any:
 
     @key_bindings.add("p")
     @key_bindings.add("left")
-    def _previous_page(event: Any) -> None:
+    def _previous_page(event: KeyPressEvent) -> None:
         """
         Move the picker selection to the previous page.
 
@@ -583,7 +614,7 @@ def _prompt_toolkit_key_bindings(state: _PromptToolkitPickerState) -> Any:
         event.app.invalidate()
 
     @key_bindings.add("enter")
-    def _select(event: Any) -> None:
+    def _select(event: KeyPressEvent) -> None:
         """
         Resume the currently highlighted conversation.
 
@@ -595,7 +626,7 @@ def _prompt_toolkit_key_bindings(state: _PromptToolkitPickerState) -> Any:
     @key_bindings.add("q")
     @key_bindings.add("escape")
     @key_bindings.add("c-d")
-    def _cancel(event: Any) -> None:
+    def _cancel(event: KeyPressEvent) -> None:
         """
         Cancel the picker without selecting a conversation.
 
@@ -605,7 +636,7 @@ def _prompt_toolkit_key_bindings(state: _PromptToolkitPickerState) -> Any:
         event.app.exit(result=None)
 
     @key_bindings.add("c-c")
-    def _interrupt(event: Any) -> None:
+    def _interrupt(event: KeyPressEvent) -> None:
         """
         Propagate Ctrl+C as :class:`KeyboardInterrupt`.
 
@@ -617,7 +648,7 @@ def _prompt_toolkit_key_bindings(state: _PromptToolkitPickerState) -> Any:
     return key_bindings
 
 
-def _prompt_toolkit_style() -> Any:
+def _prompt_toolkit_style() -> Style:
     """
     Build prompt-toolkit style classes for the picker.
 
@@ -873,15 +904,54 @@ def _page_start_for_selection(selected_index: int) -> int:
     return (selected_index // _PAGE_SIZE) * _PAGE_SIZE
 
 
+async def _list_sessions_with_retry(
+    client: OmnigentClient,
+    *,
+    limit: int = 200,
+    agent_id: str | None = None,
+    agent_name: str | None = None,
+    order: str = "desc",
+) -> list[SessionListItem]:
+    """Call ``client.sessions.list`` with bounded retries on 429.
+
+    A transient rate-limit on the picker's single list call should not
+    abort the resume journey: retry on the short
+    :data:`_SESSION_LIST_RETRY_DELAYS_S` schedule and re-raise only
+    when the 429 persists past the last attempt. Every other error
+    propagates immediately — only the transient-by-definition status
+    is worth waiting out.
+
+    :param client: SDK client whose ``sessions.list`` to call.
+    :param limit: Maximum number of session rows to fetch.
+    :param agent_id: Scope to this agent; ``None`` lists across agents.
+    :param agent_name: Scope to sessions whose bound agent has this name.
+    :param order: Sort order forwarded to ``list``.
+    :returns: The session rows.
+    :raises omnigent_client.RateLimitedError: When every attempt was
+        rate-limited.
+    """
+    from omnigent_client import RateLimitedError
+
+    for delay_s in _SESSION_LIST_RETRY_DELAYS_S:
+        try:
+            return await client.sessions.list(
+                limit=limit, agent_id=agent_id, agent_name=agent_name, order=order
+            )
+        except RateLimitedError:
+            await asyncio.sleep(delay_s)
+    return await client.sessions.list(
+        limit=limit, agent_id=agent_id, agent_name=agent_name, order=order
+    )
+
+
 async def pick_conversation_from_sdk(
-    # ``Any`` to avoid coupling the repl package to the client's load order.
-    client: Any,
+    client: OmnigentClient,
     *,
     agent_name: str,
     agent_id: str | None = None,
     agent_name_filter: str | None = None,
-    out: IO[str] | None = None,
-    in_: IO[str] | None = None,
+    out: TextIO | None = None,
+    in_: TextIO | None = None,
 ) -> str | None:
     """Fetch sessions via ``/v1/sessions`` and run the picker.
 
@@ -894,7 +964,8 @@ async def pick_conversation_from_sdk(
         has this name. Used for session-scoped agents that share a
         YAML name but intentionally do not share ``agent_id``.
     """
-    convos = await client.sessions.list(
+    convos = await _list_sessions_with_retry(
+        client,
         limit=200,
         agent_id=agent_id,
         agent_name=agent_name_filter,
@@ -905,12 +976,13 @@ async def pick_conversation_from_sdk(
 
 
 async def pick_conversation_by_wrapper_label_from_sdk(
-    client: Any,
+    client: OmnigentClient,
     *,
     wrapper_value: str,
     agent_name: str,
-    out: IO[str] | None = None,
-    in_: IO[str] | None = None,
+    host_id: str | None = None,
+    out: TextIO | None = None,
+    in_: TextIO | None = None,
 ) -> str | None:
     """Picker scoped to one wrapper kind (``omnigent.wrapper=<value>``).
 
@@ -925,13 +997,26 @@ async def pick_conversation_by_wrapper_label_from_sdk(
     user for the chdir prompt the wrapper raises after they pick.
     The cwd comes from the wrapper's client-side persistent state
     (``~/.omnigent/claude-native/``); sessions created on a
-    different machine will show as having no recorded cwd."""
-    all_convos = await client.sessions.list(limit=200, agent_id=None, order="desc")
+    different machine will show as having no recorded cwd.
+
+    :param host_id: When set, keep only rows bound to this host (the
+        invoking machine). Native transcript and workspace state are
+        host-local, so a wrapper session bound to another host is a
+        dead end in this picker — resuming it cannot work here. Rows
+        without a recorded ``host_id`` (never bound, or an older
+        server that predates the field) are kept: dropping them would
+        hide resumable local sessions. ``None`` disables host
+        filtering (explicit ``--resume <id>`` stays unrestricted for
+        diagnostics / migration workflows — it never routes through
+        this picker).
+    """
+    all_convos = await _list_sessions_with_retry(client, limit=200, agent_id=None, order="desc")
     convos = [
         c
         for c in all_convos
         if getattr(c, "labels", None)
         and c.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) == wrapper_value
+        and (host_id is None or getattr(c, "host_id", None) is None or c.host_id == host_id)
     ]
     previews = await _collect_previews_async(client, convos)
     return pick_conversation(
@@ -945,15 +1030,29 @@ async def pick_conversation_by_wrapper_label_from_sdk(
 
 
 async def pick_conversation_cross_agent_from_sdk(
-    client: Any,
+    client: OmnigentClient,
     *,
-    out: IO[str] | None = None,
-    in_: IO[str] | None = None,
+    owner_user_id: str | None = None,
+    out: TextIO | None = None,
+    in_: TextIO | None = None,
 ) -> str | None:
     """Cross-agent variant: lists every session the caller can see
     via ``/v1/sessions`` and renders runtime metadata for
-    ``omnigent resume``'s runtime-dispatch UX."""
-    convos = await client.sessions.list(limit=200, agent_id=None, order="desc")
+    ``omnigent resume``'s runtime-dispatch UX.
+
+    ``/v1/sessions`` returns every session the caller can *access*,
+    which includes ones merely shared with them. Resume is an
+    owner-only action — the server rejects binding a runner to a
+    session you don't own (``PATCH /v1/sessions/{id}`` → 403) — so a
+    shared row in this picker is a dead end. When ``owner_user_id`` is
+    set, drop the rows this caller does not own so ``omnigent resume``
+    lists only their own sessions. ``None`` leaves the list unfiltered:
+    the caller's identity could not be resolved, or the server runs
+    without permissions (``owner`` unset, no sharing to filter).
+    """
+    convos = await _list_sessions_with_retry(client, limit=200, agent_id=None, order="desc")
+    if owner_user_id is not None:
+        convos = [c for c in convos if c.owner == owner_user_id]
     previews = await _collect_previews_async(client, convos)
     # Header label is intentionally generic — "resume" describes the
     # action, not a single agent. Without overriding the legacy
@@ -970,17 +1069,11 @@ async def pick_conversation_cross_agent_from_sdk(
 
 
 def pick_conversation_from_store(
-    # ``Any`` rather than the concrete store types so the picker
-    # stays decoupled from the SqlAlchemy implementations — only
-    # the ``ConversationStore`` abstract methods used here
-    # (``list_conversations``) actually matter, and importing the
-    # abstract base here would still add a non-trivial dependency
-    # surface for a typing-only win.
-    conv_store: Any,
+    conv_store: ConversationStore,
     *,
     agent_name: str,
-    out: IO[str] | None = None,
-    in_: IO[str] | None = None,
+    out: TextIO | None = None,
+    in_: TextIO | None = None,
 ) -> str | None:
     """
     Sync sibling for the one-shot ``-p`` path. Lists conversations
@@ -1000,7 +1093,7 @@ def pick_conversation_from_store(
     :returns: Selected conversation_id, or ``None`` on cancel /
         empty list / unknown agent.
     """
-    out_stream: IO[str] = out if out is not None else sys.stderr
+    out_stream: TextIO = out if out is not None else sys.stderr
     page = conv_store.list_conversations(
         agent_name=agent_name,
         has_agent_id=True,
@@ -1019,12 +1112,12 @@ def pick_conversation_from_store(
 
 
 def _print_page(
-    page: list[_ConversationRow],
+    page: Sequence[_ConversationRow],
     page_start: int,
     selected_index: int,
     total: int,
     agent_name: str,
-    out: IO[str],
+    out: TextIO,
     previews: dict[str, _Preview | None] | None = None,
     *,
     show_runtime: bool = False,
@@ -1073,7 +1166,7 @@ def _page_header_text(
     page_len: int,
     total: int,
     agent_name: str,
-) -> Any:
+) -> Text:
     """
     Build the list header for one resume-picker page.
 
@@ -1135,7 +1228,7 @@ def _list_item_lines(
     return _PageRowRender(lines=lines)
 
 
-def _list_item_title(conv: _ConversationRow, *, absolute_index: int, selected: bool) -> Any:
+def _list_item_title(conv: _ConversationRow, *, absolute_index: int, selected: bool) -> Text:
     """
     Build the primary title line for a resume-picker list item.
 
@@ -1166,7 +1259,7 @@ def _list_item_metadata(
     show_runtime: bool,
     show_workspace: bool,
     current_cwd: Path | None,
-) -> Any:
+) -> Text:
     """
     Build the metadata line for a resume-picker list item.
 
@@ -1196,7 +1289,7 @@ def _list_item_metadata(
     return text
 
 
-def _list_item_preview(preview: _Preview | None) -> Any:
+def _list_item_preview(preview: _Preview | None) -> Text:
     """
     Build the preview line for a resume-picker list item.
 
@@ -1209,7 +1302,7 @@ def _list_item_preview(preview: _Preview | None) -> Any:
     return Text("    ") + text
 
 
-def _print_list_item(console: Any, rendered: _PageRowRender, *, is_last: bool) -> None:
+def _print_list_item(console: Console, rendered: _PageRowRender, *, is_last: bool) -> None:
     """
     Print one rendered resume-picker list item.
 
@@ -1223,7 +1316,7 @@ def _print_list_item(console: Any, rendered: _PageRowRender, *, is_last: bool) -
         console.print()
 
 
-def _print_page_footer(console: Any) -> None:
+def _print_page_footer(console: Console) -> None:
     """
     Print the resume-picker keybinding footer and trailing spacer.
 
@@ -1246,7 +1339,7 @@ def _print_page_footer(console: Any) -> None:
     console.print()
 
 
-def _print_empty(agent_name: str, out: IO[str]) -> None:
+def _print_empty(agent_name: str, out: TextIO) -> None:
     """
     Render the "no prior conversations" notice.
 
@@ -1269,7 +1362,7 @@ def _print_empty(agent_name: str, out: IO[str]) -> None:
     )
 
 
-def _print_invalid(out: IO[str]) -> None:
+def _print_invalid(out: TextIO) -> None:
     """
     Render the "invalid selection" notice between picker re-prompts.
 
@@ -1284,7 +1377,7 @@ def _print_invalid(out: IO[str]) -> None:
     console.print(Text.from_markup(f"  [{_ACCENT}]Invalid selection.[/]  [{_MUTED}]Try again.[/]"))
 
 
-def _make_console(out: IO[str]) -> Any:
+def _make_console(out: TextIO) -> Console:
     """
     Build a :class:`rich.console.Console` aimed at *out*.
 
@@ -1304,7 +1397,7 @@ def _make_console(out: IO[str]) -> Any:
     return Console(file=out, highlight=False, soft_wrap=True)
 
 
-def _render_preview_cell(preview: _Preview | None) -> Any:
+def _render_preview_cell(preview: _Preview | None) -> Text:
     """
     Render a :class:`_Preview` as a list-item preview line.
 
@@ -1329,7 +1422,7 @@ def _render_preview_cell(preview: _Preview | None) -> Any:
     )
 
 
-def _render_workspace_cell(row: _ConversationRow, *, current_cwd: Path) -> Any | None:
+def _render_workspace_cell(row: _ConversationRow, *, current_cwd: Path) -> Text | None:
     """
     Render the workspace metadata value for one picker row.
 
@@ -1398,7 +1491,7 @@ def _workspace_metadata(row: _ConversationRow, *, current_cwd: Path) -> tuple[st
     return working_directory, recorded != current_cwd
 
 
-def _launch_state_for_row(row: _ConversationRow) -> Any | None:
+def _launch_state_for_row(row: _ConversationRow) -> _LaunchState | None:
     """
     Read native launch state using the row's wrapper label.
 
@@ -1407,7 +1500,7 @@ def _launch_state_for_row(row: _ConversationRow) -> Any | None:
         or ``None`` when the row has no supported wrapper state.
     """
     labels = getattr(row, "labels", None)
-    if not isinstance(labels, dict):
+    if not isinstance(labels, Mapping):
         return None
     wrapper = labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
     if wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
@@ -1434,8 +1527,8 @@ def _escape_for_markup(text: str) -> str:
 
 
 async def _collect_previews_async(
-    client: Any,
-    conversations: list[_ConversationRow],
+    client: OmnigentClient,
+    conversations: Sequence[_ConversationRow],
 ) -> dict[str, _Preview | None]:
     """
     Fetch the latest message for each conversation in parallel.
@@ -1474,8 +1567,8 @@ async def _collect_previews_async(
 
 
 def _collect_previews_sync(
-    conv_store: Any,
-    conversations: list[_ConversationRow],
+    conv_store: ConversationStore,
+    conversations: Sequence[_ConversationRow],
 ) -> dict[str, _Preview | None]:
     """
     Sync sibling for the one-shot ``-p`` path.
@@ -1507,7 +1600,7 @@ def _collect_previews_sync(
 
 
 def _last_message_preview_from_dicts(
-    items: list[dict[str, Any]],
+    items: Sequence[object],
 ) -> _Preview | None:
     """
     Extract the latest message preview from API-shape item dicts.
@@ -1525,7 +1618,7 @@ def _last_message_preview_from_dicts(
         conversation has only tool calls, or is empty).
     """
     for item in items:
-        if not isinstance(item, dict):
+        if not isinstance(item, Mapping):
             continue
         if item.get("type") != "message":
             continue
@@ -1540,7 +1633,7 @@ def _last_message_preview_from_dicts(
     return None
 
 
-def _last_message_preview_from_entities(items: list[Any]) -> _Preview | None:
+def _last_message_preview_from_entities(items: Sequence[ConversationItem]) -> _Preview | None:
     """
     Extract the latest message preview from store entity items.
 
@@ -1570,7 +1663,7 @@ def _last_message_preview_from_entities(items: list[Any]) -> _Preview | None:
     return None
 
 
-def _extract_text_from_content_blocks(content: Any) -> str:
+def _extract_text_from_content_blocks(content: object) -> str:
     """
     Reduce a Responses-API message ``content`` to one preview line.
 
@@ -1642,10 +1735,10 @@ def _format_when(created_at: int) -> str:
         return f"{delta // 3600}h ago"
     if delta < 7 * 86400:
         return f"{delta // 86400}d ago"
-    return datetime.fromtimestamp(created_at).strftime("%b %d %H:%M")
+    return datetime.fromtimestamp(created_at, tz=timezone.utc).astimezone().strftime("%b %d %H:%M")
 
 
-def _read_line_choice(in_: IO[str]) -> str | None:
+def _read_line_choice(in_: TextIO) -> str | None:
     """
     Read one line-buffered picker choice.
 
@@ -1663,7 +1756,7 @@ def _read_line_choice(in_: IO[str]) -> str | None:
     return _SELECT_TOKEN if choice == "" else choice
 
 
-def _is_tty(in_: IO[str]) -> bool:
+def _is_tty(in_: TextIO) -> bool:
     """
     Predicate: is *in_* an interactive terminal?
 

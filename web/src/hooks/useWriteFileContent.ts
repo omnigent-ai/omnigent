@@ -1,5 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { browseLocationBase, browseLocationSegment } from "@/hooks/useWorkspaceChangedFiles";
 import type { FileContentResponse } from "./useFileContent";
 
 const DEFAULT_ENVIRONMENT_ID = "default";
@@ -9,10 +10,15 @@ async function writeFileContent(
   path: string,
   content: string,
 ): Promise<void> {
-  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  // Same slash-merge-safe wire form as the read path, via the shared helpers:
+  // a bare per-segment-encoded path, and `?base=host` for an absolute location
+  // (saving a file edited outside the workspace). See `browseLocationSegment`.
+  const encodedPath = browseLocationSegment(path);
+  const base = browseLocationBase(path);
   const url =
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
-    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}`;
+    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}` +
+    (base ? `?base=${base}` : "");
   const res = await authenticatedFetch(url, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },

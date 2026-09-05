@@ -9,7 +9,7 @@ import Foundation
 /// conversation by the SPA's own `/c/:id` route. It carries no `http`/`https` —
 /// the scheme is inferred with the same rule the setup page and desktop use
 /// (`http` for loopback, `https` for a remote host), so a deep link and a pasted
-/// URL never disagree on scheme. The Databricks workspace mount (`/ml/omnigents`)
+/// URL never disagree on scheme. The Databricks workspace mount
 /// is deliberately NOT in the link; it is server-determined and discovered by
 /// `WorkspaceURLExpander` (after consent, for an unknown server).
 ///

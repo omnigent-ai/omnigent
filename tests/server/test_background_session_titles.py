@@ -6,7 +6,10 @@ import uuid
 
 import pytest
 
+from omnigent.runner.background_titles.service import FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
 from omnigent.server.background_session_titles import (
+    BACKGROUND_TITLE_MAX_CHARS,
+    CUSTOM_BACKGROUND_TITLE_MAX_CHARS,
     BackgroundSessionTitleCoordinator,
     BackgroundTitleRequest,
     RunnerBackgroundTitleGenerator,
@@ -212,10 +215,15 @@ async def test_schedule_returns_before_delayed_generator_finishes(db_uri: str) -
         assert request.prompt == "please investigate the authentication timeout"
         assert request.harness_override == "claude-sdk"
         assert request.model_override == "claude-sonnet-4-6"
+        assert request.additional_instructions == "Prefix titles with the current date."
         await release.wait()
         return "Debug authentication timeout"
 
-    coordinator = BackgroundSessionTitleCoordinator(store, generator)
+    coordinator = BackgroundSessionTitleCoordinator(
+        store,
+        generator,
+        additional_instructions="Prefix titles with the current date.",
+    )
     started = time.perf_counter()
     coordinator.schedule(
         session_id=session_id,
@@ -277,7 +285,61 @@ async def test_generated_title_is_normalized_before_rename(db_uri: str) -> None:
 async def test_title_normalizer_rejects_empty_and_oversized_output() -> None:
     assert normalize_background_title(None) is None
     assert normalize_background_title("   \n  ") is None
-    assert normalize_background_title("x" * 61) is None
+    assert normalize_background_title("x" * (BACKGROUND_TITLE_MAX_CHARS + 1)) is None
+
+
+async def test_custom_title_instructions_allow_longer_output(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_session(store, "Review configurable title limits")
+    generated = "x" * CUSTOM_BACKGROUND_TITLE_MAX_CHARS
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return generated
+
+    coordinator = BackgroundSessionTitleCoordinator(
+        store,
+        generator,
+        additional_instructions="Use a detailed structured title.",
+    )
+    coordinator.schedule(
+        session_id=session_id,
+        prompt="review configurable title limits",
+        expected_seed_title="Review configurable title limits",
+    )
+    await coordinator.wait_for_idle()
+
+    assert store.get_conversation(session_id).title == generated
+    assert (
+        normalize_background_title(
+            "x" * (CUSTOM_BACKGROUND_TITLE_MAX_CHARS + 1),
+            max_chars=CUSTOM_BACKGROUND_TITLE_MAX_CHARS,
+        )
+        is None
+    )
+
+
+async def test_custom_title_instructions_truncate_oversized_output(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_session(store, "Review configurable title limits")
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return "x" * (CUSTOM_BACKGROUND_TITLE_MAX_CHARS + 1)
+
+    coordinator = BackgroundSessionTitleCoordinator(
+        store,
+        generator,
+        additional_instructions="Use a detailed structured title.",
+    )
+    coordinator.schedule(
+        session_id=session_id,
+        prompt="review configurable title limits",
+        expected_seed_title="Review configurable title limits",
+    )
+    await coordinator.wait_for_idle()
+
+    expected = "x" * (CUSTOM_BACKGROUND_TITLE_MAX_CHARS - 1) + "…"
+    assert store.get_conversation(session_id).title == expected
+    assert len(expected) == CUSTOM_BACKGROUND_TITLE_MAX_CHARS
 
 
 async def test_manual_rename_wins_background_title_race(db_uri: str) -> None:
@@ -427,6 +489,7 @@ async def test_runner_generator_posts_session_configuration() -> None:
             agent_id="agent_test",
             harness_override="claude-sdk",
             model_override="claude-sonnet-4-6",
+            additional_instructions="Use the requested slug format.",
         )
     )
 
@@ -441,9 +504,25 @@ async def test_runner_generator_posts_session_configuration() -> None:
                 "harness_override": "claude-sdk",
                 "model_override": "claude-sonnet-4-6",
                 "sub_agent_name": None,
+                "additional_instructions": (
+                    "Use the requested slug format.\n"
+                    "Unless another language is explicitly requested, write the title "
+                    "in the same primary language as the user's message."
+                ),
             },
         )
     ]
+
+
+async def test_runner_generator_posts_language_rule_without_operator_customization() -> None:
+    client = _FakeRunnerClient()
+    generator = RunnerBackgroundTitleGenerator(_FakeRunnerRouter(client))  # type: ignore[arg-type]
+
+    await generator(BackgroundTitleRequest(session_id="conv_test", prompt="请修复登录超时"))
+
+    assert client.requests[0][1]["additional_instructions"] == (
+        FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
+    )
 
 
 async def test_schedule_is_one_shot_per_session(db_uri: str) -> None:

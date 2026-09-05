@@ -98,6 +98,38 @@ async def test_get_client_respawns_only_when_model_changes(
         await final.client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_qwen_model_change_keeps_live_acp_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Qwen applies model changes through ACP session config without respawning."""
+    pm = HarnessProcessManager()
+    pm._started = True
+    spawns: list[str | None] = []
+
+    async def _fake_spawn(conv: str, harness: str, env: dict[str, str] | None) -> _SubprocessEntry:
+        model = (env or {}).get(_model_env_key(harness))
+        spawns.append(model)
+        return _SubprocessEntry(
+            process=_AliveProc(),  # type: ignore[arg-type]
+            client=httpx.AsyncClient(),
+            endpoint=_HarnessEndpoint(socket_path=Path("/tmp/fake-qwen.sock")),
+            harness=harness,
+            model=model,
+        )
+
+    monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
+    key = _model_env_key("qwen")
+
+    await pm.get_client("conv_qwen", "qwen", env={key: "qwen-turbo"})
+    await pm.get_client("conv_qwen", "qwen", env={key: "qwen-plus"})
+
+    assert spawns == ["qwen-turbo"]
+    entry = pm._entries.get("conv_qwen")
+    if entry is not None:
+        await entry.client.aclose()
+
+
 def test_build_harness_spawn_env_strips_binding_token_with_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

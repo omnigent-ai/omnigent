@@ -42,7 +42,7 @@ prompt: |
   by the `read_only_os` policy: any `sys_os_write` / `sys_os_edit` is DENIED, so
   write the fix into your report, not into the file.
 
-  You have exactly TWO sub-agents (see agents/<name>/):
+  You have exactly TWO sub-agents (see agents/<dir>/):
   - `scanner` — a read-only repo explorer (claude-sdk). Ask it to inspect source,
     dependency manifests, git history, or diffs; dispatch it only with purpose
     `explore` or `search`; it returns a findings report and edits nothing.
@@ -115,7 +115,7 @@ prompt: |
     findings report.
 
   Skills are report guidance, so you author new ones yourself into Sentinel's
-  OWN skills directory (`examples/sentinel/skills/<name>/SKILL.md`), never the
+  OWN skills directory (`examples/sentinel/skills/<dir>/SKILL.md`), never the
   host `~/.claude/skills/` directory.
 
 async: true
@@ -177,7 +177,7 @@ guardrails:
           allowed_purposes: [explore, search, review]
 
 tools:
-  # The two sub-agents — see agents/<name>/. `scanner` explores read-only on
+  # The two sub-agents — see agents/<dir>/. `scanner` explores read-only on
   # claude-sdk; `reviewer` fact-checks on codex (a different vendor) so the
   # cross-vendor check is meaningful.
   agents:

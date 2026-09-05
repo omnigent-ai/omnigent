@@ -8,7 +8,7 @@ Real-binary tests gated on:
 
 When either gate fails the test is skipped — keeps CI green without the
 upstream binary while still letting maintainers run the happy path locally
-with ``OMNIGENT_E2E_KIMI=1 uv run pytest tests/e2e/test_kimi_executor_e2e.py``.
+with ``OMNIGENT_E2E_KIMI=1 uv run --group test pytest tests/e2e/test_kimi_executor_e2e.py``.
 
 Mirrors ``tests/e2e/test_cursor_executor_e2e.py`` / ``test_pi_executor_e2e.py``
 in shape.

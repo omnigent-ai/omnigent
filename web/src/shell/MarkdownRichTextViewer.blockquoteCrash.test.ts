@@ -17,9 +17,11 @@
  * image extension's HTTP boundary (fetchFileContent) is mocked.
  */
 
+import type * as UseFileContentModule from "@/hooks/useFileContent";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
-import StarterKit from "@tiptap/starter-kit";
+import { StarterKit } from "@tiptap/starter-kit";
 import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
 import { TaskItem, TaskList } from "@tiptap/extension-list";
 import { Markdown } from "@tiptap/markdown";
@@ -28,7 +30,7 @@ import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 
 vi.mock("@/hooks/useFileContent", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/hooks/useFileContent")>();
+  const actual = await importOriginal<typeof UseFileContentModule>();
   return { ...actual, fetchFileContent: vi.fn().mockResolvedValue(undefined) };
 });
 

@@ -15,37 +15,48 @@ function press(init: KeyboardEventInit): KeyboardEvent {
 }
 
 describe("isVoiceDictationHotkey", () => {
-  it("matches Cmd+Alt+V and Ctrl+Alt+V by physical code", () => {
+  it("uses Cmd+Alt+V on macOS and Ctrl+Alt+V elsewhere, by physical code", () => {
     expect(
       isVoiceDictationHotkey(
         new KeyboardEvent("keydown", { code: "KeyV", metaKey: true, altKey: true }),
+        true,
       ),
     ).toBe(true);
     expect(
       isVoiceDictationHotkey(
         new KeyboardEvent("keydown", { code: "KeyV", ctrlKey: true, altKey: true }),
+        false,
       ),
     ).toBe(true);
+    // Wrong modifier for the platform.
+    expect(
+      isVoiceDictationHotkey(
+        new KeyboardEvent("keydown", { code: "KeyV", ctrlKey: true, altKey: true }),
+        true,
+      ),
+    ).toBe(false);
     // ⌥ rewrites the character to "√" on macOS, but e.code stays "KeyV".
     expect(
       isVoiceDictationHotkey(
         new KeyboardEvent("keydown", { code: "KeyV", key: "√", metaKey: true, altKey: true }),
+        true,
       ),
     ).toBe(true);
   });
 
   it("rejects the chord without Alt, and with Shift held", () => {
     expect(
-      isVoiceDictationHotkey(new KeyboardEvent("keydown", { code: "KeyV", metaKey: true })),
+      isVoiceDictationHotkey(new KeyboardEvent("keydown", { code: "KeyV", metaKey: true }), true),
     ).toBe(false);
     expect(
       isVoiceDictationHotkey(
         new KeyboardEvent("keydown", { code: "KeyV", metaKey: true, altKey: true, shiftKey: true }),
+        true,
       ),
     ).toBe(false);
     // Alt+V without a Cmd/Ctrl modifier.
     expect(
-      isVoiceDictationHotkey(new KeyboardEvent("keydown", { code: "KeyV", altKey: true })),
+      isVoiceDictationHotkey(new KeyboardEvent("keydown", { code: "KeyV", altKey: true }), true),
     ).toBe(false);
   });
 
@@ -53,6 +64,7 @@ describe("isVoiceDictationHotkey", () => {
     expect(
       isVoiceDictationHotkey(
         new KeyboardEvent("keydown", { code: "KeyK", metaKey: true, altKey: true }),
+        true,
       ),
     ).toBe(false);
   });
@@ -61,7 +73,7 @@ describe("isVoiceDictationHotkey", () => {
 describe("useVoiceDictationHotkey", () => {
   it("toggles on Cmd+Alt+V and prevents the browser default", () => {
     const onToggle = vi.fn();
-    renderHook(() => useVoiceDictationHotkey(onToggle));
+    renderHook(() => useVoiceDictationHotkey(onToggle, true, true));
 
     const e = press({ code: "KeyV", metaKey: true, altKey: true });
 
@@ -71,7 +83,7 @@ describe("useVoiceDictationHotkey", () => {
 
   it("ignores auto-repeat", () => {
     const onToggle = vi.fn();
-    renderHook(() => useVoiceDictationHotkey(onToggle));
+    renderHook(() => useVoiceDictationHotkey(onToggle, true, true));
 
     press({ code: "KeyV", metaKey: true, altKey: true, repeat: true });
 
@@ -80,7 +92,7 @@ describe("useVoiceDictationHotkey", () => {
 
   it("does nothing when disabled", () => {
     const onToggle = vi.fn();
-    renderHook(() => useVoiceDictationHotkey(onToggle, false));
+    renderHook(() => useVoiceDictationHotkey(onToggle, false, true));
 
     const e = press({ code: "KeyV", metaKey: true, altKey: true });
 
@@ -90,7 +102,7 @@ describe("useVoiceDictationHotkey", () => {
 
   it("bails when focus sits inside a terminal or code editor", () => {
     const onToggle = vi.fn();
-    renderHook(() => useVoiceDictationHotkey(onToggle));
+    renderHook(() => useVoiceDictationHotkey(onToggle, true, true));
 
     const term = document.createElement("div");
     term.className = "xterm";
@@ -107,7 +119,7 @@ describe("useVoiceDictationHotkey", () => {
 
   it("unbinds on unmount", () => {
     const onToggle = vi.fn();
-    const { unmount } = renderHook(() => useVoiceDictationHotkey(onToggle));
+    const { unmount } = renderHook(() => useVoiceDictationHotkey(onToggle, true, true));
     unmount();
 
     press({ code: "KeyV", metaKey: true, altKey: true });

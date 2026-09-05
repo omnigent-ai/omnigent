@@ -328,7 +328,7 @@ export interface AdminFailure {
  * Network failures collapse to ``status: 0`` per the convention
  * already established by :func:`login`.
  */
-async function _admin<T extends { ok: true }>(
+async function adminRequest<T extends { ok: true }>(
   doFetch: () => Promise<Response>,
   toSuccess: (body: unknown) => Omit<T, "ok">,
 ): Promise<T | AdminFailure> {
@@ -381,7 +381,7 @@ export async function listUsers(): Promise<AccountListEntry[] | null> {
  * :returns: The new token + the URL to share, or a typed failure.
  */
 export async function createInvite(isAdmin: boolean): Promise<InviteCreated | AdminFailure> {
-  return _admin<InviteCreated>(
+  return adminRequest<InviteCreated>(
     () =>
       fetch("/auth/invite", {
         method: "POST",
@@ -439,7 +439,7 @@ export async function deleteUser(userId: string): Promise<{ ok: true } | AdminFa
  * is responsible for DM-ing it to the user out-of-band.
  */
 export async function resetUserPassword(userId: string): Promise<PasswordReset | AdminFailure> {
-  return _admin<PasswordReset>(
+  return adminRequest<PasswordReset>(
     () =>
       fetch(`/auth/users/${encodeURIComponent(userId)}/reset`, {
         method: "POST",

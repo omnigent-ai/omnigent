@@ -293,11 +293,11 @@ This integration is a **separate package** (`omnigent-slack`) with heavy deps
 (slack_bolt, aiohttp) kept out of the core `omnigent` install. It resolves as an
 editable path dep of the root `omnigent` package via the `slack` extra (see
 `[tool.uv.sources]` in the root `pyproject.toml`), and shares the root's dev
-tooling (ruff, mypy, pytest) and config rather than carrying its own. Work on it
+tooling (Ruff, Pyrefly, pytest) and config rather than carrying its own. Work on it
 from the repo-root env:
 
 ```bash
-# From the repo root — add the slack extra to your existing extras:
-uv sync --extra slack       # e.g. --extra all --extra dev --extra slack
-uv run omni integration slack
+# From the repo root — install the Slack capability and contributor tooling:
+uv sync --extra slack --group dev
+uv run --no-sync omni integration slack
 ```

@@ -55,7 +55,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from omnigent.native_policy_hook import hook_payload_to_evaluation_request
+from omnigent.native_policy_hook import (
+    PolicyHookEvaluationRequest,
+    hook_payload_to_evaluation_request,
+)
 
 # Harness label stamped onto the audit ``EvaluationRequest`` context so server
 # policies can recognize antigravity-native as the originating surface.
@@ -136,7 +139,7 @@ def build_audit_evaluation_request(
     tool_name: str,
     tool_input: Mapping[str, object],
     model: str | None,
-) -> dict[str, object] | None:
+) -> PolicyHookEvaluationRequest | None:
     """
     Build the proto ``EvaluationRequest`` for a post-hoc tool-call audit.
 

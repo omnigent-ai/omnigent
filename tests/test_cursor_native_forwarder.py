@@ -229,6 +229,18 @@ class TestBlobToItem:
         blob = self._blob({"role": "user", "content": "just some unwrapped context"})
         assert fwd._blob_to_item(2, "bid", blob, "a") is None
 
+    def test_automated_notification_with_user_query_is_skipped(self) -> None:
+        content = (
+            "<timestamp>Sunday, Aug 16, 2026, 10:49 AM (UTC-4)</timestamp>\n"
+            "<system_notification>\n"
+            "The following task has finished.\n"
+            "</system_notification>\n"
+            "<user_query>Briefly inform the user about the task result and perform "
+            "any follow-up actions (if needed).</user_query>"
+        )
+        blob = self._blob({"role": "user", "content": content})
+        assert fwd._blob_to_item(2, "bid", blob, "a") is None
+
 
 class TestReadNewItems:
     def test_reads_live_wal_store(self, tmp_path: Path) -> None:

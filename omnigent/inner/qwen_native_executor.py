@@ -21,9 +21,9 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 from omnigent.inner.executor import (
+    EnqueuedContent,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -31,6 +31,7 @@ from omnigent.inner.executor import (
     Message,
     ToolSpec,
     TurnComplete,
+    describe_exception,
 )
 from omnigent.qwen_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
@@ -99,7 +100,7 @@ class QwenNativeExecutor(Executor):
         """:returns: ``True`` — messages can be injected mid-turn (steering)."""
         return True
 
-    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+    async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         """Append a live steering message to the qwen TUI input file."""
         del session_key
         text = _content_to_text(content, self._bridge_dir)
@@ -131,7 +132,7 @@ class QwenNativeExecutor(Executor):
             async with self._inject_lock:
                 await asyncio.to_thread(submit_user_message, self._bridge_dir, content=text)
         except RuntimeError as exc:
-            yield ExecutorError(message=str(exc))
+            yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
 
@@ -152,7 +153,7 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     return ""
 
 
-def _content_to_text(content: Any, bridge_dir: Path) -> str:
+def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     """Normalize executor content into text the qwen TUI receives.
 
     Text blocks are extracted directly. Image/file blocks carrying a base64 data

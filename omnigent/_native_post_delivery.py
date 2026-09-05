@@ -146,6 +146,10 @@ def post_may_have_been_delivered(exc: httpx.HTTPError) -> bool:
     - Connection-establishment / pool-acquire failures
       (:data:`_DELIVERY_SAFE_RETRY_ERRORS`): no bytes were sent → not
       delivered → safe to retry, so ``False``.
+    - An unbound ``RequestError``: the failure occurred before httpx
+      associated the exception with the outbound request (for example,
+      an auth flow failed before yielding it). No bytes were sent → safe
+      to retry, so ``False``.
     - Any other transport error (read/write timeout, read/write error,
       remote protocol error): the request was sent and we never saw a
       response, so the server may have processed it → ambiguous →
@@ -159,6 +163,10 @@ def post_may_have_been_delivered(exc: httpx.HTTPError) -> bool:
         return False
     if isinstance(exc, _DELIVERY_SAFE_RETRY_ERRORS):
         return False
+    try:
+        _ = exc.request
+    except RuntimeError:
+        return False
     return True
 
 
@@ -169,6 +177,7 @@ async def post_external_session_status(
     status: str,
     output: str | None = None,
     background_task_count: int | None = None,
+    background_tasks: list[dict[str, object]] | None = None,
     response_id: str | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
@@ -187,6 +196,11 @@ async def post_external_session_status(
         edge, forwarded so the UI can show "N background tasks still running".
         ``None`` omits the field (server leaves its sticky tally untouched) — the
         default for edges that know nothing about background shells.
+    :param background_tasks: Per-shell detail backing that count (each a dict of
+        ``id``/``type``/``status``/``description``/``command``), forwarded so the
+        UI can name the individual shells. ``None`` omits the field — the default
+        for edges with no detail; sent alongside a positive count by the
+        claude-native ``Stop`` hook.
     :param response_id: Optional id of the assistant turn this status edge
         belongs to. When set, the server attaches it to the ``session.status``
         SSE event so ap-web can drive the bubble's streaming lifecycle — that's
@@ -201,6 +215,8 @@ async def post_external_session_status(
         data["output"] = output
     if background_task_count is not None:
         data["background_task_count"] = background_task_count
+    if background_tasks is not None:
+        data["background_tasks"] = background_tasks
     if response_id is not None:
         data["response_id"] = response_id
     resp = await client.post(

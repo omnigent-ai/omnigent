@@ -71,8 +71,10 @@ Three transports, easy to confuse:
    agy models   # exits 0 and lists models only when signed in; else 'Please sign in'
    ```
    `False` / non-zero → run `agy` once and sign in. agy's token lives under
-   `~/.gemini` (`oauth_creds.json` on macOS, `antigravity-cli/antigravity-oauth-token`
-   on Linux).
+   `~/.gemini` (`oauth_creds.json` on macOS through 1.0.10,
+   `antigravity-cli/antigravity-oauth-token` on Linux); agy 1.1.7+ on macOS
+   writes no token file and keeps the credential in the Keychain, which is why
+   `gemini_login_detected()` falls back to `agy models` there.
 4. **`tmux` is on PATH.** The agy terminal is a runner-owned tmux pane; the CLI
    attaches to it and the executor drives it via `tmux send-keys`
    (`_preflight_local_tools` hard-fails without tmux).

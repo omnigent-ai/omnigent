@@ -431,6 +431,8 @@ class TerminalRegistry:
         conversation_id: str,
         terminal_name: str,
         session_key: str,
+        *,
+        expected: TerminalInstance | None = None,
     ) -> bool:
         """Close one terminal and remove it from the registry.
 
@@ -442,14 +444,23 @@ class TerminalRegistry:
         :param conversation_id: Owning conversation id.
         :param terminal_name: Terminal spec name.
         :param session_key: Session key.
+        :param expected: When given, close only if this exact instance
+            still occupies the key. A caller that wants to retract the
+            instance IT published must pass it: the key can have been
+            reassigned to a successor in the meantime, and closing by key
+            alone would terminate that successor instead. Compared under
+            the registry lock, so no other writer can swap the instance
+            between the check and the removal.
         :returns: ``True`` if a live instance was closed, ``False``
             if no live instance was found (already-closed or
-            never-launched).
+            never-launched), or if *expected* no longer occupies the key.
         """
         key = (terminal_name, session_key)
         with self._lock:
             slot = self._by_conversation.get(conversation_id)
             if slot is None:
+                return False
+            if expected is not None and slot.get(key) is not expected:
                 return False
             instance = slot.pop(key, None)
             if not slot:

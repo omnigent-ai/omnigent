@@ -27,6 +27,7 @@ parent offset resolution → ``onSetActiveSelection`` → add-comment POST.
 
 from __future__ import annotations
 
+import re
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
@@ -145,6 +146,8 @@ def test_html_preview_add_comment(
 
     # CommentsPanel opens alongside the preview.
     expect(file_viewer.locator("span.font-semibold", has_text="Comments")).to_be_visible()
+    selection_text = preview.locator("body").evaluate("() => window.getSelection().toString()")
+    assert selection_text == _ANCHOR_SENTENCE, "fresh draft selection should remain visible"
 
     comment_body = "This sentence needs a citation."
     comment_textarea = file_viewer.locator("textarea[placeholder='Add a comment…']")
@@ -329,7 +332,7 @@ def test_clicking_comment_scrolls_highlight_into_view(
     # behavior under test is driven by clicking the card, not by how it was made.
     raw_idx = _HTML_CONTENT.find(_DEEP_SENTENCE)
     assert raw_idx != -1, "fixture bug: deep sentence missing from file content"
-    httpx.post(
+    comment = httpx.post(
         f"{base_url}/v1/sessions/{session_id}/comments",
         json={
             "path": file_path,
@@ -338,6 +341,13 @@ def test_clicking_comment_scrolls_highlight_into_view(
             "end_index": raw_idx + len(_DEEP_SENTENCE),
             "anchor_content": _DEEP_SENTENCE,
         },
+        timeout=10.0,
+    )
+    comment.raise_for_status()
+    comment_id = comment.json()["id"]
+    httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}/comments/{comment_id}",
+        json={"status": "addressed"},
         timeout=10.0,
     ).raise_for_status()
 
@@ -348,8 +358,12 @@ def test_clicking_comment_scrolls_highlight_into_view(
     # Open the comments panel via the toolbar (the seeded comment isn't shown
     # until the panel is open).
     file_viewer.get_by_role("button", name="Show comments").click()
+    file_viewer.get_by_role("button", name=re.compile("Addressed")).click()
+    expect(file_viewer.get_by_text("deep comment")).to_be_visible()
+    page.wait_for_timeout(200)
+    assert _highlight_count(preview) == 0, "addressed anchors stay hidden until activated"
 
-    # Clicking the comment card in the panel activates it → the bridge scrolls.
+    # Clicking the addressed card activates it → the bridge scrolls.
     file_viewer.get_by_text("deep comment").click()
     page.wait_for_timeout(800)  # smooth scroll settle
     scrolled = preview.locator("body").evaluate("() => window.pageYOffset")

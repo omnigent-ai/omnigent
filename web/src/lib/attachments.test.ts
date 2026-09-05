@@ -1,11 +1,26 @@
 import { describe, expect, it } from "vitest";
-import { ATTACHMENT_SIZE_LIMITS_MB, classifyAttachment, validateAttachments } from "./attachments";
+import {
+  ATTACHMENT_SIZE_LIMITS_MB,
+  attachmentKey,
+  classifyAttachment,
+  validateAttachments,
+} from "./attachments";
 
 function makeFile(name: string, type: string, bytes = 10): File {
   return new File([new Uint8Array(bytes)], name, { type });
 }
 
 const MB = 1024 * 1024;
+
+describe("attachmentKey", () => {
+  it("is stable per File object and distinct for equivalent files", () => {
+    const first = makeFile("a.png", "image/png");
+    const second = makeFile("a.png", "image/png");
+
+    expect(attachmentKey(first)).toBe(attachmentKey(first));
+    expect(attachmentKey(first)).not.toBe(attachmentKey(second));
+  });
+});
 
 describe("classifyAttachment", () => {
   it("classifies images by MIME", () => {

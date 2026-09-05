@@ -134,8 +134,8 @@ function MenuRowButton({
       data-testid={`slash-menu-item-${row.name.slice(1)}`}
       data-active={active ? "true" : undefined}
       className={cn(
-        "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] text-foreground hover:bg-accent",
-        active && "bg-accent",
+        "flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-ui text-foreground hover:bg-muted dark:hover:bg-muted/50",
+        active && "bg-muted dark:bg-muted/50",
       )}
       // preventDefault keeps the textarea focused while the user clicks.
       onMouseDown={(e) => e.preventDefault()}
@@ -196,13 +196,13 @@ export function SlashCommandMenu({
   const active = activeIndex >= 0 ? rows[activeIndex] : undefined;
 
   const sectionHeader = (label: string) => (
-    <div className="px-2 pb-0.5 pt-1.5 text-[11px] font-medium text-muted-foreground">{label}</div>
+    <div className="px-1.5 py-1 text-sm font-medium text-muted-foreground">{label}</div>
   );
 
   return (
     <div className="absolute bottom-full left-0 z-10 mb-2 flex items-end gap-2">
-      <div className="w-64 shrink-0 overflow-hidden rounded-xl border border-border bg-popover shadow-lg">
-        <div ref={listRef} className="max-h-80 overflow-y-auto p-1">
+      <div className="w-64 shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu">
+        <div ref={listRef} className="max-h-80 overflow-y-auto">
           {builtinRows.length > 0 && sectionHeader("Commands")}
           {builtinRows.map((row) => (
             <MenuRowButton
@@ -229,10 +229,10 @@ export function SlashCommandMenu({
       {active && (
         <div
           data-testid="slash-menu-detail"
-          className="hidden max-h-80 w-80 shrink-0 overflow-y-auto rounded-xl border border-border bg-popover p-3 shadow-lg md:block"
+          className="hidden max-h-80 w-80 shrink-0 overflow-y-auto rounded-[12px] border border-border bg-popover p-2 shadow-menu md:block"
         >
-          <p className="font-mono text-xs font-medium text-foreground">{active.name}</p>
-          <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
+          <p className="font-mono text-sm font-medium text-foreground">{active.name}</p>
+          <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
             {active.description}
           </p>
         </div>

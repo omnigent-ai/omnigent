@@ -23,7 +23,7 @@ function stripAnsi(value) {
 // launched from a GUI, where $SHELL is typically unset — the whole premise of
 // this bug). Fall back to $SHELL, then the macOS default.
 function pickShell(os, env) {
-  let shell = null;
+  let shell;
   try {
     shell = os.userInfo().shell;
   } catch {

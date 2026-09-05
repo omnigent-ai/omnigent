@@ -9,6 +9,8 @@ on:
       - .github/scripts/waiting_on_author.py
       - .github/scripts/waiting_on_author_test.py
       - .github/workflows/waiting-on-author.yml
+      - .github/workflows/waiting-on-author-review.yml
+      - .github/workflows/waiting-on-author-review-run.yml
       - .github/workflows/waiting-on-author-test.yml
   workflow_dispatch:
 

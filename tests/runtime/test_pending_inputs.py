@@ -206,6 +206,23 @@ def test_resolve_matching_text_leaves_entries_when_no_text_matches() -> None:
     assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [first]
 
 
+def test_resolve_matching_text_does_not_match_on_unanchored_suffix() -> None:
+    """A short pending entry must not be matched by an unrelated prompt that
+    merely ends with its text (e.g. queued "ok" vs. an accepted "...still ok"),
+    or that entry's file attachments would be merged into the wrong message."""
+    short_entry = pending_inputs.record(
+        "conv_a", [_text_block("ok"), {"type": "input_image", "url": "img://1"}]
+    )
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "Let's continue - ok")
+
+    assert drained.matched is None
+    assert drained.skipped == []
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [
+        short_entry
+    ]
+
+
 def test_resolve_removes_entry_idempotently() -> None:
     """
     :func:`resolve` drops an entry by id (forward-failed rollback).
@@ -330,3 +347,11 @@ def test_stale_entries_evicted_after_ttl(monkeypatch: pytest.MonkeyPatch) -> Non
     # Past the TTL: the lazy sweep on the next access evicts the ghost.
     clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
     assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_has_pending_tracks_parked_messages() -> None:
+    assert pending_inputs.has_pending("conv_hp") is False
+    pending_id = pending_inputs.record("conv_hp", [_text_block("hello")])
+    assert pending_inputs.has_pending("conv_hp") is True
+    pending_inputs.resolve("conv_hp", pending_id)
+    assert pending_inputs.has_pending("conv_hp") is False

@@ -12,7 +12,9 @@ import time
 import uuid
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
+
+from omnigent import native_bridge_common
+from omnigent.json_types import JsonObject as _JsonObject
 
 # Per-process tiebreaker for inbox ordering. The extension delivers inbox
 # files in lexicographic filename order, so a high-resolution timestamp alone
@@ -30,6 +32,11 @@ _EXTENSION_FILE = "omnigent_pi_native_extension.js"
 _EXTENSION_PACKAGE = "omnigent.resources.pi_native"
 _INBOX_DIR = "inbox"
 _SESSIONS_DIR = "sessions"
+
+
+def bridge_root() -> Path:
+    """Return the root directory used for native Pi bridge files."""
+    return _BRIDGE_ROOT
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -55,7 +62,24 @@ def prepare_bridge_dir(session_id: str) -> Path:
     os.chmod(bridge_dir, 0o700)
     (bridge_dir / _INBOX_DIR).mkdir(mode=0o700, exist_ok=True)
     (bridge_dir / _SESSIONS_DIR).mkdir(mode=0o700, exist_ok=True)
+    # Owner-pid marker for the periodic dead-owner prune; refreshed every
+    # turn so it always names the current runner. See native_bridge_common.
+    native_bridge_common.write_owner_pid_marker(bridge_dir)
     return bridge_dir
+
+
+def prune_orphaned_bridge_dirs() -> int:
+    """
+    Remove pi-native bridge dirs whose owner process is provably dead.
+
+    Delegates to the shared sweep against this harness's bridge root; the
+    runner calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
+    at startup to reclaim dirs leaked by a prior runner that died without
+    running the explicit delete path.
+
+    :returns: The number of orphaned bridge dirs removed.
+    """
+    return native_bridge_common.prune_orphaned_dirs(bridge_root())
 
 
 def clear_inbox(bridge_dir: Path) -> None:
@@ -127,7 +151,7 @@ def enqueue_user_message(bridge_dir: Path, content: str) -> str:
     :returns: Opaque message id.
     """
     message_id = f"msg_{uuid.uuid4().hex}"
-    payload = {
+    payload: _JsonObject = {
         "id": message_id,
         "type": "user_message",
         "content": content,
@@ -150,7 +174,7 @@ def enqueue_interrupt(bridge_dir: Path) -> str:
     :returns: Opaque interrupt id.
     """
     interrupt_id = f"interrupt_{uuid.uuid4().hex}"
-    payload = {
+    payload: _JsonObject = {
         "id": interrupt_id,
         "type": "interrupt",
         "created_at": time.time(),
@@ -179,7 +203,7 @@ def enqueue_compact(bridge_dir: Path, custom_instructions: str | None = None) ->
     :returns: Opaque compact id.
     """
     compact_id = f"compact_{uuid.uuid4().hex}"
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "id": compact_id,
         "type": "compact",
         "created_at": time.time(),
@@ -188,6 +212,29 @@ def enqueue_compact(bridge_dir: Path, custom_instructions: str | None = None) ->
         payload["custom_instructions"] = custom_instructions
     _enqueue_payload(bridge_dir, compact_id, payload)
     return compact_id
+
+
+def enqueue_thinking_level_change(bridge_dir: Path, level: str) -> str:
+    """Queue a UI-originated thinking-level switch for the resident Pi extension.
+
+    The extension consumes this inbox payload and calls Pi's
+    ``setThinkingLevel``, taking effect immediately without a restart.
+
+    :param bridge_dir: Native Pi bridge directory.
+    :param level: Pi thinking level, e.g. ``"high"`` or ``"off"``. Must be in
+        Pi vocabulary — translate canonical ``"none"`` to ``"off"`` and
+        ``"ultra"`` to ``"max"`` before calling.
+    :returns: Opaque change id.
+    """
+    change_id = f"thinking_level_change_{uuid.uuid4().hex}"
+    payload: _JsonObject = {
+        "id": change_id,
+        "type": "thinking_level_change",
+        "thinkingLevel": level,
+        "created_at": time.time(),
+    }
+    _enqueue_payload(bridge_dir, change_id, payload)
+    return change_id
 
 
 def enqueue_model_change(bridge_dir: Path, model: str) -> str:
@@ -207,7 +254,7 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
     :returns: Opaque model-change id.
     """
     model_change_id = f"model_change_{uuid.uuid4().hex}"
-    payload = {
+    payload: _JsonObject = {
         "id": model_change_id,
         "type": "model_change",
         "model": model,
@@ -217,7 +264,7 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
     return model_change_id
 
 
-def _enqueue_payload(bridge_dir: Path, item_id: str, payload: dict[str, Any]) -> None:
+def _enqueue_payload(bridge_dir: Path, item_id: str, payload: _JsonObject) -> None:
     inbox = bridge_dir / _INBOX_DIR
     inbox.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Order-preserving filename. The extension polls ``inbox/*.json`` and
@@ -248,7 +295,7 @@ def write_extension_files(
     server_url: str,
     conversation_url: str,
     auth_headers: dict[str, str] | None = None,
-    tools: list[dict[str, Any]] | None = None,
+    tools: list[_JsonObject] | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -269,7 +316,7 @@ def write_extension_files(
     :returns: ``(extension_path, config_path)``.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "sessionId": session_id,
         "serverUrl": server_url.rstrip("/"),
         "conversationUrl": conversation_url,
@@ -325,6 +372,30 @@ def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) 
     return True
 
 
+def inject_relay_into_config(bridge_dir: Path, relay_url: str, relay_token: str) -> bool:
+    """Write ``relayUrl`` and ``relayToken`` into ``config.json``.
+
+    The pi extension reads these on every policy POST via ``relayCredentials()``
+    and routes to the relay instead of the server — eliminating server bearer
+    expiry for policy evaluation.
+
+    :returns: ``True`` when the config was updated.
+    """
+    path = config_path(bridge_dir)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("relayUrl") == relay_url and payload.get("relayToken") == relay_token:
+        return False
+    payload["relayUrl"] = relay_url
+    payload["relayToken"] = relay_token
+    _atomic_json(path, payload)
+    return True
+
+
 def _extension_source() -> str:
     """
     Return the packaged Pi extension source.
@@ -336,7 +407,7 @@ def _extension_source() -> str:
     return resource.read_text(encoding="utf-8")
 
 
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_json(path: Path, payload: _JsonObject) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:

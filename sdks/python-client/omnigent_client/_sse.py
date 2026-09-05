@@ -172,7 +172,10 @@ def _parse_event(event_type: str, data: dict[str, Any]) -> StreamEvent | None:
     if event_type == _T_RESPONSE_COMPLETED:
         return ResponseCompleted(response=_parse_response(data))
     if event_type == _T_RESPONSE_FAILED:
-        return ResponseFailed(response=_parse_response(data))
+        return ResponseFailed(
+            response=_parse_response(data),
+            source=str(data.get("source", "execution")),
+        )
     if event_type == _T_RESPONSE_INCOMPLETE:
         resp = _parse_response(data)
         reason = ""

@@ -16,13 +16,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 
+from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
@@ -32,6 +35,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
@@ -52,7 +56,7 @@ _HOST_NAME = "credential-test-laptop"
 @pytest.fixture(autouse=True)
 def _enable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     """Enable the feature flag for every test except the flag-off case."""
-    monkeypatch.setenv("OMNIGENT_HARNESS_INSTALL_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_FEATURES", "harness_install")
 
 
 def _websocket_scope(path: str) -> dict[str, object]:
@@ -97,6 +101,18 @@ def cred_app(
     app = FastAPI()
     app.include_router(create_host_tunnel_router(registry, host_store), prefix="/v1")
     app.include_router(create_hosts_router(registry, host_store, conv_store), prefix="/v1")
+
+    @app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(
+        request: Request,
+        exc: OmnigentError,
+    ) -> JSONResponse:
+        """Convert application errors to structured JSON responses."""
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
     return app, registry, host_store, conv_store
 
 
@@ -117,14 +133,11 @@ async def cred_setup(
     comm = await _connect_mock_host(app, registry)
     received: list[HostStoreSecretFrame] = []
     replies: dict[str, dict[str, Any]] = {}
-    stop_drain = asyncio.Event()
 
     async def _drain() -> None:
-        while not stop_drain.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        while True:
+            # An idle receive timeout cancels the ASGI app; teardown owns cancellation.
+            output = await comm.receive_output(timeout=None)
             if output.get("type") != "websocket.send":
                 continue
             text = output.get("text")
@@ -169,11 +182,13 @@ async def cred_setup(
     try:
         yield app, registry, received, replies
     finally:
-        stop_drain.set()
+        drain_task.cancel()
         try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
-            drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain_task
+        finally:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=5.0)
 
 
 # ── Happy path ──────────────────────────────────────────
@@ -203,6 +218,51 @@ async def test_store_key_forwards_frame_and_returns_readiness(
     assert received[0].secret_value == "sk-ant-SECRET"
 
 
+async def test_store_credential_tolerates_a_garbled_gateway_inference(
+    cred_setup: tuple[
+        FastAPI, HostRegistry, list[HostStoreSecretFrame], dict[str, dict[str, Any]]
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A host that answers with a non-mapping ``gateway_inference`` must not 500.
+
+    Same property the install route pins: the reply is host-supplied, so it goes
+    through the tolerant decode the tunnel path uses and anything that is not a
+    string→bool object reads as "unknown". Recording it straight would have
+    blown up in ``dict(...)``, turning a successful credential write into a 500
+    with the credential already on disk.
+
+    The garbled value is injected at the proxy's return, not through the mock
+    host: the frame decoder normalises it on the way in, so a fixture reply
+    could never reach the route with it still garbled.
+    """
+    app, registry, _received, _replies = cred_setup
+
+    async def _garbled_reply(**_kwargs: Any) -> dict[str, Any]:
+        """A host reply whose gateway_inference is a list, not a map."""
+        return {
+            "status": "ok",
+            "configured_harnesses": {"claude": True},
+            "gateway_inference": ["claude-native"],
+        }
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.hosts._proxy_store_secret",
+        _garbled_reply,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/v1/hosts/{_HOST_ID}/harnesses/claude/credential",
+            json={"kind": "key", "secret": "sk-ant-SECRET"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["gateway_inference"] is None
+    assert registry.gateway_inference(_HOST_ID) is None
+
+
 async def test_store_gateway_forwards_base_url(
     cred_setup: tuple[
         FastAPI, HostRegistry, list[HostStoreSecretFrame], dict[str, dict[str, Any]]
@@ -226,13 +286,18 @@ async def test_store_gateway_forwards_base_url(
     assert received[0].wire_api == "chat"
 
 
+@pytest.mark.parametrize(
+    "idle_seconds", [pytest.param(0.0, id="immediate"), pytest.param(0.75, id="idle")]
+)
 async def test_adopt_forwards_env_var_without_secret(
     cred_setup: tuple[
         FastAPI, HostRegistry, list[HostStoreSecretFrame], dict[str, dict[str, Any]]
     ],
+    idle_seconds: float,
 ) -> None:
     """An adopt request forwards the env var name and no secret value."""
     app, _reg, received, _replies = cred_setup
+    await asyncio.sleep(idle_seconds)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             f"/v1/hosts/{_HOST_ID}/harnesses/codex/credential",
@@ -336,12 +401,20 @@ async def test_concurrent_writes_to_one_host_are_serialized(
 
 async def test_route_hidden_when_flag_off(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With the flag off the route is 404 — the feature is invisible."""
-    monkeypatch.setenv("OMNIGENT_HARNESS_INSTALL_ENABLED", "0")
-    app, _reg, _hs, _cs = cred_app
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    _app, registry, host_store, conv_store = cred_app
+    off_app = FastAPI()
+    off_app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            feature_flags=FeatureFlags(),
+        ),
+        prefix="/v1",
+    )
+    async with AsyncClient(transport=ASGITransport(app=off_app), base_url="http://test") as client:
         resp = await client.post(
             f"/v1/hosts/{_HOST_ID}/harnesses/claude/credential",
             json={"kind": "key", "secret": "x"},
@@ -419,9 +492,10 @@ async def test_unknown_host_returns_404(
 async def test_offline_host_returns_409(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
-    """A registered-but-offline host returns 409 (no live tunnel to forward on)."""
+    """An offline host returns 409 (no live tunnel to forward on)."""
     app, _reg, host_store, _cs = cred_app
     host_store.upsert_on_connect(host_id=_HOST_ID, name=_HOST_NAME, user_id="local")
+    host_store.set_offline(_HOST_ID)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             f"/v1/hosts/{_HOST_ID}/harnesses/claude/credential",
@@ -488,11 +562,19 @@ async def test_detect_credentials_returns_non_secret_descriptors(
 
 async def test_detect_credentials_hidden_when_flag_off(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With the flag off the detect route is 404."""
-    monkeypatch.setenv("OMNIGENT_HARNESS_INSTALL_ENABLED", "0")
-    app, _reg, _hs, _cs = cred_app
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    _app, registry, host_store, conv_store = cred_app
+    off_app = FastAPI()
+    off_app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            feature_flags=FeatureFlags(),
+        ),
+        prefix="/v1",
+    )
+    async with AsyncClient(transport=ASGITransport(app=off_app), base_url="http://test") as client:
         resp = await client.get(f"/v1/hosts/{_HOST_ID}/credentials/detected")
     assert resp.status_code == 404

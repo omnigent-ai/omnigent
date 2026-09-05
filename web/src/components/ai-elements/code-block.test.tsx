@@ -11,6 +11,7 @@ describe("CodeBlock — lazy Shiki highlighting", () => {
     // Raw tokens render synchronously so the code is visible without waiting
     // for the lazily-imported Shiki engine.
     expect(screen.getByText(/const answer = 42;/)).toBeTruthy();
+    expect(document.querySelector('[data-code-highlighted="false"]')).toBeTruthy();
   });
 
   it("highlights the code with Shiki after the lazy import resolves", async () => {
@@ -27,6 +28,7 @@ describe("CodeBlock — lazy Shiki highlighting", () => {
       { timeout: 10000 },
     );
 
+    expect(container.querySelector('[data-code-highlighted="true"]')).toBeTruthy();
     // The keyword and the literal end up in distinct tokens.
     expect(screen.getByText("const")).toBeTruthy();
     expect(screen.getByText("42")).toBeTruthy();

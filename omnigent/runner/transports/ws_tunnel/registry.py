@@ -37,8 +37,10 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Protocol
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     Frame,
     HelloFrame,
@@ -328,9 +330,14 @@ class TunnelRegistry:
                     "Deregistering runner %s; aborting %d in-flight request(s)",
                     runner_id,
                     in_flight_count,
+                    extra={"session_id": runner_primary_session_id()},
                 )
             else:
-                _logger.info("Deregistering runner %s; no in-flight requests", runner_id)
+                _logger.info(
+                    "Deregistering runner %s; no in-flight requests",
+                    runner_id,
+                    extra={"session_id": runner_primary_session_id()},
+                )
             self._abort_session_inflight(
                 removed,
                 ConnectionError("tunnel closed before request completed"),
@@ -341,12 +348,10 @@ class TunnelRegistry:
     @staticmethod
     def _abort_session_inflight(session: RunnerSession, error: BaseException) -> None:
         for state in list(session.in_flight.values()):
-            _call_soon_threadsafe(state, lambda state=state: _abort_request_state(state, error))
+            _call_soon_threadsafe(state, partial(_abort_request_state, state, error))
         session.in_flight.clear()
         for channel in list(session.ws_channels.values()):
-            _call_channel_soon_threadsafe(
-                channel, lambda ch=channel: ch.inbound_queue.put_nowait(None)
-            )
+            _call_channel_soon_threadsafe(channel, partial(channel.inbound_queue.put_nowait, None))
         session.ws_channels.clear()
 
     def get(self, runner_id: str) -> RunnerSession | None:
@@ -417,6 +422,7 @@ class TunnelRegistry:
                 overflow_reason,
                 runner_id,
                 timeout_s,
+                extra={"session_id": runner_primary_session_id()},
             )
             await asyncio.sleep(timeout_s)
             return self.get(runner_id)
@@ -662,6 +668,7 @@ class TunnelRegistry:
                     _logger.warning(
                         "ws-channel %s: dropping frame with malformed base64",
                         frame.ch_id,
+                        extra={"session_id": runner_primary_session_id()},
                     )
                     return False
                 item = ("data", decoded)
@@ -670,6 +677,7 @@ class TunnelRegistry:
                     "ws-channel %s: dropping frame with unknown encoding %r",
                     frame.ch_id,
                     frame.encoding,
+                    extra={"session_id": runner_primary_session_id()},
                 )
                 return False
 
@@ -852,6 +860,7 @@ def _resolve_connect_waiter(
             "Dropping runner-connect wakeup for closed waiter loop (runner_id=%s)",
             session.runner_id,
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
 
 
@@ -910,6 +919,7 @@ def _call_soon_threadsafe(state: RequestState, callback: Callable[[], None]) -> 
             "Dropping tunnel response wakeup for closed request loop (runner_id=%s)",
             state.session.runner_id,
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
         return False
     return True
@@ -939,6 +949,7 @@ def _call_channel_soon_threadsafe(
             "Dropping ws-channel wakeup for closed loop (runner_id=%s)",
             state.session.runner_id,
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
         return False
     return True

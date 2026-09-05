@@ -19,9 +19,9 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
 
 from omnigent._platform import stable_user_id
+from omnigent.json_types import JsonObject as _JsonObject
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_KIMI_NATIVE_BRIDGE_DIR"
@@ -35,7 +35,9 @@ _TMUX_FILE = "tmux.json"
 # PermissionRequest read-only surface).
 _HOOK_CONFIG_FILE = "hook_config.json"
 _TMUX_READY_TIMEOUT_S = 30.0
-_TMUX_SEND_TIMEOUT_S = 5.0
+# Per-command tmux budget. 10s matches every other native bridge: a tmux
+# server starved by parallel worker boots can stall past 5s while healthy.
+_TMUX_SEND_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.15
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 _PASTE_BUFFER = "omnigent-kimi-paste"
@@ -116,7 +118,7 @@ def write_hook_config(
     os.replace(tmp, bridge_dir / _HOOK_CONFIG_FILE)
 
 
-def read_hook_config(bridge_dir: Path) -> dict[str, Any]:
+def read_hook_config(bridge_dir: Path) -> _JsonObject:
     """Read Omnigent routing details for the kimi hook subprocess.
 
     :param bridge_dir: The kimi-native bridge dir.
@@ -153,7 +155,7 @@ def write_tmux_target(
 ) -> None:
     """Advertise the tmux socket + target for the running Kimi terminal."""
     _ensure_dir(bridge_dir)
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "socket_path": str(socket_path),
         "tmux_target": tmux_target,
         "updated_at": time.time(),

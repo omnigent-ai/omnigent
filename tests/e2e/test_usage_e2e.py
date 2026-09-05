@@ -18,7 +18,10 @@ import json
 import tarfile
 
 import httpx
+import pytest
 import yaml
+
+from omnigent import codex_native_forwarder
 
 _OWNER_EMAIL = "usage-owner@e2e.test"
 _AGENT_NAME = "e2e-usage-test"
@@ -54,6 +57,7 @@ def _create_session(client: httpx.Client, *, email: str) -> str:
     return resp.json()["session_id"]
 
 
+@pytest.mark.compat_smoke
 def test_usage_report_happy_path(http_client: httpx.Client) -> None:
     """The report is well-formed, windows are monotonic, and it lists the caller's session."""
     session_id = _create_session(http_client, email=_OWNER_EMAIL)
@@ -78,3 +82,40 @@ def test_usage_report_happy_path(http_client: httpx.Client) -> None:
     # No turn ran, so the fresh session is priced at zero with no per-model cost.
     assert by_id[session_id]["cost_usd"] == 0.0
     assert by_id[session_id]["models"] == {}
+
+
+@pytest.mark.compat_smoke
+def test_codex_effective_context_window_reaches_session_snapshot(
+    http_client: httpx.Client,
+) -> None:
+    """A Codex usage frame persists its effective window through the live server."""
+    session_id = _create_session(http_client, email=_OWNER_EMAIL)
+    usage_data = codex_native_forwarder._session_usage_data_from_params(
+        {
+            "tokenUsage": {
+                "modelContextWindow": 258_400,
+                "total": {
+                    "inputTokens": 206_533,
+                    "outputTokens": 1_000,
+                    "contextWindow": 1_050_000,
+                },
+                "last": {"inputTokens": 206_533},
+            },
+        }
+    )
+    assert usage_data is not None
+
+    resp = http_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_usage", "data": usage_data},
+        headers={"X-Forwarded-Email": _OWNER_EMAIL},
+    )
+    assert resp.status_code == 202, resp.text
+
+    snapshot = http_client.get(
+        f"/v1/sessions/{session_id}",
+        headers={"X-Forwarded-Email": _OWNER_EMAIL},
+    )
+    snapshot.raise_for_status()
+    assert snapshot.json()["last_total_tokens"] == 206_533
+    assert snapshot.json()["context_window"] == 258_400

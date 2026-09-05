@@ -35,11 +35,11 @@ const LINE_START_QUOTE = /(^|\n)>/g;
 interface SerializerInternals {
   /** Extension names whose nodes/marks are code contexts (no escaping). */
   codeTypes: Set<string>;
-  encodeTextForMarkdown(
+  encodeTextForMarkdown: (
     text: string,
     node: JSONContent,
     parentNode: JSONContent | undefined,
-  ): string;
+  ) => string;
 }
 
 /**

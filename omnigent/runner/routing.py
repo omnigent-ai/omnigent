@@ -23,8 +23,11 @@ from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec import AgentSpec
 
 if TYPE_CHECKING:
+    from omnigent.entities import Conversation
     from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
+    from omnigent.server.host_registry import HostRegistry
     from omnigent.stores import ConversationStore
+    from omnigent.stores.host_store import HostStore
 
 
 _EXECUTOR_TYPE_TO_HARNESS: dict[str, str] = {"claude_sdk": "claude-sdk"}
@@ -73,6 +76,18 @@ class RunnerRouter:
         ``WS /v1/runners/{runner_id}/tunnel``.
     :param conversation_store: Store used to read
         ``conversations.runner_id`` affinity.
+    :param host_registry: Per-replica host-tunnel registry. Tells a
+        wrong-replica miss (host not on this replica → ``WRONG_REPLICA``,
+        re-addressable without the key) from a genuinely offline runner
+        (``RUNNER_UNAVAILABLE``). See :meth:`_runner_absent_code`. ``None``
+        (single-replica / host support not wired) keeps every miss
+        ``RUNNER_UNAVAILABLE``.
+    :param host_store: Cross-replica host liveness. Paired with
+        ``host_registry``: a miss is ``WRONG_REPLICA`` only when the host
+        is absent here but live somewhere (``is_online``). Without it, a host
+        that just disconnected (reaped from the local registry, dead
+        everywhere) would be mislabeled re-addressable instead of
+        ``RUNNER_UNAVAILABLE``. ``None`` falls back to the registry-only check.
     """
 
     def __init__(
@@ -80,9 +95,13 @@ class RunnerRouter:
         *,
         registry: TunnelRegistry,
         conversation_store: ConversationStore,
+        host_registry: HostRegistry | None = None,
+        host_store: HostStore | None = None,
     ) -> None:
         self._registry = registry
         self._conversation_store = conversation_store
+        self._host_registry = host_registry
+        self._host_store = host_store
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._lock = threading.RLock()
 
@@ -108,14 +127,21 @@ class RunnerRouter:
         if conv is None:
             raise OmnigentError("conversation not found", code=ErrorCode.NOT_FOUND)
         if conv.runner_id:
-            return self._routed_pinned_runner(conv.runner_id, harness=harness)
+            return self._routed_pinned_runner(
+                conv.runner_id, harness=harness, host_id=conv.host_id
+            )
         raise OmnigentError(
             f"conversation {conversation_id!r} is not bound to a runner; "
             "resume the session to bind a registered runner",
             code=ErrorCode.CONFLICT,
         )
 
-    def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+    def client_for_session_resources(
+        self,
+        conversation_id: str,
+        *,
+        conversation: Conversation | None = None,
+    ) -> RoutedRunner:
         """
         Return a runner client for session resource access.
 
@@ -126,11 +152,19 @@ class RunnerRouter:
 
         :param conversation_id: Conversation/session id, e.g.
             ``"conv_0123456789abcdef"``.
+        :param conversation: An already-loaded conversation. Callers that
+            just authorized the session can pass it to avoid another read.
         :returns: Selected runner id and client.
         :raises OmnigentError: If the conversation is missing, the
             pinned runner is offline, or no online runner is available.
         """
-        conv = self._conversation_store.get_conversation(conversation_id)
+        conv = conversation
+        if conv is not None and conv.id != conversation_id:
+            raise ValueError(
+                f"conversation id mismatch: expected {conversation_id!r}, got {conv.id!r}"
+            )
+        if conv is None:
+            conv = self._conversation_store.get_conversation(conversation_id)
         if conv is None:
             raise OmnigentError("conversation not found", code=ErrorCode.NOT_FOUND)
         if conv.runner_id:
@@ -138,7 +172,7 @@ class RunnerRouter:
             if session is None:
                 raise OmnigentError(
                     f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
-                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                    code=self._runner_absent_code(conv.host_id),
                 )
             return RoutedRunner(
                 runner_id=conv.runner_id,
@@ -174,7 +208,7 @@ class RunnerRouter:
         if session is None:
             raise OmnigentError(
                 f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
+                code=self._runner_absent_code(conv.host_id),
             )
         return RoutedRunner(
             runner_id=conv.runner_id,
@@ -217,12 +251,17 @@ class RunnerRouter:
         for client in clients:
             await client.aclose()
 
-    def _routed_pinned_runner(self, runner_id: str, *, harness: str) -> RoutedRunner:
+    def _routed_pinned_runner(
+        self, runner_id: str, *, harness: str, host_id: str | None = None
+    ) -> RoutedRunner:
         """
         Return a routed runner after validating hard affinity.
 
         :param runner_id: Pinned runner UUID.
         :param harness: Harness kind requested by the agent spec.
+        :param host_id: The session's bound host, used to classify an
+            offline runner as wrong-replica vs genuinely gone. See
+            :meth:`_runner_absent_code`.
         :returns: Selected runner id and client.
         :raises OmnigentError: If the runner is offline or
             lacks the requested harness capability.
@@ -231,7 +270,7 @@ class RunnerRouter:
         if session is None:
             raise OmnigentError(
                 f"runner {runner_id!r} is offline; resume the session to bind a registered runner",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
+                code=self._runner_absent_code(host_id),
             )
         if not _runner_supports_harness(session, harness):
             raise OmnigentError(
@@ -239,6 +278,46 @@ class RunnerRouter:
                 code=ErrorCode.RUNNER_CAPABILITY_MISMATCH,
             )
         return RoutedRunner(runner_id=runner_id, client=self._client_for_runner(runner_id))
+
+    def _runner_absent_code(self, host_id: str | None) -> str:
+        """
+        Classify a "bound runner, but its tunnel isn't on this replica" miss.
+
+        A runner registers its tunnel on the same replica as its host, so
+        when a bound runner's tunnel is absent here, the host tells the two
+        failure modes apart:
+
+        - host set, absent from this replica's ``HostRegistry``, and still
+          live elsewhere (``host_store.is_online``) → wrong replica. Return
+          :data:`~ErrorCode.WRONG_REPLICA` so the client re-addresses without
+          the key and reaches the host via the default route.
+        - otherwise (no host, no registry/store wired, host is on this
+          replica, or host not live anywhere) → genuinely offline. Return
+          :data:`~ErrorCode.RUNNER_UNAVAILABLE`.
+
+        Both signals are needed: the local registry answers "is the host on
+        THIS replica"; the store answers "is it alive at all". Without the
+        liveness check, a host that just disconnected (reaped locally, dead
+        everywhere) would be mislabeled ``WRONG_REPLICA`` and trigger a
+        pointless re-address. This mirrors the HTTP wrong-replica guards
+        (send / stream / create). With no store wired, fall back to the
+        registry-only check — single-replica setups never misroute.
+
+        :param host_id: The session's bound host id, or ``None`` (hostless
+            local runner — always genuinely offline when its tunnel drops).
+        :returns: The error code string to raise.
+        """
+        if (
+            host_id
+            and self._host_registry is not None
+            and self._host_registry.get(host_id) is None
+        ):
+            # Absent locally: wrong replica only if the host is live elsewhere.
+            # No store wired → no liveness to consult, so keep the registry-only
+            # behavior (treat as wrong replica).
+            if self._host_store is None or self._host_store.is_online(host_id):
+                return ErrorCode.WRONG_REPLICA
+        return ErrorCode.RUNNER_UNAVAILABLE
 
     def _client_for_runner(self, runner_id: str) -> httpx.AsyncClient:
         """

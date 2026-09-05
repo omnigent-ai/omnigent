@@ -131,9 +131,11 @@ def _harnesses_body() -> str:
                     },
                     {
                         "kind": "auth",
-                        "title": "Sign in to Codex",
-                        "detail": "Uses your ChatGPT subscription — sign in on the host.",
-                        "action": "command",
+                        "title": "Set up authentication",
+                        "detail": (
+                            "Sign in with your ChatGPT subscription, an API key, or a gateway."
+                        ),
+                        "action": "auth",
                         "command": "codex login",
                         "status_key": "authed",
                     },
@@ -238,9 +240,10 @@ async def _drive_install(base_url: str) -> None:
             # picker: open it, wait for the Codex row to render (it mounts only
             # after the /v1/agents fetch resolves — can lag under CI load), then
             # click it. Only then does the composer show the "Set up Codex"
-            # notice for its unconfigured harness.
+            # notice for its unconfigured harness. Codex is a fully supported
+            # harness, so it lists inline even while it needs setup — no "More"
+            # drill-in.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await page.get_by_test_id("new-chat-landing-harness-more").click()
             codex_option = page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")
             await expect(codex_option).to_be_visible(timeout=60_000)
             await codex_option.click()
