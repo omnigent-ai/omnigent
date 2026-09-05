@@ -498,7 +498,8 @@ class _PiNativeLaunchConfig:
         the first message.
     :param model_override: Persisted per-session ``/model`` override, e.g.
         ``"claude-4.6-sonnet-medium"``; ``None`` when unset. Consumed by the
-        cursor-native launch (``--model``), ignored by pi-native.
+        cursor-native launch (``--model``) and by pi-native as the model
+        selection threaded into the launch.
     :param reasoning_effort: Persisted per-session effort, e.g. ``"high"``.
         Consumed by the pi-native launch as ``--thinking``; ``None`` leaves
         Pi's model default in place.
@@ -2183,13 +2184,15 @@ async def _auto_create_pi_terminal(
     # ``omnigent setup`` (Databricks gateway / API key), so a separate
     # ``pi /login`` isn't required — the parity codex-native/claude-native
     # already have. Skipped when the user pinned their own provider/model via
-    # terminal_launch_args, or when no usable provider is configured (Pi then
-    # falls back to its own login). Writes a managed per-session Pi config dir,
+    # terminal_launch_args. When no usable provider is configured Pi falls
+    # back to its own login, but a spec/session-pinned model still passes
+    # through as ``--model``. Writes a managed per-session Pi config dir,
     # never touching the user's global ``~/.pi/agent``.
     credential_warning: str | None = None
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
         from omnigent.pi_native_credentials import (
             pi_native_provider_launch,
+            pi_own_login_model_arg,
             resolve_pi_native_provider,
         )
 
@@ -2215,6 +2218,11 @@ async def _auto_create_pi_terminal(
                 or provider.credential_warning
                 or launch.effort_warning
             )
+        elif spec_model:
+            # No managed provider: Pi runs on its own login, but the pinned
+            # model must still reach it — without this the pick is silently
+            # dropped and Pi opens its own default model.
+            pi_args.extend(["--model", pi_own_login_model_arg(spec_model)])
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to

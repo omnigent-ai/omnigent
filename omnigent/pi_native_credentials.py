@@ -392,11 +392,88 @@ class PiProviderConfig:
         )
 
 
+def _global_pi_agent_dir() -> Path:
+    """Return Pi's own agent config root (``~/.pi/agent`` by default).
+
+    Honours Pi's ``PI_CODING_AGENT_DIR`` override so the pre-launch catalog
+    reads the same login the launched Pi would.
+    """
+    override = os.environ.get(PI_CODING_AGENT_DIR_ENV_VAR, "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".pi" / "agent"
+
+
+def _read_json_object(path: Path) -> dict[str, object]:
+    """Load a JSON object from *path*, returning ``{}`` when absent/invalid."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if _is_str_object_dict(raw) else {}
+
+
+def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, object]]:
+    """Enumerate the models Pi's own login can use (the unmanaged fallback).
+
+    When no omnigent-managed provider is configured, the launched Pi runs on
+    its own credentials, so the pre-launch picker must offer the models that
+    login can actually drive: Pi's ``models-store.json`` catalog filtered to
+    providers with an ``auth.json`` entry.
+
+    :param agent_dir: Pi agent dir override (tests); defaults to the host's
+        own Pi agent dir.
+    :returns: Picker options shaped like :func:`pi_native_model_options`,
+        qualified as ``provider/model`` — the reference form Pi's ``--model``
+        resolves natively against its own providers.
+    """
+    root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
+    logged_in = set(_read_json_object(root / "auth.json"))
+    if not logged_in:
+        return []
+    options: dict[str, dict[str, object]] = {}
+    for provider_id, payload in _read_json_object(root / "models-store.json").items():
+        if provider_id not in logged_in or not _is_str_object_dict(payload):
+            continue
+        models = payload.get("models")
+        for model in models if isinstance(models, list) else []:
+            if not _is_str_object_dict(model):
+                continue
+            model_id = model.get("id")
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            qualified = f"{provider_id}/{model_id}"
+            name = model.get("name")
+            options[qualified] = {
+                "id": qualified,
+                "model": qualified,
+                "displayName": name if isinstance(name, str) and name else model_id,
+            }
+    return [options[model_id] for model_id in sorted(options)]
+
+
+def pi_own_login_model_arg(selection: str) -> str:
+    """Return the ``--model`` value for a Pi running on its own login.
+
+    A managed ``provider/model`` picker value names a provider that does not
+    exist without omnigent-managed config, so only the model id survives; any
+    other reference (``anthropic/claude-...`` or a bare id) passes through
+    unchanged for Pi's own resolver.
+    """
+    split = _split_pi_native_model_selection(selection)
+    return split[1] if split is not None else selection
+
+
 def pi_native_model_options() -> list[dict[str, object]]:
-    """Return pre-launch Pi choices configured through ``omni setup``."""
+    """Return the pre-launch Pi model choices for this host.
+
+    Prefers the provider configured through ``omni setup``; when none is
+    configured the launched Pi runs on its own login, so that login's models
+    (:func:`pi_own_login_model_options`) are the honest catalog.
+    """
     provider = resolve_pi_native_provider()
     if provider is None:
-        return []
+        return pi_own_login_model_options()
 
     options: dict[str, dict[str, object]] = {}
     for provider_id, payload in provider.to_models_config()["providers"].items():

@@ -2266,3 +2266,86 @@ def test_cli_config_pi_provider_discovery_failure_falls_back_to_catalog_default(
     assert provider.model == "catalog-databricks-claude-default", (
         f"discovery failure must fall back to catalog default; got {provider.model!r}"
     )
+
+
+def _seed_pi_own_login(agent_dir: Path) -> None:
+    """Seed a Pi agent dir logged into anthropic, with an extra stale catalog."""
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "auth.json").write_text(
+        json.dumps({"anthropic": {"type": "api_key", "key": "sk-own"}})
+    )
+    (agent_dir / "models-store.json").write_text(
+        json.dumps(
+            {
+                "anthropic": {
+                    "models": [
+                        {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5"},
+                        {"id": "claude-haiku-4-5"},
+                    ],
+                    "checkedAt": 1750000000,
+                },
+                # A provider with cached models but NO auth.json entry: Pi
+                # can't drive it, so the picker must not offer it.
+                "openai": {"models": [{"id": "gpt-5.2", "name": "GPT 5.2"}]},
+            }
+        )
+    )
+
+
+def test_model_options_fall_back_to_pi_own_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no managed provider, the picker offers Pi's own logged-in models.
+
+    The launched Pi runs on its own login in that state, so the pre-launch
+    catalog is Pi's ``models-store.json`` filtered to logged-in providers,
+    qualified ``provider/model`` (the form Pi's ``--model`` resolves).
+    """
+    monkeypatch.setattr(creds, "resolve_pi_native_provider", lambda: None)
+    monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(tmp_path))
+    _seed_pi_own_login(tmp_path)
+
+    assert creds.pi_native_model_options() == [
+        {
+            "id": "anthropic/claude-haiku-4-5",
+            "model": "anthropic/claude-haiku-4-5",
+            "displayName": "claude-haiku-4-5",
+        },
+        {
+            "id": "anthropic/claude-sonnet-4-5",
+            "model": "anthropic/claude-sonnet-4-5",
+            "displayName": "Claude Sonnet 4.5",
+        },
+    ]
+
+
+def test_pi_own_login_options_empty_without_login(tmp_path: Path) -> None:
+    """No (or an empty) ``auth.json`` means nothing Pi can drive: empty catalog."""
+    assert creds.pi_own_login_model_options(agent_dir=tmp_path) == []
+    (tmp_path / "auth.json").write_text("{}")
+    (tmp_path / "models-store.json").write_text(
+        json.dumps({"anthropic": {"models": [{"id": "claude-sonnet-4-5"}]}})
+    )
+    assert creds.pi_own_login_model_options(agent_dir=tmp_path) == []
+
+
+def test_pi_own_login_options_tolerate_malformed_files(tmp_path: Path) -> None:
+    """Malformed auth/models-store files degrade to an empty catalog, never raise."""
+    (tmp_path / "auth.json").write_text("{not json")
+    (tmp_path / "models-store.json").write_text("[]")
+    assert creds.pi_own_login_model_options(agent_dir=tmp_path) == []
+
+
+def test_pi_own_login_model_arg_strips_managed_prefix_only() -> None:
+    """A managed provider-qualified pick degrades to the bare model id.
+
+    Without managed config the managed provider ids don't exist inside Pi, so
+    only the model survives; Pi-native references (``anthropic/...`` or a bare
+    id) pass through unchanged for Pi's own resolver.
+    """
+    assert creds.pi_own_login_model_arg("omnigent/claude-sonnet-4-6") == "claude-sonnet-4-6"
+    assert (
+        creds.pi_own_login_model_arg("anthropic/claude-sonnet-4-5")
+        == "anthropic/claude-sonnet-4-5"
+    )
+    assert creds.pi_own_login_model_arg("claude-sonnet-4-5") == "claude-sonnet-4-5"
