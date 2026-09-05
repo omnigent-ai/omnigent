@@ -16,6 +16,7 @@ import {
   isOwnerLevel,
   listPermissions,
   revokePermission,
+  workspaceSharingBlocked,
 } from "./permissionsApi";
 
 function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
@@ -28,6 +29,45 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 }
 
 const fetchMock = vi.fn();
+
+describe("workspaceSharingBlocked", () => {
+  it.each([
+    "/",
+    "/root",
+    "/root/",
+    "/home/alice",
+    "/Users/bob",
+    "/var/home/carol",
+    "/home/alice/",
+    "/home//alice/./",
+    "/home/alice/project/..",
+    "/tmp/../root",
+    "///home/alice",
+    "/../../",
+  ])("matches the server's blocked workspace predicate for %s", (workspace) => {
+    expect(workspaceSharingBlocked(workspace)).toBe(true);
+  });
+
+  it.each([
+    undefined,
+    null,
+    "",
+    "/home/alice/project",
+    "/Users/bob/code",
+    "/var/home/carol/repo",
+    "/root/project",
+    "/home",
+    "/var/home",
+    "/workspaces/omnigent",
+    "/srv/work",
+    "/tmp/session",
+    "relative/path",
+    "~",
+    "//home/alice",
+  ])("matches the server's shareable workspace predicate for %s", (workspace) => {
+    expect(workspaceSharingBlocked(workspace)).toBe(false);
+  });
+});
 
 beforeEach(() => {
   fetchMock.mockReset();
