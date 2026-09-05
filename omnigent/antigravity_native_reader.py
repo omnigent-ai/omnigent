@@ -85,16 +85,23 @@ from omnigent.antigravity_native_rpc import (
 # (relocated from the retired transcript forwarder). The reader reuses the SAME
 # event shape so the mapped events post identically.
 from omnigent.antigravity_native_steps import (
+    CASCADE_RUN_STATUS_IDLE,
     OutboundEvent,
     PendingInteraction,
     _execution_discriminator,
     _step_index,
     _tool_call_id,
     _trajectory_id,
+    cascade_is_idle,
+    is_assistant_text_close_step,
+    is_planner_error_step,
+    is_turn_close_step,
+    is_user_turn_step,
     map_step_to_events,
     output_reasoning_delta_event,
     output_text_delta_event,
     pending_interaction,
+    planner_response_text,
 )
 from omnigent.claude_native_bridge import url_component
 from omnigent.entities.session_resources import terminal_resource_id
@@ -168,10 +175,9 @@ _STATUS_IDLE = "idle"
 # agy's OWN per-cascade run status, published in every ``GetAllCascadeTrajectories``
 # summary. This is the authoritative "is this turn over" signal — the step-type
 # close detection below only INFERS it, and every agy step type it does not know
-# about is a turn that never closes. Live-verified against agy 1.1.8: RUNNING both
-# while working AND for the whole time a permission gate is parked (75s observed),
-# so IDLE never means "waiting for the human".
-_CASCADE_RUN_STATUS_IDLE = "CASCADE_RUN_STATUS_IDLE"
+# about is a turn that never closes. Defined in the mapper module (shared with the
+# write path's completion gate); re-exported here under the reader's private name.
+_CASCADE_RUN_STATUS_IDLE = CASCADE_RUN_STATUS_IDLE
 # Consecutive idle observations required before the backstop closes a turn. One
 # reading can catch the gap between delivering a turn and agy starting it.
 _QUIESCENT_TICKS_TO_CLOSE = 2
@@ -439,20 +445,15 @@ def _cascade_is_idle(summaries: dict[str, object], bound_cascade_id: str) -> boo
     """
     Whether agy itself reports the bound cascade as no longer running.
 
-    Reads :data:`_CASCADE_RUN_STATUS_IDLE` from the cascade's own summary rather
-    than inferring the turn's end from step types. Missing or malformed entries
-    are NOT idle: closing a turn on incomplete information would be worse than
-    leaving the step-based close to do it.
+    Thin alias for :func:`omnigent.antigravity_native_steps.cascade_is_idle`, the
+    shared implementation the write path's completion gate also consults.
 
     :param summaries: ``trajectorySummaries`` from
         :func:`~omnigent.antigravity_native_rpc.get_all_cascade_trajectories`.
     :param bound_cascade_id: The cascade this reader is bound to.
     :returns: ``True`` only on an explicit idle status for the bound cascade.
     """
-    summary = summaries.get(bound_cascade_id)
-    if not isinstance(summary, dict):
-        return False
-    return summary.get("status") == _CASCADE_RUN_STATUS_IDLE
+    return cascade_is_idle(summaries, bound_cascade_id)
 
 
 def _summary_is_child_trajectory(cascade_id: str, summary: dict[str, object]) -> bool:
@@ -612,59 +613,40 @@ def _is_user_turn_step(step: dict[str, object]) -> bool:
     """
     Return whether a step opens a turn (a USER_INPUT step).
 
-    The RPC equivalent of the transcript forwarder's
-    :func:`_is_turn_boundary_running`: a user input step starts a turn (agy then
-    runs the model + tools).
+    Thin alias for :func:`omnigent.antigravity_native_steps.is_user_turn_step`:
+    a user input step starts a turn (agy then runs the model + tools).
 
     :param step: One RPC step dict.
     :returns: ``True`` for a ``CORTEX_STEP_TYPE_USER_INPUT`` step.
     """
-    return step.get("type") == _TYPE_USER_INPUT
+    return is_user_turn_step(step)
 
 
 def _is_assistant_text_close_step(step: dict[str, object]) -> bool:
     """
     Return whether a step closes a turn (assistant text, no further tool calls).
 
-    The RPC equivalent of the transcript forwarder's
-    :func:`_is_assistant_text_step`: a PLANNER_RESPONSE that carries assistant
-    text (``modifiedResponse`` or ``response``) is the closing edge of a turn —
-    agy answered and stopped. A planner step that only invokes a tool does not
-    close the turn (the tool result, and possibly more planner steps, follow).
-
-    The TEXT is what separates the two: a dispatching planner carries none, in
-    either RPC shape. The ``toolCalls`` test below is a poll-shape-only
-    belt-and-braces guard for a planner that somehow carried both — it cannot
-    fire on the stream, where the field is stripped (see
-    :func:`_is_turn_close_step`).
+    Thin alias for
+    :func:`omnigent.antigravity_native_steps.is_assistant_text_close_step`, the
+    shared implementation the write path's completion gate also consults: a
+    PLANNER_RESPONSE that carries assistant text (``modifiedResponse`` or
+    ``response``) is the closing edge of a turn — agy answered and stopped. A
+    planner step that only invokes a tool does not close the turn (the tool
+    result, and possibly more planner steps, follow).
 
     :param step: One RPC step dict.
     :returns: ``True`` when the step is a DONE PLANNER_RESPONSE with non-empty
         text and an empty/absent ``toolCalls`` list.
     """
-    # The turn-close edge must fire only on the DONE closing step. A GENERATING
-    # planner frame already carries growing ``modifiedResponse`` text with no
-    # ``toolCalls`` yet, so without this gate ``_emit_step`` would fire the IDLE
-    # status edge mid-response (the spinner closes early) on the stream path.
-    if step.get("status") != _STATUS_DONE:
-        return False
-    if step.get("type") != _TYPE_PLANNER_RESPONSE:
-        return False
-    planner = step.get("plannerResponse")
-    if not isinstance(planner, dict):
-        return False
-    modified = planner.get("modifiedResponse")
-    response = planner.get("response")
-    text = modified if isinstance(modified, str) and modified else response
-    if not isinstance(text, str) or not text.strip():
-        return False
-    tool_calls = planner.get("toolCalls")
-    return not (isinstance(tool_calls, list) and tool_calls)
+    return is_assistant_text_close_step(step)
 
 
 def _is_turn_close_step(step: dict[str, object]) -> bool:
     """
     Return whether a step ends the current turn (fire the IDLE edge).
+
+    Thin alias for :func:`omnigent.antigravity_native_steps.is_turn_close_step`,
+    the shared implementation the write path's completion gate also consults.
 
     A turn opens on USER_INPUT and stays open until agy stops working. Exactly
     two steps close it:
@@ -695,11 +677,7 @@ def _is_turn_close_step(step: dict[str, object]) -> bool:
     :param step: One RPC step dict.
     :returns: ``True`` when this step ends the turn.
     """
-    if _is_assistant_text_close_step(step):
-        return True
-    if step.get("type") != _TYPE_PLANNER_RESPONSE:
-        return False
-    return step.get("status") == _STATUS_ERROR
+    return is_turn_close_step(step)
 
 
 def _status_event(status: str) -> OutboundEvent:
@@ -1995,16 +1973,7 @@ def _committed_planner_text(step: dict[str, object]) -> str | None:
     :returns: The committed assistant text, or ``None`` for a non-planner step or
         one carrying no text (an intermediate planner that only made tool calls).
     """
-    if step.get("type") != _TYPE_PLANNER_RESPONSE:
-        return None
-    planner = step.get("plannerResponse")
-    if not isinstance(planner, dict):
-        return None
-    for key in ("modifiedResponse", "response"):
-        text = planner.get(key)
-        if isinstance(text, str) and text:
-            return text
-    return None
+    return planner_response_text(step)
 
 
 async def _close_planner_delta_stream(
@@ -2309,12 +2278,14 @@ def _step_is_error_planner(step: dict[str, object]) -> bool:
     Return whether a step is a PLANNER_RESPONSE that ended in ERROR.
 
     Used to close the turn as ``failed`` (not ``idle``) so a model/turn error is
-    not mistaken for a clean empty reply.
+    not mistaken for a clean empty reply. Thin alias for
+    :func:`omnigent.antigravity_native_steps.is_planner_error_step`, which the
+    write path's completion gate consults for the same decision.
 
     :param step: One RPC step dict.
     :returns: ``True`` for an ERROR-status planner step.
     """
-    return step.get("type") == _TYPE_PLANNER_RESPONSE and step.get("status") == _STATUS_ERROR
+    return is_planner_error_step(step)
 
 
 def _maybe_handle_interaction(
