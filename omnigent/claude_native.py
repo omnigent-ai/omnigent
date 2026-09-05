@@ -87,6 +87,7 @@ from omnigent.claude_model_vocabulary import (
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
     claude_model_alias,
+    served_canonical_overrides,
 )
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -435,6 +436,27 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
         return True
     host = (urlparse(base_url).hostname or "").lower()
     return host == "anthropic.com" or host.endswith(".anthropic.com")
+
+
+def claude_native_model_overrides(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> dict[str, str]:
+    """Canonical-to-served rewrites for Claude Code's ``modelOverrides``.
+
+    Claude Code's refusal-fallback names a canonical vendor id from its own
+    route table. A gateway that serves Claude under its own ids rejects that
+    spelling (``model_not_found``). This map — derived from every Claude id
+    the endpoint serves — rewrites those ids to the gateway's spelling.
+    Empty when there is no config, the catalog was not enumerated, or the
+    endpoint already speaks canonical Anthropic ids (nothing to rewrite).
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :returns: Canonical id → served id, e.g.
+        ``{"claude-opus-4-8": "databricks-claude-opus-4-8"}``.
+    """
+    if claude_config is None or _serves_canonical_anthropic_ids(claude_config):
+        return {}
+    return served_canonical_overrides(claude_config.routable_models)
 
 
 def _claude_family(token: str) -> str | None:
@@ -5951,6 +5973,7 @@ def _claude_terminal_request(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
+        model_overrides=claude_native_model_overrides(claude_config),
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
     )

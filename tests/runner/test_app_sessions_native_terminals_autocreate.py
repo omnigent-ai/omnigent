@@ -1078,6 +1078,11 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         env=dict(gateway_env),
         api_key_helper="printf %s sk-sentinel-do-not-use",
         model="databricks-claude-opus-4-7",
+        routable_models=(
+            "databricks-claude-opus-4-7",
+            "databricks-claude-opus-4-8",
+            "databricks-claude-sonnet-5",
+        ),
     )
     # The runner imports ``_ucode_config_for_profile`` from
     # ``omnigent.claude_native`` per call, so patch it at the source.
@@ -1148,6 +1153,11 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     assert all("sk-sentinel-do-not-use" not in arg for arg in spec.args)
     settings = _load_claude_invocation_settings(spec.args)
     assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
+    assert settings["modelOverrides"] == {
+        "claude-opus-4-7": "databricks-claude-opus-4-7",
+        "claude-opus-4-8": "databricks-claude-opus-4-8",
+        "claude-sonnet-5": "databricks-claude-sonnet-5",
+    }
     assert recorded_configs == {"13efa494411f3ae60211e6be5635062a": ucode}
 
     await fake_client.aclose()

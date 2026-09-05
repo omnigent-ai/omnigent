@@ -2816,6 +2816,35 @@ def test_augment_claude_args_materializes_api_key_helper(
     assert settings_path.stat().st_mode & 0o777 == 0o600
 
 
+def test_augment_claude_args_threads_model_overrides_into_settings(tmp_path: Path) -> None:
+    """``model_overrides`` is written into the invocation-local sidecar.
+
+    The ~30 existing ``augment_claude_args`` call sites stay valid because
+    the argument is optional; this is the one site that opts in.
+    """
+    overrides = {
+        "claude-opus-4-8": "databricks-claude-opus-4-8",
+        "claude-opus-5": "databricks-claude-opus-5",
+    }
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        api_key_helper="printf tok",
+        model_overrides=overrides,
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings["apiKeyHelper"] == "printf tok"
+    assert settings["modelOverrides"] == overrides
+
+
+def test_augment_claude_args_omits_model_overrides_when_unsupplied(tmp_path: Path) -> None:
+    """Existing call sites that omit ``model_overrides`` write no such key."""
+    settings = _load_invocation_settings(augment_claude_args((), bridge_dir=tmp_path))
+    assert "modelOverrides" not in settings
+
+
 def test_augment_claude_args_mirrors_launch_overrides_into_settings(
     tmp_path: Path,
 ) -> None:

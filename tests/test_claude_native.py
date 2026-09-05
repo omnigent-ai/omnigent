@@ -256,6 +256,108 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
     assert all("sk-sentinel-do-not-use" not in arg for arg in args)
     assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
     assert "hooks" in settings
+    assert "modelOverrides" not in settings
+
+
+def test_claude_native_model_overrides_map_routable_models_to_canonical_ids() -> None:
+    """Every served Claude spelling becomes reachable by its canonical id.
+
+    ``routable_models`` already carries the endpoint's full listing; the
+    map is that listing inverted, so whichever generation the CLI's
+    refusal route table names is rewritten to something the gateway
+    answers. The ``opus`` alias pin (newest served Opus) is left alone.
+    """
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
+        api_key_helper="printf token",
+        model="databricks-claude-opus-5",
+        routable_models=(
+            "databricks-claude-opus-5",
+            "databricks-claude-opus-4-8",
+            "databricks-claude-sonnet-5",
+            "databricks-claude-haiku-4-5",
+            "databricks-gpt-5-6",
+        ),
+    )
+
+    assert claude_native.claude_native_model_overrides(config) == {
+        "claude-opus-5": "databricks-claude-opus-5",
+        "claude-opus-4-8": "databricks-claude-opus-4-8",
+        "claude-sonnet-5": "databricks-claude-sonnet-5",
+        "claude-haiku-4-5": "databricks-claude-haiku-4-5",
+    }
+
+
+def test_claude_native_model_overrides_empty_when_endpoint_serves_canonical_ids() -> None:
+    """A direct Anthropic endpoint already speaks the ids Claude Code names."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+        api_key_helper="printf %s sk-ant-test",
+        model="claude-sonnet-4-6",
+        routable_models=("claude-sonnet-4-6", "claude-opus-4-8"),
+    )
+
+    assert claude_native.claude_native_model_overrides(config) == {}
+    assert claude_native.claude_native_model_overrides(None) == {}
+    assert (
+        claude_native.claude_native_model_overrides(
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"},
+                routable_models=(),
+            )
+        )
+        == {}
+    )
+
+
+def test_claude_terminal_request_threads_model_overrides_into_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI terminal launch writes ``modelOverrides`` into the sidecar."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
+        api_key_helper="printf token",
+        model="databricks-claude-opus-5",
+        routable_models=(
+            "databricks-claude-opus-5",
+            "databricks-claude-opus-4-8",
+        ),
+    )
+
+    body = claude_native._claude_terminal_request(
+        ("--print", "hi"),
+        command="claude",
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+        claude_config=config,
+    )
+
+    settings = _load_invocation_settings(body["spec"]["args"])
+    assert settings["modelOverrides"] == {
+        "claude-opus-5": "databricks-claude-opus-5",
+        "claude-opus-4-8": "databricks-claude-opus-4-8",
+    }
+
+
+def test_claude_terminal_request_omits_model_overrides_on_canonical_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A canonical-id endpoint writes no ``modelOverrides`` key."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+        api_key_helper="printf %s sk-ant-test",
+        model="claude-sonnet-4-6",
+        routable_models=("claude-sonnet-4-6",),
+    )
+
+    body = claude_native._claude_terminal_request(
+        ("--print", "hi"),
+        command="claude",
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+        claude_config=config,
+    )
+
+    settings = _load_invocation_settings(body["spec"]["args"])
+    assert "modelOverrides" not in settings
 
 
 def test_claude_terminal_request_preserves_user_model_arg(tmp_path, monkeypatch) -> None:
