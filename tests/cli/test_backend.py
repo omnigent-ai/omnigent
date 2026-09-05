@@ -1682,6 +1682,120 @@ def test_host_stop_force_terminates_after_session_list_timeout(
     assert "sessions_stopped=0" in result.output
 
 
+def test_host_stop_unreachable_server_degrades_to_daemon_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A dead server must not block a plain ``host stop``.
+
+    When the session-list preflight hits connection refused, the server is
+    gone and holds no sessions to stop; the stop should degrade to
+    terminating the daemon instead of failing and stranding it until the
+    user discovers ``--force``.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    # Identity normalization: the workspace-URL expansion probes the
+    # network and has dedicated tests.
+    monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: cli._HostHttpResult(
+            status_code=0,
+            body="ConnectError: [Errno 111] Connection refused",
+            unreachable=True,
+        ),
+    )
+    terminated: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: terminated.append(record.target),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert terminated == ["https://server.example.com"]
+    assert "sessions_stopped=0" in result.output
+    assert "skipping session stop" in result.output
+
+
+def test_host_stop_undiscoverable_local_server_degrades_to_daemon_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A local daemon whose server vanished still stops without ``--force``.
+
+    A local-mode record with no healthy server to discover means the
+    detached server is gone; a plain ``host stop`` should still terminate
+    the daemon rather than error out.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+    )
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: pytest.fail(f"unexpected HTTP call: {kwargs}"),
+    )
+    terminated: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: terminated.append(record.target),
+    )
+
+    result = CliRunner().invoke(cli_group, ["host", "stop", "--server", ""])
+
+    assert result.exit_code == 0, result.output
+    assert terminated == ["local"]
+    assert "sessions_stopped=0" in result.output
+
+
+def test_host_http_json_marks_connection_refused_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connect failure is classified unreachable; the result carries it.
+
+    Binds and releases a loopback port so nothing is listening, then
+    requests it: the ``ConnectError`` must surface as ``status_code=0``
+    with ``unreachable=True`` (a timeout or HTTP error must not).
+    """
+    import socket
+
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr(cli, "_host_http_headers_cache", {})
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    result = cli._host_http_json(
+        base_url=f"http://127.0.0.1:{port}",
+        method="GET",
+        path="/v1/sessions",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    assert result.unreachable is True
+    assert "ConnectError" in str(result.body)
+
+
 def test_host_stop_session_stops_only_named_sessions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
