@@ -195,6 +195,8 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
         conversation_id: str,
         terminal_name: str,
         session_key: str,
+        *,
+        expected: TerminalInstance | None = None,
     ) -> bool:
         """
         Remove the fake terminal from the registry.
@@ -202,9 +204,12 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
         :param conversation_id: Owning session id, e.g. ``"conv_codex"``.
         :param terminal_name: Terminal name, e.g. ``"codex"``.
         :param session_key: Terminal session key, e.g. ``"main"``.
+        :param expected: Compare-and-close guard (mirrors the real signature).
         :returns: ``True`` when the fake terminal existed.
         """
         slot = terminal_registry._by_conversation.get(conversation_id, {})
+        if expected is not None and slot.get((terminal_name, session_key)) is not expected:
+            return False
         return slot.pop((terminal_name, session_key), None) is not None
 
     monkeypatch.setattr(terminal_registry, "launch", _fake_launch)
@@ -226,6 +231,72 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
 
     assert closed is True
     assert registry.terminal_resource_role("conv_codex", view.id) is None
+
+
+@pytest.mark.asyncio
+async def test_close_terminal_expected_spares_a_successor_and_its_role(
+    tmp_path: Path,
+) -> None:
+    """
+    ``close_terminal(expected=...)`` retracts only the observed instance.
+
+    The idle pane reaper closes off a snapshot: while its slow close awaits, a
+    replacement terminal can take the same terminal id. Closing by id alone
+    would remove that live successor — and popping the id-keyed role marker
+    would strand it as a generic terminal. The compare-and-close must report
+    nothing closed and leave the successor's role intact.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    :returns: None.
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    stale = make_test_terminal_instance("codex", "main", tmp_path)
+    successor = make_test_terminal_instance("codex", "main", tmp_path / "successor")
+    terminal_id = "terminal_codex_main"
+
+    # The successor has taken the key the stale instance used to hold.
+    terminal_registry._by_conversation["conv_codex"] = {("codex", "main"): successor}
+    with registry._lock:
+        registry._terminal_roles[("conv_codex", terminal_id)] = CODEX_NATIVE_TERMINAL_ROLE
+
+    closed = await registry.close_terminal("conv_codex", terminal_id, expected=stale)
+
+    assert closed is False, "compare-and-close must report that nothing was closed"
+    assert successor.running is True
+    assert terminal_registry.get("conv_codex", "codex", "main") is successor
+    assert registry.terminal_resource_role("conv_codex", terminal_id) == (
+        CODEX_NATIVE_TERMINAL_ROLE
+    ), "the successor's role marker must survive a stale close attempt"
+
+
+@pytest.mark.asyncio
+async def test_close_terminal_expected_closes_the_instance_it_observed(
+    tmp_path: Path,
+) -> None:
+    """
+    ``close_terminal(expected=...)`` still closes when the id holds that instance.
+
+    The common reap path (no replacement raced in) must keep working: the
+    observed instance is closed and its role marker is dropped.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    :returns: None.
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    mine = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_id = "terminal_codex_main"
+
+    terminal_registry._by_conversation["conv_codex"] = {("codex", "main"): mine}
+    with registry._lock:
+        registry._terminal_roles[("conv_codex", terminal_id)] = CODEX_NATIVE_TERMINAL_ROLE
+
+    closed = await registry.close_terminal("conv_codex", terminal_id, expected=mine)
+
+    assert closed is True
+    assert terminal_registry.get("conv_codex", "codex", "main") is None
+    assert registry.terminal_resource_role("conv_codex", terminal_id) is None
 
 
 @pytest.mark.asyncio

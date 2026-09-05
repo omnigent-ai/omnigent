@@ -11534,12 +11534,12 @@ def create_runner_app(
 
         def _native_panes_for_reaper() -> list[PaneRef]:
             panes: list[PaneRef] = []
-            for conv_id, name, socket_path in _pane_reaper_registry.native_panes():
+            for conv_id, name, socket_path, instance in _pane_reaper_registry.native_panes():
                 terminal_id = terminal_resource_id(name, "main")
                 if is_native_harness(
                     resource_registry.terminal_resource_role(conv_id, terminal_id)
                 ):
-                    panes.append(PaneRef(conv_id, terminal_id, name, socket_path))
+                    panes.append(PaneRef(conv_id, terminal_id, name, socket_path, instance))
             return panes
 
         async def _native_pane_is_busy(pane: PaneRef) -> bool:
@@ -11566,20 +11566,39 @@ def create_runner_app(
 
         async def _reap_native_pane(pane: PaneRef) -> None:
             try:
-                await resource_registry.close_terminal(pane.conversation_id, pane.terminal_id)
+                # Retract only the instance this reap observed: a slow close
+                # frees the key mid-await, and the next message can install a
+                # replacement under the same key before this returns.
+                await resource_registry.close_terminal(
+                    pane.conversation_id, pane.terminal_id, expected=pane.instance
+                )
             finally:
                 # Closing the codex TUI pane leaves its per-session app-server
                 # (and forwarder) running — no-op for other harnesses. Tear it
                 # down in ``finally`` so an idle-reaped codex session can't orphan
                 # a ``codex app-server`` for the runner's lifetime even when the
                 # pane close above partially fails (the very leak this guards).
-                await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
-                _publish_terminal_deleted_event(
-                    conversation_id=pane.conversation_id,
-                    terminal_name=pane.terminal_name,
-                    session_key="main",
-                    publish_event=_publish_event,
+                # Skip when a successor holds the key: the session-keyed codex
+                # resources (and the terminal resource id) now belong to that
+                # live replacement, not to the stale pane this reap observed.
+                successor = _pane_reaper_registry.get(
+                    pane.conversation_id, pane.terminal_name, "main"
                 )
+                if successor is not None and successor is not pane.instance:
+                    _logger.info(
+                        "Skipping codex teardown for reaped pane superseded by a "
+                        "replacement: session=%s terminal=%s",
+                        pane.conversation_id,
+                        pane.terminal_name,
+                    )
+                else:
+                    await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
+                    _publish_terminal_deleted_event(
+                        conversation_id=pane.conversation_id,
+                        terminal_name=pane.terminal_name,
+                        session_key="main",
+                        publish_event=_publish_event,
+                    )
 
         app.state.native_pane_reaper = NativePaneReaper(
             list_native_panes=_native_panes_for_reaper,

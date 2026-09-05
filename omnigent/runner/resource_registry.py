@@ -1487,11 +1487,18 @@ class SessionResourceRegistry:
         self,
         session_id: str,
         terminal_id: str,
+        *,
+        expected: TerminalInstance | None = None,
     ) -> bool:
         """Close a terminal resource by id.
 
         :param session_id: Session/conversation identifier.
         :param terminal_id: Opaque terminal resource id.
+        :param expected: When given, close only if this exact instance still
+            holds the id. A caller acting on a snapshot (the idle pane reaper)
+            must pass the instance it observed: the id can have been reassigned
+            to a successor in the meantime, and closing by id alone would
+            terminate that live replacement instead.
         :returns: ``True`` if a terminal was closed.
         """
         if self._terminal_registry is None:
@@ -1505,8 +1512,16 @@ class SessionResourceRegistry:
                     session_id,
                     entry.terminal_name,
                     entry.session_key,
+                    expected=expected,
                 )
-                if closed:
+                if closed and (
+                    self._terminal_registry.get(session_id, entry.terminal_name, entry.session_key)
+                    is None
+                ):
+                    # Drop the id-keyed markers only when nothing holds the key
+                    # anymore: a replacement installed during the close await
+                    # re-registered its own role/lifecycle under this same id,
+                    # and popping them would strand that live successor.
                     with self._lock:
                         self._terminal_roles.pop((session_id, terminal_id), None)
                         self._terminal_lifecycles.pop((session_id, terminal_id), None)
