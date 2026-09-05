@@ -1850,13 +1850,22 @@ aside[aria-label="Workspace"][data-maximized] {
 .turn-fold-content-instant[data-state="open"] {
   animation: none;
 }
+/* The trace stays mounted while folded (TurnWorkedFold passes forceMount
+   and hides settled-closed content with the `hidden` attribute). `forwards`
+   holds the collapsed height in the gap between the animation's last frame
+   and that hide landing, so the kept content can never flash back in. */
 .turn-fold-content[data-state="closed"] {
-  animation: turn-fold-collapse 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  animation: turn-fold-collapse 200ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
 }
 @media (prefers-reduced-motion: reduce) {
   .turn-fold-content[data-state="open"],
   .turn-fold-content[data-state="closed"] {
     animation: none;
+  }
+  /* No collapse animation to wait for: hide the kept trace immediately
+     instead of letting it linger until the JS fallback fires. */
+  .turn-fold-content[data-state="closed"] {
+    display: none;
   }
 }
 /* The summary row grows in over the same beat as the trace shrinks.
