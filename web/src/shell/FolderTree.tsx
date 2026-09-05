@@ -1,5 +1,6 @@
 import { ChevronRightIcon, FileIcon } from "lucide-react";
-import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { RefObject } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   type DirectoryResult,
@@ -361,6 +362,7 @@ export function FolderTree({
   searchError = null,
   browseLocation = "",
   onNavigateDir,
+  scrollParentRef,
 }: {
   files: WorkspaceFile[] | undefined;
   isLoading: boolean;
@@ -401,6 +403,15 @@ export function FolderTree({
    * matching Finder; a single click still just expands in place.
    */
   onNavigateDir?: (relativePath: string) => void;
+  /**
+   * The scroll container the tree lives in (FilesPanel's `<section>`). When
+   * provided, the virtualizer windows rows against THIS element so it shares
+   * one scroller with the panel's scroll-position persistence — rather than a
+   * second nested scroll container the restore logic wouldn't track. When
+   * omitted (tests, stories, standalone card mode), the tree falls back to its
+   * own internal scroll container.
+   */
+  scrollParentRef?: RefObject<HTMLElement | null>;
 }) {
   // Initialise from the module-level cache so expanded state survives
   // unmount/remount (e.g. opening the FileViewer and navigating back).
@@ -491,19 +502,24 @@ export function FolderTree({
 
   // Fetch every expanded lazy directory's listing centrally (not per row), so
   // rows the virtualizer scrolls out of view can unmount without dropping their
-  // fetch. The needed-path set is derived from the PREVIOUS render's data (via
-  // the ref) to break the paths↔data cycle within one render; deeper lazy dirs
-  // are discovered on the next render as their parents' listings land.
-  const dirDataRef = useRef<Map<string, DirectoryResult>>(new Map());
-  const lazyPaths = useMemo(
-    () =>
-      visibleTree
-        ? expandedLazyPaths(visibleTree, expandedPaths, showHidden, sort, dirDataRef.current)
-        : [],
-    [visibleTree, expandedPaths, showHidden, sort],
-  );
+  // fetch. The set of paths to fetch is grown in state to a fixpoint: each pass
+  // descends only into expanded lazy dirs whose parent listing is already in
+  // `dirData`, so as one level's fetch lands the effect widens the set by the
+  // next level, until it stops changing. Holding it in state (rather than
+  // deriving it inline from a lagging ref) guarantees a real re-render drives
+  // each widening step — so a restored/re-rooted multi-level expansion resolves
+  // all the way down, and it converges the same whether listings arrive async
+  // or are already cached.
+  const [lazyPaths, setLazyPaths] = useState<string[]>([]);
   const dirData = useWorkspaceDirectories(conversationId, lazyPaths, browseLocation);
-  dirDataRef.current = dirData;
+  useEffect(() => {
+    const next = visibleTree
+      ? expandedLazyPaths(visibleTree, expandedPaths, showHidden, sort, dirData)
+      : [];
+    setLazyPaths((prev) =>
+      prev.length === next.length && prev.every((p, i) => p === next[i]) ? prev : next,
+    );
+  }, [visibleTree, expandedPaths, showHidden, sort, dirData]);
 
   // Flatten the visible tree into linear rows for the virtualizer.
   const flatRows = useMemo<FlatRow[]>(
@@ -512,11 +528,14 @@ export function FolderTree({
     [visibleTree, expandedPaths, showHidden, sort, dirData],
   );
 
-  // Virtualized scroller: window the flat rows so only the visible slice mounts.
-  const scrollRef = useRef<HTMLDivElement>(null);
+  // Virtualized scroller: window the flat rows against the panel's own scroll
+  // container when one is passed in (so windowing and scroll-position
+  // persistence share one scroller), else against a fallback internal one.
+  const ownScrollRef = useRef<HTMLDivElement>(null);
+  const scrollElementRef = scrollParentRef ?? ownScrollRef;
   const rowVirtualizer = useVirtualizer({
     count: flatRows.length,
-    getScrollElement: () => scrollRef.current,
+    getScrollElement: () => scrollElementRef.current,
     estimateSize: () => 28,
     overscan: 12,
     getItemKey: (index) => flatRows[index]?.key ?? index,
@@ -607,50 +626,59 @@ export function FolderTree({
     );
   }
   const virtualItems = rowVirtualizer.getVirtualItems();
+  // Spacer sized to the full row count so the scroll container scrolls the whole
+  // tree; only the windowed slice is mounted, positioned absolutely by
+  // translateY.
+  const spacer = (
+    <div className="relative w-full" style={{ height: `${rowVirtualizer.getTotalSize()}px` }}>
+      {virtualItems.map((vi) => {
+        const row = flatRows[vi.index];
+        if (!row) return null;
+        return (
+          <div
+            key={vi.key}
+            data-index={vi.index}
+            ref={rowVirtualizer.measureElement}
+            className="absolute top-0 left-0 w-full"
+            style={{ transform: `translateY(${vi.start}px)` }}
+          >
+            {row.kind === "placeholder" ? (
+              <p
+                className="relative py-1 pr-2 text-muted-foreground text-sm"
+                style={{ paddingLeft: `${indentFor(row.depth)}px` }}
+              >
+                <IndentGuides depth={row.depth} />
+                {row.text}
+              </p>
+            ) : (
+              <TreeNodeRow
+                node={row.node}
+                depth={row.depth}
+                open={row.open}
+                onFileSelect={onFileSelect}
+                conversationId={conversationId}
+                onTogglePath={togglePath}
+                changedFileMap={changedFileMap}
+                dirtyDirMap={dirtyDirMap}
+                onNavigateDir={onNavigateDir}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
   return (
     <TooltipProvider>
-      {/* The scroll container the virtualizer measures. The inner spacer is
-          sized to the full row count; only the windowed slice is mounted and
-          positioned absolutely by translateY. */}
-      <div ref={scrollRef} className="h-full overflow-y-auto">
-        <div className="relative w-full" style={{ height: `${rowVirtualizer.getTotalSize()}px` }}>
-          {virtualItems.map((vi) => {
-            const row = flatRows[vi.index];
-            if (!row) return null;
-            return (
-              <div
-                key={vi.key}
-                data-index={vi.index}
-                ref={rowVirtualizer.measureElement}
-                className="absolute top-0 left-0 w-full"
-                style={{ transform: `translateY(${vi.start}px)` }}
-              >
-                {row.kind === "placeholder" ? (
-                  <p
-                    className="relative py-1 pr-2 text-muted-foreground text-sm"
-                    style={{ paddingLeft: `${indentFor(row.depth)}px` }}
-                  >
-                    <IndentGuides depth={row.depth} />
-                    {row.text}
-                  </p>
-                ) : (
-                  <TreeNodeRow
-                    node={row.node}
-                    depth={row.depth}
-                    open={row.open}
-                    onFileSelect={onFileSelect}
-                    conversationId={conversationId}
-                    onTogglePath={togglePath}
-                    changedFileMap={changedFileMap}
-                    dirtyDirMap={dirtyDirMap}
-                    onNavigateDir={onNavigateDir}
-                  />
-                )}
-              </div>
-            );
-          })}
+      {/* When the panel owns the scroller (scrollParentRef), render the spacer
+          straight into it; otherwise provide a fallback scroll container. */}
+      {scrollParentRef ? (
+        spacer
+      ) : (
+        <div ref={ownScrollRef} className="h-full overflow-y-auto">
+          {spacer}
         </div>
-      </div>
+      )}
     </TooltipProvider>
   );
 }

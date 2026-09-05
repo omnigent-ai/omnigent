@@ -236,14 +236,7 @@ export function FilesPanel({
   onClose,
   frameless,
 }: FilesPanelProps) {
-  const { conversationId: urlConversationId } = useParams<{ conversationId: string }>();
-  // Defer the id the whole files/changes view keys off, so a conversation
-  // switch commits the cheap parts (sidebar highlight, header, composer)
-  // immediately and the expensive tree render happens in a non-blocking
-  // follow-up pass — React discards it if you switch again first. Only this
-  // panel lags; the main chat area and composer stay on the immediate id, so
-  // nothing desyncs. Everything below reads `conversationId`.
-  const conversationId = useDeferredValue(urlConversationId);
+  const { conversationId } = useParams<{ conversationId: string }>();
   // The runner went offline (e.g. its host restarted): `sessionStatus`
   // is "failed", set by `_on_runner_disconnect` server-side when the
   // runner's tunnel drops (and also client-side in chatStore when the
@@ -347,6 +340,13 @@ export function FilesPanel({
   }
 
   const allFilesQuery = useWorkspaceAllFiles(conversationId, { enabled: !flatView }, locationParam);
+  // Defer only the tree's file rows, not the panel's identity. On a conversation
+  // switch the heavy FolderTree render then happens in a non-blocking follow-up
+  // pass (React discards it if you switch again first), while conversationId,
+  // locationParam, and onFileSelect stay immediate — so a click during the lag
+  // resolves against the current conversation, never opens the previous one's
+  // file under the new session.
+  const deferredTreeFiles = useDeferredValue(allFilesQuery.data?.data);
   // A refused location must say so on the bar. Rendering an empty tree instead
   // would read as "this directory is empty", which is a different fact.
   const unreachable =
@@ -582,7 +582,7 @@ export function FilesPanel({
           />
         ) : (
           <FolderTree
-            files={allFilesQuery.data?.data}
+            files={deferredTreeFiles}
             isLoading={allFilesQuery.isLoading}
             isError={allFilesQuery.isError}
             error={allFilesQuery.error}
@@ -600,6 +600,7 @@ export function FilesPanel({
             searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}
             browseLocation={locationParam}
             onNavigateDir={navigateToChild}
+            scrollParentRef={scrollRef}
           />
         )}
       </section>

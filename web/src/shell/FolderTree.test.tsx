@@ -4,7 +4,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+
+// Drive lazy-directory listings from a fixture so the tree's central
+// `useWorkspaceDirectories` controller resolves nested lazy dirs without a
+// network. `lazyChildren` maps a dir path to the entries the "runner" would
+// return; the hook returns a Map only for the paths the tree currently asks
+// for, so descending into a deeper level requires the shallower level's data
+// to already be present — exactly the incremental-widening path.
+const { lazyChildren } = vi.hoisted(() => ({ lazyChildren: new Map<string, unknown[]>() }));
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
+  useWorkspaceDirectories: (_c: string | undefined, dirPaths: string[]) => {
+    const map = new Map();
+    for (const p of dirPaths) {
+      map.set(p, { data: lazyChildren.get(p), isLoading: !lazyChildren.has(p) });
+    }
+    return map;
+  },
+}));
 import { RunnerOfflineError, type WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import {
   ROW_ACTION_SIZE_CLASS,
   ROW_META_SLOT_CLASS,
@@ -267,5 +286,36 @@ describe("FolderTree double-click to open a folder", () => {
     fireEvent.doubleClick(folder);
 
     expect(folder).toBeInTheDocument();
+  });
+});
+
+describe("FolderTree nested lazy loading", () => {
+  beforeEach(() => lazyChildren.clear());
+
+  it("loads a deep lazy level on a restored multi-level expansion (no per-level clicks)", async () => {
+    // Regression guard for B1. The bug only shows on RESTORE/RE-ROOT, where a
+    // multi-level expansion is seeded at once rather than clicked open level by
+    // level — interactive expansion masks it, because each click mutates
+    // expandedPaths and re-runs the fetch-set computation anyway. Here we build
+    // the expansion with clicks (which caches src + src/deep as expanded), then
+    // REMOUNT: the fresh tree seeds both expanded paths from the cache in one
+    // shot, and its fetch set starts from nothing. The controller must widen
+    // past the first level on its own as src's listing lands, or src/deep never
+    // fetches and renders as an empty folder. A fetch-set computation that
+    // ignores freshly-arrived data resolves only src and leaves leaf.ts missing.
+    const conversationId = "conv_restore_deep";
+    lazyChildren.set("src", [dir("src/deep")]);
+    lazyChildren.set("src/deep", [file("src/deep/leaf.ts", 42)]);
+
+    const { unmount } = renderTree({ files: [dir("src")], conversationId });
+    fireEvent.click(screen.getByRole("button", { name: "src/" }));
+    fireEvent.click(await screen.findByRole("button", { name: "deep/" }));
+    expect(await screen.findByText("leaf.ts")).toBeInTheDocument();
+
+    // Restore: remount the same conversation. Expansion comes back from the
+    // cache with no clicks; the deep level must fetch and render on its own.
+    unmount();
+    renderTree({ files: [dir("src")], conversationId });
+    expect(await screen.findByText("leaf.ts")).toBeInTheDocument();
   });
 });
