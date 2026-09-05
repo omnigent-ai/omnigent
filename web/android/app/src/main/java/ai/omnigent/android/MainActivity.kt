@@ -57,6 +57,11 @@ class MainActivity : AppCompatActivity() {
     private var pendingNavigatePath: String? = null
     private var lastInsets: Insets? = null
     private var pageLoaded = false
+
+    // True between onStop and onStart. A deep link arriving while stopped is
+    // held for onStart, which emits it after resumeTimers() so the JS side is
+    // guaranteed to be running.
+    private var stopped = false
     private var bridgeTransportInstalled = false
     private var bridgeScriptHandler: ScriptHandler? = null
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
@@ -277,7 +282,49 @@ class MainActivity : AppCompatActivity() {
         )
 
         ensureNotificationPermission()
+        // Interim background-poll notifications: fire local notifications when a
+        // session finishes or raises a prompt while the app isn't foregrounded.
+        // Idempotent (KEEP), so scheduling every launch is safe.
+        SessionPollScheduler.ensureScheduled(applicationContext)
         webView.loadUrl(serverUrl)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        stopped = true
+        // Background poller resumes posting once the SPA is off-screen.
+        val appLeftScreen = AppVisibility.onActivityStopped(this)
+        if (::webView.isInitialized && appLeftScreen) {
+            // Suspend JS timers while off-screen: the SPA's heartbeat and reconnect
+            // loops otherwise burn CPU/radio until the OS freezes the process. Timers
+            // only (webView.onPause() would kill audio on screen-off). pauseTimers()
+            // is PROCESS-GLOBAL, so it is gated on the AppVisibility 1 → 0
+            // transition, not run per-activity: during in-process recreation the
+            // new instance's onStart can precede this onStop, and an unconditional
+            // pause here would freeze the foregrounded instance's JS until the
+            // user backgrounds and returns.
+            webView.pauseTimers()
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        stopped = false
+        // While visible, the SPA's useIdleNotifications posts its own in-app
+        // notification for the same edges — the background poller must not
+        // duplicate it (see AppVisibility).
+        val appCameOnScreen = AppVisibility.onActivityStarted(this)
+        if (::webView.isInitialized) {
+            // Mirror of the pause gate above: resume only on the 0 → 1
+            // transition. In the recreate() ordering (old stop 1 → 0 paused,
+            // then this start 0 → 1) this undoes the transient pause; in the
+            // overlap ordering the counter never hit 0, timers never paused,
+            // and there's nothing to resume.
+            if (appCameOnScreen) webView.resumeTimers()
+            // A notification tap that arrived while stopped deferred its deep
+            // link (see onNewIntent); emit it now that JS timers run again.
+            if (pageLoaded) flushPendingActivation()
+        }
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -406,6 +453,17 @@ class MainActivity : AppCompatActivity() {
                 if (secure) append("; Secure")
                 append("; SameSite=Lax")
             }
+        // Identity-keyed cleanup: atomically bind the marker while clearing the
+        // previous account's baseline. Cancellation shares that lock with each
+        // worker post, so an old-account notification can only land before the
+        // cancelAll() or be rejected after the new identity becomes visible.
+        // Re-injection for the SAME account keeps the baseline.
+        // Re-arm the periodic poll in case it was never scheduled (login before
+        // a server was pinned) — KEEP makes an already-scheduled poll a no-op.
+        val snapshotStore = SessionSnapshotStore(applicationContext)
+        val accountIdentity = sessionAccountIdentity(origin, token)
+        snapshotStore.bindAccount(accountIdentity, notifications::cancelAll)
+        SessionPollScheduler.ensureScheduled(applicationContext)
         val cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(true)
         authLog("onSessionToken: injecting $name (token len=${token.length})")
@@ -505,8 +563,11 @@ class MainActivity : AppCompatActivity() {
 
         val path = navigatePathOf(intent) ?: return
         pendingNavigatePath = path
-        // Replay now if the page is up; otherwise onPageReady will flush it.
-        if (pageLoaded) flushPendingActivation()
+        // Replay now if the page is up — unless we're stopped with JS timers
+        // paused, where an evaluateJavascript could be dropped on older
+        // WebViews; onStart re-flushes after resumeTimers(). A cold page
+        // flushes from onPageReady instead.
+        if (pageLoaded && !stopped) flushPendingActivation()
     }
 
     /**
@@ -524,6 +585,7 @@ class MainActivity : AppCompatActivity() {
         // cookie store. cancel() also resets inFlight so the new server can start
         // its own login immediately rather than waiting up to 5 minutes.
         loginManager.cancel()
+        SessionSnapshotStore(applicationContext).unbindAccount(notifications::cancelAll)
         removeBridge()
         pinnedOrigin = newOrigin
         pageLoaded = false
@@ -606,6 +668,7 @@ class MainActivity : AppCompatActivity() {
         // page (chrome-error://) or a foreign redirect must NOT drain
         // pendingNavigatePath or push insets into a page that can't consume them.
         if (originOf(url) != pinnedOrigin) return
+        syncPollAccount(url)
         // First authenticated app page: drop everything before it from the
         // back/forward list — the pre-auth root, any IdP pages, and the post-login
         // reload all bounce to login or show a blank if Back reaches them. After
@@ -618,6 +681,33 @@ class MainActivity : AppCompatActivity() {
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
         flushPendingActivation()
         emitInsets()
+    }
+
+    /** Bind accounts-mode/WebView-side login state to the background poller. */
+    private fun syncPollAccount(url: String?) {
+        val origin = pinnedOrigin ?: return
+        val onLoginPage =
+            Uri
+                .parse(url)
+                .path
+                ?.trimEnd('/')
+                ?.endsWith("/login") == true
+        val cookieIdentity =
+            if (onLoginPage) {
+                null
+            } else {
+                val secure = origin.startsWith("https://")
+                extractCookieValue(
+                    CookieManager.getInstance().getCookie(origin),
+                    sessionCookieName(secure),
+                )?.let { sessionAccountIdentity(origin, it) }
+            }
+        val store = SessionSnapshotStore(applicationContext)
+        if (cookieIdentity == null) {
+            store.unbindAccount(notifications::cancelAll)
+        } else {
+            store.bindAccount(cookieIdentity, notifications::cancelAll)
+        }
     }
 
     private fun flushPendingActivation() {

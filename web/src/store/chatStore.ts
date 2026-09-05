@@ -80,6 +80,12 @@ import type {
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
+import {
+  abortableDelay,
+  awaitReconnectDelay,
+  backgroundReconnectJitter,
+  nextReconnectDelay,
+} from "./streamReconnect";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
@@ -1112,13 +1118,8 @@ async function uploadFileBlocks(
 const FLASH_DURATION_MS = 800;
 const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
 
-// Reconnect backoff for the session SSE stream. Databricks Apps' ingress
-// hard-caps a single HTTP/2 stream at ~5 min, so the client must re-subscribe
-// when it's dropped. Backoff applies only between consecutive failed opens
-// (see nextReconnectDelay); a drop after a healthy connection reconnects
-// instantly.
-const STREAM_RECONNECT_BASE_MS = 250;
-const STREAM_RECONNECT_MAX_MS = 5_000;
+// Reconnect backoff constants and pacing helpers for the session SSE stream
+// live in streamReconnect.ts (unit-testable without this module's graph).
 // A reverse proxy serves 404 for the stream route for the ~10-60s a backend
 // container takes to restart (upgrade, config change, re-seed bounce), so a
 // 404 mid-restart must not be treated as permanent. Bound the retries instead
@@ -3458,41 +3459,9 @@ async function bindStream(
   }
 }
 
-/**
- * Resolve after `ms`, or immediately when `signal` aborts (so switchTo /
- * unmount interrupts a pending reconnect backoff instead of stalling the
- * loop's teardown).
- */
-function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const onAbort = (): void => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    };
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    signal.addEventListener("abort", onAbort, { once: true });
-    // Register first, then re-check: an abort that fired before the listener
-    // was attached won't dispatch to it, so resolve now if already aborted.
-    // (`resolve` is idempotent; this closes any registration-ordering gap.)
-    if (signal.aborted) onAbort();
-  });
-}
-
-/**
- * Halved-to-full jittered exponential backoff between CONSECUTIVE failed
- * opens. Only called with `failedOpens >= 1` — a drop after a healthy
- * connection reconnects instantly (no delay), so the first attempt
- * (`failedOpens === 1`) backs off from the base, doubling per failure up
- * to the cap.
- */
-function nextReconnectDelay(failedOpens: number): number {
-  const base = Math.min(STREAM_RECONNECT_BASE_MS * 2 ** (failedOpens - 1), STREAM_RECONNECT_MAX_MS);
-  return base / 2 + Math.random() * (base / 2);
-}
+// abortableDelay / nextReconnectDelay / awaitReconnectDelay live in
+// streamReconnect.ts so the pacing logic is unit-testable without this
+// module's dependency graph.
 
 /**
  * Drop the ephemeral (un-persisted) streamed blocks ahead of a reconnect.
@@ -4120,7 +4089,9 @@ export async function startStreamPump(
       // healthy connection (the benign ~5-min ingress recycle) leaves
       // failedOpens at 0, so it reconnects instantly with no delay.
       if (failedOpens > 0) {
-        await abortableDelay(nextReconnectDelay(failedOpens), controller.signal);
+        await awaitReconnectDelay(nextReconnectDelay(failedOpens), controller.signal, () =>
+          conversationRegistry.getActive()?.id === id ? 0 : backgroundReconnectJitter(),
+        );
         if (controller.signal.aborted || isConversationDisposed(id)) break;
       } else if (hasConnected && conversationRegistry.getActive()?.id !== id) {
         // Stagger a BACKGROUND conversation's reconnect. The ingress caps every
@@ -4277,15 +4248,8 @@ export async function startStreamPump(
   /* eslint-enable no-await-in-loop */
 }
 
-// Spread background reconnects over a few seconds so N conversations recycling
-// at the same ingress deadline don't fire N snapshot fetches at once. Small
-// enough that a backgrounded conversation is still current well before the user
-// could switch to it.
-const BACKGROUND_RECONNECT_JITTER_MAX_MS = 3_000;
-
-function backgroundReconnectJitter(): number {
-  return Math.random() * BACKGROUND_RECONNECT_JITTER_MAX_MS;
-}
+// backgroundReconnectJitter lives in streamReconnect.ts with the other pacing
+// helpers.
 
 /**
  * Coalesces a frame's worth of work onto a single callback.
