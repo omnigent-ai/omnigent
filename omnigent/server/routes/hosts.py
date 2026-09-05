@@ -21,7 +21,7 @@ import logging
 import secrets
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
 from omnigent.db.utils import now_epoch
@@ -711,6 +711,61 @@ def create_hosts_router(
         if isinstance(error, str) and error:
             payload["error"] = error
         return payload
+
+    @router.delete("/hosts/{host_id}", status_code=204)
+    async def delete_host(request: Request, host_id: str) -> Response:
+        """Delete an external host row (owner only; offline hosts only).
+
+        Removes a host from the DB and the New Chat picker. The primary
+        use is pruning stale external host rows that never got cleaned
+        up — e.g. a fleet of short-lived connect daemons (each a fresh
+        ``host_id``) that registered a durable row and then died, which
+        nothing else deletes (no TTL, no reaper for external hosts).
+
+        Guards, mirroring :func:`get_host`: owner-scoped (403 for
+        another user's host), and refuses an ONLINE host (409) so a live
+        machine mid-session can't be deleted out from under it — the
+        caller should disconnect it first. Managed hosts are refused
+        outright (403): their row IS the sandbox's credential, so
+        dropping it here would orphan a running VM (only
+        ``terminate_managed_host`` terminates the sandbox first) and
+        strand any session that would otherwise relaunch or wake it.
+        Deleting the session tears those down. Idempotent: an
+        already-absent host returns 204, so a best-effort cleanup client
+        can DELETE without racing a check. ``host_store.delete_host``
+        nulls ``conversations.host_id`` for any bound sessions (the DB
+        no longer cascades this) and is itself a no-op on a missing row.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: 204 No Content.
+        :raises HTTPException: 403 if the caller does not own the host
+            or the host is a managed sandbox, 409 if the host is
+            currently online.
+        """
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            # Idempotent: already pruned (or never existed). Nothing to
+            # leak, nothing to delete.
+            return Response(status_code=204)
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        if host.sandbox_provider is not None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "managed sandbox hosts cannot be deleted here; "
+                    "delete the session that owns the sandbox"
+                ),
+            )
+        if host_is_live(host):
+            raise HTTPException(
+                status_code=409,
+                detail="host is online; disconnect it before deleting",
+            )
+        await asyncio.to_thread(host_store.delete_host, host_id)
+        return Response(status_code=204)
 
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(
