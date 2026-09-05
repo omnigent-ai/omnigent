@@ -45,6 +45,7 @@ _FAKE_ROW = AcpCliHarness(
     ),
     args=("agent", "stdio"),
     aliases=("fake-cli",),
+    env_passthrough=("FAKE_API_KEY", "FAKE_HOME"),
 )
 
 
@@ -104,6 +105,7 @@ def test_spawn_env_forwards_cwd_sandbox_and_quotes_command(
         "stdio",
     ]
     assert env["HARNESS_ACP_NAME"] == "Fake CLI"
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "FAKE_API_KEY,FAKE_HOME"
     assert env["HARNESS_ACP_CWD"] == "/work/space"
     assert json.loads(env["HARNESS_ACP_OS_ENV"]) == dataclasses.asdict(os_env)
     # Rows own their model selection: no model var may ride along.
@@ -137,6 +139,33 @@ def test_fake_row_login_command() -> None:
     assert _FAKE_ROW.login_command == "fakecli login --device"
     assert _FAKE_ROW.label == "Fake CLI"
     assert _FAKE_ROW.binary == "fakecli"
+
+
+def test_zcode_row_matches_published_acp_adapter() -> None:
+    """Pin the reviewed package and ZCode runtime environment boundary."""
+    row = ACP_CLI_HARNESSES["zcode"]
+
+    assert row.install.package == "zcode-acp-server"
+    assert row.install.min_version == "0.1.0"
+    assert row.binary == "zcode-acp-server"
+    assert row.args == ()
+    assert row.login_command is None
+    assert row.aliases == ("z-code",)
+    assert row.env_passthrough == (
+        "ZCODE_BIN",
+        "ZCODE_NODE",
+        "ZCODE_MODEL",
+        "ZCODE_BASE_URL",
+    )
+
+
+def test_grok_row_keeps_deny_by_default_environment() -> None:
+    """Rows without an allowlist must not emit the passthrough escape hatch."""
+    row = ACP_CLI_HARNESSES["grok"]
+
+    assert row.env_passthrough == ()
+    env = _build_acp_cli_spawn_env(_spec("grok"), harness="grok")
+    assert "HARNESS_ACP_ENV_PASSTHROUGH" not in env
 
 
 # ---------------------------------------------------------------------------
