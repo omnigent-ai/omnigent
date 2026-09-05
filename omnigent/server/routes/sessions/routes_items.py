@@ -10,6 +10,7 @@ from fastapi import (
     Request,
 )
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -40,6 +41,7 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.schemas import (
     ChildSessionList,
     PaginatedList,
+    SessionItemsWindow,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -109,6 +111,110 @@ def register_items_routes(
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
+        )
+
+    @router.get(
+        "/sessions/{session_id}/items/search",
+        response_model=None,
+        responses={200: {"model": PaginatedList}},
+    )
+    async def search_session_items(
+        request: Request,
+        session_id: str,
+        search_query: str = Query(min_length=1, max_length=500),
+        limit: int = Query(default=200, ge=1, le=1000),
+    ) -> PaginatedList:
+        """Search committed items inside one authorized session."""
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        if access.conversation is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+
+        matches = await asyncio.to_thread(
+            conversation_store.search_visible_items_literal,
+            session_id,
+            search_query,
+            limit=limit + 1,
+        )
+        has_more = len(matches) > limit
+        visible = matches[:limit]
+        return PaginatedList(
+            data=[item.to_api_dict() for item in visible],
+            first_id=visible[0].id if visible else None,
+            last_id=visible[-1].id if visible else None,
+            has_more=has_more,
+        )
+
+    @router.get(
+        "/sessions/{session_id}/items/window",
+        response_model=SessionItemsWindow,
+    )
+    async def get_session_items_window(
+        request: Request,
+        session_id: str,
+        anchor_id: str = Query(min_length=1),
+        before: int = Query(default=30, ge=1, le=100),
+        after: int = Query(default=30, ge=1, le=100),
+    ) -> SessionItemsWindow:
+        """Return a bounded chronological window around one committed item."""
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        if access.conversation is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+
+        older_page, newer_page = await asyncio.gather(
+            asyncio.to_thread(
+                conversation_store.list_items,
+                session_id,
+                limit=before,
+                after=anchor_id,
+                order="desc",
+            ),
+            asyncio.to_thread(
+                conversation_store.list_items,
+                session_id,
+                limit=after,
+                after=anchor_id,
+                order="asc",
+            ),
+        )
+
+        # list_items cursors are exclusive. Resolve the anchor through the
+        # closest newer item, or through the newest item when the anchor is last.
+        if newer_page.data:
+            anchor_page = await asyncio.to_thread(
+                conversation_store.list_items,
+                session_id,
+                limit=1,
+                after=newer_page.data[0].id,
+                order="desc",
+            )
+        else:
+            anchor_page = await asyncio.to_thread(
+                conversation_store.list_items,
+                session_id,
+                limit=1,
+                order="desc",
+            )
+        if not anchor_page.data or anchor_page.data[0].id != anchor_id:
+            raise OmnigentError("Session item not found", code=ErrorCode.NOT_FOUND)
+
+        items = [*reversed(older_page.data), anchor_page.data[0], *newer_page.data]
+        return SessionItemsWindow(
+            data=[item.to_api_dict() for item in items],
+            anchor_id=anchor_id,
+            first_id=items[0].id if items else None,
+            last_id=items[-1].id if items else None,
+            has_older=older_page.has_more,
+            has_newer=newer_page.has_more,
         )
 
     # ── GET /sessions/{session_id}/child_sessions ────────────────

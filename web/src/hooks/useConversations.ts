@@ -25,6 +25,8 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
+import { getOmnigentHostGeneration } from "@/lib/host";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
   filtersFromConversationQueryKey,
@@ -95,7 +97,14 @@ function isAbortTimeout(error: unknown): boolean {
  * mutations that actually change archived membership or a project label
  * invalidate this key explicitly instead.
  */
+const ARCHIVED_CONVERSATIONS_KEY = ["archived-conversations"] as const;
+const ARCHIVED_SESSION_FACETS_KEY = ["archived-session-facets"] as const;
 const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
+export const ARCHIVED_PAGE_SIZE = 20;
+
+let archivedAtCapabilityGeneration = -1;
+let archivedAtQuerySupported = true;
+let archivedAtCapabilityConfirmed = false;
 
 export interface UseConversationsOptions {
   reconcileWhileConnected?: boolean;
@@ -109,6 +118,38 @@ export interface UseConversationsOptions {
    * any observed field.
    */
   notifyOnChangeProps?: readonly (keyof ReturnType<typeof useInfiniteQuery>)[];
+}
+
+export type ArchivedDateField = "created_at" | "active_at" | "archived_at";
+export type ArchivedSearchScope = "title" | "content";
+export type ArchivedSortField = "created_at" | "archived_at" | "title";
+export type ArchivedAgePreset =
+  "any" | "lt24h" | "lt7d" | "gt7d" | "gt30d" | "gt90d" | "gt180d" | "gt365d";
+
+export interface ArchivedConversationFilters {
+  searchQuery?: string;
+  searchScope?: ArchivedSearchScope;
+  project?: string;
+  hostId?: string;
+  agentName?: string;
+  dateField: ArchivedDateField;
+  sortField: ArchivedSortField;
+  agePreset: ArchivedAgePreset;
+  /** Local calendar day or inclusive range: YYYYMMDD[-YYYYMMDD]. */
+  dateRange?: string;
+  order: "asc" | "desc";
+  createdAfter?: number;
+  createdBefore?: number;
+  archivedAfter?: number;
+  archivedBefore?: number;
+  activeAfter?: number;
+  activeBefore?: number;
+}
+
+export interface ArchivedSessionFacets {
+  projects: string[];
+  hostIds: string[];
+  agentNames: string[];
 }
 
 export class BulkConversationMutationError extends Error {
@@ -135,6 +176,8 @@ export interface Conversation {
   title: string | null;
   created_at: number;
   updated_at: number;
+  /** Stable Unix seconds when the session most recently entered the archive. */
+  archived_at?: number | null;
   labels: Record<string, string>;
   permission_level: number | null;
   owner?: string | null;
@@ -222,6 +265,14 @@ export interface Conversation {
    * matched. Absent on non-search fetches and title-only matches.
    */
   search_snippet?: string | null;
+  search_match_count?: number;
+  /** Stable locator for the first visible body match in a search response. */
+  search_match?: {
+    item_id: string;
+    response_id: string;
+    created_at: number;
+    snippet: string;
+  } | null;
   /**
    * For sub-agent sessions, the id of the direct parent session.
    * `null` / absent for top-level sessions. Included in
@@ -600,6 +651,170 @@ export function useConversations(
   });
 }
 
+function archivedAgeBounds(
+  field: ArchivedDateField | "updated_at",
+  preset: ArchivedAgePreset,
+): Record<string, string> {
+  if (preset === "any") return {};
+  const match = /^(lt|gt)(24h|\d+d)$/.exec(preset);
+  if (!match) return {};
+  const amount = match[2] === "24h" ? 1 : Number.parseInt(match[2], 10);
+  const cutoff = Math.floor(Date.now() / 1000) - amount * 86_400;
+  return {
+    [`${field.replace("_at", "")}_${match[1] === "lt" ? "after" : "before"}`]: String(cutoff),
+  };
+}
+
+function archivedCalendarBounds(
+  field: ArchivedDateField | "updated_at",
+  value: string | undefined,
+): Record<string, string> {
+  const bounds = archiveDateRangeBounds(value ?? "");
+  if (!bounds) return {};
+  const prefix = field.replace("_at", "");
+  return {
+    [`${prefix}_after`]: String(bounds.after),
+    [`${prefix}_before`]: String(bounds.before),
+  };
+}
+
+async function fetchArchivedConversationsPage(
+  filters: ArchivedConversationFilters,
+  after?: string,
+  requestSignal?: AbortSignal,
+): Promise<ConversationsPage> {
+  const requestGeneration = getOmnigentHostGeneration();
+  if (requestGeneration !== archivedAtCapabilityGeneration) {
+    archivedAtCapabilityGeneration = requestGeneration;
+    archivedAtQuerySupported = true;
+    archivedAtCapabilityConfirmed = false;
+  }
+  const ensureCurrentConnection = () => {
+    if (getOmnigentHostGeneration() !== requestGeneration) {
+      throw new DOMException("Archived-session Server changed", "AbortError");
+    }
+  };
+  const usesArchivedAt =
+    filters.sortField === "archived_at" ||
+    (filters.dateField === "archived_at" &&
+      (filters.agePreset !== "any" || Boolean(filters.dateRange))) ||
+    filters.archivedAfter !== undefined ||
+    filters.archivedBefore !== undefined;
+  const usesArchiveExtensions = usesArchivedAt || filters.sortField === "title";
+  const buildParams = (supportsArchivedAt: boolean) => {
+    const dateField =
+      !supportsArchivedAt && filters.dateField === "archived_at"
+        ? ("updated_at" as const)
+        : filters.dateField;
+    const sortField =
+      !supportsArchivedAt && (filters.sortField === "archived_at" || filters.sortField === "title")
+        ? ("updated_at" as const)
+        : filters.sortField;
+    const params = new URLSearchParams({
+      // This is the pre-existing Server contract. Keep it on every request so
+      // an older Server that ignores archived_only cannot return active rows.
+      visibility: "archived",
+      archived_only: "true",
+      limit: String(ARCHIVED_PAGE_SIZE),
+      order: filters.order,
+      sort_by: sortField,
+      ...archivedAgeBounds(dateField, filters.agePreset),
+      ...archivedCalendarBounds(dateField, filters.dateRange),
+    });
+    if (after) params.set("after", after);
+    if (filters.searchQuery) params.set("search_query", filters.searchQuery);
+    if (filters.searchQuery && filters.searchScope) params.set("search_scope", filters.searchScope);
+    if (filters.project) params.set("project", filters.project);
+    if (filters.hostId) params.set("host_id", filters.hostId);
+    if (filters.agentName) params.set("agent_name", filters.agentName);
+    if (filters.createdAfter !== undefined)
+      params.set("created_after", String(filters.createdAfter));
+    if (filters.createdBefore !== undefined)
+      params.set("created_before", String(filters.createdBefore));
+    if (filters.archivedAfter !== undefined)
+      params.set(
+        supportsArchivedAt ? "archived_after" : "updated_after",
+        String(filters.archivedAfter),
+      );
+    if (filters.archivedBefore !== undefined)
+      params.set(
+        supportsArchivedAt ? "archived_before" : "updated_before",
+        String(filters.archivedBefore),
+      );
+    if (filters.activeAfter !== undefined) params.set("active_after", String(filters.activeAfter));
+    if (filters.activeBefore !== undefined)
+      params.set("active_before", String(filters.activeBefore));
+    return params;
+  };
+  const timeoutSignal = filters.searchQuery
+    ? AbortSignal.timeout(SEARCH_FETCH_TIMEOUT_MS)
+    : undefined;
+  const signal =
+    requestSignal && timeoutSignal
+      ? AbortSignal.any([requestSignal, timeoutSignal])
+      : (requestSignal ?? timeoutSignal);
+  const needsArchivedAtPreflight =
+    !archivedAtCapabilityConfirmed && usesArchivedAt && filters.sortField !== "archived_at";
+  if (needsArchivedAtPreflight) {
+    const probe = new URLSearchParams({
+      visibility: "archived",
+      archived_only: "true",
+      sort_by: "archived_at",
+      limit: "1",
+    });
+    const probeResponse = await authenticatedFetch(`/v1/sessions?${probe.toString()}`, { signal });
+    ensureCurrentConnection();
+    if (probeResponse.status === 422) {
+      archivedAtQuerySupported = false;
+    } else if (!probeResponse.ok) {
+      throw new Error(`${probeResponse.status} ${probeResponse.statusText}`);
+    }
+    archivedAtCapabilityConfirmed = true;
+  }
+
+  let params = buildParams(archivedAtQuerySupported);
+  let res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
+  ensureCurrentConnection();
+  if (res.status === 422 && archivedAtQuerySupported && usesArchiveExtensions) {
+    // f7 and older reject archived_at before the UI can apply its display
+    // fallback. Retry once against updated_at and remember the capability for
+    // this host generation so pagination/refetches do not keep probing.
+    archivedAtQuerySupported = false;
+    archivedAtCapabilityConfirmed = true;
+    params = buildParams(false);
+    res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
+    ensureCurrentConnection();
+  } else if (res.ok && usesArchiveExtensions) {
+    archivedAtCapabilityConfirmed = true;
+  }
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const page = (await res.json()) as ConversationsPage;
+  return withoutDeletingSessions({
+    ...page,
+    data: page.data.filter((conversation) => conversation.archived === true),
+  });
+}
+
+/** Test-only reset for the per-Server archived_at capability cache. */
+export function resetArchivedQueryCompatibilityForTests(): void {
+  archivedAtCapabilityGeneration = -1;
+  archivedAtQuerySupported = true;
+  archivedAtCapabilityConfirmed = false;
+}
+
+/** Server-filtered, archive-only list used by Settings → Archived sessions. */
+export function useArchivedConversations(filters: ArchivedConversationFilters, after?: string) {
+  return useQuery({
+    queryKey: [...ARCHIVED_CONVERSATIONS_KEY, filters, after ?? null],
+    queryFn: ({ signal }) => fetchArchivedConversationsPage(filters, after, signal),
+    staleTime: 30_000,
+    retry: (failureCount, error) =>
+      !isAbortTimeout(error) &&
+      !(error instanceof DOMException && error.name === "AbortError") &&
+      failureCount < 3,
+  });
+}
+
 /** PATCH /v1/sessions/{id} — exported for direct unit testing. */
 export async function renameConversation(id: string, title: string): Promise<Conversation> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
@@ -830,6 +1045,8 @@ export function useArchiveConversation() {
       // Archive membership just changed, so the archived-view picker's option
       // set may have gained/lost a project.
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_CONVERSATIONS_KEY });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_SESSION_FACETS_KEY });
     },
   });
 }
@@ -955,6 +1172,8 @@ function finalizeDeletedConversations(queryClient: QueryClient, ids: readonly st
   void queryClient.invalidateQueries({ queryKey: ["projects"] });
   // Deleting an archived session may empty its project of archived members.
   void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+  void queryClient.invalidateQueries({ queryKey: ARCHIVED_CONVERSATIONS_KEY });
+  void queryClient.invalidateQueries({ queryKey: ARCHIVED_SESSION_FACETS_KEY });
 }
 
 /**
@@ -1157,6 +1376,8 @@ export function useBulkArchiveConversations() {
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_CONVERSATIONS_KEY });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_SESSION_FACETS_KEY });
     },
   });
 }
@@ -1291,6 +1512,8 @@ export function useBulkMoveToProject() {
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_CONVERSATIONS_KEY });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_SESSION_FACETS_KEY });
     },
   });
 }
@@ -1686,6 +1909,55 @@ export function useArchivedProjectNames() {
   });
 }
 
+export async function fetchArchivedSessionFacets(
+  filters?: Partial<ArchivedConversationFilters>,
+  signal?: AbortSignal,
+): Promise<ArchivedSessionFacets> {
+  const params = new URLSearchParams();
+  const calendarBounds = archivedCalendarBounds(
+    filters?.dateField ?? "archived_at",
+    filters?.dateRange,
+  );
+  for (const [key, value] of Object.entries(calendarBounds)) params.set(key, value);
+  if (filters?.searchQuery) params.set("search_query", filters.searchQuery);
+  if (filters?.searchQuery && filters.searchScope) params.set("search_scope", filters.searchScope);
+  if (filters?.project) params.set("project", filters.project);
+  if (filters?.hostId) params.set("host_id", filters.hostId);
+  if (filters?.agentName) params.set("agent_name", filters.agentName);
+  if (filters?.createdAfter !== undefined)
+    params.set("created_after", String(filters.createdAfter));
+  if (filters?.createdBefore !== undefined)
+    params.set("created_before", String(filters.createdBefore));
+  if (filters?.archivedAfter !== undefined)
+    params.set("archived_after", String(filters.archivedAfter));
+  if (filters?.archivedBefore !== undefined)
+    params.set("archived_before", String(filters.archivedBefore));
+  if (filters?.activeAfter !== undefined) params.set("active_after", String(filters.activeAfter));
+  if (filters?.activeBefore !== undefined)
+    params.set("active_before", String(filters.activeBefore));
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  const res = await authenticatedFetch(`/v1/sessions/archived-facets${suffix}`, { signal });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const payload = (await res.json()) as {
+    projects: string[];
+    host_ids: string[];
+    agent_names: string[];
+  };
+  return {
+    projects: payload.projects,
+    hostIds: payload.host_ids,
+    agentNames: payload.agent_names,
+  };
+}
+
+export function useArchivedSessionFacets(filters?: Partial<ArchivedConversationFilters>) {
+  return useQuery<ArchivedSessionFacets>({
+    queryKey: [...ARCHIVED_SESSION_FACETS_KEY, filters ?? null],
+    queryFn: ({ signal }) => fetchArchivedSessionFacets(filters, signal),
+    staleTime: 60_000,
+  });
+}
+
 /**
  * Resolve a project NAME to its first-class id, creating the `projects` row on
  * demand when only a legacy label-project of that name exists (or nothing does).
@@ -1894,6 +2166,8 @@ export function useMoveToProject() {
       // Moving an archived session relabels which project owns it, shifting the
       // archived-view picker's option set.
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_CONVERSATIONS_KEY });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_SESSION_FACETS_KEY });
     },
   });
 }
@@ -2053,6 +2327,8 @@ export function useDeleteProject() {
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       // Deleting a project archives its members, growing the archived set.
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_CONVERSATIONS_KEY });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_SESSION_FACETS_KEY });
     },
   });
 }
@@ -2138,6 +2414,8 @@ export function useRenameProject() {
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_CONVERSATIONS_KEY });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_SESSION_FACETS_KEY });
     },
   });
 }

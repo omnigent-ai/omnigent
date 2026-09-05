@@ -53,7 +53,7 @@ import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { Link, useNavigate } from "@/lib/routing";
+import { Link, useLocation, useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
@@ -76,7 +76,7 @@ interface HeaderConversationMenuProps {
 function ArchivedToast() {
   return (
     <span>
-      View archived sessions in{" "}
+      Session archived. View it in{" "}
       <Link to="/settings/archived" className="font-medium text-primary hover:underline">
         Settings
       </Link>
@@ -100,6 +100,7 @@ export function HeaderConversationMenu({
   workspaceItems = null,
 }: HeaderConversationMenuProps) {
   const navigate = useNavigate();
+  const location = useLocation();
   const isMobile = useIsMobileViewport();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
@@ -113,6 +114,11 @@ export function HeaderConversationMenu({
   const [renameTitle, setRenameTitle] = useState(conversation.title ?? "");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBranch, setDeleteBranch] = useState(false);
+  const [archivePending, setArchivePending] = useState(false);
+  const mountedRef = useRef(false);
+  const archiveRequestRef = useRef(false);
+  const currentConversationIdRef = useRef(conversation.id);
+  const currentLocationRef = useRef(location);
   const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
   const label = conversationDisplayLabel(conversation);
@@ -126,6 +132,16 @@ export function HeaderConversationMenu({
     if (isMobile) trackClick(componentId, "button");
   };
   const gitBranch = conversation.git_branch ?? null;
+
+  currentConversationIdRef.current = conversation.id;
+  currentLocationRef.current = location;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!renameOpen) setRenameTitle(conversation.title ?? "");
@@ -171,18 +187,46 @@ export function HeaderConversationMenu({
     });
   };
 
-  const archiveConversation = () => {
+  const archiveConversation = async () => {
+    // The local ref closes the same-tick gap before React Query's isPending
+    // state reaches the menu, while the disabled state communicates progress
+    // and blocks later duplicate selections.
+    if (archiveRequestRef.current || archive.isPending) return;
+
     closeMenu();
-    // The row leaves the sidebar optimistically (useArchiveConversation flips
-    // the cached `archived` flag in onMutate), and we're viewing the session
-    // being archived, so leave its chat surface now — synchronously, like
-    // confirmDelete — rather than in an onSuccess callback that fires a
-    // round-trip later with a stale active session.
-    navigate("/", { replace: true });
-    archive.mutate({ id: conversation.id, archived: true });
-    // Fire NOW, not in a mutate onSuccess: navigating away unmounts this menu,
-    // and per-call mutate callbacks don't fire once their observer unmounts.
+    archiveRequestRef.current = true;
+    setArchivePending(true);
+    const requestedConversationId = conversation.id;
+    const requestedLocation = location;
+
+    try {
+      await archive.mutateAsync({ id: requestedConversationId, archived: true });
+    } catch {
+      // useArchiveConversation owns the error toast and optimistic-cache
+      // rollback. Staying on this route makes the restored session usable.
+      return;
+    } finally {
+      archiveRequestRef.current = false;
+      if (mountedRef.current) setArchivePending(false);
+    }
+
+    // A completed request must not pull the user away from a destination they
+    // chose while it was in flight, nor from a newer active session rendered
+    // into this same header instance.
+    const activeLocation = currentLocationRef.current;
+    if (
+      !mountedRef.current ||
+      currentConversationIdRef.current !== requestedConversationId ||
+      activeLocation.key !== requestedLocation.key ||
+      activeLocation.pathname !== requestedLocation.pathname ||
+      activeLocation.search !== requestedLocation.search ||
+      activeLocation.hash !== requestedLocation.hash
+    ) {
+      return;
+    }
+
     showArchivedToast();
+    navigate("/", { replace: true });
   };
 
   const mainItems = (
@@ -289,10 +333,11 @@ export function HeaderConversationMenu({
       <DropdownMenuItem
         data-testid="header-archive-conversation"
         className={itemClass}
+        disabled={archivePending || archive.isPending}
         onSelect={archiveConversation}
       >
         <ArchiveIcon className="size-3.5" />
-        Archive
+        {isMobile ? "Archive this session" : "Archive"}
       </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-delete-conversation"

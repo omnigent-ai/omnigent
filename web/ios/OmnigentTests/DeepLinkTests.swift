@@ -24,6 +24,23 @@ final class DeepLinkTests: XCTestCase {
     XCTAssertEqual(dl?.path, "/c/\(hex)")
   }
 
+  func testParsesArchiveLibraryReferenceWithExactLocator() {
+    let dl = DeepLink.parse(
+      URL(string: "omnigent://example.com/archive/\(hex)?response=resp_1&item=msg_2")!)
+    XCTAssertEqual(dl?.origin, "https://example.com")
+    XCTAssertEqual(dl?.path, "/archive/\(hex)?response=resp_1&item=msg_2")
+  }
+
+  func testRejectsIncompleteOrUnboundedArchiveLibraryLocator() {
+    XCTAssertNil(DeepLink.parse(URL(string: "omnigent://localhost:8000/archive/\(hex)")!))
+    XCTAssertNil(
+      DeepLink.parse(URL(string: "omnigent://localhost:8000/archive/\(hex)?response=resp_1")!))
+    XCTAssertNil(
+      DeepLink.parse(URL(string: "omnigent://localhost:8000/archive/\(hex)?item=msg_1&next=x")!))
+    XCTAssertNil(
+      DeepLink.parse(URL(string: "omnigent://localhost:8000/archive/\(hex)?item=msg_1#frag")!))
+  }
+
   func testPreservesNonDefaultPortOnRemoteHost() {
     let dl = DeepLink.parse(URL(string: "omnigent://example.com:8443/c/\(hex)")!)
     XCTAssertEqual(dl?.origin, "https://example.com:8443")

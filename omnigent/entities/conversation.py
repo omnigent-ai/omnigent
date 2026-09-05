@@ -207,6 +207,8 @@ class Conversation:
         listing (and the sidebar), surfacing only when the caller
         passes ``include_archived=True``. ``False`` for normal
         sessions; toggled via ``PATCH /v1/sessions/{id}``.
+    :param archived_at: Unix epoch seconds when the session most recently
+        transitioned into the archived state. ``None`` while active.
     :param project_id: The first-class project this session is filed
         under, or ``None`` if unfiled. Owner-private membership; see
         ``designs/PROJECTS_PRD.md``.
@@ -216,6 +218,9 @@ class Conversation:
         if the title also matched), so the search UI can show *where* the
         session matched. Never persisted (not a DB column) and ``None`` on
         every non-search read path and title-only matches.
+    :param search_item_id: Stable item id for ``search_snippet``. Transient and
+        populated together with the snippet so readers can open the matching
+        part of a long transcript without walking every earlier page.
     """
 
     id: str
@@ -244,6 +249,7 @@ class Conversation:
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
+    archived_at: int | None = None
     # Live-state fields written by the replica holding the runner tunnel
     # so any replica's session list can serve them. ``live_status`` is the
     # last relay-observed turn status ("idle"/"running"/"waiting"/"failed",
@@ -255,6 +261,10 @@ class Conversation:
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None
+    search_item_id: str | None = None
+    search_response_id: str | None = None
+    search_item_created_at: int | None = None
+    search_match_count: int = 0
 
 
 # ── Conversation item data types ───────────────────────

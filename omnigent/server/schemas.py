@@ -60,6 +60,18 @@ class PaginatedList(BaseModel):
     has_more: bool = False
 
 
+class SessionItemsWindow(BaseModel):
+    """A bounded chronological item window centered on one stable item id."""
+
+    object: Literal["session.items.window"] = "session.items.window"
+    data: list[Any] = Field(default_factory=list)
+    anchor_id: str
+    first_id: str | None = None
+    last_id: str | None = None
+    has_older: bool = False
+    has_newer: bool = False
+
+
 # ── Agents ──────────────────────────────────────────────────────
 
 
@@ -293,6 +305,7 @@ class AgentObject(BaseModel):
     description: str | None = None
     created_at: int
     updated_at: int | None = None
+    archived_at: int | None = None
     harness: str | None = None
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
     mcp_servers_editable: bool = False
@@ -2099,6 +2112,7 @@ class SessionResponse(BaseModel):
     background_tasks: list[BackgroundTaskInfo] | None = None
     created_at: int
     updated_at: int | None = None
+    archived_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
@@ -2531,6 +2545,15 @@ class SessionSwitchAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class SessionSearchMatch(BaseModel):
+    """Stable archive-library locator for one content-search hit."""
+
+    item_id: str
+    response_id: str
+    created_at: int
+    snippet: str
+
+
 class SessionListItem(BaseModel):
     """
     Lightweight session summary for ``GET /v1/sessions`` list responses.
@@ -2639,6 +2662,7 @@ class SessionListItem(BaseModel):
     status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int
+    archived_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
@@ -2658,6 +2682,8 @@ class SessionListItem(BaseModel):
     viewer_last_seen: int | None = None
     viewer_unread: bool = False
     search_snippet: str | None = None
+    search_match: SessionSearchMatch | None = None
+    search_match_count: int = Field(default=0, ge=0)
     parent_session_id: str | None = None
     # First-class project this session is filed under, or ``None`` when
     # unfiled. Lets the sidebar group sessions by project without a follow-up
@@ -2673,6 +2699,14 @@ class SessionList(BaseModel):
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
+
+
+class ArchivedSessionFacetsResponse(BaseModel):
+    """Compact filter values for ``GET /v1/sessions/archived-facets``."""
+
+    projects: list[str] = Field(default_factory=list)
+    host_ids: list[str] = Field(default_factory=list)
+    agent_names: list[str] = Field(default_factory=list)
 
 
 class ChildSessionList(BaseModel):

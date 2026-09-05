@@ -493,12 +493,18 @@ export const BubbleView = memo(
     bubble,
     isLastAssistant = false,
     showsWorking = false,
+    readOnly = false,
+    sessionId,
   }: {
     bubble: Bubble;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
+    /** Archive/library viewers reuse the normal bubbles without live actions. */
+    readOnly?: boolean;
+    /** Source session for attachments when rendering outside the active chat. */
+    sessionId?: string;
   }) {
-    if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
+    if (bubble.kind === "user") return <UserBubble bubble={bubble} sessionId={sessionId} />;
     if (bubble.kind === "compaction_loading") {
       return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
@@ -519,12 +525,16 @@ export const BubbleView = memo(
         bubble={bubble}
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
+        readOnly={readOnly}
+        sessionId={sessionId}
       />
     );
   },
   (prev, next) =>
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
+    (prev.readOnly ?? false) === (next.readOnly ?? false) &&
+    prev.sessionId === next.sessionId &&
     bubblesEqual(prev.bubble, next.bubble),
 );
 
@@ -566,8 +576,15 @@ function useCopyMessage(getText: () => string): {
   return { isCopied, handleCopy };
 }
 
-function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
-  const sessionId = useChatStore((s) => s.conversationId);
+function UserBubble({
+  bubble,
+  sessionId: sourceSessionId,
+}: {
+  bubble: Extract<Bubble, { kind: "user" }>;
+  sessionId?: string;
+}) {
+  const activeSessionId = useChatStore((s) => s.conversationId);
+  const sessionId = sourceSessionId ?? activeSessionId;
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
   const text = extractUserText(bubble.content);
@@ -748,21 +765,28 @@ function AssistantBubble({
   bubble,
   isLastAssistant = false,
   showsWorking = false,
+  readOnly = false,
+  sessionId,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
+  readOnly?: boolean;
+  sessionId?: string;
 }) {
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
   // is rendered at the page level, not inside this component.
-  const sessionStatus = useChatStore((s) => s.sessionStatus);
-  const conversationId = useChatStore((s) => s.conversationId);
+  const activeSessionStatus = useChatStore((s) => s.sessionStatus);
+  const activeConversationId = useChatStore((s) => s.conversationId);
+  const sessionStatus = readOnly ? "idle" : activeSessionStatus;
+  const conversationId = sessionId ?? activeConversationId;
   // A pending elicitation means the turn is parked awaiting the user — still in
   // flight even when its lifecycle or the session status reads settled.
-  const hasPendingElicitation = useChatStore((s) =>
+  const activeHasPendingElicitation = useChatStore((s) =>
     s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
   );
+  const hasPendingElicitation = readOnly ? false : activeHasPendingElicitation;
   // Getter computes the markdown lazily at click time.
   const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
   // null outside AppShell's provider (isolated tests) → hide the action.
@@ -826,7 +850,7 @@ function AssistantBubble({
             hasPendingElicitation={hasPendingElicitation}
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
-            onRetryError={handleRetryError}
+            onRetryError={readOnly ? undefined : handleRetryError}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
@@ -855,7 +879,7 @@ function AssistantBubble({
                 {/* Fork from this response: clone the session with history
                     truncated after this turn. Hidden while streaming and when
                     the session can't be forked. */}
-                {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                {!readOnly && forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
                   <MessageAction
                     tooltip="Fork from here"
                     size="icon-xxs"
