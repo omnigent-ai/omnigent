@@ -28,13 +28,17 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.pi_executor import (
+    _PI_IDLE_TIMEOUT_DEFAULT_S,
+    _PI_IDLE_TIMEOUT_ENV_VAR,
     PiExecutor,
     _build_models_json,
     _databricks_model_wire_catalog,
     _generate_extension_js,
+    _pi_idle_timeout_message,
     _pi_provider_for_model,
     _PiRpcSession,
     _redact_argv_for_log,
+    _resolve_pi_idle_timeout_s,
     _safe_dumps,
     _sanitize_schema,
     _split_pi_prompt,
@@ -4666,3 +4670,100 @@ def test_run_turn_prompt_command_includes_streaming_behavior():
         "residual race against a still-alive Pi process queues instead of "
         f"surfacing the raw protocol error; got {cmd!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Idle read timeout: budget resolution, timeout-vs-EOF, honest reporting
+# ---------------------------------------------------------------------------
+
+
+class TestPiIdleTimeout(unittest.TestCase):
+    """The idle read budget is env-configurable, and a read timeout is
+    reported as a timeout with child liveness — never as the EOF-style
+    process-death error."""
+
+    def test_idle_budget_defaults_when_env_unset(self):
+        with patch.dict(os.environ):
+            os.environ.pop(_PI_IDLE_TIMEOUT_ENV_VAR, None)
+            self.assertEqual(_resolve_pi_idle_timeout_s(), _PI_IDLE_TIMEOUT_DEFAULT_S)
+
+    def test_idle_budget_defaults_when_env_blank(self):
+        with patch.dict(os.environ, {_PI_IDLE_TIMEOUT_ENV_VAR: "   "}):
+            self.assertEqual(_resolve_pi_idle_timeout_s(), _PI_IDLE_TIMEOUT_DEFAULT_S)
+
+    def test_idle_budget_honours_valid_env_value(self):
+        with patch.dict(os.environ, {_PI_IDLE_TIMEOUT_ENV_VAR: "45.5"}):
+            self.assertEqual(_resolve_pi_idle_timeout_s(), 45.5)
+
+    def test_idle_budget_rejects_invalid_env_values_with_warning(self):
+        for raw in ("abc", "0", "-3", "inf", "nan"):
+            with (
+                patch.dict(os.environ, {_PI_IDLE_TIMEOUT_ENV_VAR: raw}),
+                self.assertLogs("omnigent.inner.pi_executor", level="WARNING") as logs,
+            ):
+                self.assertEqual(_resolve_pi_idle_timeout_s(), _PI_IDLE_TIMEOUT_DEFAULT_S, raw)
+            self.assertTrue(
+                any(_PI_IDLE_TIMEOUT_ENV_VAR in message for message in logs.output), raw
+            )
+
+    def test_executor_resolves_idle_budget_at_construction(self):
+        with (
+            patch.dict(os.environ, {_PI_IDLE_TIMEOUT_ENV_VAR: "7"}),
+            patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        ):
+            executor = PiExecutor()
+        self.assertEqual(executor._idle_timeout_s, 7.0)
+
+    def test_read_line_raises_timeout_when_no_line_arrives(self):
+        async def _test():
+            rpc = _PiRpcSession()
+            rpc._line_queue = asyncio.Queue()
+            with self.assertRaises(asyncio.TimeoutError):
+                await rpc.read_line(timeout=0.05)
+
+        _run(_test())
+
+    def test_read_line_returns_none_on_eof_sentinel(self):
+        async def _test():
+            rpc = _PiRpcSession()
+            rpc._line_queue = asyncio.Queue()
+            rpc._line_queue.put_nowait(None)  # the reader's EOF sentinel
+            self.assertIsNone(await rpc.read_line(timeout=0.05))
+
+        _run(_test())
+
+    def test_request_returns_none_and_requeues_deferred_on_timeout(self):
+        async def _test():
+            rpc = _PiRpcSession()
+            rpc.process = _FakeProcess()
+            rpc._line_queue = asyncio.Queue()
+            unrelated = json.dumps({"type": "message_update"})
+            rpc._line_queue.put_nowait(unrelated)
+
+            result = await rpc.request({"type": "get_state", "id": "1"}, "get_state", timeout=0.05)
+
+            self.assertIsNone(result)
+            self.assertEqual(rpc._line_queue.get_nowait(), unrelated)
+
+        _run(_test())
+
+    def test_timeout_message_reports_alive_child(self):
+        process = _FakeProcess()  # returncode None -> still alive
+        message = _pi_idle_timeout_message(process, 120.0)
+        self.assertIn("timeout", message.lower())
+        self.assertIn("still running (pid 99999)", message)
+        self.assertIn(_PI_IDLE_TIMEOUT_ENV_VAR, message)
+        self.assertNotIn("ended without response", message)
+
+    def test_timeout_message_reports_exited_child(self):
+        process = _FakeProcess()
+        process.returncode = 3
+        message = _pi_idle_timeout_message(process, 45.0)
+        self.assertIn("timeout", message.lower())
+        self.assertIn("exited with code 3", message)
+        self.assertIn("45", message)
+
+    def test_timeout_message_handles_missing_process(self):
+        message = _pi_idle_timeout_message(None, 120.0)
+        self.assertIn("timeout", message.lower())
+        self.assertIn("state unknown", message)

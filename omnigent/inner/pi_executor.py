@@ -36,6 +36,7 @@ import contextlib
 import hmac
 import json
 import logging
+import math
 import os
 import pathlib
 import re
@@ -641,6 +642,54 @@ _STREAM_READ_CHUNK_SIZE = 65536
 # inject a CancelledError that bypasses the SIGKILL path.
 _RPC_SESSION_CLOSE_REAP_TIMEOUT_S = 2.0
 
+# Idle read budget for a Pi turn: how long the turn loop waits for the *next*
+# JSONL line before giving up. A slow provider or retry backoff can
+# legitimately exceed it, so hitting it is a timeout, not a crash. Overridable
+# via the environment; resolved once at PiExecutor construction.
+_PI_IDLE_TIMEOUT_DEFAULT_S = 120.0
+_PI_IDLE_TIMEOUT_ENV_VAR = "OMNIGENT_PI_IDLE_TIMEOUT_S"
+
+
+def _resolve_pi_idle_timeout_s() -> float:
+    """Return the idle read budget in seconds, honouring the env override.
+
+    Unset or blank falls back to the default; unparseable, non-finite, or
+    non-positive values log a warning and fall back to the default.
+    """
+    raw = os.environ.get(_PI_IDLE_TIMEOUT_ENV_VAR)
+    if raw is None or not raw.strip():
+        return _PI_IDLE_TIMEOUT_DEFAULT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value <= 0:
+        logger.warning(
+            "Ignoring invalid %s=%r; using the default %gs idle timeout.",
+            _PI_IDLE_TIMEOUT_ENV_VAR,
+            raw,
+            _PI_IDLE_TIMEOUT_DEFAULT_S,
+        )
+        return _PI_IDLE_TIMEOUT_DEFAULT_S
+    return value
+
+
+def _pi_idle_timeout_message(
+    process: asyncio.subprocess.Process | None, idle_timeout_s: float
+) -> str:
+    """Describe an idle read timeout honestly: budget hit + child liveness."""
+    if process is None:
+        liveness = "pi process state unknown"
+    elif process.returncode is None:
+        liveness = f"pi process still running (pid {process.pid})"
+    else:
+        liveness = f"pi process exited with code {process.returncode}"
+    return (
+        f"Pi idle timeout: no output from pi for {idle_timeout_s:g}s "
+        f"(set {_PI_IDLE_TIMEOUT_ENV_VAR} to adjust); {liveness}."
+    )
+
+
 # CLI flags whose values are sensitive (e.g. the full system prompt) and must
 # not be written to logs verbatim. The value following these flags is replaced
 # with a length-only placeholder.
@@ -1147,7 +1196,10 @@ class _PiRpcSession:
         result: CodexEvent | None = None
         try:
             while True:
-                line = await self.read_line(timeout=timeout)
+                try:
+                    line = await self.read_line(timeout=timeout)
+                except asyncio.TimeoutError:
+                    break
                 if line is None:
                     break
                 try:
@@ -1167,12 +1219,14 @@ class _PiRpcSession:
                 self._line_queue.put_nowait(line)
         return result
 
-    async def read_line(self, timeout: float = 120.0) -> str | None:
-        """Read the next JSONL line from Pi's stdout. Returns None on EOF."""
-        try:
-            return await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return None
+    async def read_line(self, timeout: float = _PI_IDLE_TIMEOUT_DEFAULT_S) -> str | None:
+        """Read the next JSONL line from Pi's stdout.
+
+        Returns ``None`` on EOF; raises :class:`asyncio.TimeoutError` when no
+        line arrives within *timeout* seconds, so callers can tell a silent
+        (possibly still-working) child from a dead one.
+        """
+        return await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
 
     async def close(self) -> None:
         for task in (self._read_task, self._stderr_task):
@@ -1787,6 +1841,9 @@ class PiExecutor(Executor):
         # does exponential backoff + Retry-After honoring; we just set
         # the budget.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
+        # Idle read budget for turns; resolved once so every turn in the
+        # session shares one consistent budget.
+        self._idle_timeout_s = _resolve_pi_idle_timeout_s()
         # Allowlisted base env for the Pi subprocess — never the full
         # host environ. The spec's os_env.sandbox.env_passthrough is the
         # opt-in for anything beyond the base set (e.g. a provider API
@@ -2477,17 +2534,39 @@ class PiExecutor(Executor):
         while True:
             # After an errored message the only thing left to drain is the
             # already-emitted agent_end, so don't wait the full idle budget.
-            line = await rpc.read_line(timeout=120.0 if pending_error is None else 10.0)
+            timed_out = False
+            try:
+                line = await rpc.read_line(
+                    timeout=self._idle_timeout_s if pending_error is None else 10.0
+                )
+            except asyncio.TimeoutError:
+                # Idle timeout: pi went silent but did not necessarily die.
+                # Handled alongside EOF below, but reported as a timeout.
+                timed_out = True
+                line = None
             if line is None:
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                 elif not streamed_any and not response_text:
-                    stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
-                    stderr_suffix = f" Stderr: {stderr}" if stderr else ""
-                    yield ExecutorError(
-                        message=f"Pi process ended without response.{stderr_suffix}"
-                    )
+                    if timed_out:
+                        yield ExecutorError(
+                            message=_pi_idle_timeout_message(rpc.process, self._idle_timeout_s)
+                        )
+                    else:
+                        stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
+                        stderr_suffix = f" Stderr: {stderr}" if stderr else ""
+                        yield ExecutorError(
+                            message=f"Pi process ended without response.{stderr_suffix}"
+                        )
                 else:
+                    if timed_out:
+                        logger.warning(
+                            "PiExecutor: idle timeout after %gs of silence with "
+                            "partial output already streamed; completing the turn "
+                            "with what arrived so far (set %s to adjust the budget).",
+                            self._idle_timeout_s,
+                            _PI_IDLE_TIMEOUT_ENV_VAR,
+                        )
                     turn_usage = _aggregate_pi_turn_usage(message_usages, model)
                     _notify_usage_from_dict(model=model, usage=turn_usage)
                     yield TurnComplete(
