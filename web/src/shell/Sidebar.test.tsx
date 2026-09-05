@@ -162,6 +162,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
+import * as identity from "@/lib/identity";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -290,6 +291,56 @@ function seedPins(ids: string[]) {
 afterEach(cleanup);
 
 describe("Sidebar session list", () => {
+  it.each([null, 1, 2, 3, 4])(
+    "marks shared sessions regardless of permission level %s",
+    (level) => {
+      mockConversations([
+        conv("shared_session", "Claude Code", {
+          owner: "other@example.com",
+          permission_level: level,
+        }),
+        conv("private_session", "Claude Code"),
+      ]);
+      renderSidebar();
+      selectSessionFilter("all");
+
+      const sharedRow = screen.getByText("shared_session").closest("a")!;
+      const indicator = within(sharedRow).getByRole("img", { name: "Shared session" });
+      expect(indicator).toHaveAttribute("title", "Shared with you");
+      expect(indicator).toHaveClass("shrink-0");
+      expect(
+        within(screen.getByText("private_session").closest("a")!).queryByRole("img"),
+      ).toBeNull();
+    },
+  );
+
+  it("does not mark the viewer's own sessions or sessions without ownership metadata", () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    try {
+      mockConversations([
+        conv("owned_session", "Claude Code", { owner: "viewer@example.com" }),
+        conv("null_owner", "Claude Code", { owner: null }),
+        conv("missing_owner", "Claude Code"),
+      ]);
+      renderSidebar();
+      expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
+  it("keeps the shared indicator on pinned sessions across filters", () => {
+    mockConversations([conv("shared_pin", "Claude Code", { owner: "other@example.com" })]);
+    seedPins(["shared_pin"]);
+    renderSidebar();
+
+    for (const filter of ["mine", "shared", "all", "archived"] as const) {
+      selectSessionFilter(filter);
+      const pinned = screen.getByText("Pinned").closest("section")!;
+      expect(within(pinned).getByRole("img", { name: "Shared session" })).toBeInTheDocument();
+    }
+  });
+
   it("uses the interface text token for the empty session-list state", () => {
     mockConversations([]);
     renderSidebar();
