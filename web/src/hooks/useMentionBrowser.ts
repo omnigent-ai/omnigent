@@ -1,4 +1,4 @@
-import { type KeyboardEvent, type RefObject, useRef, useState } from "react";
+import { type RefObject, useRef, useState } from "react";
 
 import type { MentionItem, MentionState } from "@/lib/composerMentions";
 import { composerAttachmentKey } from "@/store/chatStore";
@@ -37,10 +37,15 @@ export interface MentionBrowser {
   openMentionDir: (path: string) => void;
   removeMentionedItem: (index: number) => void;
   /** Handle a key event for the open menu; returns true when it consumed it. */
-  handleKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => boolean;
+  handleKeyDown: (e: MentionKeyboardEvent) => boolean;
   /** Dismiss the menu (e.g. on blur). */
   dismiss: () => void;
 }
+
+export type MentionKeyboardEvent = Pick<
+  KeyboardEvent,
+  "code" | "key" | "ctrlKey" | "metaKey" | "altKey" | "shiftKey" | "preventDefault"
+>;
 
 /**
  * Shared ``@``-file-mention controller for the in-session composer and the
@@ -121,7 +126,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setMentionIndex(-1);
   };
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
+  const handleKeyDown = (e: MentionKeyboardEvent): boolean => {
     if (!mentionOpen) return false;
     const active = mentionIndex >= 0 ? mentionEntries[mentionIndex] : undefined;
     if (e.key === "ArrowDown") {

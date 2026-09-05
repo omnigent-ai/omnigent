@@ -2260,7 +2260,10 @@ async def _persist_external_conversation_item(
             drained = matched.matched
             skipped_kiro_pending = matched.skipped
         else:
-            drained = pending_inputs.resolve_oldest(session_id)
+            drained = pending_inputs.resolve_oldest_for_mirrored_text(
+                session_id,
+                _message_text(item.data.content) or "",
+            )
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)

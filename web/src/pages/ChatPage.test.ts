@@ -1433,6 +1433,54 @@ describe("dispatchInitialPrompt", () => {
     // an empty array here means first-message attachments silently vanish.
     expect(send).toHaveBeenCalledWith("what is this?", "ag_abc123", [file]);
   });
+
+  it("carries landing attachment positions through the plain-message path", () => {
+    const send = vi.fn().mockResolvedValue(undefined);
+    const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
+    const file = new File(["x"], "diagram.png", { type: "image/png" });
+    const composerParts = [
+      { type: "text" as const, text: "before " },
+      { type: "attachment" as const, file },
+      { type: "text" as const, text: " after" },
+    ];
+    dispatchInitialPrompt(
+      { text: "before  after", skill: null, files: [file], composerParts },
+      "ag_abc123",
+      send,
+      sendSlashCommand,
+    );
+
+    expect(send).toHaveBeenCalledWith("before  after", "ag_abc123", [file], {
+      composerParts,
+    });
+  });
+
+  it("sends a matched skill plus attachments as one ordered plain message", () => {
+    const send = vi.fn().mockResolvedValue(undefined);
+    const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
+    const file = new File(["x"], "diagram.png", { type: "image/png" });
+    const composerParts = [
+      { type: "text" as const, text: "/review-pr 123 " },
+      { type: "attachment" as const, file },
+    ];
+
+    dispatchInitialPrompt(
+      {
+        text: "/review-pr 123 ",
+        skill: { name: "review-pr", args: "123" },
+        files: [file],
+        composerParts,
+      },
+      "ag_abc123",
+      send,
+      sendSlashCommand,
+    );
+
+    expect(send).toHaveBeenCalledWith("/review-pr 123 ", "ag_abc123", [file], {
+      composerParts,
+    });
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
 });
 
 describe("shouldSendInitialPrompt", () => {

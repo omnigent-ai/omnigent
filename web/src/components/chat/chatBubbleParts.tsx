@@ -580,6 +580,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
   // markers (no input_file block), so surface them as chips.
   const mentionedChips = extractAttachedPaths(bubble.content);
+  const keyedContent = (() => {
+    const seen = new Map<string, number>();
+    return bubble.content.map((block) => {
+      const base = JSON.stringify(block);
+      const occurrence = seen.get(base) ?? 0;
+      seen.set(base, occurrence + 1);
+      return { block, key: `${base}:${occurrence}` };
+    });
+  })();
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
@@ -634,53 +643,6 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
             }
           >
-            {/* Inline image previews — one non-wrapping strip. */}
-            {images.length > 0 && (
-              <div className="mb-1.5 flex gap-2 overflow-x-auto">
-                {images.map((img) =>
-                  img.file_id.startsWith("pending:") ? (
-                    // Upload in-flight — show a chip placeholder
-                    <span
-                      key={img.file_id}
-                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                    >
-                      <ImageIcon className="size-3 shrink-0" />
-                      <span className="max-w-[180px] truncate">
-                        {img.filename ?? img.file_id.replace("pending:", "")}
-                      </span>
-                    </span>
-                  ) : (
-                    // Uploaded — render the actual image
-                    <SessionImage
-                      key={img.file_id}
-                      path={
-                        sessionId
-                          ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(img.file_id)}/content`
-                          : undefined
-                      }
-                      alt={img.filename ?? img.file_id}
-                      // Sizing lives in SessionImage, which reserves a matching
-                      // box so the bubble's height is settled before bytes land.
-                      className="rounded-md object-contain"
-                    />
-                  ),
-                )}
-              </div>
-            )}
-            {/* Non-image file chips */}
-            {fileChips.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap gap-1.5">
-                {fileChips.map((att) => (
-                  <span
-                    key={att.file_id}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                  >
-                    <FileTextIcon className="size-3 shrink-0" />
-                    <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
-                  </span>
-                ))}
-              </div>
-            )}
             {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
             {mentionedChips.length > 0 && (
               <div className="mb-1.5 flex flex-wrap gap-1.5">
@@ -707,10 +669,56 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 ))}
               </div>
             )}
-            {/* Render user text as markdown, matching the assistant bubble.
-              `breaks` keeps single newlines as line breaks. Empty text renders
-              nothing rather than an empty markdown block. */}
-            {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
+            {/* Preserve the authored text/attachment order after send. Adjacent
+                text is already coalesced by the composer, so each block can be
+                rendered directly without lifting uploads ahead of prose. */}
+            {keyedContent.map(({ block, key }) => {
+              if (block.type === "input_text") {
+                const visible = block.text.replace(ATTACHED_RE, "").trim();
+                return visible ? (
+                  <FilePathAwareMessageResponse key={key} breaks>
+                    {visible}
+                  </FilePathAwareMessageResponse>
+                ) : null;
+              }
+              if (block.type === "input_image") {
+                return (
+                  <div key={key} className="my-1.5 flex overflow-x-auto">
+                    {block.file_id.startsWith("pending:") ? (
+                      <span className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground">
+                        <ImageIcon className="size-3 shrink-0" />
+                        <span className="max-w-[180px] truncate">
+                          {block.filename ?? block.file_id.replace("pending:", "")}
+                        </span>
+                      </span>
+                    ) : (
+                      <SessionImage
+                        path={
+                          sessionId
+                            ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(block.file_id)}/content`
+                            : undefined
+                        }
+                        alt={block.filename ?? block.file_id}
+                        className="rounded-md object-contain"
+                      />
+                    )}
+                  </div>
+                );
+              }
+              if (block.type === "input_file") {
+                return (
+                  <div key={key} className="my-1.5 flex flex-wrap gap-1.5">
+                    <span className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground">
+                      <FileTextIcon className="size-3 shrink-0" />
+                      <span className="max-w-[180px] truncate">
+                        {block.filename ?? block.file_id}
+                      </span>
+                    </span>
+                  </div>
+                );
+              }
+              return null;
+            })}
           </MessageContent>
         </div>
         {/* Skip an empty row when there is neither a timestamp nor a copy

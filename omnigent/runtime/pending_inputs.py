@@ -41,11 +41,12 @@ stuck pending and double-rendered. Per-session SSE ordering guarantees
 the i-th persisted user message corresponds to the i-th queued one, so
 each persisted native user message drains the oldest pending entry.
 
-The one imperfect case is interleaving a web-composer message with a
-message typed directly in the TUI: the TUI message (which has no pending
-entry) drains the oldest web entry, so that web bubble briefly
-disappears and reappears once it persists. It self-heals; the committed
-bubble always renders the just-persisted content regardless.
+When an attachment-bearing web message is interleaved with direct TUI
+input, :func:`resolve_oldest_for_mirrored_text` compares the visible text
+after removing materialized attachment markers. A clear mismatch leaves
+the web entry pending so its ordered content cannot overwrite the direct
+terminal message. Plain text messages retain FIFO matching because native
+transcripts may reformat quotes and whitespace.
 
 Limitations (identical to :mod:`pending_elicitations`):
 
@@ -66,6 +67,7 @@ evicted lazily on the next :func:`record` / :func:`snapshot_for` /
 from __future__ import annotations
 
 import copy
+import re
 import threading
 import time
 import uuid
@@ -77,6 +79,7 @@ from typing import Any
 # vendor-TUI-never-accepted-the-message ghost; long enough that a slow
 # transcript round-trip on a busy session still drains normally.
 _TTL_S: float = 600.0
+_ATTACHED_MARKER_RE = re.compile(r"\[Attached(?: file)?:\s*[^\]]*\]\s*", re.IGNORECASE)
 
 
 def _now() -> float:
@@ -282,6 +285,41 @@ def resolve_oldest(conversation_id: str) -> DrainedInput | None:
             content=copy.deepcopy(entry.content),
             created_by=entry.created_by,
         )
+
+
+def resolve_oldest_for_mirrored_text(
+    conversation_id: str,
+    mirrored_text: str,
+) -> DrainedInput | None:
+    """Drain the FIFO head unless an attachment-bearing head clearly differs.
+
+    Native terminals provide no correlation id. Plain pending messages retain
+    the established FIFO behavior because transcript formatting may change
+    them. Attachment-bearing messages need a stricter guard: merging their
+    complete ordered content into unrelated direct-terminal text would replace
+    that message. Materialized ``[Attached: ...]`` lines are removed before the
+    comparison because the pending content already represents those files.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id)
+        if entries is None:
+            return None
+        oldest_id = next(iter(entries))
+        entry = entries[oldest_id]
+        has_files = any(
+            isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
+            for block in entry.content
+        )
+        if has_files:
+            pending_text = _normalize_text(_content_text(entry.content))
+            observed_text = _normalize_text(_ATTACHED_MARKER_RE.sub("", mirrored_text))
+            if pending_text != observed_text:
+                return None
+        entries.pop(oldest_id)
+        if not entries:
+            _pending.pop(conversation_id, None)
+        return _drained_input(entry)
 
 
 def resolve_matching_text(conversation_id: str, text: str) -> MatchedDrain:

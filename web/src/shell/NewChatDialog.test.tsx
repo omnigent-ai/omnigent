@@ -686,6 +686,10 @@ function host(status: "online" | "offline", i = 1): Host {
   return { host_id: `host_${i}`, name: `machine-${i}`, owner: "me", status };
 }
 
+function localHostDisplayName(): string {
+  return displayNameForHost(host("online"), "host_1", navigator.userAgent);
+}
+
 function mockHosts(hosts: Host[], queryState: Partial<ReturnType<typeof useHosts>> = {}) {
   useHostsMock.mockReturnValue({
     data: hosts,
@@ -1172,7 +1176,7 @@ describe("NewChatLandingScreen", () => {
     const composer = screen.getByTestId("new-chat-landing-composer");
     expect(composer).toHaveClass(
       "border-border",
-      "has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+      "focus-within:shadow-[var(--composer-shadow-focus)]",
     );
     expect(composer).not.toHaveClass("shadow-[var(--composer-shadow)]");
     expect(composer.className).not.toContain("has-[textarea:focus]:border-");
@@ -2539,7 +2543,7 @@ describe("NewChatLandingScreen", () => {
     // DOCUMENT_POSITION_FOLLOWING means the host item comes after it.
     const sandboxOption = screen.getByTestId("new-chat-landing-sandbox-option");
     const hostItem = screen
-      .getAllByText("This machine")
+      .getAllByText(localHostDisplayName())
       .find((el) => el.closest('[role="menuitem"]') !== null);
     expect(hostItem).toBeTruthy();
     expect(
@@ -2550,7 +2554,7 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(hostItem!);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
+        localHostDisplayName(),
       ),
     );
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
@@ -3101,7 +3105,7 @@ describe("NewChatLandingScreen skills menu", () => {
       fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
 
       expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
-        "/rev",
+        "/rev\n",
       );
       expect(authenticatedFetchMock).not.toHaveBeenCalled();
     } finally {
@@ -3487,7 +3491,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
 
       fireEvent.keyDown(input(), { key: "Enter" });
 
-      expect((input() as HTMLTextAreaElement).value).toBe("@README");
+      expect((input() as HTMLTextAreaElement).value).toBe("@README\n");
       expect(screen.queryByText("@README.md")).not.toBeInTheDocument();
       expect(authenticatedFetchMock).not.toHaveBeenCalled();
     } finally {
@@ -3813,13 +3817,13 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     const hostItem = screen
-      .getAllByText("This machine")
+      .getAllByText(localHostDisplayName())
       .find((el) => el.closest('[role="menuitem"]') !== null);
     expect(hostItem).toBeTruthy();
     fireEvent.click(hostItem!);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
+        localHostDisplayName(),
       ),
     );
     // With no custom agents yet, the create item is a top-level row (no
@@ -3840,12 +3844,12 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     const hostItem = screen
-      .getAllByText("This machine")
+      .getAllByText(localHostDisplayName())
       .find((el) => el.closest('[role="menuitem"]') !== null);
     fireEvent.click(hostItem!);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
+        localHostDisplayName(),
       ),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });

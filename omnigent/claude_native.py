@@ -5457,8 +5457,17 @@ def _claude_user_content_from_api_blocks(
     :returns: A string for simple text prompts, a Claude content block
         list for multi-block prompts, or ``None`` when no text exists.
     """
-    blocks = _claude_attachment_text_blocks_from_api_content(content, bridge_dir)
-    blocks += _claude_text_blocks_from_api_content(content, api_type="input_text")
+    blocks: list[_JsonObject] = []
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "input_text":
+                text = block.get("text")
+                if isinstance(text, str) and text:
+                    blocks.append({"type": "text", "text": text})
+            elif block.get("type") in {"input_image", "input_file"}:
+                blocks.extend(_claude_attachment_text_blocks_from_api_content([block], bridge_dir))
     if not blocks:
         return None
     if len(blocks) == 1:

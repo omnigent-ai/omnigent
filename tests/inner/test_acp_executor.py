@@ -1931,3 +1931,16 @@ async def test_close_reaps_the_agents_forked_children(tmp_path: Path) -> None:
     while _proc.process_alive(grandchild):
         assert time.monotonic() < deadline, f"agent child {grandchild} survived close()"
         await asyncio.sleep(0.05)
+
+
+def test_ordered_prompt_blocks_preserve_text_image_text_order() -> None:
+    blocks = [
+        {"type": "input_text", "text": "before"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAB"},
+        {"type": "input_text", "text": "after"},
+    ]
+    assert AcpExecutor._ordered_prompt_blocks(blocks, image_supported=True) == [
+        {"type": "text", "text": "before"},
+        {"type": "image", "mimeType": "image/png", "data": "AAAB"},
+        {"type": "text", "text": "after"},
+    ]

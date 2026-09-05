@@ -197,7 +197,7 @@ describe("Composer growth layout", () => {
 
     fireEvent.change(ta, { target: { value: "one\ntwo\nthree\nfour" } });
 
-    expect(ta.style.height).toBe("200px");
+    expect(ta).toHaveClass("max-h-[208px]", "overflow-y-auto");
     expect(form?.style.marginTop).toBe("");
   });
 
@@ -210,7 +210,7 @@ describe("Composer growth layout", () => {
       "[scrollbar-width:none]",
       "[&::-webkit-scrollbar]:hidden",
     );
-    expect(ta.parentElement).toHaveClass("overflow-hidden");
+    expect(ta).toHaveClass("max-h-[208px]");
   });
 });
 
@@ -276,7 +276,7 @@ describe("Composer send shortcut", () => {
       render(<Composer {...composerProps({ onSend })} />);
       fireEvent.change(textarea(), { target: { value: "/des" } });
       fireEvent.keyDown(textarea(), { key: "Enter" });
-      expect(textarea().value).toBe("/des");
+      expect(textarea().value).toBe("/des\n");
       expect(onSend).not.toHaveBeenCalled();
 
       fireEvent.focus(screen.getByRole("button", { name: "Send" }));
@@ -1632,25 +1632,16 @@ describe("SlashCommandMenu", () => {
   });
 });
 
-// Renders the real composer and inspects the highlight overlay's DOM, so a
-// regression where the WHOLE draft tints (not just the token) is caught.
+// Renders the real composer and inspects the decorated token in its DOM.
 describe("Composer slash-command highlight overlay", () => {
   beforeEach(() => {
     useChatStore.setState({ conversationId: "conv_test", skills: [] });
   });
   afterEach(() => cleanup());
 
-  /** The only tinted (pink) run in the overlay — should be just the token. */
+  /** The only tinted run in the editor — should be just the token. */
   function tintedText(): string | null {
-    return (
-      screen.getByTestId("composer-highlight-overlay").querySelector(".text-brand-accent")
-        ?.textContent ?? null
-    );
-  }
-
-  /** The overlay's full text, tinted + untinted — should mirror the draft. */
-  function overlayText(): string {
-    return screen.getByTestId("composer-highlight-overlay").textContent ?? "";
+    return document.querySelector("[data-composer-slash-token]")?.textContent ?? null;
   }
 
   // A slash command followed by args; only the leading token should tint.
@@ -1662,13 +1653,13 @@ describe("Composer slash-command highlight overlay", () => {
     fireEvent.change(textarea(), { target: { value: COMMAND_PROMPT } });
     expect(textarea().value).toBe(COMMAND_PROMPT);
     expect(tintedText()).toBe("/cross-review");
-    expect(overlayText()).toBe(COMMAND_PROMPT);
+    expect(textarea().textContent).toBe(COMMAND_PROMPT);
   });
 
   it("renders no overlay for plain prose", () => {
     render(<Composer {...composerProps()} />);
     fireEvent.change(textarea(), { target: { value: "just a normal message" } });
-    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+    expect(document.querySelector("[data-composer-slash-token]")).toBeNull();
   });
 });
 
@@ -2298,7 +2289,7 @@ describe("Composer config gear", () => {
         })}
       />,
     );
-    const modelTextarea = document.querySelector("textarea") as HTMLTextAreaElement;
+    const modelTextarea = textarea();
     fireEvent.change(modelTextarea, { target: { value: "/model" } });
     fireEvent.keyDown(modelTextarea, { key: "Enter", code: "Enter" });
     // Give the nonce effect a tick; the modal must stay closed.

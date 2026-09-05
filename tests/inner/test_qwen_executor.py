@@ -2321,3 +2321,16 @@ async def test_ensure_initialized_image_capability_defaults_false() -> None:
     await executor._ensure_initialized()
     assert executor._initialized is True
     assert executor._image_supported is False
+
+
+def test_ordered_prompt_blocks_preserve_text_image_text_order() -> None:
+    blocks = [
+        {"type": "input_text", "text": "before"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAB"},
+        {"type": "input_text", "text": "after"},
+    ]
+    assert QwenExecutor._ordered_prompt_blocks(blocks, image_supported=True) == [
+        {"type": "text", "text": "before"},
+        {"type": "image", "mimeType": "image/png", "data": "AAAB"},
+        {"type": "text", "text": "after"},
+    ]
