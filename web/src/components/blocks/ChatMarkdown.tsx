@@ -37,6 +37,44 @@ type WithHastNode<T> = T & { node?: unknown };
 // Trailing `:line` / `:line:col` on a cited path, e.g. `src/app.ts:42:7`.
 const POSITION_SUFFIX = /:\d+(?::\d+)?$/;
 
+// Minimal structural view of an mdast node: enough to find raw-HTML nodes and
+// rewrite them in place without depending on the mdast type packages.
+interface MdastNode {
+  type: string;
+  value?: string;
+  children?: MdastNode[];
+}
+
+/**
+ * Remark transformer that reinterprets raw-HTML nodes as literal text.
+ *
+ * micromark parses anything shaped like an HTML tag (`<div>`, `</p>`,
+ * `<!-- … -->`) into `html` nodes, which the hardened render pipeline then
+ * drops wholesale — fine for agent-authored markdown, but user-typed prose
+ * loses every angle-bracketed token. Rewriting those nodes to plain text keeps
+ * the typed characters visible verbatim; React escapes text on render, so
+ * nothing is ever parsed as live HTML. Autolinks (`<https://…>`) and code
+ * spans are different node types and pass through untouched.
+ */
+function remarkHtmlAsLiteralText() {
+  const rewrite = (node: MdastNode): void => {
+    const children = node.children;
+    if (!children) return;
+    for (let i = 0; i < children.length; i += 1) {
+      const child = children[i];
+      if (child.type === "html") {
+        const text: MdastNode = { type: "text", value: child.value ?? "" };
+        // A block-level HTML node sits directly under root; wrap its text in
+        // a paragraph so it lays out like the neighbouring prose blocks.
+        children[i] = node.type === "root" ? { type: "paragraph", children: [text] } : text;
+      } else {
+        rewrite(child);
+      }
+    }
+  };
+  return rewrite;
+}
+
 /**
  * Resolves `text` to an openable workspace file, returning the click handler
  * that opens it in the FileViewer, or null when it isn't one (no FileViewer,
@@ -340,21 +378,32 @@ function PlainTextFallback({ text }: { text: string }) {
  * `remarkPlugins` prop *replaces* its defaults rather than merging, so we
  * extend `defaultRemarkPlugins` (which carries remark-gfm) — passing
  * `[remarkBreaks]` alone would silently drop GFM tables / strikethrough.
+ *
+ * When `literalHtml` is set, raw-HTML-shaped tokens (`<div>`, `</p>`) render
+ * verbatim as text instead of being dropped by the harden pass. Used for
+ * user bubbles, where such tokens are prose the user typed, not markup.
  */
 export function FilePathAwareMessageResponse({
   children,
   breaks = false,
+  literalHtml = false,
   ...props
-}: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean }) {
+}: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
   const components = FILE_PATH_AWARE_COMPONENTS;
 
   // Extend (don't replace) Streamdown's defaults so remark-gfm survives;
-  // append remark-breaks only when `breaks` is requested. When `breaks` is
-  // false we pass `undefined` so Streamdown uses its own defaults unchanged.
-  const remarkPlugins = useMemo(
-    () => (breaks ? [...Object.values(defaultRemarkPlugins), remarkBreaks] : undefined),
-    [breaks],
-  );
+  // append the opt-in transforms only when requested. The literal-HTML
+  // rewrite runs before remark-breaks so newlines inside a rewritten block
+  // still become hard breaks. With neither opt-in we pass `undefined` so
+  // Streamdown uses its own defaults unchanged.
+  const remarkPlugins = useMemo(() => {
+    if (!breaks && !literalHtml) return undefined;
+    return [
+      ...Object.values(defaultRemarkPlugins),
+      ...(literalHtml ? [remarkHtmlAsLiteralText] : []),
+      ...(breaks ? [remarkBreaks] : []),
+    ];
+  }, [breaks, literalHtml]);
 
   // Throttle the markdown so the live (still-growing) bubble re-parses a few
   // times per second instead of on every store commit. `children` is a string

@@ -708,9 +708,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               </div>
             )}
             {/* Render user text as markdown, matching the assistant bubble.
-              `breaks` keeps single newlines as line breaks. Empty text renders
-              nothing rather than an empty markdown block. */}
-            {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
+              `breaks` keeps single newlines as line breaks; `literalHtml`
+              keeps typed angle-bracket tokens (e.g. `<div>`) visible instead
+              of letting the markdown pipeline drop them as raw HTML. Empty
+              text renders nothing rather than an empty markdown block. */}
+            {text && (
+              <FilePathAwareMessageResponse breaks literalHtml>
+                {text}
+              </FilePathAwareMessageResponse>
+            )}
           </MessageContent>
         </div>
         {/* Skip an empty row when there is neither a timestamp nor a copy

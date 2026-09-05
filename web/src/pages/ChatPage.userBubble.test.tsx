@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
@@ -99,6 +100,53 @@ describe("UserBubble markdown rendering", () => {
     // table would render as literal pipe text with no <table>/<td>.
     const cell = await screen.findByText("1", { selector: "td, td *" });
     expect(cell.closest("table")).not.toBeNull();
+  });
+
+  it("keeps angle-bracketed tag tokens visible as literal text", () => {
+    renderBubble(
+      userBubble(
+        'Please change the <div> wrapper to <section> and keep the <span class="note"> tag as-is.',
+      ),
+    );
+    const bubble = screen.getByTestId("message-bubble");
+    // The markdown pipeline parses these tokens as raw HTML; user-typed prose
+    // must keep them visible verbatim instead of dropping them.
+    expect(bubble.textContent).toContain("<div>");
+    expect(bubble.textContent).toContain("<section>");
+    expect(bubble.textContent).toContain('<span class="note">');
+    // Visible as text only — never parsed into live elements (that would be
+    // an injection vector, the opposite failure mode).
+    expect(bubble.querySelector("section")).toBeNull();
+    expect(bubble.querySelector(".note")).toBeNull();
+  });
+
+  it("keeps a message that opens with a block-level tag visible", () => {
+    renderBubble(userBubble("<div>\nwrap this\n</div>"));
+    const bubble = screen.getByTestId("message-bubble");
+    // A leading tag line makes micromark treat the whole block as raw HTML;
+    // the typed lines must all stay visible.
+    expect(bubble.textContent).toContain("<div>");
+    expect(bubble.textContent).toContain("wrap this");
+    expect(bubble.textContent).toContain("</div>");
+    expect(bubble.querySelector("div[class='']")).toBeNull();
+  });
+
+  it("still renders a tag inside inline code as inline code", () => {
+    // The inline-code override resolves workspace paths through react-query,
+    // so this render needs a QueryClientProvider (as the fileLinks tests do).
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    const { container } = render(
+      <QueryClientProvider client={client}>
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BubbleView bubble={userBubble("use `<div>` here")} />
+        </FileViewerContext.Provider>
+      </QueryClientProvider>,
+    );
+    const code = container.querySelector("code");
+    // Code spans are their own node type: the literal-HTML rewrite must not
+    // touch them or double-escape their contents.
+    expect(code).not.toBeNull();
+    expect(code?.textContent).toBe("<div>");
   });
 
   it("renders CJK text around explicit inline math", async () => {
