@@ -1056,9 +1056,13 @@
                 "type": "integer"
               },
               {
+                "type": "string"
+              },
+              {
                 "type": "null"
               }
             ],
+            "description": "Opaque vendor compaction-window identifier. Current Codex writes a UUID string to `payload.window_id` on its `type == \"compacted\"` rollout JSONL record; older Codex rollouts used integer counters there.",
             "title": "Window Id"
           }
         },
