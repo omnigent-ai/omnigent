@@ -114,6 +114,51 @@ describe("TurnRail", () => {
     for (const anchor of anchors) anchor.remove();
   });
 
+  it("keeps the initiating turn active when its anchor is windowed out of the DOM", async () => {
+    // WHY: the transcript is virtualized, so a long reply can push its own
+    // initiating user anchor out of the mounted window. The active tick must
+    // still be that turn — derived from the first MOUNTED anchor below the
+    // midpoint — not a later mounted turn or a fallback.
+    const turns = makeTurns(3);
+    const scroller = document.createElement("div");
+    vi.spyOn(scroller, "getBoundingClientRect").mockReturnValue({
+      top: 0,
+      bottom: 100,
+    } as DOMRect);
+
+    // turn 0's anchor is unmounted (scrolled beyond the overscan). turns 1 and 2
+    // are mounted below the midpoint (50) — you're reading turn 0's long reply.
+    const mounted = [turns[1]!, turns[2]!].map((turn, i) => {
+      const anchor = document.createElement("div");
+      anchor.dataset.userMessageId = turn.itemId;
+      vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue({
+        top: 60 + i * 30,
+        bottom: 80 + i * 30,
+      } as DOMRect);
+      document.body.appendChild(anchor);
+      return anchor;
+    });
+
+    render(
+      <TurnRail
+        turns={turns}
+        scroller={{ el: scroller }}
+        hasMoreHistory={false}
+        loadingMoreHistory={false}
+      />,
+    );
+
+    await waitFor(() => {
+      const activeTicks = screen
+        .getAllByRole("button")
+        .filter((tick) => tick.firstElementChild?.classList.contains("bg-foreground"));
+      expect(activeTicks).toHaveLength(1);
+      expect(activeTicks[0]).toHaveAccessibleName("Jump to: prompt number 0");
+    });
+
+    for (const anchor of mounted) anchor.remove();
+  });
+
   it("keeps the first tick active while the first message is visible", async () => {
     const turns = makeTurns(3);
     const scroller = document.createElement("div");

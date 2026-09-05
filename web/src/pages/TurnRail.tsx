@@ -84,6 +84,15 @@ export function TurnRail({
   // At the absolute start of the conversation, the first tick stays active
   // while its user message remains visible, even if the viewport midpoint has
   // already crossed into the second turn.
+  //
+  // The transcript is windowed, so a turn whose anchor has scrolled beyond the
+  // overscan is unmounted. Rather than depend on every anchor's DOM node (which
+  // would skip an unmounted initiating turn and highlight a later one), find the
+  // first MOUNTED anchor strictly below the midpoint — the active turn is the
+  // one just before it in order. An unmounted anchor is always above the
+  // midpoint (you've scrolled past it), so it never becomes that boundary and
+  // the by-index predecessor still resolves to it.
+  //
   // rAF-throttled — scroll fires far faster than we need to recompute, and
   // reading anchor rects forces layout.
   useEffect(() => {
@@ -93,30 +102,34 @@ export function TurnRail({
       frame = 0;
       const view = scrollEl.getBoundingClientRect();
       const midpoint = (view.top + view.bottom) / 2;
-      let firstAvailableId: string | null = null;
-      let nextActiveId: string | null = null;
-      for (const turn of turns) {
+      // Start-of-conversation clamp: while the very first turn's message is
+      // visible (and nothing older exists), it stays active even once the
+      // midpoint has crossed into the second turn.
+      const firstAnchor = document.querySelector(
+        `[data-user-message-id="${CSS.escape(turns[0]!.itemId)}"]`,
+      );
+      if (firstAnchor && !hasMoreHistory) {
+        const rect = firstAnchor.getBoundingClientRect();
+        if (rect.bottom > view.top && rect.top < view.bottom) {
+          setActiveId(turns[0]!.itemId);
+          return;
+        }
+      }
+      // The active turn is the one just before the first mounted anchor that
+      // sits strictly below the midpoint. No such anchor (viewport at/near the
+      // bottom) means the latest turn owns the center.
+      let activeIndex = turns.length - 1;
+      for (let i = 0; i < turns.length; i++) {
         const anchor = document.querySelector(
-          `[data-user-message-id="${CSS.escape(turn.itemId)}"]`,
+          `[data-user-message-id="${CSS.escape(turns[i]!.itemId)}"]`,
         );
         if (!anchor) continue;
-        const rect = anchor.getBoundingClientRect();
-        if (firstAvailableId === null) {
-          firstAvailableId = turn.itemId;
-          const firstMessageIsVisible =
-            !hasMoreHistory && rect.bottom > view.top && rect.top < view.bottom;
-          if (firstMessageIsVisible) {
-            nextActiveId = turn.itemId;
-            break;
-          }
-        }
-        if (rect.top <= midpoint) {
-          nextActiveId = turn.itemId;
-        } else {
+        if (anchor.getBoundingClientRect().top > midpoint) {
+          activeIndex = Math.max(0, i - 1);
           break;
         }
       }
-      setActiveId(nextActiveId ?? firstAvailableId);
+      setActiveId(turns[activeIndex]?.itemId ?? null);
     };
     const schedule = () => {
       if (frame === 0) frame = requestAnimationFrame(recompute);
