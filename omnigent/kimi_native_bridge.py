@@ -393,9 +393,77 @@ _PERMISSION_PROMPT_MARKER = "Approve once"
 APPROVE_KEY = "1"
 DENY_KEY = "3"
 
+#: Hard cap on how far above the option list the open-menu header can reach.
+#: The panel border normally bounds the block first; the cap keeps a border
+#: rendering change from letting the scan drift into scrollback.
+_MENU_BLOCK_MAX_LINES = 12
+#: Identity needles are single-line prefixes so a pane-wrapped long command
+#: still matches (mirrors the :func:`_submit_needle` sizing).
+_MENU_NEEDLE_MAX_CHARS = 24
+_MENU_NEEDLE_MIN_CHARS = 4
+
+
+def _active_menu_block(pane: str) -> str:
+    """The OPEN permission panel's header lines (question / cwd / command).
+
+    kimi renders the open menu as a bordered panel: a full-width ``─`` rule,
+    the question and the gated command, the numbered options, and a closing
+    rule. Answered prompts in scrollback keep their ``$ command`` line but
+    never the numbered options, so the block is anchored on the LAST option
+    list and bounded above by the panel's top rule — scrollback from earlier
+    (already answered) prompts stays outside it.
+
+    :param pane: A full pane capture.
+    :returns: The header lines above the option list, or ``""`` when no menu
+        is on screen.
+    """
+    lines = pane.splitlines()
+    anchor = None
+    for idx, line in enumerate(lines):
+        if _PERMISSION_PROMPT_MARKER in line:
+            anchor = idx
+    if anchor is None:
+        return ""
+    start = max(0, anchor - _MENU_BLOCK_MAX_LINES)
+    for idx in range(anchor - 1, start - 1, -1):
+        stripped = lines[idx].strip()
+        if stripped and not stripped.strip("─"):
+            start = idx + 1
+            break
+    return "\n".join(lines[start:anchor])
+
+
+def _menu_identity_needles(tool_input: dict[str, object] | None) -> list[str]:
+    """Short pane-searchable needles identifying the gated tool call.
+
+    Kimi's open menu displays the call it gates (``$ command`` for Bash, the
+    path/url for file and fetch tools), so the prompt's ``tool_input`` string
+    values are what the panel shows. Each needle is the value's first line,
+    capped so a pane-wrapped rendering still contains it.
+
+    :param tool_input: The gated tool's input from the PermissionRequest hook
+        payload, e.g. ``{"command": "touch a.txt"}``; ``None``/empty → no needles.
+    :returns: Deduplicated needles; empty when no usable string value exists.
+    """
+    if not isinstance(tool_input, dict):
+        return []
+    needles: list[str] = []
+    for value in tool_input.values():
+        if not isinstance(value, str):
+            continue
+        first_line = value.strip().splitlines()[0].strip() if value.strip() else ""
+        needle = first_line[:_MENU_NEEDLE_MAX_CHARS]
+        if len(needle) >= _MENU_NEEDLE_MIN_CHARS and needle not in needles:
+            needles.append(needle)
+    return needles
+
 
 def inject_approval_keystroke(
-    bridge_dir: Path, *, key: str, timeout_s: float = _TMUX_READY_TIMEOUT_S
+    bridge_dir: Path,
+    *,
+    key: str,
+    tool_input: dict[str, object] | None = None,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
 ) -> bool:
     """Answer kimi's tool-permission menu by typing an option digit + Enter.
 
@@ -404,15 +472,23 @@ def inject_approval_keystroke(
     :data:`APPROVE_KEY` / :data:`DENY_KEY`. This types *key* then ``Enter``.
 
     Captures the pane first and injects ONLY when the permission menu is
-    actually showing (:data:`_PERMISSION_PROMPT_MARKER`), so a web verdict that
-    lands after the user already answered in the terminal (or after the prompt
-    closed) is a no-op rather than a stray keystroke leaking into whatever is on
-    screen next.
+    actually showing (:data:`_PERMISSION_PROMPT_MARKER`) AND — when
+    *tool_input* yields identity needles — the OPEN menu is the one the verdict
+    was raised for (:func:`_active_menu_block` must show the gated call). A
+    verdict that lands after the user already answered in the terminal, or
+    whose menu was replaced by a LATER prompt for a different call, is a no-op
+    rather than a keystroke resolving a tool call nobody ruled on. Not
+    injecting is always recoverable (kimi's own TUI prompt stands); injecting
+    into the wrong menu is not.
 
     :param bridge_dir: The kimi-native bridge dir holding ``tmux.json``.
     :param key: The option digit to select (e.g. :data:`APPROVE_KEY`).
+    :param tool_input: The gated tool's input the verdict is for; used to match
+        the open menu's identity. ``None`` / no usable string values falls back
+        to the presence-only guard.
     :returns: ``True`` if the keystroke was injected; ``False`` if the
-        permission menu was not present (already answered / closed / TUI gone).
+        permission menu was not present (already answered / closed / TUI gone)
+        or a different call's menu is on screen.
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
@@ -420,8 +496,14 @@ def inject_approval_keystroke(
     tmux_target = info["tmux_target"]
     if not _session_alive(socket_path, tmux_target):
         return False
-    if _PERMISSION_PROMPT_MARKER not in _capture_pane(socket_path, tmux_target):
+    pane = _capture_pane(socket_path, tmux_target)
+    if _PERMISSION_PROMPT_MARKER not in pane:
         return False
+    needles = _menu_identity_needles(tool_input)
+    if needles:
+        block = _active_menu_block(pane)
+        if not any(needle in block for needle in needles):
+            return False
     # ``key`` is a single documented option digit; Enter confirms (the footer
     # lists "choose" and "confirm" separately, so a digit selects and ↵ commits).
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
