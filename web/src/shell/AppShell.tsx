@@ -2177,6 +2177,7 @@ export function AppShell() {
           {conversationId && (
             <PermissionsModal
               sessionId={conversationId}
+              workspace={activeSession?.workspace ?? activeConv?.workspace}
               open={shareOpen}
               onOpenChange={setShareOpen}
             />

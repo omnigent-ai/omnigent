@@ -44,6 +44,7 @@ import {
 import { useUserSearch } from "@/hooks/useUserSearch";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { getOmnigentTransformShareLink, getOmnigentUserSearch } from "@/lib/host";
+import { workspaceSharingBlocked } from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
@@ -59,22 +60,26 @@ const LEVEL_LABELS: Record<number, string> = {
 
 interface PermissionsModalProps {
   sessionId: string;
+  workspace?: string | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
 
-export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsModalProps) {
+export function PermissionsModal({
+  sessionId,
+  workspace,
+  open,
+  onOpenChange,
+}: PermissionsModalProps) {
   // Server sharing policy. While the boot probe is in flight we treat the
   // server as "on" (fail open) so the modal renders its full controls; the
   // server-side gate is the real enforcement point regardless.
   const info = useServerInfo();
   const sharingMode = info === "loading" ? "on" : info.sharing_mode;
   const sharingOff = sharingMode === "off";
-  // Both read-capped tiers present the read-only UI. Under
-  // "restricted_read_only" the server additionally blocks home/root-cwd
-  // sessions entirely; that per-session rule is enforced server-side and
-  // surfaces here as an error on the grant attempt.
   const sharingReadOnly = sharingMode === "read_only" || sharingMode === "restricted_read_only";
+  const workspaceBlocked =
+    sharingMode === "restricted_read_only" && workspaceSharingBlocked(workspace);
   // Public (anyone-with-the-link) access is a separate server switch from the
   // sharing tiers; when off, hide the toggle (the server rejects the grant too).
   const publicSharingEnabled = info === "loading" ? true : info.public_sharing_enabled;
@@ -97,7 +102,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
   function handleGrant(e: FormEvent) {
     e.preventDefault();
     const trimmed = newUserId.trim();
-    if (!trimmed) return;
+    if (!trimmed || workspaceBlocked) return;
     setError(null);
     grant.mutate(
       { userId: trimmed, level: parseInt(newLevel, 10) },
@@ -119,11 +124,13 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
   }
 
   function handleChangeLevel(userId: string, level: number) {
+    if (workspaceBlocked) return;
     setError(null);
     grant.mutate({ userId, level }, { onError: (err) => setError(err.message) });
   }
 
   function handlePublicToggle(checked: boolean) {
+    if (checked && workspaceBlocked) return;
     setError(null);
     if (checked) {
       grant.mutate({ userId: PUBLIC_USER, level: 1 }, { onError: (err) => setError(err.message) });
@@ -162,9 +169,11 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">Share this session</DialogTitle>
           <DialogDescription>
-            {sharingReadOnly
-              ? "This server allows read-only sharing — invite others to view this session."
-              : "Invite others to view or collaborate on this session."}
+            {workspaceBlocked
+              ? "This conversation is in a home or root directory and cannot be shared on this server. Start a new conversation in a project directory to share it."
+              : sharingReadOnly
+                ? "This server allows read-only sharing — invite others to view this session."
+                : "Invite others to view or collaborate on this session."}
           </DialogDescription>
         </DialogHeader>
 
@@ -178,7 +187,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
             <Switch
               checked={isPublic}
               onCheckedChange={handlePublicToggle}
-              disabled={grant.isPending || revoke.isPending}
+              disabled={grant.isPending || revoke.isPending || (workspaceBlocked && !isPublic)}
               componentId="diagnostics.permissions.public_toggle"
             />
           </div>
@@ -221,44 +230,46 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
         </div>
 
         {/* Add grant form */}
-        <form onSubmit={handleGrant} className="flex items-end gap-2">
-          <div className="flex-1">
-            <label htmlFor="perm-user" className="text-sm font-medium text-muted-foreground">
-              User ID
-            </label>
-            <AddUserField value={newUserId} onChange={setNewUserId} />
-          </div>
-          <div>
-            <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
-              Level
-            </label>
-            <Select
-              value={newLevel}
-              onValueChange={setNewLevel}
-              componentId="diagnostics.permissions.grant_level"
-              valueHasNoPii
+        {!workspaceBlocked && (
+          <form onSubmit={handleGrant} className="flex items-end gap-2">
+            <div className="flex-1">
+              <label htmlFor="perm-user" className="text-sm font-medium text-muted-foreground">
+                User ID
+              </label>
+              <AddUserField value={newUserId} onChange={setNewUserId} />
+            </div>
+            <div>
+              <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
+                Level
+              </label>
+              <Select
+                value={newLevel}
+                onValueChange={setNewLevel}
+                componentId="diagnostics.permissions.grant_level"
+                valueHasNoPii
+              >
+                <SelectTrigger className="mt-1 w-24">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="1">Read</SelectItem>
+                  {/* Read-only sharing caps new grants at view; hide Edit. */}
+                  {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
+                </SelectContent>
+              </Select>
+            </div>
+            <Button
+              type="submit"
+              size="sm"
+              loading={grant.isPending}
+              disabled={!newUserId.trim()}
+              componentId="diagnostics.permissions.grant"
             >
-              <SelectTrigger className="mt-1 w-24">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="1">Read</SelectItem>
-                {/* Read-only sharing caps new grants at view; hide Edit. */}
-                {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
-              </SelectContent>
-            </Select>
-          </div>
-          <Button
-            type="submit"
-            size="sm"
-            loading={grant.isPending}
-            disabled={!newUserId.trim()}
-            componentId="diagnostics.permissions.grant"
-          >
-            <UserPlusIcon className="mr-1 size-3.5" />
-            Grant
-          </Button>
-        </form>
+              <UserPlusIcon className="mr-1 size-3.5" />
+              Grant
+            </Button>
+          </form>
+        )}
 
         {error && <p className="text-sm text-destructive">{error}</p>}
 
