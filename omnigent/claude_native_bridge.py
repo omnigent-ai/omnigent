@@ -47,10 +47,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
-from urllib import error, request
+from urllib import request
 
 from omnigent._platform import stable_user_id
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
@@ -3809,8 +3810,8 @@ def post_tools_changed(
     :param timeout_s: Seconds to wait for the bridge HTTP control
         endpoint to publish itself, e.g. ``30.0``.
     :returns: None.
-    :raises RuntimeError: If the bridge server is not ready or
-        rejects the notification.
+    :raises RuntimeError: If the bridge server is not ready, cannot
+        be reached, or rejects the notification.
     """
     server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s)
     token = server.get("token")
@@ -3830,7 +3831,7 @@ def post_tools_changed(
         with request.urlopen(req, timeout=_TOOLS_CHANGED_POST_TIMEOUT_S) as resp:
             if resp.status >= 400:
                 raise RuntimeError(f"tools-changed POST failed with HTTP {resp.status}")
-    except error.URLError as exc:
+    except (OSError, HTTPException) as exc:
         raise RuntimeError(f"failed to notify Claude tool list change: {exc}") from exc
 
 
