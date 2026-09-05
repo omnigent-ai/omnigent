@@ -63,7 +63,7 @@ def _seed_registry(
 
 def _patch_control_attach(
     monkeypatch: pytest.MonkeyPatch,
-    on_attach: Callable[[str, str, bool], None],
+    on_attach: Callable[[str, str, bool, str | None, str | None], None],
 ) -> None:
     """Patch the control bridge at the runner route boundary."""
 
@@ -73,10 +73,12 @@ def _patch_control_attach(
         socket_path: str,
         tmux_target: str,
         read_only: bool,
+        session_id: str | None = None,
+        terminal_id: str | None = None,
         on_client_interaction: object = None,
     ) -> None:
         del websocket, on_client_interaction
-        on_attach(socket_path, tmux_target, read_only)
+        on_attach(socket_path, tmux_target, read_only, session_id, terminal_id)
         raise RuntimeError("bridge stopped")
 
     monkeypatch.setattr(
@@ -97,7 +99,7 @@ def test_runner_resource_attach_ignores_obsolete_transport_query(
         terminal_registry=registry,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    calls: list[tuple[str, str, bool]] = []
+    calls: list[tuple[str, str, bool, str | None, str | None]] = []
     _patch_control_attach(monkeypatch, lambda *args: calls.append(args))
 
     with pytest.raises(RuntimeError, match="bridge stopped"):
@@ -106,7 +108,15 @@ def test_runner_resource_attach_ignores_obsolete_transport_query(
         ):
             pass
 
-    assert calls == [(str(tmp_path / "bash-s1.sock"), "main", False)]
+    assert calls == [
+        (
+            str(tmp_path / "bash-s1.sock"),
+            "main",
+            False,
+            "conv_abc",
+            "terminal_bash_s1",
+        )
+    ]
 
 
 def test_runner_resource_attach_passes_read_only_to_control_bridge(
@@ -120,7 +130,7 @@ def test_runner_resource_attach_passes_read_only_to_control_bridge(
         terminal_registry=registry,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    calls: list[tuple[str, str, bool]] = []
+    calls: list[tuple[str, str, bool, str | None, str | None]] = []
     _patch_control_attach(monkeypatch, lambda *args: calls.append(args))
 
     with pytest.raises(RuntimeError, match="bridge stopped"):
@@ -129,7 +139,15 @@ def test_runner_resource_attach_passes_read_only_to_control_bridge(
         ):
             pass
 
-    assert calls == [(str(tmp_path / "bash-s1.sock"), "main", True)]
+    assert calls == [
+        (
+            str(tmp_path / "bash-s1.sock"),
+            "main",
+            True,
+            "conv_abc",
+            "terminal_bash_s1",
+        )
+    ]
 
 
 def test_runner_resource_attach_unknown_terminal_closes_4404(tmp_path: Path) -> None:
@@ -317,7 +335,15 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
 
     attach_sockets: list[str] = []
 
-    def record_attach(socket_path: str, _target: str, _read_only: bool) -> None:
+    def record_attach(
+        socket_path: str,
+        _target: str,
+        _read_only: bool,
+        session_id: str | None,
+        terminal_id: str | None,
+    ) -> None:
+        assert session_id == "conv_abc"
+        assert terminal_id == "terminal_tui_main"
         attach_sockets.append(socket_path)
 
     _patch_control_attach(monkeypatch, record_attach)
@@ -437,7 +463,15 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
 
     attach_sockets: list[str] = []
 
-    def record_attach(socket_path: str, _target: str, _read_only: bool) -> None:
+    def record_attach(
+        socket_path: str,
+        _target: str,
+        _read_only: bool,
+        session_id: str | None,
+        terminal_id: str | None,
+    ) -> None:
+        assert session_id == "conv_abc"
+        assert terminal_id == "terminal_qwen_main"
         attach_sockets.append(socket_path)
 
     _patch_control_attach(monkeypatch, record_attach)

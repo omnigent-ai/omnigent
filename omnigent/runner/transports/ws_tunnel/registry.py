@@ -53,6 +53,12 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 
 _logger = logging.getLogger(__name__)
 
+# Tunnel frames cannot be dropped or coalesced without stranding an RPC, so a
+# full sender queue waits briefly for drain and then fails the send loudly.
+_OUTBOUND_QUEUE_MAX_FRAMES = 1024
+_OUTBOUND_SEND_STALL_S = 10.0
+_OUTBOUND_SEND_POLL_S = 0.05
+
 
 class WebSocketLike(Protocol):
     """Minimal WebSocket protocol used by the registry + transport.
@@ -273,7 +279,7 @@ class TunnelRegistry:
             ws=ws,
             hello=hello,
             loop=loop,
-            outbound_queue=asyncio.Queue(),
+            outbound_queue=asyncio.Queue(maxsize=_OUTBOUND_QUEUE_MAX_FRAMES),
             connected_at=now,
             last_frame_at=now,
             owner=owner,
@@ -694,27 +700,104 @@ class TunnelRegistry:
         :returns: None after the frame has been accepted into the
             route-loop outbound queue.
         :raises ConnectionError: If ``session`` is no longer the
-            registry's current generation for its runner id.
+            registry's current generation for its runner id, or the
+            sender does not free queue room before the stall deadline.
         """
         ack: concurrent.futures.Future[None] = concurrent.futures.Future()
+        cancelled = False
+        enqueued = False
 
-        def _enqueue() -> None:
-            """Run on ``session.loop`` and enqueue the outbound frame."""
-            error: ConnectionError | None = None
-            with self._lock:
-                if self._sessions.get(session.runner_id) is not session:
-                    error = ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
-                else:
-                    session.outbound_queue.put_nowait(data)
-            if error is not None:
-                if not ack.done():
-                    ack.set_exception(error)
-            else:
-                if not ack.done():
+        def _resolve(error: BaseException | None) -> None:
+            """Settle the cross-loop acknowledgement once."""
+            if ack.done():
+                return
+            try:
+                if error is None:
                     ack.set_result(None)
+                else:
+                    ack.set_exception(error)
+            except concurrent.futures.InvalidStateError:
+                return
 
-        _call_session_soon_threadsafe(session, _enqueue)
-        await asyncio.wrap_future(ack)
+        def _stale() -> bool:
+            with self._lock:
+                return self._sessions.get(session.runner_id) is not session
+
+        def _replaced_error() -> ConnectionError:
+            return ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
+
+        async def _enqueue() -> None:
+            """Wait for bounded queue room on the session owner loop."""
+            nonlocal enqueued
+            try:
+                deadline = time.monotonic() + _OUTBOUND_SEND_STALL_S
+                while True:
+                    # Keep generation validation and enqueue atomic with register().
+                    with self._lock:
+                        if self._sessions.get(session.runner_id) is not session:
+                            _resolve(_replaced_error())
+                            return
+                        if cancelled:
+                            return
+                        try:
+                            session.outbound_queue.put_nowait(data)
+                        except asyncio.QueueFull:
+                            pass
+                        else:
+                            enqueued = True
+                            _resolve(None)
+                            return
+                    if time.monotonic() >= deadline:
+                        if _stale():
+                            _resolve(_replaced_error())
+                            return
+                        _logger.warning(
+                            "runner %s outbound queue freed no room in %.0fs (%d frames); "
+                            "failing send",
+                            session.runner_id,
+                            _OUTBOUND_SEND_STALL_S,
+                            session.outbound_queue.qsize(),
+                        )
+                        _resolve(
+                            ConnectionError(
+                                f"runner {session.runner_id!r} outbound tunnel stalled"
+                            )
+                        )
+                        return
+                    await asyncio.sleep(_OUTBOUND_SEND_POLL_S)
+            finally:
+                _resolve(_replaced_error())
+
+        def _finalize_enqueue(task: asyncio.Task[None]) -> None:
+            """Settle sends whose enqueue task was cancelled before starting."""
+            if not task.cancelled():
+                _ = task.exception()
+            _resolve(_replaced_error())
+
+        def _start_enqueue() -> None:
+            task = asyncio.get_running_loop().create_task(_enqueue())
+            task.add_done_callback(_finalize_enqueue)
+
+        if not session.loop.is_running():
+            raise ConnectionError(f"runner {session.runner_id!r} tunnel loop is not running")
+        try:
+            _call_session_soon_threadsafe(session, _start_enqueue)
+        except RuntimeError as exc:
+            raise ConnectionError(f"runner {session.runner_id!r} tunnel loop is closed") from exc
+        wrapped_ack = asyncio.wrap_future(ack)
+        try:
+            await asyncio.shield(wrapped_ack)
+        except asyncio.CancelledError:
+            # Cancellation and enqueue use the same registry lock. Whichever
+            # wins is externally consistent: a cancelled send never lands, and
+            # a send already enqueued completes successfully instead of being
+            # reported to its caller as cancelled.
+            with self._lock:
+                if enqueued:
+                    return
+                cancelled = True
+            ack.cancel()
+            raise
 
     # ── Routing incoming frames ──────────────────────────
 
@@ -787,7 +870,11 @@ def _retire_session_writer(session: RunnerSession, *, code: int, reason: str) ->
 
     def _retire() -> None:
         """Run on the WebSocket owner loop."""
-        session.outbound_queue.put_nowait(None)
+        try:
+            session.outbound_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            session.outbound_queue.get_nowait()
+            session.outbound_queue.put_nowait(None)
         close = getattr(session.ws, "close", None)
         if close is not None:
             with contextlib.suppress(Exception):

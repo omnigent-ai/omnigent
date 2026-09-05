@@ -9702,6 +9702,8 @@ def create_runner_app(
             socket_path=str(entry.instance.socket_path),
             tmux_target=entry.instance.tmux_target,
             read_only=read_only,
+            session_id=session_id,
+            terminal_id=terminal_id,
             on_client_interaction=entry.instance.note_client_interaction,
         )
 

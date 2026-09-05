@@ -650,7 +650,7 @@ async def test_attach_terminal_local_fallback_uses_control_mode(
         "conv_local_attach",
         [_make_running_instance("bash", "s1", tmp_path)],
     )
-    calls: list[tuple[str, str, bool]] = []
+    calls: list[tuple[str, str, bool, str | None, str | None]] = []
 
     async def fake_control(
         websocket: object,
@@ -658,9 +658,11 @@ async def test_attach_terminal_local_fallback_uses_control_mode(
         socket_path: str,
         tmux_target: str,
         read_only: bool,
+        session_id: str | None = None,
+        terminal_id: str | None = None,
     ) -> None:
         del websocket
-        calls.append((socket_path, tmux_target, read_only))
+        calls.append((socket_path, tmux_target, read_only, session_id, terminal_id))
 
     monkeypatch.setattr(
         "omnigent.server.routes.terminal_attach.bridge_tmux_control_to_websocket",
@@ -673,4 +675,12 @@ async def test_attach_terminal_local_fallback_uses_control_mode(
     ):
         pass
 
-    assert calls == [(str(tmp_path / "bash-s1.sock"), "main", True)]
+    assert calls == [
+        (
+            str(tmp_path / "bash-s1.sock"),
+            "main",
+            True,
+            "conv_local_attach",
+            "terminal_bash_s1",
+        )
+    ]
