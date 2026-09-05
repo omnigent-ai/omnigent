@@ -2871,6 +2871,12 @@ def create_runner_app(
     def _has_active_work() -> bool:
         if _active_turns:
             return True
+        # Native harnesses publish ``running`` while terminal-owned work is
+        # active, including work that outlives the HTTP turn task. ``waiting``
+        # is the session-level turn-ended state; counting it here pins a
+        # suspendable provider's activity lease forever after a completed turn.
+        if any(status == "running" for status in _native_pane_status.values()):
+            return True
         if _has_live_async_tasks(_session_async_tasks):
             return True
         for timers in _session_timers.values():
@@ -2893,7 +2899,12 @@ def create_runner_app(
 
     app.state.drain_session_streams = _drain_session_streams
 
-    def _publish_event(session_id: str, event: Mapping[str, object]) -> None:
+    def _publish_event(
+        session_id: str,
+        event: Mapping[str, object],
+        *,
+        local_status: str | None = None,
+    ) -> None:
         event_body = cast(_JsonObject, event)
         queue = _session_event_queues.get(session_id)
         if queue is None:
@@ -2901,7 +2912,9 @@ def create_runner_app(
             _session_event_queues[session_id] = queue
         queue.put_nowait(event_body)
         if event_body.get("type") == "session.status":
-            _status_value = event_body.get("status")
+            # Legacy servers receive ``running`` for ``waiting``; that wire
+            # fallback must not turn completed local work into an activity pin.
+            _status_value = local_status if local_status is not None else event_body.get("status")
             if isinstance(_status_value, str):
                 _native_pane_status[session_id] = _status_value
         _fan_out_child_delta_to_parent(session_id, event_body)
@@ -4973,6 +4986,7 @@ def create_runner_app(
         status: str,
         error: Mapping[str, object] | None = None,
     ) -> None:
+        local_status = status
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
         ):
@@ -5004,7 +5018,7 @@ def create_runner_app(
                 error,
                 extra={"session_id": conv_id},
             )
-        _publish_event(conv_id, event)
+        _publish_event(conv_id, event, local_status=local_status)
 
     def _is_native_harness(conv_id: str) -> bool:
         return is_native_harness(_session_harness_name(conv_id))

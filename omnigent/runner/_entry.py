@@ -27,6 +27,7 @@ from fastapi import FastAPI
 from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.inner import _proc
+from omnigent.runner.activity_lease import activity_lease_from_env, run_activity_lease
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 from omnigent.version import VERSION
 
@@ -1823,6 +1824,16 @@ async def _run_tunnel_from_env() -> None:
             ),
             name=f"runner-idle-monitor:{runner_id}",
         )
+    activity_lease = activity_lease_from_env(runner_id)
+    activity_lease_task: asyncio.Task[None] | None = None
+    if activity_lease is not None:
+        activity_lease_task = asyncio.create_task(
+            run_activity_lease(
+                lease=activity_lease,
+                has_active_work=_has_active_work,
+            ),
+            name=f"runner-activity-lease:{runner_id}",
+        )
     if parent_pid is not None:
 
         def _request_parent_death_shutdown() -> None:
@@ -1889,6 +1900,10 @@ async def _run_tunnel_from_env() -> None:
         if idle_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
+        if activity_lease_task is not None:
+            activity_lease_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await activity_lease_task
         if direct_attach_listener is not None:
             with contextlib.suppress(Exception):
                 await direct_attach_listener.stop()
