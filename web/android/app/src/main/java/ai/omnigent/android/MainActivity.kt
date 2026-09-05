@@ -102,7 +102,6 @@ class MainActivity : AppCompatActivity() {
             callback?.onReceiveValue(uris.toTypedArray())
         }
 
-    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -130,30 +129,7 @@ class MainActivity : AppCompatActivity() {
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true) // chrome://inspect
 
-        webView =
-            WebView(this).apply {
-                settings.javaScriptEnabled = true
-                settings.domStorageEnabled = true
-                settings.mediaPlaybackRequiresUserGesture = false
-
-                webViewClient =
-                    OmnigentWebViewClient(
-                        pinnedOrigin = { pinnedOrigin },
-                        shouldInjectBridgeAtPageReady = {
-                            bridgeTransportInstalled && bridgeScriptHandler == null
-                        },
-                        onPageReady = ::onPageReady,
-                        onLoginRequired = ::startLogin,
-                    )
-                webChromeClient =
-                    OmnigentWebChromeClient(
-                        onChooseFiles = ::chooseFiles,
-                        onPermission = ::handlePermissionRequest,
-                    )
-                setDownloadListener { downloadUrl, _, contentDisposition, mimeType, _ ->
-                    downloadFile(downloadUrl, contentDisposition, mimeType)
-                }
-            }
+        webView = buildWebView()
         // Wrap the WebView in a FrameLayout so the floating server-switcher
         // pill can sit on top of it. The pill uses the app's brand palette
         // (values/values-night colors.xml) so it adapts to light/dark mode.
@@ -189,49 +165,7 @@ class MainActivity : AppCompatActivity() {
         applySystemBarContrast()
         installBridge()
 
-        // Measure the OS safe area and push it into the page as CSS custom
-        // properties — Android WebView can't rely on `env(safe-area-inset-*)`
-        // alone (unreliable < API 30 and across OEM builds). Cached so the first
-        // post-load emit (in onPageReady) isn't lost to the pre-load race.
-        ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
-            // Edge-to-edge (setDecorFitsSystemWindows=false, above) neutralizes the
-            // manifest's adjustResize: the window no longer shrinks when the IME
-            // opens, so bottom-anchored web content (a chat composer, a terminal
-            // input) would sit BEHIND the keyboard. Resize the WebView ourselves —
-            // shrink its laid-out HEIGHT by the IME inset. It must be the view
-            // height (a bottom margin), not bottom padding: the CSS viewport
-            // (100vh / the visual viewport that fixed/sticky content anchors to)
-            // tracks the WebView's height, not its content box, so padding alone
-            // wouldn't reflow the composer above the keyboard. This is the
-            // adjustResize equivalent for an edge-to-edge window; the status/nav
-            // bars stay CSS safe-areas so content still draws behind them.
-            // Type.ime() is the real platform inset on API 30+; on 28-29 androidx
-            // backfills it from adjustResize's systemWindowInsets, so the resize
-            // still fires. If some pre-30 OEM reports none, the margin stays 0 and
-            // we simply degrade to the old (unresized) behavior — no regression.
-            (view.layoutParams as? ViewGroup.MarginLayoutParams)?.let { lp ->
-                if (lp.bottomMargin != ime.bottom) {
-                    lp.bottomMargin = ime.bottom
-                    view.layoutParams = lp
-                }
-            }
-            // Bottom safe-area: the nav bar when the keyboard is hidden; 0 while
-            // it's up (the resize already lifts content above the keyboard, and the
-            // keyboard covers the nav bar). Top/left/right are IME-independent.
-            val bottom = if (ime.bottom > 0) 0 else bars.bottom
-            lastInsets = Insets.of(bars.left, bars.top, bars.right, bottom)
-            // Push the floating switch button below the status bar so it doesn't
-            // disappear under the notch/status icons on edge-to-edge layouts.
-            (switchButton.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                lp.topMargin = bars.top + (8 * dp).toInt()
-                switchButton.layoutParams = lp
-            }
-            emitInsets()
-            insets
-        }
-
+        attachInsetsListener(webView)
         onBackPressedDispatcher.addCallback(
             this,
             object : OnBackPressedCallback(true) {
@@ -278,6 +212,114 @@ class MainActivity : AppCompatActivity() {
 
         ensureNotificationPermission()
         webView.loadUrl(serverUrl)
+    }
+
+    /** Build a WebView wired with the shell's settings, clients, and listeners. */
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun buildWebView(): WebView =
+        WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.mediaPlaybackRequiresUserGesture = false
+
+            webViewClient =
+                OmnigentWebViewClient(
+                    pinnedOrigin = { pinnedOrigin },
+                    shouldInjectBridgeAtPageReady = {
+                        bridgeTransportInstalled && bridgeScriptHandler == null
+                    },
+                    onPageReady = ::onPageReady,
+                    onLoginRequired = ::startLogin,
+                    onRendererGone = ::recoverFromRendererDeath,
+                )
+            webChromeClient =
+                OmnigentWebChromeClient(
+                    onChooseFiles = ::chooseFiles,
+                    onPermission = ::handlePermissionRequest,
+                )
+            setDownloadListener { downloadUrl, _, contentDisposition, mimeType, _ ->
+                downloadFile(downloadUrl, contentDisposition, mimeType)
+            }
+        }
+
+    /**
+     * Measure the OS safe area and push it into the page as CSS custom
+     * properties — Android WebView can't rely on `env(safe-area-inset-*)`
+     * alone (unreliable < API 30 and across OEM builds). Cached so the first
+     * post-load emit (in onPageReady) isn't lost to the pre-load race.
+     */
+    private fun attachInsetsListener(target: WebView) {
+        val dp = resources.displayMetrics.density
+        ViewCompat.setOnApplyWindowInsetsListener(target) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            // Edge-to-edge (setDecorFitsSystemWindows=false, above) neutralizes the
+            // manifest's adjustResize: the window no longer shrinks when the IME
+            // opens, so bottom-anchored web content (a chat composer, a terminal
+            // input) would sit BEHIND the keyboard. Resize the WebView ourselves —
+            // shrink its laid-out HEIGHT by the IME inset. It must be the view
+            // height (a bottom margin), not bottom padding: the CSS viewport
+            // (100vh / the visual viewport that fixed/sticky content anchors to)
+            // tracks the WebView's height, not its content box, so padding alone
+            // wouldn't reflow the composer above the keyboard. This is the
+            // adjustResize equivalent for an edge-to-edge window; the status/nav
+            // bars stay CSS safe-areas so content still draws behind them.
+            // Type.ime() is the real platform inset on API 30+; on 28-29 androidx
+            // backfills it from adjustResize's systemWindowInsets, so the resize
+            // still fires. If some pre-30 OEM reports none, the margin stays 0 and
+            // we simply degrade to the old (unresized) behavior — no regression.
+            (view.layoutParams as? ViewGroup.MarginLayoutParams)?.let { lp ->
+                if (lp.bottomMargin != ime.bottom) {
+                    lp.bottomMargin = ime.bottom
+                    view.layoutParams = lp
+                }
+            }
+            // Bottom safe-area: the nav bar when the keyboard is hidden; 0 while
+            // it's up (the resize already lifts content above the keyboard, and the
+            // keyboard covers the nav bar). Top/left/right are IME-independent.
+            val bottom = if (ime.bottom > 0) 0 else bars.bottom
+            lastInsets = Insets.of(bars.left, bars.top, bars.right, bottom)
+            // Push the floating switch button below the status bar so it doesn't
+            // disappear under the notch/status icons on edge-to-edge layouts.
+            (switchButton.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                lp.topMargin = bars.top + (8 * dp).toInt()
+                switchButton.layoutParams = lp
+            }
+            emitInsets()
+            insets
+        }
+    }
+
+    /**
+     * The WebView's renderer process died — crashed, or reclaimed by the system
+     * under memory pressure. The instance can never render again, so detach and
+     * destroy it, swap in a freshly built WebView wired like the original
+     * (clients, bridge, insets), and reload the server. Without this the
+     * framework would terminate the whole app.
+     */
+    private fun recoverFromRendererDeath(dead: WebView) {
+        if (isDestroyed || isFinishing || !::webView.isInitialized) return
+        // A late delivery for an already-replaced WebView must not tear down
+        // the healthy replacement.
+        if (dead !== webView) return
+        val parent = dead.parent as? ViewGroup
+        val index = parent?.indexOfChild(dead) ?: 0
+        parent?.removeView(dead)
+        dead.destroy()
+
+        // The bridge listener and document-start script died with the WebView;
+        // reset the bookkeeping so installBridge() re-registers them, and re-arm
+        // the page-ready state the fresh document will rebuild.
+        bridgeScriptHandler = null
+        bridgeTransportInstalled = false
+        pageLoaded = false
+        historyCleared = false
+
+        webView = buildWebView()
+        parent?.addView(webView, index)
+        attachInsetsListener(webView)
+        installBridge()
+        webView.loadUrl(ServerStore(this).currentServerUrl())
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {

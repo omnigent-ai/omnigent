@@ -3,6 +3,7 @@ package ai.omnigent.android
 import android.content.Context
 import android.net.Uri
 import android.os.Looper
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.ValueCallback
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -288,6 +289,26 @@ class OmnigentWebViewClientTest {
         assertNull(webView.loadedUrl)
     }
 
+    @Test
+    fun `renderer death hands the dying WebView to the recovery callback`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var recovered: WebView? = null
+        val client = client(onRendererGone = { recovered = it })
+
+        val handled =
+            client.onRenderProcessGone(
+                webView,
+                object : RenderProcessGoneDetail() {
+                    override fun didCrash(): Boolean = false
+
+                    override fun rendererPriorityAtExit(): Int = WebView.RENDERER_PRIORITY_IMPORTANT
+                },
+            )
+
+        assertTrue(handled)
+        assertEquals(webView, recovered)
+    }
+
     /** Run posted bounces (see the client's mainHandler) before asserting. */
     private fun idleMainLooper() = shadowOf(Looper.getMainLooper()).idle()
 
@@ -295,12 +316,14 @@ class OmnigentWebViewClientTest {
         shouldInjectBridgeAtPageReady: Boolean = false,
         pinnedOrigin: String = PINNED_ORIGIN,
         onLoginRequired: () -> Unit = {},
+        onRendererGone: (WebView) -> Unit = {},
         onPageReady: (String?) -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
         onPageReady = onPageReady,
         onLoginRequired = onLoginRequired,
+        onRendererGone = onRendererGone,
     )
 
     private fun request(

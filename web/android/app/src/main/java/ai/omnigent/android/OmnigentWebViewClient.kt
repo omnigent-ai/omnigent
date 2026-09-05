@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -22,12 +23,17 @@ import android.webkit.WebViewClient
  *
  * Also injects [WorkspaceChromeScript] once each pinned-origin document finishes,
  * so a workspace-hosted server's nav chrome stays hidden.
+ *
+ * Claims renderer-process death ([onRenderProcessGone]) and hands recovery to
+ * [onRendererGone], so the host can rebuild the WebView instead of letting
+ * Android kill the whole app.
  */
 class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
+    private val onRendererGone: (WebView) -> Unit,
 ) : WebViewClient() {
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
@@ -171,6 +177,21 @@ class OmnigentWebViewClient(
         } else {
             onLoginRequired()
         }
+        return true
+    }
+
+    /**
+     * The renderer process died — crashed, or reclaimed by the system under
+     * memory pressure (routine while backgrounded). Returning the inherited
+     * `false` would tell the framework the event is unhandled and Android would
+     * terminate the hosting process, so claim it and let the host discard this
+     * (now unusable) WebView and rebuild a fresh one.
+     */
+    override fun onRenderProcessGone(
+        view: WebView,
+        detail: RenderProcessGoneDetail,
+    ): Boolean {
+        onRendererGone(view)
         return true
     }
 
