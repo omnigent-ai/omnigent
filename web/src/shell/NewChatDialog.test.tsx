@@ -46,6 +46,7 @@ import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { NEW_SESSION_TARGET_STORAGE_KEY } from "@/lib/newSessionTarget";
 import {
   connectArcaHost,
   controlHost,
@@ -301,9 +302,9 @@ describe("isValidWorkspace", () => {
     expect(isValidWorkspace("/")).toBe(true);
   });
 
-  it("trims whitespace before checking", () => {
-    // Browsers paste with stray whitespace; trim must run before
-    // the shape check or "  /Users/corey  " would be rejected.
+  it("ignores leading whitespace without rejecting legal trailing whitespace", () => {
+    // Browsers paste with stray leading whitespace; it must not make an
+    // otherwise absolute path invalid. Trailing whitespace can be path data.
     expect(isValidWorkspace("  /Users/corey  ")).toBe(true);
   });
 
@@ -335,7 +336,7 @@ describe("isValidWorkspace", () => {
 
 // Path normalization underpins the directory-conflict match: a freshly
 // typed path and a stored workspace must compare equal despite trailing-
-// slash / whitespace differences, or the warning would silently miss
+// slash / leading-whitespace differences, or the warning would silently miss
 // (false-equal) or false-warn.
 describe("normalizeWorkspacePath", () => {
   it.each<[string, string | null]>([
@@ -343,8 +344,9 @@ describe("normalizeWorkspacePath", () => {
     // Trailing slash dropped so "/repo/" matches a stored "/repo".
     ["/Users/me/repo/", "/Users/me/repo"],
     ["/Users/me/repo///", "/Users/me/repo"],
-    // Surrounding whitespace (pasted paths) trimmed before comparison.
-    ["  /a/b  ", "/a/b"],
+    // Leading paste whitespace is ignored; trailing whitespace remains part
+    // of a legal POSIX path and must not collapse into a different directory.
+    ["  /a/b  ", "/a/b  "],
     // Root is preserved, not collapsed away.
     ["/", "/"],
     ["///", "/"],
@@ -2697,7 +2699,10 @@ describe("NewChatLandingScreen", () => {
         ok: true,
         json: async () => ({ object: "list", data: [{ id: "p_docs", name: "docs" }] }),
       } as Response)
-      .mockResolvedValue({ ok: true, json: async () => ({ id: "conv_new" }) } as Response);
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new", project_id: "p_docs" }),
+      } as Response);
     const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
     // A `?project=` landing (e.g. via the sidebar's per-project pencil) names the
     // project in the hero heading rather than a tray chip.
@@ -2731,6 +2736,11 @@ describe("NewChatLandingScreen", () => {
       project_id: string;
     };
     expect(patchBody.project_id).toBe("p_docs");
+    expect(JSON.parse(localStorage.getItem(NEW_SESSION_TARGET_STORAGE_KEY) ?? "null")).toEqual({
+      kind: "project",
+      projectId: "p_docs",
+      projectName: "docs",
+    });
 
     // The target folder fetches its own paginated list (useProjectSessions),
     // so filing the new session must invalidate it — otherwise the row only

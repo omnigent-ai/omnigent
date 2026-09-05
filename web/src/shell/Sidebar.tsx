@@ -146,6 +146,12 @@ import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
+import { useNewSessionTarget } from "@/hooks/useNewSessionTarget";
+import {
+  newSessionRoute,
+  newSessionTargetLabel,
+  type NewSessionTarget,
+} from "@/lib/newSessionTarget";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
@@ -553,6 +559,14 @@ function SidebarImpl({
 }: SidebarProps) {
   const branding = useBranding();
   const serverInfo = useServerInfo();
+  const navigate = useNavigate();
+  const { data: newSessionProjects } = useProjects();
+  const {
+    target: newSessionTarget,
+    route: newSessionTargetRoute,
+    selectNoProject: selectNoProjectNewSessionTarget,
+    selectProject: selectProjectNewSessionTarget,
+  } = useNewSessionTarget(newSessionProjects);
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
@@ -742,6 +756,78 @@ function SidebarImpl({
     activeExtensionPageId,
     newSessionProjectName,
   } = useActiveNavItem();
+
+  const onNewSessionComposer = isNewChatPage || newSessionProjectName !== null;
+  const pendingComposerTargetRef = useRef<string | null | undefined>(undefined);
+
+  useEffect(() => {
+    if (!onNewSessionComposer || newSessionProjects === undefined) return;
+    const pendingTarget = pendingComposerTargetRef.current;
+    if (pendingTarget !== undefined) {
+      if (pendingTarget !== newSessionProjectName) return;
+      pendingComposerTargetRef.current = undefined;
+    }
+    if (newSessionProjectName === null) {
+      if (newSessionTarget.kind !== "none") selectNoProjectNewSessionTarget();
+      return;
+    }
+    const project = newSessionProjects.find(
+      (candidate) => candidate.name === newSessionProjectName,
+    );
+    if (!project) return;
+    if (
+      newSessionTarget.kind === "project" &&
+      newSessionTarget.projectId === project.id &&
+      newSessionTarget.projectName === project.name
+    ) {
+      return;
+    }
+    selectProjectNewSessionTarget(project);
+  }, [
+    newSessionProjectName,
+    newSessionProjects,
+    newSessionTarget,
+    onNewSessionComposer,
+    selectNoProjectNewSessionTarget,
+    selectProjectNewSessionTarget,
+  ]);
+
+  const selectProjectTarget = useCallback(
+    (project: { id: string | null; name: string }) => {
+      if (onNewSessionComposer) pendingComposerTargetRef.current = project.name;
+      selectProjectNewSessionTarget(project);
+      if (!onNewSessionComposer) return;
+      navigate(
+        newSessionRoute({
+          kind: "project",
+          projectId: project.id,
+          projectName: project.name,
+        }),
+      );
+    },
+    [navigate, onNewSessionComposer, selectProjectNewSessionTarget],
+  );
+  const selectNoProjectTarget = useCallback(() => {
+    if (onNewSessionComposer) pendingComposerTargetRef.current = null;
+    selectNoProjectNewSessionTarget();
+    if (!onNewSessionComposer) return;
+    navigate("/");
+  }, [navigate, onNewSessionComposer, selectNoProjectNewSessionTarget]);
+
+  const routeTarget: NewSessionTarget =
+    newSessionProjectName !== null
+      ? {
+          kind: "project",
+          projectId:
+            newSessionProjects?.find((project) => project.name === newSessionProjectName)?.id ??
+            null,
+          projectName: newSessionProjectName,
+        }
+      : { kind: "none" };
+  const displayedNewSessionTarget = onNewSessionComposer ? routeTarget : newSessionTarget;
+  const selectedNewSessionProjectName =
+    displayedNewSessionTarget.kind === "project" ? displayedNewSessionTarget.projectName : null;
+  const noProjectNewSessionTargetSelected = displayedNewSessionTarget.kind === "none";
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -1036,8 +1122,9 @@ function SidebarImpl({
               lands under "My sessions" — so snap the tab back there on click
               (the button stays visible on both tabs). */}
                 <Link
-                  to="/"
+                  to={newSessionTargetRoute}
                   componentId="sidebar.new_chat"
+                  aria-label={`New session in ${newSessionTargetLabel(newSessionTarget)}`}
                   onClick={(e) => {
                     switchTab("mine");
                     onNavClick(e);
@@ -1051,7 +1138,13 @@ function SidebarImpl({
                         : "text-muted-foreground",
                     )}
                   />
-                  New session
+                  <span className="min-w-0 flex-1 truncate">New session</span>
+                  <span
+                    data-testid="new-session-target-label"
+                    className="ml-auto max-w-28 truncate text-sm text-muted-foreground"
+                  >
+                    {newSessionTargetLabel(newSessionTarget)}
+                  </span>
                 </Link>
               </Button>
               {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
@@ -1172,7 +1265,10 @@ function SidebarImpl({
                   scrollContainerRef={scrollContainerRef}
                   onRowClick={onNavClick}
                   searchQuery=""
-                  newSessionProjectName={newSessionProjectName}
+                  selectedNewSessionProjectName={selectedNewSessionProjectName}
+                  noProjectNewSessionTargetSelected={noProjectNewSessionTargetSelected}
+                  onSelectProjectNewSessionTarget={selectProjectTarget}
+                  onSelectNoProjectNewSessionTarget={selectNoProjectTarget}
                   activeTab={activeTab}
                   onActiveTabChange={switchTab}
                   multiUser={multiUser}
@@ -1291,6 +1387,7 @@ function ProjectFolder({
   activeConversationId,
   expanded,
   active,
+  onSelectNewSessionTarget,
   marker,
   onToggleCollapsed,
   pinnedConversationIds,
@@ -1321,6 +1418,8 @@ function ProjectFolder({
   expanded: boolean;
   /** Whether the new-session composer is currently scoped to this project. */
   active: boolean;
+  /** Select this project as the destination for global new-session actions. */
+  onSelectNewSessionTarget: () => void;
   marker: SessionState | null;
   onToggleCollapsed: () => void;
   pinnedConversationIds: string[];
@@ -1417,6 +1516,8 @@ function ProjectFolder({
           )
         }
         active={active}
+        onSelect={onSelectNewSessionTarget}
+        selectionLabel={`Use ${name} for new sessions`}
         marker={marker}
         conversations={conversations}
         activeConversationId={activeConversationId}
@@ -1439,6 +1540,7 @@ function ProjectFolder({
                 className="font-medium text-primary underline-offset-4 hover:underline"
                 onClick={(e) => {
                   e.stopPropagation();
+                  onSelectNewSessionTarget();
                   onRowClick(e);
                 }}
               >
@@ -1450,7 +1552,12 @@ function ProjectFolder({
         }
         indentRows
         headerAction={
-          <ProjectFolderActions projectName={name} onNavigate={onRowClick} actions={menuActions} />
+          <ProjectFolderActions
+            projectName={name}
+            onNavigate={onRowClick}
+            onSelectTarget={onSelectNewSessionTarget}
+            actions={menuActions}
+          />
         }
         // Touch exposes these actions through the header's long-press menu.
         actionHoverOnly
@@ -1460,6 +1567,7 @@ function ProjectFolder({
               components={contextBundle}
               projectName={name}
               onNavigate={onRowClick}
+              onSelectTarget={onSelectNewSessionTarget}
               actions={menuActions}
             />
           </ContextMenuContent>
@@ -1489,8 +1597,11 @@ interface ConversationListProps {
   scrollContainerRef: RefObject<HTMLElement | null>;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   searchQuery: string;
-  /** Project selected on the new-session composer route, if any. */
-  newSessionProjectName: string | null;
+  /** Project selected for the next global new-session action, if any. */
+  selectedNewSessionProjectName: string | null;
+  noProjectNewSessionTargetSelected: boolean;
+  onSelectProjectNewSessionTarget: (project: { id: string | null; name: string }) => void;
+  onSelectNoProjectNewSessionTarget: () => void;
   activeTab: SidebarTab;
   onActiveTabChange: (tab: SidebarTab) => void;
   /** Multi-user server; gates the "Shared" filter option. */
@@ -1559,7 +1670,10 @@ function ConversationList({
   scrollContainerRef,
   onRowClick,
   searchQuery,
-  newSessionProjectName,
+  selectedNewSessionProjectName,
+  noProjectNewSessionTargetSelected,
+  onSelectProjectNewSessionTarget,
+  onSelectNoProjectNewSessionTarget,
   activeTab,
   onActiveTabChange,
   multiUser,
@@ -2211,7 +2325,10 @@ function ConversationList({
                       windowConversations={group.conversations}
                       activeConversationId={resolvedActiveId}
                       expanded={expandedProjects.includes(group.name)}
-                      active={newSessionProjectName === group.name}
+                      active={selectedNewSessionProjectName === group.name}
+                      onSelectNewSessionTarget={() =>
+                        onSelectProjectNewSessionTarget({ id: group.id, name: group.name })
+                      }
                       // Best-effort marker from the globally-loaded window: a
                       // collapsed folder hasn't fetched its own sessions yet.
                       marker={projectMarkerState(group.conversations)}
@@ -2249,6 +2366,9 @@ function ConversationList({
                   >
                     <ConversationSection
                       title="Sessions"
+                      active={noProjectNewSessionTargetSelected}
+                      onSelect={onSelectNoProjectNewSessionTarget}
+                      selectionLabel="Use No Project for new sessions"
                       conversations={sections.sessions}
                       activeConversationId={resolvedActiveId}
                       emptyMessage={SIDEBAR_FILTER_EMPTY[activeTab]}
@@ -2457,6 +2577,8 @@ function SectionHeader({
   actionFocusVisible,
   collapsed,
   onToggleCollapsed,
+  onSelect,
+  selectionLabel,
   contextMenu,
   contextMenuDisabled,
 }: {
@@ -2471,7 +2593,7 @@ function SectionHeader({
       full control column there; only at rest on hover-capable desktops do the
       badges return to the rows' badge column. */
   hasAction?: boolean;
-  /** Whether the header action is absent without a fine hover pointer. */
+  /** Hide the header action at rest only when a fine hover pointer can reveal it. */
   actionHoverOnly?: boolean;
   /** Whether an always-visible control sits at the header's right edge (the
       Sessions filter), which the collapsed badges must clear even at rest on
@@ -2482,6 +2604,9 @@ function SectionHeader({
   actionFocusVisible?: boolean;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** Select a new-session target; expand/collapse moves to a separate button. */
+  onSelect?: () => void;
+  selectionLabel?: string;
   /** Optional context-menu content for the header button. */
   contextMenu?: ReactNode;
   /** Suppresses the header context menu while another interaction owns it. */
@@ -2530,14 +2655,17 @@ function SectionHeader({
   const button = (
     <button
       type="button"
-      aria-expanded={!collapsed}
-      aria-current={active ? "page" : undefined}
+      aria-expanded={onSelect ? undefined : !collapsed}
+      aria-current={!onSelect && active ? "page" : undefined}
+      aria-pressed={onSelect ? active : undefined}
+      aria-label={onSelect ? (selectionLabel ?? `Use ${title} for new sessions`) : undefined}
       onClick={(event) => {
         // A pointer click would otherwise leave the header focus-within,
         // keeping the hover-revealed controls up at rest. Keyboard toggles
         // (detail 0) keep focus for the ring.
         if (event.detail > 0) event.currentTarget.blur();
-        onToggleCollapsed();
+        if (onSelect) onSelect();
+        else onToggleCollapsed();
       }}
       className={cn(
         contextMenu && "select-none [-webkit-touch-callout:none]",
@@ -2550,6 +2678,8 @@ function SectionHeader({
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
             )
           : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
+        onSelect && "pl-8",
+        onSelect && !icon && active && cn("rounded-md", SIDEBAR_ACTIVE_HIGHLIGHT),
       )}
     >
       {icon ? (
@@ -2558,31 +2688,41 @@ function SectionHeader({
         // rather than trailing the name. Mobile (no hover) keeps the folder
         // icon and shows the trailing chevron below.
         <span className="relative flex size-4 shrink-0 items-center justify-center">
-          <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
+          <span
+            className={cn(
+              "flex",
+              !onSelect &&
+                "md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0",
+            )}
+          >
             {icon}
           </span>
-          <ChevronRightIcon
-            className={cn(
-              "absolute size-3.5 opacity-0 transition-[transform,opacity]",
-              !collapsed && "rotate-90",
-              "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-            )}
-          />
+          {!onSelect && (
+            <ChevronRightIcon
+              className={cn(
+                "absolute size-3.5 opacity-0 transition-[transform,opacity]",
+                !collapsed && "rotate-90",
+                "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+              )}
+            />
+          )}
         </span>
       ) : null}
       <span className="min-w-0 truncate">{title}</span>
       {/* Trailing chevron, rotating on expand. Headers without a leading icon
             reveal it on desktop hover/focus; icon headers show it only on mobile
             (no hover) since desktop swaps the folder for the chevron above. */}
-      <ChevronRightIcon
-        className={cn(
-          "size-3.5 shrink-0 transition-[transform,opacity]",
-          !collapsed && "rotate-90",
-          icon
-            ? "md:hidden"
-            : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-        )}
-      />
+      {!onSelect && (
+        <ChevronRightIcon
+          className={cn(
+            "size-3.5 shrink-0 transition-[transform,opacity]",
+            !collapsed && "rotate-90",
+            icon
+              ? "md:hidden"
+              : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+          )}
+        />
+      )}
       {/* A hidden row inside this collapsed section carries a marker — surface
             the exact same badge a row would show, pinned to the right edge. */}
       {showsMarker && (
@@ -2610,7 +2750,7 @@ function SectionHeader({
   );
 
   return (
-    <h2>
+    <h2 className="relative">
       {contextMenu && !contextMenuDisabled ? (
         <ContextMenu>
           <ContextMenuTrigger asChild>{button}</ContextMenuTrigger>
@@ -2618,6 +2758,23 @@ function SectionHeader({
         </ContextMenu>
       ) : (
         button
+      )}
+      {onSelect && (
+        <button
+          type="button"
+          aria-label={title}
+          aria-expanded={!collapsed}
+          onClick={(event) => {
+            event.stopPropagation();
+            if (event.detail > 0) event.currentTarget.blur();
+            onToggleCollapsed();
+          }}
+          className="-translate-y-1/2 absolute top-1/2 left-1 z-10 flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <ChevronRightIcon
+            className={cn("size-3.5 transition-transform", !collapsed && "rotate-90")}
+          />
+        </button>
       )}
     </h2>
   );
@@ -2825,6 +2982,8 @@ function ConversationSection({
   pinnedConversationIds,
   collapsed,
   onToggleCollapsed,
+  onSelect,
+  selectionLabel,
   onRowClick,
   onTogglePinned,
   selectionMode,
@@ -2856,6 +3015,8 @@ function ConversationSection({
   /** Whether this section is currently collapsed. */
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  onSelect?: () => void;
+  selectionLabel?: string;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
@@ -2867,7 +3028,7 @@ function ConversationSection({
   indentRows?: boolean;
   /** Optional control overlaid at the header's right edge. */
   headerAction?: ReactNode;
-  /** Whether `headerAction` is absent without a fine hover pointer. */
+  /** Hide `headerAction` at rest only when a fine hover pointer can reveal it. */
   actionHoverOnly?: boolean;
   /** Optional context-menu content opened from the header button. */
   headerContextMenu?: ReactNode;
@@ -2903,6 +3064,8 @@ function ConversationSection({
             hasPersistentAction={persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
+            onSelect={onSelect}
+            selectionLabel={selectionLabel}
             contextMenu={headerContextMenu}
             contextMenuDisabled={selectionMode}
           />
@@ -3437,6 +3600,59 @@ function SessionTooltipContent({
   );
 }
 
+function splitWorkspacePath(workspace: string): { prefix: string; tail: string } {
+  const match = /^(.*[\\/])([^\\/]+)$/.exec(workspace);
+  return match ? { prefix: match[1]!, tail: match[2]! } : { prefix: "", tail: workspace };
+}
+
+function SessionWorkspaceDetail({ workspace }: { workspace: string }) {
+  const { prefix, tail } = splitWorkspacePath(workspace);
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          data-testid="session-workspace-detail"
+          aria-label={`Working directory: ${workspace}`}
+          className="mx-2 mb-1 ml-8 flex min-w-0 max-w-[calc(100%-6rem)] items-center gap-1 rounded px-1 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          onPointerDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onClick={(event) => event.stopPropagation()}
+          onDoubleClick={(event) => event.stopPropagation()}
+        >
+          <FolderIcon aria-hidden className="size-3 shrink-0" />
+          <span
+            data-testid="session-workspace-path"
+            className="flex min-w-0 max-w-full items-baseline overflow-hidden"
+          >
+            {prefix && (
+              <span data-testid="session-workspace-prefix" className="min-w-0 truncate">
+                {prefix}
+              </span>
+            )}
+            <span data-testid="session-workspace-tail" className="shrink-0">
+              {tail}
+            </span>
+          </span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        side="bottom"
+        align="start"
+        collisionPadding={16}
+        className="w-auto max-w-[calc(100vw-2rem)] p-2.5 text-sm"
+      >
+        <p className="font-medium">Working directory</p>
+        <p className="mt-1 max-w-80 break-all font-mono text-xs text-muted-foreground">
+          {workspace}
+        </p>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 // Max gap between the first click and the dblclick of one double-click.
 // Browsers pair clicks within ~500ms; the margin absorbs event-loop delay.
 const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
@@ -3551,6 +3767,7 @@ function ConversationRowImpl({
   const firstClassProjectName =
     conversation.project_id != null ? projectNamesById.get(conversation.project_id) : undefined;
   const currentProject = firstClassProjectName ?? conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
+  const unfiledWorkspace = currentProject === null ? (conversation.workspace ?? "") : "";
   // Pinned sessions are lifted OUT of their project folder into the flat
   // "Pinned" section, so the row no longer shows which project it belongs to.
   // For those rows only, surface the project in a hover flyout. Non-pinned
@@ -3954,6 +4171,9 @@ function ConversationRowImpl({
           <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
         </Tooltip>
       )}
+      {!selectionMode && unfiledWorkspace && (
+        <SessionWorkspaceDetail workspace={unfiledWorkspace} />
+      )}
       {selectionMode ? (
         <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 flex items-center">
           {isSelected ? (
@@ -3966,6 +4186,7 @@ function ConversationRowImpl({
         <span
           className={cn(
             SESSION_STATE_SLOT_CLASS,
+            unfiledWorkspace && "top-4",
             // The wide "awaiting" pill keeps its natural width; every other
             // marker (running/starting/unseen dot, or the draft pencil) sits in
             // the fixed centered box so it lines up under the kebab.
@@ -3993,7 +4214,12 @@ function ConversationRowImpl({
           gap to its left. Hidden entirely while selecting (bulk mode owns the
           row controls). */}
       {!selectionMode && (
-        <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+        <div
+          className={cn(
+            "-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
+            unfiledWorkspace && "top-4",
+          )}
+        >
           {/* Archived rows omit the pin entirely: pinning is meaningless there
               (archive outranks pin), so there's no pin action even on hover. */}
           {!isArchived && (
@@ -4383,28 +4609,27 @@ function PinnedProjectFlyoutContent({
 
 // ── ProjectFolderActions ──────────────────────────────────────────────────────
 
-/** Fine-hover shortcuts for project actions and starting a pre-filed session. */
+/** Project shortcuts for starting a pre-filed session and opening its action menu. */
 function ProjectFolderActions({
   projectName,
   onNavigate,
+  onSelectTarget,
   actions,
 }: {
   projectName: string;
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  onSelectTarget: () => void;
   actions: ProjectFolderMenuActions;
 }) {
   return (
     // gap-0.5 (2px) between the pencil and kebab mirrors the session row's
     // pin↔kebab spacing, so the two icon columns line up across row types.
     <div className="flex items-center gap-0.5">
-      {/* A redundant shortcut for the kebab's always-present "New session"
-          item, so it is genuinely absent (not just clipped) wherever no fine
-          hover pointer can reveal it: on touch, folding fully into the kebab
-          instead of leaving a duplicate focus stop for keyboard/AT users. On
-          hover+fine it is display-flex and revealed on hover or keyboard focus
-          by the overlay's opacity. */}
+      {/* Keep the common new-session action one tap away on touch. On a fine
+          pointer the parent control cluster reveals both shortcuts on hover or
+          keyboard focus, preserving the quiet desktop row at rest. */}
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
@@ -4414,7 +4639,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="hidden text-muted-foreground [@media((hover:hover)_and_(pointer:fine))]:flex"
+            className="text-muted-foreground"
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
@@ -4422,6 +4647,7 @@ function ProjectFolderActions({
                 // Keep the click off the folder's collapse toggle, then run the
                 // shared nav handler (closes the sidebar overlay on mobile).
                 e.stopPropagation();
+                onSelectTarget();
                 onNavigate(e);
               }}
             >
@@ -4431,7 +4657,12 @@ function ProjectFolderActions({
         </TooltipTrigger>
         <TooltipContent side="bottom">New session in project</TooltipContent>
       </Tooltip>
-      <ProjectFolderMenu projectName={projectName} onNavigate={onNavigate} actions={actions} />
+      <ProjectFolderMenu
+        projectName={projectName}
+        onNavigate={onNavigate}
+        onSelectTarget={onSelectTarget}
+        actions={actions}
+      />
     </div>
   );
 }
@@ -4443,11 +4674,13 @@ function ProjectFolderMenuItems({
   components: C,
   projectName,
   onNavigate,
+  onSelectTarget,
   actions,
 }: {
   components: MenuComponents;
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  onSelectTarget: () => void;
   actions: ProjectFolderMenuActions;
 }) {
   useEffect(() => {
@@ -4463,6 +4696,7 @@ function ProjectFolderMenuItems({
           to={`/?project=${encodeURIComponent(projectName)}`}
           onClick={(e) => {
             e.stopPropagation();
+            onSelectTarget();
             onNavigate(e);
           }}
         >
@@ -4799,25 +5033,26 @@ function useProjectFolderMenu(
 function ProjectFolderMenu({
   projectName,
   onNavigate,
+  onSelectTarget,
   actions,
 }: {
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  onSelectTarget: () => void;
   actions: ProjectFolderMenuActions;
 }) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        {/* Revealed on hover for fine hover pointers at any width; otherwise
-            sr-only so touch and assistive tech keep a focusable, announced
-            trigger for the same actions the long-press menu also opens. */}
+        {/* Keep the menu directly available on touch. On a fine pointer the
+            parent control cluster reveals it on hover or keyboard focus. */}
         <Button
           type="button"
           variant="ghost"
           size="icon-xs"
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
-          className="sr-only text-muted-foreground focus-visible:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex"
+          className="text-muted-foreground"
           onClick={(e) => e.stopPropagation()}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
@@ -4828,6 +5063,7 @@ function ProjectFolderMenu({
           components={dropdownBundle}
           projectName={projectName}
           onNavigate={onNavigate}
+          onSelectTarget={onSelectTarget}
           actions={actions}
         />
       </DropdownMenuContent>

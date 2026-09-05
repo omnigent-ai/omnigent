@@ -1,16 +1,6 @@
-// Layout regression tests for the project-folder header's icon/chevron.
-// Desired behaviour: a project folder shows its folder icon by default and,
-// on desktop hover/focus, swaps that folder icon for a chevron *in place*
-// (rather than trailing the name). On mobile (no hover) the folder icon
-// stays put and the trailing chevron is shown instead. Plain section headers
-// with no leading icon keep the old behaviour: a trailing chevron revealed on
-// desktop hover/focus. These tests lock that structure in:
-//   1. The project header renders the folder icon and an overlaid chevron in
-//      the icon slot; the folder fades out and the chevron fades in on
-//      desktop hover/focus.
-//   2. The project header's trailing chevron is mobile-only (`md:hidden`).
-//   3. A header without a leading icon (the "Projects" group header) keeps a
-//      hover-revealed trailing chevron and does NOT swap an icon.
+// Project names select the new-session target. A separate, always-visible
+// chevron expands the project without changing that selection. The Projects
+// group itself retains its existing hover-revealed trailing chevron.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -117,6 +107,7 @@ function classOf(el: Element): string {
 }
 
 beforeEach(() => {
+  localStorage.clear();
   mockConversations([]);
 });
 
@@ -125,9 +116,9 @@ afterEach(() => {
 });
 
 describe("project folder header icon/chevron", () => {
-  it("shows the folder icon and overlays a chevron that swaps on desktop hover/focus", () => {
+  it("keeps the target's folder icon visible beside the independent toggle", () => {
     renderSidebar();
-    const header = headerButton("My Project");
+    const header = headerButton("Use My Project for new sessions");
 
     // Project folders are real rows, not muted section labels: use the shared
     // text-ui compact treatment with 8px insets/gap and foreground text.
@@ -137,7 +128,7 @@ describe("project folder header icon/chevron", () => {
       "min-h-0",
       "gap-2",
       "rounded-[var(--radius-otto-button)]",
-      "px-2",
+      "pl-8",
       "py-1.5",
       "md:py-1",
       "sidebar-compact-text",
@@ -148,44 +139,30 @@ describe("project folder header icon/chevron", () => {
     expect(folder).not.toBeNull();
     expect(folder).toHaveClass("text-muted-foreground");
 
-    // The folder icon sits in a wrapper that fades out on desktop hover/focus.
+    // Hovering the target must not hide its icon: the chevron has its own button.
     const folderWrapper = folder.parentElement as HTMLElement;
-    expect(classOf(folderWrapper)).toMatch(/md:group-hover:opacity-0/);
-    expect(classOf(folderWrapper)).toMatch(/md:group-focus-visible:opacity-0/);
-
-    // A chevron shares the icon slot (absolute), hidden by default and fading
-    // in on desktop hover/focus so it takes the folder's place.
-    const chevrons = Array.from(header.querySelectorAll(".lucide-chevron-right"));
-    const swap = chevrons.find((c) => classOf(c).includes("absolute")) as HTMLElement;
-    expect(swap).toBeTruthy();
-    expect(classOf(swap)).toMatch(/opacity-0/);
-    expect(classOf(swap)).toMatch(/md:group-hover:opacity-100/);
-    expect(classOf(swap)).toMatch(/md:group-focus-visible:opacity-100/);
-
-    // The swap chevron lives in the same icon slot as the folder (not trailing
-    // the title), so it overlays the folder position.
-    expect(swap.parentElement).toBe(folderWrapper.parentElement);
+    expect(classOf(folderWrapper)).not.toMatch(/opacity-0/);
+    expect(header.querySelector(".lucide-chevron-right")).toBeNull();
+    expect(header.contains(headerButton("My Project"))).toBe(false);
   });
 
-  it("keeps the project header's trailing chevron mobile-only", () => {
+  it("keeps the independent project chevron visible without hover", () => {
     renderSidebar();
     const header = headerButton("My Project");
 
     const chevrons = Array.from(header.querySelectorAll(".lucide-chevron-right"));
-    // Two chevrons: the in-slot swap (absolute) and the trailing one.
+    expect(chevrons).toHaveLength(1);
     const trailing = chevrons.find((c) => !classOf(c).includes("absolute")) as HTMLElement;
     expect(trailing).toBeTruthy();
-    // Trailing chevron is hidden on desktop (the swap replaces it there) and
-    // shown on mobile where there's no hover.
-    expect(classOf(trailing)).toMatch(/md:hidden/);
+    expect(classOf(trailing)).not.toMatch(/hidden|opacity-0/);
     expect(classOf(trailing)).not.toMatch(/md:group-hover:opacity-100/);
   });
 
   it("highlights the project row instead of global New session for a project-scoped composer", () => {
     renderSidebar("/?project=My%20Project");
 
-    const header = headerButton("My Project");
-    expect(header).toHaveAttribute("aria-current", "page");
+    const header = headerButton("Use My Project for new sessions");
+    expect(header).toHaveAttribute("aria-pressed", "true");
     expect(header).toHaveClass(
       "bg-[var(--sidebar-active)]",
       "text-[var(--sidebar-active-foreground)]",

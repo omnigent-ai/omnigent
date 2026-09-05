@@ -15,6 +15,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
+import { NEW_SESSION_TARGET_STORAGE_KEY } from "@/lib/newSessionTarget";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
 import type { ExtensionCatalogItem } from "@/extensions/types";
@@ -1553,6 +1554,80 @@ describe("Sidebar visibility filter (server-side mine/shared split)", () => {
 // "Sessions" list into a folder under the "Projects" group (rendered between
 // Pinned and Sessions). The project list comes from useProjects() (mocked here).
 describe("Sidebar project sections", () => {
+  it("keeps a newly selected project from being overwritten by the old composer URL", async () => {
+    projectsMock.push("Alpha", "Beta");
+    mockConversations([]);
+    renderSidebar(true, "/?project=Alpha");
+
+    const alpha = screen.getByRole("button", { name: "Use Alpha for new sessions" });
+    const beta = screen.getByRole("button", { name: "Use Beta for new sessions" });
+    expect(alpha).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(beta);
+
+    await waitFor(() => expect(beta).toHaveAttribute("aria-pressed", "true"));
+    expect(alpha).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByTestId("new-chat-button")).toHaveAttribute("href", "/?project=Beta");
+    expect(JSON.parse(localStorage.getItem(NEW_SESSION_TARGET_STORAGE_KEY) ?? "null")).toEqual({
+      kind: "project",
+      projectId: "p_Beta",
+      projectName: "Beta",
+    });
+  });
+
+  it("changes only the global target while an existing session is open", () => {
+    projectsMock.push("Customer X");
+    mockConversations([conv("conv_unfiled", "Claude Code")]);
+    renderSidebar(true, "/c/conv_unfiled");
+
+    fireEvent.click(screen.getByRole("button", { name: "Use Customer X for new sessions" }));
+
+    expect(screen.getByTestId("new-chat-button")).toHaveAttribute("href", "/?project=Customer%20X");
+    expect(screen.getByRole("button", { name: "Use Customer X for new sessions" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("selects No Project independently from section expansion", () => {
+    projectsMock.push("Customer X");
+    mockConversations([conv("conv_unfiled", "Claude Code")]);
+    renderSidebar(true, "/c/conv_unfiled");
+
+    const projectTarget = screen.getByRole("button", {
+      name: "Use Customer X for new sessions",
+    });
+    const noProjectTarget = screen.getByRole("button", {
+      name: "Use No Project for new sessions",
+    });
+    const projectToggle = screen.getByRole("button", { name: "Customer X" });
+
+    fireEvent.click(projectTarget);
+    expect(projectToggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(projectToggle);
+    expect(projectToggle).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(noProjectTarget);
+
+    expect(noProjectTarget).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("new-chat-button")).toHaveAttribute("href", "/");
+  });
+
+  it("keeps the CWD tail visible and exposes the complete path in a popup", () => {
+    const workspace = "D:\\AIProgram\\Projects\\A very long workspace folder\\repo";
+    mockConversations([conv("conv_unfiled", "Claude Code", { workspace })]);
+    renderSidebar(true, "/c/conv_unfiled");
+
+    const detail = screen.getByTestId("session-workspace-detail");
+    expect(detail).toHaveAccessibleName(`Working directory: ${workspace}`);
+    expect(screen.getByTestId("session-workspace-prefix")).toHaveClass("min-w-0", "truncate");
+    expect(screen.getByTestId("session-workspace-tail")).toHaveTextContent("repo");
+    expect(screen.getByTestId("session-workspace-tail")).toHaveClass("shrink-0");
+
+    fireEvent.click(detail);
+    expect(screen.getByText("Working directory")).toBeInTheDocument();
+    expect(screen.getAllByText(workspace)).toHaveLength(1);
+  });
+
   it("groups sessions by their project label, separate from Sessions", () => {
     projectsMock.push("Customer X");
     mockConversations([
@@ -1891,13 +1966,7 @@ describe("Sidebar project sections", () => {
     );
   });
 
-  it("keeps New session in the project menu when the pencil requires hover", async () => {
-    // The pencil is a redundant shortcut for the kebab's always-present "New
-    // session" item, so without a fine hover pointer it is genuinely absent
-    // (display:none via `hidden`), NOT sr-only — an sr-only pencil would stay
-    // focusable and announce a duplicate "New session" alongside the kebab's
-    // item. On hover+fine it is display-flex, revealed on hover/focus by the
-    // overlay's opacity. The kebab (not this pencil) carries the touch a11y path.
+  it("keeps direct and labeled project new-session paths visible on touch", async () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -1905,19 +1974,15 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     const pencil = screen.getByTestId("project-new-session");
-    expect(pencil).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:flex");
-    // Genuinely absent on touch — not merely clipped — so it leaves the a11y
-    // tree and tab order, unlike the kebab.
-    // Separate assertions: toHaveClass with multiple classes only fails when
-    // ALL are present, so a partial regression (e.g. adding just `sr-only`)
-    // would slip past a combined negation while clipping the pencil invisible
-    // on hover+fine.
+    expect(pencil).toHaveAttribute("aria-label", "New session in Customer X");
+    expect(pencil.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
+    expect(pencil).not.toHaveClass("hidden");
     expect(pencil).not.toHaveClass("sr-only");
-    expect(pencil).not.toHaveClass("focus-visible:not-sr-only");
 
-    // The menu remains a touch/long-press fallback even when the hover shortcut
-    // is eligible, because a touchscreen tap cannot reveal that shortcut first.
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
+    const kebab = screen.getByRole("button", { name: "Project actions for Customer X" });
+    expect(kebab).not.toHaveClass("hidden");
+    expect(kebab).not.toHaveClass("sr-only");
+    fireEvent.pointerDown(kebab, {
       button: 0,
       ctrlKey: false,
     });
@@ -1932,12 +1997,7 @@ describe("Sidebar project sections", () => {
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 
-  it("keeps the project kebab off the row but reachable without a fine hover pointer", () => {
-    // jsdom can't evaluate @media, so the capability contract is asserted via
-    // classes; the recorded demo is the behavioral guardrail. The base classes
-    // stand for every pointer lacking fine hover — a 390px phone and an 810px
-    // unfolded foldable alike (coarse, hover:none) — where the kebab is
-    // sr-only: absent from the row, zero layout, yet in the a11y tree.
+  it("keeps the project kebab visibly reachable without a fine hover pointer", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -1945,44 +2005,8 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     const kebab = screen.getByTestId("project-actions");
-    // sr-only at rest; revealed only where a fine hover pointer exists, at ANY
-    // width — no md gate that would drop it on a narrow hover desktop.
-    expect(kebab).toHaveClass(
-      "sr-only",
-      "[@media((hover:hover)_and_(pointer:fine))]:not-sr-only",
-      "[@media((hover:hover)_and_(pointer:fine))]:flex",
-    );
-    // Never display:none — that would strip it from the a11y tree and tab order
-    // on touch, where the long-press contextmenu isn't reliably dispatched.
     expect(kebab).not.toHaveClass("hidden");
-    // Keyboard focus un-clips it (`:focus-visible` isn't raised by a touch tap),
-    // so a sighted keyboard/switch user on a touchscreen laptop gets a visible
-    // focus ring instead of one clipped off-screen.
-    expect(kebab).toHaveClass("focus-visible:not-sr-only");
-    // No un-capability-gated display utility at md would re-expose it on a wide
-    // touch screen (the reported foldable bug) — broader than the one literal.
-    for (const cls of kebab.classList) {
-      expect(cls).not.toMatch(
-        /^md:(flex|inline-flex|block|inline-block|inline|grid|inline-grid|table|contents|flow-root)$/,
-      );
-    }
-  });
-
-  it("gives the touch kebab the sr-only (not display:none) class contract", () => {
-    // The touch/coarse case (390px and 810px). No CSS is loaded in jsdom, so a
-    // display:none button is equally findable/focusable here — the meaningful
-    // guard is the class contract: sr-only (kept in the a11y tree, unlike
-    // `hidden`) plus focus-visible:not-sr-only (a focused control becomes
-    // visible). The demo is the behavioral guardrail for the effective render.
-    projectsMock.push("Customer X");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
-    ]);
-    renderSidebar();
-
-    const kebab = screen.getByRole("button", { name: "Project actions for Customer X" });
-    expect(kebab).toHaveClass("sr-only", "focus-visible:not-sr-only");
-    expect(kebab).not.toHaveClass("hidden");
+    expect(kebab).not.toHaveClass("sr-only");
   });
 
   it("reveals the folder kebab on hover at every width, narrow hover desktops included", () => {
@@ -2040,9 +2064,13 @@ describe("Sidebar collapsed project marker", () => {
 
     // Collapsed by default → the row is hidden, but its "Needs response"
     // marker surfaces on the project header.
-    const header = screen.getByRole("button", { name: /^Customer X/ });
-    expect(header).toHaveAttribute("aria-expanded", "false");
-    expect(within(header).getByText("Needs response")).toBeInTheDocument();
+    const toggle = screen.getByRole("button", { name: "Customer X" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(
+      within(screen.getByRole("button", { name: "Use Customer X for new sessions" })).getByText(
+        "Needs response",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("drops the header marker once the project is expanded", () => {
