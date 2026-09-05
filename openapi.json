@@ -6942,6 +6942,28 @@
         "title": "SessionStatusEvent",
         "type": "object"
       },
+      "SessionStopResponse": {
+        "description": "Acknowledgement for a non-destructive session stop request.",
+        "properties": {
+          "session_id": {
+            "description": "Session whose live execution was stopped.",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "stopped": {
+            "const": true,
+            "default": true,
+            "description": "`True` when the request has been accepted. Repeating the request for a session with no live runner is also successful.",
+            "title": "Stopped",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "SessionStopResponse",
+        "type": "object"
+      },
       "SessionSupersededEvent": {
         "description": "This conversation was superseded by another and clients should\nfollow to it.\n\nEmitted by `_publish_session_superseded` in\n`omnigent/server/routes/sessions.py` when the claude-native\nforwarder rotates a session away on a Claude `/clear` (the old\nconversation keeps its history but the live terminal moves to a\nfresh conversation \u2014 see `_post_clear_supersession` in\n`omnigent/claude_native_forwarder.py`). A client actively viewing\nthe superseded conversation auto-redirects to `target_conversation_id`.\n\nCategory: **transient** (SSE-only), live-only by design. There is no\nSSE replay: a client that connects after the rotation does not get\nthis event. The durable counterpart is the persisted notice message\nappended to the old conversation (a `message` item linking to the\nnew conversation), which a reloading client renders instead of being\nforce-redirected.\n\nThe wire shape is FLAT (not enveloped):\n`{\"type\": \"session.superseded\", \"conversation_id\": <old>, \"target_conversation_id\": <new>, \"reason\": \"clear\"}`.",
         "properties": {
@@ -14297,6 +14319,50 @@
         "summary": "Get Session Resource",
         "tags": [
           "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/stop": {
+      "post": {
+        "description": "Stop live execution without deleting the session or transcript.\n\nThe operation is owner-only and idempotent. A stopped host-launched\nsession may be started again by posting a new message.\n\n**Returns:** A stable acknowledgement for the requested session.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 without owner access, 404 for an unknown session, or 503 when a reachable runner rejects the stop.",
+        "operationId": "stop_session_v1_sessions__session_id__stop_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionStopResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Session",
+        "tags": [
+          "sessions"
         ]
       }
     },

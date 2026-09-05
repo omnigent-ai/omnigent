@@ -8565,6 +8565,73 @@ async def test_stop_session_forwards_stop_session_event_to_runner(
     )
 
 
+async def test_public_stop_session_is_typed_non_destructive_and_idempotent(
+    client: httpx.AsyncClient,
+) -> None:
+    """The public stop route preserves evidence and tolerates retries."""
+    from omnigent.runtime import set_runner_client
+
+    forwarded: list[_ForwardedEffort] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            forwarded.append(
+                _ForwardedEffort(
+                    url=str(request.url),
+                    body=json.loads(request.content) if request.content else None,
+                )
+            )
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"], initial_message="Keep this evidence")
+        before = await client.get(f"/v1/sessions/{session['id']}")
+
+        first = await client.post(f"/v1/sessions/{session['id']}/stop")
+        second = await client.post(f"/v1/sessions/{session['id']}/stop")
+        after = await client.get(f"/v1/sessions/{session['id']}")
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    expected = {"session_id": session["id"], "stopped": True}
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json() == expected
+    assert second.json() == expected
+    assert after.status_code == 200
+    assert after.json()["items"] == before.json()["items"]
+    stop_forwards = [
+        item
+        for item in forwarded
+        if item.url == f"http://runner/v1/sessions/{session['id']}/events"
+    ]
+    assert [item.body for item in stop_forwards] == [
+        {"type": "stop_session"},
+        {"type": "stop_session"},
+    ]
+
+
+async def test_public_stop_session_is_in_openapi(
+    client: httpx.AsyncClient,
+) -> None:
+    """Generated clients can discover the dedicated stop contract."""
+    response = await client.get("/openapi.json")
+
+    assert response.status_code == 200
+    operation = response.json()["paths"]["/v1/sessions/{session_id}/stop"]["post"]
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/SessionStopResponse"
+    }
+    assert "/v1/sessions/{session_id}/events" not in response.json()["paths"]
+
+
 @pytest.mark.parametrize(
     "failure_mode",
     [

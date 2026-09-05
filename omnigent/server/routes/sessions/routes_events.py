@@ -207,6 +207,7 @@ from omnigent.server.schemas import (
     ErrorDetail,
     McpServerStartup,
     SessionEventInput,
+    SessionStopResponse,
 )
 from omnigent.session_lifecycle import (
     is_session_closed,
@@ -1994,6 +1995,33 @@ def register_events_routes(
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
         return response
+
+    @router.post(
+        "/sessions/{session_id}/stop",
+        response_model=SessionStopResponse,
+        status_code=200,
+    )
+    async def stop_session(
+        request: Request,
+        session_id: str,
+    ) -> SessionStopResponse:
+        """Stop live execution without deleting the session or transcript.
+
+        The operation is owner-only and idempotent. A stopped host-launched
+        session may be started again by posting a new message.
+
+        :param request: Incoming authenticated request.
+        :param session_id: Session/conversation identifier.
+        :returns: A stable acknowledgement for the requested session.
+        :raises OmnigentError: 403 without owner access, 404 for an unknown
+            session, or 503 when a reachable runner rejects the stop.
+        """
+        await post_event(
+            request,
+            session_id,
+            SessionEventInput(type=_STOP_SESSION_TYPE),
+        )
+        return SessionStopResponse(session_id=session_id)
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 

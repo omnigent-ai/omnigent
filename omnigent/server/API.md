@@ -846,6 +846,31 @@ runner id. The write replaces any previous value in
 Codex-native session routes, including the Codex Goal subresource, are
 documented in [codex-API.md](codex-API.md).
 
+### Stop Session Without Deleting It
+
+```
+POST /v1/sessions/{session_id}/stop
+```
+
+Stops the session's live execution while preserving its conversation,
+transcript, and other durable evidence. This owner-only operation is
+idempotent: repeating it after the runner is already stopped returns the same
+successful acknowledgement.
+
+```json
+{"session_id": "conv_abc123", "stopped": true}
+```
+
+The stop is non-sticky. Posting a later user message may relaunch execution on
+a still-available host. Use `DELETE /v1/sessions/{session_id}` only when the
+session and its resources should be removed.
+
+200 OK - stop accepted, including when no live runner remains
+403 Forbidden - caller lacks owner access
+404 Not Found - no session with that id
+503 Service Unavailable - the bound runner was reachable but rejected or could
+not complete the stop
+
 ### Post Event
 
 ```
