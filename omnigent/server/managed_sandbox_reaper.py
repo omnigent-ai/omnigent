@@ -165,6 +165,17 @@ class ManagedSandboxReaper:
             with launcher.reaper_identity(workspace_id):
                 for candidate in candidates:
                     try:
+                        if candidate.deleted_at is not None:
+                            sandbox_id = candidate.terminating_sandbox_id or candidate.sandbox_id
+                            if sandbox_id is None:
+                                continue
+                            launcher.terminate(sandbox_id)
+                            if self._host_store.mark_deleted_sandbox_terminated(
+                                candidate.host_id,
+                                sandbox_id=sandbox_id,
+                            ):
+                                reaped += 1
+                            continue
                         sandbox_id = candidate.terminating_sandbox_id
                         if sandbox_id is None:
                             if not self._is_reap_candidate(candidate, cutoff=cutoff, now=now):
@@ -200,7 +211,11 @@ class ManagedSandboxReaper:
     @staticmethod
     def _is_reap_candidate(host: Host, *, cutoff: int, now: int) -> bool:
         return host.sandbox_provider is not None and (
-            host.terminating_sandbox_id is not None
+            (
+                host.deleted_at is not None
+                and (host.sandbox_id is not None or host.terminating_sandbox_id is not None)
+            )
+            or host.terminating_sandbox_id is not None
             or (
                 host.sandbox_id is not None
                 and not host_is_live(host, now=now)

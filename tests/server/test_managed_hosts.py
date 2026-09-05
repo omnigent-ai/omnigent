@@ -2535,7 +2535,7 @@ async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str)
         await relaunch_managed_host(config=config, host=pending, host_store=host_store)
 
     assert exc.value.status_code == 409
-    assert "pending cleanup" in exc.value.detail
+    assert "host lifecycle" in exc.value.detail
     assert len(fake.host_starts) == 1
     assert fake.terminated == []
     still_pending = host_store.get_host(active.host_id)
@@ -2652,6 +2652,34 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
         host_store.resolve_launch_token(fake.host_starts[0].host_id, fake.host_starts[0].token)
         is None
     )
+
+
+async def test_relaunch_does_not_recreate_deleted_host(db_uri: str) -> None:
+    """A relaunch that loses to full teardown cleans up its new sandbox."""
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="c73ad22fd7be4fe2a62a36b7e0fbcaa8",
+        name="managed-deleted-relaunch",
+        user_id=_OWNER,
+        token="deleted-relaunch-token",
+        provider="modal",
+        sandbox_id="sb-deleted-old",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.delete_host(host.host_id)
+    fake = FakeSandboxLauncher()
+
+    with pytest.raises(HTTPException) as exc:
+        await relaunch_managed_host(
+            config=_injected_config(fake),
+            host=host,
+            host_store=host_store,
+        )
+
+    assert exc.value.status_code == 409
+    assert "no longer exists" in exc.value.detail
+    assert fake.terminated == ["sb-deleted-old", "sb-fake-1"]
+    assert host_store.get_host(host.host_id) is None
 
 
 async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
@@ -2951,8 +2979,8 @@ async def test_resume_managed_host_noops_for_non_resumable_provider(db_uri: str)
     )
 
 
-async def test_resume_managed_host_failure_preserves_existing_row(db_uri: str) -> None:
-    """A failed wake leaves the dormant host generation retryable."""
+async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_uri: str) -> None:
+    """A failed provider resume leaves the dormant generation unchanged."""
     host_store = HostStore(db_uri)
     host_store.register_managed_host(
         host_id="efbef7dede7be6577770cbb1287992f2",
@@ -2979,7 +3007,7 @@ async def test_resume_managed_host_failure_preserves_existing_row(db_uri: str) -
     assert host.sandbox_id == "sb-resume-fail"
     assert (
         host_store.resolve_launch_token("efbef7dede7be6577770cbb1287992f2", "tok-resume-fail")
-        is None
+        is not None
     )
 
 
@@ -2987,7 +3015,7 @@ async def test_resume_managed_host_does_not_resume_detached_generation(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A reaper detach that wins the CAS prevents the provider resume call."""
+    """A reaper detach that wins the CAS cleans up the resumed stale generation."""
     host_store = HostStore(db_uri)
     host_id = "ade43acaaaf44af59388dc2109a8557f"
     host_store.register_managed_host(
@@ -3027,11 +3055,46 @@ async def test_resume_managed_host_does_not_resume_detached_generation(
 
     await resume_managed_host(host_id, host_store, _injected_config(fake))
 
-    assert fake.resumed == []
+    assert fake.resumed == ["sb-resume-race"]
+    assert fake.terminated == ["sb-resume-race"]
     detached = host_store.get_host(host_id)
     assert detached is not None
     assert detached.sandbox_id is None
-    assert detached.terminating_sandbox_id == "sb-resume-race"
+    assert detached.terminating_sandbox_id is None
+
+
+async def test_resume_managed_host_does_not_recreate_deleted_host(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wake that loses to full teardown cleans up the resumed sandbox."""
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="463013d3d38d4096b2404962c48479b1",
+        name="managed-deleted-resume",
+        user_id=_OWNER,
+        token="deleted-resume-token",
+        provider="islo",
+        sandbox_id="sb-deleted-resume",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.set_offline(host.host_id)
+    fake = _IsloFakeLauncher(can_resume=True)
+
+    def _resume(sandbox_id: str) -> None:
+        fake.resumed.append(sandbox_id)
+        host_store.delete_host(host.host_id)
+
+    monkeypatch.setattr(fake, "resume", _resume)
+
+    with pytest.raises(HTTPException) as exc:
+        await resume_managed_host(host.host_id, host_store, _injected_config(fake))
+
+    assert exc.value.status_code == 502
+    assert "no longer exists" in exc.value.detail
+    assert fake.terminated == ["sb-deleted-resume"]
+    assert fake.host_starts == []
+    assert host_store.get_host(host.host_id) is None
 
 
 # ── terminate_managed_host ──────────────────────────────────
@@ -3083,15 +3146,15 @@ async def test_terminate_managed_host_cleans_active_and_pending_generations(db_u
         sandbox_id="sb-term-old",
         expected_updated_at=original.updated_at,
     )
-    host_store.register_managed_host(
+    replaced = host_store.replace_managed_host_sandbox(
         host_id=host_id,
-        name="managed-term-both",
         user_id=_OWNER,
         token="tok-term-new",
         provider="modal",
         sandbox_id="sb-term-new",
         token_expires_at=now_epoch() + 3600,
     )
+    assert replaced is not None
     host = host_store.get_host(host_id)
     assert host is not None
 
@@ -3101,15 +3164,72 @@ async def test_terminate_managed_host_cleans_active_and_pending_generations(db_u
     assert host_store.get_host(host_id) is None
 
 
-async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
+async def test_terminate_managed_host_targets_latest_registered_generation(db_uri: str) -> None:
+    """A stale teardown snapshot removes and terminates the current generation."""
+    fake = FakeSandboxLauncher()
+    host_store = HostStore(db_uri)
+    stale = host_store.register_managed_host(
+        host_id="5233b41530ed474f9860ecf3acfc9131",
+        name="managed-term-current",
+        user_id=_OWNER,
+        token="tok-term-old",
+        provider="modal",
+        sandbox_id="sb-term-old",
+        token_expires_at=now_epoch() + 3600,
+    )
+    updated = host_store.replace_managed_host_sandbox(
+        host_id=stale.host_id,
+        user_id=stale.user_id,
+        token="tok-term-new",
+        provider="modal",
+        sandbox_id="sb-term-new",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert updated is not None
+
+    await terminate_managed_host(stale, host_store, _injected_config(fake))
+
+    assert fake.terminated == ["sb-term-new"]
+    assert host_store.get_host(stale.host_id) is None
+
+
+async def test_terminate_managed_host_deletes_row_before_provider_call(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider teardown runs only after the host can no longer be relaunched."""
+    fake = FakeSandboxLauncher()
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="af48b60a7afb4c0696709403116c30c6",
+        name="managed-delete-first",
+        user_id=_OWNER,
+        token="tok-delete-first",
+        provider="modal",
+        sandbox_id="sb-delete-first",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    def _terminate(sandbox_id: str) -> None:
+        assert host_store.get_host(host.host_id) is None
+        fake.terminated.append(sandbox_id)
+
+    monkeypatch.setattr(fake, "terminate", _terminate)
+
+    await terminate_managed_host(host, host_store, _injected_config(fake))
+
+    assert fake.terminated == ["sb-delete-first"]
+
+
+async def test_terminate_managed_host_retries_tombstone_after_terminate_fails(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Best-effort contract: a provider termination failure neither
-    propagates nor blocks the row deletion (the provider's lifetime
-    cap reaps the sandbox; the credential must die now).
+    A provider failure does not block logical deletion, and the persisted
+    sandbox id is retried by the existing reaper.
     """
     fake = FakeSandboxLauncher()
+    original_terminate = fake.terminate
 
     def _explode(sandbox_id: str) -> None:
         """Simulate a provider API failure during termination."""
@@ -3133,15 +3253,83 @@ async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
     assert (
         host_store.resolve_launch_token("057e7fa3f1cdb40c0ec393a3d42affc7", "tok-term-2") is None
     )
+    tombstones = host_store.list_stale_managed_sandbox_hosts(now_epoch())
+    assert len(tombstones) == 1
+    assert tombstones[0].deleted_at is not None
+    assert tombstones[0].sandbox_id == "sb-term-2"
+
+    monkeypatch.setattr(fake, "terminate", original_terminate)
+    reaper = ManagedSandboxReaper(
+        host_store=host_store,
+        sandbox_config=_injected_config(fake),
+    )
+    assert await reaper.sweep_once() == 1
+    assert fake.terminated == ["sb-term-2"]
+    assert host_store.list_stale_managed_sandbox_hosts(now_epoch()) == []
+
+
+async def test_terminate_managed_host_retains_only_failed_generation(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeSandboxLauncher()
+    original_terminate = fake.terminate
+    host_store = HostStore(db_uri)
+    host_id = "9e50e018919e494886b984df0bbec12b"
+    original = host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-term-partial",
+        user_id=_OWNER,
+        token="tok-term-old-partial",
+        provider="modal",
+        sandbox_id="sb-term-old-partial",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert host_store.detach_stale_managed_sandbox(
+        host_id,
+        sandbox_id="sb-term-old-partial",
+        expected_updated_at=original.updated_at,
+    )
+    host = host_store.replace_managed_host_sandbox(
+        host_id=host_id,
+        user_id=_OWNER,
+        token="tok-term-new-partial",
+        provider="modal",
+        sandbox_id="sb-term-new-partial",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert host is not None
+    attempts: list[str] = []
+
+    def _terminate(sandbox_id: str) -> None:
+        attempts.append(sandbox_id)
+        if sandbox_id == "sb-term-new-partial":
+            raise click.ClickException("provider unavailable")
+        original_terminate(sandbox_id)
+
+    monkeypatch.setattr(fake, "terminate", _terminate)
+    await terminate_managed_host(host, host_store, _injected_config(fake))
+
+    assert attempts == ["sb-term-new-partial", "sb-term-old-partial"]
+    tombstones = host_store.list_stale_managed_sandbox_hosts(now_epoch())
+    assert len(tombstones) == 1
+    assert tombstones[0].sandbox_id == "sb-term-new-partial"
+    assert tombstones[0].terminating_sandbox_id is None
+
+    monkeypatch.setattr(fake, "terminate", original_terminate)
+    reaper = ManagedSandboxReaper(
+        host_store=host_store,
+        sandbox_config=_injected_config(fake),
+    )
+    assert await reaper.sweep_once() == 1
+    assert fake.terminated == ["sb-term-old-partial", "sb-term-new-partial"]
+    assert host_store.list_stale_managed_sandbox_hosts(now_epoch()) == []
 
 
 async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> None:
     """
-    A config change between launch and teardown (current launcher's
-    provider ≠ the provider recorded on the row) must NOT aim the new
-    provider's terminate at a stale sandbox id — the sandbox is left
-    to its lifetime cap, but the row still dies (token revoked, no
-    picker ghost). Also covers config=None (section removed).
+    A config change between launch and teardown must not aim the new provider's
+    terminate at a stale sandbox id. The host becomes invisible and its cleanup
+    tombstone remains available if that provider is configured again later.
     """
     fake = FakeSandboxLauncher()  # provider "modal"
     host_store = HostStore(db_uri)
@@ -3164,7 +3352,7 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
         host_store.resolve_launch_token("487212fd2b157b6ab6a6d6d3ef06ce5b", "tok-term-3") is None
     )
 
-    # config=None behaves the same: row deleted, nothing terminated.
+    # config=None behaves the same: host hidden, cleanup retained.
     host2 = host_store.register_managed_host(
         host_id="b114bf90a8fd155ce6007c3bb262aa79",
         name="managed-term4",

@@ -89,7 +89,8 @@ class _FakeHostStore:
             for host in self.hosts[workspace_id].values()
             if host.sandbox_provider is not None
             and (
-                host.terminating_sandbox_id is not None
+                host.deleted_at is not None
+                or host.terminating_sandbox_id is not None
                 or (host.sandbox_id is not None and host.updated_at <= older_than_epoch)
             )
         ]
@@ -111,6 +112,7 @@ class _FakeHostStore:
             self.refresh_on_detach.remove(host_id)
         if (
             host is None
+            or host.deleted_at is not None
             or host.sandbox_id != sandbox_id
             or host.updated_at != expected_updated_at
             or host.terminating_sandbox_id is not None
@@ -142,6 +144,34 @@ class _FakeHostStore:
         self.cleared.append((workspace_id, host_id, sandbox_id))
         return True
 
+    def mark_deleted_sandbox_terminated(
+        self,
+        host_id: str,
+        *,
+        sandbox_id: str,
+    ) -> bool:
+        workspace_id = current_workspace_id()
+        host = self.hosts[workspace_id].get(host_id)
+        if (
+            host is None
+            or host.deleted_at is None
+            or sandbox_id not in {host.sandbox_id, host.terminating_sandbox_id}
+        ):
+            return False
+        updated = replace(
+            host,
+            sandbox_id=None if host.sandbox_id == sandbox_id else host.sandbox_id,
+            terminating_sandbox_id=(
+                None if host.terminating_sandbox_id == sandbox_id else host.terminating_sandbox_id
+            ),
+        )
+        if updated.sandbox_id is None and updated.terminating_sandbox_id is None:
+            del self.hosts[workspace_id][host_id]
+        else:
+            self.hosts[workspace_id][host_id] = updated
+        self.cleared.append((workspace_id, host_id, sandbox_id))
+        return True
+
 
 def _host(
     host_id: str,
@@ -151,6 +181,7 @@ def _host(
     updated_at: int,
     status: str = "offline",
     terminating_sandbox_id: str | None = None,
+    deleted_at: int | None = None,
 ) -> Host:
     return Host(
         host_id=host_id,
@@ -162,6 +193,7 @@ def _host(
         sandbox_provider=provider,
         sandbox_id=sandbox_id,
         terminating_sandbox_id=terminating_sandbox_id,
+        deleted_at=deleted_at,
     )
 
 
@@ -290,6 +322,37 @@ async def test_provider_failure_does_not_stop_other_sandboxes() -> None:
     assert hosts.hosts[7]["host_modal"].terminating_sandbox_id == "sb-modal"
     assert hosts.hosts[7]["host_e2b"].sandbox_id is None
     assert e2b.terminated == ["sb-e2b"]
+
+
+async def test_deleted_host_cleanup_retries_without_offline_age() -> None:
+    now = 4_000_000
+    modal = _RecordingLauncher("modal", fail=True)
+    hosts = _FakeHostStore(
+        {
+            7: [
+                _host(
+                    "host_deleted",
+                    provider="modal",
+                    sandbox_id="sb-deleted",
+                    updated_at=now,
+                    status="online",
+                    deleted_at=now,
+                )
+            ]
+        }
+    )
+    reaper = ManagedSandboxReaper(
+        host_store=hosts,  # type: ignore[arg-type]
+        sandbox_config=_deployment([modal]),
+    )
+
+    assert await reaper.sweep_once(now=now) == 0
+    assert hosts.hosts[7]["host_deleted"].sandbox_id == "sb-deleted"
+
+    modal.fail = False
+    assert await reaper.sweep_once(now=now) == 1
+    assert modal.terminated == ["sb-deleted"]
+    assert "host_deleted" not in hosts.hosts[7]
 
 
 async def test_provider_identity_failure_does_not_stop_other_sandboxes() -> None:
