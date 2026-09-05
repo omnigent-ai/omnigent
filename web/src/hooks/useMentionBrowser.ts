@@ -42,11 +42,10 @@ export interface MentionBrowser {
   dismiss: () => void;
 }
 
-export interface MentionKeyboardEvent {
-  key: string;
-  shiftKey: boolean;
-  preventDefault: () => void;
-}
+export type MentionKeyboardEvent = Pick<
+  KeyboardEvent,
+  "code" | "key" | "ctrlKey" | "metaKey" | "altKey" | "shiftKey" | "preventDefault"
+>;
 
 /**
  * Shared ``@``-file-mention controller for the in-session composer and the

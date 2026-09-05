@@ -1,6 +1,5 @@
 import {
   type FormEvent,
-  type KeyboardEvent,
   memo,
   useCallback,
   useDeferredValue,
@@ -3516,6 +3515,7 @@ function ComposerImpl({
         <InlineComposerEditor
           ref={inlineEditorRef}
           initialParts={composerParts}
+          onHeightChange={onViewportShrinkPinScroll}
           onChange={(nextParts) => {
             composerPartsRef.current = nextParts;
             setComposerParts(nextParts);

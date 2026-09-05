@@ -4754,12 +4754,7 @@ export function NewChatLandingScreen() {
     );
     const shouldPreferSendOverCompletion = submitWithModEnter && shouldSubmitFromKeyboard;
 
-    const mentionEvent = {
-      key: event.key,
-      shiftKey: event.shiftKey,
-      preventDefault: () => event.preventDefault(),
-    };
-    if (!shouldPreferSendOverCompletion && handleMentionKeyDown(mentionEvent)) return true;
+    if (!shouldPreferSendOverCompletion && handleMentionKeyDown(event)) return true;
 
     if (slashMenuOpen && slashMenuMatches.length > 0) {
       if (event.key === "ArrowDown") {

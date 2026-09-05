@@ -1391,6 +1391,8 @@ class QwenExecutor(Executor):
                     )
                 break
 
+        latest_text = user_text
+
         # On a fresh session, replay the prior conversation so a model switch
         # (which respawns the subprocess) or a session reset doesn't drop the
         # thread — qwen otherwise only ever sees this turn's latest message.
@@ -1416,19 +1418,14 @@ class QwenExecutor(Executor):
                 prompt_blocks.append({"type": "text", "text": user_text})
             prompt_blocks.extend(image_blocks)
         else:
-            latest_text = self._text_from_blocks(
-                content,
-                emit_image_marker=not self._image_supported,
-            )
             prefix = (
                 user_text[: -len(latest_text)]
                 if latest_text and user_text.endswith(latest_text)
                 else user_text
             )
             prompt_blocks = (
-                ([{"type": "text", "text": prefix}] if prefix else [])
-                + ordered_prompt_blocks
-            )
+                [{"type": "text", "text": prefix}] if prefix else []
+            ) + ordered_prompt_blocks
             if not prompt_blocks:
                 prompt_blocks = [{"type": "text", "text": ""}]
 
