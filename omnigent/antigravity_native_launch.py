@@ -24,11 +24,12 @@ Key design points:
   ``scratch`` dir). The launcher pins the terminal cwd to the session working
   directory, so no ``--add-dir`` flag is required.
 
-* **No usable env knobs** — agy also ignores ``ANTIGRAVITY_SIDECAR_WEB_PORT``
-  (it binds its own ephemeral ports) and ``ANTIGRAVITY_EXECUTABLE_DATA_DIR``
-  (its conversation store stays under the default ``~/.gemini/antigravity-cli``)
-  for the host process; both are sidecar-plugin-scoped no-ops. So
-  :func:`build_agy_launch` emits no env overrides for a fresh session.
+* **Auth inheritance** — when local Google Application Default Credentials are
+  available, the launcher enables agy's ADC auth mode without overwriting an
+  operator-provided ``AGY_ADC_AUTH`` value. agy ignores
+  ``ANTIGRAVITY_SIDECAR_WEB_PORT`` and ``ANTIGRAVITY_EXECUTABLE_DATA_DIR`` for
+  the host process, so :func:`build_agy_launch` emits only the ADC override
+  when appropriate.
 
 * **Auth is inherited** — current agy releases accept either their persisted
   Google OAuth login or ``GEMINI_API_KEY``. The isolated settings prepared by
@@ -37,7 +38,9 @@ Key design points:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,6 +68,30 @@ _AGY_INSTALL_HINT = (
     "  curl -fsSL https://antigravity.google/cli/install.sh | bash\n"
     "Then restart your shell so ~/.local/bin is on PATH."
 )
+
+
+def _adc_credentials_path() -> Path:
+    """Return the ADC file path selected by the ambient Google auth setup."""
+    explicit_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if explicit_path:
+        return Path(explicit_path).expanduser()
+    config_dir = os.environ.get("CLOUDSDK_CONFIG")
+    if config_dir:
+        return Path(config_dir).expanduser() / "application_default_credentials.json"
+    return Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+
+
+def _adc_credentials_available() -> bool:
+    """Return whether a readable, non-empty ADC JSON object is available."""
+    path = _adc_credentials_path()
+    try:
+        if not path.is_file():
+            return False
+        with path.open(encoding="utf-8") as credentials_file:
+            credentials = json.load(credentials_file)
+    except (OSError, ValueError):
+        return False
+    return isinstance(credentials, dict) and bool(credentials)
 
 
 def agy_binary_path() -> str:
@@ -226,11 +253,12 @@ def build_agy_launch(
     gate for this harness is post-hoc/audit-only). The flag is not duplicated
     when *extra_args* already carries it.
 
-    In both modes auth is inherited from the ambient environment / agy state,
-    and the workspace is the agy process cwd (set by the terminal spec), so no
-    ``--add-dir`` is emitted. No env overrides are produced: agy ignores
-    ``ANTIGRAVITY_SIDECAR_WEB_PORT`` / ``ANTIGRAVITY_CONVERSATION_ID`` /
-    ``ANTIGRAVITY_EXECUTABLE_DATA_DIR`` for the host process.
+    In both modes the workspace is the agy process cwd (set by the terminal
+    spec), so no ``--add-dir`` is emitted. ADC auth is enabled through the
+    returned environment overrides when local credentials are available;
+    agy ignores ``ANTIGRAVITY_SIDECAR_WEB_PORT`` /
+    ``ANTIGRAVITY_CONVERSATION_ID`` / ``ANTIGRAVITY_EXECUTABLE_DATA_DIR`` for
+    the host process.
 
     :param conversation_id: agy's real conversation id to resume, e.g.
         ``"68caaeac-..."``. Required (non-``None``) when ``resume=True``;
@@ -251,7 +279,8 @@ def build_agy_launch(
     :returns: A ``(argv, env_overrides)`` tuple where *argv* is the full
         command list starting with the agy binary path and *env_overrides*
         is a dict of env variables to layer on top of the process
-        environment (always empty for the agy host process).
+        environment, including the ADC auth override when local credentials
+        are available.
     :raises ValueError: When ``resume=True`` but *conversation_id* is ``None``
         or empty (agy needs a real id to resume).
     """
@@ -271,7 +300,7 @@ def build_agy_launch(
         argv.append(_SKIP_PERMISSIONS_FLAG)
     argv.extend(extra_args)
 
-    # agy ignores every env knob we tried (sidecar port, conversation id, data
-    # dir) for the host process, so there is nothing to inject.
     env_overrides: dict[str, str] = {}
+    if "AGY_ADC_AUTH" not in os.environ and _adc_credentials_available():
+        env_overrides["AGY_ADC_AUTH"] = "1"
     return argv, env_overrides
