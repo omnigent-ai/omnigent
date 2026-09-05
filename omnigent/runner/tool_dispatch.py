@@ -4514,11 +4514,10 @@ async def _session_get_info_via_rest(
     reasoning effort, effective model,
     parent linkage, workspace / git branch, persisted last-activity time,
     and the outstanding approval prompts (the prompts themselves plus a
-    count). Runner connectivity
-    is resolved best-effort via
-    ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
-    the lookup fails or no runner is bound); host readiness is likewise
-    best-effort via ``GET /v1/hosts/{id}``. The full transcript is
+    count). Runner connectivity comes from the authorized session snapshot,
+    including liveness persisted by other server replicas. Missing liveness
+    remains unknown; host readiness is best-effort via ``GET /v1/hosts/{id}``.
+    The full transcript is
     intentionally omitted — that is what ``sys_session_get_history`` returns.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
@@ -4539,7 +4538,7 @@ async def _session_get_info_via_rest(
     try:
         resp = await server_client.get(
             f"/v1/sessions/{raw_target}",
-            params={"include_items": "false", "include_liveness": "false"},
+            params={"include_items": "false", "include_liveness": "true"},
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -4553,17 +4552,33 @@ async def _session_get_info_via_rest(
     snap: _JsonObject = resp.json()
     pending_value = snap.get("pending_elicitations")
     pending = pending_value if isinstance(pending_value, list) else []
-    snap_agent_name = _optional_string(snap.get("agent_name"))
-    snap_runner_id = _optional_string(snap.get("runner_id"))
-    snap_host_id = _optional_string(snap.get("host_id"))
-    runner_online, configured_harnesses = await asyncio.gather(
-        _runner_online_or_none(snap_runner_id, server_client),
-        _host_harnesses_or_none(snap_host_id, server_client),
+    closed = is_session_closed(
+        _string_mapping(snap.get("labels")), _optional_string(snap.get("title"))
     )
+    snap_agent_name = _optional_string(snap.get("agent_name"))
+    snap_host_id = _optional_string(snap.get("host_id"))
+    snapshot_online = snap.get("runner_online")
+    runner_online = snapshot_online if isinstance(snapshot_online, bool) else None
+    configured_harnesses = await _host_harnesses_or_none(snap_host_id, server_client)
+    status = snap.get("status")
+    status_reason: str | None = None
+    # An unclean runner death can leave the server's cached status unchanged.
+    # Reconcile this read without persisting a failure during a reconnect gap.
+    if closed:
+        status_reason = "Session is closed."
+        if status in ("running", "waiting"):
+            status = "idle"
+    elif runner_online is False and status in ("running", "waiting"):
+        status = "failed"
+        status_reason = "Runner is offline; current execution cannot be confirmed."
+    if closed or runner_online is False:
+        pending = []
     return json.dumps(
         {
             "session_id": snap.get("id"),
-            "status": snap.get("status"),
+            "status": status,
+            "status_reason": status_reason,
+            "closed": closed,
             # Persisted conversation activity is distinct from lifecycle
             # status: repeated polls with an unchanged value let an
             # orchestrator detect a running session that is not advancing.

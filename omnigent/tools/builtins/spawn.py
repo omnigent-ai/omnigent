@@ -667,8 +667,8 @@ class SysSessionGetInfoTool(Tool):
     session is described.
 
     Runner-dispatched: the runner proxies ``GET /v1/sessions/{id}``
-    (plus best-effort runner status and host readiness lookups) and projects
-    the result. Returns
+    with session liveness (plus a best-effort host readiness lookup) and
+    projects the result. Returns
     ``session_not_found`` when the id is unknown and ``access_denied``
     when the server refuses the read.
     """
@@ -687,9 +687,12 @@ class SysSessionGetInfoTool(Tool):
             "host + configured harness readiness, reasoning effort, model, "
             "parent session, workspace, "
             "persisted last-activity time, and outstanding approval "
-            "prompts. Global read — any "
+            "prompts. Includes closed and status_reason: an offline runner "
+            "changes an active status to failed, and closed sessions cannot "
+            "report running or waiting. Unknown connectivity preserves the "
+            "reported status. Global read, any "
             "session you can access. Pass session_id to target another "
-            "session; omit it to describe your own. Metadata only — "
+            "session; omit it to describe your own. Metadata only, "
             "use sys_session_get_history for the conversation transcript."
         )
 
