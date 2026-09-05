@@ -209,8 +209,7 @@ function CanvasSurface({
     };
   }, []);
 
-  // Preserve a user's saved view across ordinary window resizes. React Flow
-  // safely applies the same transform to the new container dimensions.
+  // Restore the same canvas point at the center even if the container resized.
   const applyViewport = useCallback(
     (saved: CanvasViewport | null, sessionCount: number) => {
       requestAnimationFrame(() => {
@@ -219,8 +218,21 @@ function CanvasSurface({
           saved !== null && saved.zoom >= MIN_ZOOM && saved.zoom <= MAX_ZOOM;
         if (usable) {
           viewportDirtyRef.current = true;
+          const size = containerSize();
           void setViewport(
-            { x: saved.x, y: saved.y, zoom: saved.zoom },
+            {
+              x:
+                saved.x +
+                (size.width > 0 && saved.width
+                  ? (size.width - saved.width) / 2
+                  : 0),
+              y:
+                saved.y +
+                (size.height > 0 && saved.height
+                  ? (size.height - saved.height) / 2
+                  : 0),
+              zoom: saved.zoom,
+            },
             { duration: 0 },
           );
         } else {
@@ -228,7 +240,7 @@ function CanvasSurface({
         }
       });
     },
-    [applyDefaultViewport, setViewport],
+    [applyDefaultViewport, containerSize, setViewport],
   );
 
   const openSession = useCallback(

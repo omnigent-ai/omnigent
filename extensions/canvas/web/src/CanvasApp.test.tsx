@@ -553,6 +553,53 @@ describe("CanvasApp", () => {
     expect(fitView).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { width: 1000, height: 600, x: 200, y: 150 },
+    { width: 1400, height: 800, x: 400, y: 250 },
+    { width: 1800, height: 1200, x: 600, y: 450 },
+  ])(
+    "preserves a project's viewed center when reopening at $width by $height",
+    async ({ width, height, x, y }) => {
+      const projectSession = { ...sessions[0], projectId: "proj_a" };
+      const { context, values } = contextWith(
+        [projectSession],
+        [{ id: "proj_a", name: "Alpha", icon: null }],
+      );
+      values.set(LAYOUT_META_KEY, { version: 1 });
+      values.set(viewportKey("proj_a"), {
+        x: 400,
+        y: 250,
+        zoom: 2.5,
+        width: 1400,
+        height: 800,
+      });
+      const { container } = render(<CanvasApp context={context} />);
+      await screen.findByRole("tab", { name: "Alpha" });
+      const flow = container.querySelector(".canvas-flow")!;
+      vi.spyOn(flow, "getBoundingClientRect").mockReturnValue(
+        new DOMRect(0, 0, width, height),
+      );
+      fitView.mockClear();
+      setViewport.mockClear();
+
+      fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+
+      await waitFor(() =>
+        expect(setViewport).toHaveBeenCalledExactlyOnceWith(
+          { x, y, zoom: 2.5 },
+          { duration: 0 },
+        ),
+      );
+      expect(fitView).not.toHaveBeenCalled();
+      expect(values.get(viewportKey("proj_a"))).toMatchObject({
+        x: 400,
+        y: 250,
+        width: 1400,
+        height: 800,
+      });
+    },
+  );
+
   it("refits on container resize until the user pans by hand", async () => {
     const callbacks: Array<() => void> = [];
     vi.stubGlobal(
