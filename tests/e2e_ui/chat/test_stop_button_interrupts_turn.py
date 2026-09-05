@@ -203,7 +203,7 @@ _QWEN_STUB = textwrap.dedent(
 )
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def stub_harness_runner(
     live_server: str,
     tmp_path_factory: pytest.TempPathFactory,
@@ -217,6 +217,12 @@ def stub_harness_runner(
     from its binding token) with ``OMNIGENT_HERMES_PATH`` /
     ``OMNIGENT_QWEN_PATH`` and the stub state-dir vars in its subprocess env
     — ``os.environ`` is never mutated and no boot-order assumption is made.
+
+    Function-scoped on purpose: under sharded CI an arbitrary number of
+    unrelated tests can run between this file's parametrizations, and a
+    runner spawned once per session must stay tunnel-registered across that
+    whole gap — when it drops, the session bind 400s (``runner … is not
+    registered``). A fresh runner per test binds while provably online.
 
     Yields ``(runner_id, state_dir)``: the runner to bind sessions to, and
     the dir the stubs write their pid/cancel markers into.
@@ -372,12 +378,9 @@ def test_stop_button_interrupts_running_turn(
     happens and the stub keeps "working" — this test then fails.
     """
     stub_runner_id, state_dir = stub_harness_runner
+    # state_dir is freshly minted per test, so no stale pid/cancel markers.
     pid_file = state_dir / f"{harness}.pid"
     cancel_marker = state_dir / f"{harness}.cancelled"
-    # Clean any leftovers from a prior parametrization/retry.
-    for stale in (pid_file, cancel_marker):
-        if stale.exists():
-            stale.unlink()
 
     session_id = _create_stub_session(live_server, stub_runner_id, harness)
     try:
