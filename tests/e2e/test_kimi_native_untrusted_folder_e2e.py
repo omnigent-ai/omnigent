@@ -244,7 +244,7 @@ def _build_session_home(
     bridge_dir.mkdir()
     session_home = tmp_path / "session-kimi-home"
 
-    with patch.dict(os.environ, {"KIMI_CODE_HOME": str(user_home)}):
+    with patch.dict(in_dict=os.environ, values={"KIMI_CODE_HOME": str(user_home)}):
         home_env = build_kimi_session_home(
             session_home,
             bridge_dir=bridge_dir,
