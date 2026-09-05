@@ -21,11 +21,13 @@ const fetchMock = vi.fn();
 
 beforeEach(() => {
   fetchMock.mockReset();
+  localStorage.clear();
   vi.stubGlobal("fetch", fetchMock);
   vi.resetModules();
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -40,6 +42,21 @@ describe("resolveIdentity", () => {
     expect(getCurrentUserId()).toBe("alice@example.com");
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/me");
+  });
+
+  it("hydrates server preferences during identity discovery", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        user_id: "alice@example.com",
+        preferences: { version: 1, settings: { context_indicator: "compact" } },
+      }),
+    );
+    const { resolveIdentity } = await import("./identity");
+
+    await resolveIdentity();
+
+    expect(localStorage.getItem("omnigent:context-indicator-mode")).toBe("compact");
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it("returns the cached value on subsequent calls without re-fetching", async () => {
@@ -77,6 +94,62 @@ describe("resolveIdentity", () => {
     expect(await a).toBe("carol");
     expect(await b).toBe("carol");
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes the cached identity after the embedded Server connection changes", async () => {
+    vi.useFakeTimers();
+    const serverA = vi
+      .fn()
+      .mockResolvedValue(
+        mockJsonResponse({ user_id: "alice", preferences: { version: 1, settings: {} } }),
+      );
+    const serverB = vi
+      .fn()
+      .mockResolvedValue(
+        mockJsonResponse({ user_id: "bob", preferences: { version: 1, settings: {} } }),
+      );
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity, getCurrentUserId } = await import("./identity");
+    const { queueUserPreferencePatch } = await import("./userPreferencesSync");
+
+    expect(await resolveIdentity()).toBe("alice");
+    queueUserPreferencePatch("context_indicator", "compact");
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+
+    expect(await resolveIdentity()).toBe("bob");
+    await vi.advanceTimersByTimeAsync(500);
+    expect(getCurrentUserId()).toBe("bob");
+    expect(serverA).toHaveBeenCalledOnce();
+    expect(serverB).toHaveBeenCalledOnce();
+  });
+
+  it("discards a delayed identity response from the previous Server", async () => {
+    let resolveServerA!: (response: Response) => void;
+    const serverA = vi.fn().mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveServerA = resolve;
+      }),
+    );
+    const serverB = vi
+      .fn()
+      .mockResolvedValue(
+        mockJsonResponse({ user_id: "bob", preferences: { version: 1, settings: {} } }),
+      );
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity, getCurrentUserId } = await import("./identity");
+
+    const staleResolution = resolveIdentity();
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    const currentResolution = resolveIdentity();
+    resolveServerA(mockJsonResponse({ user_id: "alice", preferences: null }));
+
+    expect(await staleResolution).toBeNull();
+    expect(await currentResolution).toBe("bob");
+    expect(getCurrentUserId()).toBe("bob");
+    expect(serverA).toHaveBeenCalledOnce();
+    expect(serverB).toHaveBeenCalledOnce();
   });
 
   it("returns null when the server responds with user_id: null", async () => {
@@ -223,6 +296,8 @@ describe("authenticatedFetch", () => {
       }));
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        getOmnigentHostGeneration: vi.fn(() => 0),
+        getOmnigentServerIdentity: vi.fn(() => "server"),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
       }));
@@ -255,6 +330,8 @@ describe("authenticatedFetch", () => {
       }));
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({})),
+        getOmnigentHostGeneration: vi.fn(() => 0),
+        getOmnigentServerIdentity: vi.fn(() => "server"),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
       }));
@@ -281,6 +358,8 @@ describe("authenticatedFetch", () => {
       }));
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        getOmnigentHostGeneration: vi.fn(() => 0),
+        getOmnigentServerIdentity: vi.fn(() => "server"),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
       }));
@@ -331,6 +410,8 @@ describe("authenticatedFetch", () => {
       }));
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        getOmnigentHostGeneration: vi.fn(() => 0),
+        getOmnigentServerIdentity: vi.fn(() => "server"),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
       }));

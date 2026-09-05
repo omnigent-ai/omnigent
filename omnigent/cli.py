@@ -4072,6 +4072,7 @@ def server(
         SESSION_TITLE_INSTRUCTIONS_KEY,
         config_str_list,
     )
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
     from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -4125,6 +4126,7 @@ def server(
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
+    user_preferences_store = SqlAlchemyUserPreferencesStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -4294,6 +4296,7 @@ def server(
         auth_provider=auth_provider,
         host_store=host_store,
         account_store=account_store,
+        user_preferences_store=user_preferences_store,
         policy_modules=cfg.get("policy_modules"),
         debug_router_modules=config_str_list(cfg.get("debug_router_modules")),
         admins=config_str_list(cfg.get("admins")),

@@ -11,7 +11,9 @@ blow up if called during import).
 
 from __future__ import annotations
 
+import ast
 import importlib
+import inspect
 import sys
 from pathlib import Path
 from typing import NoReturn
@@ -83,6 +85,24 @@ def test_entrypoint_imports_without_side_effects(
     # build_app()/main() rather than being imported or executed at module import.
     for module_name in _BOOT_MODULES:
         assert module_name not in sys.modules
+
+
+def test_docker_entrypoint_wires_the_user_preferences_store() -> None:
+    """Keep cross-device settings available on the actual container path."""
+    from deploy.docker.entrypoint import build_app
+
+    tree = ast.parse(inspect.getsource(build_app))
+    create_app_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "create_app"
+    ]
+
+    assert len(create_app_calls) == 1
+    wired_keywords = {keyword.arg for keyword in create_app_calls[0].keywords}
+    assert "user_preferences_store" in wired_keywords
 
 
 # ── artifact-store resolution + selection ────────────────────────────────

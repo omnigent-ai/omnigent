@@ -375,6 +375,10 @@ class SqlUser(OmnigentBase):
     :param last_login_at: Unix epoch seconds of the most recent
         successful ``/auth/login`` (accounts mode). ``NULL`` until
         the first login.
+    :param preferences: Versioned JSON envelope for cross-device user
+        preferences. ``NULL`` means the user has never initialized synced
+        preferences; an envelope with empty ``settings`` means they explicitly
+        initialized and are using all defaults.
     """
 
     __tablename__ = "users"
@@ -392,6 +396,9 @@ class SqlUser(OmnigentBase):
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_login_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Opaque JSON, never SQL-filtered. Compression keeps shortcut/button
+    # payloads compact without leaking persistence details into API callers.
+    preferences: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
 
 class SqlAccountToken(OmnigentBase):

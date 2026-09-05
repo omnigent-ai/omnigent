@@ -13,6 +13,7 @@ server reads it at import time, so it is checked in a subprocess.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import io
 import os
@@ -95,6 +96,34 @@ def test_app_py_extracts_web_ui_before_importing_server() -> None:
     assert 'archive = here / "web-ui.tar.gz"' in source
     assert "from web_ui_archive import extract_web_ui_archive" in source
     assert 'loose = here / "web-ui"' in source
+
+
+def test_app_wires_the_user_preferences_store() -> None:
+    """Keep cross-device settings available on the hosted workspace path."""
+    tree = ast.parse(_APP_PY.read_text())
+    assignments = {
+        target.id: node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    preference_store = assignments.get("user_preferences_store")
+    assert isinstance(preference_store, ast.Call)
+    assert isinstance(preference_store.func, ast.Name)
+    assert preference_store.func.id == "SqlAlchemyUserPreferencesStore"
+
+    create_app_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "create_app"
+    ]
+    assert len(create_app_calls) == 1
+    wired = {keyword.arg: keyword.value for keyword in create_app_calls[0].keywords}
+    assert isinstance(wired.get("user_preferences_store"), ast.Name)
+    assert wired["user_preferences_store"].id == "user_preferences_store"
 
 
 def test_app_extractor_extracts_normal_archive(tmp_path: Path) -> None:

@@ -16,7 +16,13 @@
  */
 
 import { getCachedServerInfo } from "./capabilities";
-import { getOmnigentHostConfig, hostFetch, isDatabricksWorkspace } from "./host";
+import {
+  getOmnigentHostConfig,
+  getOmnigentHostGeneration,
+  getOmnigentServerIdentity,
+  hostFetch,
+  isDatabricksWorkspace,
+} from "./host";
 import {
   clearHostKeyless,
   getSessionHost,
@@ -24,6 +30,10 @@ import {
   markHostKeyless,
   modalHostId,
 } from "@/lib/sessionHost";
+import {
+  deactivateUserPreferencesSync,
+  initializeUserPreferencesSync,
+} from "./userPreferencesSync";
 
 // Single-user sentinel from `GET /v1/me` (server's RESERVED_USER_LOCAL);
 // not a real actor, so never used as an author label.
@@ -246,6 +256,7 @@ function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined):
 let currentIsAdmin = false;
 let identityResolved = false;
 let identityPromise: Promise<string | null> | null = null;
+let identityConnectionId: string | null = null;
 // Cache the server-provided login URL on the first /v1/me probe so
 // later session-expiry redirects in authenticatedFetch hit the right
 // path per provider — "/login" for accounts, "/auth/login" for OIDC.
@@ -259,6 +270,14 @@ let serverLoginUrl: string | null = null;
 // navigations. Boot also reads this to skip mounting the app when the
 // session is already on its way out (see `isLoginRedirectPending`).
 let loginRedirectPending = false;
+
+function currentIdentityConnectionId(): string {
+  return `${getOmnigentServerIdentity() ?? "__default__"}:${getOmnigentHostGeneration()}`;
+}
+
+function identityMatchesCurrentConnection(): boolean {
+  return identityConnectionId === currentIdentityConnectionId();
+}
 
 /**
  * Hand the browser to `loginUrl`, at most once per document.
@@ -313,11 +332,25 @@ function isOnLoginPath(): boolean {
  * redirects the browser to the login page.
  */
 export async function resolveIdentity(): Promise<string | null> {
+  const stablePreferenceServerId = getOmnigentServerIdentity() ?? "__default__";
+  const preferenceConnectionId = currentIdentityConnectionId();
+  if (identityConnectionId !== preferenceConnectionId) {
+    identityConnectionId = preferenceConnectionId;
+    identityResolved = false;
+    identityPromise = null;
+    currentUserId = null;
+    currentIsAdmin = false;
+    serverLoginUrl = null;
+    deactivateUserPreferencesSync();
+  }
   if (identityResolved) return currentUserId;
   if (identityPromise) return identityPromise;
   identityPromise = (async () => {
     try {
       const res = await hostFetch("/v1/me");
+      if (preferenceConnectionId !== currentIdentityConnectionId()) {
+        return null;
+      }
       if (res.status === 401) {
         // OIDC / accounts mode: server requires authentication.
         // Redirect to the login URL provided in the response body —
@@ -328,6 +361,7 @@ export async function resolveIdentity(): Promise<string | null> {
             user_id: null;
             login_url?: string;
           };
+          if (identityConnectionId !== preferenceConnectionId) return null;
           if (data.login_url) {
             serverLoginUrl = data.login_url;
             if (!isOnLoginPath()) {
@@ -343,22 +377,38 @@ export async function resolveIdentity(): Promise<string | null> {
         const data = (await res.json()) as {
           user_id: string | null;
           is_admin?: boolean;
+          preferences?: unknown | null;
         };
+        if (identityConnectionId !== preferenceConnectionId) return null;
         currentUserId = data.user_id;
         currentIsAdmin = data.is_admin ?? false;
+        await initializeUserPreferencesSync(
+          data.preferences,
+          authenticatedFetch,
+          data.user_id,
+          stablePreferenceServerId,
+          preferenceConnectionId,
+        );
       }
     } catch {
       // Server unreachable — leave as null.
     }
-    identityResolved = true;
-    return currentUserId;
+    const connectionIsCurrent =
+      identityConnectionId === preferenceConnectionId &&
+      preferenceConnectionId === currentIdentityConnectionId();
+    if (connectionIsCurrent) identityResolved = true;
+    else if (identityConnectionId === preferenceConnectionId) {
+      currentUserId = null;
+      currentIsAdmin = false;
+    }
+    return connectionIsCurrent ? currentUserId : null;
   })();
   return identityPromise;
 }
 
 /** Return the cached user ID (null before resolveIdentity completes). */
 export function getCurrentUserId(): string | null {
-  return currentUserId;
+  return identityMatchesCurrentConnection() ? currentUserId : null;
 }
 
 /**
@@ -367,7 +417,7 @@ export function getCurrentUserId(): string | null {
  * AND OIDC. Returns false before `resolveIdentity` completes.
  */
 export function getCurrentIsAdmin(): boolean {
-  return currentIsAdmin;
+  return identityMatchesCurrentConnection() && currentIsAdmin;
 }
 
 /**
@@ -376,10 +426,11 @@ export function getCurrentIsAdmin(): boolean {
  * resolves and for the `"local"` sentinel, so those stay unlabeled.
  */
 export function getCurrentAuthorId(): string | null {
-  if (currentUserId === null || currentUserId === RESERVED_USER_LOCAL) {
+  const userId = getCurrentUserId();
+  if (userId === null || userId === RESERVED_USER_LOCAL) {
     return null;
   }
-  return currentUserId;
+  return userId;
 }
 
 /**
@@ -414,7 +465,12 @@ export async function authenticatedFetch(
   init?: RequestInit,
 ): Promise<Response> {
   const headers = new Headers(init?.headers);
-  if (currentUserId && currentUserId !== RESERVED_USER_LOCAL && !headers.has("X-Forwarded-Email")) {
+  if (
+    identityMatchesCurrentConnection() &&
+    currentUserId &&
+    currentUserId !== RESERVED_USER_LOCAL &&
+    !headers.has("X-Forwarded-Email")
+  ) {
     headers.set("X-Forwarded-Email", currentUserId);
   }
   // Pin host- and session-scoped requests to the replica holding that host's
