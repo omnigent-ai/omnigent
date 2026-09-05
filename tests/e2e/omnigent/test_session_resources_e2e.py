@@ -29,6 +29,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.e2e.helpers import live_server_client
+
 _BOOT_TIMEOUT = 30.0
 _API_TIMEOUT = 15.0
 
@@ -314,7 +316,7 @@ def test_session_resources_e2e(
     ) as proc:
         _wait_for_health(port, timeout=_BOOT_TIMEOUT, proc=proc, runner_id=runner_id)
 
-        with httpx.Client(
+        with live_server_client(
             base_url=f"http://127.0.0.1:{port}",
             timeout=_API_TIMEOUT,
         ) as client:
@@ -542,7 +544,7 @@ def test_direct_attach_e2e(
     ) as proc:
         _wait_for_health(port, timeout=_BOOT_TIMEOUT, proc=proc, runner_id=runner_id)
 
-        with httpx.Client(base_url=base_url, timeout=_API_TIMEOUT) as client:
+        with live_server_client(base_url=base_url, timeout=_API_TIMEOUT) as client:
             session_id = _create_session(client, yaml_path, runner_id)
 
             resp = client.get(f"/v1/sessions/{session_id}/resources/terminals")

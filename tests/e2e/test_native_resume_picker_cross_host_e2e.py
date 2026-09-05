@@ -51,6 +51,8 @@ import httpx
 import pytest
 import yaml
 
+from tests.e2e.helpers import live_server_client
+
 # Worktree root: tests/e2e/<this file> -> parents[2]. Threaded onto every
 # subprocess PYTHONPATH so the spawned server / daemons / CLI import THIS
 # worktree's code, not a stale editable install.
@@ -125,8 +127,8 @@ def _free_port() -> int:
 
 
 def _client() -> httpx.Client:
-    # trust_env=False: never route loopback through the CI egress proxy.
-    return httpx.Client(trust_env=False, timeout=30.0)
+    # Proxy-blind, keep-alive reuse disabled (see live_server_client).
+    return live_server_client(timeout=30.0)
 
 
 def _python() -> str:
@@ -477,7 +479,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         headers = {
             k: v for k, v in self.headers.items() if k.lower() not in ("host", "content-length")
         }
-        with httpx.Client(trust_env=False, timeout=60.0) as c:
+        with live_server_client(timeout=60.0) as c:
             upstream = c.request(
                 self.command,
                 f"{server.upstream}{self.path}",

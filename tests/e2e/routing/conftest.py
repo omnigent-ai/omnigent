@@ -38,6 +38,7 @@ import pytest
 import yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests.e2e.helpers import live_server_client
 from tests.e2e.routing._helpers import POLL_INTERVAL_S, wait_for
 from tests.e2e.routing._mock_router import MockRouter, serve_mock_router
 
@@ -261,7 +262,7 @@ def routing_client(routing_server: str) -> Iterator[httpx.Client]:
     :param routing_server: The server base URL.
     :yields: A client announcing itself as a first-party non-browser caller.
     """
-    with httpx.Client(
+    with live_server_client(
         base_url=routing_server,
         timeout=120,
         headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},

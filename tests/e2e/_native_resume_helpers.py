@@ -57,7 +57,7 @@ from pathlib import Path
 import httpx
 
 from omnigent.entities.session_resources import terminal_resource_id
-from tests.e2e.helpers import POLL_INTERVAL_S
+from tests.e2e.helpers import POLL_INTERVAL_S, live_server_client
 
 # Worktree root: tests/e2e/<this file> -> parents[2]. Threaded onto the CLI
 # and server subprocesses' PYTHONPATH so they import THIS worktree's code
@@ -684,7 +684,7 @@ def assert_native_cli_resume_restores_history(
     )
     conversation_id = conversation_id_from_output(fresh_output)
 
-    with httpx.Client(base_url=server, timeout=30) as client:
+    with live_server_client(base_url=server, timeout=30) as client:
         # The native session/thread id must be captured for a resumable session.
         external_session_id = poll_external_session_id(
             client, conversation_id=conversation_id, timeout=120.0

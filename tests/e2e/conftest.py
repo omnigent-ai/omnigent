@@ -56,7 +56,12 @@ from tests._helpers.compat import (
 )
 from tests._model_pools import current_attempt, resolve_model
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
-from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S, lookup_databricks_host
+from tests.e2e.helpers import (
+    HEALTH_TIMEOUT_S,
+    POLL_INTERVAL_S,
+    live_server_client,
+    lookup_databricks_host,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -948,7 +953,7 @@ def http_client(live_server: str) -> Iterator[httpx.Client]:
     # routes are behind require_trusted_origin; sending the sentinel keeps
     # these tests passing on their own merit rather than leaning on the
     # guard's (temporary) fail-open-on-absent-Origin behavior.
-    with httpx.Client(
+    with live_server_client(
         base_url=live_server,
         timeout=300,
         headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},

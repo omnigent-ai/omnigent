@@ -40,6 +40,7 @@ import httpx
 import pytest
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests.e2e.helpers import live_server_client
 from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
     _connect_env,
     _read_local_server_record,
@@ -226,7 +227,7 @@ def test_daemon_spawned_runner_receives_claude_telemetry_flag(
         daemon_pid = _wait_for_daemon_pid(home, timeout=_BOOT_TIMEOUT)
         server_pid, port = _read_local_server_record(home)
         base = f"http://127.0.0.1:{port}"
-        with httpx.Client(
+        with live_server_client(
             base_url=base,
             timeout=30.0,
             headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
