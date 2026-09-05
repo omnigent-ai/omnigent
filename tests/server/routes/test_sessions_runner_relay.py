@@ -369,6 +369,124 @@ async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
         session_stream.close(session_id)
 
 
+def test_context_labels_from_turn_usage_shapes() -> None:
+    """The label builder is in-process-only and degrades gracefully.
+
+    * ``context_tokens`` + a resolvable model → both labels.
+    * a turn with no ``context_tokens`` → empty (native harnesses post their
+      own usage, so this path must not double-write their labels).
+    * ``context_tokens`` but an unknown/blank model → numerator only (the ring
+      simply won't render without a denominator, rather than guessing one).
+    """
+    from omnigent.llms.context_window import get_model_context_window
+    from omnigent.server.routes.sessions import _context_labels_from_turn_usage
+
+    both = _context_labels_from_turn_usage({"context_tokens": 1234, "model": "claude-sonnet-5"})
+    assert both["omnigent.last_context_tokens"] == "1234"
+    assert both["omnigent.last_context_window"] == str(get_model_context_window("claude-sonnet-5"))
+
+    # No window-fill signal → no labels (native external_session_usage owns it).
+    assert _context_labels_from_turn_usage({"input_tokens": 10, "output_tokens": 5}) == {}
+    assert _context_labels_from_turn_usage({}) == {}
+
+    # A negative/invalid count is not a real fill signal.
+    negative = _context_labels_from_turn_usage({"context_tokens": -1, "model": "claude-sonnet-5"})
+    assert negative == {}
+
+    # Numerator without a resolvable model → tokens only.
+    no_model = _context_labels_from_turn_usage({"context_tokens": 42})
+    assert no_model == {"omnigent.last_context_tokens": "42"}
+
+
+@pytest.mark.asyncio
+async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: str) -> None:
+    """
+    An in-process turn's usage fills the context-window indicator.
+
+    A claude-sdk (or any in-process) turn reports ``context_tokens`` (window
+    fill) and its observed ``model`` on ``response.completed``. The relay must
+    persist both context labels — ``omnigent.last_context_tokens`` (numerator)
+    and ``omnigent.last_context_window`` (denominator, resolved from the
+    model's window) — and publish them on the live ``session.usage`` event, so
+    the web context ring renders live AND survives a reload/snapshot. Before
+    this, only the claude-native external_session_usage POST wrote those
+    labels, leaving a model-unpinned claude-sdk session with no ring.
+    """
+    from omnigent.llms.context_window import get_model_context_window
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    session_id = conv.id
+
+    # Denominator is the observed model's catalog window, computed the same way
+    # the relay does (the resolved value varies with catalog availability, so
+    # derive it rather than hard-coding a token count).
+    expected_window = get_model_context_window("claude-sonnet-5")
+
+    response_id = "resp_ctx_ring_1"
+    # The observed model (a full id, not a bare alias) is what the SDK reports.
+    turn_events: list[dict[str, Any]] = [
+        {"type": "response.in_progress", "response": {"id": response_id, "model": "jarvis"}},
+        {
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "model": "jarvis",
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 200,
+                    "total_tokens": 1200,
+                    "context_tokens": 45678,
+                    "model": "claude-sonnet-5",
+                },
+            },
+        },
+    ]
+    release = asyncio.Event()
+    fake_runner = _ScriptedRunnerClient(release, turn_events)
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_relay_ctx_ring",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        release.set()
+
+        # Drain to the session.usage event carrying the context fields.
+        usage_event: dict[str, Any] | None = None
+        for _ in range(50):
+            event = await collector.next_event()
+            if event["type"] == "session.usage" and "context_tokens" in event:
+                usage_event = event
+                break
+        assert usage_event is not None, "no session.usage event carried context_tokens"
+        assert usage_event["context_tokens"] == 45678
+        assert usage_event["context_window"] == expected_window
+
+        # Labels are persisted (durable across reload/snapshot).
+        refreshed = store.get_conversation(session_id)
+        assert refreshed is not None
+        assert refreshed.labels.get("omnigent.last_context_tokens") == "45678"
+        assert refreshed.labels.get("omnigent.last_context_window") == str(expected_window)
+    finally:
+        release.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None:
+            await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        session_stream.close(session_id)
+
+
 class _TunnelCloseStreamResponse:
     """
     Async context manager that raises ``ConnectionError`` mid-stream.

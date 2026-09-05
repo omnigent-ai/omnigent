@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
+    _sse,
 )
 from tests.runner.helpers import NullServerClient
 
@@ -2979,3 +2981,389 @@ async def test_events_effort_change_on_cursor_native_session_is_disabled_noop(
     assert resp.status_code == 204, (
         f"cursor-native effort_change must 204 (disabled); got {resp.status_code}: {resp.text}"
     )
+
+
+def _body_carries_text(body: dict[str, Any], needle: str) -> bool:
+    """Return whether *needle* appears in any ``input_text`` block of *body*.
+
+    The runner forwards history as nested ``message`` items, so the
+    ``input_text`` block carrying the text can sit one or more levels deep
+    inside ``content`` lists; walk them recursively.
+
+    :param body: A harness request body (from ``posted_bodies``).
+    :param needle: Substring to search for in ``input_text`` blocks.
+    :returns: ``True`` if any ``input_text`` block contains *needle*.
+    """
+
+    def _walk(node: Any) -> bool:
+        if isinstance(node, dict):
+            if node.get("type") == "input_text" and needle in (node.get("text") or ""):
+                return True
+            return _walk(node.get("content"))
+        if isinstance(node, list):
+            return any(_walk(child) for child in node)
+        return False
+
+    return _walk(body.get("content"))
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_session_dispatches_compact_turn() -> None:
+    """
+    POST ``/events`` with ``{"type":"compact"}`` on a claude-sdk session
+    dispatches a ``/compact`` turn to the harness and returns 200.
+
+    The Claude SDK owns its own context window in the harness subprocess;
+    the only effective way to compact it is to send the literal ``/compact``
+    slash command to the live client, which triggers native compaction (the
+    same PreCompact path the auto-compact machinery already handles and whose
+    ``response.compaction.completed`` the executor already emits). The runner
+    turns the compact control into a resumed ``/compact`` turn and forwards it
+    to the harness like any user message.
+
+    The 200 (not 204) is load-bearing: the Omnigent server reads it to know
+    the harness handled the control and skips its own (transcript-only,
+    ineffective for SDK) compaction. A regression returning 204 would make
+    the server surface a 400 "not available for this session type" error.
+    """
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    hc = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(hc)
+
+    sdk_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the claude-sdk spec for any agent_id."""
+        del agent_id, session_id
+        return sdk_spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    sid = "b1d0f6a2c3e14f5a9b8c7d6e5f403122"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "compact"},
+        )
+
+        # The turn runs in the background; wait for it to forward the
+        # synthesized /compact message to the harness.
+        for _ in range(100):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.02)
+
+    # 200 = handled by the harness (server skips its own compaction).
+    # 204 would make the server return 400 "not available for this
+    # session type" — the regression this pins against.
+    assert resp.status_code == 200, (
+        f"claude-sdk compact must return 200 (handled) from /events; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    # Exactly one forwarded turn. 0 = compact didn't dispatch; 2+ = it
+    # dispatched more than a single compact turn.
+    assert len(hc.posted_bodies) == 1, (
+        f"Expected exactly one forwarded turn from claude-sdk compact, "
+        f"got {len(hc.posted_bodies)}: {hc.posted_bodies}"
+    )
+    # Body contract: the literal ``/compact`` is what the Claude CLI
+    # interprets as the slash command that runs native compaction. Plain
+    # prompt text (missing slash) would land as a normal chat turn instead.
+    assert _body_carries_text(hc.posted_bodies[0], "/compact"), (
+        f"The forwarded turn must carry the literal '/compact' slash command "
+        f"so the SDK runs native compaction; got {hc.posted_bodies[0]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_buffers_behind_active_turn() -> None:
+    """
+    Compact on a busy claude-sdk session buffers ``/compact`` for the next
+    turn instead of starting a second concurrent one.
+
+    The harness holds a single live client per conversation, so a ``/compact``
+    issued while a turn is in flight must not race it. The runner buffers the
+    synthesized ``/compact`` message; the normal continuation drain runs it
+    once the active turn ends. It still returns 200 (handled) so the server
+    skips its own compaction.
+    """
+    hc = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(hc)
+
+    sdk_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the claude-sdk spec for any agent_id."""
+        del agent_id, session_id
+        return sdk_spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    sid = "c2e1a7b3d4f05a6b8c9d0e1f20314233"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        # Simulate an in-flight turn holding the slot (a non-Task sentinel so
+        # nothing tries to await/cancel it during teardown).
+        active_turns = app.state.active_turns
+        sentinel = object()
+        active_turns[sid] = sentinel
+
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "compact"},
+        )
+
+    # 200 = handled (buffered for the next turn); the server skips its own
+    # compaction just as it would for an immediately-dispatched compact.
+    assert resp.status_code == 200, (
+        f"claude-sdk compact on a busy session must still return 200; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    # The active slot must be untouched — no second turn was started.
+    assert app.state.active_turns.get(sid) is sentinel, (
+        "compact must not start a second turn while one is in flight; the "
+        "active-turn slot was replaced."
+    )
+    # The /compact message was buffered for the continuation drain.
+    buffered = app.state.session_message_buffers.get(sid) or []
+    assert len(buffered) == 1, f"Expected exactly one buffered /compact message, got {buffered!r}."
+    assert _body_carries_text(buffered[0], "/compact"), (
+        f"Buffered message must carry the literal '/compact'; got {buffered[0]!r}."
+    )
+    # Nothing was forwarded to the harness yet — it runs after the active turn.
+    assert hc.posted_bodies == [], (
+        f"Buffered compact must not forward to the harness immediately; got {hc.posted_bodies!r}."
+    )
+
+
+async def _accumulate_session_events(
+    sid: str,
+    *,
+    until_types: set[str],
+    timeout_s: float = 3.0,
+) -> list[dict[str, Any]]:
+    """Drain a session's event queue repeatedly until a terminal type appears.
+
+    The compact turn runs in the background, so its events land on the queue
+    over time. Accumulate across polls (the drain is destructive) and stop once
+    any of ``until_types`` is seen or the timeout elapses.
+
+    :param sid: Conversation id whose queue to drain.
+    :param until_types: Event ``type`` values that end the wait.
+    :param timeout_s: Upper bound on how long to poll.
+    :returns: Every dict event seen, in arrival order.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    seen: list[dict[str, Any]] = []
+    waited = 0.0
+    while waited < timeout_s:
+        seen.extend(_drain_session_event_queue(_session_event_queues_ref.get(sid)))
+        if any(e.get("type") in until_types for e in seen):
+            return seen
+        await asyncio.sleep(0.02)
+        waited += 0.02
+    return seen
+
+
+def _build_claude_sdk_compact_app(
+    sse_frames: list[str],
+) -> tuple[Any, _FakeProcessManager, _ScriptedHarnessClient]:
+    """Wire a runner app whose claude-sdk turn streams *sse_frames*.
+
+    :param sse_frames: The SSE frames the scripted harness relays for the
+        dispatched ``/compact`` turn.
+    :returns: ``(app, process_manager, harness_client)``.
+    """
+    hc = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(hc)
+
+    sdk_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return sdk_spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    return app, pm, hc
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_publishes_in_progress_up_front() -> None:
+    """A claude-sdk `/compact` publishes `response.compaction.in_progress` at once.
+
+    Native `/compact` shows a "Compacting conversation…" spinner immediately;
+    the claude-sdk turn otherwise only surfaces the generic running status
+    ("Working…") until the executor's own late `in_progress` (fired when the
+    SDK PreCompact hook hits). Publishing up front gives the same instant
+    feedback as the other harnesses.
+    """
+    frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    app, _pm, _hc = _build_claude_sdk_compact_app(frames)
+
+    sid = "d3f0a1b2c3d4e5f60718293a4b5c6d7e"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        from omnigent.runner.app import _session_event_queues_ref as _queues
+
+        _drain_session_event_queue(_queues.get(sid))
+
+        resp = await client.post(f"/v1/sessions/{sid}/events", json={"type": "compact"})
+        assert resp.status_code == 200, resp.text
+
+        events = await _accumulate_session_events(
+            sid, until_types={"response.compaction.in_progress"}
+        )
+
+    in_progress = [e for e in events if e.get("type") == "response.compaction.in_progress"]
+    assert in_progress, (
+        f"claude-sdk compact must publish response.compaction.in_progress up front so the "
+        f"'Compacting conversation…' spinner shows immediately; got events {events!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_swallows_executor_duplicate_in_progress() -> None:
+    """The executor's own `in_progress` is swallowed so the web shows one spinner.
+
+    The runner publishes an up-front `in_progress`; the executor then emits its
+    own when the PreCompact hook fires. Two spinners would leave one stranded
+    (the web removes only a single `compaction_loading` on `completed`), so the
+    relay must drop the executor's duplicate. On a real compaction (a
+    `completed` arrives), no `failed` is published.
+    """
+    frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.compaction.in_progress"}),
+        _sse(
+            {
+                "type": "response.compaction.completed",
+                "summary": "compacted",
+                "total_tokens": 1234,
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
+                    }
+                ],
+            }
+        ),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    app, _pm, _hc = _build_claude_sdk_compact_app(frames)
+
+    sid = "e4a1b2c3d4e5f60718293a4b5c6d7e8f"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        from omnigent.runner.app import _session_event_queues_ref as _queues
+
+        _drain_session_event_queue(_queues.get(sid))
+
+        resp = await client.post(f"/v1/sessions/{sid}/events", json={"type": "compact"})
+        assert resp.status_code == 200, resp.text
+
+        events = await _accumulate_session_events(
+            sid, until_types={"response.compaction.completed"}
+        )
+
+    in_progress = [e for e in events if e.get("type") == "response.compaction.in_progress"]
+    completed = [e for e in events if e.get("type") == "response.compaction.completed"]
+    failed = [e for e in events if e.get("type") == "response.compaction.failed"]
+    assert len(in_progress) == 1, (
+        f"Exactly one in_progress must reach the web (up-front published, executor's "
+        f"duplicate swallowed); got {len(in_progress)}: {events!r}"
+    )
+    assert len(completed) == 1, f"Expected the completed event to pass through; got {events!r}"
+    assert failed == [], (
+        f"No failed must be published when compaction actually completes; got {events!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_publishes_failed_when_no_compaction() -> None:
+    """When the `/compact` turn ends with no compaction, publish `failed`.
+
+    The up-front spinner is only cleared by `completed` (→ marker) or `failed`
+    (→ removed). If the turn ends without the executor reporting a compaction
+    (e.g. nothing to compact), the runner must publish `failed` so the spinner
+    is not stranded.
+    """
+    frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    app, _pm, _hc = _build_claude_sdk_compact_app(frames)
+
+    sid = "f5b2c3d4e5f60718293a4b5c6d7e8f90"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        from omnigent.runner.app import _session_event_queues_ref as _queues
+
+        _drain_session_event_queue(_queues.get(sid))
+
+        resp = await client.post(f"/v1/sessions/{sid}/events", json={"type": "compact"})
+        assert resp.status_code == 200, resp.text
+
+        events = await _accumulate_session_events(sid, until_types={"response.compaction.failed"})
+
+    failed = [e for e in events if e.get("type") == "response.compaction.failed"]
+    completed = [e for e in events if e.get("type") == "response.compaction.completed"]
+    assert failed, (
+        f"A compact turn that ends without a compaction must publish failed to clear the "
+        f"stranded spinner; got {events!r}"
+    )
+    assert completed == [], f"No completed should appear when nothing compacted; got {events!r}"

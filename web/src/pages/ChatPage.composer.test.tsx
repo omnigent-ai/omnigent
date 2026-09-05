@@ -1289,6 +1289,25 @@ describe("Composer effort slash-command visibility", () => {
     expect(screen.getByTestId("slash-menu-item-context")).toBeInTheDocument();
   });
 
+  it("shows /compact for a claude-sdk session", () => {
+    // claude-sdk is not a native wrapper, but its runner sends /compact to
+    // the live SDK client to trigger native compaction, so the command is
+    // offered even though isNativeWrapper is false.
+    useChatStore.setState({ sessionHarness: "claude-sdk" });
+    render(<Composer {...composerProps({ isNativeWrapper: false })} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(screen.getByTestId("slash-menu-item-compact")).toBeInTheDocument();
+  });
+
+  it("hides /compact for a non-native, non-claude-sdk session", () => {
+    // Other in-process SDK harnesses (openai-agents) have no /compact path
+    // yet, so the command stays hidden.
+    useChatStore.setState({ sessionHarness: "openai-agents" });
+    render(<Composer {...composerProps({ isNativeWrapper: false })} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(screen.queryByTestId("slash-menu-item-compact")).toBeNull();
+  });
+
   it("shows /model in suggestions for in-process and picker-backed native sessions", () => {
     // Type just "/" (like the /effort case) so the highlight overlay shows
     // only "/" — keeps the menu row the sole "/model" match.
