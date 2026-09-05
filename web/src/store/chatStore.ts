@@ -3199,13 +3199,12 @@ async function bindStream(
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
   try {
-    // One larger page, so opening a session is a single round trip that then
-    // stays still — rather than a small page followed by background growth
-    // the reader sees as the transcript shifting seconds after it settled.
+    // Cheap snapshot for paint; refresh_state=true runs in the background
+    // after the transcript is on screen (see below).
     const [session, page] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id, { refreshState: true }),
+        queryFn: () => getSessionSlim(id),
         staleTime: 0,
         retry: false,
       }),
@@ -3449,6 +3448,26 @@ async function bindStream(
       rootSetState({ selectedEffort: effectiveEffort, selectedModel: resolvedStickyModel });
     }
     racedNativeModelOptions.delete(id);
+    // Background runner-state refresh. Direct call (not fetchQuery) so it
+    // can't dedupe onto a concurrent refreshSessionBinding for the same key.
+    // Writes only runner-backed fields so optimistic mutations aren't clobbered.
+    void (async () => {
+      if (isConversationDisposed(id)) return;
+      try {
+        const refreshed = await getSessionSlim(id, { refreshState: true });
+        if (isConversationDisposed(id)) return;
+        queryClient.setQueryData(["session", id], refreshed);
+        setterFor(id)({
+          skills: refreshed.skills ?? [],
+          codexModelOptions: refreshed.codexModelOptions ?? [],
+          terminalPending: refreshed.terminalPending ?? false,
+          sandboxStatus: refreshed.sandboxStatus ?? null,
+          mcpStartup: refreshed.mcpStartup ?? null,
+        });
+      } catch {
+        // best-effort; a slow/offline runner is the common failure
+      }
+    })();
   } catch (err) {
     if (isConversationDisposed(id)) return;
     set({

@@ -975,10 +975,12 @@ describe("chatStore — switchTo", () => {
       ([u, init]) =>
         String(u).split("?")[0] === "/v1/sessions/conv_abc" && (init?.method ?? "GET") === "GET",
     );
-    // One GET proves bindStream refetched instead of trusting the
-    // pre-populated React Query session cache.
-    expect(sessionFetches).toHaveLength(1);
-    expect(String(sessionFetches[0]?.[0])).toContain("refresh_state=true");
+    // Two GETs: the cheap bind-time snapshot (no refresh_state) for fast paint,
+    // plus the background refresh_state=true read that updates runner-backed
+    // fields (skills, model catalog) off the critical path.
+    expect(sessionFetches).toHaveLength(2);
+    expect(String(sessionFetches[0]?.[0])).not.toContain("refresh_state=true");
+    expect(String(sessionFetches[1]?.[0])).toContain("refresh_state=true");
 
     const blocks = useChatStore.getState().blocks;
     // The server snapshot has one message; seeing any other count would
