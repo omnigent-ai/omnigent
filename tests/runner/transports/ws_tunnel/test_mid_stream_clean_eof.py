@@ -30,6 +30,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
@@ -180,4 +181,61 @@ async def test_ws_tunnel_mid_stream_failure_raises_at_consumer() -> None:
     assert isinstance(state.aborted_with, httpx.RemoteProtocolError), (
         f"aborted_with is {type(state.aborted_with).__name__!r}, "
         f"expected httpx.RemoteProtocolError"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 3: a raise after a clean end must not emit a second (error) end frame
+# ---------------------------------------------------------------------------
+
+
+def _make_app_that_raises_after_clean_end() -> FastAPI:
+    """Return a FastAPI app whose endpoint raises after a clean end.
+
+    The ASGI middleware sends the response (head + body + ``more_body=False``)
+    and then raises, modelling any post-completion failure in the app stack.
+    """
+    app = FastAPI()
+
+    @app.get("/done-then-boom")
+    async def _ok() -> dict[str, bool]:
+        return {"ok": True}
+
+    class _RaiseAfterResponse:
+        def __init__(self, inner: ASGIApp) -> None:
+            self._inner = inner
+
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            await self._inner(scope, receive, send)
+            raise RuntimeError("blew up after clean end")
+
+    app.add_middleware(_RaiseAfterResponse)
+    return app
+
+
+@pytest.mark.asyncio
+async def test_dispatch_via_asgi_raise_after_clean_end_sends_single_end_frame() -> None:
+    """A raise after ``more_body=False`` must not send a second end frame.
+
+    The response is already complete on the wire; a trailing error-flagged
+    ``ResponseEndFrame`` could race the consumer's drain and spuriously abort
+    a fully-delivered response. ``dispatch_via_asgi`` must send exactly one
+    end frame, and it must be clean.
+    """
+    app = _make_app_that_raises_after_clean_end()
+    sent: list[str] = []
+    frame = RequestFrame(id="req-after-clean-end", method="GET", path="/done-then-boom")
+
+    with contextlib.suppress(Exception):
+        await dispatch_via_asgi(app, frame, lambda t: _async_append(sent, t))
+
+    frames = [decode_frame(s) for s in sent]
+    end_frames = [f for f in frames if isinstance(f, ResponseEndFrame)]
+    assert len(end_frames) == 1, (
+        f"Expected exactly one ResponseEndFrame, got {len(end_frames)}: "
+        f"{[type(f).__name__ for f in frames]}"
+    )
+    assert end_frames[0].error is None, (
+        f"End frame after a clean completion must not carry an error, "
+        f"got {end_frames[0].error!r}"
     )

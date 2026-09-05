@@ -176,6 +176,7 @@ async def dispatch_via_asgi(
     response_status: list[int] = []
     response_headers_raw: list[tuple[bytes, bytes]] = []
     head_sent_to_ws: bool = False
+    end_sent_to_ws: bool = False
 
     async def receive() -> Message:
         nonlocal body_sent
@@ -197,7 +198,7 @@ async def dispatch_via_asgi(
         return await disconnect
 
     async def send(event: Message) -> None:
-        nonlocal head_sent_to_ws
+        nonlocal head_sent_to_ws, end_sent_to_ws
         ev_type = event.get("type")
         if ev_type == "http.response.start":
             response_status.append(event["status"])
@@ -238,6 +239,7 @@ async def dispatch_via_asgi(
                 )
             if not event.get("more_body", False):
                 await send_text(encode_frame(ResponseEndFrame(id=frame.id)))
+                end_sent_to_ws = True
 
     try:
         await app(scope, receive, send)
@@ -266,12 +268,15 @@ async def dispatch_via_asgi(
                     )
                 )
             )
-        # Only flag the end frame as an error when head was already sent;
-        # the pre-head path delivers a well-formed 500 that should close cleanly.
-        # If a clean end was already sent (more_body=False), this is a second end
-        # frame; the server's route_response_frame will drop it as an orphan.
-        end_error = "runner_stream_error" if head_sent_to_ws else None
-        await send_text(encode_frame(ResponseEndFrame(id=frame.id, error=end_error)))
+        # If a clean end already went out (more_body=False), the response is
+        # complete on the wire; a second, error-flagged end frame could race
+        # the consumer and spuriously abort a fully-delivered response. Send
+        # at most one end frame per request.
+        if not end_sent_to_ws:
+            # Only flag the end frame as an error when head was already sent;
+            # the pre-head path delivers a well-formed 500 that closes cleanly.
+            end_error = "runner_stream_error" if head_sent_to_ws else None
+            await send_text(encode_frame(ResponseEndFrame(id=frame.id, error=end_error)))
         raise
 
 
