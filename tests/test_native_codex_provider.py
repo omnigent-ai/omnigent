@@ -27,6 +27,7 @@ def _isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.ambient._llama_server_reachable", lambda: False)
     for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "CODEX_HOME"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
@@ -250,7 +251,7 @@ def test_resolve_native_codex_launch_subscription_no_login_falls_through_to_key(
     overrides → Codex login prompt.
     """
     # No ambient providers, so the fall-through target is unambiguously the
-    # explicitly-configured key (not a detected env key / Ollama).
+    # explicitly-configured key (not a detected env key / local server).
     monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
     _seed(
         _isolated,

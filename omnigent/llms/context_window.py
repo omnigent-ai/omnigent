@@ -302,8 +302,9 @@ def fetch_model_pricing_with_provider(
     2. MLflow catalog via :func:`fetch_model_pricing` (for known vendor models)
     3. ``None`` (unpriced)
 
-    This enables cost tracking for self-hosted models (Ollama, vLLM, custom
-    gateways) and gateway endpoints that expose catalog-known model IDs but
+    This enables cost tracking for self-hosted models (Ollama, llama-server,
+    vLLM, custom gateways) and gateway endpoints that expose
+    catalog-known model IDs but
     charge their own configured rates. Custom pricing takes precedence when
     configured, so a self-hosted provider serving ``claude-opus-4`` can
     override the vendor catalog rate with its own.

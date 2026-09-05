@@ -7,8 +7,10 @@ server — so the setup flow can offer them as one-tap choices instead of
 asking the user to paste keys they already have.
 
 Detection is almost entirely pure standard library (``os``, ``socket``,
-``pathlib``) and performs no network I/O beyond a single non-blocking
-localhost TCP probe for Ollama. The one exception is macOS Claude detection:
+``pathlib``) and performs no network I/O beyond a pair of non-blocking
+localhost TCP probes, one for Ollama and one for llama-server.
+The one exception is macOS Claude detection:
+
 Claude Code stores its subscription OAuth in the macOS Keychain (not a file),
 so on macOS — and only when the file check comes up empty — Claude detection
 falls back to a ``claude auth status`` subprocess (see
@@ -63,6 +65,14 @@ _OLLAMA_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}"
 # when nothing is listening.
 _OLLAMA_PROBE_TIMEOUT = 0.25
 
+# llama-server's default OpenAI-compatible endpoint.
+_LLAMA_SERVER_HOST = "localhost"
+_LLAMA_SERVER_PORT = 8080
+_LLAMA_SERVER_URL = f"http://{_LLAMA_SERVER_HOST}:{_LLAMA_SERVER_PORT}"
+
+# Timeout (seconds) for the llama-server TCP probe
+_LLAMA_SERVER_PROBE_TIMEOUT = 0.25
+
 # Claude Code's enterprise "managed settings" chain, highest precedence first.
 # An enterprise install (the shape ``isaac configure claude`` writes) configures
 # Claude Code here and nowhere else: an ``env`` block pinning
@@ -99,7 +109,7 @@ class DetectedProvider:
 
     :param name: The provider/source name, e.g. ``"anthropic"``,
         ``"openai"``, ``"openrouter"``, ``"gemini"``, ``"claude"``,
-        ``"codex"``, or ``"ollama"``.
+        ``"codex"``, ``"ollama"``, or ``"llama-server"``.
     :param kind: How the credential authenticates — ``"key"`` (an API key
         in the environment), ``"subscription"`` (a logged-in CLI), or
         ``"local"`` (a self-hosted endpoint).
@@ -625,6 +635,25 @@ def _ollama_reachable() -> bool:
         return False
 
 
+def _llama_server_reachable() -> bool:
+    """Return whether a local llama-server accepts TCP connections.
+
+    Performs a single short-timeout connect to ``localhost:8080``, mirroring
+    :func:`_ollama_reachable`. Isolated in its own helper so tests can
+    monkeypatch it without real network I/O.
+
+    :returns: ``True`` when ``localhost:8080`` accepts a TCP connection,
+        ``False`` on refusal, timeout, or any socket error.
+    """
+    try:
+        with socket.create_connection(
+            (_LLAMA_SERVER_HOST, _LLAMA_SERVER_PORT), timeout=_LLAMA_SERVER_PROBE_TIMEOUT
+        ):
+            return True
+    except OSError:
+        return False
+
+
 # One-shot prewarmed detection result, produced by
 # :func:`prewarm_detect_providers` and consumed by the next
 # :func:`detect_providers` call. Guarded by ``_prewarm_lock``.
@@ -688,10 +717,13 @@ def detect_providers() -> list[DetectedProvider]:
     4. A logged-in Codex CLI (``~/.codex/auth.json`` exists *and* carries a
        usable credential — see :func:`codex_auth_has_credential`).
     5. A reachable local Ollama (``localhost:11434`` TCP-connectable).
+    6. A reachable local llama-server (``localhost:8080``
+         TCP-connectable).
 
-    No network I/O is performed except the single Ollama probe (see
-    :func:`_ollama_reachable`). On macOS, a ``claude auth status`` subprocess
-    may run as the Claude Keychain fallback (see :func:`_claude_login_detected`).
+    No network I/O is performed except the Ollama and llama-server TCP probes
+    (see :func:`_ollama_reachable` and :func:`_llama_server_reachable`). On
+    macOS, a ``claude auth status`` subprocess may run as the Claude Keychain
+    fallback (see :func:`_claude_login_detected`).
 
     :returns: One :class:`DetectedProvider` per credential found, in the
         priority order above. Empty when nothing is detected.
@@ -816,6 +848,17 @@ def _detect_providers_now() -> list[DetectedProvider]:
                 kind=LOCAL_KIND,
                 family=OPENAI_FAMILY,
                 source=_OLLAMA_URL,
+            )
+        )
+
+    # 6. Local llama-server.
+    if _llama_server_reachable():
+        detected.append(
+            DetectedProvider(
+                name="llama-server",
+                kind=LOCAL_KIND,
+                family=OPENAI_FAMILY,
+                source=_LLAMA_SERVER_URL,
             )
         )
 
