@@ -4569,6 +4569,98 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         safe: { status: "starting", error: null },
       });
     });
+
+    it("retains a settled round's failures for the diagnostics surface", () => {
+      // The failure must stay visible somewhere after the round settles:
+      // it leaves the viewport-facing `mcpStartup` (never conversation
+      // content) but lands in `mcpStartupFailures`, which the agent-info
+      // diagnostics surface renders.
+      useChatStore.setState({ mcpStartup: null, mcpStartupFailures: null });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: {
+          pipeshub: { status: "failed", error: "401 Unauthorized" },
+          safe: { status: "ready", error: null },
+        },
+      });
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+      expect(useChatStore.getState().mcpStartupFailures).toEqual({
+        pipeshub: "401 Unauthorized",
+      });
+    });
+
+    it("falls back to a generic detail for a failed server without an error", () => {
+      useChatStore.setState({ mcpStartupFailures: null });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: { pipeshub: { status: "failed", error: null } },
+      });
+      expect(useChatStore.getState().mcpStartupFailures).toEqual({
+        pipeshub: "startup failed",
+      });
+    });
+
+    it("clears retained failures when a later map reports recovery", () => {
+      // The runner path republishes a recovered server as `ready` (e.g.
+      // after a token refresh); the diagnostics surface must clear rather
+      // than show a stale error forever.
+      useChatStore.setState({
+        mcpStartupFailures: { pipeshub: "401 Unauthorized" },
+      });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: { pipeshub: { status: "ready", error: null } },
+      });
+      expect(useChatStore.getState().mcpStartupFailures).toBeNull();
+    });
+
+    it("does not report cancellations or in-flight servers as failures", () => {
+      useChatStore.setState({ mcpStartupFailures: null });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: {
+          safe: { status: "starting", error: null },
+          "storage-console": { status: "cancelled", error: null },
+        },
+      });
+      expect(useChatStore.getState().mcpStartupFailures).toBeNull();
+    });
+
+    it("seeds retained failures from the session snapshot", async () => {
+      // A client reloading after a failed startup round reads the cached
+      // map from the snapshot; the diagnostics surface must light up off
+      // that intake too, or a reload hides the failure.
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (
+          url.split("?")[0] === "/v1/sessions/conv_mcp_failed_snapshot" &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          return mockResponse({
+            id: "conv_mcp_failed_snapshot",
+            agent_id: "agent_xyz",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            mcp_startup: {
+              pipeshub: { status: "failed", error: "handshake failed" },
+            },
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().switchTo("conv_mcp_failed_snapshot");
+
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+      expect(useChatStore.getState().mcpStartupFailures).toEqual({
+        pipeshub: "handshake failed",
+      });
+    });
   });
 
   describe("session.skills", () => {

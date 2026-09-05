@@ -3306,7 +3306,7 @@ class McpServerStartup(BaseModel):
 
 class SessionMcpStartupEvent(_SSEEventBase):
     """
-    Per-MCP-server startup progress for a native harness session.
+    Per-MCP-server startup progress for a session.
 
     A codex-native session brings up its configured MCP servers when its
     Codex thread starts; slow or failing servers previously left the web
@@ -3315,6 +3315,11 @@ class SessionMcpStartupEvent(_SSEEventBase):
     ``external_mcp_startup`` posts, republished here so the web UI can
     show which servers are still starting and which failed or were
     cancelled.
+
+    SDK-harness sessions (e.g. claude-sdk) have no such startup sequence —
+    instead, the runner's per-turn ``tools/list`` call reports failing
+    servers, which are folded into this same event so the web UI's MCP
+    surfaces work for both harness families.
 
     :param type: Always ``"session.mcp_startup"``.
     :param conversation_id: Session identifier,
