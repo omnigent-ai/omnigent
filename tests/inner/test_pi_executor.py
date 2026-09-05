@@ -1,7 +1,6 @@
 """Tests for PiExecutor."""
 
 import asyncio
-import contextlib
 import json
 import logging
 import os
@@ -1418,8 +1417,7 @@ class TestPiRpcSession(unittest.TestCase):
                 self.assertFalse(rpc.stdout_at_eof())
             finally:
                 rpc._read_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await rpc._read_task
+                await asyncio.gather(rpc._read_task, return_exceptions=True)
 
         _run(_test())
 
@@ -1432,6 +1430,24 @@ class TestPiRpcSession(unittest.TestCase):
             # Finished reader (process exited, pipe closed).
             rpc._read_task = asyncio.create_task(asyncio.sleep(0))
             await asyncio.sleep(0.01)
+            self.assertTrue(rpc.stdout_at_eof())
+
+        _run(_test())
+
+    def test_stdout_at_eof_false_until_buffered_lines_drained(self):
+        # A finished reader with lines still queued is not EOF yet: the
+        # buffered output (and the None sentinel) must be drained first.
+        async def _test():
+            rpc = _PiRpcSession()
+            rpc._line_queue = asyncio.Queue()
+            rpc._line_queue.put_nowait('{"type": "agent_end"}')
+            rpc._line_queue.put_nowait(None)
+            rpc._read_task = asyncio.create_task(asyncio.sleep(0))
+            await asyncio.sleep(0.01)
+            self.assertFalse(rpc.stdout_at_eof())
+            self.assertEqual(await rpc.read_line(timeout=0.05), '{"type": "agent_end"}')
+            self.assertFalse(rpc.stdout_at_eof())
+            self.assertIsNone(await rpc.read_line(timeout=0.05))
             self.assertTrue(rpc.stdout_at_eof())
 
         _run(_test())
@@ -2173,8 +2189,7 @@ class TestRunTurn(unittest.TestCase):
             finally:
                 feeder.cancel()
                 fake_rpc._read_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await fake_rpc._read_task
+                await asyncio.gather(fake_rpc._read_task, return_exceptions=True)
 
             errors = [e for e in events if isinstance(e, ExecutorError)]
             self.assertEqual(

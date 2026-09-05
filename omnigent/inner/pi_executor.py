@@ -1177,7 +1177,7 @@ class _PiRpcSession:
                 self._line_queue.put_nowait(line)
         return result
 
-    async def read_line(self, timeout: float = 120.0) -> str | None:
+    async def read_line(self, timeout: float = _TURN_STDOUT_IDLE_TIMEOUT_S) -> str | None:
         """Read the next JSONL line from Pi's stdout.
 
         Returns ``None`` on EOF **or** timeout; callers that must tell
@@ -1195,8 +1195,12 @@ class _PiRpcSession:
         sentinel from its ``finally``, so a finished (or never-started)
         reader means no further stdout lines can arrive, while a live
         reader means a ``read_line`` ``None`` was only an idle timeout.
+        Also requires an empty queue so already-buffered lines are
+        drained before the stream is declared exhausted.
         """
-        return self._read_task is None or self._read_task.done()
+        return (
+            self._read_task is None or self._read_task.done()
+        ) and self._line_queue.empty()
 
     async def close(self) -> None:
         for task in (self._read_task, self._stderr_task):
