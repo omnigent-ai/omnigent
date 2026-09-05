@@ -38,6 +38,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
+    sendMobileKey: ReturnType<typeof vi.fn>;
   }[],
 }));
 
@@ -50,6 +51,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     focus = vi.fn();
+    sendMobileKey = vi.fn();
 
     constructor(
       container: HTMLDivElement,
@@ -71,6 +73,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
+        sendMobileKey: this.sendMobileKey,
       });
     }
   },
@@ -770,5 +773,101 @@ describe("automatic reconnect", () => {
     await act(async () => {});
     expect(terminalSessionMock.instances).toHaveLength(1);
     expect(screen.getByText("Bridge closed: code 4405")).toBeInTheDocument();
+  });
+});
+
+/** Point `matchMedia` at a phone-width (mobile) or desktop-width viewport. */
+function setViewport(mobile: boolean): void {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: (query: string) => ({
+      matches: mobile && query.includes("max-width"),
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }),
+  });
+}
+
+describe("mobile terminal key bar", () => {
+  // Overriding matchMedia via defineProperty outlives the test; restore the
+  // desktop default so no later suite inherits the mobile viewport.
+  afterEach(() => setViewport(false));
+
+  /** Mount on the given viewport and flush the deferred (microtask) attach. */
+  async function renderOn(mobile: boolean, props?: { readOnly?: boolean }): Promise<void> {
+    setViewport(mobile);
+    render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        readOnly={props?.readOnly}
+      />,
+    );
+    await act(async () => {});
+  }
+
+  it("renders the key bar on a mobile viewport", async () => {
+    await renderOn(true);
+    const bar = screen.getByTestId("terminal-mobile-keys");
+    // The keys the phone keyboard lacks, in the requested left→right order.
+    const order = within(bar)
+      .getAllByRole("button")
+      .map((b) => b.getAttribute("aria-label"));
+    expect(order).toEqual([
+      "Shift + Tab",
+      "Escape",
+      "Left arrow",
+      "Up arrow",
+      "Down arrow",
+      "Right arrow",
+      "Enter",
+    ]);
+    // Shift+Tab shows its label as stacked words (no glyph); the accessible
+    // name stays "Shift + Tab" via aria-label.
+    const shiftTab = within(bar).getByRole("button", { name: "Shift + Tab" });
+    expect(shiftTab).toHaveTextContent("SHIFT");
+    expect(shiftTab).toHaveTextContent("TAB");
+  });
+
+  it("does not render the key bar on a desktop viewport", async () => {
+    await renderOn(false);
+    expect(screen.queryByTestId("terminal-mobile-keys")).toBeNull();
+  });
+
+  it("hides the key bar for a read-only attach even on mobile", async () => {
+    // A read-only viewer can't type, so on-screen keys would be inert chrome.
+    await renderOn(true, { readOnly: true });
+    expect(screen.queryByTestId("terminal-mobile-keys")).toBeNull();
+  });
+
+  it("sends the mapped key to the live session on tap", async () => {
+    await renderOn(true);
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    const bar = screen.getByTestId("terminal-mobile-keys");
+    const sendMobileKey = terminalSessionMock.instances[0].sendMobileKey;
+
+    fireEvent.click(within(bar).getByRole("button", { name: "Escape" }));
+    fireEvent.click(within(bar).getByRole("button", { name: "Up arrow" }));
+    fireEvent.click(within(bar).getByRole("button", { name: "Enter" }));
+
+    expect(sendMobileKey).toHaveBeenNthCalledWith(1, "escape");
+    expect(sendMobileKey).toHaveBeenNthCalledWith(2, "up");
+    expect(sendMobileKey).toHaveBeenNthCalledWith(3, "enter");
+  });
+
+  it("suppresses the pointer-down focus grab so the soft keyboard stays up", async () => {
+    // The tap must not blur the xterm textarea (which would dismiss the phone
+    // keyboard). The button cancels its own pointerdown to keep focus put;
+    // fireEvent returns false when the default action was prevented.
+    await renderOn(true);
+    const escape = within(screen.getByTestId("terminal-mobile-keys")).getByRole("button", {
+      name: "Escape",
+    });
+    expect(fireEvent.pointerDown(escape)).toBe(false);
   });
 });

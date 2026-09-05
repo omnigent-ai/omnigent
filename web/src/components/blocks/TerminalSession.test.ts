@@ -22,6 +22,7 @@ import {
   sgrWheelReports,
   terminalTheme,
   terminalKeyEventPayload,
+  terminalMobileKeyPayload,
   type ConnectionState,
   wheelReportPayload,
   type WheelMouseState,
@@ -439,6 +440,37 @@ describe("wheelReportPayload", () => {
 });
 
 // ---------------------------------------------------------------------------
+describe("terminalMobileKeyPayload", () => {
+  it("encodes mode-independent keys", () => {
+    // Esc, Shift+Tab (CSI Z backtab), and Enter (CR) don't depend on
+    // cursor-key mode, so both mode arguments must yield the same bytes.
+    for (const appCursor of [false, true]) {
+      expect(terminalMobileKeyPayload("escape", appCursor)).toBe("\x1b");
+      expect(terminalMobileKeyPayload("shift-tab", appCursor)).toBe("\x1b[Z");
+      expect(terminalMobileKeyPayload("enter", appCursor)).toBe("\r");
+    }
+  });
+
+  it("encodes arrows as CSI in normal cursor-key mode", () => {
+    // A pane not in DECCKM expects ESC [ x — the same bytes xterm's own
+    // onData emits for a physical arrow press in that mode.
+    expect(terminalMobileKeyPayload("up", false)).toBe("\x1b[A");
+    expect(terminalMobileKeyPayload("down", false)).toBe("\x1b[B");
+    expect(terminalMobileKeyPayload("right", false)).toBe("\x1b[C");
+    expect(terminalMobileKeyPayload("left", false)).toBe("\x1b[D");
+  });
+
+  it("encodes arrows as SS3 in application cursor-key mode", () => {
+    // A pane that requested DECCKM (application cursor keys) expects ESC O x;
+    // sending CSI there would read as an unrecognized sequence, so the mode
+    // must switch the encoding.
+    expect(terminalMobileKeyPayload("up", true)).toBe("\x1bOA");
+    expect(terminalMobileKeyPayload("down", true)).toBe("\x1bOB");
+    expect(terminalMobileKeyPayload("right", true)).toBe("\x1bOC");
+    expect(terminalMobileKeyPayload("left", true)).toBe("\x1bOD");
+  });
+});
+
 // TerminalSession class — wired up against a fake WebSocket + ResizeObserver.
 // The real xterm Terminal runs (it already does in jsdom for loadWebglRenderer
 // above), but the WebSocket and ResizeObserver globals are stubbed so the
@@ -576,6 +608,29 @@ describe("TerminalSession", () => {
     socket.open();
 
     expect(focusSpy).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("sends a mobile key through the onData path over the socket", () => {
+    // WHY: the on-screen key bar calls sendMobileKey, which must route through
+    // term.input → onData so the bytes hit the WS send and the input listener
+    // like a real keystroke. Default xterm cursor-key mode is normal, so an up
+    // arrow encodes as CSI (ESC [ A).
+    const onInput = vi.fn();
+    const { socket, session } = makeSession(undefined, onInput);
+    socket.open();
+    socket.sent.length = 0; // drop the open handshake's resize frame
+
+    session.sendMobileKey("up");
+
+    // Keystroke frames are binary (the encoder's bytes); resize frames are
+    // JSON strings. `instanceof Uint8Array` is unreliable here — the encoder
+    // and the test run in different realms under jsdom — so select by the
+    // string/binary split and decode the bytes.
+    const binary = socket.sent.filter((m) => typeof m !== "string");
+    expect(binary).toHaveLength(1);
+    expect(new TextDecoder().decode(binary[0] as Uint8Array)).toBe("\x1b[A");
+    expect(onInput).toHaveBeenCalled();
     session.dispose();
   });
 
