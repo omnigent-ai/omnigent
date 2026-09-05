@@ -55,6 +55,15 @@ from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
 
 BWRAP_AVAILABLE = shutil.which("bwrap") is not None
 
+# Skip anything that reaches real bwrap resolution/execution when bwrap is not
+# available (macOS, Windows, or a bwrap-less Linux box) — the backend hard-errors
+# off Linux by design. Defined here at module top so it can decorate tests
+# throughout the file, including the resolver tests below (issue #4279: it was
+# previously defined *after* those tests, so it never gated them).
+pytestmark_bwrap = pytest.mark.skipif(
+    not BWRAP_AVAILABLE, reason="bwrap not installed on this host"
+)
+
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -248,6 +257,7 @@ def _repo_root() -> Path:
 # ---------------------------------------------------------------------------
 
 
+@pytestmark_bwrap
 def test_resolve_default_keeps_cwd_read_only() -> None:
     """
     ``write_paths`` omitted (the common case) leaves ``write_roots``
@@ -275,6 +285,7 @@ def test_resolve_default_keeps_cwd_read_only() -> None:
     assert policy.read_roots is None  # No spec-supplied read_paths.
 
 
+@pytestmark_bwrap
 def test_resolve_write_paths_dot_makes_cwd_writable() -> None:
     """
     Setting ``write_paths: ["."]`` flips cwd to writable. This is the
@@ -291,6 +302,7 @@ def test_resolve_write_paths_dot_makes_cwd_writable() -> None:
     assert policy.write_roots == [Path.cwd().resolve(strict=False)]
 
 
+@pytestmark_bwrap
 def test_resolve_default_cwd_allow_hidden_is_dot_venv() -> None:
     """
     ``cwd_allow_hidden=None`` in the spec resolves to the documented
@@ -312,6 +324,7 @@ def test_resolve_default_cwd_allow_hidden_is_dot_venv() -> None:
     )
 
 
+@pytestmark_bwrap
 def test_resolve_explicit_cwd_allow_hidden_overrides_default() -> None:
     """
     An explicit ``cwd_allow_hidden`` in the spec replaces the default
@@ -1675,11 +1688,6 @@ def test_s5_read_paths_dedup_skips_paths_under_cwd(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Seccomp profile (real bwrap subprocess required)
 # ---------------------------------------------------------------------------
-
-
-pytestmark_bwrap = pytest.mark.skipif(
-    not BWRAP_AVAILABLE, reason="bwrap not installed on this host"
-)
 
 
 @pytestmark_bwrap
