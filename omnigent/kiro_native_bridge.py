@@ -122,12 +122,36 @@ def bridge_dir_for_session_id(session_id: str) -> Path:
     return _BRIDGE_ROOT / digest
 
 
+def _ensure_secure_bridge_dir(bridge_dir: Path) -> None:
+    """Create/validate *bridge_dir* as an owner-only chain before writing secrets.
+
+    ``Path.mkdir(mode=0o700, parents=True, exist_ok=True)`` applies the mode to
+    the leaf only and silently trusts any pre-existing ancestor, so on a shared
+    host an attacker could pre-create ``$TMPDIR/omnigent-<uid>`` (or a deeper
+    ancestor) as a symlink / world-writable dir and redirect the bridge tree.
+    That tree holds ``bridge.json`` — a bearer token for the relay's localhost
+    control endpoint — so its directory chain must be hardened. Delegate to the
+    same ``_ensure_secure_dir`` the shared relay (``start_tool_relay``) already
+    applies to token-bearing trees; it rejects symlinked / non-owned /
+    group-or-other accessible ancestors (the kiro-native root is in its
+    allowlist). Lazy import avoids a cycle (``claude_native_bridge`` imports
+    this module's ``bridge_root`` at module level).
+
+    :raises RuntimeError: If any ancestor fails owner-only validation.
+    """
+    from omnigent.claude_native_bridge import _ensure_secure_dir
+
+    _ensure_secure_dir(bridge_dir)
+
+
 def prepare_bridge_dir(session_id: str) -> Path:
-    """Create and return the per-session Kiro bridge directory."""
+    """Create and return the per-session Kiro bridge directory.
+
+    :raises RuntimeError: If the bridge dir fails owner-only validation
+        (:func:`_ensure_secure_bridge_dir`).
+    """
     bridge_dir = bridge_dir_for_session_id(session_id)
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with contextlib.suppress(OSError):
-        os.chmod(bridge_dir, 0o700)
+    _ensure_secure_bridge_dir(bridge_dir)
     return bridge_dir
 
 
@@ -142,8 +166,11 @@ def write_mcp_bridge_config(bridge_dir: Path) -> None:
     ``serve-mcp`` (``omnigent.claude_native_bridge``) reads ``bridge.json`` and
     refuses to start without a ``token``. Mirrors cursor-native's writer;
     idempotent so a resume reuses the existing token.
+
+    :raises RuntimeError: If the bridge dir fails owner-only validation
+        (:func:`_ensure_secure_bridge_dir`) — the token is not written.
     """
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _ensure_secure_bridge_dir(bridge_dir)
     config_path = bridge_dir / _MCP_BRIDGE_CONFIG_FILE
     if config_path.exists():
         return
