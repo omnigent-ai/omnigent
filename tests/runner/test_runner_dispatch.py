@@ -52,6 +52,7 @@ from typing import Any, cast
 import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse, Response
 from fastapi.responses import StreamingResponse as _StreamingResponse
 
 import omnigent.runtime.harnesses._executor_adapter as _adapter_mod_recovery
@@ -79,6 +80,7 @@ from omnigent.runner.app import (
     _build_spawn_env_from_spec,
     _evaluate_policy_via_omnigent,
     _forward_harness_response,
+    _harness_error_response_error,
     _resolve_harness_config,
 )
 from omnigent.runtime.harnesses import _HARNESS_MODULES
@@ -1529,6 +1531,250 @@ async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> Non
     assert "RuntimeError" in response.text
     assert "Failed to resolve the agent spec for this turn." in response.text
     assert "stream spec resolver unavailable for ag_stream" not in response.text
+
+
+# ── Harness error-response detail → stream subscribers ───
+
+_SPAWN_LOG_DETAIL = "Request failed on the runner; see the runner log for details: ~/x.log"
+
+
+@pytest.mark.parametrize(
+    "response, expected",
+    [
+        pytest.param(
+            JSONResponse(
+                status_code=503,
+                content={"error": "harness_spawn_failed", "detail": _SPAWN_LOG_DETAIL},
+            ),
+            {"message": f"harness_spawn_failed: {_SPAWN_LOG_DETAIL}"},
+            id="code-and-detail-compose",
+        ),
+        pytest.param(
+            JSONResponse(status_code=503, content={"error": "spec_resolver_failed"}),
+            {"message": "spec_resolver_failed"},
+            id="code-only-is-the-message",
+        ),
+        pytest.param(
+            JSONResponse(status_code=503, content={"detail": "just prose"}),
+            {"message": "just prose"},
+            id="detail-only-is-the-message",
+        ),
+        pytest.param(
+            JSONResponse(status_code=503, content={"error": "  ", "detail": ""}),
+            {"message": '{"error":"  ","detail":""}'},
+            id="blank-strings-fall-through-to-raw-text",
+        ),
+        pytest.param(
+            Response(content="plain text body", status_code=500),
+            {"message": "plain text body"},
+            id="non-json-body-is-the-message",
+        ),
+        pytest.param(
+            Response(content=b"\xff\xfe", status_code=500),
+            {"message": "harness returned error response"},
+            id="undecodable-body-falls-back",
+        ),
+        pytest.param(
+            object(),
+            {"message": "harness returned error response"},
+            id="missing-body-attribute-falls-back",
+        ),
+        pytest.param(
+            type("_NoneBody", (), {"body": None})(),
+            {"message": "harness returned error response"},
+            id="none-body-falls-back",
+        ),
+        pytest.param(
+            Response(content="x" * 300, status_code=500),
+            {"message": "x" * 200},
+            id="long-body-truncated-to-200",
+        ),
+        pytest.param(
+            JSONResponse(status_code=500, content=["not", "a", "dict"]),
+            {"message": '["not","a","dict"]'},
+            id="non-object-json-is-raw-text",
+        ),
+    ],
+)
+def test_harness_error_response_error_parses_runner_error_bodies(
+    response: object, expected: dict[str, str]
+) -> None:
+    """The helper turns a harness error response into a ``{message}`` error.
+
+    Covers every body shape the runner can hand back: the structured
+    ``{"error", "detail"}`` bodies ``_stream_message_to_harness`` returns,
+    partial and blank variants of those, and the degenerate bodies (plain
+    text, undecodable bytes, a ``None`` body, no ``body`` attribute at
+    all). Reaching the
+    assertion at all is the "never raises" half of the contract.
+
+    :param response: The non-streaming response handed to the helper.
+    :param expected: The exact error dict the helper must return.
+    :returns: None.
+    """
+    assert _harness_error_response_error(response) == expected
+
+
+class _SpawnFailingProcessManager(_FakeProcessManager):
+    """Process manager stub whose harness spawn always fails.
+
+    Inherits :class:`_FakeProcessManager`'s reaper and release no-ops and
+    replaces only ``get_client``, so the runner takes the
+    ``harness_spawn_failed`` 503 arm of ``_stream_message_to_harness``.
+    """
+
+    async def get_client(
+        self,
+        conversation_id: str,
+        harness_name: str,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> _FakeHarnessClient:
+        """
+        Fail the spawn the way a broken harness binary does.
+
+        :param conversation_id: Omnigent conversation id.
+        :param harness_name: Harness name requested by the runner.
+        :param env: Optional spawn environment.
+        :returns: Never returns.
+        :raises RuntimeError: Always.
+        """
+        del conversation_id, harness_name, env
+        raise RuntimeError("harness binary exploded")
+
+
+@pytest.mark.asyncio
+async def test_runner_stream_spawn_failed_reaches_subscribers_with_detail(
+    caplog: pytest.LogCaptureFixture,
+    pinned_runner_log: Path,
+) -> None:
+    """A ``stream=true`` spawn failure publishes the runner's own failure class and detail.
+
+    The direct HTTP caller already received
+    ``{"error": "harness_spawn_failed", "detail": ...}``. Relay subscribers
+    read the same failure off the terminal ``session.status: failed`` event,
+    so that event must carry the same diagnosis rather than a generic
+    placeholder — otherwise the two callers disagree about why the turn died.
+
+    :param caplog: Pytest log capture, used to confirm the raw cause is
+        logged server-side (the other half of the log-and-genericize
+        contract).
+    :param pinned_runner_log: The log path the detail must name.
+    :returns: None.
+    """
+
+    async def _none_spec_resolver(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        """
+        Resolve no spec, so the harness named in the body is used as-is.
+
+        :param agent_id: Agent id requested by the runner.
+        :param session_id: Session id (unused).
+        :returns: Always ``None``.
+        """
+        del agent_id, session_id
+        return None
+
+    conv = "conv_stream_spawn_failed"
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _SpawnFailingProcessManager()),
+        spec_resolver=_none_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            response = await http.post(
+                f"/v1/sessions/{conv}/events?stream=true",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "harness": _TEST_HARNESS_NAME,
+                    "agent_id": "ag_spawn",
+                    "model": "x",
+                    "content": [],
+                },
+            )
+        event = await _drain_failed_status_event(app.state.session_event_queues, conv, timeout=5.0)
+
+    # The direct caller's contract is unchanged.
+    assert response.status_code == 503
+    assert response.json()["error"] == "harness_spawn_failed"
+    # The subscriber's copy now names the same failure. The wire code stays
+    # the generic setup-failure code the failure card describes.
+    assert event is not None
+    assert event["error"]["code"] == "runner_error"
+    expected_detail = (
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
+    assert event["error"]["message"] == f"harness_spawn_failed: {expected_detail}"
+    assert "harness returned error response" not in event["error"]["message"]
+    # Log-and-genericize: the raw cause is logged, never relayed.
+    assert "harness binary exploded" not in event["error"]["message"]
+    assert "harness binary exploded" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_runner_background_spawn_failed_reaches_subscribers_with_detail(
+    pinned_runner_log: Path,
+) -> None:
+    """The background turn path publishes the same spawn-failure detail.
+
+    Companion to
+    :func:`test_runner_stream_spawn_failed_reaches_subscribers_with_detail`:
+    both turn paths inspect the harness error response through the same
+    helper, so a 202 background turn must surface the identical message.
+    The resolver returns a spec here (rather than ``None``) because the
+    background path takes its harness from the resolved spec, not from the
+    request body.
+
+    :param pinned_runner_log: The log path the detail must name.
+    :returns: None.
+    """
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Pin the turn to the test harness so dispatch reaches the spawn.
+
+        :param agent_id: Agent id requested by the runner (unused).
+        :param session_id: Session id (unused).
+        :returns: A minimal spec naming the test harness.
+        """
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="spawn-failing-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+        )
+
+    conv = "conv_bg_spawn_failed"
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _SpawnFailingProcessManager()),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_spawn",
+                "model": "x",
+                "content": [],
+            },
+        )
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+        event = await _drain_failed_status_event(app.state.session_event_queues, conv, timeout=5.0)
+
+    assert event is not None
+    assert event["error"]["code"] == "runner_error"
+    expected_detail = (
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
+    assert event["error"]["message"] == f"harness_spawn_failed: {expected_detail}"
+    assert "harness returned error response" not in event["error"]["message"]
 
 
 def test_direct_and_background_switch_sites_share_one_invalidation_routine() -> None:
