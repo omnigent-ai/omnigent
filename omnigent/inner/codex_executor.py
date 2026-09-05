@@ -410,6 +410,13 @@ def _find_codex_cli() -> str | None:
     return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
+# Default on-disk home spelling for the codex CLI. Genie (a Databricks fork of
+# codex, driven by :class:`~omnigent.inner.genie_executor.GenieExecutor`) reads
+# ``GENIE_HOME`` / ``~/.genie`` instead — see :class:`_CodexHomeSpec`.
+_DEFAULT_HOME_ENV_VAR = "CODEX_HOME"
+_DEFAULT_HOME_DIR_NAME = ".codex"
+
+
 async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
     """
     Return the codex CLI version as a ``(major, minor, patch)`` tuple.
@@ -773,7 +780,10 @@ def _resolve_codex_home_config_source(source_dir: Path, home_codex_home: Path) -
     return source_dir
 
 
-def _codex_home_config_source_from_env() -> Path:
+def _codex_home_config_source_from_env(
+    home_env_var: str = _DEFAULT_HOME_ENV_VAR,
+    home_dir_name: str = _DEFAULT_HOME_DIR_NAME,
+) -> Path:
     """
     Return the Codex home whose auth/config should be bridged.
 
@@ -783,12 +793,16 @@ def _codex_home_config_source_from_env() -> Path:
     can inherit a parent private home, so this resolver maps that specific
     inherited session-state home back to the user's default ``~/.codex``.
 
+    :param home_env_var: The env var naming the user's source home, e.g.
+        ``"CODEX_HOME"`` (codex) or ``"GENIE_HOME"`` (the genie fork).
+    :param home_dir_name: The default home dir under ``~`` when the env var is
+        unset, e.g. ``".codex"`` or ``".genie"``.
     :returns: Host Codex home to read ``auth.json`` and ``config.toml`` from,
         e.g. ``Path.home() / ".codex"`` or an explicit user ``CODEX_HOME``.
     """
-    home_codex_home = Path.home() / ".codex"
+    home_codex_home = Path.home() / home_dir_name
     return _resolve_codex_home_config_source(
-        Path(os.environ.get("CODEX_HOME") or str(home_codex_home)),
+        Path(os.environ.get(home_env_var) or str(home_codex_home)),
         home_codex_home,
     )
 
@@ -2242,6 +2256,8 @@ class _CodexAppServerSession:
         disable_native_tools: bool = False,
         bundle_dir: Path | None = None,
         skills_filter: str | list[str] = "all",
+        home_env_var: str = _DEFAULT_HOME_ENV_VAR,
+        home_dir_name: str = _DEFAULT_HOME_DIR_NAME,
     ) -> None:
         self._codex_path = codex_path
         self._cwd = cwd
@@ -2252,6 +2268,13 @@ class _CodexAppServerSession:
         self._disable_native_tools = disable_native_tools
         self._bundle_dir = bundle_dir
         self._skills_filter = skills_filter
+        # Home-dir spelling for the wrapped CLI. Codex reads ``CODEX_HOME`` /
+        # ``~/.codex``; the genie fork reads ``GENIE_HOME`` / ``~/.genie``. The
+        # tag (``codex`` / ``genie``) also names the private temp home so both
+        # forms are legible on disk and never collide.
+        self._home_env_var = home_env_var
+        self._home_dir_name = home_dir_name
+        self._home_tag = home_dir_name.lstrip(".") or "codex"
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -2299,7 +2322,7 @@ class _CodexAppServerSession:
         codex_home_root = Path(tempfile.gettempdir())
         if self._cwd and self._cwd != "/":
             try:
-                codex_home_root = Path(self._cwd) / ".codex-tmp"
+                codex_home_root = Path(self._cwd) / f".{self._home_tag}-tmp"
                 codex_home_root.mkdir(parents=True, exist_ok=True)
             except OSError:
                 # The cwd may be on a read-only filesystem — e.g. macOS
@@ -2308,7 +2331,7 @@ class _CodexAppServerSession:
                 # system temp directory so the codex home is still writable.
                 codex_home_root = Path(tempfile.gettempdir())
         self._codex_home_dir = Path(
-            tempfile.mkdtemp(prefix="omnigent-codex-home-", dir=str(codex_home_root))
+            tempfile.mkdtemp(prefix=f"omnigent-{self._home_tag}-home-", dir=str(codex_home_root))
         )
         # Populate the per-conversation CODEX_HOME's ``skills/`` subdir
         # based on the spec's ``skills:`` field. Codex auto-discovers
@@ -2328,7 +2351,7 @@ class _CodexAppServerSession:
         # definitions) from ``$CODEX_HOME``; without this step a freshly-
         # created temp dir has neither, causing 401 Unauthorized errors
         # for subscription-authenticated users.
-        config_source = _codex_home_config_source_from_env()
+        config_source = _codex_home_config_source_from_env(self._home_env_var, self._home_dir_name)
         # When the runner advertises a subagent-routing endpoint, the user's
         # hooks.json is merged into a generated file registering the routing
         # hooks instead of being symlinked in untouched. Only an auto-harness
@@ -2367,10 +2390,11 @@ class _CodexAppServerSession:
                 session_id=codex_router_session_id(self._env),
                 user_hooks_source=config_source / _CODEX_HOOKS_FILENAME,
             )
-        # Override CODEX_HOME so Codex stores its data (including conversation
-        # history) in a private temp directory rather than the user's ~/.codex/.
-        # This prevents subagent sessions from polluting the user's Codex history.
-        proc_env = {**self._env, "CODEX_HOME": str(self._codex_home_dir)}
+        # Override the home env var so the CLI stores its data (including
+        # conversation history) in a private temp directory rather than the
+        # user's ~/.codex/ (or ~/.genie/ for the fork). This prevents subagent
+        # sessions from polluting the user's real history.
+        proc_env = {**self._env, self._home_env_var: str(self._codex_home_dir)}
         try:
             argv = [self._codex_path, "app-server"]
             for override in self._codex_config_overrides:
@@ -3275,6 +3299,8 @@ class _AppSessionFactory(Protocol):
         disable_native_tools: bool,
         bundle_dir: Path | None,
         skills_filter: str | list[str],
+        home_env_var: str,
+        home_dir_name: str,
     ) -> _CodexAppServerSession: ...
 
 
@@ -3289,6 +3315,8 @@ def _default_app_session_factory(
     disable_native_tools: bool,
     bundle_dir: Path | None,
     skills_filter: str | list[str],
+    home_env_var: str,
+    home_dir_name: str,
 ) -> _CodexAppServerSession:
     return _CodexAppServerSession(
         codex_path=codex_path,
@@ -3300,6 +3328,8 @@ def _default_app_session_factory(
         disable_native_tools=disable_native_tools,
         bundle_dir=bundle_dir,
         skills_filter=skills_filter,
+        home_env_var=home_env_var,
+        home_dir_name=home_dir_name,
     )
 
 
@@ -3325,6 +3355,8 @@ class CodexExecutor(Executor):
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        home_env_var: str = _DEFAULT_HOME_ENV_VAR,
+        home_dir_name: str = _DEFAULT_HOME_DIR_NAME,
     ) -> None:
         """Create a CodexExecutor.
 
@@ -3415,13 +3447,15 @@ class CodexExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
-        resolved_codex = codex_path or _find_codex_cli()
+        # Home-dir spelling for the wrapped CLI (codex: ``CODEX_HOME`` /
+        # ``~/.codex``; genie fork: ``GENIE_HOME`` / ``~/.genie``), threaded
+        # into each per-session app-server so the private temp home uses the
+        # right env var. See :class:`~omnigent.inner.genie_executor.GenieExecutor`.
+        self._home_env_var = home_env_var
+        self._home_dir_name = home_dir_name
+        resolved_codex = codex_path or self._find_cli()
         if not resolved_codex:
-            raise ImportError(
-                "CodexExecutor requires the 'codex' CLI on PATH. If codex is "
-                "installed on a PATH the host daemon didn't inherit (e.g. an "
-                f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
-            )
+            raise ImportError(self._cli_missing_message())
         self._codex_path = resolved_codex
         self._env = _clean_codex_env(declared_passthrough(self._os_env_spec))
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI
@@ -3537,6 +3571,25 @@ class CodexExecutor(Executor):
             else _default_app_session_factory
         )
 
+    def _find_cli(self) -> str | None:
+        """Resolve the wrapped CLI binary when no explicit path was given.
+
+        Overridden by :class:`~omnigent.inner.genie_executor.GenieExecutor` to
+        search for ``genie`` instead of ``codex``.
+        """
+        return _find_codex_cli()
+
+    def _cli_missing_message(self) -> str:
+        """Error text when the wrapped CLI cannot be resolved.
+
+        Overridden by :class:`~omnigent.inner.genie_executor.GenieExecutor`.
+        """
+        return (
+            "CodexExecutor requires the 'codex' CLI on PATH. If codex is "
+            "installed on a PATH the host daemon didn't inherit (e.g. an "
+            f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
+        )
+
     def supports_streaming(self) -> bool:
         return True
 
@@ -3621,6 +3674,8 @@ class CodexExecutor(Executor):
             disable_native_tools=self._disable_native_tools,
             bundle_dir=self._bundle_dir,
             skills_filter=self._skills_filter,
+            home_env_var=self._home_env_var,
+            home_dir_name=self._home_dir_name,
         )
         state.app_session = app_session
         state.signature = signature

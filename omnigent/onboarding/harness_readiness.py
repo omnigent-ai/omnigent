@@ -459,6 +459,13 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
 
 def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
+    if canonical == "genie":
+        # Genie is Databricks' fork of Codex: it uses the genie binary and
+        # authenticates via Databricks profile / AI Gateway, not Codex's
+        # subscription path. Gate readiness on the genie binary only.
+        from omnigent.onboarding.harness_install import GENIE_KEY
+
+        return _installer_only_availability(GENIE_KEY)
     if _is_codex_family_harness(canonical):
         from omnigent.codex_native import _codex_auth_unavailable_reason
 

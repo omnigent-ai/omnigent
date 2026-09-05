@@ -311,6 +311,7 @@ def test_configured_harness_map_covers_all_spellings(
         "codex",
         "codex-native",
         "native-codex",
+        "genie",
         "openai-agents",
         "openai-agents-sdk",
         "open-responses",
@@ -428,10 +429,12 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     # this group — it is now auth-aware like the other native CLI harnesses, so
     # its missing binary surfaces as ``"binary-missing"`` too. Pi is also here —
     # it reports the credential axis (no CLI login; its credential is a provider).
+    # Genie is binary-gated like codex (but with the genie binary, not codex's).
     for missing in (
         "codex",
         "codex-native",
         "native-codex",
+        "genie",
         "claude-native",
         "native-claude",
         "opencode-native",
