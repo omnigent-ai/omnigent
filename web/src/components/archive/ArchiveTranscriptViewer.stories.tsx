@@ -95,7 +95,10 @@ const meta = {
           });
         }}
       >
-        <div className="fixed inset-0 flex items-center justify-center overflow-hidden bg-background">
+        <div
+          className="flex h-[700px] items-center justify-center overflow-hidden bg-background"
+          style={{ width: context.parameters.readerWidth ?? 390 }}
+        >
           <div
             data-testid="archive-reader-story-frame"
             className="flex h-full max-h-[700px] max-w-full overflow-hidden border bg-background"

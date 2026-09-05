@@ -656,7 +656,7 @@ function archivedAgeBounds(
   preset: ArchivedAgePreset,
 ): Record<string, string> {
   if (preset === "any") return {};
-  const match = /^(lt|gt)(24h|\d+d)$/.exec(preset);
+  const match = preset.match(/^(lt|gt)(24h|\d+d)$/);
   if (!match) return {};
   const amount = match[2] === "24h" ? 1 : Number.parseInt(match[2], 10);
   const cutoff = Math.floor(Date.now() / 1000) - amount * 86_400;

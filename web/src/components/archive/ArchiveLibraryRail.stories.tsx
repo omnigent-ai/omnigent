@@ -106,7 +106,10 @@ const meta = {
           });
         }}
       >
-        <div className="fixed inset-0 flex items-center justify-center overflow-hidden bg-background p-4">
+        <div
+          className="flex h-[720px] items-center justify-center overflow-hidden bg-background"
+          style={{ width: context.parameters.readerWidth ?? 390 }}
+        >
           <div
             className="flex h-[720px] max-h-full overflow-hidden rounded-lg border bg-background"
             style={{ width: context.parameters.readerWidth ?? 390 }}
@@ -123,4 +126,4 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const MobileList: Story = {};
-export const DesktopSplit: Story = { parameters: { readerWidth: 900 } };
+export const DesktopSplit: Story = { parameters: { readerWidth: 720 } };
