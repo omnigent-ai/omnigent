@@ -315,6 +315,10 @@ class SubagentRouteRequest:
     :param harness: Requesting harness id, e.g. ``"claude-native"``.
     :param task_name: Subagent type / task name from the spawn payload,
         e.g. ``"code-reviewer"``.
+    :param task_description: The spawn's human task label (Claude's
+        ``Task`` ``description``, e.g. ``"Research auth flows"``) — what
+        distinguishes same-typed spawns in a fan-out. ``None`` when the
+        harness's spawn payload names none.
     :param prompt: Raw task text. ``None`` on codex, whose spawn message
         is encrypted in hook payloads.
     :param fork: ``True`` when the spawn is a fork of the parent session.
@@ -329,6 +333,7 @@ class SubagentRouteRequest:
 
     harness: str
     task_name: str = ""
+    task_description: str | None = None
     prompt: str | None = None
     fork: bool = False
     parent_model: str | None = None
@@ -346,12 +351,20 @@ class SubagentRouteRequest:
         if not isinstance(harness, str) or not harness.strip():
             raise ValueError("route-subagent body requires a non-empty 'harness' string")
         task_name = payload.get("task_name")
+        task_description = payload.get("task_description")
         prompt = payload.get("prompt")
         parent_model = payload.get("parent_model")
         requested_model = payload.get("requested_model")
         return cls(
             harness=harness.strip(),
             task_name=task_name[:_TASK_NAME_CAP] if isinstance(task_name, str) else "",
+            # Agent-authored like task_name, so bounded the same way before
+            # it is stored or rendered.
+            task_description=(
+                task_description[:_TASK_NAME_CAP]
+                if isinstance(task_description, str) and task_description
+                else None
+            ),
             prompt=prompt if isinstance(prompt, str) and prompt else None,
             fork=bool(payload.get("fork")),
             parent_model=parent_model if isinstance(parent_model, str) and parent_model else None,
@@ -459,6 +472,7 @@ def decision_record(
         harness=decision.harness or req.harness,
         raw_model=decision.raw_model,
         agent=req.task_name or None,
+        task_description=req.task_description,
         scope=_SCOPE,
         attempted_override=attempted,
         router_source=decision.router_source,

@@ -591,6 +591,40 @@ describe("routing decision — harness / scope / raw pick", () => {
     }
   });
 
+  // A fan-out's spawns often share one subagent type, so the type badge alone
+  // leaves the chips identical; the task label is what ties each decision to
+  // the work it governed.
+  it("card: names the task the decision governed, in place of the shared type row", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-4-6"
+        applied={false}
+        rationale="Routing unavailable; spawn allowed unchanged"
+        agent="general-purpose"
+        routing={{ scope: "native_subagent", taskDescription: "Research auth flows" }}
+      />,
+    );
+    expect(screen.getByTestId("routing-decision-task")).toHaveTextContent("Research auth flows");
+    // The shared type stays visible on the scope badge.
+    expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent(
+      "subagent: general-purpose",
+    );
+  });
+
+  it("card: an unlabeled spawn keeps the agent row label", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-4-6"
+        applied={false}
+        rationale="x"
+        agent="general-purpose"
+        routing={{ scope: "native_subagent" }}
+      />,
+    );
+    expect(screen.queryByTestId("routing-decision-task")).toBeNull();
+    expect(screen.getByTestId("routing-decision-card")).toHaveTextContent("general-purpose");
+  });
+
   // The router's vocabulary pick may have had no endpoint and been mapped to a
   // servable id — that must be visible. When it resolves to the same short
   // name there is nothing to disclose, so the row stays off.

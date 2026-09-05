@@ -629,7 +629,8 @@ export function RoutingDecisionCard({
   agent,
   routing,
 }: RoutingDecisionCardProps) {
-  const { harness, scope, decisionId, rawModel, attemptedOverride, routerSource } = routing ?? {};
+  const { harness, scope, decisionId, rawModel, attemptedOverride, routerSource, taskDescription } =
+    routing ?? {};
   const short = shortModelName(model);
   const rawShort = rawPickName(model, rawModel);
   const attemptedShort = attemptedPickName(model, attemptedOverride);
@@ -644,6 +645,7 @@ export function RoutingDecisionCard({
           applied,
           rationale,
           ...(agent ? { agent } : {}),
+          ...(taskDescription ? { task_description: taskDescription } : {}),
           ...(harness ? { harness } : {}),
           ...(scope ? { scope } : {}),
           ...(decisionId ? { decision_id: decisionId } : {}),
@@ -659,6 +661,7 @@ export function RoutingDecisionCard({
       applied,
       rationale,
       agent,
+      taskDescription,
       harness,
       scope,
       decisionId,
@@ -711,7 +714,20 @@ export function RoutingDecisionCard({
         </CollapsibleTrigger>
       </div>
       <div className="flex items-center gap-2 text-sm">
-        <span className="min-w-0 truncate font-mono text-foreground">{rowLabel}</span>
+        {taskDescription ? (
+          // The human name of the work this decision governed — what tells a
+          // fan-out's chips apart when the header badge names one shared
+          // subagent type for all of them.
+          <span
+            className="min-w-0 truncate text-foreground"
+            data-testid="routing-decision-task"
+            title={taskDescription}
+          >
+            {taskDescription}
+          </span>
+        ) : (
+          <span className="min-w-0 truncate font-mono text-foreground">{rowLabel}</span>
+        )}
         {attemptedShort ? (
           // The spawn named its own model and the router picked another — the
           // substitution is the whole point of the row, so it shows at a glance.

@@ -123,6 +123,13 @@ HOOK_TIMEOUT_S = REQUEST_TIMEOUT_S + HOOK_TIMEOUT_HEADROOM_S
 # ``agent_name``.
 DEFAULT_TASK_KEYS: tuple[str, ...] = ("subagent_type",)
 
+# ``tool_input`` keys carrying the spawn's human task label, in preference
+# order. Claude's ``Task`` sends a short ``description`` ("Research auth
+# flows") that tells one fan-out spawn from its same-typed siblings; codex's
+# ``spawn_agent`` has no equivalent key (its per-spawn identity is already
+# the ``task_name``), so the field stays absent there.
+DEFAULT_DESCRIPTION_KEYS: tuple[str, ...] = ("description",)
+
 # Flags every harness hook entrypoint accepts. None is required: a hook
 # misconfiguration must degrade to "no opinion", not an argparse exit.
 STANDARD_HOOK_FLAGS: tuple[str, ...] = (
@@ -368,6 +375,7 @@ def build_route_request(
     task_keys: Sequence[str] = DEFAULT_TASK_KEYS,
     include_prompt: bool = True,
     prompt_keys: Sequence[str] = ("prompt",),
+    description_keys: Sequence[str] = DEFAULT_DESCRIPTION_KEYS,
     requested_model_resolver: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:  # type: ignore[explicit-any]
     """
@@ -382,6 +390,8 @@ def build_route_request(
         whose spawn payload carries no usable task text.
     :param prompt_keys: ``tool_input`` keys carrying the task text, in
         preference order (codex spells it ``message``).
+    :param description_keys: ``tool_input`` keys carrying the spawn's human
+        task label, in preference order.
     :param requested_model_resolver: Turns the spawn tool's own ``model``
         spelling into a catalog id the server can compare. ``None``
         forwards it verbatim, which is what codex's slugs need.
@@ -394,6 +404,12 @@ def build_route_request(
             if isinstance(value, str) and value:
                 prompt = value
                 break
+    description = None
+    for key in description_keys:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value:
+            description = value
+            break
     requested = tool_input.get("model")
     requested = requested if isinstance(requested, str) and requested else None
     if requested is not None and requested_model_resolver is not None:
@@ -401,6 +417,9 @@ def build_route_request(
     return {
         "harness": harness,
         "task_name": spawn_task_name(tool_input, task_keys),
+        # The spawn's human task label — what ties the persisted decision back
+        # to the sub-agent/task it governed when a fan-out shares one type.
+        "task_description": description,
         "prompt": prompt,
         "parent_model": parent_model,
         # The model the spawning agent asked for, if any. The router still
@@ -794,6 +813,7 @@ def route_pre_tool_use(
     task_keys: Sequence[str] = DEFAULT_TASK_KEYS,
     include_prompt: bool = True,
     prompt_keys: Sequence[str] = ("prompt",),
+    description_keys: Sequence[str] = DEFAULT_DESCRIPTION_KEYS,
     parent_model_resolver: Callable[[dict[str, Any]], str | None] | None = None,  # type: ignore[explicit-any]
     model_translator_factory: Callable[[str | Path | None], Callable[[str], str | None]]
     | None = claude_model_translator,
@@ -818,6 +838,8 @@ def route_pre_tool_use(
     :param task_keys: ``tool_input`` keys naming the subagent.
     :param include_prompt: ``False`` withholds the spawn prompt.
     :param prompt_keys: ``tool_input`` keys carrying the task text.
+    :param description_keys: ``tool_input`` keys carrying the spawn's
+        human task label.
     :param parent_model_resolver: Derives the parent model from the
         payload; ``None`` reads the bridge config instead.
     :param model_translator_factory: Builds the decision-model translator
@@ -860,6 +882,7 @@ def route_pre_tool_use(
         task_keys=task_keys,
         include_prompt=include_prompt,
         prompt_keys=prompt_keys,
+        description_keys=description_keys,
         requested_model_resolver=(
             requested_model_resolver_factory(bridge_dir or router_dir)
             if requested_model_resolver_factory is not None

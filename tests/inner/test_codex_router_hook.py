@@ -99,6 +99,9 @@ def test_build_route_request_sends_the_message_as_the_routing_prompt() -> None:
     assert body == {
         "harness": "codex-native",
         "task_name": "refactor-tests",
+        # codex's spawn_agent carries no human task label; its per-spawn
+        # identity is already the task_name.
+        "task_description": None,
         "prompt": _ENCRYPTED_MESSAGE,
         "parent_model": "gpt-5-6-sol",
         "requested_model": None,

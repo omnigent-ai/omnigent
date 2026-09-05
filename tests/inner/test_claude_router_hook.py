@@ -18,9 +18,12 @@ def _payload(
     tool_name: str = "Agent",
     subagent_type: str = "code-reviewer",
     prompt: str = "review the diff",
+    description: str | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
     tool_input: dict[str, Any] = {"subagent_type": subagent_type, "prompt": prompt}
+    if description is not None:
+        tool_input["description"] = description
     if model is not None:
         tool_input["model"] = model
     return {
@@ -104,6 +107,34 @@ def test_rewrite_allows_with_routed_model(tmp_path: Path, monkeypatch: pytest.Mo
             "permissionDecisionReason": "cheapest arm (applied as 'haiku')",
         }
     }
+
+
+def test_route_request_carries_the_task_description(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Task's human label rides the request, so a fan-out's persisted
+    decisions can each name the spawn they governed."""
+    router_dir = advertise_router(tmp_path)
+    _out, requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(description="Research auth flows"),
+        {"action": "allow", "rationale": "fine as-is"},
+    )
+    assert requests[0]["body"]["task_description"] == "Research auth flows"
+
+
+def test_a_spawn_without_a_description_sends_no_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    router_dir = advertise_router(tmp_path)
+    _out, requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(),
+        {"action": "allow", "rationale": "fine as-is"},
+    )
+    assert requests[0]["body"]["task_description"] is None
 
 
 @pytest.mark.parametrize(
@@ -321,6 +352,7 @@ def test_fork_typed_spawn_routes_like_any_other(
     assert body == {
         "harness": "claude-native",
         "task_name": "fork",
+        "task_description": None,
         "prompt": "review the diff",
         "parent_model": None,
         "requested_model": None,
