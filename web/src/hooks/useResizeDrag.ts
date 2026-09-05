@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 
 interface ResizeDragOptions<T extends Element> {
   enabled?: boolean;
@@ -179,14 +179,16 @@ export function useResizeDrag<T extends Element = Element>({
   }, [cancelDrag, enabled]);
   useEffect(() => cancelDrag, [cancelDrag]);
 
-  return {
-    cancelDrag,
-    handleProps: {
+  const handleProps = useMemo(
+    () => ({
       onPointerDown,
       onPointerMove,
       onPointerUp,
       onPointerCancel,
       onLostPointerCapture: onPointerCancel,
-    },
-  };
+    }),
+    [onPointerDown, onPointerMove, onPointerUp, onPointerCancel],
+  );
+
+  return { cancelDrag, handleProps };
 }
