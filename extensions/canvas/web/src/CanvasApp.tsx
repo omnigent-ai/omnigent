@@ -161,6 +161,7 @@ function CanvasSurface({
   const activeCanvasRef = useRef(MAIN_CANVAS_ID);
   const openingRef = useRef(false);
   const initializedRef = useRef(false);
+  const hasLoadedAllSessionsRef = useRef(false);
   const refreshInFlightRef = useRef<Promise<void> | null>(null);
   const viewportTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aliveRef = useRef(true);
@@ -394,12 +395,14 @@ function CanvasSurface({
         projectList: ExtensionProjectSummary[],
       ) => void | Promise<void>,
     ) => {
-      setLoadingSessions(true);
+      setLoadingSessions(!hasLoadedAllSessionsRef.current);
       try {
         const projectListPromise = loadProjects(context);
         await loadSessions(context, async (progress) => {
           await onProgress(progress, await projectListPromise);
         });
+        // Once the full list is known, routine refreshes stay quiet.
+        hasLoadedAllSessionsRef.current = true;
       } finally {
         if (aliveRef.current) setLoadingSessions(false);
       }

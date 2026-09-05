@@ -271,14 +271,17 @@ describe("CanvasApp", () => {
     ).toBeNull();
   });
 
-  it("shows a spinner beside the cached count until canonical sessions finish loading", async () => {
+  it("shows a spinner for the initial cached preview but keeps later refreshes quiet", async () => {
     const canonical = deferred<ExtensionSessionPage>();
+    const refresh = deferred<ExtensionSessionPage>();
+    const nextPage = deferred<ExtensionSessionPage>();
     const { context } = contextWith();
     context.capabilities = [...context.capabilities, "sessions.getCached"];
     context.sessions.getCached = vi.fn(async () => [sessions[0]]);
-    vi.mocked(context.sessions.listPage).mockImplementationOnce(
-      () => canonical.promise,
-    );
+    vi.mocked(context.sessions.listPage)
+      .mockImplementationOnce(() => canonical.promise)
+      .mockImplementationOnce(() => refresh.promise)
+      .mockImplementationOnce(() => nextPage.promise);
 
     render(<CanvasApp context={context} />);
 
@@ -293,6 +296,29 @@ describe("CanvasApp", () => {
     await act(async () => canonical.resolve(page(sessions)));
 
     expect(await screen.findByText("2 sessions")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Loading sessions" }),
+    ).toBeNull();
+
+    fireEvent(window, new Event("focus"));
+    await waitFor(() =>
+      expect(context.sessions.listPage).toHaveBeenCalledTimes(2),
+    );
+    expect(context.sessions.getCached).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("2 sessions")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Loading sessions" }),
+    ).toBeNull();
+
+    const added = { ...sessions[1], id: "conv_new", title: "New session" };
+    await act(async () => refresh.resolve(page([...sessions, added], "next")));
+    expect(await screen.findByText("3 sessions")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Loading sessions" }),
+    ).toBeNull();
+
+    await act(async () => nextPage.resolve(page([])));
+    expect(screen.getByTestId("flow-node-conv_new")).toBeInTheDocument();
     expect(
       screen.queryByRole("status", { name: "Loading sessions" }),
     ).toBeNull();
@@ -345,12 +371,14 @@ describe("CanvasApp", () => {
     ).toBeNull();
   });
 
-  it("keeps the first page usable when a background page fails", async () => {
+  it("keeps a partial count usable on failure and shows progress again on retry", async () => {
     const secondPage = deferred<ExtensionSessionPage>();
+    const retry = deferred<ExtensionSessionPage>();
     const { context } = contextWith();
     vi.mocked(context.sessions.listPage)
       .mockResolvedValueOnce(page(sessions, "next"))
-      .mockImplementationOnce(() => secondPage.promise);
+      .mockImplementationOnce(() => secondPage.promise)
+      .mockImplementationOnce(() => retry.promise);
 
     render(<CanvasApp context={context} />);
     expect(await screen.findByText("2 sessions")).toBeInTheDocument();
@@ -367,14 +395,31 @@ describe("CanvasApp", () => {
     expect(
       screen.queryByRole("status", { name: "Loading sessions" }),
     ).toBeNull();
+
+    fireEvent(window, new Event("focus"));
+    expect(
+      await screen.findByRole("status", { name: "Loading sessions" }),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(context.sessions.listPage).toHaveBeenCalledTimes(3),
+    );
+
+    await act(async () => retry.resolve(page(sessions)));
+    expect(screen.getByText("2 sessions")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(
+      screen.queryByRole("status", { name: "Loading sessions" }),
+    ).toBeNull();
   });
 
-  it("clears the count spinner when a focus refresh fails", async () => {
+  it("keeps a completed count quiet when a focus refresh fails or retries", async () => {
     const refresh = deferred<ExtensionSessionPage>();
+    const retry = deferred<ExtensionSessionPage>();
     const { context } = contextWith();
     vi.mocked(context.sessions.listPage)
       .mockResolvedValueOnce(page(sessions))
-      .mockImplementationOnce(() => refresh.promise);
+      .mockImplementationOnce(() => refresh.promise)
+      .mockImplementationOnce(() => retry.promise);
     render(<CanvasApp context={context} />);
     await screen.findByText("2 sessions");
     expect(
@@ -382,9 +427,12 @@ describe("CanvasApp", () => {
     ).toBeNull();
 
     fireEvent(window, new Event("focus"));
+    await waitFor(() =>
+      expect(context.sessions.listPage).toHaveBeenCalledTimes(2),
+    );
     expect(
-      await screen.findByRole("status", { name: "Loading sessions" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("status", { name: "Loading sessions" }),
+    ).toBeNull();
     expect(screen.getByText("2 sessions")).toBeInTheDocument();
 
     await act(async () => refresh.reject(new Error("offline")));
@@ -396,6 +444,19 @@ describe("CanvasApp", () => {
       screen.queryByRole("status", { name: "Loading sessions" }),
     ).toBeNull();
     expect(screen.getByText("2 sessions")).toBeInTheDocument();
+
+    fireEvent(window, new Event("focus"));
+    await waitFor(() =>
+      expect(context.sessions.listPage).toHaveBeenCalledTimes(3),
+    );
+    expect(
+      screen.queryByRole("status", { name: "Loading sessions" }),
+    ).toBeNull();
+    await act(async () => retry.resolve(page(sessions)));
+    expect(
+      screen.queryByRole("status", { name: "Loading sessions" }),
+    ).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("retains saved positions for sessions that arrive on a later page", async () => {
@@ -752,38 +813,44 @@ describe("CanvasApp", () => {
     }
   });
 
-  it("waits for a slow refresh before scheduling or accepting another", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    try {
-      const slowRefresh = deferred<ExtensionSessionPage>();
-      const { context } = contextWith();
-      vi.mocked(context.sessions.listPage)
-        .mockResolvedValueOnce(page(sessions))
-        .mockImplementationOnce(() => slowRefresh.promise)
-        .mockResolvedValue(page(sessions));
-      render(<CanvasApp context={context} />);
-      await screen.findByText("2 sessions");
+  it.each([
+    { label: "empty", items: [] },
+    { label: "non-empty", items: sessions },
+  ])(
+    "keeps a completed $label list quiet while awaiting a slow refresh",
+    async ({ items }) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const slowRefresh = deferred<ExtensionSessionPage>();
+        const { context } = contextWith(items);
+        vi.mocked(context.sessions.listPage)
+          .mockResolvedValueOnce(page(items))
+          .mockImplementationOnce(() => slowRefresh.promise)
+          .mockResolvedValue(page(items));
+        render(<CanvasApp context={context} />);
+        await screen.findByText(`${items.length} sessions`);
 
-      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
-      expect(context.sessions.listPage).toHaveBeenCalledTimes(2);
-      expect(
-        screen.getByRole("status", { name: "Loading sessions" }),
-      ).toBeInTheDocument();
+        await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
+        expect(context.sessions.listPage).toHaveBeenCalledTimes(2);
+        expect(
+          screen.queryByRole("status", { name: "Loading sessions" }),
+        ).toBeNull();
 
-      fireEvent(window, new Event("focus"));
-      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS * 2);
-      expect(context.sessions.listPage).toHaveBeenCalledTimes(2);
+        fireEvent(window, new Event("focus"));
+        await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS * 2);
+        expect(context.sessions.listPage).toHaveBeenCalledTimes(2);
 
-      await act(async () => slowRefresh.resolve(page(sessions)));
-      expect(
-        screen.queryByRole("status", { name: "Loading sessions" }),
-      ).toBeNull();
-      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
-      expect(context.sessions.listPage).toHaveBeenCalledTimes(3);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
+        await act(async () => slowRefresh.resolve(page(items)));
+        expect(
+          screen.queryByRole("status", { name: "Loading sessions" }),
+        ).toBeNull();
+        await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
+        expect(context.sessions.listPage).toHaveBeenCalledTimes(3);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("does not overlap polling with initial background pagination", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });

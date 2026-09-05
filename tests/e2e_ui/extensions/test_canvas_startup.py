@@ -238,12 +238,16 @@ def test_canvas_reconciles_a_sparse_cached_preview(
             canonical_queries.append(query)
             assert "after" not in query
             assert query["limit"] == ["1000"]
-            expect(canvas.get_by_text("2 sessions", exact=True)).to_be_visible()
-            expect(canvas.get_by_role("status", name="Loading sessions")).to_be_visible()
-            page.screenshot(path=str(tmp_path / "canvas-cached-preview.png"))
-            canvas.locator(".canvas-toolbar").screenshot(
-                path=str(tmp_path / "canvas-loading-count.png")
-            )
+            if len(canonical_queries) == 1:
+                expect(canvas.get_by_text("2 sessions", exact=True)).to_be_visible()
+                expect(canvas.get_by_role("status", name="Loading sessions")).to_be_visible()
+                page.screenshot(path=str(tmp_path / "canvas-cached-preview.png"))
+                canvas.locator(".canvas-toolbar").screenshot(
+                    path=str(tmp_path / "canvas-loading-count.png")
+                )
+            else:
+                expect(canvas.get_by_text("6 sessions", exact=True)).to_be_visible()
+                expect(canvas.get_by_role("status", name="Loading sessions")).to_have_count(0)
             data, has_more = sessions, False
         else:
             data, has_more = cached, cache_has_more
@@ -276,6 +280,17 @@ def test_canvas_reconciles_a_sparse_cached_preview(
     expect(canvas.get_by_role("status", name="Loading sessions")).to_have_count(0)
     assert len(canonical_queries) == 1
     page.screenshot(path=str(tmp_path / "canvas-complete.png"))
+
+    with page.expect_response(
+        lambda response: (
+            "/v1/sessions?" in response.url
+            and parse_qs(urlparse(response.url).query).get("kind") == ["default"]
+        )
+    ):
+        canvas.locator(".canvas-shell").evaluate("() => window.dispatchEvent(new Event('focus'))")
+    expect(canvas.get_by_role("status", name="Loading sessions")).to_have_count(0)
+    expect(canvas.get_by_text("6 sessions", exact=True)).to_be_visible()
+    assert len(canonical_queries) == 2
 
 
 def _wait_for_centered_canvas(page: Page, card_count: int) -> None:
