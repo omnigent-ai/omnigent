@@ -1130,6 +1130,34 @@ def test_host_reset_id_declined_prompt_leaves_id_untouched(
     assert cfg["host"]["host_id"] == "a" * 32
 
 
+def test_host_reset_id_refuses_when_env_override_pins_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With OMNIGENT_HOST_ID set, reset-id refuses instead of a silent no-op.
+
+    An env override makes the host read its identity from the environment,
+    ignoring config.yaml — so writing a fresh id to the file would be
+    ignored by the next `omnigent host`. The command must fail loud (naming
+    the env vars to unset) rather than print a reset that has no effect.
+    """
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}}))
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [])
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "b" * 32)
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-host")
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id", "--yes"])
+
+    assert result.exit_code != 0
+    assert "OMNIGENT_HOST_ID" in result.output
+    # The persisted id is untouched — no misleading "reset" happened.
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] == "a" * 32
+
+
 def test_foreground_connect_local_prompts_after_keyboard_interrupt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
