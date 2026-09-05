@@ -68,6 +68,8 @@ from omnigent.server.schemas import (
     OutputItemDoneEvent,
     PolicyEvaluationRequestEvent,
     ResponseObject,
+    RetryErrorDetail,
+    RetryEvent,
     ServerStreamEvent,
     Usage,
 )
@@ -135,6 +137,17 @@ _TURN_IDLE_TIMEOUT_S = float(
 # the idle watchdog is disabled (``HARNESS_TURN_TIMEOUT_S <= 0``) does
 # this act as a strict wall-clock cap. ``<= 0`` disables.
 _TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "10800"))
+
+# Bounded in-scaffold recovery of a WEDGED turn. When the idle watchdog
+# expires (``run_turn`` emitted nothing for the whole window — typically one
+# LLM or tool call that hangs), the scaffold abandons the wedged ``run_turn``
+# invocation (cancellation tears down the in-flight call and the inner
+# executor) and re-runs the turn instead of hard-stopping the whole run on a
+# single transiently wedged call. Kept small and hardcoded: each wedged
+# attempt already costs a full idle window, and a call that wedges twice in
+# a row is treated as genuinely stuck rather than transient. The absolute
+# ceiling spans all attempts, so recovery never extends the hard cap.
+_WEDGED_TURN_RECOVERY_RETRIES = 1
 
 
 @dataclass(frozen=True)
@@ -1517,7 +1530,16 @@ class HarnessApp:
           the idle watchdog; only with the idle watchdog disabled does
           this act as a strict wall-clock cap.
 
-        Either expiry surfaces a wedged/runaway ``run_turn`` as
+        An idle expiry means one call (typically an LLM request that opened
+        a stream and then emitted nothing) wedged mid-turn. That is usually
+        transient, so before failing the run the scaffold RECOVERS: the
+        wedged ``run_turn`` invocation is cancelled (which tears down the
+        in-flight call and the inner executor via the subclass's
+        abnormal-exit cleanup), a ``response.retry`` event is emitted so
+        clients can show the recovery, and the turn is re-run — up to
+        :data:`_WEDGED_TURN_RECOVERY_RETRIES` times. Only when every attempt
+        wedges (or the absolute ceiling expires, which spans all attempts
+        and is never extended by recovery) does the turn surface as
         ``response.failed``.
 
         :param request: Forwarded to ``run_turn``.
@@ -1526,76 +1548,126 @@ class HarnessApp:
         idle_timeout = _TURN_IDLE_TIMEOUT_S
         absolute_timeout = _TURN_ABSOLUTE_TIMEOUT_S
         # ``asyncio.timeout(None)`` is a no-op, so ``<= 0`` disables each.
-        idle_wd = asyncio.timeout(idle_timeout if idle_timeout > 0 else None)
         absolute_wd = asyncio.timeout(absolute_timeout if absolute_timeout > 0 else None)
-        if idle_timeout > 0:
-            loop = asyncio.get_running_loop()
-
-            def _reset() -> None:
-                # Push the idle deadline ``idle_timeout`` s past now. Called
-                # from ``ctx.emit`` during ``run_turn`` (inside the active
-                # context). ``expired()`` guards a late emit racing a
-                # just-fired timeout: rescheduling an expiring/expired
-                # ``asyncio.Timeout`` raises RuntimeError out of ``emit``.
-                now = loop.time()
-                if not idle_wd.expired():
-                    idle_wd.reschedule(now + idle_timeout)
-                # Real progress also extends the absolute ceiling to at
-                # least one idle window past now, so an actively-emitting
-                # turn is never guillotined mid-work for total duration
-                # alone. A turn that outlives the original ceiling and then
-                # stalls is failed by the idle watchdog one window later.
-                absolute_deadline = absolute_wd.when()
-                if (
-                    not absolute_wd.expired()
-                    and absolute_deadline is not None
-                    and absolute_deadline < now + idle_timeout
-                ):
-                    absolute_wd.reschedule(now + idle_timeout)
-
-            def _hold_idle() -> None:
-                # Keep-alive during a pending human wait: push ONLY the idle
-                # deadline, never the absolute ceiling — an approval that is
-                # never answered must still terminate at the hard cap.
-                if not idle_wd.expired():
-                    idle_wd.reschedule(loop.time() + idle_timeout)
-
-            ctx._reset_idle_watchdog = _reset
-            ctx._hold_idle_watchdog = _hold_idle
+        attempts = 1 + max(0, _WEDGED_TURN_RECOVERY_RETRIES)
+        loop = asyncio.get_running_loop()
         try:
-            # Absolute outer, idle inner: ``.expired()`` on each tells which
+            # Absolute outer (spans every recovery attempt), idle inner
+            # (fresh per attempt): ``.expired()`` on each tells which
             # ceiling tripped so the error message is accurate.
-            async with absolute_wd, idle_wd:
-                await self.run_turn(request, ctx)
+            async with absolute_wd:
+                for attempt in range(attempts):
+                    idle_wd = asyncio.timeout(idle_timeout if idle_timeout > 0 else None)
+                    if idle_timeout > 0:
+
+                        def _reset(idle_wd: asyncio.Timeout = idle_wd) -> None:
+                            # Push the idle deadline ``idle_timeout`` s past
+                            # now. Called from ``ctx.emit`` during
+                            # ``run_turn`` (inside the active context).
+                            # ``expired()`` guards a late emit racing a
+                            # just-fired timeout: rescheduling an
+                            # expiring/expired ``asyncio.Timeout`` raises
+                            # RuntimeError out of ``emit``.
+                            now = loop.time()
+                            if not idle_wd.expired():
+                                idle_wd.reschedule(now + idle_timeout)
+                            # Real progress also extends the absolute ceiling
+                            # to at least one idle window past now, so an
+                            # actively-emitting turn is never guillotined
+                            # mid-work for total duration alone. A turn that
+                            # outlives the original ceiling and then stalls
+                            # is failed by the idle watchdog one window later.
+                            absolute_deadline = absolute_wd.when()
+                            if (
+                                not absolute_wd.expired()
+                                and absolute_deadline is not None
+                                and absolute_deadline < now + idle_timeout
+                            ):
+                                absolute_wd.reschedule(now + idle_timeout)
+
+                        def _hold_idle(idle_wd: asyncio.Timeout = idle_wd) -> None:
+                            # Keep-alive during a pending human wait: push
+                            # ONLY the idle deadline, never the absolute
+                            # ceiling — an approval that is never answered
+                            # must still terminate at the hard cap.
+                            if not idle_wd.expired():
+                                idle_wd.reschedule(loop.time() + idle_timeout)
+
+                        ctx._reset_idle_watchdog = _reset
+                        ctx._hold_idle_watchdog = _hold_idle
+                    try:
+                        async with idle_wd:
+                            await self.run_turn(request, ctx)
+                        return
+                    except TimeoutError as exc:
+                        if not idle_wd.expired():
+                            # An inner ``run_turn`` TimeoutError (not the
+                            # watchdog); pass it through unchanged.
+                            raise
+                        # No retry when the absolute ceiling leaves less
+                        # than one idle window: the retry could not even
+                        # wedge again before the hard cap kills it, so a
+                        # post-ceiling stall keeps dying promptly via the
+                        # idle error instead of bouncing into the cap.
+                        absolute_deadline = absolute_wd.when()
+                        out_of_absolute_budget = absolute_wd.expired() or (
+                            absolute_deadline is not None
+                            and absolute_deadline - loop.time() < idle_timeout
+                        )
+                        last_attempt = attempt + 1 >= attempts
+                        if last_attempt or out_of_absolute_budget or ctx.cancelled.is_set():
+                            raise self._idle_watchdog_error(ctx, idle_timeout, attempt) from exc
+                        # A single wedged call must not hard-stop the whole
+                        # run: the cancelled run_turn already tore down the
+                        # wedged in-flight call; announce the retry and
+                        # re-run the turn. Detach the hooks first so the
+                        # announcement emit can't extend the absolute
+                        # ceiling — recovery never buys the turn more of the
+                        # hard cap.
+                        ctx._reset_idle_watchdog = None
+                        ctx._hold_idle_watchdog = None
+                        _logger.warning(
+                            "run_turn for %s made no progress for %.0fs (idle turn "
+                            "watchdog); abandoning the wedged call and retrying the "
+                            "turn (attempt %d/%d)",
+                            ctx.response_id,
+                            idle_timeout,
+                            attempt + 2,
+                            attempts,
+                        )
+                        ctx.emit(
+                            RetryEvent(
+                                type="response.retry",
+                                source="llm",
+                                attempt=attempt + 2,
+                                max_attempts=attempts,
+                                delay_seconds=0.0,
+                                error=RetryErrorDetail(
+                                    code="timeout",
+                                    message=(
+                                        f"turn made no progress for "
+                                        f"{idle_timeout:.0f}s (likely a wedged LLM or "
+                                        f"tool call); the wedged call was abandoned "
+                                        f"and the turn is being retried"
+                                    ),
+                                ),
+                            )
+                        )
+                    finally:
+                        # Detach the hooks before this attempt's timeout
+                        # context unwinds so a stray late ``emit`` can't
+                        # reschedule a finished timeout.
+                        ctx._reset_idle_watchdog = None
+                        ctx._hold_idle_watchdog = None
         except TimeoutError as exc:
+            # When the stall pushed the idle deadline and the extended
+            # absolute ceiling onto the same instant, both timers fire and
+            # the conversion lands at the OUTER (absolute) context — but the
+            # stall is the real cause, so prefer the idle message (matching
+            # the pre-recovery behavior). ``idle_wd``/``attempt`` are the
+            # last loop iteration's; the loop always ran at least once.
             if idle_wd.expired():
-                _logger.warning(
-                    "run_turn for %s made no progress for %.0fs (idle turn watchdog); "
-                    "marking the turn failed",
-                    ctx.response_id,
-                    idle_timeout,
-                )
-                # A native forwarder that can't reach the server (e.g.
-                # ``No route to host``) starves the turn of progress events, so
-                # the idle watchdog — not the connectivity error — is what fails
-                # the turn. If such a POST failure was recorded recently, attach
-                # it so the user sees the real cause rather than a generic
-                # "wedged LLM" reason. The window is twice the
-                # idle timeout: the failure that began the stall is already
-                # ~idle_timeout old when the watchdog fires, so a window equal
-                # to the stall would race past it; 2x captures it while still
-                # ignoring a long-resolved earlier blip.
-                forwarder_failure = native_forwarder_health.recent_post_failure(idle_timeout * 2)
-                cause = (
-                    f"likely a wedged LLM or tool call; "
-                    f"recent forwarder POST failure ({forwarder_failure})"
-                    if forwarder_failure is not None
-                    else "likely a wedged LLM or tool call"
-                )
-                raise RuntimeError(
-                    f"turn exceeded the {idle_timeout:.0f}s harness idle watchdog "
-                    f"(run_turn emitted no events for {idle_timeout:.0f}s; {cause})"
-                ) from exc
+                raise self._idle_watchdog_error(ctx, idle_timeout, attempt) from exc
             if absolute_wd.expired():
                 _logger.warning(
                     "run_turn for %s exceeded the %.0fs absolute turn ceiling; "
@@ -1617,13 +1689,58 @@ class HarnessApp:
             # ``response.cancelled`` event.
             raise
         finally:
-            # Detach the reset hook before the timeout context unwinds so
-            # a stray late ``emit`` can't reschedule a finished timeout.
-            ctx._reset_idle_watchdog = None
-            ctx._hold_idle_watchdog = None
             # Sentinel that tells ``_stream_turn`` to stop reading
             # the queue and emit the terminal event.
             ctx._event_queue.put_nowait(None)
+
+    def _idle_watchdog_error(
+        self, ctx: TurnContext, idle_timeout: float, attempt: int
+    ) -> RuntimeError:
+        """
+        Build the terminal error for an idle-watchdog expiry.
+
+        :param ctx: The per-turn context (used for logging).
+        :param idle_timeout: The idle window that expired, in seconds.
+        :param attempt: 0-based index of the attempt that wedged, so the
+            message can say recovery was already tried.
+        :returns: The ``RuntimeError`` to surface as ``response.failed``.
+        """
+        _logger.warning(
+            "run_turn for %s made no progress for %.0fs (idle turn watchdog); "
+            "marking the turn failed",
+            ctx.response_id,
+            idle_timeout,
+        )
+        # A native forwarder that can't reach the server (e.g.
+        # ``No route to host``) starves the turn of progress events, so
+        # the idle watchdog — not the connectivity error — is what fails
+        # the turn. If such a POST failure was recorded recently, attach
+        # it so the user sees the real cause rather than a generic
+        # "wedged LLM" reason. The window is one idle window per wedged
+        # attempt plus one of slack: the failure that began the stall is
+        # already ~idle_timeout × attempts old when the final watchdog
+        # fires (each recovery retry consumed another window), so a
+        # window equal to the stall would race past it; the extra window
+        # captures it while still ignoring a long-resolved earlier blip.
+        forwarder_failure = native_forwarder_health.recent_post_failure(
+            idle_timeout * (attempt + 2)
+        )
+        cause = (
+            f"likely a wedged LLM or tool call; "
+            f"recent forwarder POST failure ({forwarder_failure})"
+            if forwarder_failure is not None
+            else "likely a wedged LLM or tool call"
+        )
+        retried = (
+            f"; {attempt} recovery retr{'y was' if attempt == 1 else 'ies were'} "
+            f"attempted and also wedged"
+            if attempt > 0
+            else ""
+        )
+        return RuntimeError(
+            f"turn exceeded the {idle_timeout:.0f}s harness idle watchdog "
+            f"(run_turn emitted no events for {idle_timeout:.0f}s; {cause}{retried})"
+        )
 
     async def _heartbeat_loop(self, ctx: TurnContext) -> None:
         """
