@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -201,6 +202,94 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert started["argv"][1] == "serve"
     assert server.process is not None
     assert server.process.pid == 4242
+
+
+async def test_start_closes_process_when_readiness_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancelling startup during the readiness probe reaps ``opencode serve``.
+
+    Session teardown can land while ``start()`` is still polling readiness;
+    the spawned child has no other owner yet, so ``start()`` itself must
+    close it instead of leaking one orphaned server per cancelled startup.
+    """
+    server = _server(monkeypatch, tmp_path)
+
+    class _FakeProc:
+        returncode: int | None = None
+        terminated = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+
+        def wait(self, _timeout: float | None = None) -> int:
+            assert self.returncode is not None
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    process = _FakeProc()
+    readiness_started = asyncio.Event()
+
+    async def parked_wait(self: OpenCodeNativeServer) -> None:
+        readiness_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", lambda argv, **kwargs: process)
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", parked_wait)
+
+    start_task = asyncio.create_task(server.start())
+    await readiness_started.wait()
+    start_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+
+    assert process.terminated is True
+    assert server.process is None
+
+
+async def test_start_closes_process_when_readiness_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A readiness probe that gives up must not leave ``opencode serve`` running."""
+    server = _server(monkeypatch, tmp_path)
+
+    class _FakeProc:
+        returncode: int | None = None
+        terminated = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+
+        def wait(self, _timeout: float | None = None) -> int:
+            assert self.returncode is not None
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    process = _FakeProc()
+
+    async def failing_wait(self: OpenCodeNativeServer) -> None:
+        raise RuntimeError("opencode serve did not become ready")
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", lambda argv, **kwargs: process)
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", failing_wait)
+
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        await server.start()
+
+    assert process.terminated is True
+    assert server.process is None
 
 
 async def test_start_raises_on_unsupported_version_without_env(

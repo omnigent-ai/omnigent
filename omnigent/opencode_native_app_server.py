@@ -502,7 +502,14 @@ class OpenCodeNativeServer:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        await self._wait_until_ready()
+        try:
+            await self._wait_until_ready()
+        except BaseException:
+            # The child is already running but no caller owns it yet: a
+            # cancelled startup (session deleted mid-boot) or a failed
+            # readiness probe would otherwise orphan ``opencode serve``.
+            await self.close()
+            raise
 
     async def _wait_until_ready(self, *, attempts: int = 60, delay: float = 0.5) -> None:
         """
