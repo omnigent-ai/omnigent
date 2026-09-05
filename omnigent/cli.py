@@ -7153,6 +7153,15 @@ def _build_resume_parts() -> list[str]:
             flag = max(param.opts, key=len)
             if param.is_flag:
                 parts.append(flag)
+            elif getattr(param, "multiple", False):
+                # A repeatable option arrives as a tuple, and str() on it
+                # yields "()" or "('a=b',)" -- neither of which parses back.
+                # Emit the flag once per value instead, and skip an empty
+                # tuple entirely: click reports it as differing from a None
+                # default, so it would otherwise resume as a literal "()".
+                for item in value:
+                    parts.append(flag)
+                    parts.append(str(item))
             else:
                 parts.append(flag)
                 parts.append(str(value))
@@ -7789,6 +7798,7 @@ def _dispatch_run(
         model=model,
         prompt=None,
         system_prompt=system_prompt,
+        sub_harness=sub_harness,
         ephemeral=ephemeral,
         resume_conversation_id=resume_conversation_id,
         resume_latest=resume_latest,
