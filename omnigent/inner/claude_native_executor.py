@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 
 from omnigent.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
@@ -19,6 +19,7 @@ from omnigent.claude_native_bridge import (
     inject_user_message,
     kill_session,
     read_active_session_id,
+    read_bridge_workspace,
     read_claude_status_model,
     read_launch_model,
     read_model_env,
@@ -34,7 +35,12 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
-from omnigent.inner.native_attachments import attachment_reference_line
+from omnigent.inner.native_attachments import (
+    attachment_reference_line,
+    unresolved_attachment_marker,
+    workspace_attachment_reference_line,
+    workspace_materialize_upload_limit,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -58,6 +64,9 @@ class ClaudeNativeExecutor(Executor):
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         self._request_session_id = _request_session_id_from_env()
+        # Where non-inlinable attachments are materialized. Read once: the
+        # launch workspace does not change for the life of a bridge.
+        self._workspace = read_bridge_workspace(self._bridge_dir)
         # Serializes every write to the shared tmux pane. ``run_turn``
         # (the initiating message) and ``enqueue_session_message``
         # (mid-turn steering) run as concurrent tasks against this one
@@ -96,7 +105,7 @@ class ClaudeNativeExecutor(Executor):
         del session_key
         if not _session_is_active(self._bridge_dir, self._request_session_id):
             return False
-        text = _content_to_text(content, self._bridge_dir)
+        text = _content_to_text(content, self._bridge_dir, self._workspace)
         if not text:
             return False
         try:
@@ -149,7 +158,7 @@ class ClaudeNativeExecutor(Executor):
                 )
             )
             return
-        text = _latest_user_text(messages, self._bridge_dir)
+        text = _latest_user_text(messages, self._bridge_dir, self._workspace)
         if not text:
             yield ExecutorError(message="Claude native turn had no user text to send")
             return
@@ -376,7 +385,9 @@ def _session_is_active(bridge_dir: Path, request_session_id: str | None) -> bool
     return active_session_id is None or active_session_id == request_session_id
 
 
-def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
+def _latest_user_text(
+    messages: list[Message], bridge_dir: Path, workspace: Path | None = None
+) -> str:
     """
     Return the latest user text from executor messages.
 
@@ -387,23 +398,28 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     :param messages: Conversation history in executor message shape.
     :param bridge_dir: Bridge directory path for writing attachment
         files, e.g. ``Path("/tmp/omnigent/claude-native/<digest>")``.
+    :param workspace: Workspace root for materialized attachments.
     :returns: Concatenated latest user message text, or ``""`` when
         no user text is present.
     """
     for message in reversed(messages):
         if message.get("role") == "user":
-            return _content_to_text(message.get("content"), bridge_dir)
+            return _content_to_text(message.get("content"), bridge_dir, workspace)
     return ""
 
 
-def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
+def _content_to_text(
+    content: EnqueuedContent, bridge_dir: Path, workspace: Path | None = None
+) -> str:
     """
     Normalize executor content into plain text.
 
     Text blocks are extracted directly. Multimodal blocks
     (``input_image``, ``input_file``) that carry resolved base64 data
     URIs are decoded to files in the bridge directory and referenced
-    by path so Claude Code can view them with its Read tool.
+    by path so Claude Code can view them with its Read tool. Types that
+    are never inlined (archives, office documents, databases) go to the
+    workspace instead, where Claude's own tools already have access.
 
     :param content: Message content, e.g. a string or a list of
         ``{"type": "input_text", "text": "..."}`` blocks. May also
@@ -411,6 +427,9 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
         or ``input_file`` blocks with a ``file_data`` data URI.
     :param bridge_dir: Bridge directory path for writing attachment
         files, e.g. ``Path("/tmp/omnigent/claude-native/<digest>")``.
+    :param workspace: Workspace root for materialized attachments.
+        ``None`` (no workspace recorded at launch) surfaces a visible
+        marker rather than dropping the attachment silently.
     :returns: Plain text content with file-path references prepended
         for any materialized attachments.
     """
@@ -428,7 +447,25 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
                 if isinstance(text, str):
                     text_parts.append(text)
             elif block_type in ("input_image", "input_file"):
-                attachment_lines.append(attachment_reference_line(block, bridge_dir))
+                attachment_lines.append(_attachment_line(block, bridge_dir, workspace))
         parts = attachment_lines + text_parts
         return "\n\n".join(parts)
     return ""
+
+
+def _attachment_line(block: Mapping[str, object], bridge_dir: Path, workspace: Path | None) -> str:
+    """
+    Reference line for one attachment, routed by delivery mode.
+
+    :param block: Attachment content block.
+    :param bridge_dir: Bridge directory for inlinable types.
+    :param workspace: Workspace root for materialized types, or ``None``.
+    :returns: The transcript line referencing the materialized file, or a
+        visible marker when it could not be placed.
+    """
+    filename = block.get("filename")
+    if workspace_materialize_upload_limit(filename if isinstance(filename, str) else None) is None:
+        return attachment_reference_line(block, bridge_dir)
+    if workspace is None:
+        return unresolved_attachment_marker(block)
+    return workspace_attachment_reference_line(block, workspace)

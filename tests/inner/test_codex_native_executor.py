@@ -501,6 +501,99 @@ def test_input_file_binary_is_materialized_and_referenced_by_path(
     assert referenced.read_bytes() == pdf_bytes
 
 
+def test_input_file_zip_is_materialized_into_the_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A zip lands in the workspace, not the bridge directory.
+
+    Codex's own shell tools operate in the thread's cwd; a file staged in
+    the bridge dir sits outside it (and outside the sandbox's writable
+    root), so the agent could not open it.
+    """
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+            cwd=str(workspace),
+        ),
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    zip_bytes = b"PK\x03\x04 fake zip bytes"
+    data_uri = "data:application/zip;base64," + base64.b64encode(zip_bytes).decode()
+    block = {"type": "input_file", "file_data": data_uri, "filename": "bundle.zip"}
+
+    async def run() -> None:
+        """Drive one turn carrying a single zip ``input_file`` block."""
+        async for _event in executor.run_turn([{"role": "user", "content": [block]}], [], ""):
+            pass
+
+    asyncio.run(run())
+
+    _method, params = _FakeCodexNativeClient.requests[-1]
+    text = params["input"][0]["text"]
+    referenced = Path(text[len("[Attached file: ") : -len("]")])
+    assert referenced.parent == workspace / "session-attachments"
+    assert referenced.read_bytes() == zip_bytes
+    assert not (tmp_path / "uploads").exists()
+
+
+def test_input_file_zip_without_workspace_emits_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    With no cwd in bridge state there is nowhere to place the file, so the
+    turn carries a visible marker rather than a path the agent can't read.
+    """
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    data_uri = "data:application/zip;base64," + base64.b64encode(b"PK\x03\x04").decode()
+    block = {"type": "input_file", "file_data": data_uri, "filename": "bundle.zip"}
+
+    async def run() -> None:
+        """Drive one turn carrying a zip with no workspace recorded."""
+        async for _event in executor.run_turn([{"role": "user", "content": [block]}], [], ""):
+            pass
+
+    asyncio.run(run())
+
+    _method, params = _FakeCodexNativeClient.requests[-1]
+    assert params["input"] == [
+        {"type": "text", "text": "[Attachment bundle.zip could not be loaded]"}
+    ]
+
+
 async def test_executor_reaches_app_server_over_ws_transport(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
