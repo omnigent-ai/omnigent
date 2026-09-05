@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { ComponentType, ReactNode } from "react";
 
 /**
  * Embed host integration seam.
@@ -22,6 +22,32 @@ import type { ReactNode } from "react";
 export interface UserSuggestion {
   userId: string;
   displayName?: string;
+}
+
+export type OmnigentExtensionFramePostMessage = (
+  message: unknown,
+  transfer?: Transferable[],
+) => void;
+
+export interface OmnigentExtensionFrameReady {
+  nonce: string;
+  postMessage: OmnigentExtensionFramePostMessage;
+}
+
+/**
+ * Contract for a host-controlled extension frame. Implementations must isolate
+ * extension scripts, enforce the supplied CSP, validate the loaded frame's
+ * source and origin, and keep the returned sender bound to that exact frame.
+ */
+export interface OmnigentExtensionFrameProps {
+  title: string;
+  /** Body markup to inject into the isolated document. */
+  htmlContent: string;
+  contentSecurityPolicy: string;
+  nonce: string;
+  className?: string;
+  /** Called with the same nonce after the frame can receive init and its port. */
+  onReady: (ready: OmnigentExtensionFrameReady) => void;
 }
 
 /**
@@ -165,6 +191,8 @@ export interface OmnigentHostConfig {
      */
     databricksGitCredentials?: ReactNode;
   };
+  /** Host-provided frame used to render extensions outside the host document. */
+  extensionFrame?: ComponentType<OmnigentExtensionFrameProps>;
 }
 
 let hostConfig: OmnigentHostConfig = {};

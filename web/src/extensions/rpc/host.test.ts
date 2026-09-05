@@ -73,7 +73,7 @@ describe("loadExtensionBundle", () => {
 
 describe("buildExtensionDocument", () => {
   it("builds an opaque-origin document with no network egress", () => {
-    const { srcDoc, identity } = buildExtensionDocument(
+    const { contentSecurityPolicy, htmlContent, srcDoc, identity } = buildExtensionDocument(
       { extension, script: "globalThis.ok=true;</script>", styles: "body{color:red}</style>" },
       page,
       "nonce123",
@@ -96,6 +96,11 @@ describe("buildExtensionDocument", () => {
     expect(srcDoc).toContain("atob(");
     expect(srcDoc).not.toContain("globalThis.ok=true;</script>");
     expect(srcDoc).not.toContain("body{color:red}</style>");
+    expect(contentSecurityPolicy).toContain("default-src 'none'");
+    expect(contentSecurityPolicy).toContain("connect-src 'none'");
+    expect(htmlContent).toContain('<div id="root"></div>');
+    expect(htmlContent).toContain('nonce="nonce123"');
+    expect(srcDoc).toContain(`<body>${htmlContent}</body>`);
   });
 });
 

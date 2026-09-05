@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setOmnigentHostConfig, type OmnigentExtensionFrameProps } from "@/lib/host";
 import { EXTENSION_RPC_SOURCE, EXTENSION_RPC_VERSION } from "./rpc/protocol";
 import type { ExtensionCatalogItem, ExtensionPage } from "./types";
 
@@ -55,12 +56,20 @@ const refresh = vi.fn(async () => [extension]);
 
 beforeEach(() => {
   vi.stubGlobal("MessageChannel", FakeMessageChannel);
+  FakeMessageChannel.latest = null;
   loadBundleMock.mockReset().mockResolvedValue({ extension, script: "", styles: "" });
-  buildDocumentMock.mockReset().mockReturnValue({ srcDoc: "<html></html>", identity });
+  buildDocumentMock.mockReset().mockReturnValue({
+    srcDoc: "<html></html>",
+    htmlContent: '<div id="root"></div>',
+    contentSecurityPolicy: "default-src 'none'",
+    identity,
+  });
   refresh.mockClear();
+  setOmnigentHostConfig({});
 });
 
 afterEach(() => {
+  setOmnigentHostConfig({});
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
@@ -82,6 +91,40 @@ describe("ExtensionViewHost", () => {
       } as MessageEvent<unknown>);
     });
     await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
+  });
+
+  it("starts the handshake when a host-provided frame reports readiness", async () => {
+    let frameProps: OmnigentExtensionFrameProps | null = null;
+    const ExtensionFrame = (props: OmnigentExtensionFrameProps) => {
+      frameProps = props;
+      return <div title={props.title} />;
+    };
+    const postMessage = vi.fn();
+    setOmnigentHostConfig({ extensionFrame: ExtensionFrame });
+
+    render(<ExtensionViewHost extension={extension} page={page} refresh={refresh} />);
+
+    expect((await screen.findByTitle("Dashboard")).tagName).toBe("DIV");
+    expect(frameProps).toMatchObject({
+      htmlContent: '<div id="root"></div>',
+      contentSecurityPolicy: "default-src 'none'",
+      nonce: "nonce",
+    });
+
+    act(() => frameProps?.onReady({ nonce: "stale", postMessage }));
+    expect(postMessage).not.toHaveBeenCalled();
+    expect(FakeMessageChannel.latest).toBeNull();
+
+    act(() => frameProps?.onReady({ nonce: "nonce", postMessage }));
+
+    expect(postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ...identity,
+        source: EXTENSION_RPC_SOURCE,
+        type: "init",
+      }),
+      [FakeMessageChannel.latest!.port2],
+    );
   });
 
   it("rejects an incompatible extension SDK explicitly", async () => {

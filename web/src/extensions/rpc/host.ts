@@ -8,6 +8,13 @@ export interface LoadedExtensionBundle {
   styles: string;
 }
 
+export interface ExtensionDocument {
+  srcDoc: string;
+  htmlContent: string;
+  contentSecurityPolicy: string;
+  identity: ExtensionIdentity;
+}
+
 export function createExtensionNonce(): string {
   const bytes = new Uint8Array(24);
   crypto.getRandomValues(bytes);
@@ -67,7 +74,7 @@ export function buildExtensionDocument(
   bundle: LoadedExtensionBundle,
   page: ExtensionPage,
   nonce: string,
-): { srcDoc: string; identity: ExtensionIdentity } {
+): ExtensionDocument {
   const identity: ExtensionIdentity = {
     extensionId: bundle.extension.id,
     pageId: page.id,
@@ -90,8 +97,11 @@ export function buildExtensionDocument(
     "base-uri 'none'",
     "webrtc 'none'",
   ].join("; ");
+  const htmlContent = `<div id="root"></div><script nonce="${nonce}">${bootstrap}</script>`;
   return {
     identity,
-    srcDoc: `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><div id="root"></div><script nonce="${nonce}">${bootstrap}</script></body></html>`,
+    htmlContent,
+    contentSecurityPolicy: csp,
+    srcDoc: `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body>${htmlContent}</body></html>`,
   };
 }
