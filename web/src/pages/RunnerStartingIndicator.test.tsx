@@ -146,6 +146,32 @@ describe("RunnerStartingIndicator", () => {
     expect(indicator).not.toHaveTextContent(/starting up/i);
   });
 
+  it.each([
+    ["provisioning", /provisioning sandbox/i],
+    ["cloning", /cloning repository/i],
+    ["starting", /connecting host/i],
+    ["connecting", /starting agent/i],
+  ] as const)("row: the %s stage pairs its label with how long to expect", (stage, label) => {
+    // A bare stage label reads as stuck ("Connecting host…" gives no hint
+    // whether the wait is seconds or minutes), so every in-flight stage
+    // must carry duration-expectation copy alongside its label.
+    useChatStore.setState({ sandboxStatus: { stage, error: null } });
+    renderWithContext("row", makeCtx({ isTerminalFirst: false, terminalStartingUp: false }));
+    const indicator = screen.getByTestId("runner-starting-indicator");
+    expect(indicator).toHaveTextContent(label);
+    expect(indicator).toHaveTextContent(/second|minute|moment|quick|usually|shortly/i);
+  });
+
+  it("hero: the host-connect stage says seconds, not the generic minute copy", () => {
+    // The host-connect stage is expected to finish in seconds; telling the
+    // user it "can take a minute" oversells the wait and reads as slowness.
+    useChatStore.setState({ sandboxStatus: { stage: "starting", error: null } });
+    renderWithContext("hero", makeCtx({ isTerminalFirst: false, terminalStartingUp: false }));
+    const indicator = screen.getByTestId("runner-starting-indicator");
+    expect(indicator).toHaveTextContent(/connecting host/i);
+    expect(indicator).toHaveTextContent(/seconds/i);
+  });
+
   it.each(["hero", "row"] as const)(
     "%s: renders nothing for a FAILED sandbox launch",
     (variant) => {
