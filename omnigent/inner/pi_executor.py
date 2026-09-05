@@ -1198,9 +1198,7 @@ class _PiRpcSession:
         Also requires an empty queue so already-buffered lines are
         drained before the stream is declared exhausted.
         """
-        return (
-            self._read_task is None or self._read_task.done()
-        ) and self._line_queue.empty()
+        return (self._read_task is None or self._read_task.done()) and self._line_queue.empty()
 
     async def close(self) -> None:
         for task in (self._read_task, self._stderr_task):
