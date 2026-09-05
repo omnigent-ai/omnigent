@@ -2102,9 +2102,9 @@ export function AppShell() {
                   // No neighbor to resize against (chat is hidden, FilesPanel
                   // owns its own width) — grow via flex-1.
                   fluid={panelOpen}
-                  // Non-owners attach read-only: a shared PTY can't attribute
-                  // input per-user, so only the owner may type (server-enforced).
-                  readOnly={!isOwnerLevel(permissionLevel)}
+                  // The panel resolves read-only per terminal: the agent pane
+                  // is owner-only, user shells need edit (server-enforced).
+                  permissionLevel={permissionLevel}
                   onClose={() => setPanelInitialKey(null)}
                 />
               )}

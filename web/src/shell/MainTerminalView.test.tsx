@@ -111,7 +111,7 @@ function viewTree({
   isNativeWrapper = false,
   initialTerminalKey = null,
   visible = true,
-  readOnly = false,
+  permissionLevel = null,
   conversationId = "conv_sdk",
   runnerOnline,
   onResume,
@@ -122,7 +122,7 @@ function viewTree({
   isNativeWrapper?: boolean;
   initialTerminalKey?: string | null;
   visible?: boolean;
-  readOnly?: boolean;
+  permissionLevel?: number | null;
   conversationId?: string;
   runnerOnline?: boolean;
   onResume?: () => void | Promise<void>;
@@ -136,7 +136,7 @@ function viewTree({
         conversationId={conversationId}
         initialTerminalKey={initialTerminalKey}
         visible={visible}
-        readOnly={readOnly}
+        permissionLevel={permissionLevel}
         runnerOnline={runnerOnline}
         onResume={onResume}
       />
@@ -171,30 +171,39 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
     expect(screen.queryByTestId("new-shell-button")).toBeNull();
   });
 
-  it("forwards readOnly to the terminal so non-owners attach view-only", () => {
-    // Owner (default): the agent terminal is interactive.
-    const { unmount } = renderView({ terminals: [REPL_TERMINAL] });
+  it("attaches the agent pane read-only for non-owners, interactive for owners", () => {
+    // Owner: the agent terminal is interactive.
+    const { unmount } = renderView({ terminals: [REPL_TERMINAL], permissionLevel: 4 });
     expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-read-only", "false");
     unmount();
 
-    // Non-owner: the same pane attaches read-only — they drive the
-    // agent via the composer, since a shared PTY can't attribute
-    // per-user keystrokes.
-    renderView({ terminals: [REPL_TERMINAL], readOnly: true });
+    // Edit collaborator: the agent pane attaches read-only — typing there
+    // would persist into history as the owner, so they drive the agent via
+    // the composer instead.
+    renderView({ terminals: [REPL_TERMINAL], permissionLevel: 2 });
     expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-read-only", "true");
   });
 
-  it("forwards readOnly to a rail-opened shell too", () => {
-    // A user shell shares the owner-only rule: non-owners watch but
-    // can't type.
-    renderView({
+  it("keeps a rail-opened shell interactive for edit collaborators", () => {
+    // A user shell is workspace mutation editors already hold, so an
+    // edit-level collaborator types into it (server-permitted); only
+    // read-level viewers attach read-only.
+    const { unmount } = renderView({
       terminals: [REPL_TERMINAL, BASH_SHELL],
       initialTerminalKey: "terminal:terminal_bash_s1",
-      readOnly: true,
+      permissionLevel: 2,
     });
     const view = screen.getByTestId("terminal-view");
     expect(view).toHaveAttribute("data-terminal-id", "terminal_bash_s1");
-    expect(view).toHaveAttribute("data-read-only", "true");
+    expect(view).toHaveAttribute("data-read-only", "false");
+    unmount();
+
+    renderView({
+      terminals: [REPL_TERMINAL, BASH_SHELL],
+      initialTerminalKey: "terminal:terminal_bash_s1",
+      permissionLevel: 1,
+    });
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-read-only", "true");
   });
 
   it("renders a rail-opened shell chrome-free: shell header + close, no agent tab", () => {
@@ -380,7 +389,7 @@ describe("MainTerminalView — native wrapper sessions", () => {
 
     rerender(
       <TerminalFirstContextProvider value={makeCtx(true)}>
-        <MainTerminalView conversationId="conv_b" initialTerminalKey={null} readOnly={false} />
+        <MainTerminalView conversationId="conv_b" initialTerminalKey={null} />
       </TerminalFirstContextProvider>,
     );
 
@@ -431,12 +440,7 @@ describe("MainTerminalView — persistent hidden mount", () => {
 
     rerender(
       <TerminalFirstContextProvider value={makeCtx(false)}>
-        <MainTerminalView
-          conversationId="conv_sdk"
-          initialTerminalKey={null}
-          visible={false}
-          readOnly={false}
-        />
+        <MainTerminalView conversationId="conv_sdk" initialTerminalKey={null} visible={false} />
       </TerminalFirstContextProvider>,
     );
     expect(screen.getByTestId("main-terminal-view")).toHaveAttribute("data-visible", "false");
@@ -445,12 +449,7 @@ describe("MainTerminalView — persistent hidden mount", () => {
 
     rerender(
       <TerminalFirstContextProvider value={makeCtx(false)}>
-        <MainTerminalView
-          conversationId="conv_sdk"
-          initialTerminalKey={null}
-          visible
-          readOnly={false}
-        />
+        <MainTerminalView conversationId="conv_sdk" initialTerminalKey={null} visible />
       </TerminalFirstContextProvider>,
     );
     expect(screen.getByTestId("main-terminal-view")).toHaveAttribute("data-visible", "true");
@@ -499,12 +498,7 @@ describe("MainTerminalView — persistent hidden mount", () => {
 
     rerender(
       <TerminalFirstContextProvider value={makeCtx(false)}>
-        <MainTerminalView
-          conversationId="conv_sdk"
-          initialTerminalKey={null}
-          visible={false}
-          readOnly={false}
-        />
+        <MainTerminalView conversationId="conv_sdk" initialTerminalKey={null} visible={false} />
       </TerminalFirstContextProvider>,
     );
     // The hidden background attach now targets the agent terminal — the

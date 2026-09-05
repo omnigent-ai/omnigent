@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "../lib/identity";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import { showToast } from "@/components/ui/toast";
 
@@ -70,6 +71,34 @@ export function isAgentTerminalKey(terminalKey: string): boolean {
     if (terminalKey === `terminal:${id}`) return true;
   }
   return false;
+}
+
+/**
+ * Whether a terminal must attach read-only for the caller's permission
+ * level. Mirrors the server's `_authorize_terminal_attach` gate
+ * (`omnigent/server/routes/terminal_attach.py`) — the two must agree or
+ * the UI offers input the server refuses (or silently drops input the
+ * server would accept, which reads as an unresponsive shell):
+ *
+ * - The AGENT's own pane persists input into history as the owner, so
+ *   only the owner types there (`LEVEL_OWNER`).
+ * - A user shell is workspace mutation editors already hold (they can
+ *   open/close these shells and run agent turns), so edit access
+ *   suffices (`LEVEL_EDIT`).
+ *
+ * `null` levels stay permissive (single-user / still loading), matching
+ * `isOwnerLevel` / `isEditorLevel`.
+ *
+ * @param terminalId Opaque terminal resource id, e.g. `"terminal_zsh_u-1a2b3c"`.
+ * @param permissionLevel The caller's effective permission level, or `null`.
+ */
+export function terminalAttachReadOnly(
+  terminalId: string,
+  permissionLevel: number | null,
+): boolean {
+  return AGENT_TERMINAL_IDS.has(terminalId)
+    ? !isOwnerLevel(permissionLevel)
+    : !isEditorLevel(permissionLevel);
 }
 
 /**

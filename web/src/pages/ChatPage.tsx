@@ -1365,13 +1365,13 @@ export function shouldMountTerminalSurface(
 /**
  * One recently-viewed terminal-first session whose terminal surface stays
  * mounted (hidden) after navigating away, so switching back re-reveals a
- * live attach instead of re-dialing. ``readOnly`` is snapshotted from the
- * session's own permission level while it was active — the current
+ * live attach instead of re-dialing. ``permissionLevel`` is snapshotted
+ * from the session's own level while it was active — the current
  * session's permissions must never leak onto a warm background surface.
  */
 export interface WarmTerminalEntry {
   conversationId: string;
-  readOnly: boolean;
+  permissionLevel: number | null;
 }
 
 /**
@@ -1388,18 +1388,18 @@ export const MAX_WARM_TERMINAL_SURFACES = 8;
 
 /**
  * LRU update for the warm terminal-surface cache: move (or insert)
- * *conversationId* at the most-recent end with the given *readOnly*
- * snapshot, evicting the least-recent entry past
+ * *conversationId* at the most-recent end with the given
+ * *permissionLevel* snapshot, evicting the least-recent entry past
  * {@link MAX_WARM_TERMINAL_SURFACES}. Pure — exported for direct unit
  * testing.
  */
 export function updateWarmTerminalSurfaces(
   prev: WarmTerminalEntry[],
   conversationId: string,
-  readOnly: boolean,
+  permissionLevel: number | null,
 ): WarmTerminalEntry[] {
   const rest = prev.filter((e) => e.conversationId !== conversationId);
-  return [...rest, { conversationId, readOnly }].slice(-MAX_WARM_TERMINAL_SURFACES);
+  return [...rest, { conversationId, permissionLevel }].slice(-MAX_WARM_TERMINAL_SURFACES);
 }
 
 /**
@@ -1644,21 +1644,19 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // while the terminal is shown — a heavy transcript shouldn't render
   // behind a live terminal.
   const mountTerminal = shouldMountTerminalSurface(conversationId, terminalFirst);
-  // Non-owners attach read-only: a shared PTY can't attribute input
-  // per-user, so only the owner may type. They drive the agent via the
-  // composer instead. Server enforces this too.
-  const terminalReadOnly = !isOwnerLevel(permissionLevel);
   const [warmTerminals, setWarmTerminals] = useState<WarmTerminalEntry[]>([]);
   useEffect(() => {
     if (!mountTerminal || !conversationId) return;
-    setWarmTerminals((prev) => updateWarmTerminalSurfaces(prev, conversationId, terminalReadOnly));
-  }, [mountTerminal, conversationId, terminalReadOnly]);
+    setWarmTerminals((prev) => updateWarmTerminalSurfaces(prev, conversationId, permissionLevel));
+  }, [mountTerminal, conversationId, permissionLevel]);
   // Derive from warmTerminals only — the effect above adds the active session
   // after the first paint, so xterm (a lazy chunk) never loads on the initial
   // render. Previously the active session was included here same-commit to
   // avoid the one-frame delay; that optimization is removed so the terminal
   // chunk defers until after first paint. Returning to an already-warm
   // background session is still same-commit (it's already in warmTerminals).
+  // The effect re-runs on a late permission hydrate, so the active
+  // session's entry tracks its permission snapshot one commit later.
   const renderedTerminals = warmTerminals;
   const handleTerminalResume = useCallback(async () => {
     if (!conversationId) throw new Error("Session is not available");
@@ -1687,7 +1685,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           runnerOnline={isActive ? runnerOnline : undefined}
           onResume={isActive ? handleTerminalResume : undefined}
           onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
-          readOnly={entry.readOnly}
+          permissionLevel={entry.permissionLevel}
         />
         {isShown && (
           <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
