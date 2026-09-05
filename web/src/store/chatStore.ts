@@ -4174,7 +4174,7 @@ export async function startStreamPump(
           // surfaces as offline liveness via ConnectionIndicator.
           if (streamRes.status === 401 || streamRes.status === 403) {
             console.warn(`Session ${id}: stream unavailable (${streamRes.status}), giving up`);
-            finalizeActive(set, "failed", `stream unavailable (${streamRes.status})`, null);
+            surfaceStreamGiveUp(set, get, `stream unavailable (${streamRes.status})`);
             set({ status: "idle" });
             break;
           }
@@ -4190,7 +4190,7 @@ export async function startStreamPump(
               );
               // Local lifecycle only — see the 401/403 branch above for why
               // `sessionStatus` is left to the server.
-              finalizeActive(set, "failed", "stream unavailable (404)", null);
+              surfaceStreamGiveUp(set, get, "stream unavailable (404)");
               set({ status: "idle" });
               break;
             }
@@ -6235,6 +6235,34 @@ function finalizeActive(
       activeResponse: { responseId, state, error, completedAt: Date.now() },
     };
   });
+}
+
+/**
+ * Settle a stream-pump give-up so the turn is never left a silent blank.
+ *
+ * On a give-up (a 401/403 the token can't fix, or a 404 that outlived its
+ * retry window) the pump stops for good. When a locally initiated
+ * `activeResponse` is in flight, mark it failed so its bubble shows the
+ * failure. But on a cold reconnect — the tab reattached to a turn it never
+ * started, so there is no local `activeResponse` — `finalizeActive` is a no-op,
+ * which used to leave the turn blank: no reply rendered and no error surfaced.
+ * In that case append a client error block so the dropped stream shows up as a
+ * visible, actionable error instead of an empty response.
+ */
+function surfaceStreamGiveUp(set: Setter, get: Getter, reason: string): void {
+  const hadActive = get().activeResponse !== null;
+  finalizeActive(set, "failed", reason, null);
+  if (hadActive) return;
+  set((s) => ({
+    blocks: [
+      ...s.blocks,
+      makeClientErrorBlock(
+        "The connection to the assistant dropped before its reply finished, so this " +
+          "response may be incomplete. Reload to see the latest.",
+        "",
+      ),
+    ],
+  }));
 }
 
 // Mirrors the server's ErrorCode.RUNNER_UNAVAILABLE (omnigent/errors.py) —
