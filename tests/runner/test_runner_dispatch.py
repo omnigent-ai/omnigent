@@ -7585,9 +7585,63 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     # short-circuit regressed).
     assert info["runner_online"] is None
     assert info["last_activity_at"] == 42
+    # Snapshot carried no compaction fields (older server) → the tool
+    # reports a zero count rather than dropping the key, so orchestrator
+    # prompts can rely on its presence.
+    assert info["compaction_count"] == 0
+    assert info["last_compaction_at"] is None
     assert info["pending_elicitations"] == []
     assert info["pending_elicitation_count"] == 0
     assert not any(p.startswith("/v1/runners") for p in requested_paths)
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_projects_compaction_aggregate() -> None:
+    """
+    The compaction aggregate reaches the orchestrator's tool output.
+
+    A session parked at repeated context compactions is only detectable
+    from metadata if ``compaction_count`` / ``last_compaction_at``
+    survive the runner's snapshot→tool projection. If the projection
+    dropped them, orchestrators polling ``sys_session_get_info`` would
+    again see a healthy-looking session and wait indefinitely.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_stalled":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_stalled",
+                    "agent_id": "ag_leaf",
+                    "agent_name": "leaf",
+                    "status": "running",
+                    "created_at": 1,
+                    "updated_at": 42,
+                    "compaction_count": 2,
+                    "last_compaction_at": 41,
+                    "runner_id": None,
+                    "pending_elicitations": [],
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_stalled"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["session_id"] == "conv_stalled"
+    assert info["compaction_count"] == 2
+    assert info["last_compaction_at"] == 41
 
 
 @pytest.mark.asyncio

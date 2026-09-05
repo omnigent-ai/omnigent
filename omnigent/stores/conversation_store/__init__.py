@@ -202,6 +202,27 @@ class CreatedSession:
 
 
 @dataclass(frozen=True)
+class CompactionStats:
+    """
+    Aggregate view of a conversation's persisted compaction items.
+
+    Returned by :meth:`ConversationStore.get_compaction_stats` so the
+    session snapshot can expose a metadata-level compaction signal
+    (``compaction_count`` / ``last_compaction_at``) without paging the
+    transcript. An orchestrator polling session metadata uses it to
+    spot a session that keeps compacting without making progress.
+
+    :param count: Total compaction items persisted to the
+        conversation, e.g. ``2``. ``0`` when none.
+    :param last_compaction_at: Unix epoch seconds of the most recent
+        compaction item, or ``None`` when ``count`` is ``0``.
+    """
+
+    count: int
+    last_compaction_at: int | None
+
+
+@dataclass(frozen=True)
 class SessionConnectivity:
     """
     The minimal session fields the sidebar's online-dot needs.
@@ -592,6 +613,24 @@ class ConversationStore(ABC):
             means return all types.
         :returns: A :class:`PagedList` of
             :class:`ConversationItem` objects.
+        """
+        ...
+
+    @abstractmethod
+    def get_compaction_stats(self, conversation_id: str) -> CompactionStats:
+        """
+        Return the compaction aggregate for one conversation.
+
+        One ``COUNT``/``MAX`` aggregate over the conversation's
+        compaction items, so the session snapshot can carry
+        ``compaction_count`` / ``last_compaction_at`` without paging
+        the transcript.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: A :class:`CompactionStats`; ``count=0`` with
+            ``last_compaction_at=None`` when the conversation has no
+            compaction items (or does not exist).
         """
         ...
 

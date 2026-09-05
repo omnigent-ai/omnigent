@@ -6271,6 +6271,13 @@
             "description": "Per-shell detail for the running tally above, so a reload can restore each shell's description/command. `None` when none are tracked (or when an older runner reported only the count).",
             "title": "Background Tasks"
           },
+          "compaction_count": {
+            "default": 0,
+            "description": "Total context compactions persisted to this session's transcript, e.g. `2`. `0` when the session has never compacted. Paired with `last_compaction_at`, this lets an orchestrator polling metadata spot the repeated-compaction stall signature (count climbing while `updated_at` otherwise freezes) without scraping transcript items.",
+            "format": "int64",
+            "title": "Compaction Count",
+            "type": "integer"
+          },
           "context_window": {
             "anyOf": [
               {
@@ -6393,6 +6400,19 @@
             "description": "Session-scoped guardrails labels. Empty dict when no labels have been written.",
             "title": "Labels",
             "type": "object"
+          },
+          "last_compaction_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch seconds of the most recent persisted compaction item, or `None` when the session has never compacted. A recent value alongside no further item appends marks a session parked at a compaction summary rather than progressing.",
+            "title": "Last Compaction At"
           },
           "last_task_error": {
             "anyOf": [

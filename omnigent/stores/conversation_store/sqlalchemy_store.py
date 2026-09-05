@@ -91,6 +91,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
+    CompactionStats,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -1969,6 +1970,36 @@ class SqlAlchemyConversationStore(ConversationStore):
                 last_id=items[-1].id if items else None,
                 has_more=has_more,
             )
+
+    def get_compaction_stats(self, conversation_id: str) -> CompactionStats:
+        """
+        Return the compaction aggregate for one conversation.
+
+        A single ``COUNT``/``MAX(created_at)`` aggregate over the
+        conversation's compaction items. Reads only indexed / narrow
+        columns (never ``data`` or ``search_text``), so it stays cheap
+        on chatty conversations.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: A :class:`CompactionStats`; ``count=0`` with
+            ``last_compaction_at=None`` when the conversation has no
+            compaction items (or does not exist).
+        """
+        with self._conv_session("select_compaction_stats") as session:
+            row = session.execute(
+                select(
+                    func.count(SqlConversationItem.id),
+                    func.max(SqlConversationItem.created_at),
+                ).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.type == encode_item_type("compaction"),
+                )
+            ).one()
+            count = int(row[0] or 0)
+            last_at = int(row[1]) if row[1] is not None else None
+            return CompactionStats(count=count, last_compaction_at=last_at)
 
     def list_latest_message_items_for_conversations(
         self,

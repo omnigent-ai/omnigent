@@ -2089,6 +2089,16 @@ class SessionResponse(BaseModel):
         therefore resets the clock, so an orchestrator treating this as a pure
         item-append heartbeat should account for that. Can be compared across
         snapshots independently of lifecycle status.
+    :param compaction_count: Total context compactions persisted to this
+        session's transcript, e.g. ``2``. ``0`` when the session has never
+        compacted. Paired with ``last_compaction_at``, this lets an
+        orchestrator polling metadata spot the repeated-compaction stall
+        signature (count climbing while ``updated_at`` otherwise freezes)
+        without scraping transcript items.
+    :param last_compaction_at: Unix epoch seconds of the most recent
+        persisted compaction item, or ``None`` when the session has never
+        compacted. A recent value alongside no further item appends marks a
+        session parked at a compaction summary rather than progressing.
     """
 
     id: str
@@ -2099,6 +2109,8 @@ class SessionResponse(BaseModel):
     background_tasks: list[BackgroundTaskInfo] | None = None
     created_at: int
     updated_at: int | None = None
+    compaction_count: int = 0
+    last_compaction_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None

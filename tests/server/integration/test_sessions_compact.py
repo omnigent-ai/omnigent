@@ -465,3 +465,64 @@ async def test_compaction_snapshot_persists_without_base64_payloads(
     assert source["media_type"] == "image/png"
     assert source["data"] == "[image/png content omitted from the compaction snapshot]"
     assert messages[1]["content"][0]["text"] == "I can see the screenshot."
+
+
+async def test_snapshot_metadata_carries_compaction_aggregate(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Persisted compactions surface in the session snapshot's metadata.
+
+    An orchestrator polls ``GET /v1/sessions/{id}`` (the source for the
+    ``sys_session_get_info`` tool) with ``include_items=false``, so a
+    session stalled at repeated compactions must be visible without the
+    transcript: ``compaction_count`` climbs and ``last_compaction_at``
+    marks the newest compaction. Before this signal existed, such a
+    session was metadata-indistinguishable from a healthy one and
+    orchestrators waited on it indefinitely.
+    """
+    agent = await create_test_agent(client)
+    sid = await _create_session(client, agent["id"])
+
+    # A fresh session reports a zero aggregate, not an absent field.
+    fresh = await client.get(f"/v1/sessions/{sid}")
+    assert fresh.status_code == 200
+    fresh_body = fresh.json()
+    assert fresh_body["compaction_count"] == 0
+    assert fresh_body.get("last_compaction_at") is None
+
+    # Persist two back-to-back compaction events — the runner's wire
+    # format for a harness-internal context compaction, and the stall
+    # signature from the report (no tool output between them).
+    for ordinal in (1, 2):
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "compaction",
+                "data": {
+                    "summary": f"Compaction {ordinal}: condensed the read phase.",
+                    "last_item_id": "msg_boundary_abc123",
+                    "token_count": 64,
+                },
+            },
+        )
+        assert resp.status_code == 202, resp.text
+
+    # The slim, metadata-only snapshot (what sys_session_get_info reads)
+    # must carry the aggregate even with the items read skipped.
+    slim = await client.get(
+        f"/v1/sessions/{sid}",
+        params={"include_items": "false", "include_liveness": "false"},
+    )
+    assert slim.status_code == 200
+    body = slim.json()
+    assert body["items"] == []
+    assert body["compaction_count"] == 2, (
+        "Two persisted compactions must be countable from snapshot metadata "
+        f"alone; got compaction_count={body.get('compaction_count')!r}."
+    )
+    assert isinstance(body["last_compaction_at"], int), (
+        "last_compaction_at must carry the newest compaction's timestamp so "
+        "pollers can tell how recently the session compacted; got "
+        f"{body.get('last_compaction_at')!r}."
+    )

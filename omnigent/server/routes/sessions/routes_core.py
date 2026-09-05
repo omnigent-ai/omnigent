@@ -2793,11 +2793,17 @@ def register_core_routes(
             conversation_store.list_items, new_conv.id, limit=10000
         )
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
+        # Carried history can include compaction items; keep the fork's
+        # first snapshot consistent with the GET projection.
+        fork_compaction_stats = await asyncio.to_thread(
+            conversation_store.get_compaction_stats, new_conv.id
+        )
         return _build_session_response(
             new_conv,
             fork_items.data,
             "idle",
             permission_level=level,
+            compaction_stats=fork_compaction_stats,
             last_task_error=None,
             agent_name=base_agent.name,
         )
@@ -3024,11 +3030,17 @@ def register_core_routes(
 
         items = await asyncio.to_thread(conversation_store.list_items, session_id, limit=10000)
         level = await _get_permission_level(user_id, session_id, permission_store)
+        # An in-place switch keeps the transcript (and any compaction items
+        # in it); keep this snapshot consistent with the GET projection.
+        switch_compaction_stats = await asyncio.to_thread(
+            conversation_store.get_compaction_stats, session_id
+        )
         return _build_session_response(
             updated,
             items.data,
             "idle",
             permission_level=level,
+            compaction_stats=switch_compaction_stats,
             last_task_error=None,
             agent_name=target_agent.name,
         )

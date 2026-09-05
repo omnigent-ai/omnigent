@@ -4513,8 +4513,10 @@ async def _session_get_info_via_rest(
     binding, runner binding, host and its reported harness readiness,
     reasoning effort, effective model,
     parent linkage, workspace / git branch, persisted last-activity time,
-    and the outstanding approval prompts (the prompts themselves plus a
-    count). Runner connectivity
+    the compaction aggregate (``compaction_count`` /
+    ``last_compaction_at``, for spotting a repeatedly-compacting stalled
+    session), and the outstanding approval prompts (the prompts
+    themselves plus a count). Runner connectivity
     is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
     the lookup fails or no runner is bound); host readiness is likewise
@@ -4568,6 +4570,11 @@ async def _session_get_info_via_rest(
             # status: repeated polls with an unchanged value let an
             # orchestrator detect a running session that is not advancing.
             "last_activity_at": snap.get("updated_at"),
+            # Compaction aggregate: a climbing count while
+            # last_activity_at stays frozen is the repeated-compaction
+            # stall signature — detectable here without the transcript.
+            "compaction_count": snap.get("compaction_count", 0),
+            "last_compaction_at": snap.get("last_compaction_at"),
             "title": snap.get("title"),
             "agent_id": snap.get("agent_id"),
             # Present the public agent name: a native-UI wrapper session
@@ -5505,7 +5512,7 @@ async def _collect_sub_agents(
                     # Exclude the caller itself from its own sibling list.
                     if entry["conversation_id"] != conversation_id:
                         result.append(entry)
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.debug(
                 "sys_session_list sibling enrichment failed for parent %s",
                 parent_id,
@@ -7656,7 +7663,7 @@ async def _evaluate_async_tool_call_policy(
             evaluation_id,
             extra={"session_id": conversation_id},
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.warning(
             "async PHASE_TOOL_CALL policy evaluate failed for %s; denying",
             evaluation_id,
