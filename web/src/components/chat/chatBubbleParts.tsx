@@ -809,6 +809,7 @@ function AssistantBubble({
         from="assistant"
         data-testid="message-bubble"
         data-role="assistant"
+        data-response-stable-id={bubble.stableId}
         className={
           spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
         }
@@ -1152,9 +1153,6 @@ const PINNED_ANCHOR_TOP_GAP_PX = 96;
  */
 const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
 
-/** Sentinel anchor: the last assistant text section, re-resolved each measure. */
-const LAST_ASSISTANT_TEXT_ANCHOR = Symbol("last-assistant-text-anchor");
-
 /**
  * Trailing spacer that pins the initially loaded turn's anchor to the top of
  * the viewport. The anchor is captured once when the hydrated chat surface
@@ -1175,13 +1173,15 @@ export function LatestTurnSpacer({
   // the ResizeObserver. The hydration gate remounts this component on a switch.
   const blockCount = useChatStore((s) => s.blocks.length);
   const spacerRef = useRef<HTMLDivElement>(null);
-  // The anchor is stored by id, not by node reference: the transcript is
+  // The anchor is stored by stable id, not by node reference: the transcript is
   // windowed, so its DOM node is destroyed when the row scrolls out and a fresh
   // node is mounted when it returns — a captured node reference would stay
-  // detached forever. `undefined` = capture not run yet; a resolved value is
-  // either a user message id, the "last assistant text" sentinel, or `null`
-  // (a settled capture with no suitable anchor, e.g. a brand-new conversation).
-  const initialAnchorRef = useRef<string | typeof LAST_ASSISTANT_TEXT_ANCHOR | null | undefined>(
+  // detached forever, and a semantic "last assistant text" would silently
+  // retarget to whatever earlier turn is still mounted. `undefined` = capture
+  // not run yet; a resolved value is a {kind,id} anchor (a committed user
+  // message, or an assistant response by its stable id) or `null` (a settled
+  // capture with no suitable anchor, e.g. a brand-new conversation).
+  const initialAnchorRef = useRef<{ kind: "user" | "assistant"; id: string } | null | undefined>(
     undefined,
   );
   const initialCommittedUserIdsRef = useRef<Set<string> | null>(null);
@@ -1221,14 +1221,32 @@ export function LatestTurnSpacer({
           break;
         }
       }
-      const hasText = scrollEl.querySelector('[data-testid="assistant-text-section"]') !== null;
-      if (initialUserId === null && !hasText) {
+      // No committed user anchor: pin the LAST assistant response by its stable
+      // id (the same id the bubble is keyed by), captured now while it's mounted
+      // at the bottom, so re-resolution later targets that exact turn — not
+      // whichever assistant text happens to be last in the windowed set.
+      let initialAssistantId: string | null = null;
+      if (initialUserId === null) {
+        const texts = scrollEl.querySelectorAll<HTMLElement>(
+          '[data-testid="assistant-text-section"]',
+        );
+        const lastText = texts[texts.length - 1];
+        initialAssistantId =
+          lastText?.closest<HTMLElement>("[data-role='assistant']")?.dataset.responseStableId ??
+          null;
+      }
+      if (initialUserId === null && initialAssistantId === null) {
         const hasCommittedAnchor =
           initialCommittedUserIdsRef.current!.size > 0 ||
           useChatStore.getState().blocks.some((b) => b.type !== "user_message");
         if (hasCommittedAnchor) return; // rows not mounted yet — retry on the next tick
       }
-      initialAnchorRef.current = initialUserId ?? (hasText ? LAST_ASSISTANT_TEXT_ANCHOR : null);
+      initialAnchorRef.current =
+        initialUserId !== null
+          ? { kind: "user", id: initialUserId }
+          : initialAssistantId !== null
+            ? { kind: "assistant", id: initialAssistantId }
+            : null;
     }
     const anchorKey = initialAnchorRef.current;
     if (anchorKey === null) {
@@ -1238,17 +1256,14 @@ export function LatestTurnSpacer({
     }
     // Re-resolve the live node by id every measure so a windowed row that was
     // unmounted and remounted (a new DOM node) is picked up again.
-    let anchor: HTMLElement | null;
-    if (anchorKey === LAST_ASSISTANT_TEXT_ANCHOR) {
-      const texts = scrollEl.querySelectorAll<HTMLElement>(
-        '[data-testid="assistant-text-section"]',
-      );
-      anchor = texts[texts.length - 1] ?? null;
-    } else {
-      anchor = scrollEl.querySelector<HTMLElement>(
-        `[data-role="user"][data-user-message-id="${CSS.escape(anchorKey)}"]`,
-      );
-    }
+    const anchor =
+      anchorKey.kind === "user"
+        ? scrollEl.querySelector<HTMLElement>(
+            `[data-role="user"][data-user-message-id="${CSS.escape(anchorKey.id)}"]`,
+          )
+        : scrollEl.querySelector<HTMLElement>(
+            `[data-role="assistant"][data-response-stable-id="${CSS.escape(anchorKey.id)}"] [data-testid="assistant-text-section"]`,
+          );
     // The transcript is windowed, so the anchor can be scrolled out of the
     // mounted set. A missing node would report a zeroed rect that blows the
     // reservation up — hold the last good height until the anchor re-mounts.

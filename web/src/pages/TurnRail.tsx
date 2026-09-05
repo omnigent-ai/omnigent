@@ -39,11 +39,15 @@ export function TurnRail({
   scroller,
   hasMoreHistory,
   loadingMoreHistory,
+  ensureItemVisible,
 }: {
   turns: readonly Turn[];
   scroller: Scroller | null;
   hasMoreHistory: boolean;
   loadingMoreHistory: boolean;
+  // From the virtualized transcript: pulls a windowed-out turn into the DOM
+  // before a tick click centers on it. Omitted in tests / non-virtualized use.
+  ensureItemVisible?: (id: string) => boolean;
 }) {
   const flashUserMessage = useChatStore((s) => s.flashUserMessage);
   const railRef = useRef<HTMLDivElement | null>(null);
@@ -346,7 +350,7 @@ export function TurnRail({
               // Keyboard focus shows the preview via onFocus; clear it on blur
               // so tabbing away doesn't leave the preview stranded on-screen.
               onBlur={() => setHoveredId((cur) => (cur === turn.itemId ? null : cur))}
-              onClick={() => scrollToUserMessage(turn.itemId, flashUserMessage)}
+              onClick={() => scrollToUserMessage(turn.itemId, flashUserMessage, ensureItemVisible)}
               aria-label={`Jump to: ${turn.userText.slice(0, 80) || "message"}`}
               // Full-pitch hit area (h-2.5, no gap between ticks) so clicking
               // anywhere in a tick's band — not just the 2px dash — registers.

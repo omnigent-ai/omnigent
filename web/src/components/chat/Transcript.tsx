@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Conversation,
@@ -142,6 +142,18 @@ function TranscriptImpl({
   // prop, which leads the mirrored blocks by a commit.
   const activeConversationId = useChatStore((s) => s.conversationId);
 
+  // Pulls a windowed-out turn into the DOM before nav / rail center it. The
+  // VirtualBubbleList registers the real scroller here; until it does (or with
+  // no match) this is a no-op and the callers fall back to a plain DOM lookup.
+  const scrollToItemRef = useRef<((itemId: string) => boolean) | null>(null);
+  const registerScrollToItem = useCallback((fn: (itemId: string) => boolean) => {
+    scrollToItemRef.current = fn;
+  }, []);
+  const ensureItemVisible = useCallback(
+    (itemId: string) => scrollToItemRef.current?.(itemId) ?? false,
+    [],
+  );
+
   // Single nav instance shared by hotkey + buttons. System-message bubbles are
   // excluded — the hotkey is for navigating real user turns, not markers.
   const userMessageIds = useMemo(
@@ -153,7 +165,7 @@ function TranscriptImpl({
         .map((b) => b.itemId),
     [bubbles],
   );
-  const nav = useUserMessageNav(userMessageIds);
+  const nav = useUserMessageNav(userMessageIds, ensureItemVisible);
 
   // One rail tick per real user turn, paired with a preview of the reply that
   // followed. Mirrors the transcript's loaded window and grows lazily.
@@ -269,6 +281,7 @@ function TranscriptImpl({
                   scrollEl={scroller?.el ?? null}
                   lastAssistantIndex={lastAssistantIndex}
                   showsWorking={showsWorking}
+                  onRegisterScrollToItem={registerScrollToItem}
                 />
                 {/* Pending elicitation cards, floated to the bottom of the chat
                 so an outstanding question stays in view. Newest renders last,
@@ -328,6 +341,7 @@ function TranscriptImpl({
             scroller={scroller}
             hasMoreHistory={hasMoreHistory}
             loadingMoreHistory={loadingMoreHistory}
+            ensureItemVisible={ensureItemVisible}
           />
         )}
       </div>
@@ -353,11 +367,15 @@ function VirtualBubbleList({
   scrollEl,
   lastAssistantIndex,
   showsWorking,
+  onRegisterScrollToItem,
 }: {
   bubbles: Bubble[];
   scrollEl: HTMLElement | null;
   lastAssistantIndex: number;
   showsWorking: boolean;
+  /** Publishes an itemId→viewport scroller so off-screen turns can be pulled
+   *  into the DOM before nav / rail jumps center them. Stable across renders. */
+  onRegisterScrollToItem: (scrollToItem: (itemId: string) => boolean) => void;
 }) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   // The list isn't the scroll container's first child — indicators, padding,
@@ -400,6 +418,25 @@ function VirtualBubbleList({
     overscan: 6,
     scrollMargin,
   });
+
+  // Publish a stable itemId→scroll handle so user-turn nav and the TurnRail can
+  // reach a turn whose row is currently windowed out of the DOM: scrolling the
+  // virtualizer to its index mounts it, and the DOM-based centering scroll then
+  // refines the landing. Latest `bubbles`/virtualizer are read through refs so
+  // the published function's identity never changes.
+  const bubblesRef = useRef(bubbles);
+  bubblesRef.current = bubbles;
+  const virtualizerRef = useRef(virtualizer);
+  virtualizerRef.current = virtualizer;
+  const scrollToItem = useCallback((itemId: string): boolean => {
+    const index = bubblesRef.current.findIndex((b) => b.kind === "user" && b.itemId === itemId);
+    if (index < 0) return false;
+    virtualizerRef.current.scrollToIndex(index, { align: "center" });
+    return true;
+  }, []);
+  useEffect(() => {
+    onRegisterScrollToItem(scrollToItem);
+  }, [onRegisterScrollToItem, scrollToItem]);
 
   const totalSize = virtualizer.getTotalSize();
 

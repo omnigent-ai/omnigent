@@ -787,17 +787,24 @@ describe("LatestTurnSpacer", () => {
     });
     stickContext.scrollRef.current = scrollRoot;
 
-    if (opts.anchor !== "none") {
+    if (opts.anchor === "user") {
       const anchor = document.createElement("div");
-      if (opts.anchor === "user") {
-        anchor.dataset.role = "user";
-        anchor.dataset.userMessageId = "initial-user";
-        useChatStore.setState({ blocks: [userBlock("initial-user")] });
-      } else {
-        anchor.dataset.testid = "assistant-text-section";
-      }
+      anchor.dataset.role = "user";
+      anchor.dataset.userMessageId = "initial-user";
+      useChatStore.setState({ blocks: [userBlock("initial-user")] });
       vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(opts.anchorTop));
       scrollRoot.append(anchor);
+    } else if (opts.anchor === "text") {
+      // The assistant text section is nested inside its bubble, which carries
+      // the stable id the spacer captures and re-resolves by.
+      const bubble = document.createElement("div");
+      bubble.dataset.role = "assistant";
+      bubble.dataset.responseStableId = "resp-1";
+      const anchor = document.createElement("div");
+      anchor.dataset.testid = "assistant-text-section";
+      vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(opts.anchorTop));
+      bubble.append(anchor);
+      scrollRoot.append(bubble);
     }
 
     const { container } = render(<LatestTurnSpacer />);
@@ -1042,6 +1049,55 @@ describe("LatestTurnSpacer", () => {
     // still read the removed node; id re-resolution picks up the fresh node.
     const remounted = makeAnchor(50);
     scrollRoot.append(remounted);
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("154px");
+  });
+
+  it("does not retarget the assistant-text anchor to a different mounted turn", () => {
+    // WHY: with no committed user anchor the spacer pins the LAST assistant
+    // response by its stable id. Once that response is windowed out while an
+    // EARLIER assistant text is still mounted, a "last mounted text" resolution
+    // would silently re-anchor to the wrong turn and change the reservation.
+    // Binding to the stable id holds the last good height instead.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const makeAssistant = (stableId: string, top: number) => {
+      const bubble = document.createElement("div");
+      bubble.dataset.role = "assistant";
+      bubble.dataset.responseStableId = stableId;
+      const text = document.createElement("div");
+      text.dataset.testid = "assistant-text-section";
+      vi.spyOn(text, "getBoundingClientRect").mockReturnValue(rect(top));
+      bubble.append(text);
+      return bubble;
+    };
+    // Two assistant turns mounted; the LAST (resp-2, at 150) is the anchor.
+    const earlier = makeAssistant("resp-1", 50);
+    const last = makeAssistant("resp-2", 150);
+    scrollRoot.append(earlier, last);
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(500));
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("154px"); // 600 − (500 − 150) − 96, anchored to resp-2
+
+    // resp-2 windows out; only the earlier turn (resp-1) stays mounted. A
+    // "last mounted text" resolution would retarget to resp-1 (→ 600 − (500 −
+    // 50) − 96 = 4); binding to the stable id holds the last good height.
+    last.remove();
     act(() => holder.cb?.());
     expect(spacer.style.height).toBe("154px");
   });
