@@ -11,6 +11,7 @@ import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import { markSessionsArchiving, unmarkSessionsArchiving } from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 
 // Mock the socket transport so setWatched is observable and start/stop are
@@ -91,6 +92,9 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  // Archive tombstones live in module state; a leftover would leak into the
+  // next test's cache assertions.
+  unmarkSessionsArchiving();
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
@@ -273,6 +277,42 @@ describe("SessionUpdatesProvider project folders", () => {
       "Sprint 42",
     ]);
     expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_other"]);
+  });
+});
+
+describe("SessionUpdatesProvider archiving tombstone", () => {
+  it("does not let a stale changed frame resurrect a row whose archive is in flight", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    // The user archived conv_b: the optimistic overlay already dropped it
+    // from the sidebar cache and the PATCH is still in flight.
+    markSessionsArchiving(["conv_b"]);
+
+    // A frame whose DB read predates the PATCH commit still reports the row
+    // as live; without the tombstone override the unknown-row upsert would
+    // reinsert it into the non-archived sidebar list.
+    act(() => handler({ type: "changed", items: [{ ...conv("conv_b"), archived: false }] }));
+
+    const data = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    expect(data!.pages[0].data.map((c) => c.id)).toEqual(["conv_a"]);
+  });
+
+  it("still merges a frame that confirms the archive (archived: true)", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a", "conv_b"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    markSessionsArchiving(["conv_b"]);
+    // The row's own post-commit frame carries archived:true — it must still
+    // evict the row from the non-archived list (untouched by the override).
+    act(() => handler({ type: "changed", items: [{ ...conv("conv_b"), archived: true }] }));
+
+    const data = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    expect(data!.pages[0].data.map((c) => c.id)).toEqual(["conv_a"]);
   });
 });
 
