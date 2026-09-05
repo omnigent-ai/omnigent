@@ -27,6 +27,7 @@ import {
   readOnlyReasonForSessionLabels,
   reorderCommittedRequestElicitations,
   shouldSendInitialPrompt,
+  shouldSendResumePrompt,
   shouldShowAuthorBadge,
   shouldShowWorkingIndicator,
   MAX_WARM_TERMINAL_SURFACES,
@@ -1534,6 +1535,43 @@ describe("shouldSendInitialPrompt", () => {
         conversationId: "conv_B",
       }),
     ).toBe(false);
+  });
+});
+
+describe("shouldSendResumePrompt", () => {
+  const pendingPrompt = {
+    sessionId: "conv_abc",
+    text: "continue",
+    files: [],
+  };
+  const ready = {
+    pendingPrompt,
+    sentPrompt: null,
+    conversationId: "conv_abc",
+    agentId: "ag_abc123",
+    runnerOnline: true,
+  } as const;
+
+  it("claims a ready prompt once", () => {
+    expect(shouldSendResumePrompt(ready)).toBe(true);
+    expect(shouldSendResumePrompt({ ...ready, sentPrompt: pendingPrompt })).toBe(false);
+  });
+
+  it("allows a later intentional prompt with identical content", () => {
+    const laterPrompt = { ...pendingPrompt };
+    expect(
+      shouldSendResumePrompt({
+        ...ready,
+        pendingPrompt: laterPrompt,
+        sentPrompt: pendingPrompt,
+      }),
+    ).toBe(true);
+  });
+
+  it("waits for the pinned conversation, agent, and runner", () => {
+    expect(shouldSendResumePrompt({ ...ready, conversationId: "conv_other" })).toBe(false);
+    expect(shouldSendResumePrompt({ ...ready, agentId: null })).toBe(false);
+    expect(shouldSendResumePrompt({ ...ready, runnerOnline: false })).toBe(false);
   });
 });
 

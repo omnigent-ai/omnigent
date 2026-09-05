@@ -68,6 +68,7 @@ import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   composerAttachmentKey,
   consumePendingInitialPrompt,
+  hasQueuedSendInFlight,
   type PendingInitialPrompt,
   type QueuedMessage,
   useChatStore,
@@ -335,12 +336,13 @@ export function shouldQueueSend(
   sessionStatus: SessionStatus,
   queuedMessages: QueuedMessage[],
   alwaysSteer = false,
+  queueSendInFlight = false,
 ): boolean {
   if (conversationId === null) return false;
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
-  if (alwaysSteer) return hasQueued;
+  if (alwaysSteer) return hasQueued || queueSendInFlight;
   const isBusy = status === "streaming" || sessionStatus === "running";
-  return isBusy || hasQueued;
+  return isBusy || hasQueued || queueSendInFlight;
 }
 
 // Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
@@ -591,11 +593,8 @@ export function ChatPage() {
   // would replay into whatever session is active when a runner next comes
   // online — leaking the message into a different conversation. Keyed by
   // session id, it only ever replays into the clone it was meant for.
-  const [pendingResumePrompt, setPendingResumePrompt] = useState<{
-    sessionId: string;
-    text: string;
-    files: File[];
-  } | null>(null);
+  const [pendingResumePrompt, setPendingResumePrompt] = useState<ResumePrompt | null>(null);
+  const sentResumePromptRef = useRef<ResumePrompt | null>(null);
 
   // Replay the queued message once the picker's bind brings the runner
   // online — but ONLY while still viewing the session it was pinned to.
@@ -604,9 +603,19 @@ export function ChatPage() {
   // effect uses. If the user switched away before the clone started, the
   // prompt stays pinned and waits; it never floats into another session.
   useEffect(() => {
-    if (pendingResumePrompt === null || !agentId || !urlConvId) return;
-    if (pendingResumePrompt.sessionId !== urlConvId) return;
-    if (runnerOnline !== true) return;
+    if (
+      !shouldSendResumePrompt({
+        pendingPrompt: pendingResumePrompt,
+        sentPrompt: sentResumePromptRef.current,
+        conversationId: urlConvId,
+        agentId,
+        runnerOnline,
+      })
+    ) {
+      return;
+    }
+    if (pendingResumePrompt === null || !agentId) return;
+    sentResumePromptRef.current = pendingResumePrompt;
     const { text, files } = pendingResumePrompt;
     setPendingResumePrompt(null);
     void useChatStore.getState().send(text, agentId, files);
@@ -882,6 +891,7 @@ export function ChatPage() {
           chat.sessionStatus,
           chat.queuedMessages,
           readAlwaysSteer(),
+          hasQueuedSendInFlight(chat.conversationId),
         )
       ) {
         chat.enqueueMessage(text, files);
@@ -909,23 +919,32 @@ export function ChatPage() {
   );
 
   const onSendSlashCommand = useCallback(
-    (name: string, args: string) => {
-      if (!agentId) return;
+    (name: string, args: string): boolean => {
+      if (!agentId) return false;
       // Slash commands aren't replayed (an edge), but still route an unbound
       // coding clone to the directory picker so it isn't a dead end.
       if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
         setResumeDirDialogOpen(true);
-        return;
+        return false;
       }
       if (urlConvId && isUnreachable) {
         setReconnectDialogOpen(true);
-        return;
+        return false;
+      }
+      const chat = useChatStore.getState();
+      if (
+        chat.conversationId !== null &&
+        (hasQueuedSendInFlight(chat.conversationId) ||
+          chat.queuedMessages.some((message) => message.conversationId === chat.conversationId))
+      ) {
+        return false;
       }
       void useChatStore.getState().sendSlashCommand(name, args, agentId, {
         onConversationCreated: (newId) => {
           navigate(`/c/${newId}`, { replace: true });
         },
       });
+      return true;
     },
     [
       agentId,
@@ -1268,7 +1287,7 @@ interface MainAgentSurfaceProps {
    * is sent as plaintext for the vendor TUI to handle. See
    * `ComposerProps.onSendSlashCommand`.
    */
-  onSendSlashCommand?: (name: string, args: string) => void;
+  onSendSlashCommand?: (name: string, args: string) => boolean | void;
   onStop: () => void;
   onShowReconnectHelp: () => void;
   agents: Agent[] | undefined;
@@ -1580,7 +1599,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
       onSendSlashCommand && !isNativeWrapper
         ? (name: string, args: string) => {
             setSendScrollNonce((n) => n + 1);
-            onSendSlashCommand(name, args);
+            return onSendSlashCommand(name, args);
           }
         : undefined,
     [onSendSlashCommand, isNativeWrapper],
@@ -1847,7 +1866,7 @@ interface ComposerProps {
    * native-terminal sessions, which always send `/skill` as plaintext so
    * the vendor TUI loads the skill itself.
    */
-  onSendSlashCommand?: (name: string, args: string) => void;
+  onSendSlashCommand?: (name: string, args: string) => boolean | void;
   onStop: () => void;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
@@ -2675,6 +2694,7 @@ function ComposerImpl({
   valueRef.current = value;
   const filesRef = useRef(files);
   filesRef.current = files;
+  const submitGuardRef = useRef(false);
   // Guards against React StrictMode double-invoke in development:
   // setup → cleanup → setup runs cleanup before the user has touched
   // the input, which would delete the draft. Only save when the user
@@ -2866,6 +2886,15 @@ function ComposerImpl({
   const hasDraft = value.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
   const showInterruptButton = isWorking && !hasDraft;
 
+  // Keep one draft consumed until React commits its changed/cleared state.
+  // A microtask is too short here: browsers can run it between two delivered
+  // form events, before the controlled textarea has committed its empty value.
+  // Once any draft part changes, a new submit is allowed—even with identical
+  // text—so an intentional second entry remains distinct.
+  useEffect(() => {
+    submitGuardRef.current = false;
+  }, [value, files, mentionedItems]);
+
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // the local mention chips, deduping against what's already tagged, then
   // clear the store queue so they aren't re-applied. Placed after
@@ -2936,6 +2965,22 @@ function ComposerImpl({
         if (!showCompact) {
           setCommandError("/compact is not supported for this agent type");
           return true;
+        }
+        {
+          const chat = useChatStore.getState();
+          if (
+            chat.conversationId !== null &&
+            (hasQueuedSendInFlight(chat.conversationId) ||
+              chat.queuedMessages.some((message) => message.conversationId === chat.conversationId))
+          ) {
+            submitGuardRef.current = false;
+            dirtyRef.current = true;
+            setValue(arg ? `${cmd} ${arg}` : cmd);
+            setCommandError(
+              "Wait for the earlier queued message to settle or resolve its delivery first.",
+            );
+            return true;
+          }
         }
         dirtyRef.current = true;
         setValue("");
@@ -3130,6 +3175,11 @@ function ComposerImpl({
     )
       return;
 
+    // A key event and the form submit can reach this callback before React
+    // commits the cleared draft. Treat those re-entrant calls as one submit.
+    if (submitGuardRef.current) return;
+    submitGuardRef.current = true;
+
     // A send is actually happening: report it for both pointer clicks (which
     // reach here via the form submit) and Enter-key sends. Placed after the
     // guard so guarded no-ops don't emit, matching the disabled Send button.
@@ -3182,8 +3232,15 @@ function ComposerImpl({
       // don't apply to a slash command (no content field) — clear them.
       if (onSendSlashCommand && parts[0] in slashCommands) {
         const skillArgs = trimmed.slice(parts[0].length).trim();
+        const accepted = onSendSlashCommand(parts[0].slice(1), skillArgs);
+        if (accepted === false) {
+          submitGuardRef.current = false;
+          setCommandError(
+            "Wait for the earlier queued message to settle or resolve its delivery first.",
+          );
+          return;
+        }
         appendEntry(trimmed);
-        onSendSlashCommand(parts[0].slice(1), skillArgs);
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -3977,6 +4034,27 @@ export function shouldSendInitialPrompt(params: {
   if (!params.conversationId || params.loadingConversation || !params.agentId) {
     return false;
   }
+  return true;
+}
+
+interface ResumePrompt {
+  sessionId: string;
+  text: string;
+  files: File[];
+}
+
+/** Gate resume delivery by object identity so one effect replay cannot resend it. */
+export function shouldSendResumePrompt(params: {
+  pendingPrompt: ResumePrompt | null;
+  sentPrompt: ResumePrompt | null;
+  conversationId: string | null | undefined;
+  agentId: string | null;
+  runnerOnline: boolean | undefined;
+}): boolean {
+  const { pendingPrompt } = params;
+  if (pendingPrompt === null || pendingPrompt === params.sentPrompt) return false;
+  if (pendingPrompt.sessionId !== params.conversationId) return false;
+  if (!params.agentId || params.runnerOnline !== true) return false;
   return true;
 }
 
