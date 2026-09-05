@@ -28,6 +28,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
+import { getFileEditDiff } from "@/lib/toolEditDiff";
 import { iconForTool } from "@/lib/toolIcon";
 import {
   type ToolRunCall,
@@ -183,6 +184,9 @@ export function ToolCard({
     () => (output === null ? null : prettyPrintIfJson(output)),
     [output],
   );
+  // File-editing tools render the change as a diff so the reader sees what
+  // changed instead of decoding a full-file Parameters JSON dump.
+  const editDiff = useMemo(() => getFileEditDiff(name, args, output), [name, args, output]);
   const elapsedDuration = useElapsedDuration(state === "input-available" ? startedAt : null);
   const displayDuration = duration ?? elapsedDuration;
 
@@ -209,6 +213,15 @@ export function ToolCard({
         onBodyClick={onBodyClick}
       />
       <CollapsibleContent className="mt-1 ml-2 space-y-2 border-l pl-3 py-1 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
+        {editDiff !== null && (
+          <CodePanel
+            title="Diff"
+            text={editDiff}
+            copyText={editDiff}
+            copyLabel="Copy diff"
+            language="diff"
+          />
+        )}
         <CodePanel
           title="Parameters"
           text={inputJson}
@@ -394,14 +407,16 @@ function CodePanel({
   text,
   copyText,
   copyLabel,
+  language = "json",
 }: {
   title: string;
   text: string;
   copyText: string;
   copyLabel: string;
+  language?: "json" | "diff";
 }) {
   return (
-    <CodeBlock code={text} language="json">
+    <CodeBlock code={text} language={language}>
       <CodeBlockHeader>
         <CodeBlockTitle className="min-w-0">
           <span className="truncate font-medium uppercase tracking-wide">{title}</span>
