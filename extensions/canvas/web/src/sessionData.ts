@@ -34,20 +34,41 @@ export async function loadSessions(
   if (!canReadSessions(context)) {
     throw new Error("Canvas requires the sessions.read permission");
   }
-  const sessions: ExtensionSessionSummary[] = [];
+  const cached = context.capabilities.includes("sessions.getCached")
+    ? await context.sessions
+        .getCached({ limit: INITIAL_SESSION_PAGE_LIMIT })
+        .catch(() => null)
+    : null;
+  const preview = new Map(
+    (cached ?? []).map((session) => [session.id, session]),
+  );
+  if (preview.size > 0) {
+    await onProgress?.({ sessions: [...preview.values()], hasMore: true });
+  }
+  const sessions = new Map<string, ExtensionSessionSummary>();
   const seenCursors = new Set<string>();
   let after: string | null = null;
   for (let pageNumber = 0; pageNumber < MAX_SESSION_PAGES; pageNumber += 1) {
     const page: ExtensionSessionPage = await context.sessions.listPage({
       after,
-      limit: pageNumber === 0 ? INITIAL_SESSION_PAGE_LIMIT : SESSION_PAGE_LIMIT,
+      limit:
+        pageNumber === 0 && preview.size === 0
+          ? INITIAL_SESSION_PAGE_LIMIT
+          : SESSION_PAGE_LIMIT,
     });
-    sessions.push(...page.sessions);
-    if (sessions.length > MAX_SESSIONS) {
+    for (const session of page.sessions) sessions.set(session.id, session);
+    if (sessions.size > MAX_SESSIONS) {
       throw new Error("Canvas session load exceeded 5,000 sessions");
     }
-    await onProgress?.({ sessions: [...sessions], hasMore: page.hasMore });
-    if (!page.hasMore) return sessions;
+    // Preserve the preview while loading; only completed server pages define membership.
+    const visible = page.hasMore
+      ? new Map([...preview, ...sessions])
+      : sessions;
+    await onProgress?.({
+      sessions: [...visible.values()],
+      hasMore: page.hasMore,
+    });
+    if (!page.hasMore) return [...sessions.values()];
     if (!page.nextCursor) {
       throw new Error("Canvas session load received no next cursor");
     }

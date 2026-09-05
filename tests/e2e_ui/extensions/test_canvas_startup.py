@@ -1,4 +1,4 @@
-"""Canvas startup stays on one spinner until useful content is ready."""
+"""Canvas startup renders a preview and reconciles canonical session pages."""
 
 from __future__ import annotations
 
@@ -196,3 +196,78 @@ def test_canvas_uses_one_spinner_until_initial_content_is_ready(
     }
     assert frame_state["loadingCopySeen"] is False
     assert canvas_limits[:2] == [25, 1_000]
+
+
+@pytest.mark.parametrize("cache_has_more", [True, False])
+def test_canvas_reconciles_a_sparse_cached_preview(
+    page: Page,
+    live_server: str,
+    tmp_path: Path,
+    cache_has_more: bool,
+) -> None:
+    """A cached A,D preview must not skip B,C or duplicate A,D on reconciliation."""
+    titles = [
+        "Plan the release",
+        "Review pagination",
+        "Document the rollout",
+        "Verify SDK contracts",
+        "Check saved layouts",
+        "Run browser tests",
+    ]
+    sessions = [
+        _session(f"canvas-{index}", title, 10 - index) for index, title in enumerate(titles)
+    ]
+    cached = [sessions[0], sessions[3]]
+    catalog = json.loads(json.dumps(_CATALOG))
+    catalog["data"][0]["primary_navigation"] = [
+        {
+            "id": "omnigent.canvas.nav",
+            "label": "Canvas",
+            "page": "omnigent.canvas.home",
+            "icon": "dashboard",
+            "order": 0,
+            "when": None,
+        }
+    ]
+    canonical_queries: list[dict[str, list[str]]] = []
+    canvas = page.frame_locator('iframe[title="Canvas"]')
+
+    def serve_sessions(route: Route) -> None:
+        query = parse_qs(urlparse(route.request.url).query)
+        if query.get("kind") == ["default"]:
+            canonical_queries.append(query)
+            assert "after" not in query
+            assert query["limit"] == ["1000"]
+            expect(canvas.get_by_text("2 sessions", exact=True)).to_be_visible()
+            page.screenshot(path=str(tmp_path / "canvas-cached-preview.png"))
+            data, has_more = sessions, False
+        else:
+            data, has_more = cached, cache_has_more
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {"object": "list", "data": data, "has_more": has_more, "last_id": data[-1]["id"]}
+            ),
+        )
+
+    page.route("**/v1/extensions", lambda route: route.fulfill(json=catalog))
+    page.route(
+        "**/e2e-canvas/extension.js",
+        lambda route: route.fulfill(content_type="text/javascript", body=_CANVAS_SCRIPT),
+    )
+    page.route(
+        "**/e2e-canvas/extension.css",
+        lambda route: route.fulfill(content_type="text/css", body=_CANVAS_STYLES),
+    )
+    page.route("**/v1/sessions?*", serve_sessions)
+    page.goto(live_server)
+    expect(page.get_by_text(titles[0], exact=True).first).to_be_visible()
+    page.get_by_role("link", name="Canvas", exact=True).click()
+
+    expect(canvas.get_by_text("6 sessions", exact=True)).to_be_visible(timeout=10_000)
+    for title in titles:
+        expect(canvas.get_by_text(title, exact=True)).to_have_count(1)
+    expect(canvas.get_by_role("alert")).to_have_count(0)
+    assert len(canonical_queries) == 1
+    page.screenshot(path=str(tmp_path / "canvas-complete.png"))

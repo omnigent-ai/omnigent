@@ -230,7 +230,7 @@ export function ExtensionViewHost({
             if (!pending || !pendingRef.current.delete(message.requestId)) return;
             clearTimeout(pending.timeout);
             const withinBudget =
-              message.method === "sessions.listPage"
+              message.method === "sessions.listPage" || message.method === "sessions.getCached"
                 ? isExtensionSessionPageWithinBudget(result)
                 : isExtensionPayloadWithinBudget(result);
             if (!withinBudget) {

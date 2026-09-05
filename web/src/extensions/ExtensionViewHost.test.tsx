@@ -200,7 +200,7 @@ describe("ExtensionViewHost", () => {
     );
   });
 
-  it("uses the larger outbound budget only for bounded session pages", async () => {
+  it("uses the larger outbound budget only for bounded session pages and previews", async () => {
     const largePage = {
       sessions: Array.from({ length: 400 }, (_, index) => ({
         id: `session-${index}`,
@@ -225,6 +225,7 @@ describe("ExtensionViewHost", () => {
         refresh={refresh}
         methods={{
           "sessions.listPage": returnLargePage,
+          "sessions.getCached": () => largePage.sessions,
           "test.large": returnLargePage,
         }}
       />,
@@ -251,6 +252,13 @@ describe("ExtensionViewHost", () => {
     await waitFor(() =>
       expect(FakeMessageChannel.latest!.port1.postMessage).toHaveBeenCalledWith(
         expect.objectContaining({ requestId: "sessions", result: largePage }),
+      ),
+    );
+
+    request("preview", "sessions.getCached");
+    await waitFor(() =>
+      expect(FakeMessageChannel.latest!.port1.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ requestId: "preview", result: largePage.sessions }),
       ),
     );
 

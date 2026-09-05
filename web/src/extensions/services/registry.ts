@@ -10,6 +10,7 @@ export const HOST_METHOD_PERMISSIONS = {
   "storage.user.get": "storage.user",
   "storage.user.set": "storage.user",
   "storage.user.delete": "storage.user",
+  "sessions.getCached": "sessions.read",
   "sessions.listPage": "sessions.read",
   "sessions.pullRequest": "sessions.read",
   "projects.list": "projects.read",
