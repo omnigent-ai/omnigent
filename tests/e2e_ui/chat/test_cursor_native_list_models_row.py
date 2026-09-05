@@ -37,12 +37,14 @@ import json
 import os
 import re
 import tarfile
+import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 
 import httpx
 import pytest
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import (
@@ -247,20 +249,35 @@ def _expand_list_models_tool_call(page: Page) -> None:
 
     A lone call renders directly as a ``sys_list_models(...)`` trigger;
     completed multi-step turns fold calls into a collapsed "Called N tools"
-    group — expand groups when present, then click the call trigger so its
-    output preview (the catalog JSON) is on screen.
+    group. The transcript can remount either trigger while the terminal
+    response settles, so each attempt re-resolves both locators instead of
+    retaining a node across the remount. Expand groups when present, then
+    click the call trigger so its output preview (the catalog JSON) is on
+    screen.
 
     :param page: The Playwright page, on the parent session.
     """
-    direct = page.get_by_role("button", name=re.compile(r"^sys_list_models\("))
-    if not direct.count():
-        groups = page.get_by_text(re.compile(r"^Called \d+ tools?$"))
-        expect(groups.first).to_be_visible(timeout=30_000)
-        for group in groups.all():
-            group.click()
-        direct = page.get_by_role("button", name=re.compile(r"sys_list_models"))
-    expect(direct.first).to_be_visible(timeout=30_000)
-    direct.first.click()
+    deadline = time.monotonic() + 30
+    last_error: PlaywrightError | None = None
+    while time.monotonic() < deadline:
+        try:
+            direct = page.get_by_role("button", name=re.compile(r"^sys_list_models\("))
+            if not direct.count():
+                groups = page.get_by_text(re.compile(r"^Called \d+ tools?$"))
+                expect(groups.first).to_be_visible(timeout=2_000)
+                for group in groups.all():
+                    group.click(timeout=2_000)
+                direct = page.get_by_role("button", name=re.compile(r"sys_list_models"))
+            expect(direct.first).to_be_visible(timeout=2_000)
+            direct.first.click(timeout=2_000)
+            expect(page.get_by_text(re.compile(r'"cursor"')).first).to_be_visible(timeout=2_000)
+            return
+        except PlaywrightError as error:
+            # Chat transcript reconciliation can replace either button
+            # between actionability checks and dispatch. Start over from
+            # semantic locators so the next attempt targets the current DOM.
+            last_error = error
+    raise AssertionError("sys_list_models trigger never became clickable") from last_error
 
 
 def _cursor_catalog_row(base_url: str, session_id: str) -> dict[str, object]:
@@ -329,10 +346,6 @@ def test_cursor_native_worker_row_not_source_none(
     # status UI to go idle so the trigger cannot be replaced mid-click.
     expect(page.get_by_test_id("working-indicator")).to_be_hidden(timeout=30_000)
 
-    # Put the catalog on screen the way a user reads it (and the video shows it).
-    _expand_list_models_tool_call(page)
-    expect(page.get_by_text(re.compile(r'"cursor"')).first).to_be_visible(timeout=30_000)
-
     row = _cursor_catalog_row(chat.base_url, chat.session_id)
 
     # THE BUG: a dispatchable cursor-native worker is reported
@@ -341,3 +354,7 @@ def test_cursor_native_worker_row_not_source_none(
         "Bug reproduced: sys_list_models reports the dispatchable "
         f"cursor-native worker as source='none' — full row: {row}"
     )
+
+    # Put the catalog on screen the way a user reads it (and the video shows it).
+    _expand_list_models_tool_call(page)
+    expect(page.get_by_text(re.compile(r'"cursor"')).first).to_be_visible(timeout=30_000)

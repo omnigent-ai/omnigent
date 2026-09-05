@@ -320,13 +320,15 @@ def _wait_for_prompt_ready(
     races the submit ahead of the input loop, so the
     keystroke is dropped and the turn never starts.
 
-    The reliable input-readiness signal is the bottom status
-    toolbar, which renders ``· ready`` (with ``state:
-    sleeping``) once prompt_toolkit's application is running
-    and idle. Waiting for that after the banner makes the
-    subsequent ``child.send(...)`` land in the live input
-    loop. Using a generous timeout — agent upload + server boot
-    add latency on cold starts.
+    The reliable input-readiness signal is prompt_toolkit's
+    ``❯`` input prompt, which is rendered by the live input
+    application. The bottom status toolbar's ``· ready`` text
+    is only cosmetic and can be omitted from pexpect's captured
+    repaint even when the server reports the session sleeping.
+    Waiting for the prompt after the banner makes the subsequent
+    ``child.send(...)`` land in the live input loop. Using a
+    generous timeout — agent upload + server boot add latency on
+    cold starts.
 
     :param child: Active pexpect child.
     :param timeout: Max seconds to wait.
@@ -336,11 +338,10 @@ def _wait_for_prompt_ready(
         other fixtures.
     """
     child.expect(welcome_pattern, timeout=timeout)
-    # The banner is not input-readiness. Wait for the status
-    # toolbar's ``· ready`` (idle ``state: sleeping``) marker
-    # so the next send() lands in prompt_toolkit's live loop
-    # instead of racing ahead of it.
-    child.expect(r"·\s*ready", timeout=timeout)
+    # The banner is not input-readiness. The prompt glyph is emitted by
+    # prompt_toolkit's live input application and does not depend on a
+    # particular bottom-toolbar repaint reaching the PTY.
+    child.expect("❯", timeout=timeout)
 
 
 def _wait_for_turn_complete(child: Any, timeout: float = 45.0) -> None:
