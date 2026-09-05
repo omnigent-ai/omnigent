@@ -57,6 +57,7 @@ import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSe
 import {
   consumePendingInitialPrompt,
   handleSessionEvent,
+  HYDRATION_SNAPSHOT_TIMEOUT_MS,
   isStaleCompletedResponse,
   initChatStore,
   pumpStreamEvents,
@@ -1619,6 +1620,95 @@ describe("chatStore — switchTo", () => {
 
     expect(useChatStore.getState().conversationId).toBe("conv_other");
     expect(useChatStore.getState().blocks).toEqual([]);
+  });
+});
+
+describe("chatStore — hydration stall recovery", () => {
+  /** Hang matching snapshot GETs; everything else follows the default router. */
+  function stallSnapshotGets(sessionId: string, opts: { refreshStateOnly: boolean }): void {
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const isSnapshotGet =
+        url.split("?")[0] === `/v1/sessions/${sessionId}` && (init?.method ?? "GET") === "GET";
+      if (isSnapshotGet && (!opts.refreshStateOnly || url.includes("refresh_state=true"))) {
+        return new Promise<Response>(() => {});
+      }
+      return defaultFetchHandler(input, init);
+    });
+  }
+
+  it("paints from a direct cheap snapshot when the refresh_state read stalls", async () => {
+    // The stalled runner-backed read used to leave the page on the loading
+    // placeholder forever. The rescue read must be a DIRECT fetch: a
+    // fetchQuery on ["session", id] would dedupe onto the same stalled
+    // in-flight fetch (useSession cold-loads that key with refresh_state).
+    vi.useFakeTimers();
+    try {
+      seedSession("conv_stall", [userMessage("resp_1", "hello")]);
+      stallSnapshotGets("conv_stall", { refreshStateOnly: true });
+
+      const bind = useChatStore.getState().switchTo("conv_stall");
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(HYDRATION_SNAPSHOT_TIMEOUT_MS + 1);
+      await bind;
+
+      const state = useChatStore.getState();
+      expect(state.loadingConversation).toBe(false);
+      expect(state.conversationLoadError).toBeNull();
+      expect(state.blocks).toHaveLength(1);
+
+      const sessionGets = fetchMock.mock.calls.filter(
+        ([u, init]: [RequestInfo | URL, RequestInit | undefined]) =>
+          String(u).split("?")[0] === "/v1/sessions/conv_stall" &&
+          (init?.method ?? "GET") === "GET",
+      );
+      expect(sessionGets).toHaveLength(2);
+      expect(String(sessionGets[0]?.[0])).toContain("refresh_state=true");
+      expect(String(sessionGets[1]?.[0])).not.toContain("refresh_state=true");
+      // The rescue snapshot seeds the shared cache, so hook readers
+      // (useSession → permission level) unblock from it too.
+      expect(client.getQueryData(["session", "conv_stall"])).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("surfaces a retryable load error instead of wedging when every attempt stalls", async () => {
+    vi.useFakeTimers();
+    try {
+      seedSession("conv_stall_all", [userMessage("resp_1", "hello")]);
+      stallSnapshotGets("conv_stall_all", { refreshStateOnly: false });
+
+      const bind = useChatStore.getState().switchTo("conv_stall_all");
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(HYDRATION_SNAPSHOT_TIMEOUT_MS + 1);
+      await vi.advanceTimersByTimeAsync(HYDRATION_SNAPSHOT_TIMEOUT_MS + 1);
+      await bind;
+
+      const state = useChatStore.getState();
+      // Not wedged: the gate cleared into the error screen, which has retry.
+      expect(state.loadingConversation).toBe(false);
+      expect(state.conversationLoadError).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the single-request hydration when the snapshot answers in time", async () => {
+    seedSession("conv_prompt", [userMessage("resp_1", "hello")]);
+
+    await useChatStore.getState().switchTo("conv_prompt");
+
+    const state = useChatStore.getState();
+    expect(state.loadingConversation).toBe(false);
+    expect(state.conversationLoadError).toBeNull();
+    const sessionGets = fetchMock.mock.calls.filter(
+      ([u, init]: [RequestInfo | URL, RequestInit | undefined]) =>
+        String(u).split("?")[0] === "/v1/sessions/conv_prompt" && (init?.method ?? "GET") === "GET",
+    );
+    // No second (rescue) request on the healthy path.
+    expect(sessionGets).toHaveLength(1);
+    expect(String(sessionGets[0]?.[0])).toContain("refresh_state=true");
   });
 });
 

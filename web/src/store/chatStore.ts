@@ -3105,6 +3105,79 @@ async function refreshSessionBinding(id: string): Promise<void> {
 }
 
 /**
+ * Bound (ms) on each hydration-snapshot attempt in `fetchHydrationSnapshot`.
+ * The conversation paint gate awaits that fetch, so it must always settle:
+ * nothing below it (`authenticatedFetch`, `fetchQuery({ retry: false })`) has
+ * a client-side timeout, and the `refresh_state=true` read re-polls the
+ * runner, which can stall on a slow or unresponsive runner process.
+ */
+export const HYDRATION_SNAPSHOT_TIMEOUT_MS = 10_000;
+
+/** Marks a hydration-snapshot attempt that outlived its bounded window. */
+class HydrationStallError extends Error {
+  constructor() {
+    super(
+      "Timed out fetching the conversation snapshot; the server or its runner may be unresponsive.",
+    );
+    this.name = "HydrationStallError";
+  }
+}
+
+/** Settle with `work`, or reject with `HydrationStallError` after the bound. */
+function boundHydrationAttempt<T>(work: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new HydrationStallError());
+    }, HYDRATION_SNAPSHOT_TIMEOUT_MS);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+/**
+ * Fetch the session snapshot that gates conversation paint, guaranteed to
+ * settle.
+ *
+ * The full snapshot (`refresh_state=true`) re-polls the runner and can hang
+ * indefinitely; awaiting it unbounded left the page wedged on the loading
+ * placeholder — no transcript, no composer, no error. Two bounded attempts
+ * instead: the full snapshot first, then a degraded DB-only read. The rescue
+ * read is a DIRECT call: `useSession` cold-loads the shared `["session", id]`
+ * key with `refresh_state=true`, and a `fetchQuery` here would dedupe onto
+ * that same stalled in-flight fetch. If both attempts stall, the rejection
+ * lands in `conversationLoadError` — a visible, retryable failure instead of
+ * a permanent loading gate.
+ */
+async function fetchHydrationSnapshot(id: string, client: QueryClient): Promise<Session> {
+  try {
+    return await boundHydrationAttempt(
+      client.fetchQuery({
+        queryKey: ["session", id],
+        queryFn: () => getSessionSlim(id, { refreshState: true }),
+        staleTime: 0,
+        retry: false,
+      }),
+    );
+  } catch (err) {
+    if (!(err instanceof HydrationStallError)) throw err;
+    const session = await boundHydrationAttempt(getSessionSlim(id));
+    // Seed the shared snapshot cache so hook readers (`useSession`) unblock
+    // from the same degraded snapshot instead of their stalled fetch; the
+    // still-pending refresh_state read overwrites it if it ever lands.
+    client.setQueryData(["session", id], session);
+    return session;
+  }
+}
+
+/**
  * Start the session SSE stream, kick off the pump in the background
  * once the stream connects, then fetch metadata plus the most recent
  * page of item history and merge it into state.blocks.
@@ -3203,12 +3276,7 @@ async function bindStream(
     // stays still — rather than a small page followed by background growth
     // the reader sees as the transcript shifting seconds after it settled.
     const [session, page] = await Promise.all([
-      queryClient.fetchQuery({
-        queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id, { refreshState: true }),
-        staleTime: 0,
-        retry: false,
-      }),
+      fetchHydrationSnapshot(id, queryClient),
       fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS }),
     ]);
     if (isConversationDisposed(id)) return;
