@@ -93,7 +93,15 @@ import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
-import { overlayTitleIntoCaches, type ConversationsInfiniteData } from "@/lib/sessionListCache";
+import {
+  filtersFromConversationQueryKey,
+  insertNewRowsIntoPages,
+  markRecentlyCreated,
+  overlayTitleIntoCaches,
+  removeIdsFromPages,
+  type ConversationsInfiniteData,
+} from "@/lib/sessionListCache";
+import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { useTerminalActivityStore } from "./terminalActivity";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type {
@@ -138,6 +146,210 @@ export interface SendOptions {
    * `send` already set `conversationId` before the callback.
    */
   onConversationCreated?: (conversationId: string) => void;
+  /**
+   * Reuse the optimistic bubble already on the target entry (pushed by
+   * `beginLocalConversation`) instead of pushing a fresh one, so the navigate-
+   * first flow's POST doesn't duplicate the message the user already sees. Its
+   * `content` is already set; `session.input.consumed` pops it FIFO as usual.
+   */
+  reusePendingTempId?: string;
+  /**
+   * Target session id, overriding the active `conversationId` — so the navigate-
+   * first background POST lands on the created session even after the user moves
+   * to another chat. Defaults to the active conversation.
+   */
+  pinnedConversationId?: string;
+}
+
+/** A title-less conversation row for the sidebar cache (renders like a fresh session). */
+function makeConvRow(id: string): Conversation {
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    id,
+    object: "conversation",
+    title: null,
+    created_at: now,
+    updated_at: now,
+    labels: {},
+    permission_level: null,
+  };
+}
+
+/** Upsert one row into every `["conversations", ...]` cache variant. */
+function upsertConvRow(row: Conversation, removeId?: string): void {
+  if (queryClient === null) return;
+  const rowMap = new Map([[row.id, row]]);
+  const removeSet = removeId ? new Set([removeId]) : null;
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    if (!data) continue;
+    const base = removeSet ? (removeIdsFromPages(data, removeSet).data ?? data) : data;
+    const { data: next } = insertNewRowsIntoPages(
+      base,
+      rowMap,
+      filtersFromConversationQueryKey(key),
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+}
+
+/**
+ * Move the sidebar row from the temp id to the real one. `markRecentlyCreated`
+ * keeps it in the first-page fetch until the search index catches up; the WS
+ * `session_added` frame then finds it present and skips it (no duplicate).
+ */
+function rekeyConvRow(tempId: string, realId: string, text: string): void {
+  if (queryClient === null) return;
+  const realConv = makeConvRow(realId);
+  recordOptimisticTitle(realId, text);
+  markRecentlyCreated(realConv);
+  upsertConvRow(realConv, tempId);
+}
+
+/** Drop the sidebar row for a temp id (on create failure). */
+function removeConvRow(tempId: string): void {
+  if (queryClient === null) return;
+  const tempIds = new Set([tempId]);
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    const { data: next } = removeIdsFromPages(data, tempIds);
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+}
+
+/**
+ * Start a client-only conversation synchronously, before `createSession` runs:
+ * one temp id (`temp:*`) shared by the sidebar row, the registry entry, and the
+ * URL; the optimistic first message pushed into the entry; made active so the
+ * caller can `navigate('/c/<tempConvId>')` at once. `switchTo` paints it and
+ * skips binding for a temp id; ChatPage suppresses server-scoped fetches for it.
+ *
+ * Returns the temp id + the bubble's `pendingMsgTempId` for
+ * `hydrateLocalConversation`, or `null` with no query cache (tests).
+ */
+export function beginLocalConversation(
+  text: string,
+  files: File[] | undefined,
+): { tempConvId: string; pendingMsgTempId: string } | null {
+  if (queryClient === null) return null;
+  const tempConvId = newTempConvId();
+  pendingSeq += 1;
+  const pendingMsgTempId = `pend_${pendingSeq}`;
+
+  // Sidebar row under the same id the URL shows.
+  recordOptimisticTitle(tempConvId, text);
+  upsertConvRow(makeConvRow(tempConvId));
+
+  const fileBlocks: MessageContentBlock[] = (files ?? []).map((file) => {
+    const filename = file.name || "image.png";
+    const fileId = `pending:${attachmentKey(file)}`;
+    return file.type.startsWith("image/")
+      ? { type: "input_image" as const, file_id: fileId, filename }
+      : { type: "input_file" as const, file_id: fileId, filename };
+  });
+  const content: MessageContentBlock[] = [
+    ...fileBlocks,
+    ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
+  ];
+  const selfAuthor = getCurrentAuthorId();
+  const bubble: PendingUserMessage = {
+    tempId: pendingMsgTempId,
+    content,
+    createdAtS: Math.floor(Date.now() / 1000),
+    ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+  };
+
+  const entry = conversationRegistry.acquire(tempConvId);
+  entry.setState({
+    pendingUserMessages: [bubble],
+    loadingConversation: false,
+    status: "streaming",
+  });
+  useChatStore.setState({ conversationId: tempConvId });
+  conversationRegistry.setActive(tempConvId);
+  mirrorActiveEntry();
+  return { tempConvId, pendingMsgTempId };
+}
+
+/**
+ * Hydrate a client-only conversation onto its real server id once
+ * `createSession` returns: rekey the registry entry (carrying the optimistic
+ * bubble), the send chain, and the sidebar row from `tempConvId` to `realId`;
+ * flip the store + URL when still viewing it; then POST the first message via
+ * `send` (reusing the already-shown bubble), which binds the real stream.
+ *
+ * Navigate-away safe: the registry/chain/sidebar rekey is id-addressed and
+ * always runs. The store flip + `navigate` run ONLY when still on `tempConvId`,
+ * so a background create can't yank a user who has moved to another chat.
+ */
+export function hydrateLocalConversation(
+  tempConvId: string,
+  realId: string,
+  agentId: string,
+  text: string,
+  files: File[] | undefined,
+  pendingMsgTempId: string,
+  skill: { name: string; args: string } | null,
+  navigate: (to: string, opts?: { replace?: boolean }) => void,
+): void {
+  // Registry entry (carrying the optimistic bubble) + the sidebar row, both
+  // id-addressed. Rekey the row BEFORE the caller's refetch so a lagging index
+  // can't drop it. No send-chain migration: the composer is read-only for a temp
+  // id, so no send is ever keyed under it — the hydrating `send` below enters
+  // the chain under the real id directly.
+  conversationRegistry.rekey(tempConvId, realId);
+  rekeyConvRow(tempConvId, realId, text);
+
+  const stillViewing = useChatStore.getState().conversationId === tempConvId;
+  if (stillViewing) {
+    useChatStore.setState({ conversationId: realId });
+    conversationRegistry.setActive(realId);
+    mirrorActiveEntry();
+    navigate(`/c/${realId}`, { replace: true });
+  }
+
+  const store = useChatStore.getState();
+  if (skill !== null) {
+    // Slash command: the server resolves the skill and emits its own receipt +
+    // echo, which `sendSlashCommand` renders. Drop the plain-text placeholder
+    // bubble so it isn't duplicated, and clear the create-window "streaming"
+    // status (set by `beginLocalConversation`, no `sendLatchedAt`) so
+    // `sendSlashCommand` arms its own latch and owns the failure-settle — else a
+    // failed command would strand the conversation in "streaming" (see B1).
+    setterFor(realId)((s) => ({
+      pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== pendingMsgTempId),
+      status: "idle",
+      sendLatchedAt: null,
+    }));
+    void store.sendSlashCommand(skill.name, skill.args, agentId, { pinnedConversationId: realId });
+    return;
+  }
+  // Plain message: reuse the bubble already on the entry. `send` →
+  // `ensureBoundSession` (existing-session branch) binds the real stream (the
+  // rekeyed entry has no live pump), so no explicit bind here.
+  void store.send(text, agentId, files, {
+    pinnedConversationId: realId,
+    reusePendingTempId: pendingMsgTempId,
+  });
+}
+
+/**
+ * Discard a client-only conversation (create failed): drop the sidebar row and
+ * the registry entry. Returns whether the discarded conversation was still the
+ * one on screen, so the caller can navigate back to the landing route.
+ */
+export function removeLocalConversation(tempConvId: string): boolean {
+  const wasViewing = useChatStore.getState().conversationId === tempConvId;
+  removeConvRow(tempConvId);
+  if (wasViewing) {
+    // Reset the store to the landing state first (switchTo(null) does the full
+    // mirrored-field reset), THEN release the entry.
+    void useChatStore.getState().switchTo(null);
+  }
+  conversationRegistry.release(tempConvId);
+  return wasViewing;
 }
 
 /**
@@ -937,6 +1149,32 @@ const sendChains = new Map<string | symbol, SendChain>();
 // non-string key can never collide with a conversation id.
 const NEW_SESSION_SEND_CHAIN_KEY = Symbol("new-session");
 
+/** Prefix of a client-only conversation id, shown while `createSession` runs. */
+const TEMP_CONV_ID_PREFIX = "temp:";
+
+/** Mint a fresh client-only conversation id: `temp:<32-bit hex>`. */
+function newTempConvId(): string {
+  const hex = Math.floor(Math.random() * 0x1_0000_0000)
+    .toString(16)
+    .padStart(8, "0");
+  return `${TEMP_CONV_ID_PREFIX}${hex}`;
+}
+
+/** Whether an id is a client-only temp conversation id (not a server session). */
+export function isTempConvId(id: string | null | undefined): boolean {
+  return typeof id === "string" && id.startsWith(TEMP_CONV_ID_PREFIX);
+}
+
+/**
+ * A temp URL with no live registry entry — a reload or fresh tab landed on a
+ * `temp:` id whose client-only conversation no longer exists (it can't be
+ * re-created). ChatPage redirects these to landing so the URL-keyed landing
+ * selection isn't stuck on a permanently read-only phantom chat.
+ */
+export function isStaleTempConvId(id: string | null | undefined): boolean {
+  return isTempConvId(id) && conversationRegistry.peek(id as string) === undefined;
+}
+
 /**
  * Take a slot in a conversation's send chain.
  *
@@ -1595,17 +1833,34 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!agentId) {
       throw new Error("chatStore.send: no agentId");
     }
+    // Target session: an explicit pin (navigate-first background POST) overrides
+    // the visible conversation, so a send whose session was created while the
+    // user moved to another chat still lands on the right one, not the one on
+    // screen. `pinnedSetter` routes every write for this send there.
+    const pinnedId = opts?.pinnedConversationId ?? null;
+    const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
     // into the running task's inbox. Keep `activeResponse` untouched in
     // that case so the in-flight bubble keeps its "streaming" lifecycle
     // until its own `response.completed` arrives.
-    const alreadyStreaming = get().status === "streaming";
+    //
+    // `reusePendingTempId` is the navigate-first first turn: the entry was
+    // pre-set to "streaming" by `beginLocalConversation` (for the create-window
+    // shimmer) but has no `sendLatchedAt`. Treat it as NOT-already-streaming so
+    // this send arms the latch and owns the failure-settle — otherwise a failed
+    // first turn would strand the conversation in "streaming" with no watchdog.
+    const alreadyStreaming =
+      opts?.reusePendingTempId != null
+        ? false
+        : pinnedId === null
+          ? get().status === "streaming"
+          : setterForState(pinnedId)?.status === "streaming";
     if (!alreadyStreaming) {
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
       // moves them onto the entry together.
-      setActive({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
+      pinnedSetter({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
     }
 
     // Push to `pendingUserMessages` BEFORE the POST so the bubble
@@ -1614,8 +1869,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // response (separate TCP connections; either can resolve first).
     // FIFO promotion in the consumed handler matches this pending
     // entry to the eventual server item id.
-    pendingSeq += 1;
-    const tempId = `pend_${pendingSeq}`;
+    // Reuse a bubble already on the entry (navigate-first flow) rather than
+    // mint a new one, so the message the user has already seen isn't duplicated.
+    const reuseTempId = opts?.reusePendingTempId ?? null;
+    let tempId: string;
+    if (reuseTempId !== null) {
+      tempId = reuseTempId;
+    } else {
+      pendingSeq += 1;
+      tempId = `pend_${pendingSeq}`;
+    }
     const pendingFileBlocks: MessageContentBlock[] = (files ?? []).map((file) => {
       const filename = file.name || "image.png";
       // Key the placeholder id on the File's stable identity, not its name:
@@ -1633,30 +1896,33 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
     ];
     const selfAuthor = getCurrentAuthorId();
-    setActive((s) => ({
-      pendingUserMessages: [
-        ...s.pendingUserMessages,
-        {
-          tempId,
-          content,
-          createdAtS: Math.floor(Date.now() / 1000),
-          ...(selfAuthor !== null ? { author: selfAuthor } : {}),
-        },
-      ],
-      // A new turn does NOT supersede the background-shell tally: shells
-      // launched in an earlier turn keep running across the turn boundary, so
-      // the composer pill must stay lit alongside the "Working…" shimmer rather
-      // than blink off the moment the user sends. The count is sticky (see the
-      // `session_status` handler) and the next Stop hook re-reports it
-      // authoritatively. Only the parked-dialog reason clears — a fresh send is
-      // not parked on a dialog.
-      blockedOn: null,
-    }));
+    if (reuseTempId === null) {
+      pinnedSetter((s) => ({
+        pendingUserMessages: [
+          ...s.pendingUserMessages,
+          {
+            tempId,
+            content,
+            createdAtS: Math.floor(Date.now() / 1000),
+            ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+          },
+        ],
+        // A new turn does NOT supersede the background-shell tally: shells
+        // launched in an earlier turn keep running across the turn boundary, so
+        // the composer pill must stay lit alongside the "Working…" shimmer rather
+        // than blink off the moment the user sends. The count is sticky (see the
+        // `session_status` handler) and the next Stop hook re-reports it
+        // authoritatively. Only the parked-dialog reason clears — a fresh send is
+        // not parked on a dialog.
+        blockedOn: null,
+      }));
+    }
 
     // Pin the destination before joining the send chain: a stalled prior
     // send can delay this POST past a session switch, and resolving the
     // target afterward would leak the message into the now-active session.
-    const submitConversationId = get().conversationId;
+    // An explicit pin (navigate-first background POST) wins over the visible id.
+    const submitConversationId = pinnedId ?? get().conversationId;
 
     // Take our place in THIS conversation's send chain: wait for its prior
     // send's network work, then hand off to the next via `releaseSend` in the
@@ -1773,12 +2039,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       // Settle the conversation this send targeted, wherever the user is now:
       // its bubble must roll back and its status must not stay "streaming"
-      // forever. When the throw came from session setup itself
-      // (`postedSessionId` never resolved) there is no target conversation, so
-      // it belongs to the active one — the landing composer's own failure.
-      const failSet = postedSessionId === null ? setActive : setterFor(postedSessionId);
+      // forever. Target `postedSessionId ?? submitConversationId` (mirroring the
+      // draft restore above): a bind failure throws before `postedSessionId` is
+      // assigned, but the pin/submit id already names the session — so a failed
+      // navigate-first first turn settles the REAL new session, not whatever
+      // chat the user has since switched to. Null id (the landing composer's own
+      // failure) falls back to the active conversation.
+      const failTarget = postedSessionId ?? submitConversationId;
+      const failSet = failTarget === null ? setActive : setterFor(failTarget);
       const failGet = (): ChatState =>
-        postedSessionId === null ? get() : (setterForState(postedSessionId) ?? get());
+        failTarget === null ? get() : (setterForState(failTarget) ?? get());
       // Roll back the optimistic bubble — no server idle will fire.
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
@@ -1821,12 +2091,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!agentId) {
       throw new Error("chatStore.sendSlashCommand: no agentId");
     }
+    // See `send`: an explicit pin (navigate-first background dispatch) targets
+    // the just-created session even after the user moved to another chat.
+    const pinnedId = opts?.pinnedConversationId ?? null;
+    const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
     // Mirror `send`'s lifecycle scaffolding (streaming flag + send-chain
     // serialization) so a skill invocation behaves like any other turn.
-    const alreadyStreaming = get().status === "streaming";
+    const alreadyStreaming =
+      pinnedId === null
+        ? get().status === "streaming"
+        : setterForState(pinnedId)?.status === "streaming";
     if (!alreadyStreaming) {
       // See `send`: latch and status on one entry, in one patch.
-      setActive({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
+      pinnedSetter({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
     }
     // Optimistic echo of the typed command, mirroring `send`. Without it
     // the chat shows nothing until the server's `slash_command` receipt
@@ -1840,7 +2117,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const tempId = `pend_${pendingSeq}`;
     const commandText = args ? `/${name} ${args}` : `/${name}`;
     const selfAuthor = getCurrentAuthorId();
-    setActive((s) => ({
+    pinnedSetter((s) => ({
       pendingUserMessages: [
         ...s.pendingUserMessages,
         {
@@ -1854,7 +2131,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     // Pin the destination at submit time — see `send` above for why a late
     // resolve mis-routes to the session the user has since switched to.
-    const submitConversationId = get().conversationId;
+    const submitConversationId = pinnedId ?? get().conversationId;
 
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
 
@@ -1909,10 +2186,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const message = err instanceof Error ? err.message : String(err);
       // Settle the conversation this command targeted, wherever the user is
       // now: its echo must roll back and its status must not stay "streaming"
-      // forever. A throw from session setup itself (`postedSessionId` never
-      // resolved) has no target conversation, so it belongs to the active one —
-      // the landing composer's own failure. Mirrors `send`'s catch.
-      const failSet = postedSessionId === null ? setActive : setterFor(postedSessionId);
+      // forever. Target `postedSessionId ?? submitConversationId` (mirrors
+      // `send`'s catch): a bind failure throws before `postedSessionId` is set,
+      // but the pin/submit id already names the session, so a failed pinned
+      // command settles the real session, not the visible one. Null → active.
+      const failTarget = postedSessionId ?? submitConversationId;
+      const failSet = failTarget === null ? setActive : setterFor(failTarget);
       // Roll back the optimistic echo — no receipt will reconcile it.
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
@@ -2010,6 +2289,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Landing route: nothing to project, so reset the mirrored fields to a
       // clean slate rather than leaving the last conversation painted.
       rootSetState(createInitialConversationState() as Parameters<typeof rootSetState>[0]);
+      return;
+    }
+
+    // A client-only conversation (temp:*) shown while `createSession` is in
+    // flight has no server session to bind — its entry holds the optimistic
+    // first-message bubble locally. Paint it and return; the background create
+    // rekeys it to the real id (which then binds). If the entry is gone (a stale
+    // temp URL survived a reload — it can't be re-created), reset to landing
+    // state as a backstop; ChatPage redirects the URL to `/` (isStaleTempConvId).
+    if (isTempConvId(conversationId)) {
+      if (conversationRegistry.peek(conversationId) === undefined) {
+        conversationRegistry.setActive(null);
+        rootSetState({ conversationId: null } as Parameters<typeof rootSetState>[0]);
+        rootSetState(createInitialConversationState() as Parameters<typeof rootSetState>[0]);
+        return;
+      }
+      conversationRegistry.acquire(conversationId);
+      mirrorActiveEntry();
       return;
     }
 

@@ -68,6 +68,8 @@ import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   composerAttachmentKey,
   consumePendingInitialPrompt,
+  isStaleTempConvId,
+  isTempConvId,
   type PendingInitialPrompt,
   type QueuedMessage,
   useChatStore,
@@ -368,6 +370,10 @@ export function ChatPage() {
   // transition priority. switchTo, routing, and the composer all stay on the
   // immediate urlConvId — sends always target the conversation the URL shows.
   const deferredConvId = useDeferredValue(urlConvId);
+  // The id for every server-scoped fetch/hook — `undefined` while the URL holds
+  // a client-only temp id, so none of them hit `/v1/sessions/<temp>/*` before
+  // the session exists. `switchTo` still gets the raw `urlConvId`.
+  const sessionConvId = isTempConvId(urlConvId) ? undefined : urlConvId;
   const navigate = useNavigate();
   const appName = useAppName();
   // Optional first message handed off by the landing composer through the
@@ -418,7 +424,10 @@ export function ChatPage() {
   // Clear the "unseen messages" sidebar dot for the conversation the
   // user is currently viewing. Re-fires when conversations refresh
   // (every 4 s) so messages arriving while viewing are marked seen.
-  useMarkConversationSeen(urlConvId, conversations?.find((c) => c.id === urlConvId)?.updated_at);
+  useMarkConversationSeen(
+    sessionConvId,
+    conversations?.find((c) => c.id === sessionConvId)?.updated_at,
+  );
 
   // Sync the store's active conversation to the URL. Single source of
   // truth: URL is what's "current"; store mirrors it. The effect is
@@ -431,8 +440,16 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
+    // A stale temp URL (reload / fresh tab onto `/c/temp:*` whose client-only
+    // conversation is gone) has no forward path: landing is URL-keyed, so the
+    // page would sit on a permanently read-only phantom chat. Redirect to
+    // landing instead of binding a nonexistent session.
+    if (isStaleTempConvId(urlConvId)) {
+      navigate("/", { replace: true });
+      return;
+    }
     void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId]);
+  }, [urlConvId, navigate]);
 
   // Server-driven redirect: when the active conversation is superseded
   // (a `session.superseded` event — e.g. a Claude `/clear` rotated it
@@ -495,8 +512,8 @@ export function ChatPage() {
   // Read runner liveness from the app-level batch poller (see
   // RunnerHealthProvider). `undefined` = not yet polled — the indicator
   // stays hidden until the first poll for this session resolves.
-  const runnerOnline = useSessionRunnerOnline(urlConvId);
-  useRefreshSessionStateOnRunnerOnline(urlConvId, runnerOnline);
+  const runnerOnline = useSessionRunnerOnline(sessionConvId);
+  useRefreshSessionStateOnRunnerOnline(sessionConvId, runnerOnline);
   // OR'd into "Working…" so cross-client turns surface a shimmer.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const backgroundTaskCount = useChatStore((s) => s.backgroundTaskCount);
@@ -509,7 +526,7 @@ export function ChatPage() {
   // agent object for the active session. Drives the picker's
   // name/description; the same react-query cache also feeds the header
   // info icon (AgentInfoButton) its tools & policies.
-  const { data: boundAgentBySession } = useSessionAgent(urlConvId ?? null);
+  const { data: boundAgentBySession } = useSessionAgent(sessionConvId ?? null);
   const hasMoreHistory = useChatStore((s) => s.hasMoreHistory);
   const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
 
@@ -629,7 +646,7 @@ export function ChatPage() {
   // Must be declared BEFORE the early-return guards below — otherwise
   // the hook is skipped on renders that hit the loading/error branches,
   // tripping React's "rendered fewer hooks than expected".
-  const { session: activeSession, isLoading: sessionLoading } = useSession(urlConvId ?? null);
+  const { session: activeSession, isLoading: sessionLoading } = useSession(sessionConvId ?? null);
 
   // Orchestrator-only: polly's children inherit its agentName, so the gate
   // needs the session predicate (parent linkage), not a bare name check. An
@@ -656,7 +673,7 @@ export function ChatPage() {
   const subAgentLabel = subAgentComposerLabel(activeSession);
 
   // Hoisted above the early-return guards so the title-update effect can read them.
-  const activeConv = urlConvId ? conversations?.find((c) => c.id === urlConvId) : null;
+  const activeConv = sessionConvId ? conversations?.find((c) => c.id === sessionConvId) : null;
 
   // `isWorking` gates the parent's OWN turn (Stop/Interrupt) and must NOT
   // include child-session activity. `showsWorking` is display-only (tab title
@@ -732,7 +749,7 @@ export function ChatPage() {
   const viewerId = getCurrentAuthorId();
   const sessionOwner = activeConv?.owner ?? null;
   const viewerOwnsSession = sessionOwner !== null && sessionOwner === viewerId;
-  const { data: ownerGrants } = usePermissions(viewerOwnsSession ? (urlConvId ?? null) : null);
+  const { data: ownerGrants } = usePermissions(viewerOwnsSession ? (sessionConvId ?? null) : null);
   const isSessionShared = isSessionSharedWithOthers(sessionOwner, viewerId, ownerGrants);
 
   // The open session's derived liveness — the single signal the chat
@@ -780,7 +797,7 @@ export function ChatPage() {
   // Host-switch launch marker; see the store field. Keeps this surface's
   // liveness in step with AppShell's, which drives the startup spinner.
   const runnerLaunchedAt = useChatStore((s) => s.runnerLaunchedAt);
-  const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
+  const liveness = useSessionLiveness(sessionConvId ?? undefined, livenessRow, {
     turnActive: status === "streaming",
     launchedAt: runnerLaunchedAt,
   });
@@ -853,6 +870,8 @@ export function ChatPage() {
   const onSend = useCallback(
     (text: string, files?: File[]) => {
       if (!agentId) return;
+      // No server session yet (still creating) — nothing to POST to.
+      if (isTempConvId(urlConvId)) return;
       // An unbound coding clone (fork-source label) needs a directory before
       // it can run: open the picker and stash this message to replay after
       // the bind. Pin the prompt to THIS session so it replays here, never
@@ -953,7 +972,11 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
+  // Client-only conversation: no server session to POST a follow-up to yet, so
+  // the composer stays read-only until the create resolves and the id hydrates.
+  const readOnlyReason = isTempConvId(urlConvId)
+    ? "Starting the session…"
+    : readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Once present, the live session snapshot is authoritative. Memoized so the
   // derived props it feeds (modelPickerKind, effortLevels, wrapperLabel) keep a
   // stable identity across the switch's re-render burst.
@@ -2179,6 +2202,10 @@ function ComposerStatusLine({
   onHostReconnect?: () => void;
 }) {
   const conversationId = useChatStore((s) => s.conversationId);
+  // A client-only temp id has no server session — gate the server-scoped hooks
+  // below on it so they never fetch `/v1/sessions/temp:*` during the create
+  // window (mirrors ChatPage's top-level `sessionConvId`).
+  const sessionId = isTempConvId(conversationId) ? null : conversationId;
   const contextWindow = useChatStore((s) => s.contextWindow);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
@@ -2189,12 +2216,12 @@ function ComposerStatusLine({
 
   // Host binding drives whether the HostBadge has anything to show — read it
   // from the same source the badge does so the tray's render guard matches.
-  const { session } = useSession(conversationId);
+  const { session } = useSession(sessionId);
   const isHostBound = !!session?.hostId;
 
   // PR link → opens the workspace rail's GitHub tab. Shares the info query's
   // cache with the GitHub panel, so opening the tab is instant.
-  const github = useGithubInfo(conversationId ?? undefined);
+  const github = useGithubInfo(sessionId ?? undefined);
   const openGithubTab = useOpenGithubTab();
   const prNumber = github.data?.pr?.number ?? null;
   const showPr = !!conversationId && !isSubAgentSession && prNumber !== null && !!openGithubTab;
@@ -2655,7 +2682,10 @@ function ComposerImpl({
     unreachable,
     maybeFlushQueuedHead,
   ]);
-  const { goal, setGoal: setGoalState } = useGoalState(conversationId, showGoalControl);
+  // No server session behind a temp id — gate goal/workspace fetches on it so
+  // the create window issues no `/v1/sessions/temp:*` requests.
+  const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  const { goal, setGoal: setGoalState } = useGoalState(composerSessionId, showGoalControl);
   // "@"-file-mention is scoped to the native coding-agent harnesses: their
   // vendor CLIs run in the workspace and read an on-disk file from an
   // attachment marker the executor already emits. In-process SDK sessions
@@ -2668,7 +2698,7 @@ function ComposerImpl({
   // so the composer's "@" entry point can't split-brain from the file viewer's
   // "Attach to agent" gate (``canAttachToAgent``), which already uses it.
   const mentionEnabled = nativeCodingAgentForHarness(sessionHarness) !== undefined;
-  const workspaceFilesQuery = useWorkspaceAllFiles(conversationId ?? undefined, {
+  const workspaceFilesQuery = useWorkspaceAllFiles(composerSessionId ?? undefined, {
     enabled: mentionEnabled,
   });
   const valueRef = useRef(value);
