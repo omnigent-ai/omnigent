@@ -5114,6 +5114,54 @@ async def test_launch_harness_probe_runs_off_the_event_loop(
     )
 
 
+async def test_launch_setup_hint_does_not_block_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A slow remediation probe must leave the host loop free to handle frames."""
+    host = _make_host_process()
+    loop = asyncio.get_running_loop()
+    loop_thread_id = threading.get_ident()
+    hint_started = asyncio.Event()
+    release_hint = threading.Event()
+    hint = "upgrade the harness CLI, then log in"
+
+    def _slow_hint(harness: str) -> str:
+        assert harness == "cursor-native"
+        loop.call_soon_threadsafe(hint_started.set)
+        assert threading.get_ident() != loop_thread_id
+        assert release_hint.wait(timeout=5), "event loop did not release the hint probe"
+        return hint
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", lambda harness: False)
+    monkeypatch.setattr("omnigent.host.connect.harness_setup_hint", _slow_hint)
+    launch = asyncio.create_task(
+        host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_hint_probe",
+                binding_token="token_abc",
+                workspace=str(tmp_path),
+                harness="cursor-native",
+            )
+        )
+    )
+    try:
+        await asyncio.wait_for(hint_started.wait(), timeout=2)
+        assert not launch.done()
+    finally:
+        release_hint.set()
+        result = await launch
+
+    assert result.request_id == "req_hint_probe"
+    assert result.status == "failed"
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    assert hint in (result.error or "")
+    assert "cursor-native" in (result.error or "")
+    assert "test-laptop" in (result.error or "")
+    assert result.runner_id is None
+    assert host._runners == {}
+
+
 async def test_fatal_upgrade_error_surfaces_server_refusal_body() -> None:
     """A refusal that carries a body (what ``_refuse_upgrade`` sends, e.g. the
     server's malformed-host-id 400) is surfaced verbatim — the client passes the

@@ -1596,12 +1596,14 @@ class HostProcess:
         if frame.harness is not None and not await asyncio.to_thread(
             harness_is_configured, frame.harness
         ):
+            # Remediation may probe the CLI too, so keep it off the loop.
+            setup_hint = await asyncio.to_thread(harness_setup_hint, frame.harness)
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=(
                     f"harness {frame.harness!r} is not configured on host "
-                    f"{self._identity.name!r} — {harness_setup_hint(frame.harness)}"
+                    f"{self._identity.name!r} — {setup_hint}"
                 ),
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )
