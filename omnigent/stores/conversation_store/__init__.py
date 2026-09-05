@@ -1065,6 +1065,14 @@ class ConversationStore(ABC):
         """
         ...
 
+    def set_session_todos(
+        self,
+        conversation_id: str,
+        todos: list[dict[str, Any]],
+    ) -> bool:
+        """Persist the native Plan snapshot; return whether the session exists."""
+        raise NotImplementedError
+
     @abstractmethod
     def set_conversation_project(
         self,
