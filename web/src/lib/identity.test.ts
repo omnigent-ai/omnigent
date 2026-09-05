@@ -32,6 +32,72 @@ afterEach(() => {
 });
 
 describe("resolveIdentity", () => {
+  it("does not hydrate a preference initialization body after the Host connection changes", async () => {
+    let finishBody!: (body: unknown) => void;
+    const json = vi.fn(
+      () =>
+        new Promise<unknown>((resolve) => {
+          finishBody = resolve;
+        }),
+    );
+    const serverA = vi
+      .fn()
+      .mockResolvedValueOnce(mockJsonResponse({ user_id: "alice", preferences: null }))
+      .mockResolvedValueOnce({ ok: true, status: 200, json });
+    const serverB = vi.fn();
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity } = await import("./identity");
+    const pending = resolveIdentity();
+    await vi.waitFor(() => expect(json).toHaveBeenCalledOnce());
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    finishBody({ version: 1, settings: { context_indicator: "compact" } });
+    expect(await pending).toBeNull();
+    expect(localStorage.getItem("omnigent:context-indicator-mode")).toBeNull();
+    expect(serverB).not.toHaveBeenCalled();
+  });
+  it("discards a body decoded after switching Servers before a new identity lookup", async () => {
+    let finishBody!: (body: unknown) => void;
+    const json = vi.fn(
+      () =>
+        new Promise<unknown>((resolve) => {
+          finishBody = resolve;
+        }),
+    );
+    const serverA = vi.fn().mockResolvedValue({ ok: true, status: 200, json });
+    const serverB = vi.fn().mockResolvedValue(mockJsonResponse({ version: 1, settings: {} }));
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity } = await import("./identity");
+    const pending = resolveIdentity();
+    await vi.waitFor(() => expect(json).toHaveBeenCalledOnce());
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    finishBody({ user_id: "alice", preferences: null });
+    expect(await pending).toBeNull();
+    expect(serverB).not.toHaveBeenCalled();
+  });
+
+  it("never sends queued preferences to a newly selected Server before identity resolves", async () => {
+    vi.useFakeTimers();
+    const serverA = vi.fn().mockResolvedValue(
+      mockJsonResponse({
+        user_id: "alice",
+        preferences: { version: 1, settings: {} },
+      }),
+    );
+    const serverB = vi.fn().mockResolvedValue(mockJsonResponse({ version: 1, settings: {} }));
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity } = await import("./identity");
+    const { queueUserPreferencePatch, resetUserPreferencesSyncForTests } =
+      await import("./userPreferencesSync");
+    await resolveIdentity();
+    queueUserPreferencePatch("context_indicator", "compact");
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(serverB).not.toHaveBeenCalled();
+    resetUserPreferencesSyncForTests();
+  });
   it("calls GET /v1/me and caches the user id", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice@example.com" }));
     const { resolveIdentity, getCurrentUserId } = await import("./identity");

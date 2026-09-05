@@ -361,7 +361,11 @@ export async function resolveIdentity(): Promise<string | null> {
             user_id: null;
             login_url?: string;
           };
-          if (identityConnectionId !== preferenceConnectionId) return null;
+          if (
+            identityConnectionId !== preferenceConnectionId ||
+            preferenceConnectionId !== currentIdentityConnectionId()
+          )
+            return null;
           if (data.login_url) {
             serverLoginUrl = data.login_url;
             if (!isOnLoginPath()) {
@@ -379,7 +383,11 @@ export async function resolveIdentity(): Promise<string | null> {
           is_admin?: boolean;
           preferences?: unknown | null;
         };
-        if (identityConnectionId !== preferenceConnectionId) return null;
+        if (
+          identityConnectionId !== preferenceConnectionId ||
+          preferenceConnectionId !== currentIdentityConnectionId()
+        )
+          return null;
         currentUserId = data.user_id;
         currentIsAdmin = data.is_admin ?? false;
         await initializeUserPreferencesSync(
@@ -388,6 +396,7 @@ export async function resolveIdentity(): Promise<string | null> {
           data.user_id,
           stablePreferenceServerId,
           preferenceConnectionId,
+          () => preferenceConnectionId === currentIdentityConnectionId(),
         );
       }
     } catch {

@@ -53,6 +53,11 @@ let activeOwnerId: string | null = null;
 let activeServerId = "__default__";
 let activeConnectionId = "__default__";
 let syncGeneration = 0;
+let preferenceConnectionIsCurrent = () => true;
+
+function isCurrentPreferenceGeneration(generation: number): boolean {
+  return generation === syncGeneration && preferenceConnectionIsCurrent();
+}
 let refreshListenersInstalled = false;
 let lastFocusRefreshAt = 0;
 const pendingTimers = new Map<UserPreferenceNamespace, number>();
@@ -256,15 +261,15 @@ function hydrateServerEnvelope(envelope: UserPreferencesEnvelope): void {
 export async function refreshUserPreferencesFromServer(): Promise<void> {
   const fetcher = preferenceFetcher;
   const generation = syncGeneration;
-  if (!serverSupportsPreferences || fetcher === null) return;
+  if (!serverSupportsPreferences || fetcher === null || !preferenceConnectionIsCurrent()) return;
   try {
     const response = await fetcher("/v1/me", { cache: "no-store" });
-    if (generation !== syncGeneration) return;
+    if (!isCurrentPreferenceGeneration(generation)) return;
     if (!response.ok) return;
     const data = (await response.json()) as { user_id?: unknown; preferences?: unknown };
     const responseOwner = typeof data.user_id === "string" ? data.user_id : null;
     if (
-      generation !== syncGeneration ||
+      !isCurrentPreferenceGeneration(generation) ||
       responseOwner !== activeOwnerId ||
       !isEnvelope(data.preferences)
     )
@@ -325,6 +330,7 @@ export async function initializeUserPreferencesSync(
   ownerId: string | null = null,
   serverId = "__default__",
   connectionId = serverId,
+  isCurrentConnection: () => boolean = () => true,
 ): Promise<void> {
   if (
     activeOwnerId !== ownerId ||
@@ -337,6 +343,7 @@ export async function initializeUserPreferencesSync(
   activeServerId = serverId;
   activeConnectionId = connectionId;
   preferenceFetcher = fetcher;
+  preferenceConnectionIsCurrent = isCurrentConnection;
   if (serverValue === undefined) {
     // A native client can switch from a newer Server to an older one without
     // reloading the SPA. Cancel writes queued for the previous Server and
@@ -372,11 +379,11 @@ export async function initializeUserPreferencesSync(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(initialEnvelope),
       });
-      if (generation !== syncGeneration) return;
+      if (!isCurrentPreferenceGeneration(generation)) return;
       if (response.ok) {
         window.localStorage.setItem(USER_PREFERENCES_SCOPE_KEY, preferenceScope);
         const persisted = (await response.json().catch(() => null)) as unknown;
-        if (generation !== syncGeneration) return;
+        if (!isCurrentPreferenceGeneration(generation)) return;
         // A concurrent first device may have initialized the account first.
         // Hydrate the winning server envelope immediately instead of waiting
         // for a reload while showing stale device settings.
@@ -409,7 +416,7 @@ function schedulePatch(
     namespace,
     window.setTimeout(() => {
       pendingTimers.delete(namespace);
-      if (generation !== syncGeneration) return;
+      if (!isCurrentPreferenceGeneration(generation)) return;
       if (inFlightPatches.has(namespace)) {
         patchesAfterFlight.set(namespace, { syncValue, serialized, delayMs: 0, attempt });
         return;
@@ -426,7 +433,7 @@ function schedulePatch(
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ value: syncValue }),
           });
-          if (generation !== syncGeneration) return;
+          if (!isCurrentPreferenceGeneration(generation)) return;
           if (!response?.ok) throw new Error("preference patch failed");
           lastAcknowledged.set(namespace, serialized);
           const current = latestNamespaceValue(namespace);
@@ -443,7 +450,7 @@ function schedulePatch(
             });
           }
         } catch {
-          if (generation === syncGeneration) {
+          if (isCurrentPreferenceGeneration(generation)) {
             const current = latestNamespaceValue(namespace);
             const currentSerialized = serializedNamespaceValue(namespace, current);
             if (currentSerialized !== serialized) {
@@ -465,7 +472,7 @@ function schedulePatch(
           }
         } finally {
           if (inFlightPatches.get(namespace) === generation) inFlightPatches.delete(namespace);
-          if (generation === syncGeneration) {
+          if (isCurrentPreferenceGeneration(generation)) {
             const next = patchesAfterFlight.get(namespace);
             if (next) {
               patchesAfterFlight.delete(namespace);
@@ -486,6 +493,7 @@ export function queueUserPreferencePatch(
     typeof window === "undefined" ||
     applyingServerPreferences ||
     !serverSupportsPreferences ||
+    !preferenceConnectionIsCurrent() ||
     preferenceFetcher === null
   ) {
     return;
@@ -520,6 +528,7 @@ export function resetUserPreferencesSyncForTests(): void {
   activeServerId = "__default__";
   activeConnectionId = "__default__";
   syncGeneration = 0;
+  preferenceConnectionIsCurrent = () => true;
   lastFocusRefreshAt = 0;
   if (refreshListenersInstalled) {
     window.removeEventListener("focus", refreshOnFocus);
