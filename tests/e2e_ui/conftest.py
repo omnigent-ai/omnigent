@@ -1228,6 +1228,71 @@ def seeded_session(
                 respawned_runner.wait(timeout=5)
 
 
+# Minimal agent whose resolved harness is Claude. Tests that drive the
+# Claude PermissionRequest hook synthetically need a session this agent
+# backs, because the endpoint rejects sessions whose harness is not Claude.
+_CLAUDE_NATIVE_AGENT_YAML = """\
+name: claude_native_probe
+prompt: You are a Claude Code session under test.
+
+executor:
+  harness: claude-native
+"""
+
+
+def _build_claude_native_bundle() -> bytes:
+    """Build a gzipped tarball from ``_CLAUDE_NATIVE_AGENT_YAML``.
+
+    Same compat-adapter routing as :func:`_build_hello_world_bundle`: the
+    non-``config.yaml`` archive name translates ``executor.harness``.
+
+    :returns: The ``.tar.gz`` bytes ready for multipart upload.
+    """
+    import gzip
+
+    buf = io.BytesIO()
+    with (
+        gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz,
+        tarfile.open(fileobj=gz, mode="w") as tar,
+    ):
+        data = _CLAUDE_NATIVE_AGENT_YAML.encode()
+        info = tarfile.TarInfo(name="claude_native_probe.yaml")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+@pytest.fixture
+def claude_seeded_session(live_server: str) -> Iterator[tuple[str, str]]:
+    """Create a session whose resolved harness is Claude and yield its id.
+
+    The Claude PermissionRequest hook (``POST
+    /v1/sessions/{id}/hooks/permission-request``) only serves sessions whose
+    bound agent runs Claude, so hook-driven card tests cannot reuse the
+    non-Claude :func:`seeded_session`. No runner bind and no turn: the hook
+    parks server-side and the card renders entirely SPA-side, so nothing
+    dispatches to a runner.
+
+    :param live_server: Spawned server fixture.
+    :returns: ``(base_url, session_id)``. Tests typically navigate to
+        ``f"{base_url}/c/{session_id}"``.
+    """
+    import json as _json
+
+    create_resp = httpx.post(
+        f"{live_server}/v1/sessions",
+        data={"metadata": _json.dumps({})},
+        files={"bundle": ("agent.tar.gz", _build_claude_native_bundle(), "application/gzip")},
+        timeout=30.0,
+    )
+    create_resp.raise_for_status()
+    session_id = create_resp.json()["session_id"]
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+
+
 def _create_runner_bound_session(base_url: str, runner_id: str) -> str:
     """Create a hello_world session and PATCH-bind it to ``runner_id``.
 
