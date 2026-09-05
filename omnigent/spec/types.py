@@ -1427,6 +1427,10 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         must be ``1``.
     :param name: Human-readable agent name, e.g. ``"code-reviewer"``.
     :param description: Short summary of the agent's purpose.
+    :param short_description: Optional one-line blurb for compact
+        UI surfaces (e.g. a picker row) where ``description`` would
+        truncate badly. ``None`` means the agent declares no
+        ``short_description:``.
     :param llm: LLM configuration. ``None`` means the agent does not
         declare an LLM preference.
     :param interaction: Conversational mode and modality settings.
@@ -1545,6 +1549,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     spec_version: int
     name: str | None = None
     description: str | None = None
+    short_description: str | None = None
     llm: LLMConfig | None = None
     interaction: InteractionConfig = field(default_factory=InteractionConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)

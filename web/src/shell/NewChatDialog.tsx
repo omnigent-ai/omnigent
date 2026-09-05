@@ -252,6 +252,9 @@ import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
+// Fallback only: an agent's own spec `short_description:` (surfaced as
+// `AvailableAgent.short_description`) takes precedence over this map, so
+// only agents without one need an entry here.
 const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
   polly: "Multi-agent coding",
   debby: "Multi-agent debate",
@@ -1154,7 +1157,7 @@ export function AgentHarnessPicker({
   // hover. Run-config knobs now live in the gear-icon config modal, not here —
   // this picker only selects the agent / harness.
   const renderRowInner = (agent: AvailableAgent, withTooltip: boolean) => {
-    const blurb = AGENT_PICKER_DESCRIPTIONS[agent.name];
+    const blurb = agent.short_description ?? AGENT_PICKER_DESCRIPTIONS[agent.name];
     const inner = (
       <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
         <span className="truncate">{agent.display_name}</span>

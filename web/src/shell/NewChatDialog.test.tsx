@@ -3151,6 +3151,71 @@ describe("NewChatLandingScreen skills menu", () => {
   });
 });
 
+// Picker-row blurb: an agent's own spec `short_description` takes
+// precedence over the hardcoded AGENT_PICKER_DESCRIPTIONS fallback map,
+// so any agent can supply its own compact picker text, not just polly/debby.
+describe("NewChatLandingScreen agent picker blurb", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it("prefers a spec-provided short_description over the fallback map", () => {
+    mockAgents([
+      {
+        id: "a_polly",
+        name: "polly",
+        display_name: "Polly",
+        description: null,
+        short_description: "Spec-provided blurb",
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const row = screen.getByTestId("new-chat-landing-agent-a_polly");
+    expect(row.textContent).toContain("Spec-provided blurb");
+    expect(row.textContent).not.toContain("Multi-agent coding");
+  });
+
+  it("keeps polly's fallback blurb unchanged when its spec sets no short_description", () => {
+    mockAgents([
+      {
+        id: "a_polly",
+        name: "polly",
+        display_name: "Polly",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const row = screen.getByTestId("new-chat-landing-agent-a_polly");
+    expect(row.textContent).toContain("Multi-agent coding");
+  });
+
+  it("renders a spec-provided short_description for an agent outside the fallback map", () => {
+    mockAgents([
+      {
+        id: "a2",
+        name: "codex-native-ui",
+        display_name: "Codex",
+        description: "A much longer paragraph meant for a hover tooltip.",
+        short_description: "Fast agentic coding",
+        harness: "codex-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const row = screen.getByTestId("new-chat-landing-agent-a2");
+    expect(row.textContent).toContain("Fast agentic coding");
+  });
+});
+
 // Always-visible skill pills under the landing composer for allowlisted
 // orchestrators (polly/debby): pills surface bundled skills without
 // typing "/", and clicking one prefills the composer — it never sends.

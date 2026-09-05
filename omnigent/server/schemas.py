@@ -237,6 +237,11 @@ class AgentObject(BaseModel):
         incremented on each update.
     :param description: Optional free-text description of the
         agent's purpose.
+    :param short_description: Optional one-line blurb from the
+        spec's ``short_description:``, for compact UI surfaces
+        (e.g. a picker row) where ``description`` would truncate
+        badly. ``None`` when the spec declares none or the bundle
+        cannot be loaded.
     :param created_at: Unix epoch timestamp of creation.
     :param updated_at: Unix epoch timestamp of the last update,
         or ``None`` if never updated.
@@ -291,6 +296,7 @@ class AgentObject(BaseModel):
     name: str
     version: int = 1
     description: str | None = None
+    short_description: str | None = None
     created_at: int
     updated_at: int | None = None
     harness: str | None = None

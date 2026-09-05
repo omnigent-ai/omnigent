@@ -284,6 +284,56 @@ async def test_update_mcp_server_clears_headers_when_empty_dict_sent(
     assert "headers" not in mcp_file
 
 
+# GET /v1/sessions/{id}/agent shares its AgentObject-building code with
+# GET /v1/agents (both call a `_to_agent_object`), so this module — the one
+# that already exercises this route for mcp_servers — is also where its
+# other spec-sourced fields get covered, not just MCP-specific ones.
+async def test_session_agent_exposes_short_description_from_spec(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/sessions/{id}/agent`` reports the agent's declared
+    ``short_description:``, independent of the long-form ``description``.
+
+    Proves the field traverses this endpoint's spec-load path too, not
+    just the ``GET /v1/agents`` catalog's.
+    """
+    session = await create_test_session(
+        client,
+        name="short-desc-session-agent",
+        description="A much longer paragraph meant for a hover tooltip.",
+        short_description="One-line picker blurb",
+    )
+    session_id = session["id"]
+
+    agent_resp = await client.get(f"/v1/sessions/{session_id}/agent")
+
+    assert agent_resp.status_code == 200, agent_resp.text
+    entry = agent_resp.json()
+    assert entry["short_description"] == "One-line picker blurb"
+    assert entry["description"] == "A much longer paragraph meant for a hover tooltip."
+
+
+async def test_session_agent_short_description_none_when_undeclared(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``short_description`` is ``None`` on ``GET /v1/sessions/{id}/agent``
+    when the spec declares none.
+
+    Matches the sibling nullable fields on AgentObject (description,
+    harness, updated_at), which this endpoint also emits as null rather
+    than omitting — the model deliberately does not use exclude_none.
+    """
+    session = await create_test_session(client, name="no-short-desc-session-agent")
+    session_id = session["id"]
+
+    agent_resp = await client.get(f"/v1/sessions/{session_id}/agent")
+
+    assert agent_resp.status_code == 200, agent_resp.text
+    assert agent_resp.json()["short_description"] is None
+
+
 async def _agent_bundle(client: httpx.AsyncClient, session_id: str) -> bytes:
     """Download the session agent bundle."""
     resp = await client.get(f"/v1/sessions/{session_id}/agent/contents")

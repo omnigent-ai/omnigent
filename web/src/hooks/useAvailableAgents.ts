@@ -14,6 +14,11 @@ export interface AvailableAgent {
   name: string;
   display_name: string;
   description: string | null;
+  // One-line picker blurb from the spec's `short_description:`, e.g.
+  // "Multi-agent coding". null when the spec declares none or the
+  // server predates the field. The picker prefers this over its
+  // hardcoded AGENT_PICKER_DESCRIPTIONS fallback map.
+  short_description?: string | null;
   // Harness/kind from GET /v1/agents, e.g. "codex", "codex-native",
   // "claude-native", or "claude-sdk". null when the server couldn't load
   // the agent's spec. Lets the picker recognise Codex vs Claude agents
@@ -97,6 +102,7 @@ interface BuiltinAgentWire {
   id: string;
   name: string;
   description?: string | null;
+  short_description?: string | null;
   harness?: string | null;
   skills?: { name: string; description: string }[];
   // True only for server-seeded built-ins (deterministic id). Absent on
@@ -147,6 +153,11 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],
+    // Omit rather than set to null/undefined so toEqual comparisons aren't
+    // sensitive to an absent key — mirrors the builtin/created_at spreads
+    // below. The picker's `agent.short_description ?? fallbackMap[name]`
+    // treats a missing key the same as null.
+    ...(a.short_description !== undefined ? { short_description: a.short_description } : {}),
     // Omit rather than set to undefined so toEqual comparisons aren't
     // sensitive to absent-vs-undefined. Logic that reads builtin treats
     // undefined as "protected" (same as true), so omission is safe.
