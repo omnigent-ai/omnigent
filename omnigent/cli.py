@@ -2442,8 +2442,9 @@ _HOST_PID_PATH = data_dir() / "host.pid"
 
 # host.pid records the daemon PID + the "target" it serves: a normalized
 # server URL for remote/explicit targets, or the literal marker ``"local"``
-# for a daemon that owns a local Omnigent server. Daemon reuse is keyed on this
-# target (real URLs never collide with the marker).
+# for a daemon serving this data dir's own instance. Daemon reuse is keyed on
+# this target; loopback spellings of the tracked local server normalize to the
+# marker, so one instance never accrues per-spelling duplicate daemons.
 _LOCAL_DAEMON_MARKER = "local"
 
 # ``--server`` values that mean "run against a local server" rather than naming a
@@ -2566,13 +2567,17 @@ def _normalize_daemon_target(server_url: str | None) -> str:
     """
     Normalize a daemon target key.
 
+    A loopback URL naming the port tracked by this data dir's
+    ``local_server.pid`` collapses to ``"local"``: it addresses the data
+    dir's own server instance, so every spelling shares one record.
+
     :param server_url: Requested Omnigent server URL, e.g.
         ``"https://example.databricksapps.com/"``. ``None`` or empty
         string selects local mode.
-    :returns: ``"local"`` for local mode, otherwise the URL without a
-        trailing slash.
+    :returns: ``"local"`` for local mode or a loopback spelling of the
+        tracked local server, otherwise the URL without a trailing slash.
     """
-    return _normalize_daemon_target_impl(server_url)
+    return _normalize_daemon_target_impl(server_url, base_dir=_HOST_PID_PATH.parent)
 
 
 def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) -> bool:
@@ -2814,11 +2819,17 @@ def _load_existing_host_id() -> str | None:
 
     :returns: Host id from config, e.g. ``"host_abc123"``, or ``None``.
     """
-    candidate_paths = [_effective_global_config_path()]
-    from omnigent.host.identity import CONFIG_PATH
+    from omnigent.host.identity import CONFIG_PATH, identity_config_path
 
-    if CONFIG_PATH not in candidate_paths:
-        candidate_paths.append(CONFIG_PATH)
+    scoped = identity_config_path()
+    if scoped != CONFIG_PATH:
+        # A non-default data dir is its own host instance: its identity lives
+        # in that dir alone, never in the machine-wide config files.
+        candidate_paths = [scoped]
+    else:
+        candidate_paths = [_effective_global_config_path()]
+        if CONFIG_PATH not in candidate_paths:
+            candidate_paths.append(CONFIG_PATH)
     for path in candidate_paths:
         try:
             raw = yaml.safe_load(path.read_text()) if path.exists() else None
@@ -3211,10 +3222,10 @@ def _load_or_create_host_id() -> str | None:
     host_id = _load_existing_host_id()
     if host_id is not None:
         return host_id
-    from omnigent.host.identity import CONFIG_PATH, load_or_create_host_identity
+    from omnigent.host.identity import load_or_create_host_identity
 
     try:
-        return load_or_create_host_identity(CONFIG_PATH).host_id
+        return load_or_create_host_identity().host_id
     except (OSError, ValueError):
         # OSError: identity file unwritable. ValueError: a malformed persisted /
         # env host_id — a foreground host has nothing to key on, so degrade to
@@ -3235,6 +3246,10 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         plain reuse, a transparent tunnel-health heal, or a first spawn.
     """
     target = _normalize_daemon_target(server_url)
+    if target == _LOCAL_DAEMON_MARKER:
+        # A loopback spelling of the tracked local server addresses this data
+        # dir's own instance, so run it as the single local-mode daemon.
+        server_url = None
     decision = _reuse_existing_daemon_record(target)
     if decision.reuse:
         return False

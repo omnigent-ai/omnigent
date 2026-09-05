@@ -1,8 +1,11 @@
 """Host identity management for ``omnigent host``.
 
-Reads or creates the ``host`` section in ``~/.omnigent/config.yaml``.
-The host identity is auto-generated on first ``omnigent host``
-if the section does not exist.
+Reads or creates the ``host`` section in the data dir's ``config.yaml``
+(see :func:`identity_config_path`). The host identity is auto-generated on
+first ``omnigent host`` if the section does not exist. Identity is scoped to
+the data dir: two instances with separate ``OMNIGENT_DATA_DIR`` values
+present distinct identities instead of colliding on one machine-wide id,
+while the default data dir keeps the legacy ``~/.omnigent/config.yaml``.
 """
 
 from __future__ import annotations
@@ -16,6 +19,25 @@ from pathlib import Path
 import yaml
 
 CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
+
+
+def identity_config_path() -> Path:
+    """Return the file carrying this instance's host identity.
+
+    A host instance is identified by its data dir: with ``OMNIGENT_DATA_DIR``
+    set, the ``host:`` section lives in that dir's ``config.yaml`` so a
+    separate instance mints its own identity. The default data dir resolves
+    to the legacy :data:`CONFIG_PATH`, so existing installs keep the identity
+    (and host-bound sessions) they already have.
+
+    :returns: The config file holding the ``host:`` section.
+    """
+    from omnigent.process_logging import DATA_DIR_ENV_VAR
+
+    value = os.environ.get(DATA_DIR_ENV_VAR)
+    if value:
+        return Path(value).expanduser() / "config.yaml"
+    return CONFIG_PATH
 
 # Env vars a server-managed sandbox host is launched with. The server
 # provisions the sandbox, generates the identity + launch token, and
@@ -89,7 +111,7 @@ def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
 
 
 def load_or_create_host_identity(
-    path: Path = CONFIG_PATH,
+    path: Path | None = None,
 ) -> HostIdentity:
     """Load host identity from config.yaml, or create it if absent.
 
@@ -113,10 +135,12 @@ def load_or_create_host_identity(
 
     :param path: Path to the config YAML file, e.g.
         ``Path("~/.omnigent/config.yaml")``. Defaults to
-        :data:`CONFIG_PATH`.
+        :func:`identity_config_path` (the data dir's config file).
     :returns: The loaded or newly created :class:`HostIdentity`.
     :raises ValueError: If exactly one of the identity env vars is set.
     """
+    if path is None:
+        path = identity_config_path()
     env_host_id = os.environ.get(HOST_ID_ENV_VAR)
     env_name = os.environ.get(HOST_NAME_ENV_VAR)
     if (env_host_id is None) != (env_name is None):
@@ -224,7 +248,7 @@ def reset_host_id(path: Path = CONFIG_PATH) -> tuple[str | None, str]:
 
 
 def load_host_identity_if_present(
-    path: Path = CONFIG_PATH,
+    path: Path | None = None,
 ) -> HostIdentity | None:
     """Return the host identity if one already exists, else ``None`` — no create.
 
@@ -245,10 +269,13 @@ def load_host_identity_if_present(
     ``omnigent host`` launch path (:func:`load_or_create_host_identity`), where
     a bad id is the thing the operator is trying to use.
 
-    :param path: Path to the config YAML file. Defaults to :data:`CONFIG_PATH`.
+    :param path: Path to the config YAML file. Defaults to
+        :func:`identity_config_path` (the data dir's config file).
     :returns: The existing :class:`HostIdentity`, or ``None`` when no usable
         identity is present (absent, half-specified, or invalid).
     """
+    if path is None:
+        path = identity_config_path()
     env_host_id = os.environ.get(HOST_ID_ENV_VAR)
     env_name = os.environ.get(HOST_NAME_ENV_VAR)
     if (env_host_id is None) != (env_name is None):

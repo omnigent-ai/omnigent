@@ -9,10 +9,64 @@ import pytest
 import yaml
 
 from omnigent.host.identity import (
+    CONFIG_PATH,
+    identity_config_path,
     load_host_identity_if_present,
     load_or_create_host_identity,
     reset_host_id,
 )
+
+
+def test_identity_scoped_to_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With a data dir set, the identity lives (and stays) in that dir."""
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    instance = tmp_path / "instance-a"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(instance))
+
+    assert identity_config_path() == instance / "config.yaml"
+    identity = load_or_create_host_identity()
+    assert (instance / "config.yaml").exists()
+    assert load_or_create_host_identity().host_id == identity.host_id
+    present = load_host_identity_if_present()
+    assert present is not None and present.host_id == identity.host_id
+
+
+def test_separate_data_dirs_mint_distinct_identities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two instances with separate data dirs must not share one host id."""
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "a"))
+    first = load_or_create_host_identity()
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "b"))
+    second = load_or_create_host_identity()
+    assert first.host_id != second.host_id
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "a"))
+    assert load_or_create_host_identity().host_id == first.host_id
+
+
+def test_default_data_dir_keeps_the_legacy_identity_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a data-dir override, identity stays in the legacy config file."""
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+    assert identity_config_path() == CONFIG_PATH
+
+
+def test_env_override_wins_over_data_dir_scoping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A managed host's env identity bypasses the data dir entirely."""
+    instance = tmp_path / "instance"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(instance))
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "d6d0ccebce7b4b706d21e23696bb462a")
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-host")
+    identity = load_or_create_host_identity()
+    assert identity.host_id == "d6d0ccebce7b4b706d21e23696bb462a"
+    assert identity.name == "managed-host"
+    assert not (instance / "config.yaml").exists()
 
 
 def test_create_identity_when_no_config(tmp_path: Path) -> None:
