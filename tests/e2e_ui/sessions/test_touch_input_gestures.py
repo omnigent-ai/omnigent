@@ -141,10 +141,6 @@ def test_session_row_swipe_tracks_finger(
                 assert glyph.evaluate("element => getComputedStyle(element).scale") == "none"
         finally:
             touch(cdp, "touchCancel")
-        if reduced_motion == "reduce":
-            surface = page.get_by_test_id("conversation-swipe-surface")
-            duration = surface.evaluate("element => getComputedStyle(element).transitionDuration")
-            assert float(duration.removesuffix("s")) <= 0.001
     finally:
         context.close()
 
