@@ -205,7 +205,7 @@ def test_session_row_keyboard_focus_outline_is_not_clipped(
     seeded_session: tuple[str, str],
     width: int,
 ) -> None:
-    """Keyboard focus paints a complete outline inside every ancestor clip."""
+    """Keyboard focus outlines and control rings stay inside their clips."""
     base_url, session_id = seeded_session
     page.set_viewport_size({"width": width, "height": 800})
     page.goto(f"{base_url}/c/{session_id}?sidebar=open")
@@ -257,6 +257,54 @@ def test_session_row_keyboard_focus_outline_is_not_clipped(
         start, end = ("left", "right") if clip["axis"] == "x" else ("top", "bottom")
         assert outline["bounds"][start] >= clip["start"] - 0.5, outline
         assert outline["bounds"][end] <= clip["end"] + 0.5, outline
+
+    if width < 768:
+        return
+    control_rings = []
+    for test_id in (
+        "quick-pin-conversation",
+        "quick-archive-conversation",
+        "conversation-actions",
+    ):
+        page.keyboard.press("Tab")
+        control = _row(page, session_id).get_by_test_id(test_id)
+        expect(control).to_be_focused()
+        expect(control).to_have_css("opacity", "1")
+        ring = control.evaluate(
+            r"""element => {
+                const style = getComputedStyle(element);
+                const shadows = style.boxShadow.split(/,(?![^()]*\))/);
+                let extent = 0;
+                let ringWidth = 0;
+                for (const shadow of shadows) {
+                    const [offsetX = 0, offsetY = 0, blur = 0, spread = 0] =
+                        (shadow.match(/-?\d+(?:\.\d+)?px/g) || []).map(parseFloat);
+                    ringWidth = Math.max(ringWidth, spread);
+                    if (!shadow.includes('inset')) {
+                        extent = Math.max(extent,
+                            spread + blur + Math.max(Math.abs(offsetX), Math.abs(offsetY)));
+                    }
+                }
+                const rect = element.getBoundingClientRect();
+                const row = element.closest('li');
+                const frame = row.getBoundingClientRect();
+                const clip = {
+                    left: frame.left + row.clientLeft,
+                    top: frame.top + row.clientTop,
+                    right: frame.left + row.clientLeft + row.clientWidth,
+                    bottom: frame.top + row.clientTop + row.clientHeight,
+                };
+                const bounds = {left: rect.left - extent, right: rect.right + extent,
+                    top: rect.top - extent, bottom: rect.bottom + extent};
+                const clipped = ['left', 'top'].filter(edge => bounds[edge] < clip[edge] - 0.05)
+                    .concat(['right', 'bottom'].filter(edge => bounds[edge] > clip[edge] + 0.05));
+                return {control: element.dataset.testid, ringWidth, bounds, clip, clipped,
+                    shadow: style.boxShadow};
+            }"""
+        )
+        assert ring["ringWidth"] >= 3, ring
+        control_rings.append(ring)
+    assert all(not ring["clipped"] for ring in control_rings), control_rings
 
 
 def test_partial_swipe_reveal_is_adjacent_to_ellipsis_surface(
