@@ -7107,6 +7107,11 @@ async def _auto_create_claude_terminal(
         bundle_dir=bundle_dir,
         agent_name=agent_name,
         skills_filter=skills_filter,
+        # This launch pre-accepted Claude's workspace-trust dialog above
+        # (ensure_claude_workspace_trusted), so workspace-scoped settings must
+        # stay disabled: an unreviewed workspace's .claude/settings.json hooks
+        # would otherwise execute at startup with no user trust decision.
+        include_workspace_settings=False,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
         append_system_prompt="\n\n".join(

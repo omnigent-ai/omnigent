@@ -64,6 +64,7 @@ def claude_native_skill_args(
     *,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
+    include_workspace_settings: bool = False,
 ) -> list[str]:
     """
     Build the ``claude`` CLI args that expose bundle + host skills.
@@ -77,16 +78,28 @@ def claude_native_skill_args(
     ``--setting-sources``. ``skills_filter`` maps the same way the SDK
     maps it onto ``setting_sources`` (matching the wrapped variants):
 
-    - ``"all"`` → host skills included (the CLI's default setting
-      sources), so no ``--setting-sources`` is emitted.
+    - ``"all"`` → host skills included. With
+      ``include_workspace_settings=True`` no ``--setting-sources`` is
+      emitted (the CLI's default sources); by default only the user
+      scope is kept — see below.
     - ``"none"`` → ``--setting-sources ""`` suppresses host-skill
       discovery; bundle skills loaded via ``--plugin-dir`` are
       unaffected and remain visible.
     - ``list[str]`` → treated like ``"all"`` for host sources (the SDK
       uses ``setting_sources=None`` for the list case). The CLI has no
       per-name skill allowlist flag, so the named subset is not
-      enforced on native — bundle skills load via ``--plugin-dir`` and
-      host skills follow the default sources.
+      enforced on native — bundle skills load via ``--plugin-dir``.
+
+    ``include_workspace_settings`` decides whether workspace-scoped
+    setting sources (project ``.claude/settings.json`` and
+    ``.claude/settings.local.json``) may load. It defaults to ``False``
+    (``--setting-sources user``) because launches that pre-accept
+    Claude's workspace-trust dialog (``ensure_claude_workspace_trusted``)
+    would otherwise let an unreviewed workspace execute its own settings
+    — e.g. a ``SessionStart`` hook running arbitrary code at startup —
+    without any user trust decision. Only a launch path where Claude's
+    own trust gate is intact (the user is at the terminal to answer the
+    trust dialog themselves) may pass ``True``.
 
     ``--plugin-dir`` is emitted only when ``bundle_dir`` actually
     contains a ``skills/`` directory, so agents that ship no bundled
@@ -100,6 +113,10 @@ def claude_native_skill_args(
         ``"researcher"``. ``None`` falls back to the bundle basename.
     :param skills_filter: The spec's ``skills_filter``: ``"all"`` /
         ``"none"`` / a list of skill names. Defaults to ``"all"``.
+    :param include_workspace_settings: ``True`` keeps Claude's default
+        setting sources (workspace settings load after Claude's own
+        trust gate); ``False`` (default) restricts sources to ``user``
+        so an auto-trusted workspace cannot execute unreviewed settings.
     :returns: CLI args to append after ``claude`` (possibly empty),
         e.g. ``["--plugin-dir", "/tmp/bundle", "--setting-sources", ""]``.
     """
@@ -111,4 +128,9 @@ def claude_native_skill_args(
         # Empty setting sources suppress host-skill discovery. Bundle
         # skills ride --plugin-dir and are unaffected.
         args.extend(["--setting-sources", ""])
+    elif not include_workspace_settings:
+        # Keep user-scope config but drop workspace-scoped sources: with
+        # the trust dialog pre-accepted, an unreviewed workspace's own
+        # settings (hooks, permissions) must not execute at startup.
+        args.extend(["--setting-sources", "user"])
     return args
