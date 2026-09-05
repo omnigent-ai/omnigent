@@ -3404,8 +3404,11 @@ def create_runner_app(
         if envelope.session_id != session_id or envelope.agent_id != agent_id:
             raise ValueError("session initialization envelope identity mismatch")
 
+        from omnigent.runtime import set_remote_routing_available
+
         global _server_version
         _server_version = envelope.server_version
+        set_remote_routing_available(envelope.smart_routing_available)
         snapshot = envelope.snapshot
         _session_snapshot_cache[session_id] = _SessionSnapshot(
             ok=True,
