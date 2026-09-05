@@ -27,6 +27,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
+from omnigent.db.utils import is_transient_db_error
 from omnigent.debug_logging import (
     audit_event_logger,
     current_request_audit_attrs,
@@ -1874,6 +1875,41 @@ def create_app(
             content={"error": {"code": exc.code, "message": exc.message}},
         )
 
+    def _store_unavailable_response(request: Request, exc: Exception) -> JSONResponse:
+        """
+        Answer a transient store-availability fault with a retryable 503.
+
+        The store is momentarily unable to serve the request — rate-limited,
+        suspended/resuming (managed endpoints such as Lakebase), locked
+        (SQLite busy), or out of pooled connections — and the same request
+        succeeds once it recovers. That is an availability event, not a server
+        defect: surface ``503 store_unavailable`` so clients can retry, and
+        log one concise WARNING line instead of an internal stack trace.
+
+        :param request: The incoming request; its path supplies the session id
+            threaded into the log.
+        :param exc: The classified transient store fault.
+        :returns: A 503 JSON response with the ``store_unavailable`` code.
+        """
+        _logger.warning(
+            "Store transiently unavailable (retryable): %s: %s",
+            type(exc).__name__,
+            exc,
+            extra=_error_audit_extra(
+                request, code=str(ErrorCode.STORE_UNAVAILABLE), http_status="503"
+            ),
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": ErrorCode.STORE_UNAVAILABLE,
+                    "message": "The data store is temporarily unavailable. Retry shortly.",
+                },
+            },
+            headers={"Retry-After": "5"},
+        )
+
     @app.exception_handler(StatementError)
     async def _handle_statement_error(
         request: Request,
@@ -1886,13 +1922,16 @@ def create_app(
         stripping any legacy prefix), raising :class:`InvalidUuidError` wrapped
         in ``StatementError``. Such an id cannot address any row, so — like the
         pre-binary varchar behaviour, where it simply didn't match — treat it as
-        not-found instead of an internal error. Any other statement error (real
-        DB failure) falls through to the standard 500 shape.
+        not-found instead of an internal error. A transient store-availability
+        fault (``OperationalError`` subclasses ``StatementError``, so it lands
+        here) maps to a retryable 503. Any other statement error (real DB
+        failure) falls through to the standard 500 shape.
 
         :param request: The incoming request; its path supplies the session id
             threaded into the error log.
         :param exc: The SQLAlchemy statement error.
-        :returns: 404 for a malformed id, otherwise a 500 JSON response.
+        :returns: 404 for a malformed id, 503 for a transient store fault,
+            otherwise a 500 JSON response.
         """
         if isinstance(exc.orig, InvalidUuidError):
             # Keep a trace: a malformed id is usually a client bug, but this
@@ -1903,6 +1942,8 @@ def create_app(
                 status_code=404,
                 content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
             )
+        if is_transient_db_error(exc):
+            return _store_unavailable_response(request, exc)
         _logger.error(
             "Database error: %s",
             exc,
@@ -1934,8 +1975,14 @@ def create_app(
         :param request: The incoming request; its path supplies the session id
             threaded into the error log.
         :param exc: The unhandled exception.
-        :returns: A 500 JSON response with ``internal_error`` code.
+        :returns: A 503 for a transient store fault (e.g. a drained
+            connection pool), otherwise a 500 JSON response with
+            ``internal_error`` code.
         """
+        if is_transient_db_error(exc):
+            # Not dead code: pool-checkout TimeoutError is a SQLAlchemyError
+            # but not a StatementError, so it lands here, not above.
+            return _store_unavailable_response(request, exc)
         _logger.error(
             "Unhandled exception: %s",
             exc,

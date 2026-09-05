@@ -44,6 +44,17 @@ def test_omnigent_error_with_harness_violation_code_returns_500() -> None:
     assert "outstanding elicitations" in err.message
 
 
+def test_store_unavailable_string_value_and_status() -> None:
+    """``store_unavailable`` is the wire code clients retry on.
+
+    Clients branch on this exact string to distinguish a retryable
+    store-availability fault from ``internal_error``; renaming it or
+    drifting the status away from 503 breaks their retry logic.
+    """
+    assert ErrorCode.STORE_UNAVAILABLE == "store_unavailable"
+    assert _CODE_TO_HTTP_STATUS[ErrorCode.STORE_UNAVAILABLE] == 503
+
+
 @pytest.mark.parametrize(
     "code,expected_status",
     [
@@ -53,6 +64,7 @@ def test_omnigent_error_with_harness_violation_code_returns_500() -> None:
         (ErrorCode.CONFLICT, 409),
         (ErrorCode.INTERNAL_ERROR, 500),
         (ErrorCode.HARNESS_PROTOCOL_VIOLATION, 500),
+        (ErrorCode.STORE_UNAVAILABLE, 503),
     ],
 )
 def test_all_error_codes_have_http_status_mapping(code: str, expected_status: int) -> None:
