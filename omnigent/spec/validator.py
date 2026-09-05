@@ -75,24 +75,26 @@ class ValidationResult:
         self.errors.append(ValidationError(path=path, message=message))
 
 
-def validate(spec: AgentSpec) -> ValidationResult:
+def validate(spec: AgentSpec, *, offline: bool = False) -> ValidationResult:
     """
     Validate an :class:`AgentSpec` against AGENTSPEC.md rules.
 
     :param spec: The parsed agent spec to validate.
+    :param offline: Use only shipped harness/tool metadata, without importing
+        runtime tools or discovering community plugins.
     :returns: A :class:`ValidationResult`; check ``.valid`` to see
         if the spec passes all checks.
     """
     result = ValidationResult()
     _validate_spec_version(spec, result)
-    _validate_executor_type(spec, result)
+    _validate_executor_type(spec, result, offline=offline)
     _validate_llm(spec, result)
     _validate_reasoning_effort(spec, result)
     _validate_interaction(spec, result)
     _validate_skills(spec, result)
     _validate_mcp_servers(spec, result)
-    _validate_local_tools(spec, result)
-    _validate_sub_agents(spec, result)
+    _validate_local_tools(spec, result, offline=offline)
+    _validate_sub_agents(spec, result, offline=offline)
     _validate_compaction(spec, result)
     _validate_os_env(spec, result)
     return result
@@ -109,26 +111,18 @@ def _validate_spec_version(spec: AgentSpec, result: ValidationResult) -> None:
         result.add("spec_version", f"must be 1, got {spec.spec_version}")
 
 
-# Omnigent compat: imported surgically from a dedicated module so
-# the integration's tech debt is removable in one shot. See
-# omnigent/spec/_omnigent_compat.py. Placed after the module's
-# internal helpers (rather than with the top-of-file imports) so the
-# integration's footprint is reviewable as one contiguous block.
-from omnigent.spec._omnigent_compat import (  # noqa: E402
-    OMNIGENT_EXECUTOR_TYPE,
-    validate_omnigent_executor,
-)
-
 _VALID_EXECUTOR_TYPES = {
     "claude_sdk",
     "agents_sdk",
-    OMNIGENT_EXECUTOR_TYPE,
+    "omnigent",
 }
 
 
 def _validate_executor_type(
     spec: AgentSpec,
     result: ValidationResult,
+    *,
+    offline: bool = False,
 ) -> None:
     """
     Validate that all spec fields are valid for the declared executor type.
@@ -152,7 +146,19 @@ def _validate_executor_type(
         _validate_claude_sdk_executor(spec, result)
     elif etype == "agents_sdk":
         _validate_agents_sdk_executor(spec, result)
-    elif etype == OMNIGENT_EXECUTOR_TYPE:
+    elif offline:
+        from omnigent.harness_plugins import builtin_harness_spellings
+
+        harness = spec.executor.config.get("harness")
+        if harness not in builtin_harness_spellings() and not (
+            isinstance(harness, str) and harness.startswith("acp:") and harness[4:]
+        ):
+            result.add("executor.config.harness", "must name a shipped harness")
+        if spec.compaction is not None:
+            result.add("compaction", "not supported when executor.type is 'omnigent'")
+    else:
+        from omnigent.spec._omnigent_compat import validate_omnigent_executor
+
         validate_omnigent_executor(spec, result)
 
 
@@ -349,7 +355,9 @@ def _validate_mcp_servers(spec: AgentSpec, result: ValidationResult) -> None:
             )
 
 
-def _validate_local_tools(spec: AgentSpec, result: ValidationResult) -> None:
+def _validate_local_tools(
+    spec: AgentSpec, result: ValidationResult, *, offline: bool = False
+) -> None:
     """
     Validate local tool name uniqueness across all tool sources
     (MCP servers and local tools), and reject collisions with
@@ -361,14 +369,21 @@ def _validate_local_tools(spec: AgentSpec, result: ValidationResult) -> None:
     # Lazy import to avoid pulling the tools package during
     # spec load (the validator runs from ``omnigent.spec``,
     # which is a lower layer than ``omnigent.tools``).
-    from omnigent.tools.builtins import BUILTIN_NAMES
+    if offline:
+        from omnigent.builtin_catalog import STATIC_BUILTIN_NAMES
+
+        builtin_names = STATIC_BUILTIN_NAMES
+    else:
+        from omnigent.tools.builtins import BUILTIN_NAMES
+
+        builtin_names = BUILTIN_NAMES
 
     # Collect everything the agent declares and cross-check
     # against the reserved builtin name-space. The same set is
     # also used for duplicate-name detection across sources.
     all_tool_names: set[str] = set()
     for i, mcp in enumerate(spec.mcp_servers):
-        if mcp.name in BUILTIN_NAMES:
+        if mcp.name in builtin_names:
             result.add(
                 f"mcp_servers[{i}].name",
                 f"tool name {mcp.name!r} collides with a reserved "
@@ -376,7 +391,7 @@ def _validate_local_tools(spec: AgentSpec, result: ValidationResult) -> None:
             )
         all_tool_names.add(mcp.name)
     for i, tool in enumerate(spec.local_tools):
-        if tool.name in BUILTIN_NAMES:
+        if tool.name in builtin_names:
             result.add(
                 f"local_tools[{i}].name",
                 f"tool name {tool.name!r} collides with a reserved "
@@ -429,6 +444,8 @@ def _validate_local_tools(spec: AgentSpec, result: ValidationResult) -> None:
 def _validate_sub_agents(
     spec: AgentSpec,
     result: ValidationResult,
+    *,
+    offline: bool = False,
 ) -> None:
     """
     Validate sub-agent declarations.
@@ -456,7 +473,7 @@ def _validate_sub_agents(
     # Validate each sub-agent independently — its own executor.type
     # determines which fields are required/invalid.
     for sa in spec.sub_agents:
-        sa_result = validate(sa)
+        sa_result = validate(sa, offline=offline)
         for err in sa_result.errors:
             sa_name = sa.name or "unnamed"
             result.add(

@@ -390,8 +390,8 @@ dev = [
 # absorption. `omni` is installed as a short alias — both resolve to
 # the same entry point. (No former-name aliases: only `omnigent` and
 # `omni` ship, internal and OSS alike.)
-omnigent = "omnigent.cli:main"
-omni = "omnigent.cli:main"
+omnigent = "omnigent.entrypoint:main"
+omni = "omnigent.entrypoint:main"
 
 [tool.uv]
 # Keep plain `uv sync` aligned with the published base package. Repository

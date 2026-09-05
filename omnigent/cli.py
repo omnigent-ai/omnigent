@@ -45,10 +45,17 @@ from omnigent.cli_config import (
     _run_configure_harnesses_interactive,
     _warn_missing_harness_dependencies,
 )
-from omnigent.cli_invocation import WRAPPER_COMMAND_ENV, cli_invocation
+from omnigent.cli_invocation import REQUIRE_WRAPPER_ENV as REQUIRE_WRAPPER_ENV
+from omnigent.cli_invocation import (
+    WRAPPER_BYPASS_ENV,
+    WRAPPER_COMMAND_ENV,
+    cli_invocation,
+    wrapper_required,
+)
 from omnigent.cli_native import register_native_commands as _register_native_commands
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
+from omnigent.cli_validate import validate_command
 from omnigent.config import (
     _merge_effective_config,
     global_config_path,
@@ -93,7 +100,6 @@ from omnigent.process_logging import (
     LOG_LEVEL_ENV_VAR,
     LOG_TO_STDERR_ENV_VAR,
     data_dir,
-    env_truthy,
     process_log_dir_reference,
 )
 from omnigent.server_url import ServerUrl
@@ -2024,6 +2030,9 @@ def cli() -> None:
     """Omnigent CLI."""
 
 
+cli.add_command(validate_command)
+
+
 # Names of every subcommand the click group owns. Used by
 # :func:`main` to reject the removed top-level ad-hoc chat path
 # before click reports an opaque "no such command" error.
@@ -2070,6 +2079,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "update",
         "upgrade",
         "usage",
+        "validate",
         "version",
     }
 )
@@ -2095,6 +2105,7 @@ def _should_skip_update_check(argv: list[str]) -> bool:
         "-h",
         "--version",
         "version",
+        "validate",
         "update",
         "upgrade",
         "pane-split",
@@ -2126,10 +2137,6 @@ def _warn_deprecated_harness_path_env_vars() -> None:
         )
 
 
-REQUIRE_WRAPPER_ENV = "OMNIGENT_REQUIRE_WRAPPER"
-WRAPPER_BYPASS_ENV = "OMNIGENT_WRAPPER_BYPASS"
-
-
 def _wrapper_guard_error(env: Mapping[str, str], prog: str) -> str | None:
     """Return the block message when a naked ``omni`` call is refused, else ``None``.
 
@@ -2138,9 +2145,7 @@ def _wrapper_guard_error(env: Mapping[str, str], prog: str) -> str | None:
     ``OMNIGENT_WRAPPER_BYPASS`` around its own invocation to pass through, and
     ``OMNIGENT_WRAPPER_COMMAND`` names the command to suggest instead.
     """
-    if not env_truthy(env.get(REQUIRE_WRAPPER_ENV)):
-        return None
-    if env_truthy(env.get(WRAPPER_BYPASS_ENV)):
+    if not wrapper_required(env):
         return None
     redirect = (env.get(WRAPPER_COMMAND_ENV) or "").strip()
     if redirect:
@@ -2184,6 +2189,13 @@ def main() -> None:
     so unhandled exceptions are captured even when the user didn't
     enable ``--log`` or ``--debug-events``.
     """
+    from omnigent.entrypoint import offline_arguments
+
+    offline_args = offline_arguments(sys.argv[1:])
+    if offline_args is not None:
+        validate_command.main(args=offline_args, prog_name="omnigent validate")
+        return
+
     # Friendly crash handler: replaces Python's raw traceback with a
     # calm, branded crash screen + a one-tap path to file a GitHub issue
     # (browser opens the repo's pre-filled bug-report template with the
