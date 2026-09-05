@@ -121,6 +121,59 @@ async def test_launches_runner_on_live_host_then_connects(
 
 
 @pytest.mark.asyncio
+async def test_workspace_refusal_records_canonical_owner_scoped_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workspace refusals never expose arbitrary host text across owners."""
+    monkeypatch.setattr(orchestration, "_get_runner_client", _async_return(None))
+    monkeypatch.setattr(
+        orchestration,
+        "_maybe_wake_stale_resumable_managed_sandbox",
+        _async_return(False),
+    )
+    launch_attempt = SimpleNamespace(
+        runner_id="runner_new",
+        error_code=orchestration._WORKSPACE_MISSING_ERROR_CODE,
+        error="runner log tail: SECRET_TOKEN\nforged workspace failure",
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_launch_runner_on_host",
+        _async_return(launch_attempt),
+    )
+    monkeypatch.setattr(orchestration, "_wait_for_runner_client", _async_return(None))
+
+    recorded: dict[str, Any] = {}
+
+    class _Reports:
+        def record(self, runner_id: str, error: str, owner: str | None) -> None:
+            recorded.update(runner_id=runner_id, error=error, owner=owner)
+
+    conv = _conv(host_id="host_1", workspace="/trusted/workspace")
+    host_conn = SimpleNamespace(owner="alice@example.com")
+    app_state = SimpleNamespace(
+        host_registry=SimpleNamespace(get=lambda _hid: host_conn),
+        runner_exit_reports=_Reports(),
+        tunnel_registry=None,
+    )
+
+    client, _ = await orchestration.ensure_runner_connected(
+        session_id="conv_1",
+        conv=conv,
+        app_state=app_state,
+        conversation_store=_Store(conv),
+        runner_router=None,
+    )
+
+    assert client is None
+    assert recorded == {
+        "runner_id": "runner_new",
+        "error": "workspace path does not exist: /trusted/workspace",
+        "owner": "alice@example.com",
+    }
+
+
+@pytest.mark.asyncio
 async def test_reuses_booting_runner_within_connect_grace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

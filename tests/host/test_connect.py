@@ -30,6 +30,7 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -450,7 +451,10 @@ async def test_handle_launch_spawns_subprocess(
     _cleanup_host(host)
 
 
-async def test_handle_launch_fails_for_bad_workspace() -> None:
+async def test_handle_launch_fails_for_bad_workspace(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """
     Verify that _handle_launch returns status='failed' when the
     workspace path does not exist.
@@ -463,19 +467,25 @@ async def test_handle_launch_fails_for_bad_workspace() -> None:
         request_id="req_002",
         binding_token="token_xyz",
         workspace="/nonexistent/path/that/does/not/exist",
+        session_id="session_missing_workspace",
     )
 
-    result = await host._handle_launch(frame)
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        result = await host._handle_launch(frame)
 
     assert isinstance(result, HostLaunchRunnerResultFrame)
     assert result.status == "failed", "Should fail for nonexistent workspace"
+    assert result.error_code == WORKSPACE_MISSING_ERROR_CODE
     assert "does not exist" in (result.error or ""), (
         f"Error should mention path doesn't exist, got: {result.error!r}"
     )
-    assert result.error_code == "workspace_missing", (
-        f"Should carry workspace_missing error_code, got: {result.error_code!r}"
-    )
     assert result.runner_id is None
+    assert "session_missing_workspace" in caplog.text
+    assert "/nonexistent/path/that/does/not/exist" in caplog.text
+    output = capsys.readouterr().out
+    assert "Runner launch failed" in output
+    assert "session_missing_workspace" in output
+    assert "/nonexistent/path/that/does/not/exist" in output
 
 
 async def test_handle_launch_refuses_unconfigured_harness(
@@ -1002,6 +1012,8 @@ async def test_live_host_repushes_when_only_gateway_inference_changes(
 async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """An immediate runner death fails the launch with the actual cause.
 
@@ -1045,7 +1057,10 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
         binding_token="tok_dead",
         workspace=str(workspace),
     )
-    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+    with (
+        caplog.at_level(logging.WARNING, logger="omnigent.host.connect"),
+        patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen),
+    ):
         result = await host._handle_launch(frame)
 
     assert result.status == "failed"
@@ -1056,6 +1071,14 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     assert "~/.omnigent/logs/runner/runner-" in error
     # The tail carries the actual cause — the whole point of the report.
     assert "RuntimeError: boom-traceback" in error
+    # Host lifecycle output names the failure and log location but must not
+    # duplicate arbitrary runner output into the daemon log or foreground.
+    assert "runner process exited with code 7" in caplog.text
+    assert "RuntimeError: boom-traceback" not in caplog.text
+    output = capsys.readouterr().out
+    assert "Runner launch failed" in output
+    assert "runner process exited with code 7" in output
+    assert "RuntimeError: boom-traceback" not in output
 
 
 async def test_watch_runner_reports_unexpected_exit(

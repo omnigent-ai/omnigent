@@ -1568,6 +1568,43 @@ class HostProcess:
             "Check the server URL and your access."
         )
 
+    def _launch_failed(
+        self,
+        frame: HostLaunchRunnerFrame,
+        error: str,
+        *,
+        error_code: str | None = None,
+    ) -> HostLaunchRunnerResultFrame:
+        """Report and return a failed runner launch.
+
+        :param frame: Launch request that failed.
+        :param error: Human-readable failure reason.
+        :param error_code: Optional machine-readable failure category.
+        :returns: Failed result frame for the server.
+        """
+        session_id = frame.session_id or "<unknown>"
+        diagnostic_lines = error.splitlines()
+        diagnostic = diagnostic_lines[0] if diagnostic_lines else error
+        _logger.warning(
+            "Runner launch failed for session %r in workspace %r: %r",
+            session_id,
+            frame.workspace,
+            diagnostic,
+        )
+        print(
+            "  ! Runner launch failed\n"
+            f"    session: {session_id!r}\n"
+            f"    workspace: {frame.workspace!r}\n"
+            f"    reason: {diagnostic!r}",
+            flush=True,
+        )
+        return HostLaunchRunnerResultFrame(
+            request_id=frame.request_id,
+            status="failed",
+            error=error,
+            error_code=error_code,
+        )
+
     async def _handle_launch(
         self,
         frame: HostLaunchRunnerFrame,
@@ -1581,9 +1618,8 @@ class HostProcess:
 
         :param frame: The launch request frame.
         :returns: Result frame with status and runner_id, or a
-            ``"failed"`` result with ``error_code`` set to
-            ``"harness_not_configured"`` when the harness check
-            refuses the launch.
+            ``"failed"`` result. Deterministic preflight refusals
+            include a machine-readable ``error_code``.
         """
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
@@ -1596,10 +1632,9 @@ class HostProcess:
         if frame.harness is not None and not await asyncio.to_thread(
             harness_is_configured, frame.harness
         ):
-            return HostLaunchRunnerResultFrame(
-                request_id=frame.request_id,
-                status="failed",
-                error=(
+            return self._launch_failed(
+                frame,
+                (
                     f"harness {frame.harness!r} is not configured on host "
                     f"{self._identity.name!r} — {harness_setup_hint(frame.harness)}"
                 ),
@@ -1608,10 +1643,9 @@ class HostProcess:
 
         workspace = Path(frame.workspace).expanduser()
         if not workspace.is_dir():
-            return HostLaunchRunnerResultFrame(
-                request_id=frame.request_id,
-                status="failed",
-                error=f"workspace path does not exist: {workspace}",
+            return self._launch_failed(
+                frame,
+                f"workspace path does not exist: {workspace}",
                 error_code=WORKSPACE_MISSING_ERROR_CODE,
             )
 
@@ -1671,21 +1705,19 @@ class HostProcess:
             spawn.add_done_callback(self._discard_abandoned_spawn)
             raise
         except OSError as exc:
-            return HostLaunchRunnerResultFrame(
-                request_id=frame.request_id,
-                status="failed",
-                error=f"failed to spawn runner: {exc}",
+            return self._launch_failed(
+                frame,
+                f"failed to spawn runner: {exc}",
             )
 
         if proc.poll() is not None:
             # The runner died before Popen returned — its actual error
             # is in the captured log, so ship the tail with the result
             # instead of making the user go find the file on the host.
-            return HostLaunchRunnerResultFrame(
-                request_id=frame.request_id,
-                status="failed",
-                error=_runner_exit_error(proc.returncode, log_path),
-            )
+            error = _runner_exit_error(proc.returncode, log_path)
+            # The returned result retains the diagnostic tail, while
+            # _launch_failed limits the host lifecycle line to its first line.
+            return self._launch_failed(frame, error)
 
         # One live runner per session: the session's previous runner —
         # whose binding the server has already rotated away — is

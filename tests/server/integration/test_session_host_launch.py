@@ -30,6 +30,8 @@ from fastapi import FastAPI
 
 from omnigent.entities import Conversation
 from omnigent.host.frames import (
+    HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -646,33 +648,95 @@ async def test_inline_create_harness_not_configured_stays_lenient(
     )
 
 
-async def test_message_relaunch_harness_not_configured_persists_error_turn(
+@pytest.mark.parametrize(
+    (
+        "launch_error_code",
+        "expected_error_code",
+        "launch_error",
+        "expected_fragments",
+        "wrapper_command",
+    ),
+    [
+        (
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            _HARNESS_REFUSAL,
+            ("omnigent setup", "harness 'codex' is not configured"),
+            None,
+        ),
+        (
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            "",
+            ("isaac omni setup",),
+            "isaac omni",
+        ),
+        (
+            WORKSPACE_MISSING_ERROR_CODE,
+            WORKSPACE_MISSING_ERROR_CODE,
+            "runner log tail: SECRET_TOKEN\nforged workspace failure",
+            ("workspace path does not exist", "/work/repo"),
+            None,
+        ),
+        (
+            None,
+            WORKSPACE_MISSING_ERROR_CODE,
+            "workspace path does not exist: /work/repo",
+            ("workspace path does not exist", "/work/repo"),
+            None,
+        ),
+        (
+            "runner_crashed",
+            None,
+            "runner log tail: private output",
+            (),
+            None,
+        ),
+    ],
+)
+async def test_message_relaunch_deterministic_failure_persists_error_turn(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    launch_error_code: str | None,
+    expected_error_code: str | None,
+    launch_error: str,
+    expected_fragments: tuple[str, ...],
+    wrapper_command: str | None,
 ) -> None:
-    """A message whose host relaunch is refused persists user msg + error.
+    """A deterministic host relaunch refusal persists user msg + error.
 
     The first message is the real runner-start attempt. When the host
-    refuses the relaunch with ``harness_not_configured``, the server
-    consumes the user message AND records a sibling ``type="error"`` item
-    carrying the host's `omnigent setup` message (the web renders it as
-    an error banner) — instead of timing out into a generic
+    refuses the relaunch with a definite failure, the server
+    consumes the user message and records a sibling ``type="error"`` item
+    carrying the host's actionable message (the web renders it as an
+    error banner) instead of timing out into a generic
     ``RUNNER_UNAVAILABLE``. The binding is left intact so a later message
-    relaunches once the user has run setup.
+    can relaunch after the underlying host problem is fixed.
 
-    Mutation check: drop the ``harness_not_configured`` branch in
+    Mutation check: drop the deterministic-failure branch in
     post_event's relaunch and the message instead 503s with
     ``runner_unavailable`` and no error item is written — both assertions
     below fail.
     """
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events as routes_events_module
+
+    if wrapper_command is not None:
+        monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", wrapper_command)
 
     # Grace=0 so the message takes the relaunch branch immediately instead
     # of waiting for the (never-connecting) create-bound runner.
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    # A mutation that drops the deterministic-failure branch must fail fast
+    # instead of waiting through the production runner-connect timeout.
+    monkeypatch.setattr(
+        routes_events_module,
+        "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",
+        0.0,
+    )
 
     comm = await _connect_host(app)
     agent = await create_test_agent(
@@ -689,6 +753,7 @@ async def test_message_relaunch_harness_not_configured_persists_error_turn(
     await create_responder
     assert create_resp.status_code == 201, create_resp.text
     session_id = create_resp.json()["id"]
+    initial_runner_id = create_resp.json()["runner_id"]
 
     # Runner offline (none ever connected) → the message relaunches; serve
     # that relaunch as a harness refusal.
@@ -697,8 +762,8 @@ async def test_message_relaunch_harness_not_configured_persists_error_turn(
         _serve_one_launch(
             comm,
             launch_status="failed",
-            launch_error=_HARNESS_REFUSAL,
-            launch_error_code="harness_not_configured",
+            launch_error=launch_error,
+            launch_error_code=launch_error_code,
         )
     )
     try:
@@ -713,8 +778,22 @@ async def test_message_relaunch_harness_not_configured_persists_error_turn(
         await relaunch_responder
         set_runner_client(None)
 
-    # The message is accepted (not a 503 RUNNER_UNAVAILABLE): the server
-    # consumed it and recorded the failure turn.
+    if expected_error_code is None:
+        # Unknown host categories may contain arbitrary runner output and
+        # must not be persisted into the transcript.
+        assert msg_resp.status_code == 503
+        items = await client.get(f"/v1/sessions/{session_id}/items")
+        assert items.status_code == 200, items.text
+        assert items.json()["data"] == []
+        conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+        assert conv is not None
+        assert conv.host_id == _HOST_ID
+        assert conv.runner_id is not None
+        assert conv.runner_id != initial_runner_id
+        return
+
+    # A safe categorical failure is accepted (not a 503): the server
+    # consumed the message and recorded the failure turn.
     assert msg_resp.status_code == 202, (
         f"expected 202, got {msg_resp.status_code}: {msg_resp.text}"
     )
@@ -730,20 +809,25 @@ async def test_message_relaunch_harness_not_configured_persists_error_turn(
         for part in item.get("content", [])
     ]
     assert "hi" in user_texts, f"user message should be persisted, got {user_texts!r}"
-    # A type="error" item carries the host's refusal (rendered as a banner),
-    # including the remediation command.
+    # A type="error" item carries the safe host refusal (rendered as a banner).
     error_items = [item for item in data if item.get("type") == "error"]
     assert len(error_items) == 1, (
         f"expected exactly one error item for the refused relaunch, got {error_items!r}"
     )
-    assert error_items[0]["code"] == "harness_not_configured"
-    assert "omnigent setup" in error_items[0]["message"]
-    assert "harness 'codex' is not configured" in error_items[0]["message"]
+    assert error_items[0]["code"] == expected_error_code
+    for fragment in expected_fragments:
+        assert fragment in error_items[0]["message"]
+    if expected_error_code == WORKSPACE_MISSING_ERROR_CODE:
+        assert error_items[0]["message"] == "workspace path does not exist: /work/repo"
+        assert "SECRET_TOKEN" not in error_items[0]["message"]
+        assert "\n" not in error_items[0]["message"]
 
-    # Binding kept so a post-setup message can relaunch.
+    # Binding kept so a later message can relaunch after remediation.
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.host_id == _HOST_ID
+    assert conv.runner_id is not None
+    assert conv.runner_id != initial_runner_id
 
 
 @pytest.mark.parametrize(
@@ -1909,7 +1993,7 @@ async def test_message_relaunch_workspace_missing_persists_error_turn(
     worktree was pruned), the host returns ``workspace_missing`` and the
     runner will never appear. The server must:
     - NOT wait out the full connect timeout (which would hang every message);
-    - Persist the user message together with a ``runner_failed_to_start``
+    - Persist the user message together with a ``workspace_missing``
       error item carrying the host's actionable "workspace does not exist"
       message instead of the generic fallback.
 
@@ -1975,7 +2059,7 @@ async def test_message_relaunch_workspace_missing_persists_error_turn(
     assert len(error_items) == 1, (
         f"expected exactly one error item for the workspace-missing refusal, got {error_items!r}"
     )
-    assert error_items[0]["code"] == "workspace_missing"
+    assert error_items[0]["code"] == WORKSPACE_MISSING_ERROR_CODE
     assert "does not exist" in error_items[0]["message"], (
         f"error message should mention workspace does not exist, got {error_items[0]['message']!r}"
     )
