@@ -154,6 +154,20 @@ jobs:
           - group: slack
             paths: integrations/slack/tests
             extra: slack
+          # Discord integration (integrations/discord). Same shape as the
+          # Slack lane: its tests live outside the top-level tests/ tree and
+          # import the decoupled `omnigent_discord` package, so this lane
+          # installs the `discord` extra to pull it in.
+          - group: discord
+            paths: integrations/discord/tests
+            extra: discord
+          # The client both bots share (integrations/bot-core). Its tests own
+          # the server-contract surface (SSE parsing, the turn loop, the login
+          # flows), so they run once here rather than in each bot's lane. Either
+          # bot extra pulls the package in.
+          - group: bot-core
+            paths: integrations/bot-core/tests
+            extra: discord
 
     steps:
       - name: Check out repo
