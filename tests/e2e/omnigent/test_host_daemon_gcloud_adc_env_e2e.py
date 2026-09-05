@@ -8,13 +8,16 @@ Application Default Credentials selectors. A user who runs
     AGY_ADC_AUTH=true
     GOOGLE_APPLICATION_CREDENTIALS=~/.config/gcloud/application_default_credentials.json
     GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_QUOTA_PROJECT
-    CLOUDSDK_* (non-default gcloud config)
+    CLOUDSDK_CONFIG / CLOUDSDK_ACTIVE_CONFIG_NAME (non-default gcloud config)
 
 -- and then starts Omnigent in the background finds every one of them missing
 from the detached daemon, and therefore missing from every runner the daemon
 spawns. ``_build_host_daemon_env`` (omnigent/cli.py) filters ``os.environ``
 through ``_RUNNER_ENV_ALLOWLIST`` + ``_LOCAL_DAEMON_ENV_ALLOWLIST`` + their
-prefix sets, none of which name the ADC selectors or a ``CLOUDSDK_`` prefix;
+prefix sets, none of which named the ADC selectors or the gcloud config
+selectors before the fix (the fix adds exact names only -- deliberately not a
+``CLOUDSDK_`` prefix, which would also pass gcloud's secret-bearing
+``CLOUDSDK_AUTH_*`` tokens);
 ``_build_runner_env`` (omnigent/host/connect.py) then re-applies the runner
 allowlist. So the antigravity-native pane the runner launches inherits a
 stripped environment, ``agy`` sees no ADC selector, and every dispatched pane
@@ -69,10 +72,11 @@ _BOOT_TIMEOUT = 90.0
 _RUNNER_APPEAR_TIMEOUT = 60.0
 _POLL_PAUSE = threading.Event()
 
-# The gcloud ADC auth selectors ``agy`` reads. These are the exact names the
-# report asks to allow through both hops. ``GOOGLE_APPLICATION_CREDENTIALS`` is
-# a filesystem path (not the credential); the rest are non-secret auth-mode /
-# project / config selectors -- the same security class as ``KUBECONFIG``.
+# The gcloud ADC auth selectors ``agy`` reads, allowed through both hops by
+# exact name. ``GOOGLE_APPLICATION_CREDENTIALS`` is a filesystem path (not the
+# credential); the rest are non-secret auth-mode / project / config selectors
+# -- the same security class as ``KUBECONFIG``. Only these exact CLOUDSDK_
+# names are allowlisted; gcloud's CLOUDSDK_AUTH_* token vars stay stripped.
 _ADC_SELECTORS: dict[str, str] = {
     "AGY_ADC_AUTH": "true",
     "GOOGLE_APPLICATION_CREDENTIALS": "<set-per-test>",
@@ -114,9 +118,9 @@ def _adc_env(base_env: dict[str, str], home: Path) -> dict[str, str]:
     selectors["GOOGLE_APPLICATION_CREDENTIALS"] = str(adc_path)
     selectors["CLOUDSDK_CONFIG"] = str(gcloud_dir)
     env.update(selectors)
-    # The documented escape hatch the report shows is ineffective: its name
-    # reaches the daemon (it is allowlisted) but the ADC values it references
-    # were already dropped by the CLI->daemon strip, so it recovers nothing.
+    # Exported as in the original report. With the allowlist fix the values
+    # arrive via the allowlists regardless, so this only mirrors the reported
+    # setup; it is not what carries the selectors through.
     env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] = "AGY_ADC_AUTH,GOOGLE_APPLICATION_CREDENTIALS"
     env["OTEL_METRICS_EXPORTER"] = "otlp"
     env["OMNIGENT_TELEMETRY_ENABLED"] = "1"
@@ -189,9 +193,18 @@ def _proc_environ(pid: int) -> dict[str, str]:
 
 
 def _sigterm(pid: int) -> None:
-    """Best-effort SIGTERM so spawned processes never leak past the test."""
+    """Best-effort SIGTERM (escalating to SIGKILL) so processes never leak.
+
+    The daemon/runner are detached, not our children, so poll ``/proc`` for
+    exit instead of ``waitpid`` and escalate if the process lingers.
+    """
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.kill(pid, signal.SIGTERM)
+        for _ in range(20):
+            if not Path(f"/proc/{pid}").exists():
+                return
+            _POLL_PAUSE.wait(0.25)
+        os.kill(pid, signal.SIGKILL)
 
 
 def _assert_adc_selectors_survived(
@@ -273,9 +286,9 @@ def test_daemon_spawned_runner_receives_gcloud_adc_selectors(
     inspect the runner process env. This is the delivery the antigravity-native
     agy pane ultimately inherits (``_build_harness_spawn_env`` merges the
     runner's ``os.environ``), so the selectors reaching the runner is the
-    end-to-end contract. Also proves the ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``
-    escape hatch is ineffective here: its name reaches the daemon but the ADC
-    values were already dropped at the first hop.
+    end-to-end contract. ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` is exported as in
+    the original report, but with the fix the selectors travel via the
+    allowlists, so this test does not distinguish that mechanism.
 
     :param omnigent_python: Python interpreter fixture.
     :param omnigent_repo_root: Repo root fixture (subprocess cwd).
