@@ -1220,6 +1220,11 @@ export function LatestTurnSpacer({
       spacerEl.style.display = "none";
       return;
     }
+    // The transcript is windowed, so the captured anchor can be scrolled out of
+    // the mounted set and detached from the scroll tree. A detached node reports
+    // a zeroed rect that would blow the reservation up — leave the last good
+    // height in place until the anchor re-mounts.
+    if (!scrollEl.contains(anchor)) return;
     // rect diffs are scroll-invariant, and the spacer's top is fixed by the
     // content above it, so this is stable across the height we're about to set.
     const spacerRect = spacerEl.getBoundingClientRect();

@@ -78,6 +78,28 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   };
 }
 
+// @tanstack/react-virtual windows the transcript off the scroll element's
+// measured height, but jsdom does no layout — every element is 0×0, so the real
+// virtualizer renders nothing and component tests can't see any bubbles.
+// Replace it with a pass-through that renders every item so the transcript's
+// logic (bubble building, history load, indicators) stays testable; the
+// windowing itself is browser behaviour verified manually.
+vi.mock("@tanstack/react-virtual", () => ({
+  useVirtualizer: ({ count }: { count: number }) => {
+    const items = Array.from({ length: count }, (_, index) => ({
+      index,
+      key: index,
+      start: index * 200,
+      size: 200,
+    }));
+    return {
+      getVirtualItems: () => items,
+      getTotalSize: () => count * 200,
+      measureElement: () => {},
+    };
+  },
+}));
+
 Object.defineProperty(window, "matchMedia", {
   writable: true,
   value: (query: string) => ({
