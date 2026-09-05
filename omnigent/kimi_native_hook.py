@@ -23,10 +23,12 @@ stdin, and reads the decision back from stdout as
   ``PermissionRequest`` fire-and-forget (it does NOT read this hook's output —
   approval is answered by kimi's own TUI menu), so the hook cannot return an
   honored decision. Instead it drives a real web-UI Approve/Deny: it POSTs the
-  gated tool to ``/v1/sessions/{id}/hooks/permission-request`` (the same
-  endpoint claude-native uses — the server publishes the approval card and
-  long-polls for the web verdict), then types the answer back into kimi's
-  prompt via ``inject_approval_keystroke`` (option digit + Enter:
+  gated tool to ``/v1/sessions/{id}/hooks/native-permission-request`` (the
+  vendor-agnostic native-permission endpoint shared with qwen/kiro/hermes/goose
+  — the payload's ``agent`` / ``policy_name`` label the card "Kimi", and the
+  server publishes the approval card and long-polls for the web verdict), then
+  types the answer back into kimi's prompt via ``inject_approval_keystroke``
+  (option digit + Enter:
   :data:`~omnigent.kimi_native_bridge.APPROVE_KEY` "Approve once" /
   :data:`~omnigent.kimi_native_bridge.DENY_KEY` "Reject"). Fail-safe: on no
   verdict (timeout / unreachable / already answered in the terminal) it injects
@@ -72,11 +74,32 @@ _SURFACE_TIMEOUT_S = 10.0
 # prompt (manual approval in the terminal).
 _PERMISSION_REQUEST_TIMEOUT_S = 3600.0
 _HARNESS = "kimi-native"
+# Cap on the preview string POSTed to the card (server truncates too).
+_PREVIEW_MAX = 1024
 
 
 def _url_component(value: str) -> str:
     """Percent-encode one URL path component (slashes escaped)."""
     return urllib.parse.quote(value, safe="")
+
+
+def _content_preview(tool_input: object) -> str | None:
+    """Render a compact card preview from the gated tool's input.
+
+    Mirrors qwen's ``_preview_for``: a shell tool's ``command`` is the most
+    useful single line, otherwise the JSON-encoded input, truncated to
+    ``_PREVIEW_MAX``. Returns ``None`` when there is no usable input so the
+    field is omitted rather than echoing the bare tool name.
+    """
+    if not isinstance(tool_input, dict):
+        return None
+    command = tool_input.get("command")
+    if isinstance(command, str) and command.strip():
+        return command.strip()[:_PREVIEW_MAX]
+    try:
+        return json.dumps(tool_input, ensure_ascii=False)[:_PREVIEW_MAX]
+    except (TypeError, ValueError):
+        return None
 
 
 def _headers_from_config(config: dict[str, object]) -> dict[str, str]:
@@ -190,13 +213,17 @@ def _main_permission_request(argv: list[str]) -> int:
     honors. Instead we drive an interactive web-UI approval and type the answer
     back into kimi's prompt:
 
-    1. POST the gated tool to ``/v1/sessions/{id}/hooks/permission-request`` —
-       the server publishes the standard ``response.elicitation_request``
-       approval card and long-polls for the web verdict (the very endpoint
-       claude-native uses).
-    2. On ``allow`` / ``deny``, inject the matching kimi permission-menu option
-       digit + Enter into the TUI pane via :func:`inject_approval_keystroke`
-       (:data:`APPROVE_KEY` "Approve once" / :data:`DENY_KEY` "Reject").
+    1. POST the gated tool to ``/v1/sessions/{id}/hooks/native-permission-request``
+       — the vendor-agnostic native-permission endpoint (shared with
+       qwen/kiro/hermes/goose); the payload labels the card "Kimi", and the
+       server publishes the ``response.elicitation_request`` approval card and
+       long-polls for the web verdict.
+    2. Answer kimi's permission menu from the web verdict via
+       :func:`inject_approval_keystroke` (option digit + Enter): ``accept``
+       types :data:`APPROVE_KEY` "Approve once"; ``cancel`` types
+       :data:`DENY_KEY` "Reject". ``decline`` types NOTHING — the server
+       forwards an Escape that rejects the menu, so a second keystroke would
+       race it.
 
     Fail-safe: on no verdict (timeout / server unreachable / the prompt was
     already answered in the terminal) it injects nothing and kimi's own TUI
@@ -223,24 +250,33 @@ def _main_permission_request(argv: list[str]) -> int:
     if not isinstance(tool_name, str) or not tool_name:
         return 0
     body: dict[str, object] = {
-        "tool_name": tool_name,
         # Stable re-attach id so a severed long-poll re-parks the SAME
-        # elicitation (mirrors the claude permission hook).
-        "_omnigent_elicitation_id": f"elicit_kimi_{secrets.token_hex(16)}",
+        # elicitation. ``agent`` / ``policy_name`` label the card "Kimi".
+        "elicitation_id": f"elicit_kimi_{secrets.token_hex(16)}",
+        "agent": "Kimi",
+        "policy_name": "kimi_native_permission",
+        "message": f"Kimi wants to call **{tool_name}**",
+        "operation_type": tool_name,
     }
-    tool_input = payload.get("tool_input")
-    if isinstance(tool_input, dict):
-        body["tool_input"] = tool_input
+    preview = _content_preview(payload.get("tool_input"))
+    if preview is not None:
+        body["content_preview"] = preview
 
     url = (
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
-        f"{_url_component(session_id)}/hooks/permission-request"
+        f"{_url_component(session_id)}/hooks/native-permission-request"
     )
     verdict = _request_web_approval(url, headers, body)
-    if verdict is None:
-        # No web verdict: leave kimi's own TUI prompt for manual approval.
+    if verdict is None or verdict == "decline":
+        # Inject nothing. No verdict leaves kimi's own TUI prompt for manual
+        # answer. On an explicit decline the server best-effort forwards an
+        # Escape (kimi 0.41.0: Escape on an open menu IS Reject): when it lands
+        # it rejects and closes the menu, so a second keystroke here would race
+        # it. If that forward fails or reaches no runner the menu stays open for
+        # manual terminal input — the same fail-safe as no verdict, never a
+        # silent approve. cancel gets no forward, so it still types the digit.
         return 0
-    key = APPROVE_KEY if verdict == "allow" else DENY_KEY
+    key = APPROVE_KEY if verdict == "accept" else DENY_KEY
     try:
         inject_approval_keystroke(bridge_dir, key=key, timeout_s=_SURFACE_TIMEOUT_S)
     except RuntimeError as exc:
@@ -256,9 +292,10 @@ def _request_web_approval(
 ) -> str | None:
     """POST the approval card and long-poll for the web verdict.
 
-    :returns: ``"allow"`` / ``"deny"``, or ``None`` on timeout (server returns
-        an empty 200), transport failure, or an unparseable verdict — all of
-        which fall back to kimi's own TUI prompt.
+    :returns: the verdict action (``"accept"`` / ``"decline"`` / ``"cancel"``),
+        or ``None`` on timeout (server returns an empty 200), transport failure,
+        or an unparseable verdict — all of which fall back to kimi's own TUI
+        prompt.
     """
     timeout = httpx.Timeout(_PERMISSION_REQUEST_TIMEOUT_S, connect=_SURFACE_TIMEOUT_S)
     try:
@@ -281,27 +318,19 @@ def _request_web_approval(
 
 
 def _verdict_from_response(data: object) -> str | None:
-    """Extract ``"allow"`` / ``"deny"`` from the PermissionRequest hook response.
+    """Extract the web verdict action from the native-permission response.
 
-    The endpoint returns Claude's PermissionRequest contract
-    (``hookSpecificOutput.decision.behavior``), with ``permissionDecision`` as a
-    fallback shape. Any persistent-allow variant (``allow_*``) maps to allow.
+    The vendor-agnostic endpoint returns an ``ElicitationResult``
+    (``{"action": "accept"|"decline"|"cancel"}``); the action is returned
+    verbatim so the caller can act on ``decline`` (which the server answers
+    with a forwarded Escape) differently from ``cancel``. Anything else is no
+    verdict.
     """
     if not isinstance(data, dict):
         return None
-    hook_output = data.get("hookSpecificOutput")
-    if not isinstance(hook_output, dict):
-        return None
-    decision = hook_output.get("decision")
-    behavior = decision.get("behavior") if isinstance(decision, dict) else None
-    raw = behavior if isinstance(behavior, str) else hook_output.get("permissionDecision")
-    if not isinstance(raw, str):
-        return None
-    low = raw.lower()
-    if low.startswith("allow") or low in ("approve", "approved", "accept"):
-        return "allow"
-    if low in ("deny", "reject", "rejected", "block"):
-        return "deny"
+    action = data.get("action")
+    if action in ("accept", "decline", "cancel"):
+        return action
     return None
 
 
