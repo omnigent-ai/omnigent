@@ -559,7 +559,7 @@ def test_env_values_are_copied_and_do_not_modify_server_environment(
 def test_env_values_rejects_reserved_and_credential_names(
     launcher_cls: type[KubernetesSandboxLauncher], name: str
 ) -> None:
-    with pytest.raises(ValueError, match="reserved|credential") as exc:
+    with pytest.raises(ValueError, match=r"reserved|credential") as exc:
         launcher_cls(env_values={name: "not-for-errors"})
     assert "not-for-errors" not in str(exc.value)
 
@@ -569,7 +569,7 @@ def test_env_values_rejects_reserved_and_credential_names(
 def test_launcher_validates_env_values_without_the_parser(
     launcher_cls: type[KubernetesSandboxLauncher], values: object
 ) -> None:
-    with pytest.raises(ValueError, match="sandbox.kubernetes.env_values"):
+    with pytest.raises(ValueError, match=r"sandbox\.kubernetes\.env_values"):
         launcher_cls(env_values=values)  # type: ignore[arg-type]
 
 

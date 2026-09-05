@@ -82,9 +82,7 @@ def test_managed_env_values_reaches_live_host(provider: str) -> None:
         assert any(
             mount["mountPath"] == "/mnt/omnigent-e2e-ca" for mount in container["volumeMounts"]
         )
-        assert all(
-            mount["mountPath"] != "/mnt/omnigent-e2e-ca" for mount in init["volumeMounts"]
-        )
+        assert all(mount["mountPath"] != "/mnt/omnigent-e2e-ca" for mount in init["volumeMounts"])
         # Inspect the real container environment and load its mounted CA bundle,
         # not just the API object's intended environment.
         probe = """
