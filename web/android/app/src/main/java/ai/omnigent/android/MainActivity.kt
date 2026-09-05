@@ -24,6 +24,7 @@ import android.widget.PopupMenu
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.VisibleForTesting
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
@@ -51,6 +52,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var blobSaver: BlobSaver
     private val loginManager = OidcLoginManager()
     private var pinnedOrigin: String? = null
+
+    // CookieManager.setCookie's completion is async; substitutable so a test
+    // can hold the callback across a server switch (SessionTokenBindingTest).
+    @VisibleForTesting
+    internal var installSessionCookie: (String, String, (Boolean) -> Unit) -> Unit =
+        {
+            url,
+            value,
+            callback,
+            ->
+            CookieManager.getInstance().setCookie(url, value) { callback(it) }
+        }
 
     // Bridge-dependent work deferred until the page (and its injected emit
     // callbacks) exist — see onPageReady.
@@ -383,7 +396,17 @@ class MainActivity : AppCompatActivity() {
      * rules, so we both attempt a reorder-to-front (works within the grace
      * period) AND post a "tap to return" notification as the reliable path back.
      */
-    private fun onSessionToken(token: String) {
+    internal fun onSessionToken(
+        loginOrigin: String,
+        token: String,
+    ) {
+        // A server switch can land between starting a login and its poll
+        // completing; a token minted for another origin must never be
+        // injected into the current one.
+        if (loginOrigin != pinnedOrigin) {
+            authLog("onSessionToken: origin changed since login started — dropping token")
+            return
+        }
         // The poll can land after the activity is gone (it ran on a background
         // thread up to 5 min) — never touch a destroyed WebView.
         if (isDestroyed || isFinishing || !::webView.isInitialized) return
@@ -409,9 +432,9 @@ class MainActivity : AppCompatActivity() {
         val cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(true)
         authLog("onSessionToken: injecting $name (token len=${token.length})")
-        cookies.setCookie(origin, cookie) { accepted ->
+        installSessionCookie(origin, cookie) { accepted ->
             // setCookie's callback is async — re-check the WebView is still alive.
-            if (isDestroyed || !::webView.isInitialized) return@setCookie
+            if (isDestroyed || !::webView.isInitialized) return@installSessionCookie
             authLog(
                 "setCookie accepted=$accepted present=${cookies
                     .getCookie(
@@ -421,7 +444,14 @@ class MainActivity : AppCompatActivity() {
             // A rejected cookie means the reload would land unauthenticated,
             // bounce to login, and re-launch the browser — burning the retry
             // budget on a failure that retrying can't fix. Stay put instead.
-            if (!accepted) return@setCookie
+            if (!accepted) return@installSessionCookie
+            // The async install can also span a server switch. The cookie went
+            // to the old origin's store either way (harmless), but the WebView
+            // must never be steered back to an origin the user has left.
+            if (origin != pinnedOrigin) {
+                authLog("setCookie callback: origin changed during install — not reloading")
+                return@installSessionCookie
+            }
             cookies.flush()
             webView.loadUrl(origin)
         }
@@ -519,11 +549,7 @@ class MainActivity : AppCompatActivity() {
         serverUrl: String,
         newOrigin: String,
     ) {
-        // Cancel any in-flight login before pinning the new origin: the poll runs
-        // against the old server and its token must never land on the new origin's
-        // cookie store. cancel() also resets inFlight so the new server can start
-        // its own login immediately rather than waiting up to 5 minutes.
-        loginManager.cancel()
+        loginManager.cancel() // a login for the old origin must not outlive the switch
         removeBridge()
         pinnedOrigin = newOrigin
         pageLoaded = false

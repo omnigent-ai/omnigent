@@ -55,6 +55,20 @@ describe("managed server preferences", () => {
     );
   });
 
+  it("keeps distinct organizations on one Databricks origin", () => {
+    assert.deepEqual(
+      parseManagedServerUrls([
+        "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
+        "https://dbc-a.cloud.databricks.com/other-mount?o=team%2Fblue",
+        "https://dbc-a.cloud.databricks.com/omnigent?o=team-red",
+      ]),
+      [
+        "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
+        "https://dbc-a.cloud.databricks.com/omnigent?o=team-red",
+      ],
+    );
+  });
+
   it("rejects an invalid configuration as a whole", () => {
     assert.deepEqual(parseManagedServerUrls("https://omnigent.example.com"), []);
     assert.deepEqual(
@@ -141,6 +155,19 @@ describe("managed server preferences", () => {
         ["https://workspace.example.com/ml/omnigents"],
       ),
       ["https://personal.example.com/", "hand-edited-invalid-value"],
+    );
+  });
+
+  it("excludes only the managed organization on a shared Databricks host", () => {
+    assert.deepEqual(
+      excludingManagedServers(
+        [
+          "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
+          "https://dbc-a.cloud.databricks.com/omnigent?o=team-red",
+        ],
+        ["https://dbc-a.cloud.databricks.com/managed?o=team%2Fblue"],
+      ),
+      ["https://dbc-a.cloud.databricks.com/omnigent?o=team-red"],
     );
   });
 });

@@ -16,6 +16,66 @@
 
 const { contextBridge, ipcRenderer } = require("electron");
 
+// Sandboxed preloads cannot require sibling files, so mirror the two URL
+// helpers the bridges expose. preload.test.js keeps them aligned with url.js.
+const WORKSPACE_DOMAINS = ["databricks.com", "azuredatabricks.net"];
+
+/** True when a host is, or sits under, a Databricks workspace domain. */
+function isDatabricksWorkspaceHost(host) {
+  const normalized = (host ?? "").toLowerCase();
+  return WORKSPACE_DOMAINS.some(
+    (domain) => normalized === domain || normalized.endsWith(`.${domain}`),
+  );
+}
+
+/** Copy only Databricks' workspace selector into a fresh query. */
+function workspaceOrganizationSearch(url) {
+  const query = new URLSearchParams();
+  if (isDatabricksWorkspaceHost(url.hostname)) {
+    for (const organization of url.searchParams.getAll("o")) {
+      query.append("o", organization);
+    }
+  }
+  return query;
+}
+
+/**
+ * Compact label for a server in the setup-page recent list: host (including
+ * a non-default port), plus `/?o=…` for a Databricks organization selector.
+ *
+ * @param {string} rawUrl
+ * @returns {string}
+ */
+function serverDisplayLabel(rawUrl) {
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return String(rawUrl ?? "");
+  }
+  const serialized = workspaceOrganizationSearch(url).toString();
+  return `${url.host}${serialized ? `/?${serialized}` : ""}`;
+}
+
+/**
+ * Stable server identity for workspace-scoped state. Browser origins discard
+ * queries, but Databricks uses ``o`` to select a workspace on shared hosts.
+ * Every other query remains deliberately outside the identity boundary.
+ *
+ * @param {string | null | undefined} rawUrl
+ * @returns {string | null}
+ */
+function workspaceIdentityKey(rawUrl) {
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  const query = workspaceOrganizationSearch(url).toString();
+  return `${url.origin}${query ? `?${query}` : ""}`;
+}
+
 // Collapse the update states the in-page UpdateBanner renders on
 // (available / downloading / downloaded / error-security) to `idle` so the server page can
 // never show a banner — that UI is shell-owned (the corner overlay). Kept here
@@ -92,6 +152,10 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * recently-connected server URLs. Resolves null off a connected server.
    */
   getServerPicker: () => ipcRenderer.invoke("omnigent:get-server-picker"),
+  // Shared main/preload identity + label rules keep Databricks `o` handling
+  // identical in the server-served picker without exposing Node or Electron.
+  serverDisplayLabel,
+  workspaceIdentityKey,
   /**
    * Re-point this window to a URL returned by getServerPicker (anything else
    * rejects in the main process).
@@ -428,6 +492,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
 // Setup-page bridge: persist + navigate to a server URL, and read the saved
 // one to pre-fill the form. Separate object so the SPA never sees it.
 contextBridge.exposeInMainWorld("omnigentSetup", {
+  serverDisplayLabel,
   getServerUrl: () => ipcRenderer.invoke("omnigent:get-server-url"),
   /**
    * Persist + navigate to a server URL. Connecting this machine as a runner is

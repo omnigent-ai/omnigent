@@ -6,7 +6,36 @@
 
 const { describe, it, mock, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
 const fs = require("fs");
+const path = require("node:path");
+
+const CLI_MODULE = path.resolve(__dirname, "../src/omnigent_cli.js");
+
+function runWithoutYaml(source) {
+  return spawnSync(
+    process.execPath,
+    [
+      "--eval",
+      `const Module = require("node:module");
+const load = Module._load;
+Module._load = function(request, ...args) {
+  if (request === "js-yaml") {
+    const error = new Error("Cannot find module 'js-yaml'");
+    error.code = "MODULE_NOT_FOUND";
+    throw error;
+  }
+  return load.call(this, request, ...args);
+};
+${source}`,
+    ],
+    { encoding: "utf8" },
+  );
+}
+
+function runIsolated(source) {
+  return spawnSync(process.execPath, ["--eval", source], { encoding: "utf8" });
+}
 
 const {
   normalizeServerUrl,
@@ -16,11 +45,13 @@ const {
   candidatePaths,
   resolveCliPath,
   cliCommandParts,
+  serverAuthEntry,
   parseJsonLoose,
   matchesServer,
   parseDaemonRecord,
   daemonServerUrl,
   getHostConnectionFast,
+  probeHostTunnel,
   probeServerAuth,
   localHostId,
 } = require("../src/omnigent_cli");
@@ -64,6 +95,123 @@ describe("normalizeServerUrl", () => {
     assert.equal(normalizeServerUrl(undefined), "");
     assert.equal(normalizeServerUrl(null), "");
     assert.equal(normalizeServerUrl(42), "");
+  });
+});
+
+describe("optional YAML dependency", () => {
+  it("loads general CLI helpers when js-yaml is unavailable", () => {
+    const result = runWithoutYaml(`
+const cli = require(${JSON.stringify(CLI_MODULE)});
+console.log(cli.normalizeServerUrl("https://server.example/"));
+`);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "https://server.example");
+  });
+
+  it("reports an actionable error when machine identity needs missing js-yaml", () => {
+    const result = runWithoutYaml(`
+try {
+  const cli = require(${JSON.stringify(CLI_MODULE)});
+  require("node:fs").readFileSync = () => "host:\\n  host_id: host_abc123\\n";
+  cli.localHostId();
+  process.exitCode = 2;
+} catch (error) {
+  console.log(error.message);
+}
+`);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /machine identity.*js-yaml.*Electron dependencies/i);
+  });
+
+  it("does not misreport an unrelated js-yaml initialization failure as missing", () => {
+    const result = runIsolated(`
+const Module = require("node:module");
+const load = Module._load;
+Module._load = function(request, ...args) {
+  if (request === "js-yaml") throw new Error("parser initialization failed");
+  return load.call(this, request, ...args);
+};
+const cli = require(${JSON.stringify(CLI_MODULE)});
+require("node:fs").readFileSync = () => "host:\\n  host_id: host_abc123\\n";
+try { cli.localHostId(); } catch (error) { console.log(error.message); }
+`);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "parser initialization failed");
+  });
+
+  it("returns null for a missing config but preserves unrelated read errors", () => {
+    const missing = runIsolated(`
+const cli = require(${JSON.stringify(CLI_MODULE)});
+require("node:fs").readFileSync = () => { const error = new Error("missing"); error.code = "ENOENT"; throw error; };
+console.log(cli.localHostId() === null);
+`);
+    assert.equal(missing.status, 0, missing.stderr);
+    assert.equal(missing.stdout.trim(), "true");
+
+    const denied = runIsolated(`
+const cli = require(${JSON.stringify(CLI_MODULE)});
+require("node:fs").readFileSync = () => { const error = new Error("permission denied"); error.code = "EACCES"; throw error; };
+try { cli.localHostId(); } catch (error) { console.log(error.message); }
+`);
+    assert.equal(denied.status, 0, denied.stderr);
+    assert.equal(denied.stdout.trim(), "permission denied");
+  });
+
+  it("returns null for malformed YAML", () => {
+    const result = runIsolated(`
+const cli = require(${JSON.stringify(CLI_MODULE)});
+require("js-yaml");
+require("node:fs").readFileSync = () => "host: [unterminated";
+console.log(cli.localHostId() === null);
+`);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "true");
+  });
+});
+
+describe("serverAuthEntry", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("returns a non-expired OIDC token entry", () => {
+    mock.method(fs, "readFileSync", () =>
+      JSON.stringify({
+        "https://server.example": {
+          token: "session-jwt",
+          user_id: "user@example.com",
+          expires_at: 200,
+        },
+      }),
+    );
+
+    assert.deepEqual(serverAuthEntry("https://server.example/", { nowSeconds: 100 }), {
+      token: "session-jwt",
+      user_id: "user@example.com",
+      expires_at: 200,
+    });
+  });
+
+  it("rejects an expired token entry", () => {
+    mock.method(fs, "readFileSync", () =>
+      JSON.stringify({
+        "https://server.example": { token: "expired", expires_at: 99 },
+      }),
+    );
+
+    assert.equal(serverAuthEntry("https://server.example", { nowSeconds: 100 }), null);
+  });
+
+  it("keeps the existing Databricks pointer shape valid", () => {
+    const entry = {
+      auth_type: "databricks",
+      workspace_host: "https://workspace.example",
+    };
+    mock.method(fs, "readFileSync", () => JSON.stringify({ "https://app.example": entry }));
+
+    assert.deepEqual(serverAuthEntry("https://app.example", { nowSeconds: 100 }), entry);
   });
 });
 
@@ -365,6 +513,19 @@ describe("probeServerAuth — /v1/me auth gate", () => {
     assert.equal(calls[0].init.redirect, "manual");
   });
 
+  it("keeps a normalized organization selector on the auth probe", async () => {
+    const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue";
+    mock.method(fs, "readFileSync", () => "{}");
+    let target;
+    mock.method(globalThis, "fetch", async (value) => {
+      target = value;
+      return { status: 200 };
+    });
+
+    assert.deepEqual(await probeServerAuth(serverUrl), { authed: true, reachable: true });
+    assert.equal(target, "https://dbc-a.cloud.databricks.com/omnigent/v1/me?o=team%2Fblue");
+  });
+
   it("returns not-authed for non-200 statuses (Databricks 302, opaque-redirect 0, 401)", async () => {
     mock.method(fs, "readFileSync", () => "{}");
     const url = "https://app.example.com";
@@ -397,8 +558,10 @@ describe("probeServerAuth — /v1/me auth gate", () => {
     const url = "https://app.example.com";
 
     // Session-token record → Authorization attached, so an authed OIDC/accounts
-    // server can answer 200 and skip a needless login.
-    mock.method(fs, "readFileSync", () =>
+    // server can answer 200 and skip a needless login. Re-point one mock rather
+    // than stacking a second: restoreAll unwinds stacked mocks in creation
+    // order, which would leave the first mock installed after this test.
+    const readMock = mock.method(fs, "readFileSync", () =>
       JSON.stringify({ [url]: { token: "sess-123", expires_at: Date.now() / 1000 + 3600 } }),
     );
     let seen;
@@ -411,7 +574,7 @@ describe("probeServerAuth — /v1/me auth gate", () => {
 
     // Databricks pointer → no in-process token → no Authorization header (the
     // unauthenticated probe correctly yields not-authed and defers to login).
-    mock.method(fs, "readFileSync", () =>
+    readMock.mock.mockImplementation(() =>
       JSON.stringify({ [url]: { auth_type: "databricks", workspace_host: "https://ws" } }),
     );
     seen = undefined;
@@ -437,10 +600,41 @@ describe("probeServerAuth — /v1/me auth gate", () => {
   });
 });
 
+describe("probeHostTunnel — workspace route", () => {
+  afterEach(() => {
+    mock.restoreAll();
+  });
+
+  it("places the host path before the organization selector", async () => {
+    const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue";
+    mock.method(fs, "readFileSync", () =>
+      JSON.stringify({
+        [serverUrl]: { token: "session-token", expires_at: Date.now() / 1000 + 3600 },
+      }),
+    );
+    let target;
+    mock.method(globalThis, "fetch", async (value) => {
+      target = value;
+      return { ok: true, json: async () => ({ status: "online" }) };
+    });
+
+    assert.deepEqual(await probeHostTunnel(serverUrl, "host/a"), {
+      status: "online",
+      reachable: true,
+      authMissing: false,
+    });
+    assert.equal(
+      target,
+      "https://dbc-a.cloud.databricks.com/omnigent/v1/hosts/host%2Fa?o=team%2Fblue",
+    );
+  });
+});
+
 describe("localHostId", () => {
   // The id is memoized process-wide, so this is the ONLY case that may call
   // localHostId — a second one would read the cache, not the mocked file.
   it("strips the legacy host_ prefix so the id matches a /v1/hosts row", () => {
+    require("js-yaml");
     mock.method(fs, "readFileSync", () => "host:\n  host_id: host_abc123\n  name: laptop\n");
 
     // The renderer compares this against host_id as a plain string, so the

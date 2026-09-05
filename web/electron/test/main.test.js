@@ -24,18 +24,136 @@ const { createRequire } = require("node:module");
 const path = require("node:path");
 const vm = require("node:vm");
 
+const { runInNewContext } = vm;
+
+const {
+  isSetupIdle,
+  loadInitialDestination,
+  loadServerAfterAuth,
+  withServerLoad,
+} = require("../src/server_load");
+const { joinServerUrl, normalizeUrl, workspaceIdentityKey } = require("../src/url");
+const {
+  oidcServerUrlError,
+  runOidcBrowserLogin,
+  installAndVerifySessionCookie,
+} = require("../src/oidc_auth");
+
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
+const omnigentCliSource = readFileSync(path.join(__dirname, "../src/omnigent_cli.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 const setupSource = readFileSync(path.join(__dirname, "../setup/index.html"), "utf8");
 const urlHelpers = require("../src/url");
 
+const startLocalHandlerSource = setupSource.match(
+  /startLocalBtn\.addEventListener\("click",\s*(async \(\) => \{[\s\S]*?\n        \})\);/,
+)?.[1];
+const setupConnectSource = setupSource.match(
+  /async function connect\(\) \{[\s\S]*?\n      \}/,
+)?.[0];
+
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+const oidcSessionCode = liveCode.match(
+  /async function runWindowOidcBrowserHandoff[\s\S]*?(?=async function loadAuthenticatedServerUrl)/,
+)?.[0];
+const webAuthnTimeoutCode = liveCode.match(
+  /async function showWebAuthnTimeout[\s\S]*?(?=async function runWindowOidcBrowserHandoff)/,
+)?.[0];
+const switchServerCode = liveCode.match(
+  /ipcMain\.handle\("omnigent:switch-server"[\s\S]*?(?=ipcMain\.on\("omnigent:open-server-setup")/,
+)?.[0];
+const openServerSetupCode = liveCode.match(
+  /ipcMain\.on\("omnigent:open-server-setup"[\s\S]*?(?=ipcMain\.on\("omnigent:find-query")/,
+)?.[0];
+const setupServerCode = liveCode.match(
+  /ipcMain\.handle\("omnigent:set-server-url"[\s\S]*?(?=ipcMain\.handle\("omnigent:get-server-url")/,
+)?.[0];
+const createWindowCode = liveCode.match(
+  /function createWindow\(targetUrl, opts = \{\}\)[\s\S]*?(?=const MAX_SPELL_SUGGESTIONS)/,
+)?.[0];
+const serverLoadCode = liveCode.match(
+  /async function loadAuthenticatedServerUrl[\s\S]*?(?=async function loadSetupPage)/,
+)?.[0];
+const expiryHandoffCallbackCode = createWindowCode?.match(
+  /async \(\{ serverUrl: expiredServerUrl, returnUrl \}\) => \{[\s\S]*?\n    \}/,
+)?.[0];
+const expiryHandoffServerUrlGetterCode = createWindowCode?.match(
+  /registerOidcSessionExpiryHandoff\(\s*win\.webContents,\s*(\(\) => \{[\s\S]*?\n    \}),/,
+)?.[1];
+const oauthPopupCode = liveCode.match(
+  /function hardenOauthPopup\(child\)[\s\S]*?(?=async function showWebAuthnTimeout)/,
+)?.[0];
+const deepLinkHandlerCode = liveCode.match(
+  /async function handleDeepLink\(raw\)[\s\S]*?(?=app\.setName)/,
+)?.[0];
+
+async function runConsentUnknownDeepLink(
+  initialPendingLoads,
+  { closeDuringExpansion = false, expandedServerUrl = "https://unknown.example" } = {},
+) {
+  const state = {
+    origin: null,
+    identity: null,
+    pendingServerLoads: initialPendingLoads,
+    serverUrl: null,
+  };
+  let destroyed = false;
+  const parent = {
+    isDestroyed: () => destroyed,
+    webContents: { getURL: () => "file:///setup" },
+  };
+  const windowStates = new Map([[parent, state]]);
+  const parentLoads = [];
+  const created = [];
+  const pendingDuringExpansion = [];
+  const remembered = [];
+  const handler = runInNewContext(`${deepLinkHandlerCode}; handleDeepLink`, {
+    BrowserWindow: { getFocusedWindow: () => parent },
+    activeWindow: () => parent,
+    chooseDeepLinkStrategy: () => ({ strategy: "consent-unknown" }),
+    confirmOpenDeepLink: async () => true,
+    console: { log: () => {} },
+    createWindow: (_target, options) => {
+      created.push(options);
+      return {};
+    },
+    expandDatabricksWorkspaceUrl: async () => {
+      pendingDuringExpansion.push(state.pendingServerLoads);
+      if (closeDuringExpansion) {
+        destroyed = true;
+        windowStates.delete(parent);
+      }
+      return expandedServerUrl;
+    },
+    expandedServerUrlError: (serverUrl, expectedIdentity) =>
+      oidcServerUrlError(serverUrl) ??
+      (workspaceIdentityKey(serverUrl) === expectedIdentity ? null : "invalid_server_url"),
+    findKnownServerUrl: () => null,
+    focusAndRestore: () => {},
+    isSetupIdle,
+    knownWorkspaceIdentities: () => [],
+    loadServerUrl: async (win) => {
+      parentLoads.push(win);
+      return true;
+    },
+    workspaceIdentityKey,
+    oidcServerUrlError,
+    parseOmnigentDeepLink: () => ({ origin: "https://unknown.example", path: "/c/1" }),
+    rememberServerUrl: (url) => remembered.push(url),
+    windows: windowStates,
+    withServerLoad,
+  });
+
+  await handler("omnigent://unknown.example/c/1");
+  return { created, parent, parentLoads, pendingDuringExpansion, remembered, state };
+}
 
 function loadNavigationHarness({
   serverUrl = "https://host.example/ml/omnigents",
   savedServerUrl,
   registerFallbacks = true,
+  rejectAuthSideEffects = false,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -45,7 +163,7 @@ function loadNavigationHarness({
     );
   }
   const listeners = new Map();
-  const calls = { loadFile: [], loadURL: [] };
+  const calls = { closeAll: [], loadFile: [], loadURL: [] };
   const bannerCalls = { show: [], hide: 0 };
   let currentUrl = serverUrl;
   const appEvents = new Map();
@@ -78,7 +196,9 @@ function loadNavigationHarness({
     },
     loadURL: (...args) => {
       calls.loadURL.push(args);
-      return Promise.resolve();
+      return rejectAuthSideEffects
+        ? Promise.reject(new Error("invalid server URL reached navigation"))
+        : Promise.resolve();
     },
   };
 
@@ -115,7 +235,7 @@ function loadNavigationHarness({
         return win;
       },
       {
-        fromWebContents: () => null,
+        fromWebContents: (contents) => (contents === webContents ? win : null),
         getFocusedWindow: () => null,
         getAllWindows: () => [],
       },
@@ -143,6 +263,9 @@ function loadNavigationHarness({
     "./url": {
       ...urlHelpers,
       normalizeUrl: (url) => url,
+      normalizeRecentServers: (urls) => urls,
+      workspaceIdentityKey,
+      joinServerUrl,
       expandDatabricksWorkspaceUrl: async (url) => url,
       fetchServerManifest: async () => ({}),
       PRE_MANIFEST_BASELINE: {},
@@ -172,14 +295,40 @@ function loadNavigationHarness({
       createBrowserViewBoundsController: () => ({ attach: () => {}, detach: () => {} }),
     },
     "./browserIpc": { registerBrowserIpc: () => {} },
-    "./session-expiry": { registerSessionExpiryReload: () => {} },
+    "./session-expiry": {
+      registerSessionExpiryReload: () => {},
+      registerOidcSessionExpiryHandoff: () => {},
+    },
     "./popupPolicy": {
       decideWindowOpen: () => ({ kind: "ignore" }),
       stripCrossOriginOpenerHeaders: () => {},
       WEB_SCHEMES: new Set(),
     },
+    "./oidc_auth": {
+      OIDC_LOGIN_TIMEOUT_MS: 300_000,
+      oidcServerUrlError,
+      probeServerAuth: async () => {
+        if (rejectAuthSideEffects) assert.fail("invalid server URL reached authentication probe");
+        return { kind: "other" };
+      },
+      runOidcBrowserLogin: async () => ({ ok: false, reason: "cancelled" }),
+      installAndVerifySessionCookie: async () => {
+        if (rejectAuthSideEffects) assert.fail("invalid server URL reached cookie installation");
+      },
+    },
+    "./oidc_login_dialog": {
+      runOidcLoginDialog: async () => {
+        if (rejectAuthSideEffects) assert.fail("invalid server URL constructed the OIDC modal");
+        return false;
+      },
+    },
+    "./webauthn_timeout": {
+      isWebAuthnEscapePage: () => false,
+      registerWebAuthnTimeout: () => {},
+    },
     "./omnigent_cli": {
       isExecutableFile: () => false,
+      isLoopbackServer: () => false,
       resolveCliPath: () => null,
       localHostId: () => "host_test",
       getCliStatus: () => ({ installed: false }),
@@ -199,7 +348,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, registerNavigationFallbacks, windows, SETUP_PAGE, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
+    "\nmodule.exports.testApi = { createWindow, isPinnedWorkspaceSender, pinWindow, registerNavigationFallbacks, windows, SETUP_PAGE, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -228,10 +377,11 @@ function loadNavigationHarness({
   const api = module.exports.testApi;
   api.windows.set(win, {
     origin: new URL(serverUrl).origin,
+    identity: workspaceIdentityKey(serverUrl),
     serverUrl,
     ephemeral: false,
     badgeCount: 0,
-    browserRegistry: { closeAll: () => {} },
+    browserRegistry: { closeAll: (reason) => calls.closeAll.push(reason) },
   });
   if (registerFallbacks) api.registerNavigationFallbacks(win);
 
@@ -243,6 +393,10 @@ function loadNavigationHarness({
     hasListener: (eventName) => listeners.has(eventName),
     setUrl: (url) => {
       currentUrl = url;
+    },
+    waitForPin: async () => {
+      await api.windows.get(win)?.pendingLoad;
+      assert.ok(api.windows.get(win)?.origin, "window did not finish its authenticated pin");
     },
     win,
     cleanup: () => {
@@ -288,13 +442,49 @@ describe("managed server preference wiring", () => {
       liveCode,
       /ipcMain\.handle\("omnigent:get-managed-servers"[\s\S]{0,180}!isSetupPageSender\(event\)[\s\S]{0,180}return managedServerUrls\(\)/,
     );
+    assert.match(preloadSource, /serverDisplayLabel[,\s]/);
   });
 
-  it("preserves a managed path while still expanding bare workspace roots", () => {
-    assert.match(
-      liveCode,
-      /managedTarget\s*\?\?\s*normalizeUrl\(url\)[\s\S]{0,120}await expandDatabricksWorkspaceUrl\(normalized\)/,
+  it("returns an exact managed mount without normalizing it", async () => {
+    const managedUrl = "https://mdm.example.com/ml/omnigents";
+    const state = { ephemeral: true, serverUrl: null };
+    const win = { isDestroyed: () => false };
+    const calls = [];
+    const handlerSource = setupServerCode.slice(
+      setupServerCode.indexOf("async"),
+      setupServerCode.lastIndexOf(");"),
     );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      configuredServerUrlError: (_raw, normalized) => oidcServerUrlError(normalized),
+      configuredServerUrlErrorMessage: () => "Invalid server.",
+      expandDatabricksWorkspaceUrl: async (url) => {
+        calls.push(["expand", url]);
+        return url;
+      },
+      expandedServerUrlError: (url, expectedIdentity) =>
+        oidcServerUrlError(url) ??
+        (workspaceIdentityKey(url) === expectedIdentity ? null : "invalid_server_url"),
+      isSetupPageSender: () => true,
+      loadServerUrl: async (_win, url) => {
+        calls.push(["load", url]);
+        return true;
+      },
+      managedServerUrls: () => [managedUrl],
+      normalizeUrl: () => assert.fail("normalized a managed mount"),
+      serverSelectorV2Enabled: () => false,
+      workspaceIdentityKey,
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    const result = await handler({ sender: {} }, managedUrl);
+
+    assert.equal(result.loaded, true);
+    assert.deepEqual(calls, [
+      ["expand", managedUrl],
+      ["load", managedUrl],
+    ]);
   });
 
   it("returns managed choices in the connected-server picker", () => {
@@ -400,6 +590,7 @@ describe("return-to-server banner wiring (src/main.js)", () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
     harness.api.setAwayBannerDelayMs(5);
     harness.api.createWindow("https://host.example/ml/omnigents");
+    await harness.waitForPin();
 
     // SSO navigates the window to the IdP and leaves it there.
     harness.setUrl("https://company.okta.com/login");
@@ -429,6 +620,7 @@ describe("return-to-server banner wiring (src/main.js)", () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
     harness.api.setAwayBannerDelayMs(5);
     harness.api.createWindow("https://host.example/ml/omnigents");
+    await harness.waitForPin();
 
     harness.setUrl("https://host.example/ml/omnigents");
     harness.emit("did-navigate", "https://host.example/ml/omnigents", 200, "OK");
@@ -457,6 +649,7 @@ describe("return-to-server banner wiring (src/main.js)", () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
     harness.api.setAwayBannerDelayMs(50);
     harness.api.createWindow("https://host.example/ml/omnigents");
+    await harness.waitForPin();
 
     harness.setUrl("https://company.okta.com/login");
     harness.emit("did-navigate", "https://company.okta.com/login", 200, "OK");
@@ -469,6 +662,60 @@ describe("return-to-server banner wiring (src/main.js)", () => {
 
     assert.equal(harness.bannerCalls.show.length, 0);
     harness.cleanup();
+  });
+});
+
+describe("setup Start locally", () => {
+  it("restores the button when the connection is not accepted", async () => {
+    assert.ok(startLocalHandlerSource);
+    const startLocalBtn = { disabled: false, textContent: "Start locally" };
+    const err = { textContent: "" };
+    const input = { value: "" };
+    const handler = runInNewContext(`(${startLocalHandlerSource})`, {
+      cliInstalled: true,
+      err,
+      input,
+      setup: {
+        setServerUrl: async () => ({ loaded: false }),
+        startLocalServer: async () => ({ ok: true, url: "http://localhost:8000" }),
+      },
+      startLocalBtn,
+    });
+
+    await handler();
+
+    assert.equal(startLocalBtn.disabled, false);
+    assert.equal(startLocalBtn.textContent, "Start locally");
+    assert.equal(err.textContent, "");
+  });
+});
+
+describe("setup Connect", () => {
+  it("surfaces the canonical remote HTTP rejection on the first attempt", async () => {
+    assert.ok(setupConnectSource);
+    const button = { disabled: false };
+    const err = { textContent: "" };
+    const input = { value: "http://server.example" };
+    let attempts = 0;
+    const connect = runInNewContext(`${setupConnectSource}; connect`, {
+      button,
+      err,
+      input,
+      isPlainHttpRemote: () => true,
+      setup: {
+        setServerUrl: async () => {
+          attempts += 1;
+          return { loaded: false, error: "Remote servers require HTTPS." };
+        },
+      },
+      warnedFor: null,
+    });
+
+    await connect();
+
+    assert.equal(attempts, 1);
+    assert.equal(err.textContent, "Remote servers require HTTPS.");
+    assert.equal(button.disabled, false);
   });
 });
 
@@ -504,7 +751,7 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
 });
 
 describe("navigation fallback wiring (src/main.js)", () => {
-  it("boots a saved Databricks API URL on the UI mount without losing URL state", () => {
+  it("boots a saved Databricks API URL on the UI mount without losing URL state", async () => {
     const saved = "https://workspace.cloud.databricks.com/api/2.0/omnigent/?o=123#conversation";
     const harness = loadNavigationHarness({
       savedServerUrl: saved,
@@ -512,6 +759,7 @@ describe("navigation fallback wiring (src/main.js)", () => {
     });
 
     harness.api.createWindow();
+    await harness.waitForPin();
 
     assert.equal(
       harness.calls.loadURL[0][0],
@@ -524,6 +772,7 @@ describe("navigation fallback wiring (src/main.js)", () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
 
     const win = harness.api.createWindow("https://host.example/ml/omnigents");
+    await new Promise(setImmediate);
     harness.emit("did-navigate", "https://host.example/ml/omnigents/", 503, "Unavailable");
     // loadSetupPage defers its navigation a tick (see main.js loadSetupPage).
     await new Promise((resolve) => {
@@ -536,6 +785,1076 @@ describe("navigation fallback wiring (src/main.js)", () => {
     assert.equal(harness.calls.loadFile.length, 1);
     assert.equal(harness.calls.loadFile[0][0], harness.api.SETUP_PAGE);
     harness.cleanup();
+  });
+
+  it("surfaces an unsafe saved server URL without authentication side effects", async () => {
+    const serverUrl = "https://host.example/ml/omnigents?workspace=one";
+    const harness = loadNavigationHarness({
+      serverUrl,
+      registerFallbacks: false,
+      rejectAuthSideEffects: true,
+    });
+
+    harness.api.createWindow(serverUrl);
+    await new Promise(setImmediate);
+    // loadSetupPage defers its navigation a tick (see main.js loadSetupPage).
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+
+    assert.equal(harness.calls.loadFile.length, 1);
+    const [, options] = harness.calls.loadFile[0];
+    const search = new URLSearchParams(options.search);
+    assert.match(search.get("error"), /server address is invalid/i);
+    assert.equal(search.get("url"), serverUrl);
+    harness.cleanup();
+  });
+});
+
+describe("remote OIDC browser handoff wiring (src/main.js)", () => {
+  it("keeps js-yaml outside the main process startup import path", () => {
+    assert.match(mainSource, /const omnigentCli = require\("\.\/omnigent_cli"\)/);
+    const loaderIndex = omnigentCliSource.indexOf("function loadYamlParser");
+    assert.notEqual(loaderIndex, -1);
+    assert.doesNotMatch(omnigentCliSource.slice(0, loaderIndex), /require\("js-yaml"\)/);
+    assert.match(omnigentCliSource.slice(loaderIndex), /require\("js-yaml"\)/);
+  });
+
+  it("wiring-only: uses the main-process ticket client without requiring the CLI", () => {
+    assert.ok(oidcSessionCode);
+    assert.match(oidcSessionCode, /runOidcBrowserLogin\(/);
+    assert.match(oidcSessionCode, /onPollError:[\s\S]{0,180}updateMessage\(/);
+    assert.doesNotMatch(oidcSessionCode, /resolvedCliPath|omnigentCli\.loginServer/);
+    assert.doesNotMatch(oidcSessionCode, /storeServerAuthToken|auth_tokens\.json/);
+  });
+
+  it("wiring-only: deduplicates concurrent OIDC flows per shell window", () => {
+    assert.match(liveCode, /const oidcLoginFlows = new WeakMap\(\)/);
+    assert.match(
+      liveCode,
+      /oidcLoginFlows\.get\(win\)[\s\S]{0,180}existingFlow\?\.serverUrl === serverUrl[\s\S]{0,80}existingFlow\.promise/,
+    );
+  });
+
+  it("rejects unsafe OIDC server URLs before the authenticated probe", async () => {
+    const ensureWindowOidcSession = runInNewContext(`${oidcSessionCode}; ensureWindowOidcSession`, {
+      AbortController,
+      BrowserWindow: function BrowserWindow() {},
+      installAndVerifySessionCookie: async () => assert.fail("installed a cookie"),
+      ipcMain: {},
+      OIDC_LOGIN_PAGE: "/oidc_login.html",
+      OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+      OIDC_LOGIN_TIMEOUT_MS: 100,
+      oidcLoginFlows: new WeakMap(),
+      oidcServerUrlError,
+      omnigentCli: { isLoopbackServer: () => false },
+      probeServerAuth: async () => assert.fail("sent an authenticated probe"),
+      runOidcBrowserLogin,
+      runOidcLoginDialog: async () => assert.fail("constructed the OIDC modal"),
+      session: { defaultSession: { fetch: async () => assert.fail("made a request") } },
+      setWindowAuthenticationNavigation() {},
+      shell: { openExternal: async () => assert.fail("opened a URL") },
+      URL,
+    });
+
+    await Promise.all(
+      [
+        [
+          "http://server.example",
+          "Browser sign-in requires HTTPS for remote servers. Update the server URL and retry.",
+        ],
+        [
+          "https://user:secret@server.example",
+          "The server address is invalid. Return to setup, correct it, and retry.",
+        ],
+        [
+          "ftp://server.example",
+          "The server address is invalid. Return to setup, correct it, and retry.",
+        ],
+        ["not a url", "The server address is invalid. Return to setup, correct it, and retry."],
+      ].map(async ([serverUrl]) => {
+        const result = await ensureWindowOidcSession({}, serverUrl);
+        assert.equal(result, false);
+      }),
+    );
+  });
+
+  it("bypasses the cached CLI token when the login navigation is explicit", async () => {
+    // The expiry handoff fires on the renderer's OWN /auth/login navigation —
+    // sign-out or account switch as much as expiry. Silently reinstalling a
+    // still-valid cached CLI token there signs the user straight back in with
+    // no way out; forceInteractive must skip the cache and run the modal flow.
+    const makeSession = () => {
+      const calls = { cacheReads: 0, installs: 0, dialogs: 0 };
+      const ensureWindowOidcSession = runInNewContext(
+        `${oidcSessionCode}; ensureWindowOidcSession`,
+        {
+          BrowserWindow: function BrowserWindow() {},
+          console: { log: () => {} },
+          installAndVerifySessionCookie: async () => {
+            calls.installs += 1;
+          },
+          ipcMain: {},
+          OIDC_LOGIN_PAGE: "/oidc_login.html",
+          OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+          OIDC_LOGIN_TIMEOUT_MS: 100,
+          oidcLoginFlows: new WeakMap(),
+          oidcServerUrlError,
+          omnigentCli: {
+            isLoopbackServer: () => false,
+            serverAuthEntry: () => {
+              calls.cacheReads += 1;
+              return { token: "cached-token" };
+            },
+          },
+          probeServerAuth: async () => ({ kind: "oidc" }),
+          runOidcBrowserLogin,
+          runOidcLoginDialog: async () => {
+            calls.dialogs += 1;
+            return true;
+          },
+          session: { defaultSession: {} },
+          setWindowAuthenticationNavigation() {},
+          shell: {},
+          URL,
+        },
+      );
+      return { ensureWindowOidcSession, calls };
+    };
+
+    const cached = makeSession();
+    assert.equal(await cached.ensureWindowOidcSession({}, "https://server.example"), true);
+    assert.deepEqual(cached.calls, { cacheReads: 1, installs: 1, dialogs: 0 });
+
+    const forced = makeSession();
+    assert.equal(
+      await forced.ensureWindowOidcSession({}, "https://server.example", {
+        forceInteractive: true,
+      }),
+      true,
+    );
+    assert.deepEqual(forced.calls, { cacheReads: 0, installs: 0, dialogs: 1 });
+  });
+
+  it("routes loopback OIDC servers through the browser handoff", async () => {
+    const makeSession = (kind, calls) =>
+      runInNewContext(`${oidcSessionCode}; ensureWindowOidcSession`, {
+        BrowserWindow: function BrowserWindow() {},
+        installAndVerifySessionCookie: async () => {},
+        ipcMain: {},
+        OIDC_LOGIN_PAGE: "/oidc_login.html",
+        OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+        OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcLoginFlows: new WeakMap(),
+        oidcServerUrlError,
+        omnigentCli: { serverAuthEntry: () => null },
+        probeServerAuth: async (_session, serverUrl) => {
+          calls.probes.push(serverUrl);
+          return { kind };
+        },
+        runOidcBrowserLogin,
+        runOidcLoginDialog: async ({ serverUrl }) => {
+          calls.dialogs.push(serverUrl);
+          return true;
+        },
+        session: { defaultSession: {} },
+        setWindowAuthenticationNavigation() {},
+        shell: {},
+        URL,
+      });
+
+    // Every loopback spelling is probed; an OIDC-mode server (a tunneled or
+    // port-forwarded deployment) signs in via the system browser rather than
+    // rendering the IdP in-window.
+    const oidc = { probes: [], dialogs: [] };
+    const viaHandoff = makeSession("oidc", oidc);
+    const loopbacks = ["http://localhost:6767", "http://127.0.0.1:6767", "http://[::1]:6767"];
+    const results = await Promise.all(loopbacks.map((serverUrl) => viaHandoff({}, serverUrl)));
+    assert.deepEqual(results, [true, true, true]);
+    assert.deepEqual(oidc.probes, loopbacks);
+    assert.deepEqual(oidc.dialogs, loopbacks);
+
+    // A local no-auth dev server (probe: authenticated) still connects directly.
+    const local = { probes: [], dialogs: [] };
+    const direct = makeSession("authenticated", local);
+    assert.equal(await direct({}, "http://localhost:6767"), true);
+    assert.deepEqual(local.probes, ["http://localhost:6767"]);
+    assert.deepEqual(local.dialogs, []);
+  });
+
+  it("wiring-only: includes loopback servers in expiry handoff", () => {
+    assert.ok(expiryHandoffServerUrlGetterCode);
+    assert.doesNotMatch(expiryHandoffServerUrlGetterCode, /isLoopbackServer/);
+  });
+
+  it("completes the WebAuthn escape through ticket, cookie verification, and one reload", async () => {
+    assert.ok(webAuthnTimeoutCode);
+    let stored = null;
+    const fetches = [];
+    const electronSession = {
+      cookies: {
+        set: async (details) => {
+          stored = { ...details };
+        },
+        get: async () => [stored],
+      },
+      fetch: async (url) => {
+        fetches.push(url);
+        if (url.endsWith("/auth/cli-login")) {
+          return {
+            status: 200,
+            json: async () => ({ ticket: "one-time", login_url: "/auth/login?ticket=one-time" }),
+          };
+        }
+        if (url.includes("/auth/cli-poll")) {
+          return { status: 200, json: async () => ({ token: "session-token" }) };
+        }
+        return { status: 200, json: async () => ({ id: "user" }) };
+      },
+    };
+    const win = {
+      isDestroyed: () => false,
+      webContents: { getURL: () => "https://idp.example/passkey" },
+    };
+    const state = { serverUrl: "https://server.example", pendingServerLoads: 0 };
+    const reloads = [];
+    const opened = [];
+    const showWebAuthnTimeout = runInNewContext(
+      `${oidcSessionCode}; ${webAuthnTimeoutCode}; showWebAuthnTimeout`,
+      {
+        AbortController,
+        BrowserWindow: function BrowserWindow() {},
+        WEB_SCHEMES: new Set(["https:"]),
+        URL,
+        dialog: { showMessageBox: async () => ({ response: 0 }) },
+        installAndVerifySessionCookie,
+        ipcMain: {},
+        loadAuthenticatedServerUrl: async (...args) => reloads.push(args),
+        OIDC_LOGIN_PAGE: "/oidc_login.html",
+        OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+        OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcServerUrlError,
+        oidcLoginFlows: new WeakMap(),
+        probeServerAuth: async () => ({ kind: "oidc", status: 401 }),
+        runOidcBrowserLogin: (...args) => {
+          const options = args[3];
+          return runOidcBrowserLogin(...args.slice(0, 3), { ...options, pollIntervalMs: 1 });
+        },
+        runOidcLoginDialog: async ({ runAttempt }) => {
+          const result = await runAttempt({
+            signal: new AbortController().signal,
+            updateMessage() {},
+          });
+          return result.ok;
+        },
+        session: { defaultSession: electronSession },
+        shell: { openExternal: async (url) => opened.push(url) },
+        windows: new Map([[win, state]]),
+        withServerLoad,
+      },
+    );
+
+    await showWebAuthnTimeout(win);
+
+    assert.equal(opened.length, 1);
+    assert.equal(stored.value, "session-token");
+    assert.equal(fetches.at(-1), "https://server.example/v1/me");
+    assert.deepEqual(reloads, [[win, "https://server.example"]]);
+    assert.equal(state.pendingServerLoads, 0);
+  });
+
+  it("does not attempt ticket login for an accounts-mode passkey page", async () => {
+    const win = {
+      isDestroyed: () => false,
+      webContents: { getURL: () => "https://server.example/login" },
+    };
+    const state = { serverUrl: "https://server.example", pendingServerLoads: 0 };
+    let handoffs = 0;
+    const opened = [];
+    const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
+      WEB_SCHEMES: new Set(["https:"]),
+      URL,
+      dialog: { showMessageBox: async () => ({ response: 0 }) },
+      oidcServerUrlError,
+      probeServerAuth: async () => ({ kind: "accounts", status: 401 }),
+      runWindowOidcBrowserHandoff: async () => {
+        handoffs += 1;
+      },
+      session: { defaultSession: {} },
+      shell: { openExternal: async (url) => opened.push(url) },
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    await showWebAuthnTimeout(win);
+
+    assert.equal(handoffs, 0);
+    // "Open in Browser" must still do what it says on an accounts-mode
+    // /login page: no ticket handoff exists, so the stuck sign-in page
+    // itself goes to the system browser (where a platform passkey works).
+    assert.deepEqual(opened, ["https://server.example/login"]);
+    assert.equal(state.pendingServerLoads, 0);
+  });
+
+  it("keeps 'other' auth postures inert (no handoff, no browser open)", async () => {
+    const win = {
+      isDestroyed: () => false,
+      webContents: { getURL: () => "https://server.example/somewhere" },
+    };
+    const state = { serverUrl: "https://server.example", pendingServerLoads: 0 };
+    const opened = [];
+    const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
+      WEB_SCHEMES: new Set(["https:"]),
+      URL,
+      dialog: { showMessageBox: async () => ({ response: 0 }) },
+      oidcServerUrlError,
+      probeServerAuth: async () => ({ kind: "other", status: 500 }),
+      runWindowOidcBrowserHandoff: async () => assert.fail("constructed the OIDC modal"),
+      session: { defaultSession: {} },
+      shell: { openExternal: async (url) => opened.push(url) },
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    await showWebAuthnTimeout(win);
+
+    assert.deepEqual(opened, []);
+    assert.equal(state.pendingServerLoads, 0);
+  });
+
+  it("rejects an unsafe WebAuthn handoff before the authenticated probe", async () => {
+    const win = {
+      isDestroyed: () => false,
+      webContents: { getURL: () => "https://idp.example/passkey" },
+    };
+    const state = { serverUrl: "http://server.example", pendingServerLoads: 0 };
+    const setupLoads = [];
+    const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
+      WEB_SCHEMES: new Set(["https:"]),
+      URL,
+      configuredServerUrlErrorMessage: () => "Remote servers require HTTPS.",
+      dialog: { showMessageBox: async () => assert.fail("constructed a confirmation modal") },
+      loadSetupPage: async (...args) => setupLoads.push(args),
+      oidcServerUrlError,
+      probeServerAuth: async () => assert.fail("sent an authenticated probe"),
+      runWindowOidcBrowserHandoff: async () => assert.fail("constructed the OIDC modal"),
+      session: { defaultSession: {} },
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    await showWebAuthnTimeout(win);
+
+    assert.equal(setupLoads.length, 1);
+    assert.equal(setupLoads[0][0], win);
+    assert.equal(setupLoads[0][1].error, "Remote servers require HTTPS.");
+    assert.equal(setupLoads[0][1].url, "http://server.example");
+    assert.equal(state.pendingServerLoads, 0);
+  });
+
+  it("rejects ambiguous WebAuthn server URLs before the authenticated probe", async () => {
+    const invalidServerUrls = [
+      "https://server.example/base?workspace=one",
+      "https://server.example/base?",
+      "https://server.example/base#workspace",
+      "https://server.example/base#",
+      "https://server.example/base/../other",
+      "https://server.example/base/%2e%2e/other",
+      "https://server.example/base/%252e%252e/other",
+      "https://server.example/base/%2525252e%2525252e/other",
+      "https://server.example/base\\other",
+      "https://server.example/base//other",
+      "https://server.example/base/%2fother",
+      "https://server.example/base/%252fother",
+      "https://server.example/base/%2525252fother",
+      `https://server.example/base/%${"25".repeat(40)}2fother`,
+      "https://server.example/base/%",
+      "https://server.example/base/%C0%AF",
+    ];
+
+    await Promise.all(
+      invalidServerUrls.map(async (serverUrl) => {
+        const win = {
+          isDestroyed: () => false,
+          webContents: { getURL: () => "https://idp.example/passkey" },
+        };
+        const state = { serverUrl, pendingServerLoads: 0 };
+        const setupLoads = [];
+        const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
+          WEB_SCHEMES: new Set(["https:"]),
+          URL,
+          configuredServerUrlErrorMessage: () => "Invalid server URL.",
+          dialog: { showMessageBox: async () => assert.fail("constructed a confirmation modal") },
+          loadSetupPage: async (...args) => setupLoads.push(args),
+          oidcServerUrlError,
+          probeServerAuth: async () => assert.fail("sent an authenticated probe"),
+          runWindowOidcBrowserHandoff: async () => assert.fail("constructed the OIDC modal"),
+          session: { defaultSession: {} },
+          windows: new Map([[win, state]]),
+          withServerLoad,
+        });
+
+        await showWebAuthnTimeout(win);
+
+        assert.equal(setupLoads.length, 1);
+        assert.equal(setupLoads[0][0], win);
+        assert.equal(setupLoads[0][1].error, "Invalid server URL.");
+        assert.equal(setupLoads[0][1].url, serverUrl);
+        assert.equal(state.pendingServerLoads, 0);
+      }),
+    );
+  });
+
+  it("cancels the real ticket composition without installing or reloading", async () => {
+    const controller = new AbortController();
+    const electronSession = {
+      cookies: {
+        set: async () => assert.fail("cancelled login installed a cookie"),
+        get: async () => [],
+      },
+      fetch: async () => ({
+        status: 200,
+        json: async () => ({ ticket: "one-time", login_url: "/auth/login?ticket=one-time" }),
+      }),
+    };
+    const win = {
+      isDestroyed: () => false,
+      webContents: { getURL: () => "https://idp.example/passkey" },
+    };
+    const state = { serverUrl: "https://server.example", pendingServerLoads: 0 };
+    let reloads = 0;
+    const showWebAuthnTimeout = runInNewContext(
+      `${oidcSessionCode}; ${webAuthnTimeoutCode}; showWebAuthnTimeout`,
+      {
+        AbortController,
+        BrowserWindow: function BrowserWindow() {},
+        WEB_SCHEMES: new Set(["https:"]),
+        URL,
+        dialog: { showMessageBox: async () => ({ response: 0 }) },
+        installAndVerifySessionCookie,
+        ipcMain: {},
+        loadAuthenticatedServerUrl: async () => {
+          reloads += 1;
+        },
+        OIDC_LOGIN_PAGE: "/oidc_login.html",
+        OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+        OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcServerUrlError,
+        oidcLoginFlows: new WeakMap(),
+        probeServerAuth: async () => ({ kind: "oidc", status: 401 }),
+        runOidcBrowserLogin,
+        runOidcLoginDialog: async ({ runAttempt }) => {
+          const result = await runAttempt({ signal: controller.signal, updateMessage() {} });
+          return result.ok;
+        },
+        session: { defaultSession: electronSession },
+        shell: { openExternal: async () => controller.abort() },
+        windows: new Map([[win, state]]),
+        withServerLoad,
+      },
+    );
+
+    await showWebAuthnTimeout(win);
+
+    assert.equal(reloads, 0);
+    assert.equal(state.pendingServerLoads, 0);
+  });
+
+  it("rejects remote HTTP browser login without network, shell, or cookie side effects", async () => {
+    const runWindowOidcBrowserHandoff = runInNewContext(
+      `${oidcSessionCode}; runWindowOidcBrowserHandoff`,
+      {
+        AbortController,
+        BrowserWindow: function BrowserWindow() {},
+        installAndVerifySessionCookie: async () => assert.fail("installed a plaintext cookie"),
+        ipcMain: {},
+        OIDC_LOGIN_PAGE: "/oidc_login.html",
+        OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+        OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcLoginFlows: new WeakMap(),
+        runOidcBrowserLogin,
+        runOidcLoginDialog: async ({ runAttempt }) =>
+          runAttempt({ signal: new AbortController().signal, updateMessage() {} }),
+        session: {
+          defaultSession: { fetch: async () => assert.fail("made a plaintext request") },
+        },
+        shell: { openExternal: async () => assert.fail("opened a plaintext ticket URL") },
+        URL,
+      },
+    );
+
+    const result = await runWindowOidcBrowserHandoff({}, "http://server.example");
+
+    assert.equal(result.ok, false);
+    assert.equal(
+      result.error,
+      "Browser sign-in requires HTTPS for remote servers. Update the server URL and retry.",
+    );
+  });
+
+  it("reports a malformed OIDC server URL without authentication side effects", async () => {
+    const runWindowOidcBrowserHandoff = runInNewContext(
+      `${oidcSessionCode}; runWindowOidcBrowserHandoff`,
+      {
+        AbortController,
+        BrowserWindow: function BrowserWindow() {},
+        installAndVerifySessionCookie: async () => assert.fail("installed a cookie"),
+        ipcMain: {},
+        OIDC_LOGIN_PAGE: "/oidc_login.html",
+        OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+        OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcLoginFlows: new WeakMap(),
+        runOidcBrowserLogin,
+        runOidcLoginDialog: async ({ runAttempt }) =>
+          runAttempt({ signal: new AbortController().signal, updateMessage() {} }),
+        session: { defaultSession: { fetch: async () => assert.fail("made a request") } },
+        shell: { openExternal: async () => assert.fail("opened a URL") },
+        URL,
+      },
+    );
+
+    const result = await runWindowOidcBrowserHandoff({}, "not a url");
+
+    assert.equal(result.ok, false);
+    assert.equal(
+      result.error,
+      "The server address is invalid. Return to setup, correct it, and retry.",
+    );
+  });
+
+  it("rolls back when runAttempt is cancelled after cookie verification", async () => {
+    const controller = new AbortController();
+    let stored = null;
+    const electronSession = {
+      cookies: {
+        get: async () => (stored ? [{ ...stored }] : []),
+        set: async (details) => {
+          stored = { ...details };
+        },
+        remove: async () => {
+          stored = null;
+        },
+      },
+      fetch: async () => {
+        queueMicrotask(() => controller.abort());
+        return { status: 200, json: async () => ({ id: "user" }) };
+      },
+    };
+    let attemptResult;
+    const runWindowOidcBrowserHandoff = runInNewContext(
+      `${oidcSessionCode}; runWindowOidcBrowserHandoff`,
+      {
+        AbortController,
+        BrowserWindow: function BrowserWindow() {},
+        installAndVerifySessionCookie,
+        ipcMain: {},
+        OIDC_LOGIN_PAGE: "/oidc_login.html",
+        OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+        OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcLoginFlows: new WeakMap(),
+        runOidcBrowserLogin: async () => ({ ok: true, token: "session-token" }),
+        runOidcLoginDialog: async ({ runAttempt }) => {
+          attemptResult = await runAttempt({ signal: controller.signal, updateMessage() {} });
+          return attemptResult.ok;
+        },
+        session: { defaultSession: electronSession },
+        shell: { openExternal: async () => {} },
+        URL,
+      },
+    );
+
+    const authenticated = await runWindowOidcBrowserHandoff({}, "https://server.example");
+
+    assert.equal(authenticated, false);
+    assert.equal(attemptResult.ok, false);
+    assert.equal(stored, null);
+  });
+
+  it("routes the saved cold-launch destination through loadServerUrl", () => {
+    assert.ok(createWindowCode);
+    assert.match(
+      createWindowCode,
+      /if \(destination\)[\s\S]{0,200}loadInitialDestination\([\s\S]{0,300}loadServerUrl\(win, serverUrl, undefined, destination/,
+    );
+    assert.doesNotMatch(
+      createWindowCode,
+      /if \(destination\)[\s\S]{0,300}win\.loadURL\(destination\)/,
+    );
+  });
+
+  it("commits Setup Connect settings only inside beforeLoad", () => {
+    assert.ok(setupServerCode);
+    assert.match(
+      setupServerCode,
+      /loadServerUrl\(win, target,[\s\S]{0,300}beforeLoad:\s*\(\)\s*=>\s*\{[\s\S]{0,300}settings\.server_url = target/,
+    );
+    const beforeTransaction = setupServerCode.slice(0, setupServerCode.indexOf("loadServerUrl"));
+    assert.doesNotMatch(beforeTransaction, /settings\.server_url = target/);
+  });
+
+  it("rejects invalid Setup URLs before workspace expansion or authentication", async () => {
+    const state = { serverUrl: null };
+    const win = {};
+    const handlerSource = setupServerCode.slice(
+      setupServerCode.indexOf("async"),
+      setupServerCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      configuredServerUrlErrorMessage: (reason) =>
+        reason === "insecure_transport" ? "Remote servers require HTTPS." : "Invalid server.",
+      configuredServerUrlError: (raw, normalized) => {
+        const trimmed = String(raw).trim();
+        return oidcServerUrlError(
+          trimmed.includes("://") ? trimmed : `${new URL(normalized).protocol}//${trimmed}`,
+        );
+      },
+      expandDatabricksWorkspaceUrl: async () => assert.fail("expanded an invalid URL"),
+      isSetupPageSender: () => true,
+      managedServerUrls: () => [],
+      normalizeUrl,
+      oidcServerUrlError,
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    await Promise.all(
+      [
+        "http://server.example",
+        "https://user:secret@server.example",
+        "https://server.example/base?workspace=one",
+        "https://server.example/base/../other",
+        "server.example/base/../other",
+        "ftp://server.example",
+        "not a url",
+      ].map(async (url) => {
+        const result = await handler({ sender: {} }, url);
+        assert.equal(result.loaded, false);
+        assert.match(result.error, /server|HTTPS/i);
+      }),
+    );
+    assert.equal(state.pendingServerLoads, undefined);
+  });
+
+  it("rejects unsafe Setup expansion output before load or persistence", async () => {
+    await Promise.all(
+      [
+        "https://different.example/ml/omnigents",
+        "https://workspace.example/ml/omnigents?workspace=one",
+        "https://workspace.example/ml/omnigents#fragment",
+        "https://user:secret@workspace.example/ml/omnigents",
+        "http://workspace.example/ml/omnigents",
+        "https://workspace.example/ml//omnigents",
+        "https://workspace.example/ml/%252fomnigents",
+      ].map(async (expandedTarget) => {
+        const state = { serverUrl: null };
+        const win = {};
+        const handlerSource = setupServerCode.slice(
+          setupServerCode.indexOf("async"),
+          setupServerCode.lastIndexOf(");"),
+        );
+        const handler = runInNewContext(`(${handlerSource})`, {
+          BrowserWindow: { fromWebContents: () => win },
+          configuredServerUrlError: () => null,
+          configuredServerUrlErrorMessage: () => "The server address is invalid.",
+          expandDatabricksWorkspaceUrl: async () => expandedTarget,
+          expandedServerUrlError: (serverUrl, expectedIdentity) =>
+            oidcServerUrlError(serverUrl) ??
+            (workspaceIdentityKey(serverUrl) === expectedIdentity ? null : "invalid_server_url"),
+          isSetupPageSender: () => true,
+          loadServerUrl: async () => assert.fail("loaded an unsafe expanded URL"),
+          managedServerUrls: () => [],
+          normalizeUrl: () => "https://workspace.example",
+          workspaceIdentityKey,
+          windows: new Map([[win, state]]),
+          withServerLoad,
+        });
+
+        const result = await handler({ sender: {} }, "https://workspace.example");
+
+        assert.equal(result.loaded, false);
+        assert.equal(result.error, "The server address is invalid.");
+        assert.equal(state.pendingServerLoads, 0);
+      }),
+    );
+  });
+
+  it("keeps valid Setup URL expansion before loading", async () => {
+    const state = { serverUrl: null };
+    const win = {};
+    const calls = [];
+    const handlerSource = setupServerCode.slice(
+      setupServerCode.indexOf("async"),
+      setupServerCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      expandDatabricksWorkspaceUrl: async (url) => {
+        calls.push(["expand", url]);
+        return `${url}/ml/omnigents`;
+      },
+      expandedServerUrlError: (serverUrl, expectedIdentity) =>
+        oidcServerUrlError(serverUrl) ??
+        (workspaceIdentityKey(serverUrl) === expectedIdentity ? null : "invalid_server_url"),
+      fetchServerManifest: async () => ({}),
+      configuredServerUrlError: (_raw, normalized) => oidcServerUrlError(normalized),
+      isSetupPageSender: () => true,
+      loadServerUrl: async (_win, url) => {
+        calls.push(["load", url]);
+        return true;
+      },
+      loadSettings: () => ({}),
+      managedServerUrls: () => [],
+      normalizeUrl: (url) => url,
+      oidcServerUrlError,
+      serverSelectorV2Enabled: () => false,
+      workspaceIdentityKey,
+      rememberRecentServer() {},
+      saveSettings() {},
+      windows: new Map([[win, { ...state, ephemeral: true }]]),
+      withServerLoad,
+    });
+
+    const result = await handler({ sender: {} }, "https://ws.cloud.databricks.com");
+    assert.equal(result.loaded, true);
+    assert.deepEqual(calls, [
+      ["expand", "https://ws.cloud.databricks.com"],
+      ["load", "https://ws.cloud.databricks.com/ml/omnigents"],
+    ]);
+  });
+
+  it("blocks deep-link reuse during Setup workspace expansion", async () => {
+    const state = { serverUrl: null };
+    const win = {};
+    const expansion = Promise.withResolvers();
+    const handlerSource = setupServerCode.slice(
+      setupServerCode.indexOf("async"),
+      setupServerCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      configuredServerUrlError: (_raw, normalized) => oidcServerUrlError(normalized),
+      expandDatabricksWorkspaceUrl: () => expansion.promise,
+      isSetupPageSender: () => true,
+      managedServerUrls: () => [],
+      normalizeUrl: (url) => url,
+      oidcServerUrlError,
+      workspaceIdentityKey,
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    const connecting = handler({ sender: {} }, "https://workspace.example");
+    assert.equal(isSetupIdle(state), false);
+    expansion.reject(new Error("stop after expansion"));
+    await assert.rejects(connecting, /stop after expansion/);
+    assert.equal(isSetupIdle(state), true);
+  });
+
+  it("ignores Setup Connect while another load is pending", async () => {
+    const state = { serverUrl: null, pendingServerLoads: 1 };
+    const win = {};
+    let expansionCalled = false;
+    const handlerSource = setupServerCode.slice(
+      setupServerCode.indexOf("async"),
+      setupServerCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      configuredServerUrlError: (_raw, normalized) => oidcServerUrlError(normalized),
+      expandDatabricksWorkspaceUrl: async () => {
+        expansionCalled = true;
+        throw new Error("unexpected expansion");
+      },
+      isSetupPageSender: () => true,
+      managedServerUrls: () => [],
+      normalizeUrl: (url) => url,
+      oidcServerUrlError,
+      workspaceIdentityKey,
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    const result = await handler({ sender: {} }, "https://workspace.example");
+    assert.equal(result.loaded, false);
+    assert.equal(expansionCalled, false);
+    assert.equal(state.pendingServerLoads, 1);
+  });
+
+  it("commits switched-server settings and manifest only inside beforeLoad", () => {
+    assert.ok(switchServerCode);
+    assert.match(
+      switchServerCode,
+      /loadServerUrl\(win, url,[\s\S]{0,300}beforeLoad:\s*\(\)\s*=>\s*\{[\s\S]{0,300}settings\.server_url = url[\s\S]{0,300}setWindowServerManifest\(win, PRE_MANIFEST_BASELINE\)/,
+    );
+    const beforeTransaction = switchServerCode.slice(0, switchServerCode.indexOf("loadServerUrl"));
+    assert.doesNotMatch(beforeTransaction, /settings\.server_url = url|setWindowServerManifest/);
+  });
+
+  it("leaves the existing server state untouched when authentication fails", async () => {
+    assert.ok(serverLoadCode);
+    const previousServerUrl = "https://previous.example";
+    const previousManifest = { manifestVersion: 1 };
+    const state = {
+      origin: new URL(previousServerUrl).origin,
+      identity: workspaceIdentityKey(previousServerUrl),
+      serverUrl: previousServerUrl,
+      serverManifest: previousManifest,
+      pendingServerLoads: 0,
+    };
+    const settings = { server_url: previousServerUrl };
+    const win = { isDestroyed: () => false };
+    const loadServerUrl = runInNewContext(`${serverLoadCode}; loadServerUrl`, {
+      ensureWindowOidcSession: async () => false,
+      joinServerUrl,
+      loadServerAfterAuth,
+      pinWindow: () => assert.fail("changed the existing pin"),
+      setWindowServerUrl: () => assert.fail("changed the existing server URL"),
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    const loaded = await loadServerUrl(win, "https://next.example", undefined, undefined, {
+      beforeLoad: () => {
+        settings.server_url = "https://next.example";
+        state.serverManifest = { manifestVersion: 2 };
+      },
+    });
+
+    assert.equal(loaded, false);
+    assert.equal(state.origin, new URL(previousServerUrl).origin);
+    assert.equal(state.identity, workspaceIdentityKey(previousServerUrl));
+    assert.equal(state.serverUrl, previousServerUrl);
+    assert.equal(settings.server_url, previousServerUrl);
+    assert.equal(state.serverManifest, previousManifest);
+    assert.equal(state.pendingServerLoads, 0);
+  });
+
+  it("ignores switch-server while another window load is pending", async () => {
+    const target = "https://other.example";
+    const state = { ephemeral: false, pendingServerLoads: 1 };
+    const win = {};
+    let loadCalls = 0;
+    const handlerSource = switchServerCode.slice(
+      switchServerCode.indexOf("async"),
+      switchServerCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      isPinnedWorkspaceSender: () => true,
+      loadServerUrl: async () => {
+        loadCalls += 1;
+        return true;
+      },
+      loadSettings: () => ({ recent_servers: [target] }),
+      managedServerUrls: () => [],
+      rememberRecentServer: () => {},
+      saveSettings: () => {},
+      windows: new Map([[win, state]]),
+    });
+
+    await handler({ sender: {} }, target);
+    assert.equal(loadCalls, 0);
+    state.pendingServerLoads = 0;
+    await handler({ sender: {} }, target);
+    assert.equal(loadCalls, 1);
+  });
+
+  it("ignores open-server-setup while another window load is pending", () => {
+    const state = { ephemeral: false, pendingServerLoads: 1 };
+    const setupLoads = [];
+    const win = {};
+    const handlerSource = openServerSetupCode.slice(
+      openServerSetupCode.indexOf("(event) =>"),
+      openServerSetupCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      isPinnedWorkspaceSender: () => true,
+      loadSetupPage: (target) => {
+        setupLoads.push(target);
+        return Promise.resolve();
+      },
+      windows: new Map([[win, state]]),
+    });
+
+    handler({ sender: {} });
+    assert.equal(setupLoads.length, 0);
+    state.pendingServerLoads = 0;
+    handler({ sender: {} });
+    assert.deepEqual(setupLoads, [win]);
+  });
+
+  it("defers expiry recovery until the pending load settles", async () => {
+    assert.ok(expiryHandoffCallbackCode);
+    const win = { isDestroyed: () => false };
+    const pendingLoad = Promise.withResolvers();
+    const events = [];
+    const state = {
+      pendingServerLoads: 1,
+      serverUrl: "https://server.example",
+    };
+    // Mirror withServerLoad's finally: a settled load releases the claim.
+    state.pendingLoad = pendingLoad.promise.then(() => {
+      events.push("pending settled");
+      state.pendingServerLoads = 0;
+      state.pendingLoad = null;
+    });
+    const setupLoads = [];
+    const callback = runInNewContext(`(${expiryHandoffCallbackCode})`, {
+      loadServerUrl: async (...args) => {
+        events.push("recovery");
+        assert.deepEqual(args.slice(0, 4), [
+          win,
+          "https://server.example",
+          undefined,
+          "https://server.example/c/current",
+        ]);
+        // Recovery follows the renderer's own /auth/login navigation — an
+        // explicit unauthenticated intent, so the cached-CLI-token fast path
+        // must be bypassed. (Options come from the vm realm, so compare the
+        // field, not the object.)
+        assert.equal(args[4]?.forceInteractiveAuth, true);
+        return false;
+      },
+      loadSetupPage: async (...args) => setupLoads.push(args),
+      win,
+      windows: new Map([[win, state]]),
+    });
+
+    const recovery = callback({
+      serverUrl: "https://server.example",
+      returnUrl: "https://server.example/c/current",
+    });
+    pendingLoad.resolve();
+    await recovery;
+
+    assert.deepEqual(events, ["pending settled", "recovery"]);
+    assert.equal(setupLoads.length, 1);
+    assert.equal(setupLoads[0][0], win);
+    assert.equal(setupLoads[0][1].error, "Your session expired and sign-in did not complete.");
+    assert.equal(setupLoads[0][1].url, "https://server.example");
+  });
+
+  it("re-checks the pinned server after a pending load settles", async () => {
+    assert.ok(expiryHandoffCallbackCode);
+    const expiredServerUrl = "https://server-a.example";
+    const returnUrl = `${expiredServerUrl}/c/current`;
+
+    const runInterleaving = async ({ pinAfterPending, rejectPending = false }) => {
+      const win = { isDestroyed: () => false };
+      const pendingLoad = Promise.withResolvers();
+      const state = {
+        pendingServerLoads: 1,
+        serverUrl: expiredServerUrl,
+      };
+      // Mirror withServerLoad's finally: a settled load releases the claim.
+      state.pendingLoad = pendingLoad.promise.finally(() => {
+        state.pendingServerLoads = 0;
+        state.pendingLoad = null;
+      });
+      const recoveryLoads = [];
+      const setupLoads = [];
+      const pinCalls = [];
+      const serverUrlCalls = [];
+      const callback = runInNewContext(`(${expiryHandoffCallbackCode})`, {
+        loadServerUrl: async (...args) => {
+          recoveryLoads.push(args);
+          return true;
+        },
+        loadSetupPage: async (...args) => {
+          setupLoads.push(args);
+          pinCalls.push([args[0], null]);
+          serverUrlCalls.push([args[0], null]);
+        },
+        win,
+        windows: new Map([[win, state]]),
+      });
+
+      const recovery = callback({ serverUrl: expiredServerUrl, returnUrl });
+      if (pinAfterPending) state.serverUrl = pinAfterPending;
+      if (rejectPending) pendingLoad.reject(new Error("pending load failed"));
+      else pendingLoad.resolve();
+      await recovery;
+      return { recoveryLoads, setupLoads, pinCalls, serverUrlCalls, win };
+    };
+
+    const switched = await runInterleaving({
+      pinAfterPending: "https://server-b.example",
+    });
+    assert.deepEqual(switched.recoveryLoads, []);
+    assert.deepEqual(switched.setupLoads, []);
+    assert.deepEqual(switched.pinCalls, []);
+    assert.deepEqual(switched.serverUrlCalls, []);
+
+    const unchanged = await runInterleaving({ rejectPending: true });
+    assert.equal(unchanged.recoveryLoads.length, 1);
+    assert.deepEqual(unchanged.recoveryLoads[0].slice(0, 4), [
+      unchanged.win,
+      expiredServerUrl,
+      undefined,
+      returnUrl,
+    ]);
+    // Options come from the vm realm, so compare the field, not the object.
+    assert.equal(unchanged.recoveryLoads[0][4]?.forceInteractiveAuth, true);
+    assert.deepEqual(unchanged.setupLoads, []);
+    assert.deepEqual(unchanged.pinCalls, []);
+    assert.deepEqual(unchanged.serverUrlCalls, []);
+  });
+
+  it("leaves the window to a load that starts in the settle gap", async () => {
+    // The awaited pending load settles and a user-initiated load (switch
+    // server / deep link, possibly to the SAME server URL) claims the window
+    // in the gap before recovery runs. Recovery must do nothing — running
+    // loadServerUrl would return false (withServerLoad already claimed) and
+    // the old behavior then flashed the expired-session setup page over a
+    // healthy in-flight load.
+    assert.ok(expiryHandoffCallbackCode);
+    const win = { isDestroyed: () => false };
+    const pendingLoad = Promise.withResolvers();
+    const state = {
+      pendingServerLoads: 1,
+      serverUrl: "https://server.example",
+    };
+    state.pendingLoad = pendingLoad.promise.then(() => {
+      // Settle releases the claim — and a new load immediately takes it.
+      state.pendingServerLoads = 1;
+      state.pendingLoad = null;
+    });
+    const recoveryLoads = [];
+    const setupLoads = [];
+    const callback = runInNewContext(`(${expiryHandoffCallbackCode})`, {
+      loadServerUrl: async (...args) => {
+        recoveryLoads.push(args);
+        return false; // withServerLoad refuses: another load owns the window
+      },
+      loadSetupPage: async (...args) => setupLoads.push(args),
+      win,
+      windows: new Map([[win, state]]),
+    });
+
+    const recovery = callback({
+      serverUrl: "https://server.example",
+      returnUrl: "https://server.example/c/current",
+    });
+    pendingLoad.resolve();
+    await recovery;
+
+    assert.deepEqual(recoveryLoads, []);
+    assert.deepEqual(setupLoads, []);
+  });
+
+  it("wiring-only: limits the fail-loud WebAuthn guard to main-window fallback authentication", () => {
+    assert.ok(oauthPopupCode);
+    assert.doesNotMatch(oauthPopupCode, /registerWebAuthnTimeout|showWebAuthnTimeout/);
+    assert.match(
+      oidcSessionCode,
+      /setWindowAuthenticationNavigation\(win, true\)[\s\S]{0,220}setWindowAuthenticationNavigation\(win, probe\.kind === "other"\)/,
+    );
+    assert.match(
+      liveCode,
+      /registerWebAuthnTimeout\(win\.webContents,[\s\S]{0,500}isWebAuthnEscapePage\([\s\S]{0,160}authenticationNavigation === true/,
+    );
   });
 });
 
@@ -641,17 +1960,47 @@ describe("OAuth popup COOP-strip wiring (src/main.js)", () => {
 });
 
 describe("recent-server startup wiring (src/main.js)", () => {
+  it("routes an organization-selected cold launch through the authenticated loader", async () => {
+    const serverUrl = "https://dbc-a.cloud.databricks.com/?o=123456789";
+    const destinations = [];
+    let setupLoads = 0;
+
+    assert.equal(oidcServerUrlError(serverUrl), null);
+    const loaded = await loadInitialDestination({
+      loadServer: async () => {
+        destinations.push(serverUrl);
+        return true;
+      },
+      loadSetup: async () => {
+        setupLoads += 1;
+      },
+    });
+
+    assert.equal(loaded, true);
+    assert.deepEqual(destinations, [serverUrl]);
+    assert.equal(setupLoads, 0);
+    assert.match(
+      createWindowCode,
+      /loadInitialDestination\([\s\S]{0,300}loadServerUrl\(win, serverUrl, undefined, destination/,
+    );
+  });
+
   it("backfills a saved server only after its cold load succeeds", () => {
     assert.match(
       liveCode,
-      /loadURL\(destination\)\s*\.then\(\(\)\s*=>\s*\{\s*if\s*\(!ephemeral\s*&&\s*!explicit\s*&&\s*serverUrl\)[\s\S]{0,200}rememberRecentServer\(settings,\s*serverUrl\)/,
+      /loadInitialDestination\(\{[\s\S]{0,800}\.then\(\(loaded\)\s*=>\s*\{[\s\S]{0,200}if\s*\(loaded\s*&&\s*!ephemeral\s*&&\s*!explicit\s*&&\s*serverUrl\)[\s\S]{0,200}rememberRecentServer\(settings,\s*serverUrl\)/,
       [
         "createWindow no longer backfills a successfully loaded saved server into",
         "recent_servers. Existing installs can have server_url without recent_servers,",
         "so the setup page would show no recents after leaving that server. Keep the",
-        "backfill in loadURL(destination).then, gated away from ephemeral windows and",
-        "explicit target URLs (which may include a conversation path).",
+        "backfill in loadInitialDestination(...).then((loaded) => ...), gated on a",
+        "successful load and away from ephemeral windows and explicit target URLs",
+        "(which may include a conversation path).",
       ].join(" "),
+    );
+    assert.match(
+      liveCode,
+      /if\s*\(loaded\s*&&\s*!ephemeral\s*&&\s*!explicit\s*&&\s*serverUrl\)\s*\{\s*try\s*\{[\s\S]{0,200}rememberRecentServer[\s\S]{0,120}catch/,
     );
   });
 
@@ -664,22 +2013,25 @@ describe("recent-server startup wiring (src/main.js)", () => {
 });
 
 // Guard for the deep-link path join in createWindow. A basename-less SPA path
-// (/c/<id>) lives UNDER the server's workspace mount (/omnigent), so it
-// must be string-concatenated (resolveServerPath) — NOT resolved with
-// `new URL(path, serverUrl)`, which would anchor against the ORIGIN and drop
-// the mount, opening the wrong URL for every workspace deep link. This catches
-// a "simplification" the behavior tests can't (createWindow isn't unit-tested).
+// lives under the server mount, while an organization selector stays in the
+// query. The shared joinServerUrl helper updates URL fields without dropping either.
 describe("deep-link path join wiring (src/main.js)", () => {
-  it("joins opts.path onto opts.serverUrl via resolveServerPath as live code", () => {
+  it("joins opts.path onto opts.serverUrl via joinServerUrl as live code", () => {
     assert.match(
       liveCode,
-      /resolveServerPath\(serverUrl, opts\.path\)/,
+      /joinServerUrl\(serverUrl, opts\.path\)/,
       [
         "createWindow no longer joins opts.path onto opts.serverUrl via",
-        "resolveServerPath. A deep link to a workspace server (origin + /omnigent",
-        "mount) would lose the mount and 404. Restore the mount-aware join (see",
-        "resolveServerPath); do not replace it with `new URL(path, serverUrl)`.",
+        "joinServerUrl. A deep link to a workspace server would lose its",
+        "mount or organization selector. Restore the URL-aware mount join.",
       ].join(" "),
+    );
+  });
+
+  it("keeps the organization selector after a mounted deep-link path", () => {
+    assert.equal(
+      joinServerUrl("https://dbc-a.cloud.databricks.com/omnigent?o=123456789", "/c/conv_abc"),
+      "https://dbc-a.cloud.databricks.com/omnigent/c/conv_abc?o=123456789",
     );
   });
 
@@ -812,7 +2164,7 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
     // consent-unknown branch, and does NOT appear before chooseDeepLinkStrategy.
     assert.match(
       liveCode,
-      /confirmOpenDeepLink\(parent, targetOrigin\)[\s\S]{0,300}expandDatabricksWorkspaceUrl\(targetOrigin\)/,
+      /confirmOpenDeepLink\(parent, parsed\.origin, workspaceCandidates\)[\s\S]{0,700}expandDatabricksWorkspaceUrl\(targetIdentity\)/,
       [
         "handleDeepLink no longer defers expandDatabricksWorkspaceUrl until AFTER",
         "confirmOpenDeepLink. A deep link to an unknown (attacker-chosen) server would",
@@ -830,6 +2182,65 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
         "handleDeepLink, reopening the pre-consent SSRF. The probe must run only after",
         "confirmOpenDeepLink (in the consent-unknown branch), not before chooseDeepLinkStrategy.",
       ].join(" "),
+    );
+  });
+
+  it("registers consent-unknown expansion as a pending load", async () => {
+    const result = await runConsentUnknownDeepLink(0);
+    assert.deepEqual(result.pendingDuringExpansion, [1]);
+    assert.equal(result.state.pendingServerLoads, 0);
+  });
+
+  it("rejects unsafe expanded server URLs before load or persistence", async () => {
+    await Promise.all(
+      [
+        "https://user:secret@unknown.example/ml/omnigents",
+        "https://unknown.example/ml/omnigents?workspace=one",
+        "https://unknown.example/ml/omnigents#fragment",
+        "http://unknown.example/ml/omnigents",
+        "https://different.example/ml/omnigents",
+        "https://unknown.example/ml//omnigents",
+        "https://unknown.example/ml/%252fomnigents",
+      ].map(async (expandedServerUrl) => {
+        const result = await runConsentUnknownDeepLink(0, { expandedServerUrl });
+        assert.deepEqual(result.parentLoads, []);
+        assert.deepEqual(result.created, []);
+        assert.deepEqual(result.remembered, []);
+        assert.equal(result.state.pendingServerLoads, 0);
+      }),
+    );
+  });
+
+  it("loads and remembers a canonical expanded server URL", async () => {
+    const result = await runConsentUnknownDeepLink(0, {
+      expandedServerUrl: "https://unknown.example/ml/omnigents",
+    });
+
+    assert.deepEqual(result.parentLoads, [result.parent]);
+    assert.deepEqual(result.remembered, ["https://unknown.example/ml/omnigents"]);
+  });
+
+  it("reuses an idle setup parent but not a busy one", async () => {
+    const idle = await runConsentUnknownDeepLink(0);
+    assert.deepEqual(idle.parentLoads, [idle.parent]);
+    assert.equal(idle.created.length, 0);
+
+    const busy = await runConsentUnknownDeepLink(1);
+    assert.equal(busy.parentLoads.length, 0);
+    assert.equal(busy.created.length, 1);
+    assert.equal(busy.state.pendingServerLoads, 1);
+  });
+
+  it("opens a replacement when the idle parent closes during expansion", async () => {
+    const result = await runConsentUnknownDeepLink(0, { closeDuringExpansion: true });
+    assert.equal(result.created.length, 1);
+    assert.equal(result.parentLoads.length, 0);
+  });
+
+  it("remembers explicit consent even when loading the reused window fails", () => {
+    assert.match(
+      deepLinkHandlerCode,
+      /await loadServerUrl\(parent,[\s\S]{0,100}\.catch\(\(\) => \{\}\);[\s\S]{0,300}rememberServerUrl\(serverUrl\)/,
     );
   });
 });
@@ -921,35 +2332,593 @@ describe("HTTP error status fallback (src/main.js)", () => {
   });
 });
 
+describe("privileged IPC workspace sender gate (src/main.js)", () => {
+  it("rejects a same-origin frame that changes or drops o", (t) => {
+    const workspaceA = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
+    const harness = loadNavigationHarness({ serverUrl: workspaceA });
+    t.after(harness.cleanup);
+    const eventFor = (url) => ({
+      sender: harness.win.webContents,
+      senderFrame: { url },
+    });
+
+    assert.equal(
+      harness.api.isPinnedWorkspaceSender(
+        eventFor("https://dbc-a.cloud.databricks.com/omnigent/c/1?o=workspace-a"),
+      ),
+      true,
+    );
+    assert.equal(
+      harness.api.isPinnedWorkspaceSender(
+        eventFor("https://dbc-a.cloud.databricks.com/omnigent/c/1?o=workspace-b"),
+      ),
+      false,
+    );
+    assert.equal(
+      harness.api.isPinnedWorkspaceSender(
+        eventFor("https://dbc-a.cloud.databricks.com/omnigent/c/1"),
+      ),
+      false,
+    );
+  });
+});
+
 // pinWindow is the one chokepoint every "leave this server" path routes through
 // (Connect to new server, Change Server…, switch-server, did-fail-load fallback).
 // Those navigations tear down the renderer WITHOUT running BrowserPane's unmount
-// detach, so pinWindow must close the window's browser registry when the origin
-// changes — else the native WebContentsView dangles over the setup/welcome page.
+// detach, so pinWindow must close the window's browser registry when the
+// workspace identity changes — else the native WebContentsView dangles over
+// the next workspace or setup page.
 describe("browser-view teardown on server change (src/main.js)", () => {
-  it("closes the window's browserRegistry when pinWindow changes origin", () => {
+  it("closes embedded views when o changes on the same origin", (t) => {
+    const workspaceA = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
+    const workspaceB = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-b";
+    const harness = loadNavigationHarness({ serverUrl: workspaceA });
+    t.after(harness.cleanup);
+
+    harness.api.pinWindow(harness.win, workspaceB);
+
+    assert.deepEqual(harness.calls.closeAll, ["server-changed"]);
+    assert.equal(harness.api.windows.get(harness.win).identity, workspaceIdentityKey(workspaceB));
+  });
+
+  it("guards the teardown so the initial cold-connect pin doesn't fire it", (t) => {
+    const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
+    const harness = loadNavigationHarness({ serverUrl });
+    t.after(harness.cleanup);
+    const state = harness.api.windows.get(harness.win);
+    state.origin = null;
+    state.identity = null;
+
+    harness.api.pinWindow(harness.win, serverUrl);
+
+    assert.deepEqual(harness.calls.closeAll, []);
+  });
+});
+
+// Round-1 review fixes: expiry reload matching, deep-link workspace identity,
+// cold-start failure fallback, and New Window's explicit target.
+describe("expired-session reload identity matching (src/main.js)", () => {
+  const { expiredRequestMatchesIdentity } = require("../src/session-expiry");
+
+  it("wires expiredRequestMatchesIdentity into the pinned-workspace predicate", () => {
     assert.match(
       liveCode,
-      /function pinWindow\(win,\s*origin\)\s*\{[\s\S]{0,600}browserRegistry\?\.closeAll\(/,
+      /function isPinnedWorkspaceUrl\(url\)\s*\{[\s\S]{0,300}expiredRequestMatchesIdentity\(state\.identity,\s*identity\)/,
       [
-        "pinWindow no longer closes the window's embedded-browser views when the",
-        "origin changes. Leaving a server (Connect to new server / Change Server / switch)",
-        "navigates the window away and tears down the renderer WITHOUT running",
-        "BrowserPane's unmount detach, so the native WebContentsView keeps painting over",
-        "the setup/welcome page. Restore the closeAll call in pinWindow.",
+        "isPinnedWorkspaceUrl no longer matches via expiredRequestMatchesIdentity.",
+        "The API request that hits the expired SSO gate usually lacks the ?o=",
+        "selector a pinned identity carries, so exact matching means the expiry",
+        "reload never fires for ?o=-pinned Databricks windows.",
       ].join(" "),
     );
   });
 
-  it("guards the teardown so the initial cold-connect pin doesn't fire it", () => {
+  it("wires expiredRequestMatchesIdentity into the reload loop", () => {
     assert.match(
       liveCode,
-      /function pinWindow\(win,\s*origin\)\s*\{[\s\S]{0,600}state\.origin\s*!=\s*null[\s\S]{0,120}browserRegistry\?\.closeAll\(/,
+      /registerSessionExpiryReload\([\s\S]{0,900}expiredRequestMatchesIdentity\(state\.identity,\s*identity\)/,
       [
-        "The closeAll in pinWindow is no longer guarded on a prior origin. Without the",
-        "state.origin != null guard the initial pin (setup→first connect) would try to",
-        "close a registry with nothing open. Keep the guard.",
+        "The expiry-reload window loop no longer matches via",
+        "expiredRequestMatchesIdentity, so ?o=-pinned windows are never reloaded",
+        "when their bare-origin API request hits the expired gate.",
       ].join(" "),
     );
+  });
+
+  it("reloads a ?o=-pinned window for a bare-origin expired request end to end", () => {
+    const pinned = "https://ws.databricks.com?o=123456789";
+    assert.equal(
+      expiredRequestMatchesIdentity(
+        pinned,
+        workspaceIdentityKey("https://ws.databricks.com/ajax-api/2.0/omnigents/v1/sessions"),
+      ),
+      true,
+    );
+  });
+});
+
+describe("deep-link workspace identity (src/main.js)", () => {
+  const { parseOmnigentDeepLink } = require("../src/deepLink");
+
+  function runDeepLink(
+    raw,
+    { knownIdentities = [], knownServerUrl = null, liveIdentities = [] } = {},
+  ) {
+    const decisions = [];
+    const created = [];
+    const lookups = [];
+    const windows = new Map(
+      liveIdentities.map((entry) => {
+        const descriptor = typeof entry === "string" ? { identity: entry } : entry;
+        return [
+          {
+            isDestroyed: () => descriptor.destroyed === true,
+            webContents: { getURL: () => `${descriptor.identity.split("?")[0]}/` },
+          },
+          {
+            closing: descriptor.closing === true,
+            identity: descriptor.identity,
+            serverUrl: descriptor.identity,
+          },
+        ];
+      }),
+    );
+    const handler = runInNewContext(`${deepLinkHandlerCode}; handleDeepLink`, {
+      BrowserWindow: { getFocusedWindow: () => null },
+      chooseDeepLinkStrategy: (state) => {
+        decisions.push(state);
+        return { strategy: "open-known" };
+      },
+      console: { log: () => {} },
+      createWindow: (_target, options) => {
+        created.push(options);
+        return {};
+      },
+      focusAndRestore: () => {},
+      findKnownServerUrl: (identity) => {
+        lookups.push(identity);
+        return knownServerUrl;
+      },
+      knownWorkspaceIdentities: () => knownIdentities,
+      parseOmnigentDeepLink,
+      windows,
+      workspaceIdentityKey,
+    });
+    return handler(raw).then(() => ({ decisions, created, lookups }));
+  }
+
+  it("keeps the link's ?o= selector in the target identity", async () => {
+    const { decisions, lookups } = await runDeepLink(
+      "omnigent://ws.cloud.databricks.com/c/conv_abc?o=123456789",
+      {
+        knownIdentities: ["https://ws.cloud.databricks.com?o=123456789"],
+        knownServerUrl: "https://ws.cloud.databricks.com/omnigent?o=123456789",
+      },
+    );
+
+    assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com?o=123456789");
+    assert.deepEqual(lookups, ["https://ws.cloud.databricks.com?o=123456789"]);
+  });
+
+  it("adopts a known ?o= identity for a selector-less link to the same origin", async () => {
+    const { decisions, created } = await runDeepLink(
+      "omnigent://ws.cloud.databricks.com/c/conv_abc",
+      {
+        knownIdentities: ["https://ws.cloud.databricks.com?o=123456789"],
+        knownServerUrl: "https://ws.cloud.databricks.com/omnigent?o=123456789",
+      },
+    );
+
+    assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com?o=123456789");
+    assert.equal(created[0].serverUrl, "https://ws.cloud.databricks.com/omnigent?o=123456789");
+  });
+
+  it("keeps a bare identity when it is itself known", async () => {
+    const { decisions } = await runDeepLink("omnigent://ws.cloud.databricks.com/c/conv_abc", {
+      knownIdentities: [
+        "https://ws.cloud.databricks.com",
+        "https://ws.cloud.databricks.com?o=123456789",
+      ],
+      knownServerUrl: "https://ws.cloud.databricks.com",
+    });
+
+    assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com");
+  });
+
+  it("ignores non-Databricks query parameters for identity", async () => {
+    const { decisions } = await runDeepLink("omnigent://server.example/c/conv_abc?token=evil");
+
+    assert.equal(decisions[0].targetOrigin, "https://server.example");
+  });
+
+  it("counts a live ephemeral workspace against silent adoption", async () => {
+    // Only ?o=111 is PERSISTED, but an ephemeral window is live on ?o=222 —
+    // adopting the persisted identity would silently route the link away
+    // from a workspace the user is actively using (and skip its consent
+    // ambiguity listing). The identity must stay bare (ambiguous).
+    const { decisions } = await runDeepLink("omnigent://ws.cloud.databricks.com/c/conv_abc", {
+      knownIdentities: ["https://ws.cloud.databricks.com?o=111"],
+      liveIdentities: ["https://ws.cloud.databricks.com?o=222"],
+      knownServerUrl: null,
+    });
+
+    assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com");
+  });
+
+  it("adopts a live-only workspace identity when it is the only one on the origin", async () => {
+    // Nothing persisted, one ephemeral window live on the origin: the link
+    // can only mean that workspace.
+    const { decisions } = await runDeepLink("omnigent://ws.cloud.databricks.com/c/conv_abc", {
+      knownIdentities: [],
+      liveIdentities: ["https://ws.cloud.databricks.com?o=222"],
+      knownServerUrl: null,
+    });
+
+    assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com?o=222");
+  });
+
+  it("excludes destroyed and closing windows from adoption and dispatch", async () => {
+    await Promise.all(
+      [{ destroyed: true }, { closing: true }].map(async (unavailable) => {
+        const { decisions } = await runDeepLink("omnigent://ws.cloud.databricks.com/c/conv_abc", {
+          liveIdentities: [
+            {
+              identity: "https://ws.cloud.databricks.com?o=222",
+              ...unavailable,
+            },
+          ],
+        });
+
+        assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com");
+        assert.deepEqual(Array.from(decisions[0].windows), []);
+      }),
+    );
+  });
+
+  it("lists live workspaces among the consent candidates", async () => {
+    const confirmCalls = [];
+    const parentState = { serverUrl: null, pendingServerLoads: 0 };
+    const parent = { isDestroyed: () => false, webContents: { getURL: () => "file:///setup" } };
+    const live = {
+      isDestroyed: () => false,
+      webContents: { getURL: () => "https://ws.cloud.databricks.com/" },
+    };
+    const handler = runInNewContext(`${deepLinkHandlerCode}; handleDeepLink`, {
+      BrowserWindow: { getFocusedWindow: () => null },
+      activeWindow: () => parent,
+      chooseDeepLinkStrategy: () => ({ strategy: "consent-unknown" }),
+      confirmOpenDeepLink: async (...args) => {
+        confirmCalls.push(args);
+        return false; // cancel — the candidates listing is what's under test
+      },
+      console: { log: () => {} },
+      findKnownServerUrl: () => null,
+      knownWorkspaceIdentities: () => ["https://ws.cloud.databricks.com?o=111"],
+      parseOmnigentDeepLink,
+      windows: new Map([
+        [parent, parentState],
+        [live, { identity: "https://ws.cloud.databricks.com?o=222", serverUrl: null }],
+      ]),
+      workspaceIdentityKey,
+    });
+
+    await handler("omnigent://ws.cloud.databricks.com/c/conv_abc");
+
+    assert.equal(confirmCalls.length, 1);
+    // Array.from: the candidates array is built inside the vm realm, so the
+    // strict deepEqual prototype check needs a host-realm copy.
+    assert.deepEqual(Array.from(confirmCalls[0][2]), [
+      "https://ws.cloud.databricks.com?o=111",
+      "https://ws.cloud.databricks.com?o=222",
+    ]);
+  });
+
+  it("does not guess between several known ?o= workspaces on one origin", async () => {
+    // A selector-less link is ambiguous when the origin has several saved
+    // workspaces — silently adopting one (e.g. the saved default) could
+    // route the conversation into the wrong tenant. The identity stays bare
+    // so the link goes through the consent path instead.
+    const { decisions } = await runDeepLink("omnigent://ws.cloud.databricks.com/c/conv_abc", {
+      knownIdentities: [
+        "https://ws.cloud.databricks.com?o=111",
+        "https://ws.cloud.databricks.com?o=222",
+      ],
+      knownServerUrl: null,
+    });
+
+    assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com");
+  });
+
+  it("passes the ambiguous workspace candidates to the consent dialog", async () => {
+    const confirmCalls = [];
+    const state = { serverUrl: null, pendingServerLoads: 0 };
+    const parent = { isDestroyed: () => false, webContents: { getURL: () => "file:///setup" } };
+    const handler = runInNewContext(`${deepLinkHandlerCode}; handleDeepLink`, {
+      BrowserWindow: { getFocusedWindow: () => null },
+      activeWindow: () => parent,
+      chooseDeepLinkStrategy: () => ({ strategy: "consent-unknown" }),
+      confirmOpenDeepLink: async (...args) => {
+        confirmCalls.push(args);
+        return false; // cancel — the candidates listing is what's under test
+      },
+      console: { log: () => {} },
+      findKnownServerUrl: () => null,
+      knownWorkspaceIdentities: () => [
+        "https://ws.cloud.databricks.com?o=111",
+        "https://ws.cloud.databricks.com?o=222",
+      ],
+      parseOmnigentDeepLink,
+      windows: new Map([[parent, state]]),
+      workspaceIdentityKey,
+    });
+
+    await handler("omnigent://ws.cloud.databricks.com/c/conv_abc");
+
+    assert.equal(confirmCalls.length, 1);
+    // Array.from: the candidates array is built inside the vm realm, so the
+    // strict deepEqual prototype check needs a host-realm copy.
+    assert.deepEqual(Array.from(confirmCalls[0][2]), [
+      "https://ws.cloud.databricks.com?o=111",
+      "https://ws.cloud.databricks.com?o=222",
+    ]);
+  });
+
+  it("lists the candidate workspaces in the consent dialog detail", async () => {
+    const confirmCode = liveCode.match(
+      /async function confirmOpenDeepLink\(parent, targetOrigin, workspaceCandidates = \[\]\)[\s\S]*?\n\}/,
+    )?.[0];
+    assert.ok(confirmCode);
+    const boxes = [];
+    const confirm = runInNewContext(`${confirmCode}; confirmOpenDeepLink`, {
+      URL,
+      ICON_PNG: "/icon.png",
+      dialog: {
+        showMessageBox: async (_parent, options) => {
+          boxes.push(options);
+          return { response: 1 };
+        },
+      },
+      nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
+    });
+
+    const opened = await confirm({}, "https://ws.cloud.databricks.com", [
+      "https://ws.cloud.databricks.com?o=111",
+      "https://ws.cloud.databricks.com?o=222",
+    ]);
+
+    assert.equal(opened, true);
+    assert.match(boxes[0].detail, /2 saved workspaces/);
+    assert.match(boxes[0].detail, /o=111, o=222/);
+
+    // A single (or no) candidate adds no note — adoption handles that case.
+    await confirm({}, "https://ws.cloud.databricks.com", []);
+    assert.doesNotMatch(boxes[1].detail, /saved workspaces/);
+  });
+});
+
+describe("cold-start load failure fallback (src/main.js)", () => {
+  it("defers load failures to did-fail-load instead of blanking the setup params", () => {
+    assert.ok(createWindowCode);
+    assert.doesNotMatch(
+      createWindowCode,
+      /loadInitialDestination\([\s\S]{0,900}\.catch\(\(\) => loadSetupPage\(win\)\)/,
+      [
+        "createWindow's cold-start catch loads a BLANK setup page again. did-fail-load",
+        "already routes a failed saved-server load to setup WITH ?error=&url= — the",
+        "catch must stay a no-op so it cannot supersede that parameterized page.",
+      ].join(" "),
+    );
+    assert.match(
+      createWindowCode,
+      /loadInitialDestination\([\s\S]{0,1200}\.catch\(\(\) => \{\s*\}\)/,
+      "createWindow's cold-start load chain lost its no-op rejection catch.",
+    );
+  });
+});
+
+describe("New Window explicit target (src/main.js)", () => {
+  const newWindowCode = liveCode.match(/function newWindow\(\)[\s\S]*?\n\}/)?.[0];
+
+  it("passes only http(s) pages as the clone target", () => {
+    assert.ok(newWindowCode);
+    const created = [];
+    const win = {
+      webContents: { getURL: () => "file:///electron/setup/index.html" },
+    };
+    const newWindow = runInNewContext(`${newWindowCode}; newWindow`, {
+      activeWindow: () => win,
+      createWindow: (target, opts) => created.push({ target, opts }),
+      windows: new Map([[win, { ephemeral: false, serverUrl: null }]]),
+      workspaceIdentityKey,
+    });
+
+    newWindow();
+
+    // The setup page's file:// URL must not be treated as a server to clone
+    // (it would prefill a "server address is invalid" banner downstream).
+    assert.equal(created[0].target, undefined);
+  });
+
+  it("still clones a real server page URL", () => {
+    const created = [];
+    const win = {
+      webContents: { getURL: () => "https://server.example/c/conv_abc" },
+    };
+    const newWindow = runInNewContext(`${newWindowCode}; newWindow`, {
+      activeWindow: () => win,
+      createWindow: (target, opts) => created.push({ target, opts }),
+      windows: new Map([[win, { ephemeral: false, serverUrl: "https://server.example" }]]),
+      workspaceIdentityKey,
+    });
+
+    newWindow();
+
+    assert.equal(created[0].target, "https://server.example/c/conv_abc");
+    assert.equal(created[0].opts.serverUrl, "https://server.example");
+  });
+
+  it("does not clone a mid-SSO foreign IdP page as the target", () => {
+    // While the window is off on its IdP, the current URL is a one-time
+    // authorization URL on a foreign origin — the clone must fall back to
+    // the window's own server, never load that URL again.
+    const created = [];
+    const win = {
+      webContents: {
+        getURL: () => "https://idp.example/authorize?client_id=x&code_challenge=y",
+      },
+    };
+    const newWindow = runInNewContext(`${newWindowCode}; newWindow`, {
+      activeWindow: () => win,
+      createWindow: (target, opts) => created.push({ target, opts }),
+      windows: new Map([[win, { ephemeral: false, serverUrl: "https://server.example" }]]),
+      workspaceIdentityKey,
+    });
+
+    newWindow();
+
+    assert.equal(created[0].target, undefined);
+    assert.equal(created[0].opts.serverUrl, "https://server.example");
+  });
+
+  it("does not clone across ?o= workspaces on one Databricks host", () => {
+    const created = [];
+    const win = {
+      webContents: {
+        getURL: () => "https://ws.cloud.databricks.com/omnigent/c/x?o=999",
+      },
+    };
+    const newWindow = runInNewContext(`${newWindowCode}; newWindow`, {
+      activeWindow: () => win,
+      createWindow: (target, opts) => created.push({ target, opts }),
+      windows: new Map([
+        [win, { ephemeral: false, serverUrl: "https://ws.cloud.databricks.com/omnigent?o=123" }],
+      ]),
+      workspaceIdentityKey,
+    });
+
+    newWindow();
+
+    assert.equal(created[0].target, undefined);
+  });
+});
+
+describe("expired-session reload attribution (src/main.js)", () => {
+  const accessCode = liveCode.match(/function registerSessionExpiryAccess\(\)[\s\S]*?\n\}/)?.[0];
+  const pinnedCode = liveCode.match(/function isPinnedWorkspaceUrl\(url\)[\s\S]*?\n\}/)?.[0];
+  const {
+    expiredRequestMatchesIdentity,
+    registerSessionExpiryReload,
+  } = require("../src/session-expiry");
+
+  const HOST_URL = "https://ws.databricks.com/ajax-api/2.0/omnigents/v1/sessions";
+  const LOGIN_REDIRECT = {
+    url: HOST_URL,
+    statusCode: 303,
+    redirectURL: "https://ws.databricks.com/login.html?next_url=%2Fajax-api",
+  };
+
+  function makeWindow(id, identity) {
+    let reloads = 0;
+    const win = {
+      isDestroyed: () => false,
+      webContents: {
+        id,
+        reload: () => {
+          reloads += 1;
+        },
+      },
+    };
+    return { win, state: { identity }, reloadCount: () => reloads };
+  }
+
+  function wire(windowsList, { monotonicNow = () => 1_000_000, wallDate = Date } = {}) {
+    assert.ok(accessCode);
+    assert.ok(pinnedCode);
+    let listener = null;
+    const ses = {
+      webRequest: {
+        onBeforeRedirect: (cb) => {
+          listener = cb;
+        },
+      },
+    };
+    const windows = new Map(windowsList.map(({ win, state }) => [win, state]));
+    const register = runInNewContext(`${pinnedCode}; ${accessCode}; registerSessionExpiryAccess`, {
+      Date: wallDate,
+      EXPIRY_RELOAD_MIN_INTERVAL_MS: 15_000,
+      expiredRequestMatchesIdentity,
+      lastExpiryReloadAt: new WeakMap(),
+      performance: { now: monotonicNow },
+      registerSessionExpiryReload,
+      session: { defaultSession: ses },
+      windows,
+      workspaceIdentityKey,
+    });
+    register();
+    return { emit: (details) => listener(details) };
+  }
+
+  it("reloads only the window whose webContents issued the request", () => {
+    // Two windows pinned to different ?o= workspaces on ONE host: a
+    // bare-origin login redirect matches both identities, so only the
+    // issuing webContents may decide which window reloads.
+    const a = makeWindow(1, "https://ws.databricks.com?o=111");
+    const b = makeWindow(2, "https://ws.databricks.com?o=222");
+    const { emit } = wire([a, b]);
+
+    emit({ ...LOGIN_REDIRECT, webContentsId: 1 });
+
+    assert.equal(a.reloadCount(), 1);
+    assert.equal(b.reloadCount(), 0);
+  });
+
+  it("reloads nothing for an untracked webContents", () => {
+    // A login-shaped redirect from contents the shell doesn't own (an
+    // embedded browser view, a worker, or a hostile page's synthesized
+    // request) must not reload any window.
+    const a = makeWindow(1, "https://ws.databricks.com?o=111");
+    const b = makeWindow(2, "https://ws.databricks.com?o=222");
+    const { emit } = wire([a, b]);
+
+    emit({ ...LOGIN_REDIRECT, webContentsId: 99 });
+    emit({ ...LOGIN_REDIRECT }); // no webContentsId at all
+
+    assert.equal(a.reloadCount(), 0);
+    assert.equal(b.reloadCount(), 0);
+  });
+
+  it("keeps the identity match as a secondary filter", () => {
+    // The issuing window still only reloads when the request identity fits
+    // its pinned identity (cross-origin requests from a pinned window's
+    // page must not reload it).
+    const a = makeWindow(1, "https://other.example");
+    const { emit } = wire([a]);
+
+    emit({ ...LOGIN_REDIRECT, webContentsId: 1 });
+
+    assert.equal(a.reloadCount(), 0);
+  });
+
+  it("throttles on a monotonic clock — a backward wall-clock step cannot suppress reloads", () => {
+    const a = makeWindow(1, "https://ws.databricks.com?o=111");
+    const monotonic = [1_000, 2_000, 18_000];
+    let tick = 0;
+    // Wall clock steps BACKWARD across the whole scenario (NTP correction):
+    // Date.now()-based throttling would see `now - last` negative forever
+    // and suppress every reload until wall time recovers.
+    let wall = 5_000_000_000;
+    const { emit } = wire([a], {
+      monotonicNow: () => monotonic[tick],
+      wallDate: { now: () => (wall -= 60_000) },
+    });
+
+    emit({ ...LOGIN_REDIRECT, webContentsId: 1 }); // t=1s → reload
+    tick = 1;
+    emit({ ...LOGIN_REDIRECT, webContentsId: 1 }); // t=2s → throttled
+    tick = 2;
+    emit({ ...LOGIN_REDIRECT, webContentsId: 1 }); // t=18s → reload again
+
+    assert.equal(a.reloadCount(), 2);
   });
 });

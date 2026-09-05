@@ -12,29 +12,13 @@ import {
 import {
   getServerPicker,
   openServerSetup,
+  serverDisplayLabel,
   switchServer,
   type ServerPickerInfo,
+  workspaceIdentityKey,
 } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
-
-/** Short display label for a server URL — its host, e.g. "localhost:8000". */
-function hostOf(url: string): string {
-  try {
-    return new URL(url).host;
-  } catch {
-    return url;
-  }
-}
-
-/** Origin of a server URL, for matching recents against the current origin. */
-function originOf(url: string): string | null {
-  try {
-    return new URL(url).origin;
-  } catch {
-    return null;
-  }
-}
 
 /**
  * Server picker for the native shells (Electron desktop and iOS), pinned to
@@ -76,16 +60,19 @@ export function SidebarServerPicker() {
 
   if (!info) return null;
 
+  const currentUrl = info.currentServerUrl ?? info.currentOrigin;
+  const comparableIdentity = (url: string) => workspaceIdentityKey(url) ?? url;
+  const currentIdentity = comparableIdentity(currentUrl);
   const managed = Array.isArray(info.managedServers) ? info.managedServers : [];
-  const managedOrigins = new Set(managed.map(originOf).filter((origin) => origin !== null));
-  const currentIsManaged = managedOrigins.has(info.currentOrigin);
+  const managedIdentities = new Set(managed.map(comparableIdentity));
+  const currentIsManaged = managedIdentities.has(currentIdentity);
   // The current server leads its section even when settings were edited out
-  // from under us. Managed origins are not repeated under Recents.
+  // from under us. Managed workspaces are not repeated under Recents.
   const recentOthers = info.recentServers.filter((url) => {
-    const origin = originOf(url);
-    return origin !== info.currentOrigin && (origin === null || !managedOrigins.has(origin));
+    const identity = comparableIdentity(url);
+    return identity !== currentIdentity && !managedIdentities.has(identity);
   });
-  const currentHost = hostOf(info.currentOrigin);
+  const currentLabel = serverDisplayLabel(currentUrl);
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
@@ -112,11 +99,11 @@ export function SidebarServerPicker() {
               "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
               "data-[state=open]:bg-muted data-[state=open]:text-foreground",
             )}
-            aria-label={`Server: ${currentHost}. Switch server`}
+            aria-label={`Server: ${currentLabel}. Switch server`}
             data-testid="sidebar-server-picker"
           >
             <ServerIcon className="ui-icon text-muted-foreground" />
-            <span className="truncate">{currentHost}</span>
+            <span className="truncate">{currentLabel}</span>
             {/* Points up: the menu opens upward from the sidebar's bottom. */}
             <ChevronUpIcon className="ui-icon ml-auto shrink-0 text-muted-foreground" />
           </Button>
@@ -130,7 +117,7 @@ export function SidebarServerPicker() {
                 Provided by your organization
               </DropdownMenuLabel>
               {managed.map((url) => {
-                const isCurrent = originOf(url) === info.currentOrigin;
+                const isCurrent = comparableIdentity(url) === currentIdentity;
                 return (
                   <DropdownMenuItem
                     key={url}
@@ -144,7 +131,7 @@ export function SidebarServerPicker() {
                       <span className="size-4 shrink-0" aria-hidden="true" />
                     )}
                     <span className={cn("truncate", isCurrent && "font-medium")}>
-                      {hostOf(url)}
+                      {serverDisplayLabel(url)}
                     </span>
                   </DropdownMenuItem>
                 );
@@ -158,7 +145,7 @@ export function SidebarServerPicker() {
               {!currentIsManaged ? (
                 <DropdownMenuItem disabled className="gap-2 opacity-100">
                   <CheckIcon className="size-4 shrink-0" />
-                  <span className="truncate font-medium">{currentHost}</span>
+                  <span className="truncate font-medium">{currentLabel}</span>
                 </DropdownMenuItem>
               ) : null}
               {recentOthers.map((url) => (
@@ -168,7 +155,7 @@ export function SidebarServerPicker() {
                   onSelect={() => void switchServer(url)}
                 >
                   <span className="size-4 shrink-0" aria-hidden="true" />
-                  <span className="truncate">{hostOf(url)}</span>
+                  <span className="truncate">{serverDisplayLabel(url)}</span>
                 </DropdownMenuItem>
               ))}
             </>
