@@ -1018,6 +1018,47 @@ describe("ForkSessionDialog", () => {
       expect(screen.queryByTestId("fork-session-error")).not.toBeInTheDocument();
     });
 
+    it("offers the source's own sandbox host as the launch target", () => {
+      // A managed-deployment session's only compute is the server-managed
+      // sandbox host it runs on. That host must stay offerable, or the fork
+      // dialog dead-ends at the connect instructions and the session can
+      // never be forked.
+      setHosts([host({ host_id: "host_sb", name: "managed-abc123", sandbox_provider: "lakebox" })]);
+      renderDialog({ ...CODING, sourceHostId: "host_sb" });
+
+      // Offered + auto-selected (it's the source host), labeled by its
+      // provider like the chat header's badge — not the generated machine
+      // name — and the fork is submittable.
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent(
+        "Databricks Sandbox",
+      );
+      expect(screen.queryByTestId("connect-host-command")).not.toBeInTheDocument();
+      expect(screen.getByTestId("fork-session-submit")).toBeEnabled();
+    });
+
+    it("hides sandbox hosts that don't back the source session", () => {
+      // Other sandbox hosts stay hidden from the picker: they're launch
+      // targets the server creates on demand, not user-pickable machines.
+      // Only the SOURCE's own sandbox is meaningful as a fork target.
+      setHosts([
+        host({ host_id: "host_1" }),
+        host({ host_id: "host_sb_other", name: "managed-zzz", sandbox_provider: "modal" }),
+      ]);
+      renderDialog(CODING);
+
+      // The dialog opts into the unfiltered list (so the source's sandbox
+      // CAN appear) and applies the source-scoped filter itself.
+      expect(useHostsMock).toHaveBeenCalledWith({ enabled: true, includeSandbox: true });
+
+      const trigger = screen.getByTestId("fork-session-host-select");
+      fireEvent.pointerDown(trigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+      fireEvent.click(trigger);
+      expect(screen.getByTestId("fork-session-host-option-host_1")).toBeInTheDocument();
+      expect(
+        screen.queryByTestId("fork-session-host-option-host_sb_other"),
+      ).not.toBeInTheDocument();
+    });
+
     it("reveals connect-host instructions via the collapsible toggle when a host is online", () => {
       // Mirrors NewChatDialog: with a host online the picker shows, and the
       // CLI command for connecting ANOTHER host hides behind a toggle.
