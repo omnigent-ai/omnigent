@@ -351,6 +351,10 @@ Open the server URL it prints, hit **New Chat**, pick your machine, and go.
 Check status with `omnigent server status`; stop everything with
 `omnigent stop`.
 
+A session can also start itself: the **Automations** page runs an agent on a
+recurring schedule. See the [automations guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/AUTOMATIONS.md)
+for the schedule format, the REST API, and the current limits.
+
 <details>
 <summary>Customize automatic session titles</summary>
 
