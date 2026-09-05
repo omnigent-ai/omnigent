@@ -312,6 +312,84 @@ function withoutDeletingSessions(page: ConversationsPage): ConversationsPage {
   };
 }
 
+// ── Archiving-session tombstones ──────────────────────────────────────────
+//
+// Archive paints optimistically too: `useArchiveConversation` overlays
+// `archived: true` and the row leaves the default sidebar before the
+// `PATCH /v1/sessions/{id}` resolves. But a list fetch whose DB read
+// predates the PATCH commit — or, on the search-indexed deployment, the
+// reindex — still returns the row as unarchived, and the full-page replace
+// it triggers would resurrect the just-archived row until the next push
+// frame or poll. Delete already guards this window with a tombstone;
+// archive needs its own.
+//
+// Ids recorded here override the `archived` flag on every list fetch and
+// WS upsert until the archive settles: dropped immediately when it fails
+// (the row comes back) or when the user unarchives, and after a grace
+// window once it succeeds (the server's async reindex).
+const archivingSessionIds = new Set<string>();
+
+/** Grace window for the server's async archive reindex. */
+const ARCHIVED_TOMBSTONE_MS = 60_000;
+
+/** Treat these sessions as archived in every list fetch (optimistic archive). */
+export function markSessionsArchiving(ids: Iterable<string>): void {
+  for (const id of ids) archivingSessionIds.add(id);
+}
+
+/** Whether a session has an optimistic archive in flight (tombstoned). */
+export function isSessionArchiving(id: string): boolean {
+  return archivingSessionIds.has(id);
+}
+
+/**
+ * Stop overriding sessions — their archive failed or the user unarchived,
+ * so server-reported state wins again. Omit `ids` to release every
+ * tombstone at once.
+ */
+export function unmarkSessionsArchiving(ids?: Iterable<string>): void {
+  if (ids === undefined) {
+    archivingSessionIds.clear();
+    return;
+  }
+  for (const id of ids) archivingSessionIds.delete(id);
+}
+
+/** Release confirmed-archive tombstones once the server has caught up. */
+function expireSessionsArchiving(ids: string[]): void {
+  setTimeout(() => unmarkSessionsArchiving(ids), ARCHIVED_TOMBSTONE_MS);
+}
+
+/**
+ * Enforce archiving tombstones on a freshly fetched page: a row whose
+ * archive is still in flight is forced `archived: true` when the list can
+ * hold archived rows, and dropped otherwise — recomputing the page cursors
+ * from the survivors (mirrors `withoutDeletingSessions`).
+ *
+ * @param page - A page as returned by `GET /v1/sessions`.
+ * @param includeArchived - Whether the requesting list holds archived rows.
+ * @returns The page, or a corrected copy when it held an archiving session.
+ */
+function withoutArchivingSessions(
+  page: ConversationsPage,
+  includeArchived: boolean,
+): ConversationsPage {
+  if (archivingSessionIds.size === 0) return page;
+  const stale = (conv: Conversation) => archivingSessionIds.has(conv.id) && !conv.archived;
+  if (!page.data.some(stale)) return page;
+  if (includeArchived) {
+    const data = page.data.map((conv) => (stale(conv) ? { ...conv, archived: true } : conv));
+    return { ...page, data };
+  }
+  const data = page.data.filter((conv) => !stale(conv));
+  return {
+    ...page,
+    data,
+    first_id: data[0]?.id ?? null,
+    last_id: data[data.length - 1]?.id ?? null,
+  };
+}
+
 // ── Recently-created keep-alive ───────────────────────────────────────
 //
 // The push stream inserts a just-created session into the sidebar instantly
@@ -479,16 +557,19 @@ async function fetchConversationsPage({
   // falling back to the modal. host_id is fixed for a session's life, so this
   // can't seed a stale value; a hostless row clears any prior mapping.
   for (const row of page.data) setSessionHost(row.id, row.host_id);
-  return withoutDeletingSessions(
-    withRecentlyCreated(
-      page,
-      after,
-      searchQuery,
-      project,
-      includeArchived,
-      queryClient,
-      visibility,
+  return withoutArchivingSessions(
+    withoutDeletingSessions(
+      withRecentlyCreated(
+        page,
+        after,
+        searchQuery,
+        project,
+        includeArchived,
+        queryClient,
+        visibility,
+      ),
     ),
+    includeArchived,
   );
 }
 
@@ -799,16 +880,29 @@ export function useArchiveConversation() {
     mutationFn: ({ id, archived }: { id: string; archived: boolean }) =>
       archiveConversation(id, archived),
     onMutate: async ({ id, archived }) => {
+      // Tombstone the id so a list fetch or WS frame resolving mid-PATCH
+      // can't repaint the row (see `withoutArchivingSessions`); an unarchive
+      // lifts any live tombstone so the returning row isn't suppressed.
+      if (archived) markSessionsArchiving([id]);
+      else unmarkSessionsArchiving([id]);
       // Cancel any in-flight list refetch so it can't resolve after this
       // overlay and clobber the flag with the stale search-indexed state.
-      await queryClient.cancelQueries({ queryKey: ["conversations"] });
+      // The project folders render their own ["project-sessions"] lists, so
+      // those are cancelled too (parity with rename/delete).
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: ["conversations"] }),
+        queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
+      ]);
       const snapshot = snapshotArchiveLists(queryClient);
       overlayArchivedIntoCaches(queryClient, id, archived);
       // Drop an archived pin from the backfill cache too (mirrors delete).
       if (archived) dropFromPinnedCache(queryClient, [id]);
       return { snapshot };
     },
-    onError: (_err, { archived }, context) => {
+    onError: (_err, { id, archived }, context) => {
+      // The archive didn't land, so server state wins again: lift the
+      // tombstone before the caches roll back.
+      if (archived) unmarkSessionsArchiving([id]);
       // Roll back to exactly the pre-archive caches, synchronously — so the
       // row (and any dropped pin) returns at once, rather than waiting on a
       // search-indexed refetch that lags the write.
@@ -819,7 +913,10 @@ export function useArchiveConversation() {
           : "Couldn't unarchive the session.",
       );
     },
-    onSuccess: (updated) => {
+    onSuccess: (updated, { archived }) => {
+      // Keep the tombstone through the reindex window: the PATCH committed,
+      // but a list fetch whose read predates it can still resolve late.
+      if (archived) expireSessionsArchiving([updated.id]);
       markConversationSeen(updated.id, updated.updated_at);
       // Archiving/unarchiving the last (or first) non-archived member of a
       // project removes/restores it from the server's project list, and adds
@@ -1131,13 +1228,29 @@ export function useBulkArchiveConversations() {
         .map((r) => r.value);
     },
     onMutate: async ({ ids, archived }) => {
-      await queryClient.cancelQueries({ queryKey: ["conversations"] });
+      // Tombstone the selection so a list fetch or WS frame resolving while
+      // the PATCHes are in flight can't repaint the rows (see
+      // `withoutArchivingSessions`); a bulk unarchive lifts live tombstones.
+      if (archived) markSessionsArchiving(ids);
+      else unmarkSessionsArchiving(ids);
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: ["conversations"] }),
+        queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
+      ]);
       const snapshot = snapshotArchiveLists(queryClient);
       for (const id of ids) overlayArchivedIntoCaches(queryClient, id, archived);
       if (archived) dropFromPinnedCache(queryClient, ids);
       return { snapshot };
     },
     onError: (err, { ids, archived }, context) => {
+      const failed = new Set(err instanceof BulkConversationMutationError ? err.failed : ids);
+      const succeeded = ids.filter((id) => !failed.has(id));
+      if (archived) {
+        // Failed archives come back (server state wins now); successful ones
+        // stay tombstoned through the reindex window.
+        unmarkSessionsArchiving(failed);
+        expireSessionsArchiving(succeeded);
+      }
       // Partial failure: restore the pre-archive caches, then RE-apply the
       // overlay for the ids that DID archive so they stay hidden — only the
       // failed ids return. Restoring from the snapshot rather than refetching
@@ -1145,10 +1258,12 @@ export function useBulkArchiveConversations() {
       // the successful archives (the exact regression this reconcile guards).
       if (!context?.snapshot) return;
       restoreArchiveLists(queryClient, context.snapshot);
-      const failed = new Set(err instanceof BulkConversationMutationError ? err.failed : ids);
-      const succeeded = ids.filter((id) => !failed.has(id));
       for (const id of succeeded) overlayArchivedIntoCaches(queryClient, id, archived);
       if (archived) dropFromPinnedCache(queryClient, succeeded);
+    },
+    onSuccess: (_updated, { ids, archived }) => {
+      // Every PATCH committed — keep the tombstones through the reindex window.
+      if (archived) expireSessionsArchiving(ids);
     },
     onSettled: () => {
       // Project caches read the DB directly (no search-index lag), so unlike
@@ -1353,7 +1468,11 @@ export async function fetchPinnedConversations(): Promise<PinnedConversationsRes
   });
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const rows = withoutDeletingSessions((await res.json()) as ConversationsPage).data;
+  // The pinned list holds only active rows, so both tombstones drop theirs.
+  const rows = withoutArchivingSessions(
+    withoutDeletingSessions((await res.json()) as ConversationsPage),
+    false,
+  ).data;
   const conversations = rows.filter((c) => c.labels?.[PINNED_LABEL_KEY] != null);
   // Honored iff the server returned nothing, or everything it returned is
   // actually pinned. An old server returns unfiltered rows (none pinned), so a
@@ -1965,7 +2084,11 @@ async function fetchProjectSessionsPage(
   if (after) params.set("after", after);
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return withoutDeletingSessions((await res.json()) as ConversationsPage);
+  // Folder lists are non-archived, so both tombstones drop their rows.
+  return withoutArchivingSessions(
+    withoutDeletingSessions((await res.json()) as ConversationsPage),
+    false,
+  );
 }
 
 /**

@@ -20,7 +20,11 @@ import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
-import { isSessionDeleting, markRecentlyCreated } from "@/hooks/useConversations";
+import {
+  isSessionArchiving,
+  isSessionDeleting,
+  markRecentlyCreated,
+} from "@/hooks/useConversations";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
@@ -64,7 +68,18 @@ function applyItemsToCache(
   // Frames are full rows with explicit nulls; convert null → undefined so a
   // cleared field overlays the cache in the same shape GET /v1/sessions
   // produces (absent), without tripping the permission_level === null sentinel.
-  const itemsById = new Map(items.map((item) => [item.id, nullsToUndefined(item)]));
+  // A frame whose DB read predates an in-flight archive still says
+  // archived:false — force the optimistic flag so the stale row can't merge
+  // back into (or insert into) a non-archived list mid-PATCH.
+  const itemsById = new Map(
+    items.map((item) => {
+      const wire = nullsToUndefined(item);
+      if (wire.archived !== true && isSessionArchiving(wire.id)) {
+        return [wire.id, { ...wire, archived: true }] as const;
+      }
+      return [wire.id, wire] as const;
+    }),
+  );
   const foundAnywhere = new Set<string>();
   let needsRefetch = false;
   const entries = queryClient.getQueriesData<ConversationsInfiniteData>({
