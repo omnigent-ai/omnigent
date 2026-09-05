@@ -109,6 +109,19 @@ button:disabled {
   font-size: 12px;
 }
 
+.canvas-session-count {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--canvas-muted);
+}
+
+.canvas-session-count .canvas-spinner {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+
 .canvas-banner {
   margin: 0 24px 12px;
   border: 1px solid var(--canvas-border);

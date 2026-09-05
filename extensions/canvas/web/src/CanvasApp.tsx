@@ -143,6 +143,7 @@ function CanvasSurface({
   }
   const [activeCanvas, setActiveCanvas] = useState(MAIN_CANVAS_ID);
   const [loading, setLoading] = useState(true);
+  const [loadingSessions, setLoadingSessions] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
   const flowContainerRef = useRef<HTMLDivElement>(null);
@@ -393,10 +394,15 @@ function CanvasSurface({
         projectList: ExtensionProjectSummary[],
       ) => void | Promise<void>,
     ) => {
-      const projectListPromise = loadProjects(context);
-      await loadSessions(context, async (progress) => {
-        await onProgress(progress, await projectListPromise);
-      });
+      setLoadingSessions(true);
+      try {
+        const projectListPromise = loadProjects(context);
+        await loadSessions(context, async (progress) => {
+          await onProgress(progress, await projectListPromise);
+        });
+      } finally {
+        if (aliveRef.current) setLoadingSessions(false);
+      }
     },
     [context],
   );
@@ -859,7 +865,19 @@ function CanvasSurface({
       <header className="canvas-toolbar">
         <div>
           <h1>Canvas</h1>
-          <span>{sessionCountLabel(visibleSessions.length)}</span>
+          <div className="canvas-session-count">
+            <span>{sessionCountLabel(visibleSessions.length)}</span>
+            {loadingSessions && (
+              <svg
+                className="canvas-spinner"
+                role="status"
+                aria-label="Loading sessions"
+                viewBox="0 0 24 24"
+              >
+                <path d="M21 12a9 9 0 1 1-6.22-8.56" />
+              </svg>
+            )}
+          </div>
         </div>
       </header>
       {canvasTabs}

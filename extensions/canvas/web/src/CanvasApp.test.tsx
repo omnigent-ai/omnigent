@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -265,6 +266,36 @@ describe("CanvasApp", () => {
     expect(flowProps.current?.nodesFocusable).toBe(false);
     expect(flowProps.current?.zoomOnDoubleClick).toBe(false);
     expect(flowProps.current?.onlyRenderVisibleElements).toBe(true);
+    expect(
+      screen.queryByRole("status", { name: "Loading sessions" }),
+    ).toBeNull();
+  });
+
+  it("shows a spinner beside the cached count until canonical sessions finish loading", async () => {
+    const canonical = deferred<ExtensionSessionPage>();
+    const { context } = contextWith();
+    context.capabilities = [...context.capabilities, "sessions.getCached"];
+    context.sessions.getCached = vi.fn(async () => [sessions[0]]);
+    vi.mocked(context.sessions.listPage).mockImplementationOnce(
+      () => canonical.promise,
+    );
+
+    render(<CanvasApp context={context} />);
+
+    const count = await screen.findByText("1 session");
+    expect(
+      within(count.parentElement!).getByRole("status", {
+        name: "Loading sessions",
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("flow-node-conv_1")).toBeInTheDocument();
+
+    await act(async () => canonical.resolve(page(sessions)));
+
+    expect(await screen.findByText("2 sessions")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Loading sessions" }),
+    ).toBeNull();
   });
 
   it("renders the first page while later pages load and appends them progressively", async () => {
@@ -274,16 +305,21 @@ describe("CanvasApp", () => {
       title: "Three",
     };
     const secondPage = deferred<ExtensionSessionPage>();
+    const thirdPage = deferred<ExtensionSessionPage>();
     const { context } = contextWith();
     vi.mocked(context.sessions.listPage)
       .mockResolvedValueOnce(page(sessions, "next"))
-      .mockImplementationOnce(() => secondPage.promise);
+      .mockImplementationOnce(() => secondPage.promise)
+      .mockImplementationOnce(() => thirdPage.promise);
 
     render(<CanvasApp context={context} />);
 
     expect(await screen.findByText("2 sessions")).toBeInTheDocument();
     expect(screen.getByTestId("flow-node-conv_1")).toBeInTheDocument();
     expect(screen.queryByTestId("flow-node-conv_3")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: "Loading sessions" }),
+    ).toBeInTheDocument();
     await waitFor(() =>
       expect(setViewport).toHaveBeenCalledWith(
         { x: 24, y: 24, zoom: 0.9 },
@@ -291,10 +327,22 @@ describe("CanvasApp", () => {
       ),
     );
 
-    await act(async () => secondPage.resolve(page([later])));
+    await act(async () => secondPage.resolve(page([later], "last")));
 
     expect(await screen.findByText("3 sessions")).toBeInTheDocument();
     expect(screen.getByTestId("flow-node-conv_3")).toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: "Loading sessions" }),
+    ).toBeInTheDocument();
+
+    await act(async () =>
+      thirdPage.resolve(page([{ ...later, id: "conv_4" }])),
+    );
+
+    expect(await screen.findByText("4 sessions")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Loading sessions" }),
+    ).toBeNull();
   });
 
   it("keeps the first page usable when a background page fails", async () => {
@@ -306,6 +354,9 @@ describe("CanvasApp", () => {
 
     render(<CanvasApp context={context} />);
     expect(await screen.findByText("2 sessions")).toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: "Loading sessions" }),
+    ).toBeInTheDocument();
 
     await act(async () => secondPage.reject(new Error("page two timed out")));
 
@@ -313,6 +364,38 @@ describe("CanvasApp", () => {
       "Refresh failed: page two timed out",
     );
     expect(screen.getByTestId("flow-node-conv_1")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Loading sessions" }),
+    ).toBeNull();
+  });
+
+  it("clears the count spinner when a focus refresh fails", async () => {
+    const refresh = deferred<ExtensionSessionPage>();
+    const { context } = contextWith();
+    vi.mocked(context.sessions.listPage)
+      .mockResolvedValueOnce(page(sessions))
+      .mockImplementationOnce(() => refresh.promise);
+    render(<CanvasApp context={context} />);
+    await screen.findByText("2 sessions");
+    expect(
+      screen.queryByRole("status", { name: "Loading sessions" }),
+    ).toBeNull();
+
+    fireEvent(window, new Event("focus"));
+    expect(
+      await screen.findByRole("status", { name: "Loading sessions" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("2 sessions")).toBeInTheDocument();
+
+    await act(async () => refresh.reject(new Error("offline")));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Refresh failed: offline",
+    );
+    expect(
+      screen.queryByRole("status", { name: "Loading sessions" }),
+    ).toBeNull();
+    expect(screen.getByText("2 sessions")).toBeInTheDocument();
   });
 
   it("retains saved positions for sessions that arrive on a later page", async () => {
@@ -683,12 +766,18 @@ describe("CanvasApp", () => {
 
       await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
       expect(context.sessions.listPage).toHaveBeenCalledTimes(2);
+      expect(
+        screen.getByRole("status", { name: "Loading sessions" }),
+      ).toBeInTheDocument();
 
       fireEvent(window, new Event("focus"));
       await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS * 2);
       expect(context.sessions.listPage).toHaveBeenCalledTimes(2);
 
       await act(async () => slowRefresh.resolve(page(sessions)));
+      expect(
+        screen.queryByRole("status", { name: "Loading sessions" }),
+      ).toBeNull();
       await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
       expect(context.sessions.listPage).toHaveBeenCalledTimes(3);
     } finally {
