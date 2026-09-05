@@ -1989,32 +1989,14 @@ class TestSystemMessages(unittest.TestCase):
         _run(_t())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "claude-sdk is COMPOSED_SESSION_SNAPSHOT: the cached persistent "
-        "client does not rebuild when late-bound framework instructions "
-        "change after client creation, so a live session stays pinned to "
-        "the prompt it was created with. Deferred, with its follow-up "
-        "recorded in docs/AGENT_YAML_SPEC.md. If this test starts passing, "
-        "the client refresh landed — flip claude-sdk's registry row to "
-        "COMPOSED_PER_TURN in the same commit that removes this xfail, do "
-        "not let the two drift apart."
-    ),
-)
-def test_client_does_not_refresh_late_framework_instructions() -> None:
-    """Desired conformance, not the current bug: a framework instruction
-    that activates mid-conversation (e.g. ``shared_message_attribution_
-    enabled()`` flips on between turns) must reach the SDK client on the
-    very next turn. Today the client is constructed once and cached; only
-    ``model`` is refreshed on reuse (see ``_get_or_create_client``), so the
-    composed text a later turn actually sees is turn 1's stale value. This
-    asserts the fix's intended behavior, so it correctly XFAILs now and
-    would XPASS (failing the suite, per ``strict=True``) the moment someone
-    rebuilds the client on a changed composed prompt.
+def test_late_framework_instructions_rebuild_client() -> None:
+    """A framework instruction that activates mid-conversation (or an
+    agent-spec instructions edit) must reach the SDK client on the very
+    next turn. ``_get_or_create_client`` records the composed prompt the
+    client was built with and a changed composition drops the cached
+    client, so the rebuilt client carries the recomposed text.
     """
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-    from omnigent.runtime.prompt import SHARED_SESSION_AUTHORSHIP_INSTRUCTION
 
     class _ResultMessage:
         def __init__(self, subtype, result):
@@ -2055,7 +2037,11 @@ def test_client_does_not_refresh_late_framework_instructions() -> None:
                 return None
 
     turn1_instructions = "Base authored instructions."
-    turn2_instructions = f"{turn1_instructions}\n\n{SHARED_SESSION_AUTHORSHIP_INSTRUCTION}"
+    # A framework instruction activates between turns; the runner
+    # recomposes and passes the new value on the next call.
+    turn2_instructions = (
+        f"{turn1_instructions}\n\nAttribute shared-session messages to their author."
+    )
 
     async def _t():
         executor = ClaudeSDKExecutor()
@@ -2087,6 +2073,168 @@ def test_client_does_not_refresh_late_framework_instructions() -> None:
     # choice rather than part of the contract.
     assert len(captured_options) >= 1
     assert captured_options[-1].system_prompt == turn2_instructions
+
+
+def test_unchanged_composed_prompt_reuses_cached_client() -> None:
+    """An unchanged composed prompt must keep the cached client. Rebuilding
+    on every turn would silently downgrade every follow-up to a cold-start
+    history replay, so the reuse half of the staleness check is load-bearing.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    class _ResultMessage:
+        def __init__(self, subtype, result):
+            self.subtype = subtype
+            self.result = result
+
+    constructed = []
+    queried_prompts = []
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = type("SystemMessage", (), {})
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                constructed.append(self)
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                queried_prompts.append(prompt)
+
+            async def receive_response(self):
+                yield _ResultMessage("default", "ok")
+
+            async def disconnect(self):
+                return None
+
+            async def set_model(self, model):
+                return None
+
+    instructions = "Stable authored instructions."
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    instructions,
+                )
+            ]
+            [
+                e
+                async for e in executor.run_turn(
+                    [
+                        {"role": "user", "content": "hello"},
+                        {"role": "assistant", "content": "hi"},
+                        {"role": "user", "content": "follow-up"},
+                    ],
+                    [],
+                    instructions,
+                )
+            ]
+
+    _run(_t())
+
+    assert len(constructed) == 1
+    # A reused client resumes: turn 2 sends only the trailing user message.
+    assert queried_prompts[-1] == "follow-up"
+
+
+def test_recomposed_prompt_rebuild_replays_history() -> None:
+    """The rebuild that delivers a recomposed prompt must not lose the
+    conversation: the fresh client's first prompt replays prior turns.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    class _ResultMessage:
+        def __init__(self, subtype, result):
+            self.subtype = subtype
+            self.result = result
+
+    constructed = []
+    queried_prompts = []
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = type("SystemMessage", (), {})
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                constructed.append(self)
+                self.disconnected = False
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                queried_prompts.append(prompt)
+
+            async def receive_response(self):
+                yield _ResultMessage("default", "ok")
+
+            async def disconnect(self):
+                self.disconnected = True
+
+            async def set_model(self, model):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "Base authored instructions.",
+                )
+            ]
+            [
+                e
+                async for e in executor.run_turn(
+                    [
+                        {"role": "user", "content": "hello"},
+                        {"role": "assistant", "content": "hi"},
+                        {"role": "user", "content": "follow-up"},
+                    ],
+                    [],
+                    "Base authored instructions.\n\nA framework instruction activated.",
+                )
+            ]
+
+    _run(_t())
+
+    assert len(constructed) == 2
+    # The stale client was torn down, not leaked.
+    assert constructed[0].disconnected is True
+    # The fresh client cold-starts with the prior conversation replayed.
+    replay = queried_prompts[-1]
+    assert isinstance(replay, str)
+    assert "Conversation so far:" in replay
+    assert "hello" in replay
+    assert replay.rstrip().endswith("user: follow-up")
 
 
 # ---------------------------------------------------------------------------

@@ -833,6 +833,9 @@ class _ClaudeClientState:
     model: str | None
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
+    # Composed system prompt (pre MCP augmentation) the client was built
+    # with; a turn arriving with a different composition rebuilds the client.
+    system_prompt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2431,6 +2434,19 @@ class ClaudeSDKExecutor(Executor):
                 )
             )
             return
+        # Composition identity for the cached client, captured before the
+        # MCP-tools augmentation below mutates ``system_prompt``.
+        composed_system_prompt = system_prompt
+        # A live client is pinned to the composed system prompt it was built
+        # with — the SDK cannot swap the prompt in place. When the runner
+        # recomposes it between turns (an agent-spec instructions edit, or a
+        # framework instruction activating mid-session), drop the cached
+        # client: this turn then starts a fresh vendor session built with the
+        # updated prompt, and ``_build_prompt`` (``resume_session=False``)
+        # replays prior history so conversational context carries over.
+        stale_state = self._clients.get(session_key)
+        if stale_state is not None and stale_state.system_prompt != composed_system_prompt:
+            await self._close_live_client(session_key)
         prompt = self._build_prompt(
             messages,
             resume_session=session_key in self._clients,
@@ -2806,6 +2822,13 @@ class ClaudeSDKExecutor(Executor):
             options=options,
             model=model,
         )
+        # Record the composition the live client is now serving, pairing
+        # with the staleness eviction above. Same value on reuse (a changed
+        # composition was evicted before ``_build_prompt``), the initial
+        # value on a fresh client.
+        live_state = self._clients.get(session_key)
+        if live_state is not None:
+            live_state.system_prompt = composed_system_prompt
 
         # ── LLM_REQUEST policy evaluation ────────────────────────
         # If the executor adapter installed a ``_policy_evaluator``

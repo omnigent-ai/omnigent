@@ -515,7 +515,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
-        instruction_delivery=_ID.COMPOSED_SESSION_SNAPSHOT,
+        # The executor rebuilds its cached client when the composed prompt
+        # changes between turns, so each turn runs on its own composition.
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "codex": _C(
         _IM.CLI_SUBPROCESS,
