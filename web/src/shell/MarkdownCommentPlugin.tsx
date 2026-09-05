@@ -184,6 +184,14 @@ export function MarkdownCommentPlugin({
         setButtonPos(null);
         return;
       }
+      // A rendered Markdown selection is commentable only when it maps to an
+      // exact raw-source range. Approximate offsets can target different text.
+      if (
+        !computeSelectionData(selection.from, selection.to, editor.state.doc, contentRef.current)
+      ) {
+        setButtonPos(null);
+        return;
+      }
 
       const nativeSel = window.getSelection();
       if (!nativeSel || nativeSel.rangeCount === 0) return;

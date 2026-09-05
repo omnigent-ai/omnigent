@@ -187,31 +187,23 @@ describe("computeSelectionData", () => {
     expect(result).toEqual({ start_index: 0, end_index: 3, anchor_content: "foo" });
   });
 
-  it("falls back to proportional indices when anchor_content is not in rawContent verbatim", () => {
+  it("rejects a rendered selection that cannot be anchored verbatim in rawContent", () => {
     // Simulate a multi-line selection where the doc joins with "\n" but
     // rawContent uses a different representation.
     const docText = "first\nsecond"; // doc has "\n" as separator
     const rawContent = "first\r\nsecond"; // raw file has "\r\n" (different)
     const doc = makeDoc(docText);
-    // Select "first\nsecond" — the "\n" form won't be found in rawContent.
+    // Select "first\nsecond": persisting proportional raw offsets would mix
+    // rendered anchor text with a different raw source span.
     const result = computeSelectionData(0, 12, doc, rawContent);
-    expect(result).not.toBeNull();
-    // Should use proportional fallback (hint-based) rather than returning null.
-    expect(result!.anchor_content).toBe("first\nsecond");
-    // start_index is proportional: hint = round(0 * 13 / 12) = 0
-    expect(result!.start_index).toBe(0);
-    // end_index is start_index + anchor_content.length = 0 + 12 = 12
-    expect(result!.end_index).toBe(12);
+    expect(result).toBeNull();
   });
 
-  it("falls back to proportional indices when rawContent is empty", () => {
+  it("rejects a rendered selection when rawContent is empty", () => {
     const text = "Hello";
     const doc = makeDoc(text);
     const result = computeSelectionData(0, 5, doc, "");
-    expect(result).not.toBeNull();
-    expect(result!.anchor_content).toBe("Hello");
-    expect(result!.start_index).toBe(0);
-    expect(result!.end_index).toBe(5);
+    expect(result).toBeNull();
   });
 
   it("handles selection of the full document", () => {
