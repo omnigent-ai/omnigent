@@ -235,7 +235,9 @@ def native_launch_rig(
                         online = True
                         break
             except httpx.HTTPError:
-                pass
+                # The rig is still booting; retry until the deadline.
+                time.sleep(0.5)
+                continue
             time.sleep(0.5)
         if not online:
             raise RuntimeError(
