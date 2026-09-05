@@ -251,7 +251,11 @@ def create_host_tunnel_router(
 
         await ws.accept()
         conn: HostConnection | None = None
-        host_persisted = False
+        # Generation token from THIS connect's upsert. Non-None means the row
+        # was persisted; the pre-registry cleanup passes it back so a newer
+        # connect's re-stamped row is left alone (compare-and-update in the
+        # store, so the guard also holds across server replicas).
+        host_generation: int | None = None
         stage = "hello"
         try:
             raw = await ws.receive_text()
@@ -275,7 +279,7 @@ def create_host_tunnel_router(
                 return
 
             stage = "registration"
-            await asyncio.to_thread(
+            persisted = await asyncio.to_thread(
                 host_store.upsert_on_connect,
                 host_id=host_id,
                 name=frame.name,
@@ -284,7 +288,7 @@ def create_host_tunnel_router(
                 configured_harnesses=frame.configured_harnesses,
                 managed_token=managed_token,
             )
-            host_persisted = True
+            host_generation = persisted.connect_generation
 
             stage = "registry"
             conn = host_registry.register(
@@ -422,8 +426,14 @@ def create_host_tunnel_router(
             if conn is not None:
                 if host_registry.deregister(host_id, conn=conn):
                     await asyncio.to_thread(host_store.set_offline, host_id)
-            elif host_persisted:
-                await asyncio.to_thread(host_store.set_offline, host_id)
+            elif host_generation is not None:
+                # Persisted but never registered: clean up the ghost-online
+                # row — unless a newer connect already re-stamped it, in
+                # which case that connection owns the row and this stale
+                # cleanup must not flip it offline.
+                await asyncio.to_thread(
+                    host_store.set_offline_if_generation, host_id, host_generation
+                )
 
     return router
 
