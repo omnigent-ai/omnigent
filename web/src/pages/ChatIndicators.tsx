@@ -1,4 +1,4 @@
-import { Loader2Icon, WifiOffIcon } from "lucide-react";
+import { CircleStopIcon, Loader2Icon, WifiOffIcon } from "lucide-react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
@@ -111,9 +111,32 @@ export function ConnectionIndicator({
     );
   }
 
+  // An explicitly-stopped session says so — for every session shape,
+  // terminal-first included. Unlike the silent `runner_asleep` (an idle
+  // sleep the user never asked for), the user just confirmed "Stop
+  // session", so the only acknowledgement must not be the dialog closing:
+  // without this band the stopped session is indistinguishable from a
+  // running one. Passive and muted — the composer stays open and the next
+  // message relaunches the runner, which is exactly what the copy says.
+  if (liveness.kind === "stopped") {
+    return (
+      <div
+        data-testid="stopped-indicator"
+        role="status"
+        className={cn(
+          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-muted-foreground text-sm",
+          CHAT_COLUMN_WIDTH,
+        )}
+      >
+        <CircleStopIcon className="size-3.5 shrink-0" aria-hidden />
+        <span>Session stopped — send a message to start it again</span>
+      </div>
+    );
+  }
+
   // Terminal-first sessions: the Chat/Terminal switcher lives in the header
   // (ViewModeToggle) on every shell, iOS included — this band renders
-  // nothing for them outside the unreachable states above.
+  // nothing for them outside the unreachable/stopped states above.
   if (terminalFirst?.isTerminalFirst) {
     return null;
   }
@@ -138,7 +161,8 @@ export function ConnectionIndicator({
 
   // `online`/`unknown` for a non-terminal-first session and
   // `runner_asleep`/`host_asleep` for any session: status lives in the
-  // sidebar / the composer stays open, so render nothing here.
+  // sidebar / the composer stays open, so render nothing here. (`stopped`
+  // renders its own band above — the user explicitly asked for that state.)
   return null;
 }
 
