@@ -208,6 +208,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.idle_pause_after_s: int | None = None
         self.cluster: str | None = None
         # Kubernetes ctor wiring (captured by install_fake_kubernetes_launcher).
+        self.env_values: dict[str, str] | None = None
         self.namespace: str | None = None
         self.secret_name: str | None = None
         self.service_account: str | None = None
@@ -553,7 +554,7 @@ def install_fake_kubernetes_launcher(
     """
     Substitute the fake for ``KubernetesSandboxLauncher`` at its public seam.
 
-    The managed flow constructs ``KubernetesSandboxLauncher(image=…, env=…,
+    The managed flow constructs ``KubernetesSandboxLauncher(image=…, env=…, env_values=…,
     namespace=…, secret_name=…, service_account=…, node_selector=…,
     kubeconfig=…, in_cluster=…, resources=…, pvc_mounts=…, secret_mounts=…,
     pod_ready_timeout_s=…, runtime_class=…)``; the shim records those constructor args on the
@@ -568,6 +569,7 @@ def install_fake_kubernetes_launcher(
         *,
         image: str | None = None,
         env: list[str] | None = None,
+        env_values: dict[str, str] | None = None,
         namespace: str | None = None,
         secret_name: str | None = None,
         service_account: str | None = None,
@@ -583,6 +585,7 @@ def install_fake_kubernetes_launcher(
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
         fake.env = env
+        fake.env_values = env_values
         fake.namespace = namespace
         fake.secret_name = secret_name
         fake.service_account = service_account

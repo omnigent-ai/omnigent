@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from omnigent.host.identity import (
     HOST_NAME_ENV_VAR,
     HOST_TOKEN_ENV_VAR,
 )
+from omnigent.onboarding.sandboxes.agent_sandbox import AgentSandboxLauncher
 from omnigent.onboarding.sandboxes.base import (
     render_host_config_write_command,
 )
@@ -519,6 +521,101 @@ def test_resolve_sandbox_env_rejects_reserved_and_credential_and_missing(
         KubernetesSandboxLauncher(env=["DEFINITELY_UNSET_VAR_XYZ"])._resolve_sandbox_env()
 
 
+@pytest.mark.parametrize("launcher_cls", [KubernetesSandboxLauncher, AgentSandboxLauncher])
+def test_env_values_are_copied_and_do_not_modify_server_environment(
+    launcher_cls: type[KubernetesSandboxLauncher], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.setenv("PLAIN_CONFIG", "from-server")
+    before = dict(os.environ)
+    values = {"SSL_CERT_FILE": "/mnt/ca/ca.crt", "EMPTY": "", "TEXT": "  literal\ntext  "}
+    launcher = launcher_cls(env=["PLAIN_CONFIG"], env_values=values)
+    values["SSL_CERT_FILE"] = "/changed-after-construction"
+    resolved = launcher._resolve_sandbox_env()
+    assert resolved == {
+        "SSL_CERT_FILE": "/mnt/ca/ca.crt",
+        "EMPTY": "",
+        "TEXT": "  literal\ntext  ",
+        "PLAIN_CONFIG": "from-server",
+    }
+    resolved["SSL_CERT_FILE"] = "/changed-after-resolution"
+    assert launcher._resolve_sandbox_env()["SSL_CERT_FILE"] == "/mnt/ca/ca.crt"
+    assert dict(os.environ) == before
+
+
+@pytest.mark.parametrize("launcher_cls", [KubernetesSandboxLauncher, AgentSandboxLauncher])
+@pytest.mark.parametrize(
+    "name",
+    [
+        *sorted(k8s._RESERVED_ENV_NAMES),
+        "OPENAI_API_KEY",
+        "git_TOKEN",
+        "my_password",
+        "MY_SECRET",
+        "CREDENTIAL",
+        "SOME_CREDENTIALS",
+    ],
+)
+def test_env_values_rejects_reserved_and_credential_names(
+    launcher_cls: type[KubernetesSandboxLauncher], name: str
+) -> None:
+    with pytest.raises(ValueError, match="reserved|credential") as exc:
+        launcher_cls(env_values={name: "not-for-errors"})
+    assert "not-for-errors" not in str(exc.value)
+
+
+@pytest.mark.parametrize("launcher_cls", [KubernetesSandboxLauncher, AgentSandboxLauncher])
+@pytest.mark.parametrize("values", [[], {"BAD-NAME": "x"}, {"PLAIN_CONFIG": 1}])
+def test_launcher_validates_env_values_without_the_parser(
+    launcher_cls: type[KubernetesSandboxLauncher], values: object
+) -> None:
+    with pytest.raises(ValueError, match="sandbox.kubernetes.env_values"):
+        launcher_cls(env_values=values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("launcher_cls", [KubernetesSandboxLauncher, AgentSandboxLauncher])
+def test_env_values_rejects_explicit_overlap(
+    launcher_cls: type[KubernetesSandboxLauncher],
+) -> None:
+    with pytest.raises(ValueError, match="overlaps"):
+        launcher_cls(env=["SSL_CERT_FILE"], env_values={"SSL_CERT_FILE": "/mnt/ca/ca.crt"})
+
+
+@pytest.mark.parametrize("launcher_cls", [KubernetesSandboxLauncher, AgentSandboxLauncher])
+@pytest.mark.parametrize("server_value", [None, "/mnt/ca/ca.crt"])
+def test_env_values_rejects_env_fallback_overlap_even_if_unset_or_equal(
+    launcher_cls: type[KubernetesSandboxLauncher],
+    server_value: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    if server_value is not None:
+        monkeypatch.setenv("SSL_CERT_FILE", server_value)
+    launcher = launcher_cls(env_values={"SSL_CERT_FILE": "/mnt/ca/ca.crt"})
+    monkeypatch.setenv(k8s.SANDBOX_ENV_PASSTHROUGH_ENV_VAR, " SSL_CERT_FILE ,")
+    with pytest.raises(click.ClickException, match=r"overlaps.*SSL_CERT_FILE"):
+        launcher._resolve_sandbox_env()
+
+
+@pytest.mark.parametrize("launcher_cls", [KubernetesSandboxLauncher, AgentSandboxLauncher])
+def test_env_values_preserves_name_only_fallback_and_explicit_empty_env(
+    launcher_cls: type[KubernetesSandboxLauncher], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(k8s.SANDBOX_ENV_PASSTHROUGH_ENV_VAR, raising=False)
+    assert launcher_cls()._resolve_sandbox_env() == {}
+    assert launcher_cls(env_values={})._resolve_sandbox_env() == {}
+    monkeypatch.setenv(k8s.SANDBOX_ENV_PASSTHROUGH_ENV_VAR, "PLAIN_CONFIG")
+    monkeypatch.setenv("PLAIN_CONFIG", "from-server")
+    assert launcher_cls()._resolve_sandbox_env() == {"PLAIN_CONFIG": "from-server"}
+    assert launcher_cls(env_values={})._resolve_sandbox_env() == {"PLAIN_CONFIG": "from-server"}
+    assert launcher_cls(env=[])._resolve_sandbox_env() == {}
+    launcher = launcher_cls(env=[], env_values={"PLAIN_CONFIG": "pod-only"})
+    assert launcher._resolve_sandbox_env() == {"PLAIN_CONFIG": "pod-only"}
+    monkeypatch.delenv("PLAIN_CONFIG")
+    with pytest.raises(click.ClickException, match="not set"):
+        launcher_cls(env_values={"SSL_CERT_FILE": "/mnt/ca/ca.crt"})._resolve_sandbox_env()
+
+
 def test_env_var_name_override_is_validated(monkeypatch: pytest.MonkeyPatch) -> None:
     """An env-var namespace override that isn't a valid RFC 1123 name fails fast."""
     monkeypatch.setenv(k8s.NAMESPACE_ENV_VAR, "Not_A_Valid_NS")
@@ -764,6 +861,66 @@ def test_launch_host_creates_secret_then_job_and_returns_workspace(
     assert batch.created_jobs[0]["metadata"]["name"] == "omnigent-job-1"
     # Nothing torn down on success.
     assert batch.deleted_jobs == []
+
+
+@pytest.mark.parametrize("repo_url", [None, "https://github.com/org/repo.git"])
+def test_launch_host_threads_env_values_into_host_but_only_config_home_into_init(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+    repo_url: str | None,
+) -> None:
+    core, batch = fake_clients
+    _setup_pod_discovery(core)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    before = dict(os.environ)
+    values = {
+        "SSL_CERT_FILE": "/mnt/ca/ca.crt",
+        "OMNIGENT_CONFIG_HOME": "/home/omnigent/custom-config",
+        "EMPTY": "",
+    }
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        env=(),
+        env_values=values,
+        secret_mounts=[{"secret_name": "runner-ca", "mount_path": "/mnt/ca"}],
+    )
+    launcher.start_host(
+        "omnigent-job-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+        repo_url=repo_url,
+        repo_name="repo" if repo_url else None,
+        host_config=_HOST_CONFIG,
+    )
+    spec = _pod_spec(batch.created_jobs[0])
+    host_env = spec["containers"][0]["env"]
+    for name, value in values.items():
+        assert {"name": name, "value": value} in host_env
+    assert len({entry["name"] for entry in host_env}) == len(host_env)
+    init = spec["initContainers"][0]
+    init_env = init["env"]
+    assert {"name": "OMNIGENT_CONFIG_HOME", "value": values["OMNIGENT_CONFIG_HOME"]} in init_env
+    assert all(entry["name"] not in ("SSL_CERT_FILE", "EMPTY") for entry in init_env)
+    has_init_token = any(entry["name"] == HOST_TOKEN_ENV_VAR for entry in init_env)
+    assert has_init_token is (repo_url is not None)
+    assert any(m["mountPath"] == "/mnt/ca" for m in spec["containers"][0]["volumeMounts"])
+    assert all(m["mountPath"] != "/mnt/ca" for m in init["volumeMounts"])
+    assert dict(os.environ) == before
+
+
+@pytest.mark.parametrize("launcher_cls", [KubernetesSandboxLauncher, AgentSandboxLauncher])
+def test_env_values_config_home_still_requires_shared_init_volume(
+    launcher_cls: type[KubernetesSandboxLauncher],
+) -> None:
+    launcher = launcher_cls(env=(), env_values={"OMNIGENT_CONFIG_HOME": "/tmp/not-shared"})
+    with pytest.raises(ValueError, match=r"OMNIGENT_CONFIG_HOME.*must resolve under"):
+        build_job_manifest(
+            **{**_MANIFEST_KW, "env_literals": launcher._resolve_sandbox_env()},
+            host_config=_HOST_CONFIG,
+        )
 
 
 def test_launch_host_threads_pvc_mounts_into_the_job(

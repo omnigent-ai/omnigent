@@ -12,6 +12,7 @@ an optional dependency, so a fake package with a recording
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import types
 from datetime import UTC, datetime
@@ -75,6 +76,7 @@ class _FakeCore:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.created_secrets: list[dict[str, object]] = []
         self.deleted_secrets: list[str] = []
         self.deleted_pods: list[str] = []
         self.read_pod_error: Exception | None = None
@@ -85,8 +87,13 @@ class _FakeCore:
         if self.read_pod_error is not None:
             raise self.read_pod_error
         return SimpleNamespace(
-            metadata=SimpleNamespace(name=name, deletion_timestamp=self.pod_deletion_timestamp)
+            metadata=SimpleNamespace(name=name, deletion_timestamp=self.pod_deletion_timestamp),
+            status=SimpleNamespace(phase="Running"),
         )
+
+    def create_namespaced_secret(self, namespace, body, _request_timeout=None):
+        self.calls.append("create_secret")
+        self.created_secrets.append(body)
 
     def delete_namespaced_secret(self, name, namespace, _request_timeout=None):
         self.calls.append("delete_secret")
@@ -198,6 +205,44 @@ def test_sandbox_manifest_carries_the_pod_template_verbatim() -> None:
     assert pod_spec["automountServiceAccountToken"] is False
     assert pod_spec["securityContext"]["runAsNonRoot"] is True
     assert pod_spec["restartPolicy"] == "OnFailure"
+
+
+def test_start_host_carries_env_values_into_the_sandbox_manifest(
+    fake_clients: tuple[_FakeCore, _FakeCustom], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    core, custom = fake_clients
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    before = dict(os.environ)
+    values = {
+        "SSL_CERT_FILE": "/mnt/ca/ca.crt",
+        "OMNIGENT_CONFIG_HOME": "/home/omnigent/custom-config",
+        "EMPTY": "",
+    }
+    launcher = AgentSandboxLauncher(
+        in_cluster=True, namespace="omnigent-sandboxes", env=(), env_values=values
+    )
+    launcher.start_host(
+        _SANDBOX_ID,
+        token="test-launch-token",
+        host_id="host_abcdef",
+        host_name="managed-abcdef",
+        server_url="http://srv.example.com",
+        host_config={"providers": {"litellm": {"kind": "gateway"}}},
+    )
+    assert core.created_secrets
+    assert len(custom.created) == 1
+    manifest = custom.created[0]
+    assert manifest["kind"] == "Sandbox"
+    spec = manifest["spec"]["podTemplate"]["spec"]
+    host_env = spec["containers"][0]["env"]
+    for name, value in values.items():
+        assert {"name": name, "value": value} in host_env
+    assert len({entry["name"] for entry in host_env}) == len(host_env)
+    assert spec["initContainers"][0]["env"] == [
+        {"name": "HOME", "value": k8s._HOME_DIR},
+        {"name": "OMNIGENT_CONFIG_HOME", "value": values["OMNIGENT_CONFIG_HOME"]},
+    ]
+    assert dict(os.environ) == before
 
 
 def test_sandbox_manifest_expiry_suspends_rather_than_destroys() -> None:

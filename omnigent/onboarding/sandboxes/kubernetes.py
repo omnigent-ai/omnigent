@@ -244,6 +244,8 @@ _RESERVED_ENV_NAMES: frozenset[str] = frozenset(
     {"HOME", "IS_SANDBOX", HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR}
 )
 
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
 # PID-1 reaper, run as the host container's entrypoint. It spawns its argv
 # (``omnigent host …``) as a child, forwards SIGTERM/SIGINT for prompt graceful
 # shutdown, and loops os.wait() to reap every child — including runner processes
@@ -343,6 +345,41 @@ def _env_name_is_sensitive(name: str) -> bool:
     """
     segments = {seg.upper() for seg in name.split("_") if seg}
     return bool(segments & _SENSITIVE_KEY_SEGMENTS)
+
+
+def validate_env_values(values: object, *, env: Sequence[str] = ()) -> dict[str, str]:
+    """Validate Pod-only literals without resolving or modifying the server environment."""
+    field = "sandbox.kubernetes.env_values"
+    if not isinstance(values, Mapping):
+        raise ValueError(f"{field} must be a mapping of environment variable names to strings")
+    validated: dict[str, str] = {}
+    for name, value in values.items():
+        if not isinstance(name, str) or not _ENV_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"{field} has an invalid environment variable name: {name!r} "
+                "(expected [A-Za-z_][A-Za-z0-9_]*)"
+            )
+        if name in _RESERVED_ENV_NAMES:
+            raise ValueError(f"{field} names {name!r}, which is reserved by the sandbox launcher")
+        if _env_name_is_sensitive(name):
+            raise ValueError(
+                f"{field} names {name!r}, which looks like a credential; "
+                "use the Secret named by sandbox.kubernetes.secret_name instead "
+                "(literal values are stored in the Pod spec and etcd)"
+            )
+        if not isinstance(value, str):
+            raise ValueError(f"{field}[{name!r}] must be a string (quote YAML numbers/booleans)")
+        if "\0" in value:
+            raise ValueError(f"{field}[{name!r}] must not contain NUL characters")
+        validated[name] = value
+    overlap = sorted(set(env) & validated.keys())
+    if overlap:
+        raise ValueError(
+            f"{field} overlaps sandbox.kubernetes.env / "
+            f"{SANDBOX_ENV_PASSTHROUGH_ENV_VAR}: {', '.join(overlap)}; "
+            "each name must have only one source"
+        )
+    return validated
 
 
 def _validate_k8s_name_env(
@@ -667,8 +704,10 @@ def build_job_manifest(
         via ``secretKeyRef``.
     :param harness_secret: Name of the harness-credentials Secret projected via
         ``envFrom``, or ``None`` for none.
-    :param env_literals: Literal name → value env entries (the resolved
-        server-env passthrough). Secrets ride *harness_secret*, not this map.
+    :param env_literals: Literal name → value env entries (resolved server-env
+        passthrough plus Pod-only ``env_values``). These go to the host only,
+        except ``OMNIGENT_CONFIG_HOME``, which is shared with init.
+        Secrets ride *harness_secret*, not this map.
     :param node_selector: Extra node selector labels, or ``None``. Merged with
         a default ``kubernetes.io/arch: amd64``; an operator-supplied
         ``kubernetes.io/arch`` entry overrides the default.
@@ -1108,6 +1147,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         image: str | None = None,
         namespace: str | None = None,
         env: Sequence[str] | None = None,
+        env_values: Mapping[str, str] | None = None,
         secret_name: str | None = None,
         node_selector: dict[str, str] | None = None,
         service_account: str | None = None,
@@ -1131,6 +1171,11 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._image_ref = image
         self._namespace = namespace
         self._env_names = tuple(env) if env is not None else None
+        self._env_values = (
+            validate_env_values(env_values, env=self._env_names or ())
+            if env_values is not None
+            else {}
+        )
         self._secret_name = secret_name
         self._node_selector = dict(node_selector) if node_selector is not None else None
         self._service_account = service_account
@@ -1281,14 +1326,16 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
 
         Explicit constructor names win; otherwise
         :data:`SANDBOX_ENV_PASSTHROUGH_ENV_VAR` (comma-separated) applies. Values
-        come from the server's own environment — a configured name that is unset
-        there fails loud (silently launching without it would surface much later
-        as an opaque failure inside the sandbox).
+        for those names come from the server's own environment — a configured
+        name that is unset there fails loud. ``env_values`` supplies separate
+        Pod-only literals without reading or changing the server environment.
+        A name in both sources is an error, even if its server value is unset.
 
         :returns: Name → value mapping for literal Pod ``env``.
         :raises click.ClickException: When a configured name is unset in the
             server environment, names a reserved variable, or looks like a
-            credential (use ``sandbox.kubernetes.secret_name`` for those).
+            credential (use ``sandbox.kubernetes.secret_name`` for those), or
+            overlaps ``env_values``.
         """
         if self._env_names is not None:
             names: Sequence[str] = self._env_names
@@ -1298,7 +1345,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 for name in os.environ.get(SANDBOX_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
                 if name.strip()
             ]
-        resolved: dict[str, str] = {}
+        try:
+            resolved = validate_env_values(self._env_values, env=names)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
         for name in names:
             if name in _RESERVED_ENV_NAMES:
                 raise click.ClickException(
