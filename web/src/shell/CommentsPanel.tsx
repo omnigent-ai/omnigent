@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useResizableCommentsPanel } from "@/hooks/useResizableCommentsPanel";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { userDisplayName } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -496,8 +497,10 @@ function CommentCard({
               <TooltipProvider>
                 <Tooltip>
                   <TooltipTrigger asChild>
+                    {/* Visible label is the humanized name; the raw email
+                        identity stays available in the tooltip. */}
                     <span className="truncate text-sm text-muted-foreground">
-                      {c.created_by ?? "You"}
+                      {c.created_by ? userDisplayName(c.created_by) : "You"}
                     </span>
                   </TooltipTrigger>
                   <TooltipContent>{c.created_by ?? "You"}</TooltipContent>
@@ -506,6 +509,11 @@ function CommentCard({
             </div>
             <span className="text-[10px] text-muted-foreground/70">
               {formatCommentTime(c.created_at, now)}
+              {c.edited_at != null && (
+                <span className="ml-1 italic" data-testid="comment-edited">
+                  (edited)
+                </span>
+              )}
             </span>
             {statusLabel && (
               <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] w-fit">

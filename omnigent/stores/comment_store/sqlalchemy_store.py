@@ -35,6 +35,7 @@ def _to_entity(row: SqlComment) -> Comment:
         updated_at=row.updated_at,
         anchor_content=row.anchor_content,
         created_by=row.created_by,
+        edited_at=row.edited_at,
     )
 
 
@@ -140,6 +141,10 @@ class SqlAlchemyCommentStore(CommentStore):
                 row.body = body
             if status is not None or body is not None:
                 row.updated_at = now_epoch_us()
+            # Only a body rewrite marks the comment as edited; a status-only
+            # change (e.g. marking it addressed) leaves the text untouched.
+            if body is not None:
+                row.edited_at = row.updated_at
             return _to_entity(row)
 
     def delete(self, comment_id: str, conversation_id: str) -> Comment | None:

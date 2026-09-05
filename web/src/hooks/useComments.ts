@@ -31,6 +31,13 @@ export interface Comment {
   updated_at: number;
   anchor_content: string | null;
   created_by: string | null;
+  /**
+   * Unix **microseconds** of the last **body** edit, or `null` when the
+   * text was never rewritten. Status-only changes (e.g. marking a
+   * comment addressed) do not set it, so it drives the card's "edited"
+   * indicator without false positives.
+   */
+  edited_at: number | null;
 }
 
 // ── Query helpers ────────────────────────────────────────────────────────────

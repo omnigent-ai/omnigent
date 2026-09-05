@@ -55,7 +55,7 @@ import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { approve, getSession } from "@/lib/sessionsApi";
-import { userColor, userInitials } from "@/lib/userBadge";
+import { userColor, userDisplayName, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
 
@@ -367,7 +367,12 @@ export function InboxPage() {
               <div className="flex min-w-0 flex-1 flex-col gap-1">
                 <div className="flex items-center gap-2">
                   <span className="min-w-0 truncate text-ui">
-                    <span className="font-medium">{author}</span>
+                    {/* Visible label is the humanized name; the avatar pill
+                        stays keyed off the raw identity so its color matches
+                        the presence circles everywhere else. */}
+                    <span className="font-medium" title={author}>
+                      {userDisplayName(author)}
+                    </span>
                     <span className="text-muted-foreground"> commented on </span>
                     <span className="font-mono text-sm">{comment.path}</span>
                   </span>

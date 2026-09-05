@@ -89,7 +89,7 @@ class ListCommentsTool(Tool):
         :returns: JSON string with a ``"comments"`` list, each
             entry containing ``id``, ``path``, ``anchor_content``,
             ``start_index``, ``end_index``, ``body``, ``status``,
-            and ``created_by``.
+            ``created_by``, and ``edited_at``.
         """
         if ctx.conversation_id is None:
             return json.dumps({"error": "no conversation context — cannot scope comment query"})

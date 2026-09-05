@@ -132,9 +132,10 @@ def test_comment_surfaces_in_inbox_until_opened_in_file_browser(
 
     # The item's icon is the author's avatar pill — initials derived
     # from Alice's email local part ("alice.smith" → "AS"), alongside
-    # her identity as the author label.
+    # her humanized display name (not the raw email) as the author label.
     expect(item).to_contain_text("AS")
-    expect(item).to_contain_text(_ALICE)
+    expect(item).to_contain_text("Alice Smith")
+    expect(item).not_to_contain_text(_ALICE)
 
     # The sidebar Inbox badge counts the unseen comment. Exactly one
     # item exists on this worker's server (sessions are per-test and

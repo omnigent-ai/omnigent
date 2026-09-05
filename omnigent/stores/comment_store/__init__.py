@@ -110,6 +110,8 @@ class CommentStore(ABC):
         :param status: New status, e.g. ``"addressed"``. ``None`` leaves
             it unchanged.
         :param body: New comment body text. ``None`` leaves it unchanged.
+            A body rewrite also stamps ``edited_at`` (status-only changes
+            do not), so clients can flag visibly edited comments.
         :returns: The updated :class:`Comment`, or ``None`` if no comment with
             that id exists or it is not owned by ``conversation_id``.
         """

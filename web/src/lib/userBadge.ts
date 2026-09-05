@@ -16,6 +16,21 @@ export function userInitials(userId: string): string {
   return (segments[0]!.slice(0, 1) + segments[1]!.slice(0, 1)).toUpperCase();
 }
 
+/**
+ * Human-readable display name derived from the email local part:
+ * `"alice.smith@x.com"` → `"Alice Smith"`, `"bob@x.com"` → `"Bob"`.
+ * Identities without an `@` are title-cased the same way. The server
+ * only knows email identities, so this is the shared display-name
+ * mapping for attribution surfaces — the raw email stays available
+ * for tooltips and identity comparisons.
+ */
+export function userDisplayName(userId: string): string {
+  const localPart = userId.split("@", 1)[0] ?? userId;
+  const segments = localPart.split(/[._\-+]+/).filter(Boolean);
+  if (segments.length === 0) return userId;
+  return segments.map((s) => s[0]!.toUpperCase() + s.slice(1)).join(" ");
+}
+
 // Per-user accent slots drawn from the app's own design tokens (see
 // `src/index.css`): the categorical chart colors plus the brand
 // accent, each with light/dark-theme variants the CSS vars resolve

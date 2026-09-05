@@ -120,6 +120,7 @@ function makeComment(overrides: Partial<Comment> & { id: string }): Comment {
     updated_at: 1_000_000_000,
     anchor_content: null,
     created_by: "alice@example.com",
+    edited_at: null,
     ...overrides,
   };
 }

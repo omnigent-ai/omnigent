@@ -732,6 +732,68 @@ def test_update_comment_with_no_fields_does_not_bump_updated_at(
     assert updated.updated_at == 1_000 * _US
 
 
+def test_add_leaves_edited_at_unset(store: SqlAlchemyCommentStore, clock: dict[str, int]) -> None:
+    """A freshly created comment reports no body edit (``edited_at is None``)."""
+    comment = store.add(
+        conversation_id="840c7e6167d54b9d8f4cb718ecfc086c",
+        path="src/app.py",
+        body="first",
+        start_index=0,
+        end_index=5,
+    )
+    # A never-rewritten comment must not claim an edit, or every card
+    # would render an "edited" marker from birth.
+    assert comment.edited_at is None
+
+
+def test_update_comment_body_stamps_edited_at_and_persists(
+    store: SqlAlchemyCommentStore, clock: dict[str, int]
+) -> None:
+    """A body rewrite records the edit instant in ``edited_at``."""
+    comment = store.add(
+        conversation_id="840c7e6167d54b9d8f4cb718ecfc086c",
+        path="src/app.py",
+        body="first",
+        start_index=0,
+        end_index=5,
+    )
+    clock["now"] = 2_000
+    updated = store.update_comment(comment.id, "840c7e6167d54b9d8f4cb718ecfc086c", body="second")
+
+    assert updated is not None
+    # The visible text changed, so the edit marker input must be set —
+    # and match updated_at, since the rewrite is the latest mutation.
+    assert updated.edited_at == 2_000 * _US
+    assert updated.updated_at == 2_000 * _US
+    # The stamp must be persisted, not just present on the returned entity.
+    fetched = store.get(comment.id, "840c7e6167d54b9d8f4cb718ecfc086c")
+    assert fetched is not None
+    assert fetched.edited_at == 2_000 * _US
+
+
+def test_update_comment_status_only_does_not_stamp_edited_at(
+    store: SqlAlchemyCommentStore, clock: dict[str, int]
+) -> None:
+    """A status-only change (e.g. addressed) is not a visible text edit."""
+    comment = store.add(
+        conversation_id="840c7e6167d54b9d8f4cb718ecfc086c",
+        path="src/app.py",
+        body="first",
+        start_index=0,
+        end_index=5,
+    )
+    clock["now"] = 2_000
+    updated = store.update_comment(
+        comment.id, "840c7e6167d54b9d8f4cb718ecfc086c", status="addressed"
+    )
+
+    assert updated is not None
+    # updated_at moves (fingerprint), but the text never changed, so the
+    # card must not gain an "edited" marker from a workflow action.
+    assert updated.updated_at == 2_000 * _US
+    assert updated.edited_at is None
+
+
 def test_get_comments_fingerprints_empty_input_returns_empty(
     store: SqlAlchemyCommentStore,
 ) -> None:

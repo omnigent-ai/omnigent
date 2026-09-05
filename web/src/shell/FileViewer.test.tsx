@@ -188,6 +188,7 @@ function makeComment(id: string, status: Comment["status"] = "draft"): Comment {
     updated_at: 0,
     anchor_content: "hello",
     created_by: null,
+    edited_at: null,
   };
 }
 
