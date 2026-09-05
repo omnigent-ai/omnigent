@@ -151,8 +151,53 @@ _catalog_cache: cachetools.TTLCache[str, _DiskCatalogEntry | None] = cachetools.
 _catalog_cache_lock = threading.Lock()
 
 
+_ATLASCLOUD_CATALOG_URL = "https://api.atlascloud.ai/api/v1/models"
+
+
+def _normalize_atlascloud_catalog(payload: dict[str, Any]) -> dict[str, Any]:
+    """Convert Atlas Cloud's public model list to the internal catalog shape.
+
+    Atlas Cloud publishes image, video, and text models in one unauthenticated
+    endpoint. Omnigent's harness picker needs only OpenAI-compatible text
+    models, so non-text entries are excluded here instead of appearing as
+    unusable coding-agent choices.
+
+    :param payload: Parsed response from Atlas Cloud's public model endpoint.
+    :returns: A catalog mapping with text models under ``models``.
+    """
+    models: dict[str, dict[str, Any]] = {}
+    entries = payload.get("data")
+    if not isinstance(entries, list):
+        return {"schema_version": _CATALOG_UPSTREAM_SCHEMA_MAJOR, "models": models}
+
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "Text":
+            continue
+        model = entry.get("model")
+        if not isinstance(model, str) or not model:
+            continue
+        context: dict[str, int] = {}
+        if isinstance(entry.get("contextLength"), int):
+            context["max_input"] = entry["contextLength"]
+        if isinstance(entry.get("maxCompletionTokens"), int):
+            context["max_output"] = entry["maxCompletionTokens"]
+        models[model] = {
+            "mode": "chat",
+            "capabilities": {},
+            "context_window": context,
+        }
+    return {"schema_version": _CATALOG_UPSTREAM_SCHEMA_MAJOR, "models": models}
+
+
 def _catalog_source_url(provider: str) -> str:
-    """Return the release-asset URL for one provider catalog."""
+    """Return the catalog URL for one provider.
+
+    Atlas Cloud is not published in the MLflow release catalog, so it serves
+    its own unauthenticated model list, normalized by
+    :func:`_normalize_atlascloud_catalog` into the same internal shape.
+    """
+    if provider == "atlascloud":
+        return _ATLASCLOUD_CATALOG_URL
     return _MLFLOW_CATALOG_URL.format(provider=urllib.parse.quote(provider, safe=""))
 
 
@@ -307,8 +352,16 @@ def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
         return None
     url = _catalog_source_url(provider)
     try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        request: str | urllib.request.Request = url
+        if provider == "atlascloud":
+            # Atlas Cloud's edge rejects the default urllib User-Agent.
+            request = urllib.request.Request(
+                url, headers={"User-Agent": "omnigent-model-catalog"}
+            )
+        with urllib.request.urlopen(request, timeout=5) as resp:
             result: dict[str, Any] = json.loads(resp.read())
+        if provider == "atlascloud":
+            result = _normalize_atlascloud_catalog(result)
         if not _valid_catalog_payload(result):
             _logger.warning("Ignoring incompatible model catalog payload for %s", provider)
             return None
@@ -396,6 +449,7 @@ def _list_provider_names() -> list[str]:
             "aleph_alpha",
             "amazon_nova",
             "anthropic",
+            "atlascloud",
             "anyscale",
             "azure",
             "azure_ai",
@@ -498,6 +552,7 @@ def _normalize_provider(provider: str) -> str:
 COMMON_PROVIDERS: list[str] = [
     "openai",
     "anthropic",
+    "atlascloud",
     "databricks",
     "bedrock",
     "gemini",
@@ -1069,6 +1124,7 @@ _PROVIDER_DISPLAY_NAMES: dict[str, str] = {
     "cerebras": "Cerebras",
     "deepseek": "DeepSeek",
     "openrouter": "OpenRouter",
+    "atlascloud": "Atlas Cloud",
     "ollama": "Ollama",
 }
 
@@ -1099,6 +1155,7 @@ PROVIDER_ENV_VARS: dict[str, str] = {
     "deepseek": "DEEPSEEK_API_KEY",
     "xai": "XAI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
+    "atlascloud": "ATLASCLOUD_API_KEY",
     "togetherai": "TOGETHERAI_API_KEY",
     "cohere": "COHERE_API_KEY",
     "ai21": "AI21_API_KEY",

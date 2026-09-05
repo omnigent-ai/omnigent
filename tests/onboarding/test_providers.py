@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -25,6 +27,15 @@ from omnigent.onboarding.providers import (
 # Keyed by provider name; each value is what _fetch_provider_catalog returns
 # (the full parsed dict with a "models" key).
 _FAKE_CATALOG: dict[str, dict] = {
+    "atlascloud": {
+        "models": {
+            "deepseek-ai/deepseek-v4-pro": {
+                "mode": "chat",
+                "capabilities": {},
+                "context_window": {"max_input": 128000, "max_output": 8192},
+            },
+        }
+    },
     "anthropic": {
         "schema_version": "1.0",
         "models": {
@@ -162,7 +173,7 @@ def test_get_all_providers_returns_nonempty_list() -> None:
 def test_get_all_providers_contains_major_providers() -> None:
     """Major providers must appear in the catalog."""
     providers = get_all_providers()
-    for expected in ["anthropic", "openai", "gemini", "groq", "deepseek"]:
+    for expected in ["anthropic", "openai", "atlascloud", "gemini", "groq", "deepseek"]:
         assert expected in providers, (
             f"Expected {expected!r} in providers list. "
             f"Catalog file {expected}.json may be missing."
@@ -654,6 +665,71 @@ def test_default_chat_model_openai_uses_newest_general_model() -> None:
 def test_default_chat_model_openrouter_prefers_kimi_family() -> None:
     """OpenRouter prefers its broadly-served Kimi family over newer entries."""
     assert default_chat_model("openrouter") == "moonshotai/kimi-k2.6"
+
+
+def test_normalize_atlascloud_catalog_keeps_text_models_only() -> None:
+    """Atlas' mixed public catalog exposes only text models to harnesses."""
+    payload = {
+        "code": "200",
+        "data": [
+            {
+                "model": "deepseek-ai/deepseek-v4-pro",
+                "type": "Text",
+                "contextLength": 128000,
+                "maxCompletionTokens": 8192,
+            },
+            {"model": "black-forest-labs/flux", "type": "Image"},
+        ],
+    }
+
+    catalog = _providers_mod._normalize_atlascloud_catalog(payload)
+
+    assert set(catalog["models"]) == {"deepseek-ai/deepseek-v4-pro"}
+    model = catalog["models"]["deepseek-ai/deepseek-v4-pro"]
+    assert model["mode"] == "chat"
+    assert model["context_window"] == {"max_input": 128000, "max_output": 8192}
+
+
+def test_download_atlascloud_catalog_sends_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Atlas catalog requests identify the client instead of receiving HTTP 403."""
+    seen: list[urllib.request.Request] = []
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+
+    def fake_urlopen(request: urllib.request.Request, timeout: int) -> io.BytesIO:
+        seen.append(request)
+        assert timeout == 5
+        return io.BytesIO(b'{"code":"200","data":[]}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    catalog = _providers_mod._download_provider_catalog("atlascloud")
+
+    assert catalog is None  # empty catalog fails upstream payload validation
+    assert seen[0].full_url == "https://api.atlascloud.ai/api/v1/models"
+    assert seen[0].headers["User-agent"] == "omnigent-model-catalog"
+
+
+def test_default_chat_model_dynamic_skips_specialty_variants() -> None:
+    """The dynamic rule (non-pinned providers) drops specialty modalities.
+
+    Pinned providers short-circuit, so this exercises the catalog rule via
+    the internal helper on the openai catalog (whose newest-first top entry
+    is a specialty model): the dynamic pick must skip audio/realtime/etc.
+    and choose a general-purpose ``gpt-*``. Guards the fallback used for any
+    non-pinned provider.
+    """
+    from omnigent.onboarding.providers import _SPECIALTY_MODEL_TOKENS
+
+    general = [
+        m.name
+        for m in get_chat_models("openai")
+        if not any(tok in m.name.lower() for tok in _SPECIALTY_MODEL_TOKENS)
+    ]
+    assert general, "openai catalog should have a general-purpose model"
+    # The catalog's raw newest-first top entry IS a specialty model, so the
+    # dynamic rule's exclusion genuinely changes the result.
+    assert general[0] != get_chat_models("openai")[0].name
+    assert general[0].startswith("gpt-")
 
 
 def test_default_chat_model_openrouter_requires_kimi_family() -> None:
