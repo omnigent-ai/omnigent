@@ -5,6 +5,8 @@ import { authenticatedFetch } from "../lib/identity";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import { showToast } from "@/components/ui/toast";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { readTerminalThemeMode, resolveTerminalIsDark } from "@/lib/terminalThemePreferences";
 
 export { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 
@@ -225,6 +227,12 @@ export async function fetchTerminals(conversationId: string): Promise<TerminalIn
  * :param terminal: Declared terminal name from the agent spec,
  *     e.g. ``"shell"`` (or a shell basename like ``"zsh"`` for a native
  *     session offering the host's installed shells).
+ * :param terminalTheme: The concrete light/dark palette the pane will
+ *     render with (the terminal theme preference resolved against the
+ *     app's appearance). Sent as ``terminal_theme`` so the runner can
+ *     tell the pane's process which background it renders against
+ *     (``COLORFGBG``) — the canvas repaint alone never reaches the PTY.
+ *     Omitted from the body when not provided.
  * :returns: The created terminal mapped to :class:`TerminalInfo`.
  * :raises Error: When the server rejects the create (e.g. the agent
  *     has no terminal access) or the launch fails.
@@ -232,6 +240,7 @@ export async function fetchTerminals(conversationId: string): Promise<TerminalIn
 export async function createTerminal(
   conversationId: string,
   terminal: string,
+  terminalTheme?: "light" | "dark",
 ): Promise<TerminalInfo> {
   // Random session key so repeated clicks launch fresh terminals —
   // the runner's launch is idempotent per (terminal, session_key), so
@@ -242,7 +251,11 @@ export async function createTerminal(
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ terminal, session_key: sessionKey }),
+      body: JSON.stringify({
+        terminal,
+        session_key: sessionKey,
+        ...(terminalTheme ? { terminal_theme: terminalTheme } : {}),
+      }),
     },
   );
   if (!res.ok) {
@@ -270,13 +283,26 @@ export async function createTerminal(
  * waiting for the ``session.resource.created`` SSE round-trip — which
  * still arrives and dedupes as a no-op.
  *
+ * The created pane's PTY is told which background it renders against:
+ * the terminal theme preference is resolved against the app's current
+ * appearance at click time and rides the create request (see
+ * :func:`createTerminal`'s ``terminalTheme``).
+ *
  * :param conversationId: Session/conversation identifier.
  * :returns: TanStack mutation taking the declared terminal name.
  */
 export function useCreateTerminal(conversationId: string) {
   const queryClient = useQueryClient();
+  const resolvedMode = useResolvedThemeMode();
   return useMutation({
-    mutationFn: (terminal: string) => createTerminal(conversationId, terminal),
+    mutationFn: (terminal: string) =>
+      createTerminal(
+        conversationId,
+        terminal,
+        // Read the stored mode at mutate time (not mount) so a Settings
+        // change between renders still resolves fresh.
+        resolveTerminalIsDark(readTerminalThemeMode(), resolvedMode === "dark") ? "dark" : "light",
+      ),
     onSuccess: (info) => {
       const key = terminalsQueryKey(conversationId);
       const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];

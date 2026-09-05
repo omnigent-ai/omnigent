@@ -9337,6 +9337,20 @@ def create_runner_app(
                 tmux_allow_passthrough=bool(spec.get("tmux_allow_passthrough", False)),
                 tmux_start_on_attach=bool(spec.get("tmux_start_on_attach", False)),
             )
+
+        # The web client resolves its terminal theme (Match app / Light /
+        # Dark) to a concrete light/dark at create time and sends it as
+        # ``terminal_theme``; translate it into a COLORFGBG launch-env hint
+        # so the process in the pane knows which background the canvas
+        # renders it against. A spec that already pins COLORFGBG wins, and
+        # the spec is cloned rather than mutated — a declared spec object
+        # is shared across launches.
+        from omnigent.inner.terminal import terminal_theme_env_hint
+
+        theme_hint = terminal_theme_env_hint(body.get("terminal_theme"))
+        if theme_hint and "COLORFGBG" not in env_spec.env:
+            env_spec = dataclasses.replace(env_spec, env={**env_spec.env, **theme_hint})
+
         bridge_inject = bool(body.get("bridge_inject_dir"))
         bridge_id = session_id
         # Set only when this launch installed the relay, so a failure rolls

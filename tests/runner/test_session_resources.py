@@ -1188,6 +1188,172 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
     assert launch.env == {"OPERATOR": "set"}
 
 
+def _declared_terminal_app(
+    tmp_path: Path,
+    declared: TerminalEnvSpec,
+) -> tuple[Any, httpx.AsyncClient, Any]:
+    """Build a runner app whose session agent declares one ``zsh`` terminal.
+
+    :param tmp_path: Temporary directory for the fake registry.
+    :param declared: The :class:`TerminalEnvSpec` the agent declares as
+        ``"zsh"``.
+    :returns: ``(app, server_client, resource_registry)`` — the caller owns
+        closing ``server_client``.
+    """
+    from omnigent.inner.datamodel import AgentDef
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    agent = AgentDef(
+        name="shelly",
+        os_env=OSEnvSpec(type="caller_process", cwd=str(workspace)),
+        terminals={"zsh": declared},
+    )
+
+    async def _session_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_shelly"})
+
+    async def _resolver(agent_id: str, session_id: str) -> Any:
+        return agent
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_session_handler),
+        base_url="http://server",
+    )
+    resource_registry = _CapturingResourceRegistry(tmp_path, runner_workspace=workspace)
+    app = create_runner_app(
+        resource_registry=resource_registry,
+        server_client=server_client,
+        spec_resolver=_resolver,
+    )
+    return app, server_client, resource_registry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("theme", "expected_hint"),
+    [("dark", "15;0"), ("light", "0;15")],
+)
+async def test_create_terminal_theme_sets_pane_background_hint(
+    tmp_path: Path,
+    theme: str,
+    expected_hint: str,
+) -> None:
+    """A create request's resolved theme becomes a COLORFGBG launch hint.
+
+    The web UI resolves its terminal theme to a concrete light/dark and
+    sends it as ``terminal_theme``; the pane's process can only pick
+    readable ANSI colors when the launch env says which background the
+    canvas renders it against.
+    """
+    resource_registry = _CapturingResourceRegistry(tmp_path)
+    app = create_runner_app(
+        resource_registry=resource_registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+        resp = await c.post(
+            "/v1/sessions/conv_abc/resources/terminals",
+            json={
+                "terminal": "shell",
+                "session_key": "u-abc123",
+                "terminal_theme": theme,
+                "spec": {"command": "bash", "env": {"KEEP": "1"}},
+            },
+        )
+
+    assert resp.status_code == 200
+    launch = resource_registry.launches[0]
+    assert launch.env["COLORFGBG"] == expected_hint
+    # The hint merges into the request's env instead of replacing it.
+    assert launch.env["KEEP"] == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("theme", [None, "auto", "solarized", 7])
+async def test_create_terminal_unresolved_theme_adds_no_background_hint(
+    tmp_path: Path,
+    theme: object,
+) -> None:
+    """Anything but a concrete light/dark theme yields no COLORFGBG guess."""
+    resource_registry = _CapturingResourceRegistry(tmp_path)
+    app = create_runner_app(
+        resource_registry=resource_registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    body: dict[str, Any] = {
+        "terminal": "shell",
+        "session_key": "u-abc123",
+        "spec": {"command": "bash"},
+    }
+    if theme is not None:
+        body["terminal_theme"] = theme
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+        resp = await c.post("/v1/sessions/conv_abc/resources/terminals", json=body)
+
+    assert resp.status_code == 200
+    assert "COLORFGBG" not in resource_registry.launches[0].env
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_theme_hint_clones_declared_spec(
+    tmp_path: Path,
+) -> None:
+    """The hint merges into a declared terminal spec without mutating it.
+
+    Declared specs are shared objects (sub-agents and other tools hold the
+    same instance), so writing COLORFGBG into the original would leak one
+    request's theme into every later launch of that terminal.
+    """
+    declared_zsh = TerminalEnvSpec(command="zsh", env={"OPERATOR": "set"}, os_env="inherit")
+    app, server_client, resource_registry = _declared_terminal_app(tmp_path, declared_zsh)
+    transport = httpx.ASGITransport(app=app)
+
+    async with (
+        server_client,
+        httpx.AsyncClient(transport=transport, base_url="http://runner") as c,
+    ):
+        resp = await c.post(
+            "/v1/sessions/conv_test/resources/terminals",
+            json={"terminal": "zsh", "session_key": "s1", "terminal_theme": "dark"},
+        )
+
+    assert resp.status_code == 200
+    launch = resource_registry.launches[0]
+    assert launch is not declared_zsh
+    assert launch.env == {"OPERATOR": "set", "COLORFGBG": "15;0"}
+    # The shared declared spec is untouched for the next launch.
+    assert declared_zsh.env == {"OPERATOR": "set"}
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_theme_hint_defers_to_declared_colorfgbg(
+    tmp_path: Path,
+) -> None:
+    """A spec that explicitly pins COLORFGBG wins over the client's theme."""
+    declared_zsh = TerminalEnvSpec(command="zsh", env={"COLORFGBG": "7;0"}, os_env="inherit")
+    app, server_client, resource_registry = _declared_terminal_app(tmp_path, declared_zsh)
+    transport = httpx.ASGITransport(app=app)
+
+    async with (
+        server_client,
+        httpx.AsyncClient(transport=transport, base_url="http://runner") as c,
+    ):
+        resp = await c.post(
+            "/v1/sessions/conv_test/resources/terminals",
+            json={"terminal": "zsh", "session_key": "s1", "terminal_theme": "light"},
+        )
+
+    assert resp.status_code == 200
+    launch = resource_registry.launches[0]
+    assert launch is declared_zsh
+    assert launch.env == {"COLORFGBG": "7;0"}
+
+
 @pytest.mark.asyncio
 async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
     tmp_path: Path,
