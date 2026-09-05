@@ -683,6 +683,8 @@ class SqlConversationMetadata(OmnigentBase):
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Native Plan display state is independent of harness execution state.
+    session_todos: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # JSON-encoded list of strings. NULL for non-native sessions.
     terminal_launch_args: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Required when host_id is set; enforced by check constraint below.

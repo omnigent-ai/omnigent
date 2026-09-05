@@ -120,6 +120,7 @@ from omnigent.server.routes._sessions.common import (
     _pushed_model_options_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
+    _session_todos_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -1479,7 +1480,7 @@ def register_events_routes(
             )
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_TODOS_TYPE:
-            _handle_external_session_todos(session_id, body)
+            await _handle_external_session_todos(session_id, body, conversation_store)
             return {"queued": False}
         if body.type == _EXTERNAL_SUBAGENT_START_TYPE:
             child_id = await _persist_external_subagent_start(
@@ -2340,6 +2341,7 @@ def register_events_routes(
         # while the session exists (the extension only pushes on start), so a
         # deleted session would otherwise leak its entry for the process life.
         _pushed_model_options_cache.pop(session_id, None)
+        _session_todos_cache.pop(session_id, None)
         # Drop the deleted session's per-user read-state from every user's
         # caches so they don't accumulate orphan entries for the process
         # lifetime.

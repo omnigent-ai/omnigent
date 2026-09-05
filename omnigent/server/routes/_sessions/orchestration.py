@@ -1141,10 +1141,9 @@ def _build_session_response(
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
-        # Replay the latest todo list for claude-native sessions.
-        # Populated by _handle_external_session_todos; empty list for
-        # non-claude-native sessions or before the first poll tick.
-        todos=_session_todos_cache.get(conv.id, []),
+        # Replay the last native Plan even before a replacement Server has
+        # received another forwarder update. New sessions remain empty.
+        todos=_session_todos_cache.get(conv.id, conv.session_todos),
         skills=skills or [],
         model_options=[
             NativeModelOption.model_validate(option) for option in (model_options or [])

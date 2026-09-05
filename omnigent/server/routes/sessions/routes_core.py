@@ -113,6 +113,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _logger,
     _managed_launch_tasks,
+    _session_todos_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -2989,6 +2990,7 @@ def register_core_routes(
         _invalidate_runner_backed_snapshot_state(
             session_id, cancel_inflight=True, drop_model_options=True
         )
+        _session_todos_cache.pop(session_id, None)
 
         # Tell every connected client the binding changed so they re-derive
         # session state (presentation labels, bound agent) from a fresh

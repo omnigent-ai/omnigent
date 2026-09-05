@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import suppress
 from typing import Any, Protocol, cast
 
 from sqlalchemy import (
@@ -209,6 +210,13 @@ def _to_conversation(
     session_usage: dict[str, Any] = {}
     if meta and meta.session_usage:
         session_usage = json.loads(meta.session_usage)
+    from omnigent.session_todos import validate_session_todos
+
+    session_todos: list[dict[str, Any]] = []
+    if meta and meta.session_todos:
+        # Older/invalid stored snapshots must not break session loading.
+        with suppress(TypeError, ValueError):
+            session_todos = validate_session_todos(json.loads(meta.session_todos))
     overrides = _decode_session_overrides(row.session_overrides)
     return Conversation(
         id=row.id,
@@ -228,6 +236,7 @@ def _to_conversation(
         labels=labels if labels is not None else {},
         session_state=session_state,
         session_usage=session_usage,
+        session_todos=session_todos,
         reasoning_effort=overrides["reasoning_effort"],
         model_override=overrides["model_override"],
         reported_model=overrides["reported_model"],
@@ -1396,6 +1405,29 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 .values(session_usage=json.dumps(usage))
             )
+
+    def set_session_todos(
+        self,
+        conversation_id: str,
+        todos: list[dict[str, Any]],
+    ) -> bool:
+        """Persist a bounded snapshot without recreating a deleted session."""
+        from omnigent.session_todos import validate_session_todos
+
+        payload = json.dumps(validate_session_todos(todos), separators=(",", ":"))
+        with self._session("set_session_todos") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                    )
+                    .values(session_todos=payload)
+                ),
+            )
+            return result.rowcount > 0
 
     def set_conversation_project(
         self,
@@ -4205,6 +4237,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
             if meta is not None:
                 meta.external_session_id = None
+                meta.session_todos = None
                 # Launch flags are CLI-specific: a switch to a different CLI
                 # (e.g. claude-code → pi) leaves the prior CLI's flags stale —
                 # Claude Code's ``--permission-mode`` makes pi exit 1 at launch.
