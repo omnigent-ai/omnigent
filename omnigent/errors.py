@@ -116,26 +116,39 @@ class OmnigentError(Exception):
     exception handler converts it to a JSON response automatically.
     """
 
-    def __init__(self, message: str, *, code: str = ErrorCode.INTERNAL_ERROR) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = ErrorCode.INTERNAL_ERROR,
+        http_status: int | None = None,
+    ) -> None:
         """
         Create a new application error.
 
         :param message: Human-readable error description.
         :param code: Machine-readable error code from
             :class:`ErrorCode`, e.g. ``ErrorCode.NOT_FOUND``.
+        :param http_status: Explicit HTTP status overriding the code's
+            mapped status. For mirroring an upstream (runner/host) error
+            whose code is outside :class:`ErrorCode`'s vocabulary.
         """
         super().__init__(message)
         self.code = code
         self.message = message
+        self._http_status = http_status
 
     @property
     def http_status(self) -> int:
         """
         Map this error's code to an HTTP status code.
 
-        :returns: HTTP status (e.g. 404 for ``NOT_FOUND``).
+        :returns: The explicit override when one was given, else the
+            HTTP status mapped from the code (e.g. 404 for ``NOT_FOUND``).
             Defaults to 500 for unknown codes.
         """
+        if self._http_status is not None:
+            return self._http_status
         return _CODE_TO_HTTP_STATUS.get(self.code, 500)
 
 
