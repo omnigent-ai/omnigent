@@ -226,7 +226,11 @@ _CODEX_AUTH_ERROR_FRAGMENTS = (
     "reauthenticate",
     "credentials",
     "access token",
+    # Underscored JSON-field spelling gateways echo verbatim, e.g. the
+    # Databricks AI Gateway's "access_token is expired".
+    "access_token",
     "token expired",
+    "token is expired",
     "expired token",
     "session expired",
     "api key",
