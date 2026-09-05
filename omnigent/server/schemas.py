@@ -225,6 +225,29 @@ class PolicySummary(BaseModel):
     description: str | None = None
 
 
+class SubAgentSummary(BaseModel):
+    """
+    One delegable sub-agent of a multi-agent bundle.
+
+    Exposed so a client can see, and let a person change, WHICH model
+    does which job. Before this the catalog reported a single
+    ``harness`` -- the orchestrator's brain -- so a bundle like polly or
+    debby looked like one agent, and the UI's Configure dialog could
+    only offer the brain. The team was legible only by reading the
+    bundle's YAML off disk.
+
+    :param name: The sub-agent's declared name, e.g. ``"gemini"``.
+    :param description: Its declared description, or ``None``.
+    :param harness: The harness it currently runs on, e.g.
+        ``"antigravity-native"``. ``None`` when the child spec declares
+        no executor kind.
+    """
+
+    name: str
+    description: str | None = None
+    harness: str | None = None
+
+
 class AgentObject(BaseModel):
     """
     API representation of a registered agent.
@@ -294,6 +317,8 @@ class AgentObject(BaseModel):
     created_at: int
     updated_at: int | None = None
     harness: str | None = None
+    # The delegable team, in spec order. Empty for a single-agent bundle.
+    sub_agents: list[SubAgentSummary] = Field(default_factory=list)
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
     mcp_servers_editable: bool = False
     policies: list[PolicySummary] = Field(default_factory=list)
