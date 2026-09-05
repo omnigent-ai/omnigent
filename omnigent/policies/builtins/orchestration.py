@@ -15,7 +15,13 @@ import shlex
 from collections.abc import Callable, Collection
 from typing import Any, TypeAlias
 
-from omnigent.policies.builtins._shell import SHELL_TOOLS
+from omnigent.policies.builtins._shell import (
+    MAX_SHELL_NESTING,
+    SHELL_TOOLS,
+    real_invocation_tokens,
+    split_command_segments,
+    unwrap_shell_command,
+)
 from omnigent.policies.builtins.safety import NATIVE_WRITE_TOOLS
 
 # Heterogeneous JSON-shaped maps — the V0 policy event + decision payloads.
@@ -135,33 +141,44 @@ _ENV_ASSIGNMENT_RE: re.Pattern[str] = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _SHELL_TOOLS: frozenset[str] = SHELL_TOOLS
 
 
-def _shell_statements(command: str) -> list[list[str]]:
+def _shell_statements(command: str, _depth: int = 0) -> list[list[str]]:
     """
     Best-effort split of a shell command line into per-statement token lists.
 
-    Splits on the common statement / pipe separators (``;`` ``&&`` ``||`` ``|``
-    newline) and tokenizes each piece with :func:`shlex.split` (falling back to
-    a whitespace split on a quoting error). This is a heuristic for catching
-    obvious destructive commands — it deliberately does NOT model subshells,
-    command substitution, or ``eval``, which a determined caller could use to
-    evade it. The policy is a safety net against accidental / obvious damage,
-    not a security boundary (that is sandboxing).
+    Built on the shared ``_shell.py`` primitives (the same ones the ``github``
+    / ``working_dir`` policies use): statements are split on chaining operators
+    and command substitutions, leading env-assignments / wrappers (``sudo``,
+    ``nohup``, ``timeout``, …) are stripped, and shell-interpreter wrappers
+    (``bash -c "<cmd>"``, ``eval``, ``env -S``) are unwrapped recursively — so
+    the same destructive command classifies identically in every spelling
+    rather than asking in one and silently passing in another. Segments that
+    ``shlex`` cannot tokenize fall back to a whitespace split so an obvious
+    ``rm -rf`` next to an unbalanced quote is still classified. The policy is a
+    safety net against accidental / obvious damage, not a security boundary
+    (that is sandboxing).
 
     :param command: A shell command string, e.g. ``"cd repo && rm -rf build"``.
+    :param _depth: Internal recursion guard for nested interpreter wrappers;
+        callers leave it 0.
     :returns: One token list per statement, e.g.
         ``[["cd", "repo"], ["rm", "-rf", "build"]]``.
     """
+    if _depth > MAX_SHELL_NESTING:
+        return []
     statements: list[list[str]] = []
-    for piece in re.split(r"&&|\|\||[;|\n]", command):
-        piece = piece.strip()
-        if not piece:
-            continue
+    for segment in split_command_segments(command):
         try:
-            argv = shlex.split(piece)
+            argv = shlex.split(segment)
         except ValueError:
-            argv = piece.split()
-        if argv:
-            statements.append(argv)
+            argv = segment.split()
+        tokens = real_invocation_tokens(argv)
+        if not tokens:
+            continue
+        inner = unwrap_shell_command(tokens)
+        if inner is not None:
+            statements.extend(_shell_statements(inner, _depth + 1))
+            continue
+        statements.append(tokens)
     return statements
 
 
