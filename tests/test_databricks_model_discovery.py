@@ -371,3 +371,17 @@ def test_select_servable_model_matches_legacy_spelling() -> None:
     assert select_servable_model("databricks-gpt-5-6-luna", servable) == "system.ai.gpt-5-6-luna"
     # A model the workspace does not serve is left for the caller to pass through.
     assert select_servable_model("databricks-gpt-9-9", servable) is None
+
+
+def test_is_system_catalog_spelling_matches_exact_prefix_only() -> None:
+    """Only the exact served ``system.ai.`` spelling counts as canonical.
+
+    Legacy, bare, and oddly-cased ids keep the full resolution path, where a
+    listing can translate them onto the served spelling.
+    """
+    from omnigent.databricks_model_discovery import is_system_catalog_spelling
+
+    assert is_system_catalog_spelling("system.ai.gpt-5-6-sol")
+    assert not is_system_catalog_spelling("databricks-gpt-5-6-sol")
+    assert not is_system_catalog_spelling("gpt-5-6-sol")
+    assert not is_system_catalog_spelling("SYSTEM.AI.gpt-5-6-sol")
