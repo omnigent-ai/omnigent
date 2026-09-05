@@ -1,6 +1,6 @@
 import Foundation
 
-/// A parsed `omnigent://<hostname>/c/<session_id>` deep link — the iOS analog
+/// A parsed `omnigent://<hostname>/{c|archive}/<session_id>` deep link — the iOS analog
 /// of the desktop shell's `parseOmnigentDeepLink` (web/electron/src/deepLink.js),
 /// kept pure so it unit-tests without a WKWebView. See designs/desktop-deep-link.md
 /// for the shared design (URL shape, scheme inference, security rationale).
@@ -87,6 +87,19 @@ struct DeepLink: Equatable {
     return !id.contains { blockedIdCharacters.contains($0) }
   }
 
+  /// Archive locators are server-generated opaque ids. Keep their accepted
+  /// alphabet deliberately small so query text cannot become URL structure
+  /// when the normalized SPA path is rebuilt below.
+  private static func isValidReferenceId(_ id: String) -> Bool {
+    guard !id.isEmpty, id.count <= 256 else { return false }
+    return id.unicodeScalars.allSatisfy { scalar in
+      (scalar.value >= 48 && scalar.value <= 57)
+        || (scalar.value >= 65 && scalar.value <= 90)
+        || (scalar.value >= 97 && scalar.value <= 122)
+        || scalar.value == 95 || scalar.value == 45
+    }
+  }
+
   /// Hostnames that resolve to the local machine — default to `http` for these
   /// (local dev is plain http, and ATS exempts loopback), `https` for everything
   /// else. Mirrors the desktop shell's `LOCAL_HOSTS` / `defaultSchemeFor` so the
@@ -101,7 +114,8 @@ struct DeepLink: Equatable {
     guard raw.scheme?.lowercased() == "omnigent" else { return nil }
     guard let host = raw.host, !host.isEmpty else { return nil }
 
-    // v1 accepts only `/c/<id>`. CRUCIALLY, `URL.path` returns the
+    // Accept the normal `/c/<id>` route and the Archive Library's read-only
+    // `/archive/<id>` route. CRUCIALLY, `URL.path` returns the
     // PERCENT-DECODED path, so a link like `omnigent://host/c/id%3Fview=terminal`
     // exposes `?` as a LITERAL character in `path` (and `%23` → `#`,
     // `%2F` → `/`, `%2E` → `.`, `%00`/`%0A`/`%7F` → control chars). The old
@@ -121,15 +135,46 @@ struct DeepLink: Equatable {
     // parser only stops a malformed link from reaching it with smuggled
     // structure.
     let path = raw.path
-    guard path.hasPrefix("/c/") else { return nil }
-    var id = path.dropFirst(3)
+    let route: String
+    let prefixLength: Int
+    if path.hasPrefix("/c/") {
+      route = "c"
+      prefixLength = 3
+    } else if path.hasPrefix("/archive/") {
+      route = "archive"
+      prefixLength = 9
+    } else {
+      return nil
+    }
+    var id = path.dropFirst(prefixLength)
     if id.hasSuffix("/") { id = id.dropLast() }
     guard !id.isEmpty, !id.contains("/") else { return nil }
     guard isValidConversationId(id) else { return nil }
 
+    var routePath = "/\(route)/\(id)"
+    if route == "archive" {
+      guard raw.fragment == nil,
+        let components = URLComponents(url: raw, resolvingAgainstBaseURL: false),
+        let queryItems = components.queryItems,
+        queryItems.count >= 1, queryItems.count <= 2
+      else { return nil }
+      let itemValues = queryItems.filter { $0.name == "item" }.compactMap(\.value)
+      let responseValues = queryItems.filter { $0.name == "response" }.compactMap(\.value)
+      guard queryItems.allSatisfy({ $0.name == "item" || $0.name == "response" }),
+        queryItems.filter({ $0.name == "item" }).count == 1,
+        queryItems.filter({ $0.name == "response" }).count <= 1,
+        itemValues.count == 1,
+        responseValues.count <= 1,
+        itemValues.allSatisfy({ isValidReferenceId($0) }),
+        responseValues.allSatisfy({ isValidReferenceId($0) }),
+        let encodedQuery = components.percentEncodedQuery
+      else { return nil }
+      routePath += "?\(encodedQuery)"
+    }
+
     let scheme = defaultScheme(for: host)
     guard let origin = makeOrigin(scheme: scheme, host: host, port: raw.port) else { return nil }
-    return DeepLink(origin: origin, path: "/c/\(id)")
+    return DeepLink(origin: origin, path: routePath)
   }
 
   /// Infer `http` for loopback hosts, `https` otherwise — matching the setup

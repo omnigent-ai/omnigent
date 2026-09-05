@@ -16,6 +16,17 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
     document.body.style.userSelect = "none";
   }, []);
 
+  const onKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    setWidth((current) =>
+      Math.max(
+        minRef.current,
+        Math.min(maxRef.current, current + (e.key === "ArrowRight" ? 24 : -24)),
+      ),
+    );
+  }, []);
+
   useEffect(() => {
     function onMouseMove(e: MouseEvent) {
       if (!dragging.current || !containerRef.current) return;
@@ -49,9 +60,14 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
     /** Spread onto the resize handle element at the right edge of the left column. */
     handleProps: {
       onMouseDown,
+      onKeyDown,
       role: "separator" as const,
+      tabIndex: 0,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize terminal list",
+      "aria-valuemin": minWidth,
+      "aria-valuemax": maxWidth,
+      "aria-valuenow": Math.round(width),
     },
   };
 }

@@ -41,6 +41,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from omnigent.tools.builtins.load_skill import format_skill_meta_text
 from tests.server.helpers import create_test_agent
 
@@ -2427,6 +2428,8 @@ async def test_patch_session_archive_hides_from_default_list(
     resp = await client.patch(f"/v1/sessions/{sid}", json={"archived": True})
     assert resp.status_code == 200
     assert resp.json()["archived"] is True
+    archived_at = resp.json()["archived_at"]
+    assert isinstance(archived_at, int)
 
     # Default listing excludes it.
     default_ids = {s["id"] for s in (await client.get("/v1/sessions")).json()["data"]}
@@ -2439,11 +2442,55 @@ async def test_patch_session_archive_hides_from_default_list(
     archived_row = next((s for s in archived_list if s["id"] == sid), None)
     assert archived_row is not None, "include_archived=true must return the archived session"
     assert archived_row["archived"] is True, "list item must carry archived=true"
+    assert archived_row["archived_at"] == archived_at
+
+    renamed = await client.patch(f"/v1/sessions/{sid}", json={"title": "renamed later"})
+    assert renamed.status_code == 200
+    assert renamed.json()["archived_at"] == archived_at
+
+    filtered = await client.get(
+        "/v1/sessions",
+        params={
+            "archived_only": "true",
+            "sort_by": "archived_at",
+            "archived_after": str(archived_at),
+        },
+    )
+    assert filtered.status_code == 200
+    assert sid in {row["id"] for row in filtered.json()["data"]}
+
+    active_overlap = await client.get(
+        "/v1/sessions",
+        params={
+            "archived_only": "true",
+            "active_after": str(session["created_at"]),
+            "active_before": str(session["created_at"] + 1),
+        },
+    )
+    assert active_overlap.status_code == 200
+    assert sid in {row["id"] for row in active_overlap.json()["data"]}
+
+    active_before_creation = await client.get(
+        "/v1/sessions",
+        params={
+            "archived_only": "true",
+            "active_before": str(session["created_at"]),
+        },
+    )
+    assert active_before_creation.status_code == 200
+    assert sid not in {row["id"] for row in active_before_creation.json()["data"]}
+
+    invalid_mixed_sort = await client.get(
+        "/v1/sessions",
+        params={"include_archived": "true", "sort_by": "archived_at"},
+    )
+    assert invalid_mixed_sort.status_code == 400
 
     # Unarchive restores it to the default list.
     resp = await client.patch(f"/v1/sessions/{sid}", json={"archived": False})
     assert resp.status_code == 200
     assert resp.json()["archived"] is False
+    assert resp.json()["archived_at"] is None
     default_ids_after = {s["id"] for s in (await client.get("/v1/sessions")).json()["data"]}
     assert sid in default_ids_after, "unarchived session must reappear in the default list"
 
@@ -10768,3 +10815,198 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+async def test_archived_facets_returns_distinct_server_aggregates(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The Archive page gets filter options in one compact Server response."""
+    codex = await create_test_agent(client, name="codex-native")
+    claude = await create_test_agent(client, name="claude-native")
+    codex_session = await _create_session(
+        client,
+        codex["id"],
+        title="archived codex",
+        labels={"omni_project": "Core"},
+    )
+    claude_session = await _create_session(
+        client,
+        claude["id"],
+        title="archived claude",
+        labels={"omni_project": "Agents"},
+    )
+    first_class_project = SqlAlchemyProjectStore(db_uri).create(
+        uuid.uuid4().hex, "First class", None
+    )
+    first_class_session = await _create_session(
+        client,
+        codex["id"],
+        title="first-class archived session",
+    )
+    SqlAlchemyConversationStore(db_uri).set_conversation_project(
+        first_class_session["id"], first_class_project.id
+    )
+    active = await _create_session(
+        client,
+        codex["id"],
+        title="active only",
+        labels={"omni_project": "Active only"},
+    )
+    host = HostStore(db_uri).upsert_on_connect(
+        "6b9c07bfb42f687d53af44f018adebec",
+        "archive-host",
+        "owner@example.com",
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(codex_session["id"], host_id=host.host_id, workspace="/work/core")
+    for session in (codex_session, claude_session, first_class_session):
+        archived = await client.patch(f"/v1/sessions/{session['id']}", json={"archived": True})
+        assert archived.status_code == 200, archived.text
+
+    response = await client.get("/v1/sessions/archived-facets")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["projects"] == ["Agents", "Core", "First class"]
+    assert body["host_ids"] == [host.host_id]
+    assert body["agent_names"] == ["claude-native", "codex-native"]
+    assert "Active only" not in body["projects"]
+    assert active["id"] not in response.text
+
+    linked = await client.get(
+        "/v1/sessions/archived-facets",
+        params={"project": "Core"},
+    )
+    assert linked.status_code == 200, linked.text
+    assert linked.json()["host_ids"] == [host.host_id]
+    assert linked.json()["agent_names"] == ["codex-native"]
+
+    agent_linked = await client.get(
+        "/v1/sessions/archived-facets",
+        params={"agent_name": "claude-native"},
+    )
+    assert agent_linked.status_code == 200, agent_linked.text
+    assert agent_linked.json()["projects"] == ["Agents"]
+
+
+async def test_search_session_items_is_scoped_to_full_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """Archive readers search persisted items without loading transcript pages."""
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        initial_message="needle unique archive phrase",
+    )
+    await _wait_for_idle(client, session["id"])
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/items/search",
+        params={"search_query": "edle"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["data"]
+    assert any(item.get("role") == "user" for item in body["data"])
+    assert body["first_id"] == body["data"][0]["id"]
+
+
+async def test_get_session_items_window_centers_on_anchor(
+    client: httpx.AsyncClient,
+) -> None:
+    """Archive readers can fetch a bounded window around an exact item."""
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        initial_message="window anchor",
+    )
+    await _wait_for_idle(client, session["id"])
+
+    items_resp = await client.get(f"/v1/sessions/{session['id']}/items")
+    items = items_resp.json()["data"]
+    assert items
+    anchor_id = items[0]["id"]
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/items/window",
+        params={"anchor_id": anchor_id, "before": 1, "after": 1},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    ids = [item["id"] for item in body["data"]]
+    assert body["object"] == "session.items.window"
+    assert body["anchor_id"] == anchor_id
+    assert anchor_id in ids
+    assert len(ids) <= 3
+
+
+async def test_get_session_items_window_404_for_unknown_anchor(
+    client: httpx.AsyncClient,
+) -> None:
+    """A stale deep-link locator does not silently open the wrong message."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="known item")
+    await _wait_for_idle(client, session["id"])
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/items/window",
+        params={"anchor_id": "msg_missing", "before": 1, "after": 1},
+    )
+    assert resp.status_code == 404
+
+
+async def test_archive_item_search_excludes_internal_prompt_context(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    stored = store.append(
+        session["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_hidden",
+                data=MessageData(
+                    role="user",
+                    is_meta=True,
+                    content=[{"type": "input_text", "text": "needle internal context"}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_visible",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "needle visible context"}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_visible_two",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "needle second visible context"}],
+                    agent="test-agent",
+                ),
+            ),
+        ],
+    )
+
+    response = await client.get(
+        f"/v1/sessions/{session['id']}/items/search",
+        params={"search_query": "needle", "limit": 1},
+    )
+
+    assert response.status_code == 200, response.text
+    ids = {item["id"] for item in response.json()["data"]}
+    assert stored[0].id not in ids
+    assert stored[1].id in ids
+    assert stored[2].id not in ids
+    assert response.json()["has_more"] is True

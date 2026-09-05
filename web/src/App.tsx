@@ -60,6 +60,10 @@ const UsagePage = withPageView(
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
+const ArchiveSessionPage = withPageView(
+  "archive_reference",
+  lazy(() => import("@/pages/ArchiveSessionPage").then((m) => ({ default: m.ArchiveSessionPage }))),
+);
 
 interface AppProps {
   /**
@@ -153,6 +157,7 @@ function App({ basename }: AppProps = {}) {
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+          <Route path={`${prefix}/archive/:sessionId`} element={<ArchiveSessionPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
           {isFeatureEnabled(info, "usage_page") && (
