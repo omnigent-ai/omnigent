@@ -16,6 +16,9 @@ Two auth setups are exercised:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -24,6 +27,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.runtime import user_session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
@@ -363,3 +367,103 @@ async def test_cannot_delete_another_users_project(
     assert (
         await multi_user_client.get(f"/v1/projects/{created['id']}", headers=_as_user(BOB))
     ).status_code == 200
+
+
+# ── Live broadcast of project changes ────────────────────────────────────────
+#
+# Project mutations must announce on the owner's session-updates discovery
+# channel (``user_session_stream``): that push is the only thing that lets the
+# owner's OTHER connected clients (another tab, the mobile app) refresh their
+# projects cache, so a rename made here shows up there without a reload.
+
+
+@contextlib.asynccontextmanager
+async def _collect_discovery_events(user_key: str) -> AsyncIterator[list[dict]]:
+    """Collect every event published on ``user_key``'s discovery channel."""
+    events: list[dict] = []
+
+    async def _drain() -> None:
+        async for evt in user_session_stream.subscribe(user_key):
+            events.append(evt)
+
+    task = asyncio.create_task(_drain())
+    # Let the subscriber register before the caller mutates anything.
+    await asyncio.sleep(0)
+    try:
+        yield events
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def _wait_for_events(events: list[dict], count: int, *, timeout: float = 2.0) -> None:
+    """Wait until ``events`` holds ``count`` items (publish is a queued hop)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if len(events) >= count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"expected {count} events, saw {events}")
+
+
+async def test_project_mutations_announce_projects_changed_to_owner(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """Create, rename, and delete each push ``projects_changed`` to the owner
+    — and never to another user's channel (projects are owner-private)."""
+    async with (
+        _collect_discovery_events(ALICE) as alice_events,
+        _collect_discovery_events(BOB) as bob_events,
+    ):
+        created = await multi_user_client.post(
+            "/v1/projects", json={"name": "Live folder"}, headers=_as_user(ALICE)
+        )
+        assert created.status_code == 200
+        await _wait_for_events(alice_events, 1)
+
+        renamed = await multi_user_client.patch(
+            f"/v1/projects/{created.json()['id']}",
+            json={"name": "Live folder renamed"},
+            headers=_as_user(ALICE),
+        )
+        assert renamed.status_code == 200
+        await _wait_for_events(alice_events, 2)
+
+        deleted = await multi_user_client.delete(
+            f"/v1/projects/{created.json()['id']}", headers=_as_user(ALICE)
+        )
+        assert deleted.status_code == 200
+        await _wait_for_events(alice_events, 3)
+
+        assert alice_events == [{"type": "projects_changed"}] * 3
+        # Give any mis-keyed publish a chance to land before asserting silence.
+        await asyncio.sleep(0.05)
+        assert bob_events == []
+
+
+async def test_rejected_project_mutation_announces_nothing(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """A 404'd cross-user rename/delete pushes no event on either channel."""
+    created = await multi_user_client.post(
+        "/v1/projects", json={"name": "Bob private"}, headers=_as_user(BOB)
+    )
+    assert created.status_code == 200
+    async with (
+        _collect_discovery_events(ALICE) as alice_events,
+        _collect_discovery_events(BOB) as bob_events,
+    ):
+        rename = await multi_user_client.patch(
+            f"/v1/projects/{created.json()['id']}",
+            json={"name": "Hijacked"},
+            headers=_as_user(ALICE),
+        )
+        assert rename.status_code == 404
+        delete = await multi_user_client.delete(
+            f"/v1/projects/{created.json()['id']}", headers=_as_user(ALICE)
+        )
+        assert delete.status_code == 404
+        await asyncio.sleep(0.05)
+        assert alice_events == []
+        assert bob_events == []
