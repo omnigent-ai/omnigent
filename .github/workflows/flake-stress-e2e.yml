@@ -233,10 +233,10 @@ jobs:
           # PAT passthrough for the codex / claude-sdk auth commands.
           echo "DATABRICKS_BEARER=$LLM_API_KEY" >> "$GITHUB_ENV"
 
-      - name: Install project and dev dependencies
+      - name: Install project and test dependencies
         # Matches e2e.yml; ``--extra all`` pulls the harness SDKs so the
         # executor adapters import at collection time.
-        run: uv sync --extra all --extra dev
+        run: uv sync --extra all --group test
 
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
