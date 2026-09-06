@@ -113,6 +113,7 @@ vi.mock("@tanstack/react-virtual", () => ({
       getVirtualItemForOffset: (offset: number) =>
         items[Math.max(0, Math.min(Math.floor(offset / ROW), count - 1))],
       getOffsetForIndex: (index: number) => [index * ROW, "start"] as const,
+      takeSnapshot: () => items,
       scrollOffset: 0,
       range: count > 0 ? { startIndex: 0, endIndex: count - 1 } : null,
     };

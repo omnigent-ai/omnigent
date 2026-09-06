@@ -1174,6 +1174,10 @@ const ANCHOR_CAPTURE_MAX_RETRIES = 10;
  */
 export function LatestTurnSpacer({
   scrollElement,
+  conversationId,
+  blockCount: blockCountProp,
+  committedUserIds,
+  hasCommittedAnchor: hasCommittedAnchorProp,
   // Gap left above the pinned anchor. Defaults to clearing the top fade band;
   // with the Plan accordion pinned above (fade dropped, container already below
   // the header), the caller passes the small content inset so a framed turn
@@ -1191,6 +1195,10 @@ export function LatestTurnSpacer({
   remeasureNonce = 0,
 }: {
   scrollElement?: HTMLElement | null;
+  conversationId?: string | null;
+  blockCount?: number;
+  committedUserIds?: ReadonlySet<string>;
+  hasCommittedAnchor?: boolean;
   topGapPx?: number;
   measureRef?: React.RefObject<(() => void) | null>;
   remeasureNonce?: number;
@@ -1198,10 +1206,8 @@ export function LatestTurnSpacer({
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
   };
-  // Block changes remeasure the frozen anchor; streaming growth is covered by
-  // the ResizeObserver. The hydration gate remounts this component on a
-  // conversation switch, which captures that conversation's initial anchor.
-  const blockCount = useChatStore((s) => s.blocks.length);
+  const storeBlockCount = useChatStore((s) => s.blocks.length);
+  const blockCount = blockCountProp ?? storeBlockCount;
   const spacerRef = useRef<HTMLDivElement>(null);
   // The anchor is stored by stable id, not by node reference: the transcript is
   // windowed, so its DOM node is destroyed when the row scrolls out and a fresh
@@ -1215,19 +1221,6 @@ export function LatestTurnSpacer({
     undefined,
   );
   const initialCommittedUserIdsRef = useRef<Set<string> | null>(null);
-  if (initialCommittedUserIdsRef.current === null) {
-    const ids = new Set<string>();
-    for (const block of useChatStore.getState().blocks) {
-      if (
-        block.type === "user_message" &&
-        !isSystemUserContent(block.content) &&
-        block.ctx.itemId !== null
-      ) {
-        ids.add(block.ctx.itemId);
-      }
-    }
-    initialCommittedUserIdsRef.current = ids;
-  }
   // Bounded rAF retries for capturing the anchor when committed blocks exist but
   // their rows haven't mounted yet (windowed transcript, published a frame
   // before the virtualizer fills its window). A resize we could observe isn't
@@ -1240,6 +1233,37 @@ export function LatestTurnSpacer({
   // the next measure past the same-node skip (viewport/content size changed).
   const lastAnchorNodeRef = useRef<HTMLElement | null>(null);
   const forceMeasureRef = useRef(true);
+
+  // Transcript keys the spacer by displayed conversation; this reset also
+  // covers callers that reuse one spacer instance across conversation changes.
+  const storeConversationId = useChatStore((s) => s.conversationId);
+  const displayedConversationId = conversationId ?? storeConversationId;
+  const prevConversationIdRef = useRef(displayedConversationId);
+  if (prevConversationIdRef.current !== displayedConversationId) {
+    prevConversationIdRef.current = displayedConversationId;
+    initialAnchorRef.current = undefined;
+    initialCommittedUserIdsRef.current = null; // recomputed below from new blocks
+    captureAttemptsRef.current = 0;
+    lastAnchorNodeRef.current = null;
+    forceMeasureRef.current = true;
+  }
+  if (initialCommittedUserIdsRef.current === null) {
+    if (committedUserIds) {
+      initialCommittedUserIdsRef.current = new Set(committedUserIds);
+    } else {
+      const ids = new Set<string>();
+      for (const block of useChatStore.getState().blocks) {
+        if (
+          block.type === "user_message" &&
+          !isSystemUserContent(block.content) &&
+          block.ctx.itemId !== null
+        ) {
+          ids.add(block.ctx.itemId);
+        }
+      }
+      initialCommittedUserIdsRef.current = ids;
+    }
+  }
 
   const measure = useCallback(() => {
     const scrollEl = scrollElement ?? ctx.scrollRef?.current;
@@ -1279,8 +1303,9 @@ export function LatestTurnSpacer({
       }
       if (initialUserId === null && initialAssistantId === null) {
         const hasCommittedAnchor =
-          initialCommittedUserIdsRef.current!.size > 0 ||
-          useChatStore.getState().blocks.some((b) => b.type !== "user_message");
+          hasCommittedAnchorProp ??
+          (initialCommittedUserIdsRef.current!.size > 0 ||
+            useChatStore.getState().blocks.some((b) => b.type !== "user_message"));
         // Rows not mounted yet: retry on the next frame, up to a small budget,
         // so a resize that never comes can't leave the spacer uncaptured — and
         // an anchorless turn (tool-only trailing bubble) still settles instead
@@ -1324,6 +1349,7 @@ export function LatestTurnSpacer({
     // mounted set. A missing node would report a zeroed rect that blows the
     // reservation up — hold the last good height until the anchor re-mounts.
     if (!anchor) return;
+    spacerEl.style.display = "";
     // The reservation depends only on the anchor NODE and the viewport height,
     // both scroll-invariant. This effect also fires on every windowed-range
     // change (a scroll-frequency signal), so skip the forced-layout rect reads
@@ -1355,7 +1381,7 @@ export function LatestTurnSpacer({
     );
     const current = Number.parseFloat(spacerEl.style.height) || 0;
     if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
-  }, [ctx.scrollRef, scrollElement, topGapPx]);
+  }, [ctx.scrollRef, hasCommittedAnchorProp, scrollElement, topGapPx]);
 
   // A block-count change shifts content; force past the same-node skip. The
   // range nonce (scroll) does NOT force — the guard skips it when the anchor
@@ -1364,9 +1390,11 @@ export function LatestTurnSpacer({
   useLayoutEffect(() => {
     forceMeasureRef.current = true;
     measure();
-    // remeasureNonce is a dep so a windowed-out anchor's remount re-measures,
-    // but it must NOT force — the same-node guard makes that path cheap.
-  }, [measure, blockCount, remeasureNonce]);
+  }, [measure, blockCount, displayedConversationId]);
+
+  useLayoutEffect(() => {
+    measure();
+  }, [measure, remeasureNonce]);
 
   useLayoutEffect(() => {
     if (!measureRef) return;

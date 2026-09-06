@@ -1,5 +1,15 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
   Conversation,
   ConversationContent,
@@ -11,6 +21,7 @@ import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { cn } from "@/lib/utils";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { hasCommandModifier } from "@/lib/hotkeys";
+import { isSystemUserContent } from "@/lib/systemMessage";
 import {
   type Bubble,
   type BubbleCache,
@@ -50,14 +61,9 @@ import {
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
 } from "@/components/chat/chatBubbleParts";
+import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
 export interface TranscriptProps {
-  /**
-   * Deferred conversation id — keys the `<Conversation>` subtree so it
-   * remounts at transition priority rather than blocking the interaction frame.
-   * Passed from ChatPage as `useDeferredValue(urlConvId)`.
-   */
-  conversationKey: string | null | undefined;
   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
    *  JumpToTopButton hover ancestor). Owned by the parent, forwarded here. */
   setConversationEl: (el: HTMLDivElement | null) => void;
@@ -91,7 +97,6 @@ export interface TranscriptProps {
  * dialogs bail out via React's normal prop-equality check.
  */
 function TranscriptImpl({
-  conversationKey,
   setConversationEl,
   containerEl,
   scroller,
@@ -114,6 +119,7 @@ function TranscriptImpl({
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   const hasTasks = useChatStore((s) => s.todos.length > 0);
+  const conversationId = useChatStore((s) => s.conversationId);
 
   // Build bubbles once per blocks/activeResponse change. Per-surface reuse
   // cache so a streaming append rebuilds only the active bubble, reusing the
@@ -147,6 +153,60 @@ function TranscriptImpl({
     sessionStatus,
   ]);
 
+  const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
+  const streamBubbles = useMemo(
+    () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
+    [bubbles, pendingElicitations.length],
+  );
+  const committedUserIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const block of blocks) {
+      if (
+        block.type === "user_message" &&
+        !isSystemUserContent(block.content) &&
+        block.ctx.itemId !== null
+      ) {
+        ids.add(block.ctx.itemId);
+      }
+    }
+    return ids;
+  }, [blocks]);
+  // Defer one coherent display model. Every bubble-derived surface changes in
+  // the same commit, so the rail/spacer/indicators can never describe the new
+  // conversation while the virtual rows still show the previous one.
+  const nextDisplaySnapshot = useMemo(
+    () => ({
+      conversationId,
+      bubbles,
+      streamBubbles,
+      pendingElicitations,
+      blockCount: blocks.length,
+      committedUserIds,
+      hasCommittedAnchor:
+        committedUserIds.size > 0 || blocks.some((block) => block.type !== "user_message"),
+      hasTasks,
+      mcpStartupActive,
+      hasMoreHistory,
+      loadingMoreHistory,
+      showsWorking,
+    }),
+    [
+      conversationId,
+      bubbles,
+      streamBubbles,
+      pendingElicitations,
+      blocks,
+      committedUserIds,
+      hasTasks,
+      mcpStartupActive,
+      hasMoreHistory,
+      loadingMoreHistory,
+      showsWorking,
+    ],
+  );
+  const display = useDeferredValue(nextDisplaySnapshot);
+  const isSwitchPending = display.conversationId !== conversationId;
+
   // Virtualizer-derived geometry (scroll handle, active turn, range nonce),
   // published by VirtualBubbleList. The rail reads the active turn and the
   // spacer the range nonce, all from the virtualizer's model rather than the
@@ -169,12 +229,12 @@ function TranscriptImpl({
   // excluded — the hotkey is for navigating real user turns, not markers.
   const userMessageIds = useMemo(
     () =>
-      bubbles
+      display.bubbles
         .filter(
           (b): b is Extract<Bubble, { kind: "user" }> => b.kind === "user" && !isSystemBubble(b),
         )
         .map((b) => b.itemId),
-    [bubbles],
+    [display.bubbles],
   );
   const nav = useUserMessageNav(userMessageIds, ensureItemVisible);
 
@@ -182,12 +242,12 @@ function TranscriptImpl({
   // followed. Mirrors the transcript's loaded window and grows lazily.
   const turns = useMemo<Turn[]>(() => {
     const out: Turn[] = [];
-    for (let i = 0; i < bubbles.length; i++) {
-      const b = bubbles[i];
+    for (let i = 0; i < display.bubbles.length; i++) {
+      const b = display.bubbles[i];
       if (b.kind !== "user" || isSystemBubble(b)) continue;
       let preview = "";
-      for (let j = i + 1; j < bubbles.length; j++) {
-        const next = bubbles[j];
+      for (let j = i + 1; j < display.bubbles.length; j++) {
+        const next = display.bubbles[j];
         if (next.kind === "user" && !isSystemBubble(next)) break;
         if (next.kind === "assistant") {
           const textItem = next.items.find((it) => it.kind === "text" && it.text.trim());
@@ -204,19 +264,11 @@ function TranscriptImpl({
       });
     }
     return out;
-  }, [bubbles]);
+  }, [display.bubbles]);
 
-  // Pending elicitation cards float to the bottom of the chat: rendered as the
-  // last items and removed from their inline slot so they don't render twice.
-  // `streamBubbles` keeps `bubbles`' reference when nothing is pending.
-  const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
-  const streamBubbles = useMemo(
-    () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
-    [bubbles, pendingElicitations.length],
-  );
   const lastAssistantIndex = useMemo(
-    () => liveCandidateAssistantIndex(streamBubbles),
-    [streamBubbles],
+    () => liveCandidateAssistantIndex(display.streamBubbles),
+    [display.streamBubbles],
   );
 
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) user-turn navigation.
@@ -233,7 +285,13 @@ function TranscriptImpl({
     return () => window.removeEventListener("keydown", handler);
   }, [nav]);
 
-  const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
+  const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+  useLayoutEffect(() => {
+    const content = scroller?.el.firstElementChild;
+    if (!(content instanceof HTMLElement)) return;
+    content.toggleAttribute("inert", isSwitchPending);
+    return () => content.removeAttribute("inert");
+  }, [isSwitchPending, scroller]);
 
   return (
     <>
@@ -247,15 +305,13 @@ function TranscriptImpl({
         ref={setConversationEl}
         className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
-        <Conversation
-          key={conversationKey ?? "landing"}
-          className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}
-        >
+        <Conversation className={cn(!display.hasTasks && "chat-scroll-fade", "flex-1")}>
           <ConversationContent
             scrollClassName="transcript-hide-native-scrollbar"
+            aria-hidden={isSwitchPending || undefined}
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6",
-              hasTasks ? "pt-4" : "pt-20",
+              display.hasTasks ? "pt-4" : "pt-20",
               "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
               CHAT_COLUMN_WIDTH,
             )}
@@ -265,7 +321,7 @@ function TranscriptImpl({
             <KeepBottomOnViewportResize />
             <ConversationScrollRefBridge onScroller={setScroller} />
             <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
-            {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
+            {display.bubbles.length === 0 && !showWorkingIndicator && !display.mcpStartupActive ? (
               (terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp) ||
               sandboxLaunching ? (
                 <RunnerStartingIndicator variant="hero" />
@@ -286,18 +342,19 @@ function TranscriptImpl({
             ) : (
               <>
                 {/* Older pages prepend here while their request is in flight. */}
-                {loadingMoreHistory && <HistoryLoadingIndicator />}
+                {display.loadingMoreHistory && <HistoryLoadingIndicator />}
                 <VirtualBubbleList
-                  bubbles={streamBubbles}
+                  bubbles={display.streamBubbles}
                   scrollEl={scroller?.el ?? null}
                   lastAssistantIndex={lastAssistantIndex}
-                  showsWorking={showsWorking}
+                  showsWorking={display.showsWorking}
+                  conversationId={display.conversationId}
                   onGeometryChange={onGeometryChange}
                 />
                 {/* Pending elicitation cards, floated to the bottom of the chat
                 so an outstanding question stays in view. Newest renders last,
                 nearest the composer. Above the Working… indicator. */}
-                {pendingElicitations.map((item) => (
+                {display.pendingElicitations.map((item) => (
                   <Message
                     key={item.elicitationId}
                     from="assistant"
@@ -321,8 +378,13 @@ function TranscriptImpl({
             )}
             {/* Frames the initially loaded turn at the top of the viewport. */}
             <LatestTurnSpacer
+              key={display.conversationId ?? "landing"}
               scrollElement={scroller?.el ?? null}
-              topGapPx={hasTasks ? 16 : undefined}
+              conversationId={display.conversationId}
+              blockCount={display.blockCount}
+              committedUserIds={display.committedUserIds}
+              hasCommittedAnchor={display.hasCommittedAnchor}
+              topGapPx={display.hasTasks ? 16 : undefined}
               measureRef={spacerMeasureRef}
               remeasureNonce={spacerMeasureNonce}
             />
@@ -338,12 +400,12 @@ function TranscriptImpl({
         </Conversation>
         {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
         chat-scroll-fade mask. */}
-        <TranscriptScrollbar scroller={scroller} topInset={hasTasks ? 12 : undefined} />
+        <TranscriptScrollbar scroller={scroller} topInset={display.hasTasks ? 12 : undefined} />
         {/* Hover the top edge to reveal a pill that loads all older history. */}
         <JumpToTopButton
           containerEl={containerEl}
           scroller={scroller}
-          hasMoreHistory={hasMoreHistory}
+          hasMoreHistory={display.hasMoreHistory}
         />
         {/* Too-many-tabs warning, a sibling of Conversation. */}
         <StreamBudgetBanner />
@@ -351,8 +413,8 @@ function TranscriptImpl({
         {!isMobileViewport && (
           <TurnRail
             turns={turns}
-            hasMoreHistory={hasMoreHistory}
-            loadingMoreHistory={loadingMoreHistory}
+            hasMoreHistory={display.hasMoreHistory}
+            loadingMoreHistory={display.loadingMoreHistory}
             ensureItemVisible={ensureItemVisible}
             activeTurnId={activeTurnId}
           />
@@ -410,20 +472,86 @@ export interface TranscriptGeometry {
   rangeNonce: number;
 }
 
+export type TranscriptViewSnapshot =
+  | { atBottom: true }
+  | {
+      atBottom: false;
+      anchorKey: string | null;
+      anchorOffset: number;
+      fallbackOffset: number;
+    };
+
+export function captureTranscriptViewSnapshot({
+  atBottom,
+  scrollTop,
+  anchor,
+}: {
+  atBottom: boolean;
+  scrollTop: number;
+  anchor?: { key: string; start: number };
+}): TranscriptViewSnapshot {
+  if (atBottom) return { atBottom: true };
+  return {
+    atBottom: false,
+    anchorKey: anchor?.key ?? null,
+    anchorOffset: anchor ? anchor.start - scrollTop : 0,
+    fallbackOffset: Math.round(scrollTop),
+  };
+}
+
+export function resolveTranscriptViewOffset(
+  snapshot: Exclude<TranscriptViewSnapshot, { atBottom: true }>,
+  getAnchorStart: (key: string) => number | undefined,
+): number {
+  const anchorStart = snapshot.anchorKey === null ? undefined : getAnchorStart(snapshot.anchorKey);
+  return anchorStart === undefined
+    ? snapshot.fallbackOffset
+    : Math.max(0, anchorStart - snapshot.anchorOffset);
+}
+
+const MAX_CACHED_VIEWS = 24;
+const transcriptViewCache = new Map<string, TranscriptViewSnapshot>();
+function rememberTranscriptView(convId: string, snap: TranscriptViewSnapshot): void {
+  transcriptViewCache.delete(convId); // re-insert to refresh LRU order
+  transcriptViewCache.set(convId, snap);
+  while (transcriptViewCache.size > MAX_CACHED_VIEWS) {
+    const oldest = transcriptViewCache.keys().next().value;
+    if (oldest === undefined) break;
+    transcriptViewCache.delete(oldest);
+  }
+}
+/** Physical "is this scroll element at (or within a hair of) its bottom". */
+const BOTTOM_EPSILON_PX = 8;
+const RESTORE_CANCEL_EVENTS = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
+function isElAtBottom(el: HTMLElement): boolean {
+  return el.scrollHeight - el.clientHeight - el.scrollTop <= BOTTOM_EPSILON_PX;
+}
+
 function VirtualBubbleList({
   bubbles,
   scrollEl,
   lastAssistantIndex,
   showsWorking,
+  conversationId,
   onGeometryChange,
 }: {
   bubbles: Bubble[];
   scrollEl: HTMLElement | null;
   lastAssistantIndex: number;
   showsWorking: boolean;
+  conversationId: string | null | undefined;
   /** Publishes virtualizer-derived geometry up to the rail/spacer. */
   onGeometryChange: (geometry: TranscriptGeometry) => void;
 }) {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    stopScroll: () => void;
+    state: { isAtBottom: boolean; escapedFromLock: boolean };
+  };
+  const ctxRef = useRef(ctx);
+  ctxRef.current = ctx;
+  const storeConvId = useChatStore((s) => s.conversationId);
+  const restoringRef = useRef<string | null>(null);
+
   const wrapperRef = useRef<HTMLDivElement>(null);
   // The list isn't the scroll container's first child — indicators, padding,
   // and the task tracker sit above it — so its top offset feeds the virtualizer
@@ -472,6 +600,105 @@ function VirtualBubbleList({
   bubblesRef.current = bubbles;
   const virtualizerRef = useRef(virtualizer);
   virtualizerRef.current = virtualizer;
+
+  // Persist the item crossing the viewport top, not only a raw scrollTop.
+  // Virtual row estimates can change while a conversation is hidden; the key
+  // lets restoration follow the same bubble as those estimates settle.
+  useEffect(() => {
+    if (!scrollEl || !conversationId) return;
+    const save = () => {
+      if (storeConvId !== conversationId || restoringRef.current === conversationId) return;
+      if (isElAtBottom(scrollEl)) {
+        rememberTranscriptView(conversationId, { atBottom: true });
+        return;
+      }
+      const top = scrollEl.scrollTop;
+      const anchor = virtualizerRef.current.getVirtualItemForOffset(top);
+      const bubble = anchor ? bubblesRef.current[anchor.index] : undefined;
+      rememberTranscriptView(
+        conversationId,
+        captureTranscriptViewSnapshot({
+          atBottom: false,
+          scrollTop: top,
+          anchor: anchor && bubble ? { key: bubbleKey(bubble), start: anchor.start } : undefined,
+        }),
+      );
+    };
+    save();
+    scrollEl.addEventListener("scroll", save, { passive: true });
+    return () => {
+      save();
+      scrollEl.removeEventListener("scroll", save);
+    };
+  }, [conversationId, scrollEl, storeConvId]);
+
+  // Restore only when the coherent deferred snapshot changes conversation.
+  // Bottom mode is written synchronously before StickToBottom takes over.
+  // Mid-scroll mode resolves the saved bubble through the virtualizer on every
+  // frame, so estimate-to-measure corrections preserve its viewport position.
+  useLayoutEffect(() => {
+    if (!scrollEl || !conversationId) return;
+    const c = ctxRef.current;
+    const saved = transcriptViewCache.get(conversationId);
+    restoringRef.current = conversationId;
+    let frame = 0;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (restoringRef.current === conversationId) restoringRef.current = null;
+      cancelAnimationFrame(frame);
+      for (const type of RESTORE_CANCEL_EVENTS) {
+        scrollEl.removeEventListener(type, finish);
+      }
+    };
+
+    if (!saved || saved.atBottom) {
+      const pinBottom = () => {
+        c.state.isAtBottom = true;
+        c.state.escapedFromLock = false;
+        scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight - 1);
+        void c.scrollToBottom("instant");
+      };
+      pinBottom();
+      // Runs after sibling layout effects (notably LatestTurnSpacer) but before
+      // the browser's next paint.
+      queueMicrotask(() => {
+        if (!done && restoringRef.current === conversationId) pinBottom();
+      });
+      frame = requestAnimationFrame(() => {
+        pinBottom();
+        frame = requestAnimationFrame(finish);
+      });
+      return finish;
+    }
+
+    c.stopScroll();
+    const deadline = performance.now() + SCROLL_RESTORE_BUDGET_MS;
+    const pinAnchor = () => {
+      scrollEl.scrollTop = resolveTranscriptViewOffset(saved, (key) => {
+        const index = bubblesRef.current.findIndex((bubble) => bubbleKey(bubble) === key);
+        return index < 0
+          ? undefined
+          : virtualizerRef.current.getOffsetForIndex(index, "start")?.[0];
+      });
+    };
+    const tick = () => {
+      if (done || restoringRef.current !== conversationId) return;
+      if (performance.now() >= deadline) {
+        finish();
+        return;
+      }
+      pinAnchor();
+      frame = requestAnimationFrame(tick);
+    };
+    for (const type of RESTORE_CANCEL_EVENTS) {
+      scrollEl.addEventListener(type, finish, { passive: true });
+    }
+    pinAnchor();
+    frame = requestAnimationFrame(tick);
+    return finish;
+  }, [conversationId, scrollEl]);
 
   const scrollToItem = useCallback((itemId: string): boolean => {
     const index = bubblesRef.current.findIndex((b) => b.kind === "user" && b.itemId === itemId);

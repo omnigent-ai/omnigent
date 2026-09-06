@@ -3,7 +3,6 @@ import {
   type KeyboardEvent,
   memo,
   useCallback,
-  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -364,10 +363,6 @@ function truncateTitle(raw: string, max = 60): string {
  */
 export function ChatPage() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
-  // Defer only the transcript key so the <Conversation> subtree remounts at
-  // transition priority. switchTo, routing, and the composer all stay on the
-  // immediate urlConvId — sends always target the conversation the URL shows.
-  const deferredConvId = useDeferredValue(urlConvId);
   const navigate = useNavigate();
   const appName = useAppName();
   // Optional first message handed off by the landing composer through the
@@ -1017,7 +1012,6 @@ export function ChatPage() {
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
-      conversationKey={deferredConvId}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -1242,9 +1236,6 @@ interface MainAgentSurfaceProps {
    * session in terminal-first mode.
    */
   conversationId: string | null;
-  /** Deferred conversation id passed as the transcript key so <Conversation>
-   *  remounts at transition priority instead of blocking the interaction frame. */
-  conversationKey: string | null | undefined;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. Gates the
    *  composer's Stop/Interrupt button — the parent's OWN turn only. */
@@ -1413,7 +1404,6 @@ export function updateWarmTerminalSurfaces(
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
-  conversationKey,
   status,
   isWorking,
   showsWorking,
@@ -1710,7 +1700,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
           <Transcript
-            conversationKey={conversationKey}
             setConversationEl={setConversationEl}
             containerEl={containerEl}
             scroller={scroller}
