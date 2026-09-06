@@ -301,6 +301,28 @@ export function useUnseenTick(): number {
   );
 }
 
+export function useConversationReadState(
+  conversationId: string,
+  updatedAt: number,
+  status: string | undefined,
+): { unseen: boolean; explicitlyUnread: boolean } {
+  const read = () =>
+    (isConversationUnseen(conversationId, updatedAt, status) ? 1 : 0) |
+    (isExplicitlyUnread(conversationId) ? 2 : 0);
+  const state = useSyncExternalStore(
+    (onChange) => {
+      subscribers.add(onChange);
+      return () => subscribers.delete(onChange);
+    },
+    read,
+    read,
+  );
+  return {
+    unseen: (state & 1) !== 0,
+    explicitlyUnread: (state & 2) !== 0,
+  };
+}
+
 /**
  * A conversation is "unseen" only when (a) the agent has finished
  * a turn — status is "idle" or "failed", not "running" — and
