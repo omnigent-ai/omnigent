@@ -1677,10 +1677,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     return (
       <div
         key={entry.conversationId}
-        className={cn(
-          "absolute inset-0 flex flex-col",
-          !isShown && "pointer-events-none invisible",
-        )}
+        className={cn("absolute inset-0 flex flex-col", !isShown && "invisible")}
         aria-hidden={!isShown}
       >
         <MainTerminalView
