@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef } from "react";
+import { memo, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import {
   Conversation,
   ConversationContent,
@@ -26,14 +26,22 @@ import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
 import { RunnerStartingIndicator, McpStartupIndicator } from "@/pages/ChatIndicators";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 import {
+  DEFAULT_BOTTOM_LOCK_ENABLED,
+  readBottomLockEnabled,
+  subscribeBottomLockEnabled,
+} from "@/lib/bottomLockPreferences";
+import {
   type ConversationScroller,
+  BottomLockController,
   BubbleView,
+  ConversationScrollPosition,
   ConversationScrollRefBridge,
   HistoryAutoLoader,
   HistoryLoadingIndicator,
   JumpToTopButton,
   KeepBottomOnViewportResize,
   LatestTurnSpacer,
+  ReleaseBottomLockOnResponseEnd,
   ScrollToBottomOnSend,
   UserMessageNavConnected,
   WorkingIndicator,
@@ -113,6 +121,12 @@ function TranscriptImpl({
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   const hasTasks = useChatStore((s) => s.todos.length > 0);
+  const status = useChatStore((s) => s.status);
+  const bottomLockEnabled = useSyncExternalStore(
+    subscribeBottomLockEnabled,
+    readBottomLockEnabled,
+    () => DEFAULT_BOTTOM_LOCK_ENABLED,
+  );
 
   // Build bubbles once per blocks/activeResponse change. Per-surface reuse
   // cache so a streaming append rebuilds only the active bubble, reusing the
@@ -242,8 +256,10 @@ function TranscriptImpl({
             )}
           >
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
-            <ScrollToBottomOnSend nonce={sendScrollNonce} />
-            <KeepBottomOnViewportResize />
+            <BottomLockController enabled={bottomLockEnabled} />
+            <ScrollToBottomOnSend nonce={sendScrollNonce} enabled={bottomLockEnabled} />
+            <ReleaseBottomLockOnResponseEnd status={status} enabled={bottomLockEnabled} />
+            {bottomLockEnabled && <KeepBottomOnViewportResize />}
             <ConversationScrollRefBridge onScroller={setScroller} />
             <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
             {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
@@ -320,6 +336,11 @@ function TranscriptImpl({
         {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
         chat-scroll-fade mask. */}
         <TranscriptScrollbar scroller={scroller} topInset={hasTasks ? 12 : undefined} />
+        <ConversationScrollPosition
+          conversationId={conversationKey ?? null}
+          scroller={scroller}
+          followBottomOnFallback={bottomLockEnabled}
+        />
         {/* Hover the top edge to reveal a pill that loads all older history. */}
         <JumpToTopButton
           containerEl={containerEl}

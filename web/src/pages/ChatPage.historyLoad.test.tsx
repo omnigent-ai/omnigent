@@ -3,11 +3,15 @@ import { Profiler, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserMessageBlock } from "@/lib/blocks";
 import { useChatStore } from "@/store/chatStore";
+import { captureActiveConversationScroll } from "@/lib/conversationScrollPositions";
 import {
+  BottomLockController,
+  ConversationScrollPosition,
   HistoryAutoLoader,
   JumpToTopButton,
   KeepBottomOnViewportResize,
   LatestTurnSpacer,
+  ReleaseBottomLockOnResponseEnd,
 } from "./ChatPage";
 
 const stickContext = vi.hoisted(() => ({
@@ -68,6 +72,151 @@ function setScrollMetrics(
     get: () => metrics.clientHeight ?? 0,
   });
 }
+
+describe("BottomLockController", () => {
+  afterEach(() => {
+    cleanup();
+    stickContext.scrollRef.current = null;
+    stickContext.stopScroll = undefined;
+  });
+
+  it("releases the lock initially and whenever reaching the bottom re-arms it", () => {
+    const scrollRoot = document.createElement("div");
+    stickContext.scrollRef.current = scrollRoot;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    const stopScroll = vi.fn();
+    stickContext.stopScroll = stopScroll;
+
+    render(<BottomLockController enabled={false} />);
+    expect(stopScroll).toHaveBeenCalledOnce();
+    expect(stickContext.state).toEqual({ isAtBottom: false, escapedFromLock: true });
+
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    fireEvent.scroll(scrollRoot);
+    expect(stopScroll).toHaveBeenCalledTimes(2);
+    expect(stickContext.state).toEqual({ isAtBottom: false, escapedFromLock: true });
+  });
+});
+
+describe("ConversationScrollPosition", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    stickContext.scrollRef.current = null;
+    stickContext.scrollToBottom.mockReset();
+    stickContext.stopScroll = undefined;
+  });
+
+  it("restores a session's non-bottom transcript position after remount", () => {
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((_callback: FrameRequestCallback) => {
+        return 1;
+      }),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    const metrics = { scrollTop: 0, scrollHeight: 2400, clientHeight: 800 };
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+    const stopScroll = vi.fn();
+    stickContext.stopScroll = stopScroll;
+    const scroller = { el: scrollRoot, state: stickContext.state, stopScroll };
+
+    const view = render(
+      <ConversationScrollPosition
+        conversationId="conv-scroll-restore"
+        scroller={scroller}
+        followBottomOnFallback
+      />,
+    );
+    // New-session init parks at the bottom; the reader then scrolls up to 640.
+    metrics.scrollTop = 640;
+    // Switching away captures the reading position ahead of the store switch
+    // (ChatPage's urlConvId effect), so the init scroll can't lose it.
+    captureActiveConversationScroll("conv-scroll-restore");
+    view.rerender(
+      <ConversationScrollPosition
+        conversationId="conv-other-session"
+        scroller={scroller}
+        followBottomOnFallback
+      />,
+    );
+    metrics.scrollTop = 300;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+
+    view.rerender(
+      <ConversationScrollPosition
+        conversationId="conv-scroll-restore"
+        scroller={scroller}
+        followBottomOnFallback
+      />,
+    );
+
+    expect(metrics.scrollTop).toBe(640);
+    expect(stopScroll).toHaveBeenCalledOnce();
+    expect(stickContext.state).toEqual({ isAtBottom: false, escapedFromLock: true });
+  });
+});
+
+describe("ReleaseBottomLockOnResponseEnd", () => {
+  it("keeps the reader's position when streaming settles", () => {
+    const scrollRoot = document.createElement("div");
+    const metrics = { scrollTop: 640, scrollHeight: 2400, clientHeight: 800 };
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    const stopScroll = vi.fn();
+    stickContext.stopScroll = stopScroll;
+
+    const { rerender } = render(
+      <ReleaseBottomLockOnResponseEnd status="streaming" enabled={false} />,
+    );
+    rerender(<ReleaseBottomLockOnResponseEnd status="idle" enabled={false} />);
+
+    expect(stopScroll).toHaveBeenCalledOnce();
+    expect(stickContext.state).toEqual({ isAtBottom: false, escapedFromLock: true });
+    expect(metrics.scrollTop).toBe(640);
+  });
+
+  it("keeps the normal bottom lock when the reader is already at the end", () => {
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 1600, scrollHeight: 2400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    const stopScroll = vi.fn();
+    stickContext.stopScroll = stopScroll;
+
+    const { rerender } = render(
+      <ReleaseBottomLockOnResponseEnd status="streaming" enabled={false} />,
+    );
+    rerender(<ReleaseBottomLockOnResponseEnd status="idle" enabled={false} />);
+
+    expect(stopScroll).not.toHaveBeenCalled();
+    expect(stickContext.state).toEqual({ isAtBottom: true, escapedFromLock: false });
+  });
+
+  it("allows completion to follow the response when bottom locking is enabled", () => {
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 640, scrollHeight: 2400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    const stopScroll = vi.fn();
+    stickContext.stopScroll = stopScroll;
+
+    const { rerender } = render(<ReleaseBottomLockOnResponseEnd status="streaming" enabled />);
+    rerender(<ReleaseBottomLockOnResponseEnd status="idle" enabled />);
+
+    expect(stopScroll).not.toHaveBeenCalled();
+    expect(stickContext.state).toEqual({ isAtBottom: true, escapedFromLock: false });
+  });
+});
 
 describe("KeepBottomOnViewportResize", () => {
   let resize: (() => void) | null;

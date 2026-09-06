@@ -56,6 +56,23 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
 import { useStickToBottomContext } from "use-stick-to-bottom";
+import {
+  getConversationScrollPosition,
+  getConversationScrollRestoreTarget,
+  isConversationScrollPositionRestored,
+  registerActiveConversationScroller,
+  restoreConversationScrollPosition,
+  saveConversationScrollPosition,
+} from "@/lib/conversationScrollPositions";
+import {
+  beginConversationScrollRestore,
+  conversationScrollMode,
+  followConversationBottom,
+  isConversationFollowingBottom,
+  isCurrentConversationScrollRestore,
+  markConversationScrollRestoring,
+  takeConversationScrollControl,
+} from "@/lib/conversationScrollState";
 import { UserMessageNav } from "@/components/UserMessageNav";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
@@ -905,18 +922,24 @@ export function UserMessageNavConnected(props: React.ComponentProps<typeof UserM
   );
 }
 
-/**
- * Forces the conversation back to the bottom when this client submits a new
- * message.
- */
-export function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
-  const { scrollToBottom } = useStickToBottomContext();
+/** Optionally jumps to and follows the response after a local send. */
+export function ScrollToBottomOnSend({ nonce, enabled }: { nonce: number; enabled: boolean }) {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef?: React.RefObject<HTMLElement>;
+  };
+  const scrollRef = ctx.scrollRef;
+  const scrollToBottom = ctx.scrollToBottom;
 
   useLayoutEffect(() => {
-    if (nonce === 0) return;
+    if (!enabled || nonce === 0) return;
+    const el = scrollRef?.current;
+    if (el) followConversationBottom(el);
     scrollToBottom("instant");
-    requestAnimationFrame(() => scrollToBottom("instant"));
-  }, [nonce, scrollToBottom]);
+    const frame = requestAnimationFrame(() => {
+      if (!el || isConversationFollowingBottom(el)) scrollToBottom("instant");
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [enabled, nonce, scrollRef, scrollToBottom]);
 
   return null;
 }
@@ -971,6 +994,261 @@ export function KeepBottomOnViewportResize() {
       if (frame !== null) cancelAnimationFrame(frame);
     };
   }, [scrollRef, scrollToBottom, state]);
+
+  return null;
+}
+
+export function BottomLockController({ enabled }: { enabled: boolean }) {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef?: React.RefObject<HTMLElement>;
+    contentRef?: React.RefObject<HTMLElement>;
+    state: { isAtBottom: boolean; escapedFromLock: boolean };
+    stopScroll: () => void;
+  };
+  const scrollRef = ctx.scrollRef;
+  const contentRef = ctx.contentRef;
+  const state = ctx.state;
+  const stopScroll = ctx.stopScroll;
+
+  useLayoutEffect(() => {
+    if (enabled) return;
+    const scrollElement = scrollRef?.current;
+    const release = () => {
+      stopScroll();
+      state.isAtBottom = false;
+      state.escapedFromLock = true;
+    };
+    release();
+    if (!scrollElement) return;
+
+    scrollElement.addEventListener("scroll", release, { passive: true });
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => release());
+    const contentElement = contentRef?.current;
+    if (contentElement) observer?.observe(contentElement);
+    return () => {
+      scrollElement.removeEventListener("scroll", release);
+      observer?.disconnect();
+    };
+  }, [contentRef, enabled, scrollRef, state, stopScroll]);
+
+  return null;
+}
+
+/**
+ * Preserves each transcript's reading position while switching sessions.
+ *
+ * Session hydration temporarily unmounts the conversation, and StickToBottom
+ * initializes every mount at the end. A user-message anchor and its viewport
+ * offset restore the same visible turn even when transcript height changes.
+ */
+export function ConversationScrollPosition({
+  conversationId,
+  scroller,
+  followBottomOnFallback,
+}: {
+  conversationId: string | null;
+  scroller: ConversationScroller | null;
+  followBottomOnFallback: boolean;
+}) {
+  const scrollElement = scroller?.el ?? null;
+  const scrollState = scroller?.state ?? null;
+  const stopScroll = scroller?.stopScroll ?? null;
+  const followBottomOnFallbackRef = useRef(followBottomOnFallback);
+  useLayoutEffect(() => {
+    followBottomOnFallbackRef.current = followBottomOnFallback;
+  }, [followBottomOnFallback]);
+  useLayoutEffect(() => {
+    const el = scrollElement;
+    if (!el || !conversationId || !scrollState || !stopScroll) return;
+    const unregister = registerActiveConversationScroller(conversationId, el);
+    const saved = getConversationScrollPosition(conversationId);
+    const generation = saved === undefined ? 0 : beginConversationScrollRestore(el);
+    let frame = 0;
+    let restoring = saved !== undefined;
+    let userIntentSeen = false;
+
+    const releaseBottomLock = () => {
+      stopScroll();
+      scrollState.isAtBottom = false;
+      scrollState.escapedFromLock = true;
+    };
+    const persist = () => saveConversationScrollPosition(conversationId, el);
+    const onScroll = () => {
+      if (userIntentSeen && !restoring && conversationScrollMode(el) === "user-controlled")
+        persist();
+    };
+    const takeUserControl = () => {
+      userIntentSeen = true;
+      takeConversationScrollControl(el);
+      restoring = false;
+      cancelAnimationFrame(frame);
+      releaseBottomLock();
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.isContentEditable ||
+        target?.matches('input, textarea, select, button, a, [role="button"]')
+      )
+        return;
+      if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
+        takeUserControl();
+      }
+    };
+
+    const onPointerDown = (event: PointerEvent) => {
+      // A pointerdown on the scroll root itself is a native scrollbar drag.
+      if (event.target === el) takeUserControl();
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    for (const event of ["wheel", "touchmove"] as const) {
+      el.addEventListener(event, takeUserControl, { passive: true });
+    }
+    el.addEventListener("pointerdown", onPointerDown, { passive: true });
+    window.addEventListener("keydown", onKeyDown, true);
+
+    if (saved) {
+      releaseBottomLock();
+      const deadline = performance.now() + 7_000;
+      let quietSince = performance.now();
+      let lastScrollHeight = el.scrollHeight;
+      let largestScrollHeight = lastScrollHeight;
+
+      const finishAtBottom = () => {
+        if (!isCurrentConversationScrollRestore(el, generation)) return;
+        el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        restoring = false;
+        if (followBottomOnFallbackRef.current) {
+          followConversationBottom(el);
+          scrollState.isAtBottom = true;
+          scrollState.escapedFromLock = false;
+        } else {
+          takeConversationScrollControl(el);
+          releaseBottomLock();
+        }
+      };
+
+      const restore = () => {
+        if (!isCurrentConversationScrollRestore(el, generation)) return;
+        const now = performance.now();
+        const scrollHeight = el.scrollHeight;
+        if (scrollHeight !== lastScrollHeight) quietSince = now;
+        largestScrollHeight = Math.max(largestScrollHeight, scrollHeight);
+        const target = getConversationScrollRestoreTarget(el, saved);
+
+        if (target.kind === "restore") {
+          if (!markConversationScrollRestoring(el, generation)) return;
+          restoreConversationScrollPosition(el, saved);
+          const settled =
+            isConversationScrollPositionRestored(el, saved) && now - quietSince >= 150;
+          if (settled) {
+            restoring = false;
+            takeConversationScrollControl(el);
+            releaseBottomLock();
+            persist();
+            return;
+          }
+        } else {
+          // Anchor not yet loaded (history is paginated). Stay at the
+          // currently rendered bottom rather than sitting at scrollTop=0,
+          // so a running session doesn't flash to the top while waiting.
+          if (!markConversationScrollRestoring(el, generation)) return;
+          el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+          // A shrinking document can make the old location permanently invalid.
+          // Once that shrink settles, bottom is the only valid fallback.
+          const shrank = scrollHeight < largestScrollHeight;
+          if (shrank && now - quietSince >= 150) {
+            finishAtBottom();
+            return;
+          }
+        }
+
+        lastScrollHeight = scrollHeight;
+        if (now >= deadline) {
+          finishAtBottom();
+          return;
+        }
+        frame = requestAnimationFrame(restore);
+      };
+      if (saved.wasAtBottom && followBottomOnFallbackRef.current) finishAtBottom();
+      else restore();
+    } else {
+      // No saved position. With the lock on, StickToBottom owns initial
+      // positioning (its own settle parks one pixel short of the maximum) —
+      // writing here would override that park by a pixel and shift the whole
+      // transcript. Only the lock-off path pins explicitly, because the
+      // released library never will.
+      if (followBottomOnFallbackRef.current) {
+        followConversationBottom(el);
+      } else {
+        el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        takeConversationScrollControl(el);
+        releaseBottomLock();
+      }
+    }
+
+    return () => {
+      cancelAnimationFrame(frame);
+      unregister();
+      el.removeEventListener("scroll", onScroll);
+      for (const event of ["wheel", "touchmove"] as const) {
+        el.removeEventListener(event, takeUserControl);
+      }
+      el.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, [conversationId, scrollElement, scrollState, stopScroll]);
+
+  return null;
+}
+
+/** Prevent completion-time resizes from moving readers when bottom locking is disabled. */
+export function ReleaseBottomLockOnResponseEnd({
+  status,
+  enabled,
+}: {
+  status: "idle" | "streaming";
+  enabled: boolean;
+}) {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef?: React.RefObject<HTMLElement>;
+    state: { isAtBottom: boolean; escapedFromLock: boolean };
+    stopScroll: () => void;
+  };
+  const previousStatusRef = useRef(status);
+  const scrollRef = ctx.scrollRef;
+  const state = ctx.state;
+  const stopScroll = ctx.stopScroll;
+
+  useLayoutEffect(() => {
+    const previousStatus = previousStatusRef.current;
+    previousStatusRef.current = status;
+    if (enabled || previousStatus !== "streaming" || status !== "idle") return;
+    const scrollElement = scrollRef?.current;
+    if (!scrollElement || !isConversationFollowingBottom(scrollElement)) return;
+    const scrollTop = scrollElement.scrollTop;
+    const physicallyAtBottom =
+      scrollElement.scrollHeight - scrollElement.clientHeight - scrollTop <= 1;
+    if (physicallyAtBottom) return;
+    const preserve = () => {
+      if (!isConversationFollowingBottom(scrollElement)) return;
+      stopScroll();
+      state.isAtBottom = false;
+      state.escapedFromLock = true;
+      scrollElement.scrollTop = scrollTop;
+    };
+    preserve();
+    let secondFrame = 0;
+    const firstFrame = requestAnimationFrame(() => {
+      preserve();
+      secondFrame = requestAnimationFrame(preserve);
+    });
+    return () => {
+      cancelAnimationFrame(firstFrame);
+      if (secondFrame) cancelAnimationFrame(secondFrame);
+    };
+  }, [enabled, scrollRef, state, status, stopScroll]);
 
   return null;
 }

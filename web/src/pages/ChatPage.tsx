@@ -9,6 +9,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
 import {
@@ -33,6 +34,13 @@ import {
 } from "@/components/KeyboardShortcut";
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { captureActiveConversationScroll } from "@/lib/conversationScrollPositions";
+import { takeConversationScrollControl } from "@/lib/conversationScrollState";
+import {
+  DEFAULT_BOTTOM_LOCK_ENABLED,
+  readBottomLockEnabled,
+  subscribeBottomLockEnabled,
+} from "@/lib/bottomLockPreferences";
 import { Button } from "@/components/ui/button";
 import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
@@ -103,13 +111,16 @@ export type { MentionItem, MentionState };
 // keep working. SessionSharedContext and computeIsWorking are also imported
 // back below for ChatPage's own use.
 export {
+  BottomLockController,
   BubbleView,
+  ConversationScrollPosition,
   ConversationScrollRefBridge,
   HistoryAutoLoader,
   HistoryLoadingIndicator,
   JumpToTopButton,
   KeepBottomOnViewportResize,
   LatestTurnSpacer,
+  ReleaseBottomLockOnResponseEnd,
   ScrollToBottomOnSend,
   SessionSharedContext,
   UserMessageNavConnected,
@@ -431,6 +442,7 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
+    captureActiveConversationScroll(useChatStore.getState().conversationId);
     void useChatStore.getState().switchTo(urlConvId ?? null);
   }, [urlConvId]);
 
@@ -1552,12 +1564,33 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     };
   }, [scroller]);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
+  const bottomLockEnabled = useSyncExternalStore(
+    subscribeBottomLockEnabled,
+    readBottomLockEnabled,
+    () => DEFAULT_BOTTOM_LOCK_ENABLED,
+  );
+  const prepareSendScroll = useCallback(() => {
+    const current = scroller;
+    if (!current) return;
+    // Lock on: sending follows the response (jump to the latest message),
+    // matching the preference's description and the library's contract.
+    if (bottomLockEnabled) {
+      setSendScrollNonce((n) => n + 1);
+      return;
+    }
+    // Lock off: sending must not yank a reader parked in history.
+    const { el, state, stopScroll } = current;
+    takeConversationScrollControl(el);
+    stopScroll();
+    state.isAtBottom = false;
+    state.escapedFromLock = true;
+  }, [bottomLockEnabled, scroller]);
   const handleSend = useCallback(
     (text: string, files?: File[]) => {
-      setSendScrollNonce((n) => n + 1);
+      prepareSendScroll();
       onSend(text, files);
     },
-    [onSend],
+    [onSend, prepareSendScroll],
   );
   // Wrap the slash-command sender the same way (scroll to bottom on send).
   // Gated off for native-wrapper sessions (claude-native / codex-native):
@@ -1579,11 +1612,11 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     () =>
       onSendSlashCommand && !isNativeWrapper
         ? (name: string, args: string) => {
-            setSendScrollNonce((n) => n + 1);
+            prepareSendScroll();
             onSendSlashCommand(name, args);
           }
         : undefined,
-    [onSendSlashCommand, isNativeWrapper],
+    [onSendSlashCommand, isNativeWrapper, prepareSendScroll],
   );
 
   // Synchronous bottom re-pin for the composer's growth, called in the same

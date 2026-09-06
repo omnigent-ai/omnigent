@@ -172,6 +172,12 @@ import {
   writeTranscriptViewDefault,
   type TranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
+import {
+  BOTTOM_LOCK_STORAGE_KEY,
+  DEFAULT_BOTTOM_LOCK_ENABLED,
+  readBottomLockEnabled,
+  writeBottomLockEnabled,
+} from "@/lib/bottomLockPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import {
@@ -754,6 +760,34 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
+function BottomLockControl() {
+  const [enabled, setEnabled] = useState(() => readBottomLockEnabled());
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeBottomLockEnabled(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Keep chat pinned to bottom
+        </span>
+        <span className="text-sm text-muted-foreground">
+          Jump to the latest message when you send, then follow new response content automatically.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="bottom-lock-toggle"
+        className="mt-0.5 shrink-0"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   // Embedded: the host owns light/dark, so the Mode picker would be a no-op —
   // replace it with a note (plus a link to the host's own theme settings when
@@ -785,6 +819,8 @@ function AppearanceSection() {
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
+    writeBottomLockEnabled(DEFAULT_BOTTOM_LOCK_ENABLED);
+
     applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
@@ -810,6 +846,7 @@ function AppearanceSection() {
           "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
           "omnigent:hide-unconfigured-harnesses",
+          BOTTOM_LOCK_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
         }
@@ -894,6 +931,8 @@ function AppearanceSection() {
         <WorkspacePanelDefaultControl />
 
         <HideUnconfiguredHarnessesControl />
+
+        <BottomLockControl />
 
         <UiFontSizeControl />
 

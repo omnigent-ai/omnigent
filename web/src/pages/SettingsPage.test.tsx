@@ -543,6 +543,16 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-font-family")).toBeNull();
   });
 
+  it("keeps automatic bottom locking on by default", () => {
+    renderPage("/settings/appearance");
+    const toggle = screen.getByTestId("bottom-lock-toggle");
+
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(localStorage.getItem("omnigent:bottom-lock")).toBe("false");
+  });
+
   it("resets every appearance preference back to product defaults", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
@@ -557,6 +567,7 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
     fireEvent.click(screen.getByTestId("workspace-panel-default-collapsed"));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
+    fireEvent.click(screen.getByTestId("bottom-lock-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
@@ -613,6 +624,9 @@ describe("SettingsPage", () => {
       "aria-checked",
       "false",
     );
+
+    // Bottom lock is back on (the product default).
+    expect(screen.getByTestId("bottom-lock-toggle")).toHaveAttribute("aria-checked", "true");
   });
 
   it("lets you clear and retype the font size without clamping mid-edit", () => {
