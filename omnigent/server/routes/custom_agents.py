@@ -197,9 +197,7 @@ def create_custom_agents_router(
                         "schema": {
                             "type": "object",
                             "required": ["bundle"],
-                            "properties": {
-                                "bundle": {"type": "string", "format": "binary"}
-                            },
+                            "properties": {"bundle": {"type": "string", "format": "binary"}},
                         }
                     },
                 },

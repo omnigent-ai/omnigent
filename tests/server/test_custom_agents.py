@@ -322,9 +322,7 @@ def test_repeated_instruction_edits_reuse_generated_member() -> None:
     once = patch_bundle(bundle(), {"instructions": "First revision"})
     twice = patch_bundle(once, {"instructions": "Second revision"})
 
-    generated = [
-        name for name in members(twice) if name.startswith("catalog-instructions-")
-    ]
+    generated = [name for name in members(twice) if name.startswith("catalog-instructions-")]
     assert len(generated) == 1
     assert members(twice)[generated[0]][0] == b"Second revision"
     assert validate_agent_bundle(twice).instructions == "Second revision"
