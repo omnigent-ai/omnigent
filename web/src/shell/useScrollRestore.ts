@@ -131,64 +131,56 @@ export function useScrollRestore(
     const pending = pendingRef.current;
     if (!el || !pending || !ready) return;
 
-    const settle = () => {
-      if (pendingRef.current === pending) pendingRef.current = null;
-    };
-
-    // A zero target needs no geometry: write it and settle, so we don't force a
-    // synchronous layout of the freshly mounted tree during the switch commit.
-    if (pending.target === 0) {
-      el.scrollTop = 0;
-      settle();
-      return;
-    }
-
-    // Nonzero: assert the target, then keep re-asserting it as the container
-    // grows/measures — a virtualized tree settles its row heights after mount,
-    // which shifts scrollTop — until it holds through the budget or a user
-    // scrolls. A ResizeObserver on the scrolled content drives the re-asserts
-    // instead of reading layout on every animation frame. Keeping `pending`
-    // non-null until settle also suppresses the save handler, so those
-    // measurement-driven scroll events can't overwrite the saved offset.
-    let done = false;
     let frame = 0;
-    let ro: ResizeObserver | null = null;
+    let done = false;
+    // A user gesture settles the restore so we never fight the reader.
+    const onUserScroll = () => finish();
+    // Tear down listeners/frame WITHOUT touching pendingRef, so it is safe as
+    // the effect's cleanup: under StrictMode dev replay (setup → cleanup →
+    // setup on one commit) settling here would null pendingRef and the re-setup
+    // would then early-return without restoring. Only `finish` settles.
+    const teardown = () => {
+      cancelAnimationFrame(frame);
+      for (const type of USER_SCROLL_EVENTS) el.removeEventListener(type, onUserScroll);
+    };
     const finish = () => {
       if (done) return;
       done = true;
-      settle();
-      for (const type of USER_SCROLL_EVENTS) el.removeEventListener(type, finish);
-      ro?.disconnect();
-      cancelAnimationFrame(frame);
+      if (pendingRef.current === pending) pendingRef.current = null;
+      teardown();
     };
-    const reassert = () => {
-      if (pendingRef.current !== pending) {
+
+    // A zero target needs no work beyond writing it: settle immediately so we
+    // don't force a synchronous layout of the freshly mounted content.
+    if (pending.target === 0) {
+      el.scrollTop = 0;
+      finish();
+      return teardown;
+    }
+
+    // Nonzero: re-assert the target every frame until it holds through the
+    // budget or a user scrolls. This is a write-only loop (`el.scrollTop = …`,
+    // never a scrollHeight/clientHeight read), so it forces no layout and works
+    // for every consumer regardless of which descendant grows — a virtualized
+    // tree's spacer, an editor's content, or async notebook cells. As content
+    // grows, later frames' writes reach further until the offset sticks.
+    // Keeping `pending` non-null until finish also suppresses the save handler,
+    // so growth-driven scroll events can't overwrite the saved offset.
+    const tick = () => {
+      if (done) return;
+      if (pendingRef.current !== pending || performance.now() >= pending.deadline) {
         finish();
         return;
       }
       el.scrollTop = pending.target;
-    };
-    // Poll only the clock (no layout read) until the budget expires; the
-    // ResizeObserver — not this loop — re-asserts on content growth.
-    const tick = () => {
-      if (done) return;
-      if (performance.now() >= pending.deadline) {
-        finish();
-        return;
-      }
       frame = requestAnimationFrame(tick);
     };
     for (const type of USER_SCROLL_EVENTS) {
-      el.addEventListener(type, finish, { passive: true });
+      el.addEventListener(type, onUserScroll, { passive: true });
     }
     el.scrollTop = pending.target;
-    if (typeof ResizeObserver !== "undefined") {
-      ro = new ResizeObserver(reassert);
-      const content = el.firstElementChild;
-      if (content) ro.observe(content);
-    }
-    tick();
-    return finish;
+    frame = requestAnimationFrame(tick);
+    return teardown;
   }, [key, ready, ref]);
 
   return useCallback((event: UIEvent<HTMLElement>) => {

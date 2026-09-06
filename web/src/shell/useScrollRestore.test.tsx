@@ -11,7 +11,7 @@
 //   6. Saving resumes once the restore settles.
 //   7. A null key disables persistence entirely.
 
-import { useRef } from "react";
+import { StrictMode, useRef } from "react";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -171,5 +171,25 @@ describe("useScrollRestore", () => {
     fireEvent.scroll(el);
 
     expect(getSavedScrollTop("null")).toBeUndefined();
+  });
+
+  it("keeps the restore armed under StrictMode's mount/cleanup/mount replay", () => {
+    // StrictMode replays setup → cleanup → setup on one commit. The effect's
+    // cleanup must NOT settle the pending restore, or the replay would leave it
+    // disarmed and a clamp-induced scroll event (scrollTop forced to 0 before
+    // content is tall) would overwrite the saved offset.
+    saveScrollTop("view:strict", 200);
+    const view = render(
+      <StrictMode>
+        <Scroller scrollKey="view:strict" ready />
+      </StrictMode>,
+    );
+    const el = view.getByTestId("scroller");
+
+    // A clamp to 0 (short content) fires a scroll during the still-pending
+    // restore; it must be ignored, not saved.
+    el.scrollTop = 0;
+    fireEvent.scroll(el);
+    expect(getSavedScrollTop("view:strict")).toBe(200);
   });
 });
