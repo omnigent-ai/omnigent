@@ -349,6 +349,7 @@ function TranscriptImpl({
                   lastAssistantIndex={lastAssistantIndex}
                   showsWorking={display.showsWorking}
                   conversationId={display.conversationId}
+                  hasTasks={display.hasTasks}
                   onGeometryChange={onGeometryChange}
                 />
                 {/* Pending elicitation cards, floated to the bottom of the chat
@@ -527,12 +528,13 @@ function isElAtBottom(el: HTMLElement): boolean {
   return el.scrollHeight - el.clientHeight - el.scrollTop <= BOTTOM_EPSILON_PX;
 }
 
-function VirtualBubbleList({
+export function VirtualBubbleList({
   bubbles,
   scrollEl,
   lastAssistantIndex,
   showsWorking,
   conversationId,
+  hasTasks,
   onGeometryChange,
 }: {
   bubbles: Bubble[];
@@ -540,6 +542,7 @@ function VirtualBubbleList({
   lastAssistantIndex: number;
   showsWorking: boolean;
   conversationId: string | null | undefined;
+  hasTasks: boolean;
   /** Publishes virtualizer-derived geometry up to the rail/spacer. */
   onGeometryChange: (geometry: TranscriptGeometry) => void;
 }) {
@@ -578,7 +581,7 @@ function VirtualBubbleList({
     observer.observe(scrollEl); // viewport height changes
     if (wrapper.parentElement) observer.observe(wrapper.parentElement); // content reflow above
     return () => observer.disconnect();
-  }, [scrollEl, bubbles.length]);
+  }, [scrollEl, bubbles.length, hasTasks]);
 
   const virtualizer = useVirtualizer({
     count: bubbles.length,
