@@ -10376,6 +10376,53 @@ def test_claude_catalog_serves_model(
     )
 
 
+def _gateway_catalog() -> list[dict[str, object]]:
+    """A gateway-probed catalog: alias rows onto bare wire models."""
+    return [
+        {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
+        {"id": "opus[1m]", "model": "claude-opus-4-8[1m]", "displayName": "Opus 4.8 (1M)"},
+        {"id": "haiku", "model": "claude-haiku-4-5", "displayName": "Haiku 4.5"},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        # A gateway/catalog-namespace pin folds onto the row's wire model.
+        ("system.ai.claude-sonnet-5", "claude-sonnet-5"),
+        ("databricks-claude-sonnet-5", "claude-sonnet-5"),
+        ("system.ai.claude-opus-4-8[1m]", "claude-opus-4-8[1m]"),
+        # Case is mechanical too.
+        ("SYSTEM.AI.Claude-Sonnet-5", "claude-sonnet-5"),
+        # An exact row keeps the caller's spelling untouched.
+        ("claude-sonnet-5", "claude-sonnet-5"),
+        ("opus[1m]", "opus[1m]"),
+        # The 1M marker distinguishes requests: a bare pin never folds onto a
+        # [1m]-only row, and vice versa.
+        ("system.ai.claude-opus-4-8", None),
+        ("system.ai.claude-haiku-4-5[1m]", None),
+        # A model no row denotes stays refused.
+        ("system.ai.claude-mythos-9", None),
+        ("databricks-gpt-5-5", None),
+        ("", None),
+    ],
+)
+def test_claude_catalog_launch_spelling_folds_gateway_namespaces(
+    model: str, expected: str | None
+) -> None:
+    """A served model pinned in the gateway spelling folds onto the catalog's."""
+    assert claude_native.claude_catalog_launch_spelling(_gateway_catalog(), model) == expected
+
+
+def test_claude_catalog_launch_spelling_refuses_an_ambiguous_fold() -> None:
+    """Two rows spelling different launch ids for one fold cannot pick either."""
+    rows = [
+        {"id": "sonnet", "model": "claude-sonnet-5"},
+        {"id": "sonnet-gw", "model": "system.ai.claude-sonnet-5"},
+    ]
+    assert claude_native.claude_catalog_launch_spelling(rows, "databricks-claude-sonnet-5") is None
+
+
 @pytest.mark.parametrize(
     ("config", "label"),
     [

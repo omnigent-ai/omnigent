@@ -90,17 +90,30 @@ _CANONICAL_ID_PREFIX = "claude-"
 _SEGMENT_RE = re.compile(r"[^a-z0-9]+")
 
 
+def prefix_folded_model_id(model: str) -> str:
+    """Lower-case a model id and strip its catalog prefix, keeping ``[1m]``.
+
+    The mechanical ``databricks-`` / ``system.ai.`` prefixes and case never
+    distinguish models, but the ``[1m]`` marker does (a 1M-context request on
+    the same model), so it survives this fold.
+
+    :param model: Any model id or alias, e.g. ``"system.ai.claude-opus-4-8[1m]"``.
+    :returns: The prefix-folded id, e.g. ``"claude-opus-4-8[1m]"``.
+    """
+    bare = model.strip().lower()
+    for prefix in _CATALOG_PREFIXES:
+        if bare.startswith(prefix):
+            return bare[len(prefix) :]
+    return bare
+
+
 def normalized_model_id(model: str) -> str:
     """Lower-case a model id, dropping catalog prefix and ``[1m]`` suffix.
 
     :param model: Any model id or alias.
     :returns: The comparable bare id, e.g. ``"claude-sonnet-5"``.
     """
-    bare = model.strip().lower().removesuffix("[1m]")
-    for prefix in _CATALOG_PREFIXES:
-        if bare.startswith(prefix):
-            return bare[len(prefix) :]
-    return bare
+    return prefix_folded_model_id(model).removesuffix("[1m]")
 
 
 def alias_pins(env: Mapping[str, str] | None = None) -> dict[str, str]:

@@ -6917,6 +6917,7 @@ async def _auto_create_claude_terminal(
     # and leave the model to invisible CLI-private state.
     if session_model_override or launch_model is None:
         from omnigent.claude_native import (
+            claude_catalog_launch_spelling,
             claude_catalog_serves_model,
             claude_launch_catalog,
             claude_launch_catalog_is_stale,
@@ -6954,42 +6955,79 @@ async def _auto_create_claude_terminal(
                     rows, pick, claude_config
                 ) or claude_catalog_serves_model(rows, resolved_request, claude_config)
 
+            # A spec pin or routing pick can spell a served model in the
+            # gateway/catalog namespace ("system.ai.claude-opus-4-8[1m]")
+            # while the launch catalog lists the same model bare; folding the
+            # mechanical prefix away keeps the pick launchable on the
+            # catalog's own spelling instead of falling back to the default.
+            def _fold_pick(rows: list[dict[str, object]]) -> str | None:
+                """
+                The rows' launch spelling for the pick's persisted or resolved id.
+                """
+                # The custom picker slot resolves to a provider-configured id
+                # (e.g. "system.ai.claude-sonnet-5"), so like _serves_pick the
+                # fold must consult both spellings.
+                return claude_catalog_launch_spelling(
+                    rows, pick
+                ) or claude_catalog_launch_spelling(rows, resolved_request)
+
+            folded_spelling = _fold_pick(launch_catalog)
             # Only rows that are fresh may retire the pick: a stale entry may
             # predate a provider change, so it is re-probed first, and a
-            # failed probe leaves no fresh rows at all.
+            # failed probe leaves no fresh rows at all. A foldable pin counts
+            # as an exact serve for staleness: it launches on the stale rows'
+            # spelling without a re-probe, like the exact-serve stale path.
             fresh_rows: list[dict[str, object]] | None = launch_catalog
-            if launch_catalog_was_stale and not _serves_pick(launch_catalog):
+            if (
+                launch_catalog_was_stale
+                and not _serves_pick(launch_catalog)
+                and folded_spelling is None
+            ):
                 fresh_rows = await claude_reprobed_launch_catalog(claude_config)
                 if fresh_rows:
                     launch_catalog = fresh_rows
                     launch_catalog_was_stale = False
+                    folded_spelling = _fold_pick(launch_catalog)
             if not _serves_pick(launch_catalog):
-                # The pick outlives the provider it was made under (a later
-                # ``omnigent setup`` can re-point the default). Launch on what
-                # this provider serves; reset the pick to Default only on fresh
-                # evidence, so the picker shows what the session now runs.
-                offered = ", ".join(
-                    str(row.get("id") or row.get("model") or "") for row in launch_catalog
-                )
-                if fresh_rows:
-                    reset_pick_after_launch = True
-                    outcome = "launching on the provider default and resetting the pick to Default"
-                else:
-                    outcome = (
-                        "the re-probe failed, so launching on the provider default and "
-                        "keeping the pick for the next relaunch"
+                if folded_spelling is not None:
+                    _logger.info(
+                        "claude launch gate folded the pinned model %r onto the catalog "
+                        "spelling %r for session=%s",
+                        pick,
+                        folded_spelling,
+                        session_id,
+                        extra={"session_id": session_id},
                     )
-                _logger.warning(
-                    "claude-native: model pick %r for session %s is not served by %s "
-                    "(it offers: %s); %s",
-                    pick,
-                    session_id,
-                    claude_launch_endpoint_label(claude_config),
-                    offered,
-                    outcome,
-                    extra={"session_id": session_id},
-                )
-                launch_model = unpinned_launch_model
+                    launch_model = folded_spelling
+                else:
+                    # The pick outlives the provider it was made under (a later
+                    # ``omnigent setup`` can re-point the default). Launch on what
+                    # this provider serves; reset the pick to Default only on fresh
+                    # evidence, so the picker shows what the session now runs.
+                    offered = ", ".join(
+                        str(row.get("id") or row.get("model") or "") for row in launch_catalog
+                    )
+                    if fresh_rows:
+                        reset_pick_after_launch = True
+                        outcome = (
+                            "launching on the provider default and resetting the pick to Default"
+                        )
+                    else:
+                        outcome = (
+                            "the re-probe failed, so launching on the provider default and "
+                            "keeping the pick for the next relaunch"
+                        )
+                    _logger.warning(
+                        "claude-native: model pick %r for session %s is not served by %s "
+                        "(it offers: %s); %s",
+                        pick,
+                        session_id,
+                        claude_launch_endpoint_label(claude_config),
+                        offered,
+                        outcome,
+                        extra={"session_id": session_id},
+                    )
+                    launch_model = unpinned_launch_model
         if launch_model is None and launch_catalog:
             # A stale entry's default is yesterday's answer: pinning it as
             # ``--model`` turns a provider-side retirement or entitlement
