@@ -9,7 +9,14 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
-import { ArrowUpIcon, ClockIcon, GripVerticalIcon, PencilIcon, Trash2Icon } from "lucide-react";
+import {
+  ArrowUpIcon,
+  CircleAlertIcon,
+  ClockIcon,
+  GripVerticalIcon,
+  PencilIcon,
+  Trash2Icon,
+} from "lucide-react";
 
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { QueuedMessage } from "@/store/chatStore";
@@ -75,12 +82,14 @@ function QueuedRow({
     id: message.queueId,
     disabled: !reorderable,
   });
+  const deliveryUncertain = message.deliveryState === "uncertain";
 
   return (
     <div
       ref={setDropRef}
       className={cn(
-        "flex items-center gap-1.5 text-sm text-muted-foreground max-md:gap-0.5",
+        "flex items-center gap-1.5 text-sm max-md:gap-0.5",
+        deliveryUncertain ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground",
         isDragging && "opacity-40",
         isOver && "rounded bg-foreground/5",
       )}
@@ -99,9 +108,14 @@ function QueuedRow({
         >
           <GripVerticalIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
         </button>
+      ) : deliveryUncertain ? (
+        <CircleAlertIcon className="size-3.5 shrink-0" aria-hidden="true" />
       ) : (
         <ClockIcon className={cn(ACTION_ICON_CLASS, "shrink-0")} aria-hidden="true" />
       )}
+      {deliveryUncertain ? (
+        <span className="shrink-0 text-xs font-medium">Delivery uncertain</span>
+      ) : null}
       <span className="min-w-0 flex-1 truncate">{message.text}</span>
       {/* Always visible (not hover-gated) so the actions are discoverable;
           they brighten on hover/focus. */}
@@ -110,14 +124,16 @@ function QueuedRow({
           <TooltipTrigger asChild>
             <button
               type="button"
-              aria-label="Send queued message now"
+              aria-label={deliveryUncertain ? "Retry uncertain message" : "Send queued message now"}
               className={ACTION_BUTTON_CLASS}
               onClick={() => onSteer(message.queueId)}
             >
               <ArrowUpIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
             </button>
           </TooltipTrigger>
-          <TooltipContent side="top">Send now</TooltipContent>
+          <TooltipContent side="top">
+            {deliveryUncertain ? "Check the chat, then retry" : "Send now"}
+          </TooltipContent>
         </Tooltip>
       ) : null}
       <button
@@ -166,9 +182,16 @@ export function QueuedMessagesStrip({
 
   if (messages.length === 0) return null;
 
+  // An uncertain row is an ordering barrier. Hide every drag handle until the
+  // user retries, edits, or removes it so the UI does not advertise an action
+  // that the store must reject to keep later messages behind it.
+  const reorderable =
+    onReorder !== undefined && !messages.some((message) => message.deliveryState === "uncertain");
+  const uncertainIndex = messages.findIndex((message) => message.deliveryState === "uncertain");
+
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
-    if (onReorder === undefined || over === null || active.id === over.id) return;
+    if (!reorderable || onReorder === undefined || over === null || active.id === over.id) return;
     const from = messages.findIndex((m) => m.queueId === active.id);
     const to = messages.findIndex((m) => m.queueId === over.id);
     if (from === -1 || to === -1) return;
@@ -179,14 +202,14 @@ export function QueuedMessagesStrip({
     onReorder(String(active.id), beforeQueueId);
   };
 
-  const rows = messages.map((message) => (
+  const rows = messages.map((message, index) => (
     <QueuedRow
       key={message.queueId}
       message={message}
       onDelete={onDelete}
       onEdit={onEdit}
-      onSteer={onSteer}
-      reorderable={onReorder !== undefined}
+      onSteer={uncertainIndex === -1 || index <= uncertainIndex ? onSteer : undefined}
+      reorderable={reorderable}
     />
   ));
 
@@ -201,7 +224,7 @@ export function QueuedMessagesStrip({
       {/* Cap the list height and scroll when the queue is long, so a big
           backlog never pushes the composer off-screen. ~5 rows tall. */}
       <div className="flex max-h-32 flex-col gap-1 overflow-y-auto">
-        {onReorder === undefined ? (
+        {!reorderable ? (
           rows
         ) : (
           <DndContext

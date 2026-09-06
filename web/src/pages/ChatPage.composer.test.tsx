@@ -164,6 +164,37 @@ describe("Composer session drafts", () => {
     fireEvent.submit(textarea().closest("form")!);
     await waitFor(() => expect(hasSessionDraft("conv_draft")).toBe(false));
   });
+
+  it("consumes one unchanged draft only once when submit is re-entered", () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const form = textarea().closest("form")!;
+    fireEvent.change(textarea(), { target: { value: "send once" } });
+
+    act(() => {
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("send once", undefined);
+  });
+
+  it("allows two intentional submits with identical text", async () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const form = textarea().closest("form")!;
+
+    fireEvent.change(textarea(), { target: { value: "same text" } });
+    fireEvent.submit(form);
+    await Promise.resolve();
+    fireEvent.change(textarea(), { target: { value: "same text" } });
+    fireEvent.submit(form);
+
+    expect(onSend).toHaveBeenCalledTimes(2);
+    expect(onSend).toHaveBeenNthCalledWith(1, "same text", undefined);
+    expect(onSend).toHaveBeenNthCalledWith(2, "same text", undefined);
+  });
 });
 
 describe("Composer growth layout", () => {
@@ -509,10 +540,12 @@ describe("Composer slash-command submit routing", () => {
   // the real action after each test so the mock can't bleed into later
   // tests in this file (zustand state is module-global).
   const realSetModel = useChatStore.getState().setModel;
+  const realCompact = useChatStore.getState().compact;
 
   beforeEach(() => {
     useChatStore.setState({
       conversationId: "conv_test",
+      queuedMessages: [],
       skills: [
         { name: "deep-research", description: "Run a deep research sweep" },
         { name: "deslop", description: "Remove AI slop" },
@@ -523,7 +556,12 @@ describe("Composer slash-command submit routing", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
-    useChatStore.setState({ setModel: realSetModel, sessionHarness: null });
+    useChatStore.setState({
+      setModel: realSetModel,
+      compact: realCompact,
+      queuedMessages: [],
+      sessionHarness: null,
+    });
   });
 
   it("routes a known skill through onSendSlashCommand with parsed args", () => {
@@ -540,6 +578,54 @@ describe("Composer slash-command submit routing", () => {
     expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug");
     // It's a slash_command event, NOT a plaintext message.
     expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("keeps a known skill draft when an earlier queued delivery blocks it", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn().mockReturnValue(false);
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+
+    fireEvent.change(ta, { target: { value: "/deslop fix the bug" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(ta).toHaveValue("/deslop fix the bug");
+    expect(
+      screen.getByText(
+        "Wait for the earlier queued message to settle or resolve its delivery first.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps /compact in the composer while an uncertain delivery blocks it", () => {
+    const compact = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_test",
+      compact,
+      queuedMessages: [
+        {
+          queueId: "q_1",
+          text: "possibly delivered",
+          conversationId: "conv_test",
+          deliveryState: "uncertain",
+        },
+      ],
+    });
+    renderWithTooltips(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    const ta = textarea();
+
+    fireEvent.change(ta, { target: { value: "/compact " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(compact).not.toHaveBeenCalled();
+    expect(ta).toHaveValue("/compact");
+    expect(
+      screen.getByText(
+        "Wait for the earlier queued message to settle or resolve its delivery first.",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("routes a known skill whose args carry slashes (paths, URLs)", () => {
@@ -3049,6 +3135,11 @@ describe("shouldQueueSend", () => {
 
   it("sends directly when idle and nothing is queued for this conversation", () => {
     expect(shouldQueueSend("conv_a", "idle", "idle", [])).toBe(false);
+  });
+
+  it("queues while a queue-owned POST has temporarily removed its head", () => {
+    expect(shouldQueueSend("conv_a", "idle", "idle", [], false, true)).toBe(true);
+    expect(shouldQueueSend("conv_a", "idle", "idle", [], true, true)).toBe(true);
   });
 
   it("sends directly on `waiting` (turn ended, only background work remains)", () => {

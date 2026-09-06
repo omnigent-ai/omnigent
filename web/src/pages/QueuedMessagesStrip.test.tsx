@@ -9,10 +9,15 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { QueuedMessage } from "@/store/chatStore";
 import { QueuedMessagesStrip } from "./QueuedMessagesStrip";
 
-const msg = (queueId: string, text: string): QueuedMessage => ({
+const msg = (
+  queueId: string,
+  text: string,
+  deliveryState?: QueuedMessage["deliveryState"],
+): QueuedMessage => ({
   queueId,
   text,
   conversationId: "conv_abc",
+  ...(deliveryState === undefined ? {} : { deliveryState }),
 });
 
 afterEach(cleanup);
@@ -93,6 +98,47 @@ describe("QueuedMessagesStrip", () => {
     fireEvent.click(buttons[1]!);
     expect(onSteer).toHaveBeenCalledTimes(1);
     expect(onSteer).toHaveBeenCalledWith("q_2");
+  });
+
+  it("labels uncertain delivery and makes retry an explicit action", () => {
+    const onSteer = vi.fn();
+    const longMessage = "possibly delivered ".repeat(20).trim();
+    render(
+      <TooltipProvider>
+        <QueuedMessagesStrip
+          messages={[msg("q_1", longMessage, "uncertain")]}
+          onDelete={vi.fn()}
+          onEdit={vi.fn()}
+          onSteer={onSteer}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText("Delivery uncertain")).toBeInTheDocument();
+    expect(screen.getByText(longMessage)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send queued message now" })).toBeNull();
+    const retry = screen.getByRole("button", { name: "Retry uncertain message" });
+    fireEvent.click(retry);
+    expect(onSteer).toHaveBeenCalledWith("q_1");
+  });
+
+  it("hides every reorder handle while a delivery-uncertain row blocks the queue", () => {
+    render(
+      <TooltipProvider>
+        <QueuedMessagesStrip
+          messages={[msg("q_1", "possibly delivered", "uncertain"), msg("q_2", "wait behind it")]}
+          onDelete={vi.fn()}
+          onEdit={vi.fn()}
+          onSteer={vi.fn()}
+          onReorder={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(screen.queryByRole("button", { name: "Reorder queued message" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Retry uncertain message" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send queued message now" })).toBeNull();
+    expect(screen.getByText("Delivery uncertain")).toBeInTheDocument();
   });
 
   it("gives every row action a 44px mobile tap target with a larger icon", () => {

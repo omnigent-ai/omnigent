@@ -1754,6 +1754,44 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(eventBodies.map(textOf)).toEqual(["1", "2", "3"]);
   });
 
+  it("does not mistake a later queued message for an earlier send barrier", async () => {
+    useChatStore.setState({
+      conversationId: "conv_x",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "idle",
+    });
+
+    const delivered: string[] = [];
+    const resolvers: (() => void)[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_x/events" && init?.method === "POST") {
+        delivered.push(JSON.parse(init.body as string).data.content[0].text);
+        return new Promise<Response>((resolve) => {
+          resolvers.push(() => resolve(mockResponse({ queued: true, item_id: "ci_mock" })));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const first = useChatStore.getState().send("first", "agent_xyz");
+    const second = useChatStore.getState().send("second", "agent_xyz");
+    await tick();
+    expect(delivered).toEqual(["first"]);
+
+    useChatStore.getState().enqueueMessage("third", undefined);
+    resolvers[0]!();
+    await tick();
+    expect(delivered).toEqual(["first", "second"]);
+    expect(useChatStore.getState().queuedMessages.map((message) => message.text)).toEqual([
+      "third",
+    ]);
+
+    resolvers[1]!();
+    await Promise.all([first, second]);
+  });
+
   it("serializes a second send issued while a NEW chat's session is still being created", async () => {
     // The narrowest ordering window, and the one a per-conversation chain
     // opens: the first send from `/` has no conversation id, so it takes a slot
@@ -2379,6 +2417,72 @@ describe("chatStore — sendSlashCommand", () => {
     });
   });
 
+  it("does not post a slash command past an uncertain queued message", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      queuedMessages: [
+        {
+          queueId: "q_1",
+          text: "possibly delivered",
+          conversationId: "conv_existing",
+          deliveryState: "uncertain",
+        },
+      ],
+    });
+
+    await useChatStore.getState().sendSlashCommand("grill-me", "review this plan", "agent_xyz");
+
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url, init]) => String(url).endsWith("/events") && init?.method === "POST",
+      ),
+    ).toEqual([]);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().status).toBe("idle");
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+  });
+
+  it("does not mistake a later queued message for a slash-command barrier", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "idle",
+    });
+    const eventTypes: string[] = [];
+    let releaseFirst: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        const type = JSON.parse(init.body as string).type;
+        eventTypes.push(type);
+        if (type === "message") {
+          return new Promise<Response>((resolve) => {
+            releaseFirst = () => resolve(mockResponse({ queued: true, item_id: "ci_first" }));
+          });
+        }
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const first = useChatStore.getState().send("first", "agent_xyz");
+    await tick();
+    const command = useChatStore
+      .getState()
+      .sendSlashCommand("grill-me", "review this plan", "agent_xyz");
+    useChatStore.getState().enqueueMessage("later", undefined);
+
+    releaseFirst();
+    await first;
+    await command;
+
+    expect(eventTypes).toEqual(["message", "slash_command"]);
+    expect(useChatStore.getState().queuedMessages.map((message) => message.text)).toEqual([
+      "later",
+    ]);
+  });
+
   it("sends empty arguments when the skill is invoked with no args", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
@@ -2614,6 +2718,29 @@ describe("chatStore — sendSlashCommand", () => {
     expect(useChatStore.getState().status).toBe("idle");
     // And rolls back the optimistic echo — no receipt will ever pop it.
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+  });
+
+  it("does not compact past an uncertain queued message", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      queuedMessages: [
+        {
+          queueId: "q_1",
+          text: "possibly delivered",
+          conversationId: "conv_existing",
+          deliveryState: "uncertain",
+        },
+      ],
+    });
+
+    await expect(useChatStore.getState().compact()).rejects.toThrow(
+      "Wait for the earlier queued message to settle or resolve its delivery first.",
+    );
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url, init]) => String(url).endsWith("/events") && init?.method === "POST",
+      ),
+    ).toEqual([]);
   });
 });
 
@@ -10947,6 +11074,26 @@ describe("chatStore — client-side message queue", () => {
     expect(useChatStore.getState().queuedMessages.map((m) => m.queueId)).toEqual(["a1", "o1"]);
   });
 
+  it("reorderQueuedMessage cannot move an uncertain row or its successors", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      queuedMessages: [
+        {
+          queueId: "q_1",
+          text: "possibly delivered",
+          conversationId: "conv_abc",
+          deliveryState: "uncertain",
+        },
+        { queueId: "q_2", text: "wait behind it", conversationId: "conv_abc" },
+      ],
+    });
+
+    useChatStore.getState().reorderQueuedMessage("q_2", "q_1");
+    useChatStore.getState().reorderQueuedMessage("q_1", null);
+
+    expect(useChatStore.getState().queuedMessages.map((m) => m.queueId)).toEqual(["q_1", "q_2"]);
+  });
+
   it("steerMessage sends the chosen message now and removes it from the queue", () => {
     const sendSpy = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({
@@ -11148,6 +11295,103 @@ describe("chatStore — client-side message queue", () => {
 
     expect(sendSpy).not.toHaveBeenCalled();
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["wait"]);
+  });
+
+  it("does not flush an uncertain head after returning to its conversation", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+      send: sendSpy,
+      queuedMessages: [
+        {
+          queueId: "q_1",
+          text: "possibly sent",
+          conversationId: "conv_abc",
+          deliveryState: "uncertain",
+        },
+        { queueId: "q_2", text: "wait behind it", conversationId: "conv_abc" },
+      ],
+    });
+
+    useChatStore.getState().maybeFlushQueuedHead();
+
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
+      "possibly sent",
+      "wait behind it",
+    ]);
+  });
+
+  it("marks a failed active queue flush uncertain and does not flush it again", async () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+      queuedMessages: [{ queueId: "q_1", text: "possibly sent", conversationId: "conv_abc" }],
+    });
+    let posts = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_abc/events" && init?.method === "POST") {
+        posts += 1;
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    await tick();
+    expect(posts).toBe(1);
+    expect(useChatStore.getState().queuedMessages).toMatchObject([
+      { queueId: "q_1", deliveryState: "uncertain" },
+    ]);
+
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    expect(posts).toBe(1);
+  });
+
+  it("keeps a failed explicit retry uncertain until the user acts again", async () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+      queuedMessages: [
+        {
+          queueId: "q_1",
+          text: "possibly sent",
+          conversationId: "conv_abc",
+          deliveryState: "uncertain",
+        },
+      ],
+    });
+    let posts = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_abc/events" && init?.method === "POST") {
+        posts += 1;
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.getState().steerMessage("q_1");
+    await tick();
+    await tick();
+    expect(posts).toBe(1);
+    expect(useChatStore.getState().queuedMessages).toMatchObject([
+      { queueId: "q_1", deliveryState: "uncertain" },
+    ]);
+
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    expect(posts).toBe(1);
   });
 
   // Regression: a message queued while the agent was ALREADY idle (the send
@@ -11373,7 +11617,7 @@ describe("chatStore — background cross-session flush", () => {
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["mine"]);
   });
 
-  it("leaves a message queued when its background POST fails", async () => {
+  it("marks a failed background event POST as delivery-uncertain", async () => {
     seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
     useChatStore.setState({
       conversationId: "conv_active",
@@ -11391,13 +11635,80 @@ describe("chatStore — background cross-session flush", () => {
     await tick();
     await tick();
 
-    // POST failed → the message is re-queued for the next trigger to retry.
-    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["retry-me"]);
+    expect(useChatStore.getState().queuedMessages).toMatchObject([
+      { text: "retry-me", deliveryState: "uncertain" },
+    ]);
   });
 
-  it("does not re-POST a just-failed conversation within its cooldown", async () => {
-    // Guards the retry-storm case: a persistently-failing idle conversation
-    // must not be hammered when the queue-change effect re-fires immediately.
+  it("does not retry when the browser loses an accepted POST response", async () => {
+    seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+    useChatStore.setState({
+      conversationId: "conv_active",
+      queuedMessages: [{ queueId: "q_1", text: "accepted-once", conversationId: "conv_bg" }],
+    });
+    let posts = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/conv_bg\/events$/.test(url) && init?.method === "POST") {
+        posts += 1;
+        // Models the server accepting the event while the browser observes
+        // only a transport failure and cannot inspect the response.
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+    expect(posts).toBe(1);
+    expect(useChatStore.getState().queuedMessages).toMatchObject([
+      { text: "accepted-once", deliveryState: "uncertain" },
+    ]);
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    expect(posts).toBe(1);
+  });
+
+  it("restores a never-settling background POST as uncertain after its timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+      useChatStore.setState({
+        conversationId: "conv_active",
+        queuedMessages: [{ queueId: "q_1", text: "hung", conversationId: "conv_bg" }],
+      });
+      let posts = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (/\/v1\/sessions\/conv_bg\/events$/.test(url) && init?.method === "POST") {
+          posts += 1;
+          return new Promise<Response>(() => {});
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      useChatStore.getState().flushBackgroundQueues();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(posts).toBe(1);
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(180_000);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(useChatStore.getState().queuedMessages).toMatchObject([
+        { queueId: "q_1", deliveryState: "uncertain" },
+      ]);
+
+      useChatStore.getState().flushBackgroundQueues();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(posts).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never automatically retries a delivery-uncertain message", async () => {
     seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
     useChatStore.setState({
       conversationId: "conv_active",
@@ -11413,24 +11724,25 @@ describe("chatStore — background cross-session flush", () => {
       return defaultFetchHandler(input, init);
     });
 
-    // First flush POSTs once and fails → re-queued + cooldown set.
+    // The browser received an error, but the client cannot prove whether the
+    // server persisted the event before producing that response.
     useChatStore.getState().flushBackgroundQueues();
     await tick();
     await tick();
     expect(posts).toBe(1);
 
-    // Immediate re-triggers (mirroring the effect firing on every re-queue)
-    // must NOT POST again while the conversation is in cooldown.
+    // Cache, route, and idle changes may all call the level-triggered flush.
+    // None may turn an uncertain result into a hidden second POST.
     useChatStore.getState().flushBackgroundQueues();
     useChatStore.getState().flushBackgroundQueues();
     await tick();
     expect(posts).toBe(1);
-    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["flaky"]);
+    expect(useChatStore.getState().queuedMessages).toMatchObject([
+      { text: "flaky", deliveryState: "uncertain" },
+    ]);
   });
 
-  it("re-queues a failed head ahead of its own successors (FIFO preserved)", async () => {
-    // conv_bg has two queued messages; only the head fails. It must land back
-    // in front of its successor, not behind it.
+  it("keeps an uncertain head ahead of and blocking its successors", async () => {
     seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
     useChatStore.setState({
       conversationId: "conv_active",
@@ -11451,9 +11763,128 @@ describe("chatStore — background cross-session flush", () => {
     await tick();
     await tick();
 
-    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
-      "bg-first",
-      "bg-second",
+    expect(useChatStore.getState().queuedMessages).toMatchObject([
+      { text: "bg-first", deliveryState: "uncertain" },
+      { text: "bg-second" },
+    ]);
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    expect(eventPosts()).toEqual([{ id: "conv_bg", text: "bg-first" }]);
+  });
+
+  it("does not send a successor when an active flush fails after navigation", async () => {
+    seedConversationsCache([conv("conv_source", "idle"), conv("conv_other", "idle")]);
+    bindConversationForTest("conv_source", {
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+    });
+    useChatStore.setState({
+      queuedMessages: [{ queueId: "q_1", text: "possibly sent", conversationId: "conv_source" }],
+    });
+
+    const posted: string[] = [];
+    let rejectFirst: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_source/events" && init?.method === "POST") {
+        const body = JSON.parse(init.body as string);
+        const text = body.data.content.find(
+          (block: { type: string }) => block.type === "input_text",
+        )?.text;
+        posted.push(text);
+        if (text === "possibly sent") {
+          return new Promise<Response>((_resolve, reject) => {
+            rejectFirst = () => reject(new TypeError("Failed to fetch"));
+          });
+        }
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    expect(posted).toEqual(["possibly sent"]);
+
+    // A non-Composer caller can still invoke send directly while the queue head
+    // is temporarily absent. It joins the same send chain and must recheck the
+    // queue after the first POST settles.
+    const laterSend = useChatStore.getState().send("must wait", "agent_xyz");
+    await tick();
+    expect(posted).toEqual(["possibly sent"]);
+
+    bindConversationForTest("conv_other", {
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+    });
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    expect(posted).toEqual(["possibly sent"]);
+
+    rejectFirst();
+    await laterSend;
+    await tick();
+    await tick();
+    expect(useChatStore.getState().queuedMessages).toMatchObject([
+      { text: "possibly sent", deliveryState: "uncertain" },
+      { text: "must wait" },
+    ]);
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    expect(posted).toEqual(["possibly sent"]);
+  });
+
+  it("keeps a queued predecessor ahead when it becomes in-flight during a chain wait", async () => {
+    seedConversationsCache([conv("conv_source", "idle"), conv("conv_other", "idle")]);
+    bindConversationForTest("conv_source", {
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+    });
+
+    const posted: string[] = [];
+    let releaseFirst: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_source/events" && init?.method === "POST") {
+        const text = JSON.parse(init.body as string).data.content.find(
+          (block: { type: string }) => block.type === "input_text",
+        )?.text;
+        posted.push(text);
+        if (text === "first") {
+          return new Promise<Response>((resolve) => {
+            releaseFirst = () => resolve(mockResponse({ queued: true, item_id: "ci_first" }));
+          });
+        }
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const first = useChatStore.getState().send("first", "agent_xyz");
+    await tick();
+    useChatStore.setState({
+      queuedMessages: [{ queueId: "q_1", text: "queued-first", conversationId: "conv_source" }],
+    });
+    const later = useChatStore.getState().send("later-direct", "agent_xyz");
+
+    bindConversationForTest("conv_other", {
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+    });
+    useChatStore.getState().flushBackgroundQueues();
+    releaseFirst();
+    await first;
+    await later;
+    await tick();
+    await tick();
+
+    expect(posted).toEqual(["first", "queued-first"]);
+    expect(useChatStore.getState().queuedMessages.map((message) => message.text)).toEqual([
+      "later-direct",
     ]);
   });
 
@@ -11531,10 +11962,44 @@ describe("chatStore — background cross-session flush", () => {
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["with-image"]);
   });
 
-  it("does not re-upload an attachment when a retry follows a post-phase failure", async () => {
-    // Upload succeeds but the post fails → re-queued on cooldown. The retry
-    // must reuse the already-uploaded file_id, not upload the blob again (which
-    // would orphan the first one server-side).
+  it("restores a never-settling upload without marking delivery uncertain", async () => {
+    vi.useFakeTimers();
+    try {
+      seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+      let events = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/v1/sessions/conv_bg/resources/files") && init?.method === "POST") {
+          return new Promise<Response>(() => {});
+        }
+        if (/\/v1\/sessions\/conv_bg\/events$/.test(url) && init?.method === "POST") {
+          events += 1;
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const file = new File(["x"], "hung.png", { type: "image/png" });
+      useChatStore.setState({
+        conversationId: "conv_active",
+        queuedMessages: [
+          { queueId: "q_1", text: "with-image", conversationId: "conv_bg", files: [file] },
+        ],
+      });
+
+      useChatStore.getState().flushBackgroundQueues();
+      await vi.advanceTimersByTimeAsync(180_000);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(events).toBe(0);
+      expect(useChatStore.getState().queuedMessages).toMatchObject([
+        { queueId: "q_1", text: "with-image" },
+      ]);
+      expect(useChatStore.getState().queuedMessages[0]?.deliveryState).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reuses an uploaded attachment only after an explicit uncertain-delivery retry", async () => {
     seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
     let uploads = 0;
     let failPost = true;
@@ -11557,23 +12022,36 @@ describe("chatStore — background cross-session flush", () => {
     useChatStore.setState({
       conversationId: "conv_active",
       queuedMessages: [
-        { queueId: "q_1", text: "see this", conversationId: "conv_bg", files: [file] },
+        {
+          queueId: "q_1",
+          text: "see this",
+          conversationId: "conv_bg",
+          agentId: "agent_xyz",
+          files: [file],
+        },
       ],
     });
 
-    // First attempt: upload lands, post fails → re-queued.
+    // Upload lands, then the event POST fails ambiguously.
     useChatStore.getState().flushBackgroundQueues();
     await tick();
     await tick();
     expect(uploads).toBe(1);
-    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["see this"]);
+    expect(useChatStore.getState().queuedMessages).toMatchObject([
+      { text: "see this", deliveryState: "uncertain" },
+    ]);
 
-    // Retry (post now succeeds): the upload must NOT run again. Re-init clears
-    // the post-failure cooldown (same query client → seeded cache persists)
-    // without touching the queue or the File→upload cache.
+    // Nothing retries until the user returns to this conversation and clicks
+    // the row's retry action. The File-to-upload cache still avoids a second
+    // blob upload.
     failPost = false;
-    initChatStore(client);
-    useChatStore.getState().flushBackgroundQueues();
+    useChatStore.setState({
+      conversationId: "conv_bg",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+    });
+    useChatStore.getState().steerMessage("q_1");
     await tick();
     await tick();
     expect(uploads).toBe(1);
