@@ -147,7 +147,9 @@ def test_new_session_shows_first_prompt_optimistically(
 
     # Sanity: the real auto-send handoff ran (its POST was intercepted),
     # so a green run isn't a composer that silently never sent.
-    # Yield through Playwright so its sync dispatcher can run the route callback.
+    # Pump the driver with wait_for_timeout, not time.sleep: the sync API
+    # dispatches route handlers only inside Playwright calls, so a bare
+    # sleep loop never runs handle_events for a late-landing POST.
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline and _PROMPT not in event_texts:
         page.wait_for_timeout(50)

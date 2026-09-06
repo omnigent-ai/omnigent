@@ -877,6 +877,22 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def clear_model_override_if_matches(
+        self,
+        conversation_id: str,
+        expected_model_override: str,
+    ) -> bool:
+        """Clear a model selection only while the stored settings still match.
+
+        :param conversation_id: Conversation to update.
+        :param expected_model_override: Model selection that must still be stored.
+        :returns: ``True`` when cleared; ``False`` when missing, mismatched,
+            or any session override changed concurrently. Other settings and
+            metadata remain unchanged.
+        """
+        ...
+
+    @abstractmethod
     def rename_conversation_if_title_matches(
         self,
         conversation_id: str,

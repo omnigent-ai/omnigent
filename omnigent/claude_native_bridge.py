@@ -47,10 +47,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
-from urllib import error, request
+from urllib import request
 
 from omnigent._platform import stable_user_id
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
@@ -58,6 +59,7 @@ from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import CONTEXT_RAW_FILE
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
+from omnigent.model_metadata import concrete_reported_model
 
 if TYPE_CHECKING:
     import httpx
@@ -3809,8 +3811,8 @@ def post_tools_changed(
     :param timeout_s: Seconds to wait for the bridge HTTP control
         endpoint to publish itself, e.g. ``30.0``.
     :returns: None.
-    :raises RuntimeError: If the bridge server is not ready or
-        rejects the notification.
+    :raises RuntimeError: If the bridge server is not ready, cannot
+        be reached, or rejects the notification.
     """
     server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s)
     token = server.get("token")
@@ -3830,7 +3832,7 @@ def post_tools_changed(
         with request.urlopen(req, timeout=_TOOLS_CHANGED_POST_TIMEOUT_S) as resp:
             if resp.status >= 400:
                 raise RuntimeError(f"tools-changed POST failed with HTTP {resp.status}")
-    except error.URLError as exc:
+    except (OSError, HTTPException) as exc:
         raise RuntimeError(f"failed to notify Claude tool list change: {exc}") from exc
 
 
@@ -4713,7 +4715,7 @@ def _tool_relay_handler_factory(
             # process where these modules are already loaded.
             from omnigent.native_policy_hook import (
                 evaluation_response_to_hook_output,
-                fail_closed_hook_output,
+                fail_ask_hook_output,
                 hook_payload_to_evaluation_request,
             )
 
@@ -4763,7 +4765,7 @@ def _tool_relay_handler_factory(
                     last_error = "malformed EvaluationResponse body"
                 break
             if not isinstance(verdict, dict) or not verdict.get("result"):
-                self._respond_hook_output(fail_closed_hook_output(hook_event, last_error))
+                self._respond_hook_output(fail_ask_hook_output(hook_event, last_error))
                 return
             self._respond_hook_output(evaluation_response_to_hook_output(hook_event, verdict))
 
@@ -5537,10 +5539,7 @@ def _model_from_transcript_entry(entry: _JsonObject) -> str | None:
     message = entry.get("message")
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return None
-    model = message.get("model")
-    if isinstance(model, str) and model:
-        return model
-    return None
+    return concrete_reported_model(message.get("model"))
 
 
 def _custom_title_from_transcript_entry(entry: _JsonObject) -> str | None:

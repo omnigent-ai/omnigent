@@ -488,6 +488,49 @@ def claude_catalog_serves_model(
     )
 
 
+def claude_catalog_launch_spelling(
+    rows: list[dict[str, object]],
+    model: str,
+) -> str | None:
+    """The catalog's own launch spelling for *model*, when a row denotes it.
+
+    A deployed spec pin or a routing pick can spell a served model in the
+    gateway/catalog namespace (``system.ai.claude-opus-4-8[1m]``,
+    ``databricks-claude-sonnet-5``) while the launch catalog lists the same
+    model bare — the mechanical ``databricks-`` / ``system.ai.`` prefixes and
+    case never distinguish models. Fold those away and return the matching
+    row's wire model (its id when the row carries no wire model): the
+    spelling this catalog vouches for as ``--model``. The ``[1m]`` marker
+    denotes a distinct request on the same model, so it never folds away.
+
+    An exact row keeps the caller's spelling. An id no row folds onto — or
+    one that folds onto several *different* launch spellings — returns
+    ``None``; the caller decides whether that refuses the launch.
+
+    :param rows: Catalog rows, e.g. ``[{"id": "opus", "model": "claude-opus-5"}]``.
+    :param model: A picker id or model id, e.g. ``"system.ai.claude-opus-5"``.
+    :returns: The catalog's launch spelling for the model, or ``None``.
+    """
+    from omnigent.claude_model_vocabulary import prefix_folded_model_id
+    from omnigent.model_catalog_store import catalog_contains
+
+    if catalog_contains(rows, model):
+        return model
+    folded = prefix_folded_model_id(model)
+    if not folded:
+        return None
+    spellings: set[str] = set()
+    for row in rows:
+        row_id = str(row.get("id") or "").strip()
+        wire_model = str(row.get("model") or "").strip()
+        if any(
+            spelling and prefix_folded_model_id(spelling) == folded
+            for spelling in (row_id, wire_model)
+        ):
+            spellings.add(wire_model or row_id)
+    return next(iter(spellings)) if len(spellings) == 1 else None
+
+
 def _endpoint_origin(url: str) -> str:
     """
     Reduce an endpoint URL to its scheme and host, for log lines.

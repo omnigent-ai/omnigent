@@ -14,10 +14,13 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator
+from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TextIO
+from unittest.mock import Mock
+from urllib.error import URLError
 
 import pytest
 
@@ -4607,6 +4610,48 @@ def test_inject_slash_command_raises_when_tmux_target_never_published(
         )
 
 
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        URLError("bridge unavailable"),
+        ConnectionResetError("connection reset"),
+        RemoteDisconnected("bridge disconnected"),
+        TimeoutError("notification timed out"),
+        BadStatusLine("invalid response"),
+    ],
+)
+def test_post_tools_changed_normalizes_transport_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transport_error: Exception
+) -> None:
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_server_info",
+        Mock(return_value={"url": "http://127.0.0.1:12345", "token": "test-token"}),
+    )
+    monkeypatch.setattr(claude_native_bridge.request, "urlopen", Mock(side_effect=transport_error))
+
+    with pytest.raises(RuntimeError, match="failed to notify Claude tool list change") as caught:
+        post_tools_changed(tmp_path)
+
+    assert caught.value.__cause__ is transport_error
+
+
+def test_post_tools_changed_preserves_programming_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_server_info",
+        Mock(return_value={"url": "http://127.0.0.1:12345", "token": "test-token"}),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge.request, "urlopen", Mock(side_effect=ValueError("bug"))
+    )
+
+    with pytest.raises(ValueError, match="bug"):
+        post_tools_changed(tmp_path)
+
+
 @pytest.mark.asyncio
 async def test_channel_server_relays_active_omnigent_tools(
     tmp_path: Path,
@@ -5769,6 +5814,37 @@ def test_read_transcript_items_from_offset_returns_latest_model(
     )
 
     assert result.latest_model == "claude-opus-4-7"
+
+
+@pytest.mark.parametrize("initial_model", [None, "gateway-claude-model"])
+def test_transcript_synthetic_error_preserves_model(
+    tmp_path: Path, initial_model: str | None
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    models = [initial_model, "<synthetic>"] if initial_model else ["<synthetic>"]
+    transcript_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": f"a{index}",
+                    "message": {
+                        "role": "assistant",
+                        "model": model,
+                        "content": [{"type": "text", "text": "API Error: 429"}],
+                    },
+                }
+            )
+            + "\n"
+            for index, model in enumerate(models)
+        ),
+        encoding="utf-8",
+    )
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    assert result.latest_model == initial_model
+    assert result.items  # Error messages remain visible; only model metadata is ignored.
 
 
 def test_read_transcript_items_surfaces_custom_title_without_an_item(
@@ -8974,7 +9050,7 @@ async def test_hook_evaluate_endpoint_returns_deny_hook_output(
 async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Upstream failure denies PreToolUse and stays open for PostToolUse."""
+    """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
     client = _ScriptedPolicyClient(None)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
@@ -8985,7 +9061,7 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
             _PRE_TOOL_USE_PAYLOAD,
         )
         output = json.loads(body)
-        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
 
         post_body = await asyncio.to_thread(
             _relay_request_raw,
@@ -9060,7 +9136,7 @@ async def test_curl_evaluate_policy_command_round_trips(
     )
     assert result.returncode == 0, result.stderr
     output = json.loads(result.stdout)
-    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
 
 

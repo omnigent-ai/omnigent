@@ -25,7 +25,7 @@ from omnigent.runner.resource_registry import (
     _sanitize_session_id,
     _session_workspace,
     _terminal_exit_diagnostics,
-    _trim_terminal_exit_output,
+    trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
@@ -757,13 +757,13 @@ async def test_required_terminal_exit_while_running_is_failure(tmp_path: Path) -
     assert exits[0].session_was_idle is False
 
 
-def test_trim_terminal_exit_output_drops_whole_leading_lines() -> None:
+def test_trim_terminal_output_drops_whole_leading_lines() -> None:
     # Over the char budget: the first surviving line must be a WHOLE line, never
     # a mid-word fragment (the "rity reasons" cut). The final line — the one that
     # matters — stays intact.
     filler = "\n".join(f"line {i} " + "x" * 80 for i in range(200))
     text = filler + "\n--dangerously-skip-permissions cannot be run for security reasons"
-    trimmed = _trim_terminal_exit_output(text)
+    trimmed = trim_terminal_output(text)
     assert trimmed is not None
     assert len(trimmed) <= _TERMINAL_EXIT_OUTPUT_MAX_CHARS + 60  # + the omitted-lines marker
     assert trimmed.startswith("... omitted ")
@@ -774,11 +774,11 @@ def test_trim_terminal_exit_output_drops_whole_leading_lines() -> None:
     assert first_content.startswith("line ")
 
 
-def test_trim_terminal_exit_output_hard_clips_single_overlong_line() -> None:
+def test_trim_terminal_output_hard_clips_single_overlong_line() -> None:
     # A single line longer than the budget has no line boundary to snap to, so
     # it's clipped from the tail as a last resort.
     line = "y" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 500)
-    trimmed = _trim_terminal_exit_output(line)
+    trimmed = trim_terminal_output(line)
     assert trimmed is not None
     assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
 

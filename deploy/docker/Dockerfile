@@ -41,6 +41,11 @@
 #   docker build -t omnigent-host:latest --target host \
 #                -f deploy/docker/Dockerfile .
 #
+# To bake extra harness CLIs into a host image beyond the default set, build
+# with EXTRA_HARNESS_CLIS="goose jcode opencode" — harness names, optional
+# @version pins, or npm:<pkg-spec> entries (see deploy/docker/README.md and
+# deploy/docker/install-harness-cli.sh for the supported names).
+#
 # Behind corporate package proxies (the host target also installs the
 # harness CLIs from npm, so it needs the npm proxy too):
 #
@@ -208,9 +213,11 @@ ENV PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:${PATH}" \
     IS_SANDBOX=1
 
+# bzip2 ships on every host so the goose EXTRA_HARNESS_CLIS row works without
+# another package-list edit (goose's release archive is .tar.bz2).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      git tmux procps lsof bubblewrap curl ca-certificates unzip \
+      git tmux procps lsof bubblewrap curl ca-certificates unzip bzip2 \
       iproute2 nftables \
  && rm -rf /var/lib/apt/lists/*
 
@@ -315,6 +322,12 @@ RUN set -eu; \
 ARG AGY_VERSION=1.1.16
 ARG AGY_SHA256_AMD64=7742953b7835b457e9102f1357a493913657dfd147435584f609d58356ec085a
 ARG AGY_SHA256_ARM64=c71599bb548cf72dfe7a8f6c411b3c7a3623cd4b0f6276bae89c69f769d6c92d
+# Exported for install-harness-cli.sh's agy row, so a build that adds
+# EXTRA_HARNESS_CLIS=agy pins the same version + sha256 as the install above
+# (and UBI — which has no baked agy — pins the same values).
+ENV AGY_VERSION=${AGY_VERSION} \
+    AGY_SHA256_AMD64=${AGY_SHA256_AMD64} \
+    AGY_SHA256_ARM64=${AGY_SHA256_ARM64}
 RUN set -eu; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
@@ -383,6 +396,19 @@ RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
 # resolve to the system Python instead of the venv. profile.d snippets
 # are sourced after that reset, so this puts the venv back in front.
 RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
+
+# Optional extra harness CLIs, off by default: space-separated harness names
+# with optional @version pins, or npm:<pkg-spec> — see install-harness-cli.sh
+# and deploy/docker/README.md. Kept at the end of the stage so script churn
+# doesn't bust the layers above. `set -f` stops glob expansion in the unquoted
+# arg list (npm specs may contain *). The script is removed after use.
+ARG EXTRA_HARNESS_CLIS=
+COPY deploy/docker/install-harness-cli.sh /tmp/install-harness-cli.sh
+RUN if [ -n "${EXTRA_HARNESS_CLIS}" ]; then \
+        set -f; \
+        bash /tmp/install-harness-cli.sh ${EXTRA_HARNESS_CLIS}; \
+    fi; \
+    rm -f /tmp/install-harness-cli.sh
 
 WORKDIR /root
 

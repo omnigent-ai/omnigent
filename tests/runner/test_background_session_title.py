@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import stat
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date
@@ -661,6 +662,75 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
     assert process_manager.get_client_calls == []
     assert process_manager.released == []
     assert harness_client.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_during_lookup", [False, True])
+async def test_codex_native_title_keeps_loop_responsive_during_profile_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cancel_during_lookup: bool,
+) -> None:
+    """Title preparation must not block unrelated runner tasks on profile lookup."""
+    loop = asyncio.get_running_loop()
+    lookup_started = asyncio.Event()
+    lookup_release = threading.Event()
+    lookup_finished = threading.Event()
+    loop_progressed: list[bool] = []
+
+    def resolve_host(profile: str | None) -> None:
+        assert profile == "test-profile"
+        loop.call_soon_threadsafe(lookup_started.set)
+        loop_progressed.append(lookup_release.wait(timeout=1.0))
+        lookup_finished.set()
+
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.resolve_native_codex_launch",
+        lambda *, model, spec=None: NativeCodexLaunch([], model, "test-profile"),
+    )
+    monkeypatch.setattr("omnigent.codex_native_app_server._find_codex_cli", lambda: "codex")
+    monkeypatch.setattr("omnigent.codex_native_app_server._clean_codex_env", dict)
+    monkeypatch.setattr("omnigent.codex_native_app_server._databricks_gateway_host", resolve_host)
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        lambda: tmp_path,
+    )
+    make_temp_dir = codex_native_titles.tempfile.TemporaryDirectory
+    monkeypatch.setattr(
+        codex_native_titles.tempfile,
+        "TemporaryDirectory",
+        lambda **kwargs: make_temp_dir(dir=tmp_path, **kwargs),
+    )
+
+    task = asyncio.create_task(
+        codex_native_titles.generate_background_title(
+            BackgroundTitleContext(
+                prompt="Investigate startup latency",
+                harness="codex-native",
+                spawn_env={},
+                process_manager=None,
+            )
+        )
+    )
+    try:
+        await asyncio.wait_for(lookup_started.wait(), timeout=2.0)
+        title_roots = list(tmp_path.glob("omnigent-codex-title-*"))
+        assert len(title_roots) == 1
+        if cancel_during_lookup:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            lookup_release.set()
+            with pytest.raises(OSError, match="profile 'test-profile'"):
+                await task
+    finally:
+        lookup_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        assert await asyncio.to_thread(lookup_finished.wait, 2.0)
+
+    assert loop_progressed == [True], "title profile resolution blocked the runner's event loop"
+    assert not title_roots[0].exists()
 
 
 @pytest.mark.asyncio

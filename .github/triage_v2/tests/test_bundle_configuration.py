@@ -68,6 +68,11 @@ def test_v2_owns_intake_when_enabled_and_manual_dispatch_is_dry_by_default() -> 
         "apply: ${{ github.event_name != 'workflow_dispatch' || inputs.apply_labels }}"
     )
     assert apply_expression in prioritize
+    assert (
+        "post_duplicate_comments: ${{ github.event_name == 'workflow_dispatch' "
+        "&& inputs.post_comment }}" in prioritize
+    )
+    assert "post_duplicate_comments: ${{ inputs.post_comment }}" not in prioritize
     assert "--intake --maintainers .github/MAINTAINER" in reusable
     assert "mode=dry_run" in reusable
 

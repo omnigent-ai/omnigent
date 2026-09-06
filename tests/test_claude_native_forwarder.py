@@ -3662,9 +3662,12 @@ async def test_model_reports_keep_generation_and_context_marker(tmp_path: Path) 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         for model in (
+            "<synthetic>",
             "databricks-claude-opus-4-8",
+            "<synthetic>",
             "databricks-claude-opus-4-9",
             "databricks-claude-opus-4-9[1m]",
+            " <synthetic> ",
         ):
             await forwarder._post_model_change_if_new(
                 client, session_id="conv_abc", dedupe=dedupe, model=model
@@ -3675,6 +3678,7 @@ async def test_model_reports_keep_generation_and_context_marker(tmp_path: Path) 
         "databricks-claude-opus-4-9",
         "databricks-claude-opus-4-9[1m]",
     ]
+    assert dedupe.observed_model == "databricks-claude-opus-4-9[1m]"
 
 
 @pytest.mark.asyncio

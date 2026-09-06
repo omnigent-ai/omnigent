@@ -1713,10 +1713,10 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
 _ACCENT_RGB = (244, 59, 166)
 
 # Command names that are pure aliases of another command (the same Click
-# object registered under a second name, e.g. ``update`` -> ``upgrade``).
+# object registered under a second name, e.g. ``antigravity`` -> ``agy``).
 # Kept runnable/registered but omitted from the ``--help`` listing so the
 # alias isn't shown as a duplicate line.
-_ALIAS_COMMANDS: frozenset[str] = frozenset({"update", "antigravity"})
+_ALIAS_COMMANDS: frozenset[str] = frozenset({"antigravity"})
 
 
 def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
@@ -1792,7 +1792,7 @@ class _OmnigentCLI(click.Group):
             cmd = self.get_command(ctx, subcommand)
             if cmd is None or cmd.hidden:
                 continue
-            # Skip pure aliases (e.g. ``update`` -> ``upgrade``) so the
+            # Skip pure aliases (e.g. ``antigravity`` -> ``agy``) so the
             # listing doesn't show a duplicate line; still runnable.
             if subcommand in _ALIAS_COMMANDS:
                 continue
@@ -2080,9 +2080,9 @@ def _should_skip_update_check(argv: list[str]) -> bool:
 
     Skipped for help / version requests, internal TUI subcommands
     (``pane-split`` / ``pane-picker``, invoked by the terminal UI rather
-    than the user), and ``upgrade`` (and its ``update`` alias) itself
-    (pointing the user at ``omni upgrade`` while they are running it is
-    noise).
+    than the user), and ``upgrade`` (and its deprecated ``update`` spelling)
+    itself (pointing the user at ``omni upgrade`` while they are running it
+    is noise).
 
     :param argv: CLI arguments without the program name, e.g.
         ``["run", "agent.yaml"]``.
@@ -5608,11 +5608,34 @@ def upgrade(
     )
 
 
-# ``omni update`` is an alias for ``omni upgrade`` — mistyping the latter as
-# the former is common, and silently doing nothing is annoying. Registering
-# the same Command object under a second name shares the exact callback,
-# options, and semantics; there is no duplicated implementation to drift.
-cli.add_command(upgrade, name="update")
+@click.pass_context
+def _update_deprecated(ctx: click.Context, **kwargs: object) -> None:
+    """Warn that ``update`` is deprecated, then run the ``upgrade`` flow.
+
+    :param ctx: The click context, used to invoke ``upgrade``.
+    :param kwargs: ``upgrade``'s own parsed options, forwarded verbatim.
+    :returns: None.
+    """
+    click.echo(
+        f"omnigent: `update` is deprecated; use `{cli_invocation(name='omni')} upgrade`.",
+        err=True,
+    )
+    ctx.invoke(upgrade, **kwargs)
+
+
+# Deprecated rather than deleted: the desktop About window shipped this same
+# ``omni update`` hint, and ``server start`` was deleted outright in v0.7.0
+# (#3105) then restored (#3578) when older clients hard-failed on it.
+cli.add_command(
+    click.Command(
+        "update",
+        params=list(upgrade.params),
+        callback=_update_deprecated,
+        hidden=True,
+        # Static: a module-level f-string would freeze the wrapper spelling.
+        help="Deprecated spelling of `upgrade`. Use `upgrade` instead.",
+    )
+)
 
 
 def _bundle(source: Path) -> bytes:

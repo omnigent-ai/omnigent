@@ -3869,15 +3869,16 @@ async def _auto_create_codex_terminal(
     # Resolved before the fork/cold-resume branches below so any rollout
     # synthesis can stamp session_meta.model_provider with the provider
     # this launch actually routes through.
-    default_model = launch_config.model_override or _codex_native_model_from_spec(agent_spec)
+    unpinned_model = _codex_native_model_from_spec(agent_spec)
+    default_model = launch_config.model_override or unpinned_model
     # Thread the spec so its executor.auth / legacy profile win over
     # machine-level config, parity with the in-process harness (#2744).
     _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     _codex_launch = resolve_native_codex_launch(model=default_model, spec=_launch_spec)
-    _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     from omnigent.inner.codex_executor import _find_codex_cli
 
     _codex_cli_path = _find_codex_cli()
+    pick_to_reset: str | None = None
     # Explicit launches (model-flows design §4): validate an explicit request
     # against the shared catalog, and give a Default launch on codex's own
     # login the ACCOUNT's real default — so the ``model =`` line copied from
@@ -3889,22 +3890,71 @@ async def _auto_create_codex_terminal(
     ):
         from dataclasses import replace as _dataclass_replace
 
+        from omnigent.codex_model_vocabulary import codex_reachable_model_slug
         from omnigent.codex_native_app_server import (
             codex_launch_catalog,
             codex_launch_catalog_is_stale,
+            codex_reprobed_launch_catalog,
         )
-        from omnigent.model_catalog_store import catalog_contains, default_row
+        from omnigent.model_catalog_store import default_row
 
-        # Read staleness BEFORE the fetch — the fetch kicks the background
-        # re-probe, which could land between the two reads.
-        _codex_catalog_was_stale = await codex_launch_catalog_is_stale(codex_path=_codex_cli_path)
-        _codex_catalog = await codex_launch_catalog(codex_path=_codex_cli_path)
+        _codex_catalog: list[_JsonObject] | None = None
+        _codex_catalog_was_stale = False
+        _catalog_launch = None
+        try:
+            _catalog_launch = await asyncio.to_thread(
+                resolve_native_codex_launch, model=None, spec=_launch_spec
+            )
+            # Read staleness before the fetch can start a background probe.
+            # The fingerprint and probe must use this session's provider.
+            _codex_catalog_was_stale = await codex_launch_catalog_is_stale(
+                codex_path=_codex_cli_path, launch=_catalog_launch
+            )
+            _codex_catalog = await codex_launch_catalog(
+                codex_path=_codex_cli_path, launch=_catalog_launch
+            )
+        except Exception:  # noqa: BLE001 — discovery must not prevent a launch
+            _logger.warning(
+                "codex launch catalog unavailable for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
         if launch_config.model_override and _codex_catalog:
-            if not catalog_contains(_codex_catalog, launch_config.model_override):
-                raise click.ClickException(
-                    f"the requested model {launch_config.model_override!r} is not in "
-                    "this host's current model list — it may have changed since the "
-                    "pick. Pick again from the model menu."
+            pick = launch_config.model_override
+            reachable = codex_reachable_model_slug(pick, _codex_catalog)
+            fresh_rows = _codex_catalog
+            if reachable is None and _codex_catalog_was_stale:
+                fresh_rows = await codex_reprobed_launch_catalog(
+                    codex_path=_codex_cli_path, launch=_catalog_launch
+                )
+                if fresh_rows:
+                    _codex_catalog = fresh_rows
+                    _codex_catalog_was_stale = False
+                    reachable = codex_reachable_model_slug(pick, fresh_rows)
+            if reachable is None:
+                # Re-resolve so provider overrides cannot retain the old model.
+                # A failed probe permits fallback, but cannot retire the pick.
+                _codex_launch = resolve_native_codex_launch(
+                    model=unpinned_model, spec=_launch_spec
+                )
+                pick_to_reset = pick if fresh_rows else None
+                outcome = (
+                    "resetting the pick to Default after terminal launch"
+                    if pick_to_reset is not None
+                    else "keeping the pick because the catalog re-probe failed"
+                )
+                offered = ", ".join(
+                    str(row.get("id") or row.get("model") or "") for row in _codex_catalog
+                )
+                _logger.warning(
+                    "codex-native: model pick %r for session %s is not in the provider's "
+                    "model list (it offers: %s); launching on the default and %s",
+                    pick,
+                    session_id,
+                    offered,
+                    outcome,
+                    extra={"session_id": session_id},
                 )
         if _codex_launch.model is None and _codex_launch.profile is None and _codex_catalog:
             # Same staleness rule as the claude branch: never convert a stale
@@ -3924,6 +3974,7 @@ async def _auto_create_codex_terminal(
                 )
                 if _default_id:
                     _codex_launch = _dataclass_replace(_codex_launch, model=_default_id)
+    _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)
@@ -4169,7 +4220,10 @@ async def _auto_create_codex_terminal(
         )
         or None
     )
-    app_server = build_codex_native_server(
+    # SDK initialization can block on DNS/auth before model discovery times out.
+    # Keep it off the runner loop so heartbeats and other sessions can progress.
+    app_server = await asyncio.to_thread(
+        build_codex_native_server,
         socket_path=socket_path,
         codex_home=codex_home,
         cwd=Path(workspace),
@@ -4448,6 +4502,13 @@ async def _auto_create_codex_terminal(
         name=f"codex-forwarder-{session_id}",
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
+
+    if pick_to_reset is not None and server_client is not None:
+        await _clear_session_model_override(
+            session_id,
+            server_client,
+            expected_model_override=pick_to_reset,
+        )
 
     # A prompt a previous launch blocked for routing but never got to replay
     # exists nowhere else: the block consumed it and the marker stops the hook
@@ -6365,27 +6426,38 @@ async def _load_claude_launch_metadata(
 async def _clear_session_model_override(
     session_id: str,
     server_client: httpx.AsyncClient,
+    *,
+    expected_model_override: str | None = None,
 ) -> None:
     """
     Reset a session's persisted model pick to Default.
 
-    The server clears the pick only for its explicit ``"default"`` alias; a
-    JSON ``null`` leaves it unchanged. Best-effort: a failed reset keeps the
-    pick, and the next relaunch repeats the fallback.
+    Conditional resets preserve a selection made during launch. An older
+    server rejects the conditional endpoint, retaining the pick for retry.
+    Legacy callers use the explicit ``"default"`` alias; JSON null is a no-op.
 
     :param session_id: Session/conversation identifier.
     :param server_client: Runner Omnigent server client.
+    :param expected_model_override: Only clear this original launch-time pick.
     """
     try:
-        resp = await server_client.patch(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            json={"model_override": "default"},
-            timeout=10.0,
-        )
+        session_path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}"
+        if expected_model_override is not None:
+            resp = await server_client.post(
+                f"{session_path}/model-override/reset",
+                json={"expected_model_override": expected_model_override},
+                timeout=10.0,
+            )
+        else:
+            resp = await server_client.patch(
+                session_path,
+                json={"model_override": "default"},
+                timeout=10.0,
+            )
         resp.raise_for_status()
-    except httpx.HTTPError:
+    except (httpx.HTTPError, RuntimeError):
         _logger.warning(
-            "claude-native: could not reset the model pick for session %s",
+            "native terminal: could not reset the model pick for session %s",
             session_id,
             exc_info=True,
         )
@@ -6845,6 +6917,7 @@ async def _auto_create_claude_terminal(
     # and leave the model to invisible CLI-private state.
     if session_model_override or launch_model is None:
         from omnigent.claude_native import (
+            claude_catalog_launch_spelling,
             claude_catalog_serves_model,
             claude_launch_catalog,
             claude_launch_catalog_is_stale,
@@ -6882,42 +6955,79 @@ async def _auto_create_claude_terminal(
                     rows, pick, claude_config
                 ) or claude_catalog_serves_model(rows, resolved_request, claude_config)
 
+            # A spec pin or routing pick can spell a served model in the
+            # gateway/catalog namespace ("system.ai.claude-opus-4-8[1m]")
+            # while the launch catalog lists the same model bare; folding the
+            # mechanical prefix away keeps the pick launchable on the
+            # catalog's own spelling instead of falling back to the default.
+            def _fold_pick(rows: list[dict[str, object]]) -> str | None:
+                """
+                The rows' launch spelling for the pick's persisted or resolved id.
+                """
+                # The custom picker slot resolves to a provider-configured id
+                # (e.g. "system.ai.claude-sonnet-5"), so like _serves_pick the
+                # fold must consult both spellings.
+                return claude_catalog_launch_spelling(
+                    rows, pick
+                ) or claude_catalog_launch_spelling(rows, resolved_request)
+
+            folded_spelling = _fold_pick(launch_catalog)
             # Only rows that are fresh may retire the pick: a stale entry may
             # predate a provider change, so it is re-probed first, and a
-            # failed probe leaves no fresh rows at all.
+            # failed probe leaves no fresh rows at all. A foldable pin counts
+            # as an exact serve for staleness: it launches on the stale rows'
+            # spelling without a re-probe, like the exact-serve stale path.
             fresh_rows: list[dict[str, object]] | None = launch_catalog
-            if launch_catalog_was_stale and not _serves_pick(launch_catalog):
+            if (
+                launch_catalog_was_stale
+                and not _serves_pick(launch_catalog)
+                and folded_spelling is None
+            ):
                 fresh_rows = await claude_reprobed_launch_catalog(claude_config)
                 if fresh_rows:
                     launch_catalog = fresh_rows
                     launch_catalog_was_stale = False
+                    folded_spelling = _fold_pick(launch_catalog)
             if not _serves_pick(launch_catalog):
-                # The pick outlives the provider it was made under (a later
-                # ``omnigent setup`` can re-point the default). Launch on what
-                # this provider serves; reset the pick to Default only on fresh
-                # evidence, so the picker shows what the session now runs.
-                offered = ", ".join(
-                    str(row.get("id") or row.get("model") or "") for row in launch_catalog
-                )
-                if fresh_rows:
-                    reset_pick_after_launch = True
-                    outcome = "launching on the provider default and resetting the pick to Default"
-                else:
-                    outcome = (
-                        "the re-probe failed, so launching on the provider default and "
-                        "keeping the pick for the next relaunch"
+                if folded_spelling is not None:
+                    _logger.info(
+                        "claude launch gate folded the pinned model %r onto the catalog "
+                        "spelling %r for session=%s",
+                        pick,
+                        folded_spelling,
+                        session_id,
+                        extra={"session_id": session_id},
                     )
-                _logger.warning(
-                    "claude-native: model pick %r for session %s is not served by %s "
-                    "(it offers: %s); %s",
-                    pick,
-                    session_id,
-                    claude_launch_endpoint_label(claude_config),
-                    offered,
-                    outcome,
-                    extra={"session_id": session_id},
-                )
-                launch_model = unpinned_launch_model
+                    launch_model = folded_spelling
+                else:
+                    # The pick outlives the provider it was made under (a later
+                    # ``omnigent setup`` can re-point the default). Launch on what
+                    # this provider serves; reset the pick to Default only on fresh
+                    # evidence, so the picker shows what the session now runs.
+                    offered = ", ".join(
+                        str(row.get("id") or row.get("model") or "") for row in launch_catalog
+                    )
+                    if fresh_rows:
+                        reset_pick_after_launch = True
+                        outcome = (
+                            "launching on the provider default and resetting the pick to Default"
+                        )
+                    else:
+                        outcome = (
+                            "the re-probe failed, so launching on the provider default and "
+                            "keeping the pick for the next relaunch"
+                        )
+                    _logger.warning(
+                        "claude-native: model pick %r for session %s is not served by %s "
+                        "(it offers: %s); %s",
+                        pick,
+                        session_id,
+                        claude_launch_endpoint_label(claude_config),
+                        offered,
+                        outcome,
+                        extra={"session_id": session_id},
+                    )
+                    launch_model = unpinned_launch_model
         if launch_model is None and launch_catalog:
             # A stale entry's default is yesterday's answer: pinning it as
             # ``--model`` turns a provider-side retirement or entitlement

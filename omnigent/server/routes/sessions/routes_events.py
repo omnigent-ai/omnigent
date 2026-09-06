@@ -2362,7 +2362,7 @@ def register_events_routes(
         host_store_for_managed = getattr(request.app.state, "host_store", None)
         if conv.host_id is not None and host_store_for_managed is not None:
             bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
-            if bound_host is not None and bound_host.sandbox_id is not None:
+            if bound_host is not None and bound_host.sandbox_provider is not None:
                 from omnigent.server.managed_hosts import terminate_managed_host
 
                 await terminate_managed_host(

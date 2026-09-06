@@ -405,13 +405,14 @@ def test_summarize_checks_empty() -> None:
     }
 
 
-def test_gh_uses_per_user_broker_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Broker configured (connected) + token resolved → gh runs with
-    # GH_TOKEN/GITHUB_TOKEN set to it, authenticating as the connected owner.
-    monkeypatch.setattr(
-        github_resource, "_broker_coords_from_git_helper", lambda cwd: ("http://srv", "h1", "t9")
-    )
-    monkeypatch.setattr(github_resource, "_broker_github_token", lambda coords: "ghu_peruser")
+def test_gh_scrubs_env_tokens_in_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    # In a sandbox the panel's gh must authenticate as the connected owner via
+    # hosts.yml, never an ambient GH_TOKEN/GITHUB_TOKEN (gh ranks those above
+    # hosts.yml) — so they're scrubbed from gh's env, restoring the fail-closed
+    # property and preventing a stray token from making the panel a shared identity.
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    monkeypatch.setenv("GH_TOKEN", "shared-tok")
+    monkeypatch.setenv("GITHUB_TOKEN", "shared-tok")
     captured: dict[str, object] = {}
 
     def fake_run(argv: Sequence[str], *, cwd: str, timeout: float, env=None):
@@ -420,18 +421,18 @@ def test_gh_uses_per_user_broker_token(monkeypatch: pytest.MonkeyPatch) -> None:
         return 0, "", ""
 
     monkeypatch.setattr(github_resource, "_run", fake_run)
-    github_resource._gh(["auth", "status"], cwd="/tmp")
-    assert captured["argv"] == ["gh", "auth", "status"]
+    github_resource._gh(["api", "user"], cwd="/tmp")
+    assert captured["argv"] == ["gh", "api", "user"]
     env = captured["env"]
     assert isinstance(env, dict)
-    assert env["GH_TOKEN"] == "ghu_peruser"
-    assert env["GITHUB_TOKEN"] == "ghu_peruser"
+    assert "GH_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
 
 
-def test_gh_inherits_env_when_no_broker_configured(monkeypatch: pytest.MonkeyPatch) -> None:
-    # No broker helper (local dev / not connected) → gh inherits the runner env
-    # (env=None), preserving prior shared-token / local-gh behavior.
-    monkeypatch.setattr(github_resource, "_broker_coords_from_git_helper", lambda cwd: None)
+def test_gh_inherits_env_outside_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Local dev (not a sandbox): env is inherited untouched (env=None), so the
+    # developer's own gh auth / GH_TOKEN keeps working — no regression.
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
     captured: dict[str, object] = {}
 
     def fake_run(argv: Sequence[str], *, cwd: str, timeout: float, env=None):
@@ -441,75 +442,3 @@ def test_gh_inherits_env_when_no_broker_configured(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(github_resource, "_run", fake_run)
     github_resource._gh(["pr", "diff"], cwd="/tmp")
     assert captured["env"] is None
-
-
-def test_gh_fails_closed_when_broker_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Broker configured (connected) but its token can't be resolved → fail CLOSED:
-    # scrub the ambient GitHub token so gh can't silently act as the shared
-    # identity (it runs unauthenticated instead).
-    monkeypatch.setenv("GH_TOKEN", "shared-token")
-    monkeypatch.setenv("GITHUB_TOKEN", "shared-token")
-    monkeypatch.setattr(
-        github_resource, "_broker_coords_from_git_helper", lambda cwd: ("http://srv", "h1", "t9")
-    )
-    monkeypatch.setattr(github_resource, "_broker_github_token", lambda coords: None)
-    captured: dict[str, object] = {}
-
-    def fake_run(argv: Sequence[str], *, cwd: str, timeout: float, env=None):
-        captured["env"] = env
-        return 0, "", ""
-
-    monkeypatch.setattr(github_resource, "_run", fake_run)
-    github_resource._gh(["auth", "status"], cwd="/tmp")
-    env = captured["env"]
-    assert isinstance(env, dict)
-    assert "GH_TOKEN" not in env
-    assert "GITHUB_TOKEN" not in env
-
-
-def test_broker_coords_parsed_from_git_helper(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Coords are read back from the broker git credential helper that
-    # configure_host_git bakes in (present only when the owner is connected).
-    helper = (
-        "!python3 -m omnigent.git_credential_github --server http://srv "
-        "--host-id host1 --host-token tok9\n"
-    )
-    monkeypatch.setattr(github_resource, "_git", lambda argv, *, cwd: (0, helper, ""))
-    assert github_resource._broker_coords_from_git_helper("/tmp") == (
-        "http://srv",
-        "host1",
-        "tok9",
-    )
-
-
-def test_broker_coords_none_without_helper(monkeypatch: pytest.MonkeyPatch) -> None:
-    # No broker helper wired (local dev, or a shared-token / not-connected
-    # sandbox) → no coords, so the panel's gh falls back to ambient auth.
-    monkeypatch.setattr(github_resource, "_git", lambda argv, *, cwd: (0, "", ""))
-    assert github_resource._broker_coords_from_git_helper("/tmp") is None
-
-
-def test_broker_github_token_fetches_with_coords(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Given coords, fetch the connected owner's token via the broker.
-    monkeypatch.setattr(github_resource, "_broker_token_cache", (0.0, None))
-    seen: dict[str, object] = {}
-
-    def fake_resolve(server: str, host_id: str, host_token: str):
-        seen["args"] = (server, host_id, host_token)
-        return "ghu_peruser"
-
-    monkeypatch.setattr(github_resource, "resolve_github_token", fake_resolve)
-    assert github_resource._broker_github_token(("http://srv", "host1", "tok9")) == "ghu_peruser"
-    assert seen["args"] == ("http://srv", "host1", "tok9")
-
-
-def test_broker_github_token_none_on_fetch_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Broker unreachable → None, so the caller fails closed rather than using the
-    # ambient identity.
-    monkeypatch.setattr(github_resource, "_broker_token_cache", (0.0, None))
-
-    def boom(*_a: str) -> str:
-        raise RuntimeError("broker down")
-
-    monkeypatch.setattr(github_resource, "resolve_github_token", boom)
-    assert github_resource._broker_github_token(("http://srv", "host1", "tok9")) is None

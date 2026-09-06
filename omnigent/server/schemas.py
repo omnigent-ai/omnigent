@@ -2295,6 +2295,20 @@ class AutomaticSessionRenameResponse(BaseModel):
     reason: Literal["not_top_level", "no_seed", "title_changed"] | None = None
 
 
+class ResetSessionModelOverrideRequest(BaseModel):
+    """Reset a launch-time model selection only while that selection is current."""
+
+    expected_model_override: str = Field(min_length=1)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ResetSessionModelOverrideResponse(BaseModel):
+    """Whether the launch-time selection was still current and was cleared."""
+
+    reset: bool
+
+
 class BackgroundSessionTitleRequest(BaseModel):
     """Private runner request for isolated background title inference."""
 

@@ -57,6 +57,7 @@ from omnigent.inner.hook_scripts import subagent_router
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
+from omnigent.model_metadata import concrete_reported_model
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
 
@@ -2958,8 +2959,8 @@ class ClaudeSDKExecutor(Executor):
                         assistant_msg = cast(_AssistantMessageObj, message)
                         # Capture the concrete model the SDK used (the resolved
                         # config ``model`` is None when the spec pins none).
-                        _am_model = getattr(assistant_msg, "model", None)
-                        if isinstance(_am_model, str) and _am_model:
+                        _am_model = concrete_reported_model(getattr(assistant_msg, "model", None))
+                        if _am_model is not None:
                             observed_model = _am_model
                         if got_stream_events:
                             # StreamEvents already emitted text. Emit the

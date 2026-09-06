@@ -56,6 +56,7 @@ from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
+from omnigent.model_metadata import concrete_reported_model
 from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -1374,9 +1375,9 @@ async def _persist_relay_reported_model(
     if not isinstance(usage_obj, dict):
         return
     raw_model = usage_obj.get("model")
-    if not isinstance(raw_model, str) or not raw_model.strip():
+    model = concrete_reported_model(raw_model)
+    if model is None:
         return
-    model = raw_model.strip()
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conv is None or conv.reported_model == model:
         return
@@ -3586,6 +3587,13 @@ def _kick_managed_wake_impl(
     # session page when the wake fires (the composer let them send into a
     # host_asleep session).
     _publish_sandbox_status(session_id, "provisioning")
+    wake_agent_store = getattr(app_state, "agent_store", None)
+    if wake_agent_store is None:
+        _logger.warning(
+            "session %s: wake has no agent store; woken runner stays unclassified",
+            session_id,
+            extra={"session_id": session_id},
+        )
     wake_task = asyncio.create_task(
         _run_managed_wake(
             session_id=session_id,
@@ -3596,6 +3604,8 @@ def _kick_managed_wake_impl(
             host_store=host_store,
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
+            agent_store=wake_agent_store,
+            agent_id=conv.agent_id,
         )
     )
     _managed_launch_tasks.add(wake_task)
@@ -3612,6 +3622,8 @@ async def _run_managed_wake(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    agent_store: AgentStore | None = None,
+    agent_id: str | None = None,
 ) -> None:
     """
     Wake a dormant resumable managed host in the background, settling the
@@ -3640,8 +3652,16 @@ async def _run_managed_wake(
         frame. ``None`` in minimal test wirings.
     :param tunnel_registry: Runner-tunnel registry used to await the launched
         runner's connection. ``None`` in minimal test wirings.
+    :param agent_store: Store the runner's agent classifier is resolved from,
+        or ``None`` (a stripped test wiring) to leave the runner unclassified.
+    :param agent_id: Agent the session is bound to, resolved through the
+        built-in gate into the woken runner Pod's ``omnigent.ai/agent``
+        classifier, or ``None`` to leave it unstamped.
     """
-    from omnigent.server.managed_hosts import resume_managed_host
+    from omnigent.server.managed_hosts import (
+        resolve_managed_agent_label,
+        resume_managed_host,
+    )
     from omnigent.server.routes import sessions as _facade
 
     host_id = conv.host_id
@@ -3665,8 +3685,25 @@ async def _run_managed_wake(
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
+        # Re-derived here rather than by the caller, matching the launch path:
+        # the read runs on the task that already owns the single-flight claim,
+        # and it is never read back from a stored label — so there is nothing to
+        # keep in sync, or to forge.
+        agent_name: str | None = None
+        if agent_store is not None and agent_id is not None:
+            agent_name = await asyncio.to_thread(
+                resolve_managed_agent_label,
+                agent_store,
+                agent_id,
+                session_id=session_id,
+            )
         await resume_managed_host(
-            host_id, host_store, sandbox_config, force=True, on_stage=_on_stage
+            host_id,
+            host_store,
+            sandbox_config,
+            force=True,
+            on_stage=_on_stage,
+            agent_name=agent_name,
         )
         _publish_sandbox_status(session_id, "connecting")
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -9825,8 +9862,8 @@ async def _get_session_snapshot(
     # a verbatim ``reported_model``, it supersedes the spec-derived value on
     # the wire's ``llm_model`` field (the web renders and highlights only
     # from this).
-    if conv.reported_model:
-        llm_model = conv.reported_model
+    if reported_model := concrete_reported_model(conv.reported_model):
+        llm_model = reported_model
     # Skills are runner-owned: the bound runner discovers them against its
     # own filesystem (bundled skills + host skills under the session's
     # workspace and ``~/.claude/skills/``) — the host where the harness

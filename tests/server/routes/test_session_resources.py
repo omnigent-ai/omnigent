@@ -4605,8 +4605,10 @@ async def test_relay_skips_malformed_resource_created_from_runner() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal_type", ["response.completed", "response.failed"])
+@pytest.mark.parametrize("reported_model", ["claude-opus-4-8", "<synthetic>"])
 async def test_relay_persists_harness_reported_model(
     terminal_type: str,
+    reported_model: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """SDK terminal usage records the concrete model on the session snapshot."""
@@ -4631,7 +4633,7 @@ async def test_relay_persists_harness_reported_model(
                             "input_tokens": 0,
                             "output_tokens": 0,
                             "total_tokens": 0,
-                            "model": "claude-opus-4-8",
+                            "model": reported_model,
                         },
                     },
                 }
@@ -4642,15 +4644,20 @@ async def test_relay_persists_harness_reported_model(
 
     await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
 
-    assert store.get_conversation(session_id).reported_model == "claude-opus-4-8"  # type: ignore[union-attr]
+    expected = None if reported_model == "<synthetic>" else reported_model
+    assert store.get_conversation(session_id).reported_model == expected  # type: ignore[union-attr]
     model_events = [event for event in published if event.get("type") == "session.model"]
-    assert model_events == [
-        {
-            "type": "session.model",
-            "conversation_id": session_id,
-            "model": "claude-opus-4-8",
-        }
-    ]
+    assert model_events == (
+        []
+        if expected is None
+        else [
+            {
+                "type": "session.model",
+                "conversation_id": session_id,
+                "model": "claude-opus-4-8",
+            }
+        ]
+    )
 
 
 @pytest.mark.asyncio

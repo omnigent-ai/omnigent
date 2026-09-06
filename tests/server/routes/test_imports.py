@@ -14,7 +14,11 @@ from fastapi.responses import JSONResponse
 from omnigent.db.utils import builtin_agent_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.host_registry import HostRegistry
-from omnigent.server.routes.imports import _stream_local_sessions_from_host, create_imports_router
+from omnigent.server.routes.imports import (
+    LocalImportRequest,
+    _stream_local_sessions_from_host,
+    create_imports_router,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
@@ -227,6 +231,15 @@ def test_imported_session_ref_allows_null_title() -> None:
     assert ImportedSessionRef(session_id="conv_y", title=None).title is None
 
 
+def test_exact_local_import_requires_one_harness_and_trims_id() -> None:
+    """An exact id is normalized and cannot be paired with the all selector."""
+    request = LocalImportRequest(host_id="h1", source="claude", session_id="  exact-id  ")
+    assert request.session_id == "exact-id"
+
+    with pytest.raises(ValueError, match="requires a specific harness"):
+        LocalImportRequest(host_id="h1", source="all", session_id="exact-id")
+
+
 async def test_stream_local_sessions_yields_each_then_stops_on_done() -> None:
     """The streaming consumer yields one session per frame, then cleans up on done.
 
@@ -273,6 +286,37 @@ async def test_stream_local_sessions_yields_each_then_stops_on_done() -> None:
     assert [s["external_session_id"] for s in got] == ["c1", "c2"]
     # The per-request queue is removed once the stream ends.
     assert conn.pending_import_local == {}
+
+
+async def test_stream_local_sessions_sends_exact_session_id() -> None:
+    """The server carries an exact id through the host tunnel request."""
+    from omnigent.host.frames import HostImportLocalByIdFrame, decode_host_frame
+
+    conn = SimpleNamespace(host_id="h1", pending_import_local={})
+    sent: list[HostImportLocalByIdFrame] = []
+
+    class _Reg:
+        def send_text(self, host_conn: object, frame: str) -> None:
+            decoded = decode_host_frame(frame)
+            assert isinstance(decoded, HostImportLocalByIdFrame)
+            sent.append(decoded)
+            (queue,) = conn.pending_import_local.values()
+            queue.put_nowait(("done", {"status": "ok", "error": None}))
+
+    got = [
+        session
+        async for session in _stream_local_sessions_from_host(
+            host_registry=_Reg(),  # type: ignore[arg-type]
+            host_conn=conn,  # type: ignore[arg-type]
+            source="codex",
+            limit=10,
+            session_id="session-exact",
+        )
+    ]
+
+    assert got == []
+    assert sent[0].source == "codex"
+    assert sent[0].session_id == "session-exact"
 
 
 async def test_stream_local_sessions_surfaces_host_failed_count() -> None:

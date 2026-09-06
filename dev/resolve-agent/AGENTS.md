@@ -170,11 +170,12 @@ For `session` and `ci_link`, you need four things before you can do anything: th
    read its **`workspace`** field: that is the `repro/<slug>` worktree the repro
    ran in, where repro-agent left the authored test **uncommitted** at
    `test_path`. Read the full file from `<workspace>/<test_path>` off disk and
-   copy it into your own worktree at `test_path`. (Do **not** rely on the
-   transcript for the test body — it is truncated; the file on disk is the source
-   of truth. The session's own `workspace` is the authoritative link back to the
-   right reproduction — never guess by picking some "newest" repro worktree, which
-   may belong to an unrelated bug.)
+   copy it into your own worktree at `test_path` — with **shell** commands: that
+   workspace sits outside your own worktree, where your file tools cannot reach.
+   (Do **not** rely on the transcript for the test body — it is truncated; the
+   file on disk is the source of truth. The session's own `workspace` is the
+   authoritative link back to the right reproduction — never guess by picking
+   some "newest" repro worktree, which may belong to an unrelated bug.)
 3. If `sys_session_get_info` returns no `workspace`, or that path/`test_path`
    doesn't exist (e.g. the repro worktree was removed), stop with
    `needs_more_info` naming what you couldn't recover — do not reconstruct the
@@ -186,10 +187,17 @@ The repro worktree is gone, so recover from the run's artifacts and logs with th
 `gh` CLI. Be **tolerant** — the exact artifact layout may vary, so try in order
 and fall back rather than assuming a fixed structure:
 
-1. Download this run's `repro-bundle-<run-id>` artifact first. If it contains
-   top-level `repro-handoff.json`, parse and validate that checkpoint before
-   reading the full job log: it is the smallest, most direct structured source
-   for `verdict`/`facets`/`test_path`/`journey`/`bug_url`/`session_id`. Copy each
+1. Download this run's `repro-bundle-<run-id>` artifact first, staging it
+   **inside your worktree** at `.omnigent/repro-bundle/` (e.g. `gh run download
+   <run-id> --name repro-bundle-<run-id> --dir .omnigent/repro-bundle`). Your
+   file tools are worktree-scoped: a bundle staged under `/tmp` or
+   `$RUNNER_TEMP` sits outside the environment root, so every file-tool read of
+   it errors and only shell fallbacks work. `.omnigent/` is gitignored and
+   excluded by the commit rules, so nothing staged there can leak into your
+   diff. If the bundle contains top-level `repro-handoff.json`, parse and
+   validate that checkpoint before reading the full job log: it is the
+   smallest, most direct structured source for
+   `verdict`/`facets`/`test_path`/`journey`/`bug_url`/`session_id`. Copy each
    test named by `test_path` from the artifact's `files/` tree into your checkout.
    Also retain `patch.diff`, recordings, and `run.log` as supporting evidence.
 

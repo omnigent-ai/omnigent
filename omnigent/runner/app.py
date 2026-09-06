@@ -146,6 +146,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
+    trim_terminal_output,
 )
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
@@ -3147,6 +3148,49 @@ def create_runner_app(
             if diagnosis.remediation:
                 error["remediation"] = diagnosis.remediation
         return error
+
+    def _live_terminal_pane_snapshot(conv_id: str) -> str | None:
+        """Return the first captured pane text among the conversation's terminals.
+
+        Serves failures that strike while terminals are still alive (e.g. a
+        harness stream drop): the required-terminal *exit* diagnostics never
+        fire, yet what is on the pane right now is often the most actionable
+        context available (a CLI parked at a trust prompt, an auth error, ...).
+        """
+        registry = resource_registry.terminal_registry if resource_registry else None
+        if registry is None:
+            return None
+        for entry in registry.list_for_conversation(conv_id):
+            try:
+                pane = trim_terminal_output(entry.instance.last_pane_text())
+            except Exception:
+                _logger.exception(
+                    "Failed to read terminal pane diagnostics for %s",
+                    conv_id,
+                    extra={"session_id": conv_id},
+                )
+                continue
+            if pane:
+                return pane
+        return None
+
+    def _harness_stream_failure_message(conv_id: str, exc: BaseException) -> str:
+        """Compose the user-facing message for a harness stream failure.
+
+        Leads with the real transport cause (which otherwise reaches only the
+        runner log) and attaches the live pane snapshot as a ``Last captured
+        terminal output:`` block, which the web UI renders as diagnostics.
+        """
+        cause = str(exc).strip()
+        message = (
+            f"Harness stream connection error: {cause}"
+            if cause
+            else "Harness stream connection error."
+        )
+        pane = _live_terminal_pane_snapshot(conv_id)
+        if pane:
+            message = f"{message}\n\nLast captured terminal output:\n{pane}"
+        return message
 
     def _release_required_terminal_session(session_id: str) -> None:
         if process_manager is None:
@@ -8364,7 +8408,7 @@ def create_runner_app(
                 )
                 _error = {
                     "code": "connection_error",
-                    "message": "Harness stream connection error.",
+                    "message": _harness_stream_failure_message(conv_id, exc),
                     "type": type(exc).__name__,
                 }
                 _http_fail = {

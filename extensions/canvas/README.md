@@ -4,7 +4,7 @@ An independently installable browser extension that visualizes accessible Omnige
 
 Each card shows the session status, title, and working directory. Double-click a card (or focus it and press Enter/Space) to open Omnigent's existing session transcript.
 
-![Canvas showing three sessions](../../docs/demo/canvas.png)
+![Canvas organizing live Omnigent sessions by project](../../docs/demo/canvas.png)
 
 ## Install from this checkout
 

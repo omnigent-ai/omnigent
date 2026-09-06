@@ -516,10 +516,11 @@ export interface LocalImportResult {
 }
 
 /**
- * Import the caller's most recent local transcripts from a chosen host. The
+ * Import local transcripts from a chosen host. The
  * host reads + normalizes its own transcripts over the tunnel (they live on
  * that machine, not the server); already-imported sessions are skipped.
- * `source` is a specific harness or "all" for every harness at once.
+ * Passing `sessionId` loads that exact session from `source` without listing
+ * local history. Otherwise, `source` may be "all" for every harness at once.
  *
  * Prefers the streaming endpoint `POST /v1/imports/local/stream` (NDJSON):
  * `onSession` fires for each newly imported session as its frame lands, so
@@ -536,15 +537,20 @@ export async function importLocalSessions(
   source: ImportSourceSelector,
   limit: number,
   onSession?: (session: ImportedSessionRef) => void,
+  sessionId?: string,
 ): Promise<LocalImportResult> {
+  const body = { host_id: hostId, source, limit, session_id: sessionId };
   const res = await authenticatedFetch("/v1/imports/local/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
-    body: JSON.stringify({ host_id: hostId, source, limit }),
+    body: JSON.stringify(body),
   });
   // Older server without the streaming endpoint: fall back to the buffered
   // import so a newer client still works against it.
   if (res.status === 404) {
+    if (sessionId !== undefined) {
+      throw new Error("Direct session import is not supported by this server.");
+    }
     return importLocalSessionsBuffered(hostId, source, limit, onSession);
   }
   if (!res.ok) throw await apiErrorFromResponse(res);

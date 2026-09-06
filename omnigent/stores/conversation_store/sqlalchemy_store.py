@@ -8,6 +8,7 @@ from typing import Any, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
+    LargeBinary,
     Select,
     and_,
     asc,
@@ -2957,6 +2958,46 @@ class SqlAlchemyConversationStore(ConversationStore):
         else:
             meta = self._get_meta(conversation_id)
         return _to_conversation(row, meta, labels)
+
+    def clear_model_override_if_matches(
+        self,
+        conversation_id: str,
+        expected_model_override: str,
+    ) -> bool:
+        """Clear only a matching model selection with an atomic settings compare-and-swap."""
+        workspace_id = current_workspace_id()
+        with self._conv_session("clear_model_override_if_matches") as session:
+            original = session.scalar(
+                select(SqlConversation.session_overrides).where(
+                    SqlConversation.workspace_id == workspace_id,
+                    SqlConversation.id == conversation_id,
+                )
+            )
+            overrides: dict[str, Any] = json.loads(original) if original else {}
+            if overrides.get("model_override") != expected_model_override:
+                return False
+            del overrides["model_override"]
+            encoded = json.dumps(overrides, separators=(",", ":")) if overrides else None
+            unchanged = SqlConversation.session_overrides == original
+            if self._conv_engine.dialect.name == "mysql":
+                # MySQL text collations can equate distinct, case-only model selections.
+                unchanged = SqlConversation.session_overrides.cast(LargeBinary) == (
+                    original.encode("utf-8") if original is not None else None
+                )
+            # Comparing the whole blob preserves concurrent updates to sibling settings too.
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == workspace_id,
+                        SqlConversation.id == conversation_id,
+                        unchanged,
+                    )
+                    .values(session_overrides=encoded, updated_at=now_epoch())
+                ),
+            )
+            return result.rowcount == 1
 
     def rename_conversation_if_title_matches(
         self,

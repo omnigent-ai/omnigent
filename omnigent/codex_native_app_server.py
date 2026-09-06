@@ -23,6 +23,7 @@ import tomlkit
 import websockets
 from cachetools import TTLCache
 from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import ConnectionClosed
 
 from omnigent import model_catalog
 from omnigent.json_types import JsonObject as _JsonObject
@@ -76,6 +77,8 @@ CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
+# Initialization and model/list can stall after the listener becomes ready.
+_MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _STDERR_CHUNK_LIMIT = 65536
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
@@ -603,18 +606,22 @@ class CodexAppServerClient:
 
         :returns: None.
         """
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._reader_task
-        for future in self._pending_requests.values():
-            if not future.done():
-                future.cancel()
-        self._pending_requests.clear()
-        if self._ws is not None:
-            await self._ws.close()
-        self._ws = None
-        self._reader_task = None
+        try:
+            if self._reader_task is not None:
+                self._reader_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, ConnectionClosed):
+                    await self._reader_task
+        finally:
+            for future in self._pending_requests.values():
+                if not future.done():
+                    future.cancel()
+            self._pending_requests.clear()
+            try:
+                if self._ws is not None:
+                    await self._ws.close()
+            finally:
+                self._ws = None
+                self._reader_task = None
 
     async def request(self, method: str, params: CodexParams) -> CodexMessage:
         """
@@ -957,7 +964,9 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
     return marked
 
 
-async def probe_codex_model_options(*, codex_path: str | None = None) -> list[_JsonObject]:
+async def probe_codex_model_options(
+    *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+) -> list[_JsonObject]:
     """
     Ask a session-configured Codex app-server for its own model list.
 
@@ -974,13 +983,16 @@ async def probe_codex_model_options(*, codex_path: str | None = None) -> list[_J
     a live session will offer.
 
     :param codex_path: Optional Codex executable override.
+    :param launch: An already-resolved ``model=None`` launch shape. When
+        omitted, resolve the host's default shape.
     :returns: The probe rows with a single default marked.
     :raises ImportError: When the Codex CLI is unavailable.
     :raises OSError: When a Databricks profile resolves no workspace host.
     :raises RuntimeError: When the probe app-server exits before connecting.
     :raises TimeoutError: When the probe app-server does not become ready.
     """
-    launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+    if launch is None:
+        launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
     resolved_codex = codex_path or _find_codex_cli()
     if not resolved_codex:
         raise ImportError("Native Codex model probing requires the 'codex' CLI on PATH.")
@@ -1056,21 +1068,15 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
     )
 
 
-async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonObject] | None:
-    """
-    The shared codex catalog for this host's default shape: store, then probe.
-
-    Reads the on-disk catalog for the ``model=None`` launch shape; a miss
-    pays one session-shaped probe (real auth linked in) and persists the
-    answer for every later consumer.
-
-    :param codex_path: Optional Codex executable override.
-    :returns: Catalog rows, or ``None`` when no catalog could be obtained.
-    """
+async def _codex_launch_catalog(
+    *, codex_path: str | None, launch: NativeCodexLaunch | None, reprobe: bool
+) -> list[_JsonObject] | None:
+    """Read or refresh one launch shape without resolving a different probe shape."""
     from omnigent import model_catalog_store
 
     try:
-        launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+        if launch is None:
+            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
     except Exception:  # noqa: BLE001 — a broken provider config means no catalog
         _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
         return None
@@ -1078,29 +1084,73 @@ async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonOb
 
     async def _probe() -> list[_JsonObject] | None:
         try:
-            return await probe_codex_model_options(codex_path=codex_path)
+            return await asyncio.wait_for(
+                probe_codex_model_options(codex_path=codex_path, launch=launch),
+                timeout=_MODEL_CATALOG_PROBE_TIMEOUT_SECONDS,
+            )
         except Exception:  # noqa: BLE001 — probe failure means "no catalog", never a crash
             # Best-effort probe re-run on every catalog fetch; log once so a
             # persistently failing probe doesn't flood the logs.
             log_once(_logger, logging.WARNING, "codex catalog probe failed", exc_info=True)
             return None
 
-    return await model_catalog_store.ensure_catalog("codex-native", fingerprint, _probe)
+    read = model_catalog_store.reprobe_catalog if reprobe else model_catalog_store.ensure_catalog
+    return await read("codex-native", fingerprint, _probe)
 
 
-async def codex_launch_catalog_is_stale(*, codex_path: str | None = None) -> bool:
+async def codex_launch_catalog(
+    *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+) -> list[_JsonObject] | None:
     """
-    Whether the default launch shape's stored catalog is past the TTL.
+    The shared codex catalog for a launch shape: store, then probe.
+
+    Reads the on-disk catalog for the ``model=None`` launch shape; a miss
+    pays one session-shaped probe (real auth linked in) and persists the
+    answer for every later consumer.
+
+    :param codex_path: Optional Codex executable override.
+    :param launch: An already-resolved ``model=None`` launch shape. When
+        omitted, resolve the host's default shape.
+    :returns: Catalog rows, or ``None`` when no catalog could be obtained.
+    """
+    return await _codex_launch_catalog(codex_path=codex_path, launch=launch, reprobe=False)
+
+
+async def codex_reprobed_launch_catalog(
+    *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+) -> list[_JsonObject] | None:
+    """
+    Await a fresh catalog for one launch shape, joining an in-flight probe.
+
+    Failed or empty probes leave the stored catalog untouched; stale rows
+    are never returned as the result of the refresh.
+
+    :param codex_path: Optional Codex executable override.
+    :param launch: An already-resolved ``model=None`` launch shape. When
+        omitted, resolve the host's default shape.
+    :returns: Fresh probe rows, or ``None`` when the probe failed.
+    """
+    return await _codex_launch_catalog(codex_path=codex_path, launch=launch, reprobe=True)
+
+
+async def codex_launch_catalog_is_stale(
+    *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+) -> bool:
+    """
+    Whether a launch shape's stored catalog is past the TTL.
 
     :param codex_path: Optional Codex executable override, matching the
         one :func:`codex_launch_catalog` would probe with.
+    :param launch: An already-resolved ``model=None`` launch shape. When
+        omitted, resolve the host's default shape.
     :returns: ``True`` when the store holds only a stale entry; ``False``
         when it is fresh, absent, or the launch shape cannot resolve.
     """
     from omnigent import model_catalog_store
 
     try:
-        launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+        if launch is None:
+            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
     except Exception:  # noqa: BLE001 — a broken provider config means no catalog
         return False
     return model_catalog_store.catalog_is_stale(

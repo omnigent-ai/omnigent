@@ -131,11 +131,31 @@ server's `sandbox:` config:
 sandbox:
   provider: acme
   server_url: https://your-host
+  reaper:
+    enabled: true
+    terminate_after_offline_days: 30  # optional; defaults to 30 days
+    sweep_interval_s: 86400           # optional; defaults to 1 day
 ```
 
 The server resolves the provider through the registry and calls
 `prepare()` → `provision()` → `start_host()` → wait for online registration.
 Each managed sandbox authenticates back with a server-minted per-launch token.
+
+`sandbox.reaper` is deployment-wide: configure it next to `provider` or
+`providers`, never inside one provider entry. One configurable loop covers every
+configured provider and dispatches termination through the provider recorded on
+each managed host. Reaping keeps the session and durable host binding so the
+next message can launch a fresh sandbox generation.
+
+The loop discovers workspaces with active or pending managed sandboxes, then
+queries stale managed hosts within each workspace. Before calling the provider,
+it atomically detaches the stale sandbox id from the active host generation.
+Failed terminations stay pending and are retried by later sweeps; providers must
+therefore make `terminate()` succeed when the sandbox is already absent.
+
+The reaper reuses one launcher per workspace and provider. Override
+`reaper_identity(workspace_id)` when background termination needs a scoped
+credential context; the default context is a no-op.
 
 ## Provider capabilities
 

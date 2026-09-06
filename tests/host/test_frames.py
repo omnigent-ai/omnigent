@@ -20,6 +20,7 @@ from omnigent.host.frames import (
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportedLocalSession,
+    HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
     HostImportLocalSessionFrame,
@@ -56,6 +57,21 @@ def test_import_local_frames_round_trip() -> None:
         encode_host_frame(HostImportLocalFrame(request_id="req_imp", source="claude", limit=3))
     )
     assert request == HostImportLocalFrame(request_id="req_imp", source="claude", limit=3)
+
+    exact_request = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalByIdFrame(
+                request_id="req_exact",
+                source="codex",
+                session_id="0198d07d-session",
+            )
+        )
+    )
+    assert exact_request == HostImportLocalByIdFrame(
+        request_id="req_exact",
+        source="codex",
+        session_id="0198d07d-session",
+    )
 
     session = decode_host_frame(
         encode_host_frame(

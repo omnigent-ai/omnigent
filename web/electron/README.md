@@ -51,7 +51,7 @@ adds native niceties:
   native `Cmd+,` accelerator on macOS (`Ctrl+,` elsewhere) and routes the
   focused connected window through the SPA without reloading it. On macOS,
   **About Omnigent** opens a shell-owned modal showing the platform app and
-  detected CLI versions; the CLI section points users to `omni update`.
+  detected CLI versions; the CLI section points users to `omni upgrade`.
   **Check for Updates…** in
   the Server menu opens the same modal and starts a check. **Update now** in the
   shell update prompt opens the modal, hides the prompt, and starts the download;

@@ -180,6 +180,8 @@ from omnigent.server.schemas import (
     PaginatedList,
     ProjectSessionCreateRequest,
     ReadStatePutRequest,
+    ResetSessionModelOverrideRequest,
+    ResetSessionModelOverrideResponse,
     SessionAgentChangedEvent,
     SessionCreateRequest,
     SessionForkRequest,
@@ -1767,6 +1769,38 @@ def register_core_routes(
         if updated is None:
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
         return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
+
+    @router.post(
+        "/sessions/{session_id}/model-override/reset",
+        response_model=ResetSessionModelOverrideResponse,
+    )
+    async def reset_session_model_override(
+        request: Request,
+        session_id: str,
+        body: ResetSessionModelOverrideRequest,
+    ) -> ResetSessionModelOverrideResponse:
+        """Retire a rejected pick after fallback without replacing a newer selection."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or conv.agent_id is None:
+            raise _session_not_found()
+        try:
+            validate_model_override(body.expected_model_override)
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid expected_model_override: {exc}", code=ErrorCode.INVALID_INPUT
+            ) from exc
+        # The terminal already launched its fallback. This only retires metadata;
+        # forwarding another model change could undo a concurrent live selection.
+        reset = await asyncio.to_thread(
+            conversation_store.clear_model_override_if_matches,
+            session_id,
+            body.expected_model_override,
+        )
+        return ResetSessionModelOverrideResponse(reset=reset)
 
     @router.patch(
         "/sessions/{session_id}",
