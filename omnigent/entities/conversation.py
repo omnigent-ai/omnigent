@@ -139,6 +139,13 @@ class Conversation:
         Mutable via ``PATCH /v1/sessions/{id}`` at any time; read per
         spawn by the route-subagent relay, so a change takes effect on
         the next spawn.
+    :param sub_harness_override: Per-session harness override for the
+        bundle's SUB-agents, as a compact ``{"name":"harness"}`` JSON
+        string, e.g. ``'{"gpt":"antigravity-native"}'``. Keyed by each
+        sub-agent's declared name. ``harness_override`` pins the brain
+        and this pins the heads; unset leaves the team as the bundle
+        declared it. Read when a sub-agent is spawned, so it applies to
+        every spawn after it is set.
     :param harness_override: Per-session harness override for the
         bound agent's brain, e.g. ``"pi"`` or ``"openai-agents"``.
         ``None`` means use the harness declared in the agent spec
@@ -237,6 +244,7 @@ class Conversation:
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
+    sub_harness_override: str | None = None
     sub_agent_name: str | None = None
     task_summary: str | None = None
     external_session_id: str | None = None

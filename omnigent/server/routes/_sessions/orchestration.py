@@ -304,6 +304,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_cost_control_mode_override,
     _validated_harness_override,
     _validated_harness_override_executor_type,
+    _validated_sub_harness_override,
     _validated_spec_smart_routing_harness,
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
@@ -8407,6 +8408,12 @@ async def _create_session_from_existing_agent(
         harness_override = await asyncio.to_thread(
             _validated_harness_override, body.harness_override, agent
         )
+    # The heads, independent of the brain: a bundle can keep its declared
+    # brain and still retarget who it delegates to, so this is resolved
+    # outside the branch above rather than alongside the brain override.
+    sub_harness_override = await asyncio.to_thread(
+        _validated_sub_harness_override, body.sub_harness_override, agent
+    )
 
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
@@ -8642,6 +8649,7 @@ async def _create_session_from_existing_agent(
         or cost_control_mode_override is not None
         or subagent_routing_override is not None
         or harness_override is not None
+        or sub_harness_override is not None
     ):
         # ``create_conversation`` has no override params; reuse the
         # PATCH path's store write before the runner reads the snapshot
@@ -8655,6 +8663,7 @@ async def _create_session_from_existing_agent(
             cost_control_mode_override=cost_control_mode_override,
             subagent_routing_override=subagent_routing_override,
             harness_override=harness_override,
+            sub_harness_override=sub_harness_override,
         )
         if updated_conv is None:
             raise OmnigentError(

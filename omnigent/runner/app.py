@@ -7732,6 +7732,9 @@ def create_runner_app(
                     session_id=conv_id,
                     model_override=cast(str | None, body.get("model_override")),
                     harness_override=cast(str | None, body.get("harness_override")),
+                    sub_harness_override=_parse_sub_harness_override(
+                        cast(str | None, body.get("sub_harness_override"))
+                    ),
                     sub_agent_name=_sub_agent_name,
                     cwd=await _session_runtime_cwd(conv_id),
                 )
@@ -11630,6 +11633,32 @@ def create_runner_app_from_env() -> FastAPI:
     return create_runner_app(server_client=server_client)
 
 
+def _parse_sub_harness_override(raw: str | None) -> dict[str, str] | None:
+    """Parse the stored ``{"name": "harness"}`` blob the server forwards.
+
+    Travels as a string so an older runner round-trips it untouched and the
+    wire shape matches the stored column exactly.
+
+    Never raises: a malformed blob means this session falls back to the
+    bundle's declared team, which is the behaviour before the field existed.
+    Refusing to spawn over an unreadable preference would be worse than
+    ignoring it.
+
+    :param raw: The JSON string, or ``None``.
+    :returns: Sub-agent name -> harness, or ``None`` when absent/unusable.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        _logger.warning("ignoring unparseable sub_harness_override: %r", raw[:120])
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return {str(k): str(v) for k, v in parsed.items() if isinstance(v, str)}
+
+
 async def _resolve_harness_config(
     *,
     agent_id: str | None,
@@ -11637,6 +11666,7 @@ async def _resolve_harness_config(
     session_id: str | None = None,
     model_override: str | None = None,
     harness_override: str | None = None,
+    sub_harness_override: dict[str, str] | None = None,
     sub_agent_name: str | None = None,
     cwd: Path | None = None,
 ) -> tuple[str, dict[str, str] | None]:
@@ -11688,7 +11718,19 @@ async def _resolve_harness_config(
                 else:
                     spec = _unwrap_resolved_spec(sub_entry)
                     workdir = _resolved_spec_workdir(sub_entry)
-            harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
+            # Precedence, most specific first: a harness picked for THIS
+            # sub-agent, then the session's brain override, then what the
+            # resolved spec declares. The per-child pick wins over the brain
+            # override because it names one head explicitly, while the brain
+            # override is about the orchestrator and reaches children only as
+            # a side effect.
+            child_harness = (sub_harness_override or {}).get(sub_agent_name or "")
+            harness = (
+                child_harness
+                or harness_override
+                or spec.executor.config.get("harness")
+                or spec.executor.type
+            )
             harness = canonicalize_harness(harness) or harness
             spawn_env = _build_spawn_env_from_spec(
                 spec,

@@ -19,6 +19,19 @@ export interface AvailableAgent {
   // the agent's spec. Lets the picker recognise Codex vs Claude agents
   // by kind rather than by name slug.
   harness: string | null;
+  // The bundle's delegable team, in spec order, each with the harness it
+  // currently runs on. Empty for a single-agent bundle, and empty on an
+  // older server that does not send the field -- callers must treat both
+  // the same way and simply show no per-role rows.
+  //
+  // Without this the UI could only offer the orchestrator's brain, so a
+  // multi-agent bundle looked like one agent: examples/debby fans out to a
+  // Claude head and a GPT head, and someone with no OpenAI account had no
+  // way to see that, let alone change it.
+  // Optional, not just possibly-empty: an older server does not send the
+  // field at all, and every existing caller that builds an AvailableAgent by
+  // hand predates it. Readers use `?? []` and treat absent and empty the same.
+  sub_agents?: { name: string; description: string | null; harness: string | null }[];
   // Skills bundled in the agent spec (name + one-line description).
   // Feeds the landing composer's "/" menu before a session exists;
   // host-discovered skills only resolve once a runner is bound, so
@@ -98,6 +111,7 @@ interface BuiltinAgentWire {
   name: string;
   description?: string | null;
   harness?: string | null;
+  sub_agents?: { name: string; description?: string | null; harness?: string | null }[];
   skills?: { name: string; description: string }[];
   // True only for server-seeded built-ins (deterministic id). Absent on
   // older servers, where every catalog row degrades to a protected entry.
@@ -146,6 +160,11 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
     display_name: displayNameForAgent(a.name, a.harness),
     description: a.description ?? null,
     harness: a.harness ?? null,
+    sub_agents: (a.sub_agents ?? []).map((c) => ({
+      name: c.name,
+      description: c.description ?? null,
+      harness: c.harness ?? null,
+    })),
     skills: a.skills ?? [],
     // Omit rather than set to undefined so toEqual comparisons aren't
     // sensitive to absent-vs-undefined. Logic that reads builtin treats

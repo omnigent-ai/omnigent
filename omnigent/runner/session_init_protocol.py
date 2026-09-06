@@ -25,6 +25,11 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     reasoning_effort: str | None = None
     model_override: str | None = None
     harness_override: str | None = None
+    # The session's per-sub-agent harnesses, as the compact JSON string the
+    # server stores. A string rather than a dict so an older runner that does
+    # not know the field still round-trips it untouched, and so the wire shape
+    # matches the stored column exactly.
+    sub_harness_override: str | None = None
     cost_control_mode_override: str | None = None
     terminal_launch_args: list[str] | None = None
     external_session_id: str | None = None
