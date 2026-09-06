@@ -123,46 +123,73 @@ export function useScrollRestore(
       : null;
   }
 
-  // No dependency array: intentionally runs after every render — each
-  // content-growth step is another chance to reach the saved offset. Cleanup
-  // cancels the previous run's frame, so only one loop is ever live.
+  // Arm a restore once per content identity / readiness change — NOT every
+  // render. A virtualized tree re-renders on every scroll frame; re-running the
+  // restore then would fight the user and re-read layout each frame.
   useLayoutEffect(() => {
     const el = ref.current;
     const pending = pendingRef.current;
     if (!el || !pending || !ready) return;
-    let frame = 0;
-    function settleForUser() {
-      pendingRef.current = null;
-      cancelAnimationFrame(frame);
-      detach();
-    }
-    const detach = () => {
-      for (const type of USER_SCROLL_EVENTS) el.removeEventListener(type, settleForUser);
+
+    const settle = () => {
+      if (pendingRef.current === pending) pendingRef.current = null;
     };
-    const attempt = () => {
-      // A user gesture (or a later render's loop) may have already settled it.
+
+    // A zero target needs no geometry: write it and settle, so we don't force a
+    // synchronous layout of the freshly mounted tree during the switch commit.
+    if (pending.target === 0) {
+      el.scrollTop = 0;
+      settle();
+      return;
+    }
+
+    // Nonzero: assert the target, then keep re-asserting it as the container
+    // grows/measures — a virtualized tree settles its row heights after mount,
+    // which shifts scrollTop — until it holds through the budget or a user
+    // scrolls. A ResizeObserver on the scrolled content drives the re-asserts
+    // instead of reading layout on every animation frame. Keeping `pending`
+    // non-null until settle also suppresses the save handler, so those
+    // measurement-driven scroll events can't overwrite the saved offset.
+    let done = false;
+    let frame = 0;
+    let ro: ResizeObserver | null = null;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      settle();
+      for (const type of USER_SCROLL_EVENTS) el.removeEventListener(type, finish);
+      ro?.disconnect();
+      cancelAnimationFrame(frame);
+    };
+    const reassert = () => {
       if (pendingRef.current !== pending) {
-        detach();
+        finish();
         return;
       }
       el.scrollTop = pending.target;
-      const maxScroll = el.scrollHeight - el.clientHeight;
-      if (maxScroll >= pending.target || performance.now() >= pending.deadline) {
-        pendingRef.current = null;
-        detach();
+    };
+    // Poll only the clock (no layout read) until the budget expires; the
+    // ResizeObserver — not this loop — re-asserts on content growth.
+    const tick = () => {
+      if (done) return;
+      if (performance.now() >= pending.deadline) {
+        finish();
         return;
       }
-      frame = requestAnimationFrame(attempt);
+      frame = requestAnimationFrame(tick);
     };
     for (const type of USER_SCROLL_EVENTS) {
-      el.addEventListener(type, settleForUser, { passive: true });
+      el.addEventListener(type, finish, { passive: true });
     }
-    attempt();
-    return () => {
-      cancelAnimationFrame(frame);
-      detach();
-    };
-  });
+    el.scrollTop = pending.target;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(reassert);
+      const content = el.firstElementChild;
+      if (content) ro.observe(content);
+    }
+    tick();
+    return finish;
+  }, [key, ready, ref]);
 
   return useCallback((event: UIEvent<HTMLElement>) => {
     if (keyRef.current && pendingRef.current === null) {

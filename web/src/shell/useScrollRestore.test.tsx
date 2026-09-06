@@ -113,16 +113,27 @@ describe("useScrollRestore", () => {
     expect(getSavedScrollTop("view:slow")).toBe(140);
   });
 
-  it("settles as soon as the target is reachable", async () => {
+  it("suppresses programmatic scroll saves through the budget even when reachable", async () => {
+    // The offset fits immediately, but the restore intentionally does NOT
+    // settle on first reach: a virtualized tree measures its rows after mount
+    // and shifts scrollTop, and that programmatic adjustment must not overwrite
+    // the saved offset. So a non-user scroll within the budget is ignored;
+    // only the budget expiring (or a user gesture) re-enables saving.
     saveScrollTop("view:reachable", 50);
     const { el } = mount("view:reachable");
-    // Tall content: the offset fits, so no budget needs to be spent.
     Object.defineProperty(el, "scrollHeight", { configurable: true, value: 1000 });
     await nextFrame();
 
+    // A measurement-driven (non-user) scroll mid-restore is not persisted.
     el.scrollTop = 60;
     fireEvent.scroll(el);
-    expect(getSavedScrollTop("view:reachable")).toBe(60);
+    expect(getSavedScrollTop("view:reachable")).toBe(50);
+
+    // Once the budget expires, saving resumes.
+    await settleRestore();
+    el.scrollTop = 75;
+    fireEvent.scroll(el);
+    expect(getSavedScrollTop("view:reachable")).toBe(75);
   });
 
   it("stops fighting the user when they scroll during a pending restore", async () => {

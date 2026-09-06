@@ -254,21 +254,21 @@ function flattenTree(
       if (lazyLoading) {
         rows.push({
           kind: "placeholder",
-          key: `loading ${node.path}`,
+          key: `loading:${node.path}`,
           depth: depth + 1,
           text: "Loading…",
         });
       } else if (lazyError) {
         rows.push({
           kind: "placeholder",
-          key: `error ${node.path}`,
+          key: `error:${node.path}`,
           depth: depth + 1,
           text: "Failed to load this folder.",
         });
       } else if (children.length === 0 && rawChildren.length > 0) {
         rows.push({
           kind: "placeholder",
-          key: `hidden ${node.path}`,
+          key: `hidden:${node.path}`,
           depth: depth + 1,
           text: "All files are hidden — click the eye icon to reveal them.",
         });
