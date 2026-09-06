@@ -2396,3 +2396,34 @@ describe("Sidebar collapsed marker", () => {
     expect(openAside).not.toHaveAttribute("data-collapsed");
   });
 });
+
+describe("Sidebar drag ghost placement", () => {
+  // The aside always carries a transform (translate-x), which per CSS makes it
+  // the containing block for position:fixed descendants. The dnd-kit
+  // DragOverlay is position:fixed and computes viewport coordinates, so if it
+  // renders inside the aside the ghost lands offset by the floating peek
+  // card's own viewport offset (down-right of the cursor). It must therefore
+  // portal to <body>, outside the transformed sidebar.
+  it("renders the drag ghost outside the transformed sidebar aside", async () => {
+    mockConversations([conv("conv_drag", "Claude Code", { title: "Drag ghost row" })]);
+    renderSidebar();
+    const row = document.querySelector('a[href="/c/conv_drag"]')?.closest("li");
+    expect(row).toBeTruthy();
+    // Real mouse-drag activation: press, then cross the MouseSensor's 5px
+    // activation distance so the DragOverlay mounts its preview card.
+    fireEvent.mouseDown(row!, { button: 0, clientX: 5, clientY: 5 });
+    fireEvent.mouseMove(document, { clientX: 40, clientY: 40 });
+    const ghost = await waitFor(() => {
+      const el = Array.from(document.querySelectorAll("div.pointer-events-none")).find(
+        (d) => d.textContent === "Drag ghost row",
+      );
+      if (!el) throw new Error("drag ghost (session preview card) never appeared");
+      return el;
+    });
+    // Inside the aside, the fixed ghost's containing block is the translated
+    // sidebar and its position no longer tracks the pointer's viewport coords.
+    expect(ghost.closest("aside.conversations-sidebar")).toBeNull();
+    expect(document.body.contains(ghost)).toBe(true);
+    fireEvent.mouseUp(document, { clientX: 40, clientY: 40 });
+  });
+});
