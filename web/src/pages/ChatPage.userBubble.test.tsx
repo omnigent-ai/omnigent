@@ -181,6 +181,38 @@ describe("AssistantBubble lifecycle rendering", () => {
   });
 });
 
+describe("UserBubble action-row spacing", () => {
+  // The hover action row (timestamp/Copy) is transparent at rest but still
+  // occupies layout space. The assistant's row is a direct child of the
+  // gap-2 Message column; the user bubble nests its row inside a custom
+  // shrink-wrap column. If that inner column drops the shared gap, the user
+  // bubble trails 8px less invisible space than an assistant bubble and the
+  // transcript's visible whitespace around sent messages reads asymmetric.
+  const actionRow = (): HTMLElement | null =>
+    screen.getByRole("button", { name: "Copy" }).closest('div[class*="group-hover:opacity-100"]');
+
+  it("separates the action row from the bubble with the shared gap-2", () => {
+    renderBubble(userBubble("measure my spacing"));
+
+    const row = actionRow();
+    expect(row).not.toBeNull();
+    expect(row!.parentElement).toHaveClass("gap-2");
+  });
+
+  it("matches the assistant action row's content gap", () => {
+    renderBubble(assistantBubble("completed"));
+    const assistantRow = actionRow();
+    expect(assistantRow).not.toBeNull();
+    expect(assistantRow!.parentElement).toHaveClass("gap-2");
+    cleanup();
+
+    renderBubble(userBubble("same rhythm on both sides"));
+    const userRow = actionRow();
+    expect(userRow).not.toBeNull();
+    expect(userRow!.parentElement).toHaveClass("gap-2");
+  });
+});
+
 describe("UserBubble copy button", () => {
   afterEach(() => {
     vi.unstubAllGlobals();

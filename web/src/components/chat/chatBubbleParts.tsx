@@ -602,7 +602,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-user-message-id={bubble.itemId}
       className="max-w-[640px]"
     >
-      <div className="ml-auto flex w-fit max-w-full flex-col items-end">
+      {/* gap-2 mirrors Message's content→actions spacing so the invisible
+          action row adds the same trailing space as an assistant bubble's,
+          keeping the transcript's visible rhythm symmetric around user
+          messages. */}
+      <div className="ml-auto flex w-fit max-w-full flex-col items-end gap-2">
         {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
             immediately left of the right-aligned bubble. */}
         <div className="flex w-fit max-w-full items-center gap-1.5">
