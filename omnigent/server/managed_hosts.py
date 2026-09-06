@@ -2218,19 +2218,21 @@ def _resolve_microsandbox_host_ports(raw: dict[str, object], server_url: str) ->
 
     Managed VMs run untrusted agent code on the SAME machine as the server,
     so their default ``host`` network mode is scoped to explicit ports rather
-    than the whole host: the port of *server_url* (the dial-back path) plus
-    any operator-listed ``sandbox.microsandbox.host_ports`` (e.g. a local LLM
-    gateway). Only the launcher's managed path receives this list - the CLI
-    bootstrap constructs the launcher without one and keeps full host access
-    (a locally self-hosted server's port isn't known at creation time).
+    than the whole host: the port of *server_url* when it targets the host
+    gateway, plus any operator-listed ``sandbox.microsandbox.host_ports``
+    (e.g. a local LLM gateway). Public server URLs need only public egress and
+    do not implicitly expose the same port on the host machine.
 
     :param raw: The raw ``sandbox`` mapping.
     :param server_url: The validated ``sandbox.server_url`` value.
-    :returns: De-duplicated port list, always containing the server port.
+    :returns: De-duplicated host port list, containing the server port only
+        when the URL targets ``host.microsandbox.internal``.
     :raises ValueError: When ``host_ports`` is present but not a list of
         integers in 1-65535, or the server URL carries no resolvable port.
     """
     from urllib.parse import urlsplit
+
+    from omnigent.onboarding.sandboxes.microsandbox import HOST_GATEWAY_NAME
 
     split = urlsplit(server_url.strip())
     server_port = split.port
@@ -2244,7 +2246,7 @@ def _resolve_microsandbox_host_ports(raw: dict[str, object], server_url: str) ->
             "non-zero port for the microsandbox provider (an explicit :port, "
             "or an http/https scheme)"
         )
-    ports = [server_port]
+    ports = [server_port] if (split.hostname or "").lower() == HOST_GATEWAY_NAME else []
     section = _parse_provider_section(raw, "microsandbox")
     extra = section.get("host_ports") if section is not None else None
     if extra is not None:

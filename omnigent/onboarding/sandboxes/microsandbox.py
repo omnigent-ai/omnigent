@@ -99,7 +99,8 @@ configured host ports; ``public-only`` drops all host rules (use it when
 ``server_url`` is a genuinely public URL); ``all`` opens LAN/private egress
 too."""
 
-_HOST_GATEWAY_NAME = "host.microsandbox.internal"
+HOST_GATEWAY_NAME: str = "host.microsandbox.internal"
+"""Stable guest hostname for the machine running microsandbox."""
 
 # Resources for the VM. Matches the Modal / Daytona / boxlite launchers:
 # 2 vCPU / 4 GiB is enough for a host running one interactive session.
@@ -161,7 +162,7 @@ except OSError:
 def _host_ports_for_server_url(server_url: str) -> tuple[int, ...]:
     """Return the host-gateway port needed to reach a local server URL."""
     split = urlsplit(server_url.strip())
-    if (split.hostname or "").lower() != _HOST_GATEWAY_NAME:
+    if (split.hostname or "").lower() != HOST_GATEWAY_NAME:
         return ()
     try:
         port = split.port

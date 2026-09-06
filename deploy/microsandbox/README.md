@@ -72,7 +72,7 @@ sandbox:
 | `all` | Everything, including private LANs. |
 
 Under `host` mode, VMs run untrusted agent code on the same machine as the server, so guest-to-host access is always scoped to a TCP port allowlist.
-Managed VMs allow the `server_url` port plus any `host_ports` entries.
+Managed VMs allow the `server_url` port when it uses `host.microsandbox.internal`, plus any explicit `host_ports` entries.
 List the ports of host-local services agents legitimately need - e.g. `host_ports: [8317]` for a local LLM gateway the sandbox env points at via `http://host.microsandbox.internal:8317`.
 Everything else on the host stays unreachable.
 CLI-bootstrap VMs allow only the local `--server` port; public server URLs add no host rule.

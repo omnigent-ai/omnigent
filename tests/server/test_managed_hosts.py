@@ -1464,10 +1464,10 @@ def test_parse_microsandbox_without_section_defaults(
     assert fake.host_ports == [8799]
 
 
-def test_parse_microsandbox_derives_scheme_default_port(
+def test_parse_microsandbox_public_server_does_not_open_host_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A server_url without an explicit port scopes host access by scheme."""
+    """A public server URL needs no corresponding host-machine rule."""
     cfg = parse_sandbox_config(
         {"provider": "microsandbox", "server_url": "https://omnigent.example.com"}
     )
@@ -1476,7 +1476,25 @@ def test_parse_microsandbox_derives_scheme_default_port(
     fake = FakeSandboxLauncher()
     install_fake_microsandbox_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
-    assert fake.host_ports == [443]
+    assert fake.host_ports == []
+
+
+def test_parse_microsandbox_public_server_keeps_explicit_host_ports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operators can still expose named host-local services explicitly."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "microsandbox",
+            "server_url": "https://omnigent.example.com",
+            "microsandbox": {"host_ports": [8317]},
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_microsandbox_launcher(monkeypatch, fake)
+    assert cfg.default.launcher_factory() is fake
+    assert fake.host_ports == [8317]
 
 
 @pytest.mark.parametrize(
