@@ -27,8 +27,14 @@ export function saveScrollTop(key: string, scrollTop: number): void {
  */
 export const SCROLL_RESTORE_BUDGET_MS = 1500;
 
-/** Pointer/touch/wheel input that means the user has taken over scrolling. */
-const USER_SCROLL_EVENTS = ["wheel", "touchstart", "pointerdown"] as const;
+/**
+ * Input that means the reader has taken over scrolling, so the restore must
+ * stop re-asserting the saved offset and never fight them. Includes `keydown`
+ * for keyboard and assistive-tech scrolling (PageDown/arrows/Space/Home/End),
+ * not just pointer/touch/wheel — otherwise a keyboard scroll within the restore
+ * budget would be snapped back each frame.
+ */
+const USER_SCROLL_EVENTS = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
 
 /** The slice of a Monaco code editor the scroll restore needs. */
 interface ScrollableEditor {

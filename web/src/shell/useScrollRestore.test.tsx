@@ -147,6 +147,20 @@ describe("useScrollRestore", () => {
     expect(getSavedScrollTop("view:wheel")).toBe(12);
   });
 
+  it("stops fighting a keyboard / assistive-tech scroll during a pending restore", async () => {
+    // Keyboard scrolling (PageDown/arrows/Space) and AT scroll-into-view fire
+    // keydown, not wheel/pointer — the restore must yield to them too, or it
+    // snaps the reader back for the whole budget.
+    saveScrollTop("view:keydown", 300);
+    const { el } = mount("view:keydown");
+
+    fireEvent.keyDown(el, { key: "PageDown" });
+    el.scrollTop = 42;
+    fireEvent.scroll(el);
+
+    expect(getSavedScrollTop("view:keydown")).toBe(42);
+  });
+
   it("saves again once the restore has settled", async () => {
     saveScrollTop("view:settle", 90);
     const { el } = mount("view:settle");
