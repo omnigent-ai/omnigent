@@ -1,5 +1,6 @@
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -7,6 +8,7 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { useCustomAgents } from "@/lib/customAgentsApi";
 import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -42,6 +44,10 @@ vi.mock("@/store/chatStore", () => ({
 }));
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/customAgentsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CustomAgentsApiModule>()),
+  useCustomAgents: vi.fn(() => ({ data: [], isPending: false, error: null })),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: [] })),
@@ -211,16 +217,9 @@ function renderRoutingLanding(): { rerender: (ui: ReactNode) => void; unmount: (
   return { rerender, unmount };
 }
 
-/**
- * Open the picker and commit (select + close) an agent by clicking its row.
- * The composed agents these tests use live under the "Custom agents"
- * submenu, so drill in when the row isn't already listed inline.
- */
+/** Open the picker and commit (select + close) an agent by clicking its row. */
 function selectAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
-    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
-  }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
 }
 
@@ -241,6 +240,12 @@ async function submitAndReadBody(): Promise<Record<string, unknown>> {
 beforeEach(() => {
   navigateMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
+  vi.mocked(useCustomAgents).mockReset();
+  vi.mocked(useCustomAgents).mockReturnValue({
+    data: [],
+    isPending: false,
+    error: null,
+  } as unknown as ReturnType<typeof useCustomAgents>);
   // The landing draft is module-scoped and survives unmount by design; clear it
   // so a case that never submits can't leak its state into the next test.
   resetLandingDraft();

@@ -2,6 +2,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ToastModule from "@/components/ui/toast";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -19,6 +20,7 @@ import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { moveConversationToProject, useProjectConfig, useProjects } from "@/hooks/useConversations";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { showToast } from "@/components/ui/toast";
+import { customAgentBundle, useCustomAgents } from "@/lib/customAgentsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
@@ -46,6 +48,11 @@ vi.mock("@/store/chatStore", () => ({
 }));
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/customAgentsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CustomAgentsApiModule>()),
+  customAgentBundle: vi.fn(),
+  useCustomAgents: vi.fn(() => ({ data: [], isPending: false, error: null })),
+}));
 vi.mock("@/components/ui/toast", async (importOriginal) => ({
   ...(await importOriginal<typeof ToastModule>()),
   showToast: vi.fn(),
@@ -86,7 +93,7 @@ vi.mock("./WorkspacePicker", () => ({
   ),
 }));
 // Multipart-path plumbing: a fake bundle, a mocked multipart create + runner
-// launch, and a CreateAgentDialog stub whose button commits a pending agent.
+// launch, and a lightweight CreateAgentDialog stub for unrelated renders.
 vi.mock("@/lib/agentBundle", () => ({
   buildAgentBundle: vi.fn(() => Promise.resolve(new File(["x"], "bundle.tar.gz"))),
 }));
@@ -208,9 +215,6 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}): {
 /** Open the picker and commit (select + close) an agent by clicking its row. */
 function selectAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
-    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
-  }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
 }
 
@@ -243,6 +247,14 @@ beforeEach(() => {
   vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new" });
   vi.mocked(launchRunner).mockReset();
   vi.mocked(launchRunner).mockResolvedValue(undefined as never);
+  vi.mocked(customAgentBundle).mockReset();
+  vi.mocked(customAgentBundle).mockResolvedValue(new File(["x"], "bundle.tar.gz"));
+  vi.mocked(useCustomAgents).mockReset();
+  vi.mocked(useCustomAgents).mockReturnValue({
+    data: [],
+    isPending: false,
+    error: null,
+  } as unknown as ReturnType<typeof useCustomAgents>);
   searchParams = new URLSearchParams("project=Alpha");
   resetLandingDraft();
   localStorage.clear();
@@ -406,6 +418,22 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
 
   it("carries project_id and the omission rules through the multipart (bundled) path", async () => {
     setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+    vi.mocked(useCustomAgents).mockReturnValue({
+      data: [
+        {
+          id: "ca_project_test",
+          name: "Project test",
+          description: null,
+          harness: null,
+          model: null,
+          version: 1,
+          created_at: 1,
+          updated_at: null,
+        },
+      ],
+      isPending: false,
+      error: null,
+    } as unknown as ReturnType<typeof useCustomAgents>);
     vi.mocked(createBundledSession).mockResolvedValue({
       id: "conv_new",
       warnings: [{ code: "project_agent_mismatch", message: "bundled agent differs" }],
@@ -414,8 +442,8 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
-    // Commit a pending custom agent (via the stubbed dialog), then submit.
-    fireEvent.click(screen.getByTestId("test-create-pending"));
+    // Pick a saved custom Agent, then submit through the multipart path.
+    selectAgent("ca_project_test");
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "hello" },
     });
@@ -426,7 +454,10 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     // Atomic filing rides in the metadata part; the config-seeded workspace
     // is omitted (server default-fill) and no born-filed label is stamped.
     const [, metadata] = vi.mocked(createBundledSession).mock.calls[0];
-    expect(metadata).toEqual({ project_id: "proj_alpha" });
+    expect(metadata).toEqual({
+      project_id: "proj_alpha",
+      labels: { "omnigent:agent-template-id": "ca_project_test" },
+    });
     // The runner still launches with the explicit client-side workspace.
     expect(vi.mocked(launchRunner)).toHaveBeenCalledWith("host_1", "conv_new", REPO, undefined);
     expect(vi.mocked(moveConversationToProject)).not.toHaveBeenCalled();
