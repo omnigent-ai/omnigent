@@ -9,6 +9,7 @@
 import { useEffect } from "react";
 import {
   ArchiveIcon,
+  BotIcon,
   ArrowLeftIcon,
   BlocksIcon,
   DownloadIcon,
@@ -32,6 +33,7 @@ import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
+  | "agents"
   | "appearance"
   | "general"
   | "git"
@@ -47,6 +49,7 @@ export type SettingsSectionId =
   | "updates";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
+  "agents",
   "appearance",
   "general",
   "git",
@@ -93,6 +96,7 @@ export function settingsNavGroups(
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
+    { id: "agents", label: "Agents", icon: BotIcon },
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },

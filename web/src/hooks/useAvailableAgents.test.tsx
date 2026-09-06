@@ -393,7 +393,12 @@ describe("useAvailableAgents", () => {
           },
           // Genuinely custom agent; survives with scan-only fields on initial
           // load (harness/description filled on hover via prefetchAvailableAgentDetails).
-          { id: "conv_3", agent_id: "ag_doc", agent_name: "doc-writer" },
+          {
+            id: "conv_3",
+            agent_id: "ag_doc",
+            agent_name: "doc-writer",
+            labels: { "omnigent:agent-template-id": "ca_doc_writer" },
+          },
           // Same custom agent on an older session — deduped by id.
           { id: "conv_4", agent_id: "ag_doc", agent_name: "doc-writer" },
           // Orphaned row (agent deleted) — skipped.
@@ -429,6 +434,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: null,
         sessionId: "conv_3",
+        templateId: "ca_doc_writer",
         skills: [],
       },
     ]);

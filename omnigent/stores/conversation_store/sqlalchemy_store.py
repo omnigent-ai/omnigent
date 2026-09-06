@@ -4145,6 +4145,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # from an earlier switch survives and offers the wrong "switch
             # back" target (the label is overwritten on each switch).
             | {SWITCH_PREVIOUS_BUILTIN_LABEL_KEY}
+            | {"omnigent:agent-template-id"}
         )
         if not carry_history_into_native:
             drop_keys.add(FORK_CARRY_HISTORY_LABEL_KEY)

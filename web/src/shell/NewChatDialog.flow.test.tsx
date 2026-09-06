@@ -1,5 +1,6 @@
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -13,6 +14,7 @@ import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { useCustomAgents } from "@/lib/customAgentsApi";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 
@@ -75,6 +77,14 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
 }));
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/customAgentsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CustomAgentsApiModule>()),
+  useCustomAgents: vi.fn(() => ({
+    data: [],
+    isPending: false,
+    error: null,
+  })),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({
@@ -283,6 +293,11 @@ beforeEach(() => {
   localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [SEEDED_WORKSPACE] }));
   setHosts([host()]);
   setAgents([agent()]);
+  vi.mocked(useCustomAgents).mockReturnValue({
+    data: [],
+    isPending: false,
+    error: null,
+  } as unknown as ReturnType<typeof useCustomAgents>);
 });
 
 afterEach(() => {
@@ -321,6 +336,54 @@ describe("NewChatLandingScreen create flow", () => {
 
     // On success the screen routes to the freshly created session.
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("posts a saved Agent id even when its name matches a hidden legacy agent", async () => {
+    vi.mocked(useCustomAgents).mockReturnValue({
+      data: [
+        {
+          id: "ca_kimi",
+          name: "kimi",
+          description: null,
+          harness: "codex",
+          model: null,
+          version: 1,
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+      isPending: false,
+      error: null,
+    } as unknown as ReturnType<typeof useCustomAgents>);
+    vi.mocked(authenticatedFetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        headers: new Headers({ "Content-Type": "application/gzip" }),
+        blob: async () => new Blob(["saved-agent-bundle"]),
+      } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ session_id: "conv_new" }),
+      } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ runner_id: "runner_new" }),
+      } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ca_kimi"));
+    typeMessage("use the saved agent");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(3));
+    const calls = vi.mocked(authenticatedFetch).mock.calls;
+    expect(calls[0]?.[0]).toBe("/v1/custom-agents/ca_kimi/contents");
+    expect(calls[1]?.[0]).toBe("/v1/sessions");
+    const form = calls[1]?.[1]?.body as FormData;
+    const metadata = JSON.parse(form.get("metadata") as string);
+    expect(metadata.labels).toEqual({ "omnigent:agent-template-id": "ca_kimi" });
   });
 
   it("records the launched workspace under its host without corrupting other recents", async () => {
@@ -1785,10 +1848,8 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick the non-default agent (Radix opens on pointerdown). "second_agent"
-    // is a custom agent, so it lives in the "Custom agents" submenu.
+    // Pick the non-default agent from the selection-only menu.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_two"));
     // The explicit pick persists immediately — no session has to be created
     // for the preference to stick.

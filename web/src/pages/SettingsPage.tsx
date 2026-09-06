@@ -28,6 +28,7 @@
  *   Unarchive opens the restored session.
  */
 
+import { AgentsSettings } from "@/components/AgentsSettings";
 import {
   type ComponentType,
   lazy,
@@ -309,6 +310,7 @@ export function SettingsPage() {
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
+      {section === "agents" && <AgentsSettings />}
       {section === "general" && <GeneralSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}

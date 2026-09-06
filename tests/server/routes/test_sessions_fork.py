@@ -915,6 +915,7 @@ async def test_fork_switch_drops_claude_permission_mode_label() -> None:
 
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
     dropped = conv_store.fork_calls[0]["dropped_label_keys"]
+    assert "omnigent:agent-template-id" in dropped
     assert "omnigent.claude_native.permission_mode" in dropped, (
         f"agent switch must drop the claude permission-mode label, got {dropped!r}"
     )

@@ -27,8 +27,9 @@ describe("selectableSessionAgents", () => {
       agent({ name: "nessie" }),
       agent({ name: "kimi" }),
       agent({ name: "kimi-code" }),
+      agent({ id: "ca_kimi", name: "kimi" }),
     ]);
-    expect(result.map((a) => a.name)).toEqual(["hello"]);
+    expect(result.map((a) => a.id)).toEqual(["id-hello", "ca_kimi"]);
   });
 });
 
