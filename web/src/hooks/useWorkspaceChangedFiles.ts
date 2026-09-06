@@ -14,7 +14,7 @@
 // gracefully when the runner has no OS environment for the session
 // (e.g. cloud-only agents).
 
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { authenticatedFetch } from "@/lib/identity";
@@ -905,18 +905,14 @@ export function useWorkspaceDirectories(
 ): Map<string, DirectoryResult> {
   const serveable = useWorkspaceServeable(conversationId);
   const enabled = !!conversationId && serveable !== false;
-  // `combine` lets TanStack memoize the assembled Map: it recomputes only when
-  // a listing's data/loading/error actually changes, returning a stable
-  // reference otherwise. Without it a fresh Map every render would re-run the
-  // tree's flatten memo and lazy-path widening effect on every unrelated render.
-  return useQueries({
-    queries: dirPaths.map((dirPath) => ({
-      queryKey: ["workspace-dir", conversationId, dirPath, location],
-      queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath, location),
-      enabled,
-      staleTime: 5_000,
-    })),
-    combine: (results) => {
+  // `combine` lets TanStack memoize the assembled Map. Its recompute gate is a
+  // reference check on the combine fn (`combine !== lastCombine`), so the
+  // callback must be stable — an inline closure is a fresh fn every render and
+  // defeats the gate, rebuilding the Map (and re-running the tree's flatten
+  // memo + widening effect) on every render, including every scroll frame.
+  // Keyed on `dirPaths`, which the caller holds stable at its widening fixpoint.
+  const combine = useCallback(
+    (results: { data?: WorkspaceFile[]; isLoading: boolean; isError: boolean }[]) => {
       const map = new Map<string, DirectoryResult>();
       dirPaths.forEach((dirPath, i) => {
         map.set(dirPath, {
@@ -927,5 +923,15 @@ export function useWorkspaceDirectories(
       });
       return map;
     },
+    [dirPaths],
+  );
+  return useQueries({
+    queries: dirPaths.map((dirPath) => ({
+      queryKey: ["workspace-dir", conversationId, dirPath, location],
+      queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath, location),
+      enabled,
+      staleTime: 5_000,
+    })),
+    combine,
   });
 }
