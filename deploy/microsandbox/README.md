@@ -28,7 +28,7 @@ Hardware virtualization on the machine running the Omnigent server (or CLI):
 No other install is needed - the Python wheel bundles the runtime and libkrunfw.
 The optional `msb` CLI (`brew install superradcompany/tap/microsandbox`) is handy for debugging (`msb doctor`, `msb ls`, `msb logs <name>`).
 
-> **Beta software:** microsandbox is explicitly beta with a breaking-change warning, which is why the extra pins `>=0.6.6,<0.7`.
+> **Beta software:** microsandbox is explicitly beta with a breaking-change warning, which is why the extra pins `>=0.6.9,<0.7`.
 > Do not bump the minor without re-running the smoke test below.
 
 ## Server configuration
@@ -68,13 +68,14 @@ sandbox:
 | Mode | Guest can reach |
 |------|-----------------|
 | `host` (default) | Public internet plus selected ports on the host machine (`host.microsandbox.internal`), while loopback, private LANs, and cloud metadata stay blocked. |
-| `public-only` | Public internet only, for public `server_url` values that do not need local dial-back or CLI App OAuth port-forwarding. |
+| `public-only` | Public internet only, for public `server_url` values that do not need local dial-back. CLI App OAuth port-forwarding still works. |
 | `all` | Everything, including private LANs. |
 
-Under `host` mode, **managed** VMs run untrusted agent code on the same machine as the server, so guest-to-host access is scoped to a TCP port allowlist: the `server_url` port (always) plus any `host_ports` entries.
+Under `host` mode, VMs run untrusted agent code on the same machine as the server, so guest-to-host access is always scoped to a TCP port allowlist.
+Managed VMs allow the `server_url` port plus any `host_ports` entries.
 List the ports of host-local services agents legitimately need - e.g. `host_ports: [8317]` for a local LLM gateway the sandbox env points at via `http://host.microsandbox.internal:8317`.
 Everything else on the host stays unreachable.
-CLI-bootstrap sandboxes (`omnigent sandbox create`, your own interactive session) keep unrestricted host access, because the App OAuth relay port is not known at VM creation time.
+CLI-bootstrap VMs allow only the local `--server` port; public server URLs add no host rule.
 
 ### Environment variables
 
@@ -92,7 +93,8 @@ Names only, so secret values never live in the config file.
 omnigent sandbox create --provider microsandbox --server https://omnigent.example.com
 ```
 
-Builds the local wheels, provisions a VM from the host image, overlays the wheels, runs the in-sandbox App OAuth flow when the server needs it (the port-forward rides an in-guest relay to `host.microsandbox.internal`, so it needs the default `host` network mode and `python3` in the image - the official host image has it), and holds the host open in the foreground.
+Builds the local wheels, provisions a VM from the host image, overlays the wheels, runs the in-sandbox App OAuth flow when the server needs it, and holds the host open in the foreground.
+The OAuth callback binds on the local host and bridges into the guest over the SDK exec channel, so it works under every network mode and needs `python3` in the image (the official host image has it).
 
 ## How it works
 

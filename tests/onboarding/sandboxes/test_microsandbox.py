@@ -262,7 +262,7 @@ class _FakeHandle:
 
     async def kill(self) -> None:
         sandbox = self._state.sandboxes[self._name]
-        if sandbox.status != _FakeSandboxStatus.RUNNING:
+        if sandbox.status == _FakeSandboxStatus.STOPPED:
             raise RuntimeError("sandbox is not running")
         await sandbox.kill()
 
@@ -270,7 +270,11 @@ class _FakeHandle:
         self._state.remove_attempts.append(self._name)
         if self._state.remove_raises is not None:
             raise self._state.remove_raises
-        if self._state.sandboxes[self._name].status == _FakeSandboxStatus.RUNNING:
+        if self._state.sandboxes[self._name].status in {
+            _FakeSandboxStatus.RUNNING,
+            _FakeSandboxStatus.DRAINING,
+            _FakeSandboxStatus.PAUSED,
+        }:
             raise RuntimeError("sandbox is still running")
         self._state.sandboxes.pop(self._name)
         self._state.removed.append(self._name)
@@ -638,14 +642,10 @@ def test_provision_timeout_cancels_and_cleans_up(
 # ── network modes ───────────────────────────────────────────
 
 
-def test_provision_default_network_allows_public_and_host(
+def test_provision_default_network_has_no_unscoped_host_access(
     fake_microsandbox: _FakeMicrosandboxState,
 ) -> None:
-    """
-    The default "host" mode keeps deny-by-default egress with DNS + public +
-    host allow rules - the host rule is what lets a VM dial back to a server
-    on this machine via host.microsandbox.internal.
-    """
+    """No server context means deny-by-default egress with no host rule."""
     MicrosandboxSandboxLauncher().provision("a")
 
     [create] = fake_microsandbox.create_calls
@@ -654,7 +654,31 @@ def test_provision_default_network_allows_public_and_host(
     assert network.policy.default_egress == _FakeAction.DENY
     destinations = {rule.destination for rule in network.policy.rules}
     assert "group:public" in destinations
-    assert "group:host" in destinations
+    assert "group:host" not in destinations
+
+
+def test_provision_server_url_scopes_host_rule_to_local_server(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """CLI server context permits only its host-gateway TCP port."""
+    MicrosandboxSandboxLauncher(server_url="http://host.microsandbox.internal:8799").provision("a")
+
+    [create] = fake_microsandbox.create_calls
+    host_rules = [
+        rule for rule in create.kwargs["network"].policy.rules if rule.destination == "group:host"
+    ]
+    assert [(rule.protocol, rule.port) for rule in host_rules] == [(_FakeProtocol.TCP, 8799)]
+
+
+def test_provision_public_server_url_does_not_open_host_port(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """A public CLI target needs no guest-to-host allow-rule."""
+    MicrosandboxSandboxLauncher(server_url="https://omnigent.example.com").provision("a")
+
+    [create] = fake_microsandbox.create_calls
+    destinations = {rule.destination for rule in create.kwargs["network"].policy.rules}
+    assert "group:host" not in destinations
 
 
 def test_provision_host_ports_scope_the_host_rules(
@@ -945,6 +969,21 @@ def test_terminate_kills_running_and_removes(
 
     # Already gone → no-op success.
     launcher.terminate(sandbox_id)
+    assert fake_microsandbox.removed == [sandbox_id]
+
+
+def test_terminate_kills_draining_sandbox_before_removal(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """Idle draining remains live and must be killed before removal."""
+    launcher = MicrosandboxSandboxLauncher()
+    sandbox_id = _provisioned(fake_microsandbox, launcher)
+    sandbox = fake_microsandbox.sandboxes[sandbox_id]
+    sandbox.status = _FakeSandboxStatus.DRAINING
+
+    launcher.terminate(sandbox_id)
+
+    assert sandbox.killed is True
     assert fake_microsandbox.removed == [sandbox_id]
 
 

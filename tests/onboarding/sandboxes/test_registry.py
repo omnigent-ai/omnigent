@@ -286,6 +286,16 @@ def test_get_launcher_uses_registry() -> None:
     assert launcher.provider == "modal"
 
 
+def test_get_launcher_passes_server_url_to_microsandbox() -> None:
+    """CLI server context reaches the microsandbox network configuration."""
+    reset_plugin_state_for_tests()
+    launcher = get_launcher(
+        "microsandbox",
+        server_url="http://host.microsandbox.internal:8799",
+    )
+    assert launcher._host_ports == (8799,)
+
+
 def test_get_launcher_unknown_raises_click_exception() -> None:
     """An unknown provider still surfaces as a click.ClickException."""
     reset_plugin_state_for_tests()

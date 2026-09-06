@@ -21,10 +21,10 @@ Platform traits that shape this launcher:
   and restarts in place in well under a second, so ``can_resume`` is ``True``
   and idle sandboxes are drained (``idle_timeout``) instead of killed.
 - **Guest-to-host networking.** The guest reaches the machine running the
-  server at ``host.microsandbox.internal`` - the default network policy here
-  is public egress plus a host allow-rule so a locally self-hosted server's
-  ``server_url`` is reachable. ``forward_local_port`` does NOT ride this
-  path: it pipes host connections inward over the SDK's exec channel.
+  server at ``host.microsandbox.internal``. Host access is deny-by-default
+  and scoped to configured TCP ports; the CLI derives a local server's port
+  from ``--server``. ``forward_local_port`` does NOT ride this path: it pipes
+  host connections inward over the SDK's exec channel.
 
 Concurrency model: the SDK is async-only; omnigent calls launcher methods
 synchronously (the server marshals them off its event loop via
@@ -45,6 +45,7 @@ import threading
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
+from urllib.parse import urlsplit
 
 import click
 
@@ -93,11 +94,12 @@ disables draining entirely)."""
 
 NETWORK_MODES: tuple[str, ...] = ("host", "public-only", "all")
 """Recognized values for the launcher's ``network`` setting. ``host`` (the
-default) is microsandbox's public-egress-only posture PLUS an allow-rule for
-guest-to-host traffic, so hosts can dial back to a server on this machine via
-``host.microsandbox.internal``; ``public-only`` drops the host rule (use it
-when ``server_url`` is a genuinely public URL); ``all`` opens LAN/private
-egress too."""
+default) is microsandbox's public-egress-only posture plus scoped rules for
+configured host ports; ``public-only`` drops all host rules (use it when
+``server_url`` is a genuinely public URL); ``all`` opens LAN/private egress
+too."""
+
+_HOST_GATEWAY_NAME = "host.microsandbox.internal"
 
 # Resources for the VM. Matches the Modal / Daytona / boxlite launchers:
 # 2 vCPU / 4 GiB is enough for a host running one interactive session.
@@ -154,6 +156,26 @@ try:
 except OSError:
     pass
 """
+
+
+def _host_ports_for_server_url(server_url: str) -> tuple[int, ...]:
+    """Return the host-gateway port needed to reach a local server URL."""
+    split = urlsplit(server_url.strip())
+    if (split.hostname or "").lower() != _HOST_GATEWAY_NAME:
+        return ()
+    try:
+        port = split.port
+    except ValueError as exc:
+        raise click.ClickException(
+            f"invalid microsandbox server URL {server_url!r}: {exc}"
+        ) from exc
+    if port is None:
+        port = {"http": 80, "https": 443}.get(split.scheme.lower())
+    if not port:
+        raise click.ClickException(
+            "a microsandbox server URL using host.microsandbox.internal must have a non-zero port"
+        )
+    return (port,)
 
 
 # ── Shared process-lifetime event loop ─────────────────
@@ -459,6 +481,7 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
         idle_timeout_s: int | None = None,
         network: str | None = None,
         host_ports: Sequence[int] | None = None,
+        server_url: str | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -479,13 +502,10 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
             drains itself (restartable via :meth:`resume`); ``None`` uses
             :data:`DEFAULT_IDLE_TIMEOUT_S`, ``0`` disables draining.
         :param network: One of :data:`NETWORK_MODES`; ``None`` uses ``host``.
-        :param host_ports: Under the ``host`` network mode, restrict
-            guest-to-host traffic to these TCP ports (e.g. the omnigent
-            server port plus an LLM-gateway port). ``None`` allows every
-            host port - the CLI bootstrap uses it because a locally
-            self-hosted server's port isn't known at creation time; the
-            server's managed path always passes an explicit list so
-            untrusted agents cannot reach unrelated host-local services.
+        :param host_ports: Guest-to-host TCP ports allowed under the ``host``
+            network mode, e.g. the Omnigent server plus an LLM gateway.
+        :param server_url: CLI bootstrap target. Its port is added to the host
+            allowlist only when it uses ``host.microsandbox.internal``.
         :raises click.ClickException: When *network* is not a recognized mode.
         """
         if network is not None and network not in NETWORK_MODES:
@@ -501,7 +521,8 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
             idle_timeout_s if idle_timeout_s is not None else (DEFAULT_IDLE_TIMEOUT_S)
         )
         self._network_mode = network or "host"
-        self._host_ports = tuple(host_ports) if host_ports is not None else None
+        server_host_ports = _host_ports_for_server_url(server_url) if server_url else ()
+        self._host_ports = tuple(dict.fromkeys((*server_host_ports, *(host_ports or ()))))
         self._connections: dict[str, microsandbox_sdk.Sandbox] = {}
 
     # ── Config resolution ──────────────────────────────
@@ -549,10 +570,8 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
         Build the sandbox network config for the configured mode.
 
         ``host`` keeps microsandbox's public-egress-only posture and adds
-        guest-to-host allow-rules (``host.microsandbox.internal``), so hosts
-        can dial back to a server on this machine. Loopback / private-LAN /
-        metadata destinations stay blocked, and when ``host_ports`` is set
-        the host rules are scoped to just those TCP ports.
+        scoped guest-to-host rules for ``host.microsandbox.internal``.
+        Loopback / private-LAN / metadata destinations stay blocked.
         """
         import microsandbox as msb
 
@@ -561,14 +580,10 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
         if self._network_mode == "public-only":
             return msb.Network.from_profiles(msb.NetworkProfile.PUBLIC)
         host = msb.Destination.group(msb.DestGroup.HOST)
-        host_rules: tuple[msb.Rule, ...]
-        if self._host_ports is None:
-            host_rules = (msb.Rule.allow(destination=host),)
-        else:
-            host_rules = tuple(
-                msb.Rule.allow(protocol=msb.Protocol.TCP, port=port, destination=host)
-                for port in self._host_ports
-            )
+        host_rules = tuple(
+            msb.Rule.allow(protocol=msb.Protocol.TCP, port=port, destination=host)
+            for port in self._host_ports
+        )
         return msb.Network(
             policy=msb.NetworkPolicy(
                 default_egress=msb.Action.DENY,
@@ -962,11 +977,10 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
                 handle = await msb.Sandbox.get(sandbox_id)
             except msb.SandboxNotFoundError:
                 return  # already gone - idempotent success
-            # kill() on an already-stopped sandbox raises; stopping first is
-            # not required for removal, only being non-running is.
-            if handle.status == msb.SandboxStatus.RUNNING:
-                with contextlib.suppress(Exception):
-                    await handle.kill()
+            # kill() on an already-stopped sandbox raises; remove() below
+            # reports whether a live sandbox actually remained.
+            with contextlib.suppress(Exception):
+                await handle.kill()
             try:
                 await handle.remove()
             except msb.SandboxNotFoundError:
