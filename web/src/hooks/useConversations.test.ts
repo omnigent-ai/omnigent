@@ -458,9 +458,59 @@ describe("fetchArchivedSessionFacets", () => {
       Number(url.searchParams.get("active_after")),
     );
   });
+
+  it("applies the rolling age preset to the facets request", async () => {
+    const now = 2_000_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    fetchMock.mockResolvedValueOnce(mockResponse({ projects: [], host_ids: [], agent_names: [] }));
+
+    await fetchArchivedSessionFacets({
+      dateField: "archived_at",
+      dateRange: "",
+      sortField: "archived_at",
+      agePreset: "lt30d",
+      order: "desc",
+    });
+
+    const url = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    expect(url.searchParams.get("archived_after")).toBe(
+      String(Math.floor(now / 1000) - 30 * 86_400),
+    );
+    nowSpy.mockRestore();
+  });
 });
 
 describe("useArchivedConversations", () => {
+  it("reuses one 365-day cutoff for the list and facets", async () => {
+    const referenceSeconds = 2_000_000_000;
+    const filters = {
+      dateField: "active_at" as const,
+      dateRange: "",
+      sortField: "created_at" as const,
+      agePreset: "lt365d" as const,
+      ageReferenceSeconds: referenceSeconds,
+      order: "desc" as const,
+    };
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      )
+      .mockResolvedValueOnce(mockResponse({ projects: [], host_ids: [], agent_names: [] }));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    renderHook(() => useArchivedConversations(filters), { wrapper });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await fetchArchivedSessionFacets(filters);
+
+    const expected = String(referenceSeconds - 365 * 86_400);
+    const listUrl = new URL(fetchMock.mock.calls[0][0] as string, "http://test");
+    const facetsUrl = new URL(fetchMock.mock.calls[1][0] as string, "http://test");
+    expect(listUrl.searchParams.get("active_after")).toBe(expected);
+    expect(facetsUrl.searchParams.get("active_after")).toBe(expected);
+  });
+
   it("maps the selected Active calendar day to active interval bounds", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),

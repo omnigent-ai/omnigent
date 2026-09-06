@@ -124,7 +124,7 @@ export type ArchivedDateField = "created_at" | "active_at" | "archived_at";
 export type ArchivedSearchScope = "title" | "content";
 export type ArchivedSortField = "created_at" | "archived_at" | "title";
 export type ArchivedAgePreset =
-  "any" | "lt24h" | "lt7d" | "gt7d" | "gt30d" | "gt90d" | "gt180d" | "gt365d";
+  "any" | "lt24h" | "lt7d" | "lt30d" | "lt365d" | "gt7d" | "gt30d" | "gt90d" | "gt180d" | "gt365d";
 
 export interface ArchivedConversationFilters {
   searchQuery?: string;
@@ -135,6 +135,8 @@ export interface ArchivedConversationFilters {
   dateField: ArchivedDateField;
   sortField: ArchivedSortField;
   agePreset: ArchivedAgePreset;
+  /** Stable epoch-second reference shared by age-filter consumers. */
+  ageReferenceSeconds?: number;
   /** Local calendar day or inclusive range: YYYYMMDD[-YYYYMMDD]. */
   dateRange?: string;
   order: "asc" | "desc";
@@ -654,12 +656,13 @@ export function useConversations(
 function archivedAgeBounds(
   field: ArchivedDateField | "updated_at",
   preset: ArchivedAgePreset,
+  referenceSeconds = Math.floor(Date.now() / 1000),
 ): Record<string, string> {
   if (preset === "any") return {};
   const match = preset.match(/^(lt|gt)(24h|\d+d)$/);
   if (!match) return {};
   const amount = match[2] === "24h" ? 1 : Number.parseInt(match[2], 10);
-  const cutoff = Math.floor(Date.now() / 1000) - amount * 86_400;
+  const cutoff = referenceSeconds - amount * 86_400;
   return {
     [`${field.replace("_at", "")}_${match[1] === "lt" ? "after" : "before"}`]: String(cutoff),
   };
@@ -718,7 +721,7 @@ async function fetchArchivedConversationsPage(
       limit: String(ARCHIVED_PAGE_SIZE),
       order: filters.order,
       sort_by: sortField,
-      ...archivedAgeBounds(dateField, filters.agePreset),
+      ...archivedAgeBounds(dateField, filters.agePreset, filters.ageReferenceSeconds),
       ...archivedCalendarBounds(dateField, filters.dateRange),
     });
     if (after) params.set("after", after);
@@ -1914,10 +1917,14 @@ export async function fetchArchivedSessionFacets(
   signal?: AbortSignal,
 ): Promise<ArchivedSessionFacets> {
   const params = new URLSearchParams();
-  const calendarBounds = archivedCalendarBounds(
-    filters?.dateField ?? "archived_at",
-    filters?.dateRange,
+  const dateField = filters?.dateField ?? "archived_at";
+  const ageBounds = archivedAgeBounds(
+    dateField,
+    filters?.agePreset ?? "any",
+    filters?.ageReferenceSeconds,
   );
+  for (const [key, value] of Object.entries(ageBounds)) params.set(key, value);
+  const calendarBounds = archivedCalendarBounds(dateField, filters?.dateRange);
   for (const [key, value] of Object.entries(calendarBounds)) params.set(key, value);
   if (filters?.searchQuery) params.set("search_query", filters.searchQuery);
   if (filters?.searchQuery && filters.searchScope) params.set("search_scope", filters.searchScope);

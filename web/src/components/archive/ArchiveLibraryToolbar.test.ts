@@ -14,6 +14,7 @@ const view: ArchiveLibraryViewState = {
   agentName: "codex",
   dateField: "active_at",
   dateRange: "20260901-20260904",
+  agePreset: "lt30d",
   sortField: "title",
   order: "asc",
 };
@@ -40,6 +41,7 @@ describe("ArchiveLibraryToolbar date ranges", () => {
       agentName: "codex",
       dateField: "active_at",
       dateRange: "20260901-20260904",
+      agePreset: "any",
       sortField: "title",
       order: "asc",
     });
@@ -49,5 +51,20 @@ describe("ArchiveLibraryToolbar date ranges", () => {
     const range = parseArchiveDateRange("20260902");
     expect(range).not.toBeNull();
     expect((range?.before ?? 0) - (range?.after ?? 0)).toBe(86_400);
+  });
+
+  it("maps the default 30-day preset without populating the manual range", () => {
+    const filters = buildArchiveConversationFilters({ ...view, dateRange: "" }, "", 2_000_000_000);
+
+    expect(filters.agePreset).toBe("lt30d");
+    expect(filters.ageReferenceSeconds).toBe(2_000_000_000);
+    expect(filters.dateRange).toBe("");
+  });
+
+  it("lets a valid manual range take priority over a preset", () => {
+    const filters = buildArchiveConversationFilters(view, "");
+
+    expect(filters.agePreset).toBe("any");
+    expect(filters.dateRange).toBe("20260901-20260904");
   });
 });

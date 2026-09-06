@@ -9,7 +9,10 @@ import {
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { ArchiveDateRangePicker } from "@/components/archive/ArchiveDateRangePicker";
+import {
+  ArchiveDateRangePicker,
+  type ArchiveDatePreset,
+} from "@/components/archive/ArchiveDateRangePicker";
 import {
   Command,
   CommandEmpty,
@@ -37,6 +40,7 @@ export interface ArchiveLibraryViewState {
   agentName?: string;
   dateField: ArchivedDateField;
   dateRange: string;
+  agePreset: ArchiveDatePreset;
   sortField: ArchivedSortField;
   order: "asc" | "desc";
 }
@@ -49,6 +53,7 @@ export interface ArchiveFilterOption {
 
 interface ArchiveLibraryToolbarProps {
   value: ArchiveLibraryViewState;
+  ageReferenceSeconds?: number;
   projectOptions: ArchiveFilterOption[];
   hostOptions: ArchiveFilterOption[];
   agentOptions: ArchiveFilterOption[];
@@ -63,7 +68,10 @@ export function parseArchiveDateRange(value: string): { after: number; before: n
 export function buildArchiveConversationFilters(
   value: ArchiveLibraryViewState,
   searchQuery: string,
+  ageReferenceSeconds = Math.floor(Date.now() / 1000),
 ): ArchivedConversationFilters {
+  const manualRange = archiveDateRangeBounds(value.dateRange);
+  const agePreset = manualRange ? "any" : value.agePreset;
   return {
     searchQuery,
     searchScope: value.searchScope,
@@ -71,9 +79,10 @@ export function buildArchiveConversationFilters(
     hostId: value.hostId,
     agentName: value.agentName,
     dateField: value.dateField,
-    dateRange: value.dateRange,
+    dateRange: manualRange ? value.dateRange : "",
     sortField: value.sortField,
-    agePreset: "any",
+    agePreset,
+    ...(agePreset === "any" ? {} : { ageReferenceSeconds }),
     order: value.order,
   };
 }
@@ -167,6 +176,7 @@ function sortLabel(value: ArchiveLibraryViewState): string {
 
 export function ArchiveLibraryToolbar({
   value,
+  ageReferenceSeconds,
   projectOptions,
   hostOptions,
   agentOptions,
@@ -174,7 +184,12 @@ export function ArchiveLibraryToolbar({
   className,
 }: ArchiveLibraryToolbarProps) {
   const hasFilters = Boolean(
-    value.searchQuery || value.project || value.hostId || value.agentName || value.dateRange,
+    value.searchQuery ||
+    value.project ||
+    value.hostId ||
+    value.agentName ||
+    value.dateRange ||
+    value.agePreset !== "any",
   );
 
   return (
@@ -317,7 +332,11 @@ export function ArchiveLibraryToolbar({
                     type="button"
                     variant="outline"
                     size="icon-sm"
-                    className={cn("size-8", value.dateRange && "border-primary/40 bg-primary/5")}
+                    className={cn(
+                      "size-8",
+                      (value.dateRange || value.agePreset !== "any") &&
+                        "border-primary/40 bg-primary/5",
+                    )}
                     aria-label="Filter archive by date"
                   >
                     <CalendarRangeIcon className="size-3.5" />
@@ -327,7 +346,11 @@ export function ArchiveLibraryToolbar({
             </TooltipTrigger>
             <TooltipContent>Filter by Created, Active, or Archived date.</TooltipContent>
           </Tooltip>
-          <PopoverContent align="end" className="w-[20rem] space-y-3 p-3">
+          <PopoverContent
+            align="end"
+            className="w-[calc(100vw-1rem)] max-w-[20rem] space-y-3 p-3"
+            data-testid="archive-date-popover"
+          >
             <div
               role="group"
               aria-label="Archive date dimension"
@@ -357,6 +380,9 @@ export function ArchiveLibraryToolbar({
             <ArchiveDateRangePicker
               value={value.dateRange}
               onValueChange={(dateRange) => onChange({ dateRange })}
+              agePreset={value.agePreset}
+              ageReferenceSeconds={ageReferenceSeconds}
+              onAgePresetChange={(agePreset) => onChange({ agePreset })}
               inlineCalendar
             />
           </PopoverContent>
@@ -377,6 +403,7 @@ export function ArchiveLibraryToolbar({
                     hostId: undefined,
                     agentName: undefined,
                     dateRange: "",
+                    agePreset: "any",
                   })
                 }
               >

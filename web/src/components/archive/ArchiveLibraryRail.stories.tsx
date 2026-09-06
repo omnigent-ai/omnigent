@@ -59,6 +59,8 @@ const items: ConversationItem[] = [
   },
 ];
 
+const STORY_AGE_REFERENCE_SECONDS = Math.floor(Date.now() / 1000);
+
 const initialFilters = {
   searchQuery: "",
   searchScope: "title" as const,
@@ -68,7 +70,8 @@ const initialFilters = {
   dateField: "archived_at" as const,
   dateRange: "",
   sortField: "archived_at" as const,
-  agePreset: "any" as const,
+  agePreset: "lt30d" as const,
+  ageReferenceSeconds: STORY_AGE_REFERENCE_SECONDS,
   order: "desc" as const,
 };
 
@@ -76,6 +79,10 @@ const meta = {
   title: "Components/Archive/LibraryRail",
   component: ArchiveLibraryRail,
   tags: ["visual-snapshot"],
+  args: {
+    ageReferenceSeconds: STORY_AGE_REFERENCE_SECONDS,
+    initialAgePreset: "lt30d",
+  },
   decorators: [
     (Story, context) => (
       <StoryQueryRouter

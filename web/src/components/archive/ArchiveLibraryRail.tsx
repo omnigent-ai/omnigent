@@ -39,27 +39,46 @@ import {
 } from "@/hooks/useConversations";
 import { useHosts } from "@/hooks/useHosts";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { cn } from "@/lib/utils";
 
 const SPLIT_STORAGE_KEY = "omnigent:archive-library-rail-split-v1";
 const DATE_STORAGE_KEY = "omnigent:archive-date-filter-v1";
 
-function readDateSelection(): Pick<ArchiveLibraryViewState, "dateField" | "dateRange"> {
+function readDateSelection(): Pick<
+  ArchiveLibraryViewState,
+  "dateField" | "dateRange" | "agePreset"
+> {
   try {
     const stored = JSON.parse(localStorage.getItem(DATE_STORAGE_KEY) ?? "null") as {
       dateField?: string;
       dateRange?: string;
+      agePreset?: string;
     } | null;
+    const storedDateRange = typeof stored?.dateRange === "string" ? stored.dateRange : "";
+    const dateRange = archiveDateRangeBounds(storedDateRange) ? storedDateRange : "";
+    const agePreset =
+      stored?.agePreset === "any" ||
+      stored?.agePreset === "lt7d" ||
+      stored?.agePreset === "lt30d" ||
+      stored?.agePreset === "lt365d"
+        ? dateRange
+          ? "any"
+          : stored.agePreset
+        : dateRange
+          ? "any"
+          : "lt30d";
     return {
       dateField:
         stored?.dateField === "created_at" || stored?.dateField === "active_at"
           ? stored.dateField
           : "archived_at",
-      dateRange: typeof stored?.dateRange === "string" ? stored.dateRange : "",
+      dateRange,
+      agePreset,
     };
   } catch {
-    return { dateField: "archived_at", dateRange: "" };
+    return { dateField: "archived_at", dateRange: "", agePreset: "lt30d" };
   }
 }
 
@@ -154,14 +173,23 @@ export function ArchiveLibraryRail({
   activeConversationId,
   initialProject,
   initialHostId,
+  initialAgePreset,
+  ageReferenceSeconds,
 }: {
   activeConversationId?: string;
   initialProject?: string | null;
   initialHostId?: string | null;
+  initialAgePreset?: ArchiveLibraryViewState["agePreset"];
+  ageReferenceSeconds?: number;
 }) {
   const isMobileViewport = useIsMobileViewport();
   const { containerRef, ratio, handleProps } = useVerticalSplit();
-  const [view, setView] = useState(() => initialView(initialProject, initialHostId));
+  const [view, setView] = useState(() => {
+    const initial = initialView(initialProject, initialHostId);
+    return initialAgePreset === undefined
+      ? initial
+      : { ...initial, dateRange: "", agePreset: initialAgePreset };
+  });
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [selected, setSelected] = useState<Conversation | null>(null);
   const [pageAfter, setPageAfter] = useState<string | undefined>();
@@ -183,13 +211,17 @@ export function ArchiveLibraryRail({
   useEffect(() => {
     localStorage.setItem(
       DATE_STORAGE_KEY,
-      JSON.stringify({ dateField: view.dateField, dateRange: view.dateRange }),
+      JSON.stringify({
+        dateField: view.dateField,
+        dateRange: view.dateRange,
+        agePreset: view.agePreset,
+      }),
     );
-  }, [view.dateField, view.dateRange]);
+  }, [view.agePreset, view.dateField, view.dateRange]);
 
   const filters = useMemo(
-    () => buildArchiveConversationFilters(view, debouncedQuery),
-    [debouncedQuery, view],
+    () => buildArchiveConversationFilters(view, debouncedQuery, ageReferenceSeconds),
+    [ageReferenceSeconds, debouncedQuery, view],
   );
   const facets = useArchivedSessionFacets(filters);
   const archivedQuery = useArchivedConversations(filters, pageAfter);
@@ -305,6 +337,7 @@ export function ArchiveLibraryRail({
       >
         <ArchiveLibraryToolbar
           value={view}
+          ageReferenceSeconds={filters.ageReferenceSeconds}
           projectOptions={projectOptions}
           hostOptions={hostOptions}
           agentOptions={agentOptions}

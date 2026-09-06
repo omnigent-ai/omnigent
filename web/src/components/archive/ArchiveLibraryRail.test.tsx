@@ -118,6 +118,54 @@ describe("ArchiveLibraryRail", () => {
     expect(screen.getByText("Page 1")).toBeInTheDocument();
   });
 
+  it("defaults the archive date filter to the last 30 days", async () => {
+    renderRail({ ageReferenceSeconds: 2_000_000_000 });
+
+    await waitFor(() => {
+      expect(useArchivedMock.mock.calls.at(-1)?.[0]).toMatchObject({
+        agePreset: "lt30d",
+        ageReferenceSeconds: 2_000_000_000,
+        dateRange: "",
+      });
+    });
+  });
+
+  it("replaces an invalid legacy date draft with the default preset", async () => {
+    localStorage.setItem(
+      "omnigent:archive-date-filter-v1",
+      JSON.stringify({ dateField: "archived_at", dateRange: "202609" }),
+    );
+
+    renderRail();
+
+    await waitFor(() => {
+      expect(useArchivedMock.mock.calls.at(-1)?.[0]).toMatchObject({
+        agePreset: "lt30d",
+        dateRange: "",
+      });
+    });
+  });
+
+  it("normalizes a valid manual range to override a stored preset", async () => {
+    localStorage.setItem(
+      "omnigent:archive-date-filter-v1",
+      JSON.stringify({
+        dateField: "archived_at",
+        dateRange: "20260901-20260904",
+        agePreset: "lt30d",
+      }),
+    );
+
+    renderRail();
+
+    await waitFor(() => {
+      expect(useArchivedMock.mock.calls.at(-1)?.[0]).toMatchObject({
+        agePreset: "any",
+        dateRange: "20260901-20260904",
+      });
+    });
+  });
+
   it("fuzzy-selects a viable first-class project from linked facets", () => {
     useFacetsMock.mockReturnValue({
       data: { projects: ["First class project"], hostIds: [], agentNames: [] },

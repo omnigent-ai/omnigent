@@ -113,6 +113,7 @@ import {
   type GithubConnectionStatus,
 } from "@/lib/githubIntegration";
 import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
@@ -2253,6 +2254,7 @@ const DEFAULT_ARCHIVED_VIEW: ArchivedViewPreferences = {
   agentName: undefined,
   dateField: "archived_at",
   dateRange: "",
+  agePreset: "lt30d",
   sortField: "archived_at",
   order: "desc",
 };
@@ -2276,12 +2278,26 @@ function readArchivedViewPreferences(): ArchivedViewPreferences {
         : typeof stored.createdRange === "string"
           ? stored.createdRange
           : "";
+    const storedDateRange = typeof stored.dateRange === "string" ? stored.dateRange : legacyRange;
+    const dateRange = archiveDateRangeBounds(storedDateRange) ? storedDateRange : "";
+    const agePreset =
+      stored.agePreset === "any" ||
+      stored.agePreset === "lt7d" ||
+      stored.agePreset === "lt30d" ||
+      stored.agePreset === "lt365d"
+        ? dateRange
+          ? "any"
+          : stored.agePreset
+        : dateRange
+          ? "any"
+          : "lt30d";
     return {
       ...DEFAULT_ARCHIVED_VIEW,
       ...stored,
       searchScope: stored.searchScope === "content" ? "content" : "title",
       dateField,
-      dateRange: typeof stored.dateRange === "string" ? stored.dateRange : legacyRange,
+      dateRange,
+      agePreset,
       sortField:
         stored.sortField === "created_at" || stored.sortField === "title"
           ? stored.sortField
@@ -2615,6 +2631,7 @@ function ArchivedListPane({
 
       <ArchiveLibraryToolbar
         value={view}
+        ageReferenceSeconds={queryView.ageReferenceSeconds}
         projectOptions={projectOptions}
         hostOptions={hostOptions}
         agentOptions={agentOptions}

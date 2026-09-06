@@ -1401,6 +1401,7 @@ describe("SettingsPage", () => {
   it("persists the compact archive view options", async () => {
     renderPage("/settings/archived");
 
+    expect(mocks.archivedFilters?.agePreset).toBe("lt30d");
     fireEvent.click(screen.getByRole("button", { name: "Content" }));
 
     await waitFor(() => {
@@ -1409,6 +1410,60 @@ describe("SettingsPage", () => {
       ) as Record<string, unknown>;
       expect(stored.searchScope).toBe("content");
       expect(mocks.archivedFilters?.searchScope).toBe("content");
+    });
+  });
+
+  it("clears the default rolling date preset and preserves that choice", async () => {
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear all archive filters" }));
+
+    await waitFor(() => {
+      expect(mocks.archivedFilters?.agePreset).toBe("any");
+      const stored = JSON.parse(
+        localStorage.getItem("omnigent:archived-sessions-view-v1") ?? "{}",
+      ) as Record<string, unknown>;
+      expect(stored.agePreset).toBe("any");
+    });
+  });
+
+  it("normalizes invalid legacy date storage to <30d", () => {
+    localStorage.setItem(
+      "omnigent:archived-sessions-view-v1",
+      JSON.stringify({ dateField: "archived_at", dateRange: "202609" }),
+    );
+
+    renderPage("/settings/archived");
+
+    expect(mocks.archivedFilters).toMatchObject({ agePreset: "lt30d", dateRange: "" });
+  });
+
+  it("preserves an explicitly cleared rolling date preset on reload", () => {
+    localStorage.setItem(
+      "omnigent:archived-sessions-view-v1",
+      JSON.stringify({ dateField: "archived_at", dateRange: "", agePreset: "any" }),
+    );
+
+    renderPage("/settings/archived");
+
+    expect(mocks.archivedFilters).toMatchObject({ agePreset: "any", dateRange: "" });
+  });
+
+  it("normalizes a valid manual range to override a stored preset", () => {
+    localStorage.setItem(
+      "omnigent:archived-sessions-view-v1",
+      JSON.stringify({
+        dateField: "archived_at",
+        dateRange: "20260901-20260904",
+        agePreset: "lt30d",
+      }),
+    );
+
+    renderPage("/settings/archived");
+
+    expect(mocks.archivedFilters).toMatchObject({
+      agePreset: "any",
+      dateRange: "20260901-20260904",
     });
   });
 

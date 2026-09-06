@@ -13,6 +13,19 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { parseArchiveDateRange } from "@/lib/archiveDateRange";
 import { cn } from "@/lib/utils";
 
+export type ArchiveDatePreset = "any" | "lt7d" | "lt30d" | "lt365d";
+
+const ARCHIVE_DATE_PRESETS: {
+  value: Exclude<ArchiveDatePreset, "any">;
+  label: string;
+  ariaLabel: string;
+  days: number;
+}[] = [
+  { value: "lt7d", label: "<7d", ariaLabel: "Last 7 days", days: 7 },
+  { value: "lt30d", label: "<30d", ariaLabel: "Last 30 days", days: 30 },
+  { value: "lt365d", label: "<1y", ariaLabel: "Last 1 year", days: 365 },
+];
+
 function formatDay(date: Date): string {
   return [date.getFullYear(), date.getMonth() + 1, date.getDate()]
     .map((part, index) => (index === 0 ? String(part) : String(part).padStart(2, "0")))
@@ -35,6 +48,14 @@ function yearPageStart(year: number): number {
   return origin + Math.floor((year - origin) / 12) * 12;
 }
 
+function presetCalendarRange(preset: ArchiveDatePreset, ageReferenceSeconds?: number): string {
+  const days = ARCHIVE_DATE_PRESETS.find((candidate) => candidate.value === preset)?.days;
+  if (!days) return "";
+  const end = new Date(ageReferenceSeconds === undefined ? Date.now() : ageReferenceSeconds * 1000);
+  const start = new Date(end.getTime() - days * 86_400_000);
+  return formatDay(start) + "-" + formatDay(end);
+}
+
 function monthDays(month: Date): { key: string; day: Date | null }[] {
   const first = new Date(month.getFullYear(), month.getMonth(), 1);
   const count = new Date(month.getFullYear(), month.getMonth() + 1, 0).getDate();
@@ -55,24 +76,27 @@ function monthDays(month: Date): { key: string; day: Date | null }[] {
 function CalendarGrid({
   value,
   onValueChange,
+  focusRangeEnd = false,
 }: {
   value: string;
   onValueChange: (value: string) => void;
+  focusRangeEnd?: boolean;
 }) {
   const parsed = parseArchiveDateRange(value);
-  const [month, setMonth] = useState(() => parsed?.start ?? new Date());
+  const focusedDate = focusRangeEnd ? parsed?.end : parsed?.start;
+  const [month, setMonth] = useState(() => focusedDate ?? new Date());
   const [view, setView] = useState<CalendarView>("days");
   const [yearPage, setYearPage] = useState(() =>
-    yearPageStart((parsed?.start ?? new Date()).getFullYear()),
+    yearPageStart((focusedDate ?? new Date()).getFullYear()),
   );
   const [anchor, setAnchor] = useState<Date | null>(null);
   const pendingPickedValue = useRef<string | null>(null);
   const days = useMemo(() => monthDays(month), [month]);
-  const parsedStart = parsed?.start.getTime();
+  const parsedFocus = focusedDate?.getTime();
 
   useEffect(() => {
-    if (parsedStart === undefined) return;
-    const next = new Date(parsedStart);
+    if (parsedFocus === undefined) return;
+    const next = new Date(parsedFocus);
     setMonth(new Date(next.getFullYear(), next.getMonth(), 1));
     if (pendingPickedValue.current === value) {
       pendingPickedValue.current = null;
@@ -81,7 +105,7 @@ function CalendarGrid({
       setView("days");
       setYearPage(yearPageStart(next.getFullYear()));
     }
-  }, [parsedStart, value]);
+  }, [parsedFocus, value]);
 
   const pick = (day: Date) => {
     if (anchor === null) {
@@ -254,6 +278,23 @@ function CalendarGrid({
           </Button>
         </>
       )}
+      <div className="mt-2 border-t pt-1">
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          className="h-7 w-full text-xs text-primary"
+          aria-label="Today"
+          onClick={() => {
+            const today = new Date();
+            setMonth(new Date(today.getFullYear(), today.getMonth(), 1));
+            setView("days");
+            setYearPage(yearPageStart(today.getFullYear()));
+          }}
+        >
+          Today
+        </Button>
+      </div>
     </div>
   );
 }
@@ -263,40 +304,101 @@ export function ArchiveDateRangePicker({
   onValueChange,
   className,
   inlineCalendar = false,
+  agePreset = "any",
+  ageReferenceSeconds,
+  onAgePresetChange,
 }: {
   value: string;
   onValueChange: (value: string) => void;
   className?: string;
   inlineCalendar?: boolean;
+  agePreset?: ArchiveDatePreset;
+  ageReferenceSeconds?: number;
+  onAgePresetChange?: (preset: ArchiveDatePreset) => void;
 }) {
-  const parsed = parseArchiveDateRange(value);
-  const invalid = value.trim().length > 0 && parsed === null;
+  const [draft, setDraft] = useState(value);
   const [open, setOpen] = useState(false);
+  const parsed = parseArchiveDateRange(draft);
+  const invalid = draft.trim().length > 0 && parsed === null;
+  const calendarValue = parsed ? draft : presetCalendarRange(agePreset, ageReferenceSeconds);
+
+  useEffect(() => setDraft(value), [agePreset, value]);
+
+  const changeManualValue = (next: string) => {
+    setDraft(next);
+    if (next === "") {
+      onValueChange("");
+      return;
+    }
+    if (!parseArchiveDateRange(next)) return;
+    onValueChange(next);
+    onAgePresetChange?.("any");
+  };
 
   const input = (
-    <>
-      <Input
-        value={value}
-        onChange={(event) => onValueChange(event.target.value.replace(/[^0-9-]/g, ""))}
-        aria-label="Archive day or date range"
-        aria-invalid={invalid || undefined}
-        placeholder="YYYYMMDD or YYYYMMDD-YYYYMMDD"
-        maxLength={17}
-        className={cn("h-9 min-w-0 font-mono text-xs", !inlineCalendar && "rounded-r-none")}
-      />
-      {invalid && (
-        <p className="mt-1 text-[11px] text-destructive" role="alert">
-          Use YYYYMMDD or YYYYMMDD-YYYYMMDD.
-        </p>
-      )}
-    </>
+    <Input
+      value={draft}
+      onChange={(event) => changeManualValue(event.target.value.replace(/[^0-9-]/g, ""))}
+      aria-label="Archive day or date range"
+      data-testid="archive-date-input"
+      aria-invalid={invalid || undefined}
+      placeholder="YYYYMMDD or YYYYMMDD-YYYYMMDD"
+      maxLength={17}
+      className={cn("h-9 min-w-0 font-mono text-xs", !inlineCalendar && "rounded-r-none")}
+    />
   );
 
   if (inlineCalendar) {
     return (
       <div className={cn("min-w-0 space-y-3", className)}>
-        <div>{input}</div>
-        {!invalid && <CalendarGrid value={value} onValueChange={onValueChange} />}
+        <div>
+          <div className="flex min-w-0 items-center gap-1">
+            <div className="min-w-0 flex-1">{input}</div>
+            {onAgePresetChange && (
+              <div
+                className="flex shrink-0 items-center gap-1"
+                role="group"
+                aria-label="Date presets"
+              >
+                {ARCHIVE_DATE_PRESETS.map((preset) => (
+                  <Button
+                    key={preset.value}
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className={cn(
+                      "h-9 w-10 px-1 text-xs font-normal",
+                      agePreset === preset.value &&
+                        "border-primary/40 bg-primary/15 text-primary dark:bg-primary/15",
+                    )}
+                    aria-label={preset.ariaLabel}
+                    data-testid={`archive-date-preset-${preset.value}`}
+                    aria-pressed={agePreset === preset.value}
+                    onClick={() => {
+                      setDraft("");
+                      onValueChange("");
+                      onAgePresetChange(preset.value);
+                    }}
+                  >
+                    {preset.label}
+                  </Button>
+                ))}
+              </div>
+            )}
+          </div>
+          {invalid && (
+            <p className="mt-1 text-[11px] text-destructive" role="alert">
+              Use YYYYMMDD or YYYYMMDD-YYYYMMDD.
+            </p>
+          )}
+        </div>
+        {!invalid && (
+          <CalendarGrid
+            value={calendarValue}
+            onValueChange={changeManualValue}
+            focusRangeEnd={agePreset !== "any" && parsed === null}
+          />
+        )}
       </div>
     );
   }
@@ -304,7 +406,14 @@ export function ArchiveDateRangePicker({
   return (
     <div className={cn("min-w-0", className)}>
       <div className="flex min-w-0">
-        <div className="min-w-0 flex-1">{input}</div>
+        <div className="min-w-0 flex-1">
+          {input}
+          {invalid && (
+            <p className="mt-1 text-[11px] text-destructive" role="alert">
+              Use YYYYMMDD or YYYYMMDD-YYYYMMDD.
+            </p>
+          )}
+        </div>
         <Popover open={open} onOpenChange={(next) => setOpen(next && !invalid)}>
           <PopoverTrigger asChild>
             <Button
@@ -318,7 +427,7 @@ export function ArchiveDateRangePicker({
             </Button>
           </PopoverTrigger>
           <PopoverContent align="end" className="w-[19rem] p-3">
-            <CalendarGrid value={value} onValueChange={onValueChange} />
+            <CalendarGrid value={calendarValue} onValueChange={changeManualValue} />
           </PopoverContent>
         </Popover>
       </div>
