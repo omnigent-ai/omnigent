@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -189,6 +190,19 @@ def test_process_alive_is_a_nondestructive_probe() -> None:
 def test_process_alive_false_for_bogus_pid() -> None:
     assert _proc.process_alive(2_000_000_000) is False
     assert _proc.process_alive(-1) is False
+
+
+def test_killpg_refuses_the_broadcast_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A target pgid of 1 must never be signalled.
+
+    ``killpg(1, sig)`` is ``kill(-1, sig)`` -- a broadcast to every process
+    the user can signal (a mocked pid that coerces to 1 killed the CI runner).
+    """
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(_proc, "_getpgid_fn", lambda pid: 1 if pid else 54321)
+    monkeypatch.setattr(_proc, "_killpg_fn", lambda pgid, sig: sent.append((pgid, sig)))
+    assert _proc._killpg(1, signal.SIGTERM) is False
+    assert sent == []
 
 
 def test_terminate_tree_stops_the_process() -> None:

@@ -34,11 +34,13 @@ Closes #
 ## Demo
 
 <!--
-Video or images demonstrating the change. Drag-and-drop a screenshot or screen
-recording, or paste a link. Expected for UI / frontend changes (check the
-"UI / frontend change" box below) — show the new behaviour. Optional otherwise;
-use `N/A` for non-visual changes.
+Choose the evidence format that applies. UI / frontend changes require video or
+images. For non-visual changes, put reproducible evidence here or in Test Plan.
 -->
+
+- [ ] Visual demo attached below
+- [ ] Non-visual evidence provided below or in Test Plan
+- [ ] Not applicable — no behavioral change
 
 ## Type of change
 

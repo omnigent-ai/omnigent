@@ -14,6 +14,7 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
+from omnigent.spec.types import RetryPolicy
 from tests.codex_parity.helpers import (
     assert_completed as _assert_completed,
 )
@@ -256,13 +257,14 @@ async def test_real_codex_ignores_retry_progress_until_terminal_failure(
     # error. CodexExecutor must keep waiting until Codex has exhausted retries.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "source-codex-home"))
     (tmp_path / "source-codex-home").mkdir()
+    max_attempts = RetryPolicy().max_retries + 1
     sidecar = codex_responses_sidecar(
         [
             [
                 ev_response_created("resp-failed"),
                 ev_failed("resp-failed", "boom from mock model"),
             ]
-            for _ in range(6)
+            for _ in range(max_attempts)
         ]
     )
     executor = _executor(resolved_codex_bin, sidecar.base_url, tmp_path / "workspace")
@@ -276,7 +278,7 @@ async def test_real_codex_ignores_retry_progress_until_terminal_failure(
     assert len(errors) == 1
     assert "boom from mock model" in errors[0].message
     assert errors[0].retryable is True
-    assert len(sidecar.requests(min_count=6)) == 6
+    assert len(sidecar.requests(min_count=max_attempts)) == max_attempts
 
 
 @pytest.mark.asyncio

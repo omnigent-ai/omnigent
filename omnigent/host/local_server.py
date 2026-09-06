@@ -113,6 +113,8 @@ def server_config_signature(*, include_features: bool = True) -> str:
     * the resolved auth source — auth mode is baked at boot and cannot be
       reconfigured in place;
     * the enabled release-feature set — features are snapshotted at boot; and
+    * custom session-title instructions — title metadata is configured at boot;
+      and
     * the installed package version — a running server holds its code in
       memory, so after ``omni upgrade`` (or a manual ``uv tool upgrade``)
       the old process keeps serving pre-upgrade code until it is cycled.
@@ -135,6 +137,13 @@ def server_config_signature(*, include_features: bool = True) -> str:
 
     from omnigent.server.auth import resolve_auth_source
     from omnigent.server.feature_flags import resolve_feature_flags
+    from omnigent.server.server_config import session_title_instructions
+
+    title_instructions = None
+    if include_features:
+        from omnigent.config import load_global_config
+
+        title_instructions = session_title_instructions(load_global_config())
 
     try:
         version = importlib.metadata.version("omnigent")
@@ -147,6 +156,7 @@ def server_config_signature(*, include_features: bool = True) -> str:
         {
             "auth": resolve_auth_source(),
             "features": (resolve_feature_flags().enabled_names() if include_features else ()),
+            "session_title_instructions": title_instructions,
             "version": version,
         },
         sort_keys=True,

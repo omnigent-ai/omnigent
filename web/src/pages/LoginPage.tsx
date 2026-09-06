@@ -25,9 +25,11 @@
  * reach the deploy.
  */
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { useSearchParams } from "@/lib/routing";
 import { useAppName } from "@/lib/branding";
+import { useLoginV2 } from "@/lib/useLoginV2";
+import { AuthCardShell } from "@/pages/onboarding/AuthCardShell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { getMe, login as loginRequest } from "@/lib/accountsApi";
@@ -54,6 +56,7 @@ function rememberUsername(value: string): void {
 
 export function LoginPage() {
   const appName = useAppName();
+  const loginV2 = useLoginV2();
   const [params] = useSearchParams();
   // `return_to` is set by both identity.ts (on 401 redirect) and the
   // server-side magic-redeem 302 fallback. Trust only same-origin
@@ -132,6 +135,91 @@ export function LoginPage() {
     setError(result.error);
   }
 
+  const heading = (
+    <div className="space-y-1 text-center">
+      <h1 className="text-2xl font-semibold tracking-tight">Sign in</h1>
+      <p className="text-ui text-muted-foreground">Welcome to {appName}.</p>
+    </div>
+  );
+
+  const body: ReactNode = (
+    <>
+      {heading}
+
+      <form onSubmit={onSubmit} className="space-y-4">
+        <div className="space-y-1.5">
+          <label htmlFor="login-username" className="text-ui font-medium leading-none">
+            Username
+          </label>
+          <Input
+            id="login-username"
+            type="text"
+            autoComplete="username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            disabled={submitting}
+            required
+          />
+          <p className="text-sm text-muted-foreground">
+            On a fresh install your username is your machine login (the output of{" "}
+            <code className="font-mono">whoami</code>), unless an admin set a different one.
+          </p>
+        </div>
+
+        <div className="space-y-1.5">
+          <label htmlFor="login-password" className="text-ui font-medium leading-none">
+            Password
+          </label>
+          <Input
+            id="login-password"
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            disabled={submitting}
+            required
+          />
+        </div>
+
+        {error !== null && (
+          <div
+            role="alert"
+            className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+          >
+            {error}
+          </div>
+        )}
+
+        <Button
+          type="submit"
+          className="w-full"
+          disabled={submitting || password.length === 0}
+          componentId="login.sign_in"
+        >
+          {submitting ? "Signing in…" : "Sign in"}
+        </Button>
+      </form>
+
+      <p className="text-center text-sm text-muted-foreground">
+        On a fresh install you set the first admin's password yourself — no credential is
+        auto-generated. A brand-new instance shows a Create-admin form instead of this one; the
+        password can also be pre-seeded with{" "}
+        <code className="rounded bg-muted px-1 py-0.5 font-mono">
+          OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD
+        </code>
+        .
+      </p>
+    </>
+  );
+
+  if (loginV2) {
+    return (
+      <AuthCardShell>
+        <div className="flex flex-col gap-6">{body}</div>
+      </AuthCardShell>
+    );
+  }
+
   return (
     <div
       className="flex min-h-screen items-center justify-center bg-background px-4"
@@ -142,76 +230,7 @@ export function LoginPage() {
         paddingBottom: "var(--omnigent-safe-bottom)",
       }}
     >
-      <div className="w-full max-w-sm space-y-6">
-        <div className="space-y-1 text-center">
-          <h1 className="text-2xl font-semibold tracking-tight">Sign in</h1>
-          <p className="text-ui text-muted-foreground">Welcome to {appName}.</p>
-        </div>
-
-        <form onSubmit={onSubmit} className="space-y-4">
-          <div className="space-y-1.5">
-            <label htmlFor="login-username" className="text-ui font-medium leading-none">
-              Username
-            </label>
-            <Input
-              id="login-username"
-              type="text"
-              autoComplete="username"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              disabled={submitting}
-              required
-            />
-            <p className="text-sm text-muted-foreground">
-              On a fresh install your username is your machine login (the output of{" "}
-              <code className="font-mono">whoami</code>), unless an admin set a different one.
-            </p>
-          </div>
-
-          <div className="space-y-1.5">
-            <label htmlFor="login-password" className="text-ui font-medium leading-none">
-              Password
-            </label>
-            <Input
-              id="login-password"
-              type="password"
-              autoComplete="current-password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              disabled={submitting}
-              required
-            />
-          </div>
-
-          {error !== null && (
-            <div
-              role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
-            >
-              {error}
-            </div>
-          )}
-
-          <Button
-            type="submit"
-            className="w-full"
-            disabled={submitting || password.length === 0}
-            componentId="login.sign_in"
-          >
-            {submitting ? "Signing in…" : "Sign in"}
-          </Button>
-        </form>
-
-        <p className="text-center text-sm text-muted-foreground">
-          On a fresh install you set the first admin's password yourself — no credential is
-          auto-generated. A brand-new instance shows a Create-admin form instead of this one; the
-          password can also be pre-seeded with{" "}
-          <code className="rounded bg-muted px-1 py-0.5 font-mono">
-            OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD
-          </code>
-          .
-        </p>
-      </div>
+      <div className="w-full max-w-sm space-y-6">{body}</div>
     </div>
   );
 }

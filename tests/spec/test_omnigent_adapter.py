@@ -1106,6 +1106,49 @@ def test_os_env_round_trips_through_translator() -> None:
     assert forward.os_env is original_os_env
 
 
+def test_inline_agent_tool_preserves_launch_settings_across_translation(
+    tmp_path: Path,
+) -> None:
+    """Sub-agent history and session limits survive the real YAML load path."""
+    from omnigent.inner.tools import AgentTool
+    from omnigent.spec.omnigent import agent_spec_to_agent_def
+
+    yaml_path = tmp_path / "agent.yaml"
+    yaml_path.write_text(
+        yaml.dump(
+            {
+                "name": "history_repro",
+                "prompt": "Validate agent-tool history settings.",
+                "executor": {
+                    "harness": "claude-sdk",
+                    "model": "databricks-claude-sonnet-4-6",
+                },
+                "tools": {
+                    "reviewer": {
+                        "type": "agent",
+                        "prompt": "Review the current changes.",
+                        "executor": {
+                            "harness": "claude-sdk",
+                            "model": "databricks-claude-sonnet-4-6",
+                        },
+                        "pass_history": True,
+                        "pass_histories": ["research"],
+                        "max_sessions": 2,
+                    },
+                },
+            },
+        ),
+    )
+
+    spec = load(yaml_path)
+    reviewer = agent_spec_to_agent_def(spec).tools["reviewer"]
+
+    assert isinstance(reviewer, AgentTool)
+    assert reviewer.pass_history is True
+    assert reviewer.pass_histories == ["research"]
+    assert reviewer.max_sessions == 2
+
+
 def test_inline_agent_tool_inherit_resolves_to_parent_os_env() -> None:
     """
     An inline :class:`AgentTool` that declares

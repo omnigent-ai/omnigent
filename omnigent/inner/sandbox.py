@@ -76,11 +76,9 @@ class SandboxPolicy:
     :param allow_network: ``True`` to share the host network namespace,
         ``False`` to isolate (bwrap adds ``--unshare-net``).
     :param cwd_allow_hidden: List of dotfile / dotdir basenames that
-        pass through the sandbox view at any depth under cwd. Only
-        consumed by the bwrap backend today (it tmpfs-masks every
-        dotfile whose basename is not in this list); other backends
-        ignore the field. ``None`` means the policy carries no
-        allowlist and the consuming backend applies its own default.
+        pass through the sandbox view at any depth under cwd. ``"*"``
+        explicitly allows every dotpath while retaining symlink escape
+        masking. ``None`` lets the backend apply its default.
     :param cwd_hidden_scan_max_entries: Cap on entries the bwrap
         backend's recursive cwd walker visits. Ignored by other
         backends. Pair with :attr:`cwd_hidden_scan_overflow` to

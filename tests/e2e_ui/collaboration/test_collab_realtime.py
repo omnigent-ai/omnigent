@@ -80,8 +80,8 @@ def test_two_browser_contexts_sync_message_realtime(
         # session stream. The collaborator must be subscribed before the
         # owner sends, otherwise a passing collaborator assertion could
         # be a post-reload snapshot read rather than a live delivery.
-        owner_composer = owner.get_by_placeholder("Ask the agent anything…")
-        collab_composer = collab.get_by_placeholder("Ask the agent anything…")
+        owner_composer = owner.get_by_placeholder("Send a message…")
+        collab_composer = collab.get_by_placeholder("Send a message…")
         expect(owner_composer).to_be_visible()
         expect(collab_composer).to_be_visible()
 

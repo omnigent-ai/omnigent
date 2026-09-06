@@ -47,6 +47,9 @@ from omnigent.server.admin_list import resolve_data_dir
 
 logger = logging.getLogger(__name__)
 
+SESSION_TITLE_INSTRUCTIONS_KEY = "session_title_instructions"
+SESSION_TITLE_INSTRUCTIONS_MAX_CHARS = 4_000
+
 
 def resolve_config_path() -> Path | None:
     """Resolve the server config file path, or ``None`` if there is none.
@@ -99,6 +102,39 @@ def config_str_list(value: Any) -> list[str]:
         return []
     items = value if isinstance(value, list) else [value]
     return [str(item).strip() for item in items if str(item).strip()]
+
+
+def session_title_instructions(config: Mapping[str, Any]) -> str | None:
+    """Return validated additional guidance for automatic session titles.
+
+    The setting is server-owned metadata rather than part of an agent spec.
+    Invalid values fail open to the default title prompt so a config typo can
+    never prevent a user turn from starting.
+
+    :param config: Loaded server config containing the optional
+        ``session_title_instructions`` top-level key.
+    :returns: Stripped custom instructions, or ``None`` when unset or invalid.
+    """
+    raw = config.get(SESSION_TITLE_INSTRUCTIONS_KEY)
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        logger.warning(
+            "server config %s must be a string — using default title instructions",
+            SESSION_TITLE_INSTRUCTIONS_KEY,
+        )
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if len(value) > SESSION_TITLE_INSTRUCTIONS_MAX_CHARS:
+        logger.warning(
+            "server config %s exceeds %d characters — using default title instructions",
+            SESSION_TITLE_INSTRUCTIONS_KEY,
+            SESSION_TITLE_INSTRUCTIONS_MAX_CHARS,
+        )
+        return None
+    return value
 
 
 def _config_positive_int(key: str, default: int) -> int:

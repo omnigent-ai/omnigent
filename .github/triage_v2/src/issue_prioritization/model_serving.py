@@ -11,6 +11,7 @@ def serving_endpoint_classifier(
     endpoint: str,
     areas: AreaCatalog,
     workspace: WorkspaceClient | None = None,
+    duplicate_candidates: tuple[dict[str, object], ...] = (),
 ) -> PromptClassifier:
     if not endpoint:
         raise ValueError("model_endpoint is required when issue classifications are missing")
@@ -31,4 +32,4 @@ def serving_endpoint_classifier(
             return choice.text
         raise RuntimeError("model endpoint returned an empty response")
 
-    return PromptClassifier(query, areas)
+    return PromptClassifier(query, areas, duplicate_candidates)

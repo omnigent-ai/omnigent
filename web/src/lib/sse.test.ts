@@ -300,3 +300,25 @@ describe("parseEvent — session.mcp_startup", () => {
     ).toBeNull();
   });
 });
+
+describe("parseEvent — response.output_item.done error level", () => {
+  it("lifts level: info onto the error event and omits it otherwise", () => {
+    const item = {
+      id: "err_1",
+      response_id: "resp_1",
+      type: "error",
+      source: "harness",
+      code: "codex_thread_reset",
+      message: "Codex started a fresh thread.",
+    };
+    const info = parseEvent("response.output_item.done", { item: { ...item, level: "info" } });
+    expect(info).toMatchObject({
+      type: "error",
+      error: { code: "codex_thread_reset", level: "info" },
+    });
+    const plain = parseEvent("response.output_item.done", { item });
+    const plainError = plain?.type === "error" ? plain.error : null;
+    expect(plainError).not.toBeNull();
+    expect(plainError).not.toHaveProperty("level");
+  });
+});

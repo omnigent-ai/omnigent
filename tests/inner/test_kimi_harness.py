@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -701,14 +702,21 @@ def test_sandbox_launch_path_wraps_when_sandbox_requested(
     class _ActivePolicy:
         active = True
 
+    captured_write_roots: list[Path] = []
+
+    def _capture_write_roots(policy: _ActivePolicy, roots: list[Path]) -> _ActivePolicy:
+        captured_write_roots.extend(roots)
+        return policy
+
     monkeypatch.setattr(sandbox_mod, "resolve_sandbox", lambda *_a, **_k: _ActivePolicy())
     monkeypatch.setattr(sandbox_mod, "with_additional_read_roots", lambda s, _roots: s)
-    monkeypatch.setattr(sandbox_mod, "with_additional_write_roots", lambda s, _roots: s)
+    monkeypatch.setattr(sandbox_mod, "with_additional_write_roots", _capture_write_roots)
     monkeypatch.setattr(sandbox_mod, "with_spawn_env_allowlist", lambda s, _names: s)
     monkeypatch.setattr(
         sandbox_mod, "create_exec_launcher", lambda target, _policy: f"LAUNCHER::{target}"
     )
 
+    monkeypatch.delenv("KIMI_CODE_HOME", raising=False)
     os_env = OSEnvSpec(
         type="caller_process",
         cwd=None,
@@ -719,6 +727,17 @@ def test_sandbox_launch_path_wraps_when_sandbox_requested(
     launch = ex._sandbox_launch_path(("PATH",))
 
     assert launch.startswith("LAUNCHER::")
+    assert Path.home() / ".kimi-code" in captured_write_roots
+    assert Path.home() / ".kimi" not in captured_write_roots
+
+    # A custom $KIMI_CODE_HOME moves kimi's config dir; the jail's write
+    # grant must follow it or the CLI can't persist config when overridden.
+    captured_write_roots.clear()
+    monkeypatch.setenv("KIMI_CODE_HOME", "/srv/custom-kimi-home")
+    launch = ex._sandbox_launch_path(("PATH",))
+    assert launch.startswith("LAUNCHER::")
+    assert Path("/srv/custom-kimi-home") in captured_write_roots
+    assert Path.home() / ".kimi-code" not in captured_write_roots
 
 
 def test_run_turn_emits_error_when_kimi_binary_missing(monkeypatch: pytest.MonkeyPatch) -> None:

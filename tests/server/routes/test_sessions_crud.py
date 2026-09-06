@@ -15,6 +15,7 @@ import pytest
 import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
+from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -314,6 +315,20 @@ async def test_patch_session_title(
     assert resp.status_code == 200
 
 
+async def test_patch_session_title_enforces_user_limit(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Manual titles accept 200 characters and reject 201."""
+    accepted = "x" * USER_SESSION_TITLE_MAX_CHARS
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"title": accepted})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["title"] == accepted
+
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"title": accepted + "x"})
+    assert resp.status_code == 422, resp.text
+
+
 async def test_patch_session_not_found(client: httpx.AsyncClient) -> None:
     """Patching a nonexistent session returns 404."""
     resp = await client.patch(
@@ -597,6 +612,31 @@ async def test_patch_rejects_client_supplied_sandbox_labels(
         conv = conv_store.get_conversation(session_id)
         assert conv is not None
         assert key not in conv.labels
+
+
+async def test_patch_rejects_client_supplied_archived_at_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """``omnigent.archived_at`` is stamped by the server on the archive
+    transition only. A client write would forge the retention clock (including
+    on shared sessions the caller does not own), so it must be rejected and
+    nothing persisted."""
+    from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    for value in ("1000", ""):
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"labels": {ARCHIVED_AT_LABEL_KEY: value}},
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert ARCHIVED_AT_LABEL_KEY not in conv.labels
 
 
 async def test_list_sessions_pinned_filter(

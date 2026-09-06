@@ -34,7 +34,7 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
-_COMPOSER_PLACEHOLDER = "Ask the agent anything…"
+_COMPOSER_PLACEHOLDER = "Send a message…"
 _MSG1 = "sentinel-steer-msg1-2b8d first message, holds the turn open"
 _MSG2 = "sentinel-steer-msg2-6f4a queued then steered"
 

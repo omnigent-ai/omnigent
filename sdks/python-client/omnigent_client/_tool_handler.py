@@ -163,7 +163,14 @@ class TransportErrorCtx:
 
 @dataclass
 class SubAgentInfo:
-    """Info about a single spawned sub-agent."""
+    """Info about a single spawned sub-agent.
+
+    ``agent_name`` is the best identifier available at spawn time: the
+    spawn event carries only the child's agent id (e.g. ``ag_abc123``),
+    so that is what spawn-side callbacks receive. Correlate spawn and
+    completion callbacks by ``response_id`` (the child session id),
+    which is identical on both.
+    """
 
     response_id: str
     agent_name: str
@@ -171,7 +178,11 @@ class SubAgentInfo:
 
 @dataclass
 class SubAgentSpawnedCtx:
-    """Context for ``on_sub_agent_spawned``."""
+    """Context for ``on_sub_agent_spawned``.
+
+    Fires for the session's DIRECT children only: a grandchild's spawn
+    event rides the child's own stream, not this session's.
+    """
 
     parent_response_id: str
     sub_agents: list[SubAgentInfo] = field(default_factory=list)
@@ -179,7 +190,18 @@ class SubAgentSpawnedCtx:
 
 @dataclass
 class SubAgentCompletedCtx:
-    """Context for ``on_sub_agent_completed``."""
+    """Context for ``on_sub_agent_completed``.
+
+    ``agent_name`` is the child's tool label (e.g. ``summarizer``) once a
+    status delta has carried one — richer than the raw agent id the spawn
+    callback sees. Correlate with the spawn callback by ``response_id``
+    (the child session id), not by name.
+
+    Reliable pairing needs a long-lived ``stream()`` subscription: a
+    ``send()`` call closes its stream when its own turn ends, and a child
+    typically completes in a later auto-wake continuation turn, so
+    ``send()`` consumers may see the spawn but miss this completion.
+    """
 
     response_id: str
     agent_name: str

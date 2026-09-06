@@ -6,7 +6,7 @@ import sys
 
 from playwright.sync_api import Page, expect
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 
 
 def test_new_session_hotkey_from_focused_composer(

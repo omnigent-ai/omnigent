@@ -18,6 +18,7 @@ The managed config dir is per-session (like codex-native's managed
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ import re
 import shlex
 import subprocess
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypeAlias, TypedDict, TypeGuard
@@ -36,6 +38,7 @@ from omnigent.databricks_ai_gateway import (
     DATABRICKS_TRUSTED_HOST_SUFFIXES,
     is_databricks_ai_gateway_url,
 )
+from omnigent.databricks_model_discovery import preferred_served_claude_model
 from omnigent.model_metadata import ModelWireAPI
 from omnigent.model_override import normalize_model_for_provider
 from omnigent.onboarding.provider_config import (
@@ -51,11 +54,13 @@ from omnigent.onboarding.provider_config import (
     load_config,
 )
 from omnigent.pi_model_compatibility import (
+    PI_CLAUDE_THINKING_MODEL_FRAGMENTS,
     SYSTEM_AI_RESPONSES_KEYWORDS,
     DatabricksPiSurface,
     PiModelEntry,
     databricks_pi_surface_for_model,
     enrich_databricks_model_catalog,
+    pi_model_is_reasoning,
     pi_model_json_entry,
     unsupported_in_pi,
 )
@@ -429,6 +434,31 @@ def _default_claude_model_from(entries: list[_PiModelEntry]) -> str | None:
     return ids[0] if ids else None
 
 
+def _select_databricks_claude_model(model: str | None, claude_models: list[_PiModelEntry]) -> str:
+    """Resolve an implicit Databricks default to an equivalent served Claude id."""
+    selected_model = (
+        model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+    )
+    if model is not None or not claude_models:
+        return selected_model
+    served_model = preferred_served_claude_model(
+        (model_id for item in claude_models if isinstance((model_id := item.get("id")), str)),
+        preferred_model_id=selected_model,
+    )
+    if served_model is None:
+        # No family match among the served ids: still prefer a live-served id
+        # over a catalog default the workspace may answer with 501.
+        served_model = _default_claude_model_from(claude_models)
+    if served_model is None or served_model == selected_model:
+        return selected_model
+    _LOGGER.warning(
+        "pi-native: resolved default model %s to workspace-served model %s",
+        selected_model,
+        served_model,
+    )
+    return served_model
+
+
 def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
     """Resolve a Databricks-profile provider into Pi gateway config.
 
@@ -480,6 +510,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
             _LOGGER.info(
                 "pi-native: could not fetch workspace model list; showing default model only"
             )
+    selected_model = _select_databricks_claude_model(model, claude_models)
     additional: dict[str, _PiProviderPayload] = {}
     if gpt_models:
         additional[_PI_OPENAI_PROVIDER_ID] = _databricks_openai_provider(
@@ -499,9 +530,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         api="anthropic-messages",
         # DATABRICKS-PATCH(pi-live-model-discovery): prefer what the workspace
         # actually serves (fetched above) over the bundled catalog.
-        model=model
-        or _default_claude_model_from(claude_models)
-        or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+        model=selected_model,
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token is re-read per request (the auth command attempts a
         # refresh), matching codex-native's refresh semantics.
@@ -597,6 +626,43 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
         return None
 
 
+# Entries at or below this need no probe: Pi's own default ceiling is lower, so
+# they cannot exceed any observed serving cap. Skipping them keeps launch fast.
+_CAP_PROBE_FLOOR = 16384
+_CAP_PROBE_WORKERS = 8
+
+
+def _clamp_entries_to_output_caps(
+    workspace_url: str,
+    token: str,
+    entries: list[_PiModelEntry],
+) -> None:
+    """Lower each entry's ``maxTokens`` to the serving endpoint's real cap.
+
+    Omnigent's catalog reports a model's native output ceiling, but a Databricks
+    serving endpoint may enforce a lower per-request cap; Pi would then send the
+    native value and every call fails with 400. The cap is a model property, so
+    a single probe on the MLflow chat surface yields it regardless of which
+    surface the model is finally served on. Best-effort and parallel: any probe
+    failure leaves the catalog value untouched, so a network blip never blocks
+    launch. Re-probing each launch picks up a cap that is later raised.
+    """
+    # ponytail: re-probes every launch; cache by the model-services etag to skip
+    # unchanged endpoints once that field is plumbed through the listing.
+    base_url = f"{workspace_url.rstrip('/')}/ai-gateway/mlflow/v1"
+    targets = [e for e in entries if (e.get("maxTokens") or 0) > _CAP_PROBE_FLOOR]
+    if not targets:
+        return
+
+    def clamp(entry: _PiModelEntry) -> None:
+        cap = model_catalog.probe_output_token_cap(base_url, token, entry["id"])
+        if cap is not None:
+            entry["maxTokens"] = min(entry.get("maxTokens", cap), cap)
+
+    with ThreadPoolExecutor(max_workers=_CAP_PROBE_WORKERS) as pool:
+        list(pool.map(clamp, targets))
+
+
 def _fetch_pi_model_lists(
     workspace_url: str,
     token: str,
@@ -680,6 +746,10 @@ def _fetch_pi_model_lists(
             "pi-native: Unity Catalog model-services returned no LLM models; "
             "Pi will show only the selected model"
         )
+
+    # Claude entries keep their catalog ceiling (already within serving caps);
+    # the OSS/GPT/Gemini surfaces carry the oversized values that 400 at runtime.
+    _clamp_entries_to_output_caps(workspace_url, token, [*gpt_responses, *completions, *gemini])
 
     return claude, gpt_responses, completions, gemini
 
@@ -869,9 +939,15 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     if real_workspace_url and transport.auth_command:
         token = _run_auth_command(transport.auth_command)
         if token:
-            claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
-                real_workspace_url, token
-            )
+            try:
+                claude_models, gpt_models, completions_models, gemini_models = (
+                    _fetch_pi_model_lists(real_workspace_url, token)
+                )
+            except Exception:  # noqa: BLE001 — network failure must not break launch
+                _LOGGER.info(
+                    "pi-native: could not fetch workspace model list; showing default model only",
+                    exc_info=True,
+                )
         else:
             _LOGGER.info(
                 "pi-native: auth command produced no token; Pi will show only the selected model"
@@ -917,7 +993,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         provider_id=_PI_PROVIDER_ID,
         base_url=_gateway_anthropic_base_url(transport.base_url),
         api="anthropic-messages",
-        model=model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+        model=_select_databricks_claude_model(model, claude_models),
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token (the codex auth command prints it) is refreshed per
         # request — matching codex-native's refresh semantics.
@@ -942,6 +1018,97 @@ def _inline_family_order(model: str | None) -> tuple[str, ...]:
     if model and model_catalog.model_family_token(model) != "claude":
         return ("openai", "anthropic")
     return ("anthropic", "openai")
+
+
+def _gateway_pi_model_entry(
+    model_id: str,
+    *,
+    configured_context_window: int | None = None,
+    configured_max_output_tokens: int | None = None,
+) -> _PiModelEntry:
+    """Build a Pi models.json entry for a generic gateway model.
+
+    Pi defaults a model entry with no ``contextWindow``/``maxTokens`` to
+    128k/16k, silently truncating large-context gateway models (e.g. a 1M-
+    context GLM).  This helper enriches the entry with real limits.
+
+    Resolution order (first value found wins per field):
+    1. Provider-config-supplied ``context_window``/``max_output_tokens``.
+    2. Best-effort catalog fuzzy match by normalised model id fragment
+       (``glm-5.2`` → ``databricks-glm-5-2`` carries 1M context/65k output).
+    3. No ``contextWindow``/``maxTokens`` key — Pi uses its own defaults;
+       still better than a completely bare entry because ``reasoning`` and
+       ``input`` are set correctly.
+
+    ``reasoning`` is set via :func:`pi_model_is_reasoning` so that DeepSeek
+    and similar chain-of-thought models surface their thinking channel in Pi.
+
+    :param model_id: The gateway model id as configured by the user,
+        e.g. ``"glm-5.2"`` or ``"deepseek-r2"``.
+    :param configured_context_window: User-supplied context limit from the
+        provider config's ``context_window`` field, or ``None``.
+    :param configured_max_output_tokens: User-supplied output limit from the
+        provider config's ``max_output_tokens`` field, or ``None``.
+    :returns: A Pi model entry with as many fields populated as possible.
+    """
+    entry: _PiModelEntry = {"id": model_id, "input": ["text", "image"]}
+    # Set reasoning for DeepSeek (reads reasoning_content channel) and for
+    # Claude (enables Pi's thinking level controls).
+    if pi_model_is_reasoning(model_id) or any(
+        fragment in model_id.lower() for fragment in PI_CLAUDE_THINKING_MODEL_FRAGMENTS
+    ):
+        entry["reasoning"] = True
+
+    # Determine context window and max output tokens.
+    context_window = configured_context_window
+    max_output_tokens = configured_max_output_tokens
+
+    # Fall back to a catalog fuzzy match when the user hasn't configured limits.
+    if context_window is None or max_output_tokens is None:
+        catalog_entry = _catalog_entry_for_model(model_id)
+        if catalog_entry is not None:
+            if context_window is None and catalog_entry.metadata.context_window is not None:
+                context_window = catalog_entry.metadata.context_window
+            if max_output_tokens is None and catalog_entry.metadata.max_output_tokens is not None:
+                max_output_tokens = catalog_entry.metadata.max_output_tokens
+
+    if context_window is not None:
+        entry["contextWindow"] = context_window
+    if max_output_tokens is not None:
+        entry["maxTokens"] = max_output_tokens
+    return entry
+
+
+def _catalog_entry_for_model(model_id: str) -> model_catalog.ModelEntry | None:
+    """Find the best catalog entry for *model_id* by normalised id fragment.
+
+    Tries an exact match first, then a prefix-aware substring match so that
+    user-facing ids like ``glm-5.2`` resolve against catalog entries like
+    ``databricks-glm-5-2``.  Normalises dots to dashes for version numbers.
+
+    :param model_id: A model id, e.g. ``"glm-5.2"`` or ``"gpt-4o-mini"``.
+    :returns: The best matching catalog :class:`ModelEntry`, or ``None``.
+    """
+    lower = model_id.lower()
+    # Normalise dots to dashes so "glm-5.2" matches "databricks-glm-5-2".
+    normalised = lower.replace(".", "-")
+
+    all_entries: list[model_catalog.ModelEntry] = []
+    for provider in ("openai", "anthropic", "databricks", "google"):
+        with contextlib.suppress(Exception):  # catalog failure must not break launch
+            all_entries.extend(model_catalog.catalog_model_entries(provider))
+
+    # 1. Exact match (covers common ids like "gpt-4o-mini").
+    for entry in all_entries:
+        if entry.id.lower() == lower:
+            return entry
+
+    # 2. Normalised substring match (covers "glm-5.2" → "databricks-glm-5-2").
+    for entry in all_entries:
+        if normalised in entry.id.lower().replace(".", "-"):
+            return entry
+
+    return None
 
 
 def _inline_family_pi_provider(
@@ -993,6 +1160,11 @@ def _inline_family_pi_provider(
         # Strip bracket suffixes (e.g. "[1m]") — accepted by the direct
         # Anthropic API but rejected by the Databricks AI Gateway.
         resolved_model = re.sub(r"\[.*?\]$", "", resolved_model)
+        model_entry = _gateway_pi_model_entry(
+            resolved_model,
+            configured_context_window=family.context_window,
+            configured_max_output_tokens=family.max_output_tokens,
+        )
         return PiProviderConfig(
             provider_id=_PI_PROVIDER_ID,
             base_url=family.base_url,
@@ -1000,6 +1172,7 @@ def _inline_family_pi_provider(
             model=resolved_model,
             api_key=api_key,
             auth_header=auth_header,
+            extra_models=[model_entry],
         )
     return None
 

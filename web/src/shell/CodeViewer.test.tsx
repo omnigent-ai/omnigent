@@ -92,7 +92,11 @@ function renderViewer(
   content: string,
   panelOpen = true,
   path = "notes.md",
-  opts: { viewMode?: "editor" | "preview" | "source" | "diff"; truncated?: boolean } = {},
+  opts: {
+    viewMode?: "editor" | "preview" | "source" | "diff";
+    truncated?: boolean;
+    onRequestEditMode?: () => void;
+  } = {},
 ) {
   // Markdown source view still renders via the Shiki DOM, where the
   // select-all/copy override under test lives. Non-markdown files now render in
@@ -111,6 +115,7 @@ function renderViewer(
       setSearchOpen={() => {}}
       searchInputRef={noopRef}
       viewMode={opts.viewMode ?? "source"}
+      onRequestEditMode={opts.onRequestEditMode}
     />,
   );
 }
@@ -267,6 +272,47 @@ describe("CodeViewer truncated preview", () => {
   it("shows no banner in markdown preview when not truncated", () => {
     renderViewer("# full file", true, "notes.md", { viewMode: "preview", truncated: false });
     expect(screen.queryByText(/too large to load fully/)).toBeNull();
+  });
+});
+
+describe("CodeViewer markdown preview comment hint", () => {
+  // The rendered preview can't anchor text-selection comments, so it points the
+  // user at the editor instead of offering a second, fuzzier comment surface.
+  it("shows the switch-to-edit hint in markdown preview", () => {
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
+    expect(screen.getByRole("button", { name: /switch to edit mode/i })).toBeDefined();
+  });
+
+  it("switches to the editor when the hint is clicked", () => {
+    const onRequestEditMode = vi.fn();
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode });
+    fireEvent.click(screen.getByRole("button", { name: /switch to edit mode/i }));
+    expect(onRequestEditMode).toHaveBeenCalledOnce();
+  });
+
+  it("hides the hint for read-only viewers", () => {
+    vi.mocked(permissions.useCanEdit).mockReturnValue(false);
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+
+  it("shows no hint when the editor isn't reachable (no callback)", () => {
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview" });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+
+  it("shows no hint in the editor surface", () => {
+    renderViewer("# doc", true, "notes.md", { viewMode: "editor", onRequestEditMode: () => {} });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+
+  it("shows no hint for a truncated file (the editor can't comment on it either)", () => {
+    renderViewer("# big", true, "notes.md", {
+      viewMode: "preview",
+      truncated: true,
+      onRequestEditMode: () => {},
+    });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
   });
 });
 

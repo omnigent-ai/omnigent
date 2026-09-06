@@ -17,7 +17,7 @@ import re
 import stat
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, ParamSpec
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, ParamSpec
 
 from omnigent.entities.environment_filesystem import (
     DeleteFilesystemResult,
@@ -913,17 +913,29 @@ class CallerProcessFilesystem:
             entry=entry,
         )
 
-    async def stat(self, path: str) -> FilesystemEntry:
-        """Return metadata for a single path via the sandboxed helper.
+    async def _helper_stat(
+        self, target: str, *, probe_read: bool = False
+    ) -> dict[str, Any] | None:
+        """Stat *target* through the sandboxed helper.
 
-        :param path: Relative path within the environment.
-        :returns: The filesystem entry.
-        :raises FilesystemPathNotFound: If the path does not exist.
+        The helper sees the workspace as the sandbox presents it. Each
+        backend masks differently: bwrap binds ``/dev/null`` over a masked
+        file, so it stats as a character device on another inode, while
+        Seatbelt leaves ``stat`` working and fails the read. ``probe_read``
+        opens the file inside the helper, takes the identity from that
+        descriptor, and reads a byte from it, so ``"r"`` means "a regular
+        file the helper can actually read" under either, and the reported
+        inode is the one that was read rather than one stat'ed separately.
+
+        :param target: Path as the helper should see it: workspace-relative,
+            or absolute for a path under a declared grant.
+        :param probe_read: Also open and read one byte of a regular file.
+        :returns: ``{"s": size, "m": mtime, "d": is_dir, "l": is_symlink,
+            "r": readable_regular_file, "dev": st_dev, "ino": st_ino}``, or
+            ``None`` when the helper cannot stat the path.
         """
         import json as _json
 
-        validated = _validate_path(path) if path else ""
-        target = validated or "."
         # Embed the path as a Python literal via json.dumps and shell-quote
         # the entire script (matching list_dir/search_files). This keeps the
         # caller-controlled path out of any shell-interpreted context: it never
@@ -934,8 +946,18 @@ class CallerProcessFilesystem:
                 "import os, json, stat as S",
                 f"p = {_json.dumps(target)}",
                 "s = os.stat(p)",
+                "r = S.S_ISREG(s.st_mode)",
+                f"if r and {probe_read!r}:",
+                "    try:",
+                "        with open(p, 'rb') as f:",
+                "            s = os.fstat(f.fileno())",
+                "            r = S.S_ISREG(s.st_mode)",
+                "            f.read(1)",
+                "    except OSError:",
+                "        r = False",
                 "print(json.dumps({'s': s.st_size, 'm': int(s.st_mtime),",
-                "    'd': S.S_ISDIR(s.st_mode), 'l': S.S_ISLNK(s.st_mode)}))",
+                "    'd': S.S_ISDIR(s.st_mode), 'l': S.S_ISLNK(s.st_mode),",
+                "    'r': r, 'dev': s.st_dev, 'ino': s.st_ino}))",
             ]
         )
         result = await _run_os_env_async(
@@ -943,11 +965,23 @@ class CallerProcessFilesystem:
             f"python3 -c {_shell_quote(_script)}",
         )
         if "error" in result or result.get("exit_code", 1) != 0:
-            raise FilesystemPathNotFound(f"Path {path!r} not found")
+            return None
         try:
-            info = _json.loads(result.get("stdout", "{}"))
-        except _json.JSONDecodeError as exc:
-            raise FilesystemPathNotFound(f"Path {path!r} not found") from exc
+            return _json.loads(result.get("stdout", "{}"))
+        except _json.JSONDecodeError:
+            return None
+
+    async def stat(self, path: str) -> FilesystemEntry:
+        """Return metadata for a single path via the sandboxed helper.
+
+        :param path: Relative path within the environment.
+        :returns: The filesystem entry.
+        :raises FilesystemPathNotFound: If the path does not exist.
+        """
+        validated = _validate_path(path) if path else ""
+        info = await self._helper_stat(validated or ".")
+        if info is None:
+            raise FilesystemPathNotFound(f"Path {path!r} not found")
         name = os.path.basename(validated) if validated else ""
         entry_type: Literal["file", "directory", "symlink"] = "file"
         if info.get("d"):
@@ -962,6 +996,58 @@ class CallerProcessFilesystem:
             bytes=info["s"] if entry_type == "file" else None,
             modified_at=info["m"],
         )
+
+    async def open_download(self, path: str) -> tuple[BinaryIO, Path, int]:
+        """Open *path* for a raw download, bound to what the sandbox can read.
+
+        The bytes are served from this process, since the helper's
+        single-message protocol cannot stream, so the file is opened here
+        first and the sandboxed helper is then asked to stat and read the
+        same path. The helper must report a readable regular file on the
+        very inode this process opened: a bwrap ``/dev/null`` mask is a
+        character device on another inode, a Seatbelt mask stats fine but
+        fails the read, and a path swapped between the two steps no longer
+        matches. A path admitted only because the environment is unconfined
+        has no sandbox to consult.
+
+        :param path: Relative path within the environment, or an absolute
+            path elsewhere on the filesystem.
+        :returns: The open file at byte 0, its resolved path, and its size.
+        :raises InvalidPath: If the path names a directory.
+        :raises FilesystemPathNotFound: If the path is missing, not a
+            regular file, or hidden from the helper.
+        :raises PathUnreachable: If an absolute path is out of reach.
+        """
+        resolved = self._resolve(path)
+        if resolved.is_dir():
+            raise InvalidPath(f"Path {path!r} is a directory")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(resolved, flags)
+        except OSError as exc:
+            raise FilesystemPathNotFound(f"Path {path!r} not found") from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise FilesystemPathNotFound(f"Path {path!r} not found")
+            if not self._absolute(path):
+                target: str | None = _validate_path(path) or "."
+            elif self._within_grants(resolved):
+                target = str(resolved)
+            else:
+                target = None
+            if target is not None:
+                info = await self._helper_stat(target, probe_read=True)
+                if (
+                    info is None
+                    or not info.get("r")
+                    or (info.get("dev"), info.get("ino")) != (st.st_dev, st.st_ino)
+                ):
+                    raise FilesystemPathNotFound(f"Path {path!r} not found")
+        except BaseException:
+            os.close(fd)
+            raise
+        return os.fdopen(fd, "rb"), resolved, st.st_size
 
     async def edit_text(
         self,

@@ -2200,3 +2200,288 @@ async def test_retry_session_host_refusal_is_typed_and_does_not_persist(
     assert response.json()["error"]["code"] == error_code
     after = await client.get(f"/v1/sessions/{session_id}/items")
     assert after.json() == before.json()
+
+
+async def test_relaunch_stops_the_superseded_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relaunch asks the host to stop the runner it just superseded.
+
+    ``replace_runner_id`` unbinds the previous runner but — before this —
+    nothing ever stopped it: the process idled on the host forever (tunnel
+    still authenticating, transcript forwarder still tailing the session),
+    leaking one full runner + native pane per relaunch (#5182).
+
+    Mutation check: drop the ``_spawn_superseded_runner_stop`` call in
+    ``_launch_runner_on_host_locked`` and no stop frame arrives — the
+    stop-frame assertion fails.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    original_runner_id = session["runner_id"]
+
+    set_runner_client(None)
+    post_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            },
+        )
+    )
+    launch_frame: HostLaunchRunnerFrame | None = None
+    stop_frame: HostStopRunnerFrame | None = None
+    try:
+        # The stop is a detached task, so the stop and launch frames can
+        # arrive in either order; collect until both are seen.
+        for _ in range(40):
+            if launch_frame is not None and stop_frame is not None:
+                break
+            output = await comm.receive_output(timeout=3.0)
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostLaunchRunnerFrame):
+                launch_frame = frame
+            elif isinstance(frame, HostStopRunnerFrame):
+                stop_frame = frame
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostStopRunnerResultFrame(
+                                request_id=frame.request_id,
+                                status="stopped",
+                            )
+                        ),
+                    }
+                )
+    finally:
+        post_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await post_task
+
+    assert launch_frame is not None, "the relaunch itself must still fire"
+    assert stop_frame is not None, (
+        "the relaunch must ask the host to stop the superseded runner; "
+        "without it the old runner process leaks on the host (#5182)"
+    )
+    assert stop_frame.runner_id == original_runner_id, (
+        f"the stop must target the SUPERSEDED runner {original_runner_id!r}, "
+        f"got {stop_frame.runner_id!r}"
+    )
+
+
+async def test_concurrent_relaunches_are_single_flight(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two racing messages to an offline-runner session launch ONE runner.
+
+    Before the per-conversation single-flight, each racing request rotated
+    the binding and spawned its own runner (observed 3 seconds apart in
+    the #5182 incident) — every extra spawn a leaked generation.
+
+    Mutation check: remove the relaunch lock / re-read short-circuit and
+    two launch frames arrive — the exactly-one assertion fails.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    set_runner_client(None)
+
+    def _post() -> Any:
+        return client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            },
+        )
+
+    tasks = [asyncio.create_task(_post()), asyncio.create_task(_post())]
+    launches: list[HostLaunchRunnerFrame] = []
+    try:
+        # Collect every frame the host sees inside a bounded window; a
+        # second launch frame (the double-spawn) would arrive well within
+        # it since both requests are already in flight.
+        with contextlib.suppress(asyncio.TimeoutError):
+            for _ in range(40):
+                output = await comm.receive_output(timeout=2.0)
+                if output["type"] != "websocket.send":
+                    continue
+                frame = decode_host_frame(output["text"])
+                if isinstance(frame, HostLaunchRunnerFrame):
+                    launches.append(frame)
+                    # Answer "launched" so the first flight's result wait
+                    # returns and releases the relaunch lock — the second
+                    # flight must then SHORT-CIRCUIT on the rotated binding
+                    # rather than launching again.
+                    await comm.send_input(
+                        {
+                            "type": "websocket.receive",
+                            "text": encode_host_frame(
+                                HostLaunchRunnerResultFrame(
+                                    request_id=frame.request_id,
+                                    status="launched",
+                                    runner_id="runner_from_host",
+                                )
+                            ),
+                        }
+                    )
+                elif isinstance(frame, HostStopRunnerFrame):
+                    await comm.send_input(
+                        {
+                            "type": "websocket.receive",
+                            "text": encode_host_frame(
+                                HostStopRunnerResultFrame(
+                                    request_id=frame.request_id,
+                                    status="stopped",
+                                )
+                            ),
+                        }
+                    )
+    finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    assert len(launches) == 1, (
+        f"concurrent relaunches must single-flight into ONE host.launch_runner; "
+        f"got {len(launches)} — each extra spawn is a leaked runner (#5182)"
+    )
+
+
+async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both racing messages surface a host refusal, not a generic timeout.
+
+    Single-flight makes the second caller ride the first flight's rotated
+    binding; without the last-attempt memo it would lose the structured
+    ``harness_not_configured`` refusal and dead-end in a connect wait.
+    Both messages must return promptly, and every error turn they leave
+    behind must carry the actionable refusal.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    create_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    create_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await create_responder
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["id"]
+
+    set_runner_client(None)
+
+    async def _serve_refusals() -> int:
+        """Answer every launch with a refusal (and ack stops) for a while."""
+        served = 0
+        with contextlib.suppress(asyncio.TimeoutError):
+            for _ in range(40):
+                output = await comm.receive_output(timeout=2.0)
+                if output["type"] != "websocket.send":
+                    continue
+                frame = decode_host_frame(output["text"])
+                if isinstance(frame, HostLaunchRunnerFrame):
+                    served += 1
+                    await comm.send_input(
+                        {
+                            "type": "websocket.receive",
+                            "text": encode_host_frame(
+                                HostLaunchRunnerResultFrame(
+                                    request_id=frame.request_id,
+                                    status="failed",
+                                    error=_HARNESS_REFUSAL,
+                                    error_code="harness_not_configured",
+                                )
+                            ),
+                        }
+                    )
+                elif isinstance(frame, HostStopRunnerFrame):
+                    await comm.send_input(
+                        {
+                            "type": "websocket.receive",
+                            "text": encode_host_frame(
+                                HostStopRunnerResultFrame(
+                                    request_id=frame.request_id,
+                                    status="stopped",
+                                )
+                            ),
+                        }
+                    )
+        return served
+
+    responder = asyncio.create_task(_serve_refusals())
+
+    def _post() -> Any:
+        return client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+
+    # Both must complete promptly (the rider must not dead-end in a 30s
+    # connect wait after losing the refusal).
+    first, second = await asyncio.wait_for(asyncio.gather(_post(), _post()), timeout=15.0)
+    responder.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await responder
+
+    assert first.status_code in (200, 202), first.text
+    assert second.status_code in (200, 202), second.text
+    # Reaching here at all is the guard: a rider that loses the refusal falls
+    # into the 30s connect wait and the wait_for above fires. What the
+    # transcript must show is that every banner carries the actionable
+    # refusal. A count would instead pin how many messages opened a turn,
+    # which turn scheduling decides, not the rider path.
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    error_items = [i for i in items if i.get("type") == "error"]
+    assert error_items, "the refused relaunch must persist an actionable banner"
+    for item in error_items:
+        assert item["code"] == "harness_not_configured", (
+            f"a racing caller surfaced a non-actionable error instead of the "
+            f"host refusal: {item!r}"
+        )
+        assert "omnigent setup" in item["message"], item

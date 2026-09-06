@@ -93,6 +93,7 @@ def test_pipeline_reuses_persisted_classification_and_includes_maintainers() -> 
         component_labels=("comp:db",),
         reasoning="No workaround",
         content_hash=issue.content().content_hash,
+        reported_type=IssueType.BUG,
     )
     classifier = FakeClassifier(classification)
     maintainer_classification = replace(
@@ -134,6 +135,7 @@ def test_pipeline_reclassifies_changed_content() -> None:
         component_labels=("comp:db",),
         reasoning="Has mitigation",
         content_hash=issue.content().content_hash,
+        reported_type=IssueType.BUG,
     )
     stale = Classification(
         issue_number=1,
@@ -168,6 +170,110 @@ def test_pipeline_reclassifies_changed_content() -> None:
     assert progress == [(0, 1), (1, 1)]
 
 
+def test_pipeline_skips_malformed_classification_and_continues_batch() -> None:
+    malformed = _bronze(1)
+    valid = _bronze(2)
+    valid_classification = Classification(
+        issue_number=2,
+        issue_type=IssueType.BUG,
+        impact=Impact.MEDIUM,
+        area_keys=("db",),
+        component_labels=("comp:db",),
+        reasoning="Has mitigation",
+        content_hash=valid.content().content_hash,
+        reported_type=IssueType.BUG,
+    )
+
+    class PartiallyMalformedClassifier:
+        def classify(self, issue):
+            if issue.number == malformed.number:
+                raise ValueError("invalid\n information status")
+            return valid_classification
+
+    classifications = FakeClassifications({})
+    sink = CaptureSink()
+    progress = []
+    area = Area("db", "comp:db", Decimal("1.2"))
+    catalog = AreaCatalog(by_key={"db": area}, by_label={"comp:db": (area,)})
+    pipeline = IssuePrioritizationPipeline(
+        source=FakeSource([malformed, valid]),
+        classifier=PartiallyMalformedClassifier(),
+        classifications=classifications,
+        scores=sink,
+        artifacts=sink,
+        engine=ScoreEngine(ScoringConfig.default(), catalog),
+        classification_progress=lambda completed, total: progress.append((completed, total)),
+    )
+
+    run = pipeline.run("run-partially-malformed")
+
+    assert classifications.updated == [valid_classification]
+    assert [item.issue.number for item in run.ranked] == [valid.number]
+    assert run.classifications_updated == 1
+    assert len(run.classification_failures) == 1
+    assert run.classification_failures[0].issue_number == malformed.number
+    assert run.classification_failures[0].reason == "invalid information status"
+    assert progress == [(0, 2), (1, 2), (2, 2)]
+
+
+def test_pipeline_propagates_classifier_runtime_error() -> None:
+    issue = _bronze(1)
+
+    class UnavailableClassifier:
+        def classify(self, issue):
+            raise RuntimeError("model endpoint unavailable")
+
+    sink = CaptureSink()
+    pipeline = IssuePrioritizationPipeline(
+        source=FakeSource([issue]),
+        classifier=UnavailableClassifier(),
+        classifications=FakeClassifications({}),
+        scores=sink,
+        artifacts=sink,
+        engine=ScoreEngine(ScoringConfig.default(), AreaCatalog({}, {})),
+    )
+
+    with pytest.raises(RuntimeError, match="model endpoint unavailable"):
+        pipeline.run("run-model-unavailable")
+
+    assert sink.runs == []
+
+
+def test_pipeline_refreshes_reported_type_after_label_only_change() -> None:
+    issue = replace(_bronze(1), labels=("Feature", "P2-medium"))
+    cached = Classification(
+        issue_number=1,
+        issue_type=IssueType.BUG,
+        impact=Impact.MEDIUM,
+        area_keys=("db",),
+        component_labels=("comp:db",),
+        reasoning="Has mitigation",
+        content_hash=issue.content().content_hash,
+        reported_type=IssueType.BUG,
+    )
+    refreshed = replace(cached, reported_type=IssueType.ENHANCEMENT)
+    classifier = FakeClassifier(cached)
+    classifications = FakeClassifications({1: cached})
+    sink = CaptureSink()
+    area = Area("db", "comp:db", Decimal("1.2"))
+    catalog = AreaCatalog(by_key={"db": area}, by_label={"comp:db": (area,)})
+    pipeline = IssuePrioritizationPipeline(
+        source=FakeSource([issue]),
+        classifier=classifier,
+        classifications=classifications,
+        scores=sink,
+        artifacts=sink,
+        engine=ScoreEngine(ScoringConfig.default(), catalog),
+    )
+
+    run = pipeline.run("run-label-only-change")
+
+    assert classifier.calls == 0
+    assert classifications.updated == [refreshed]
+    assert run.classifications_updated == 1
+    assert run.ranked[0].issue.reported_type == IssueType.ENHANCEMENT
+
+
 def test_pipeline_can_force_regrade_cached_content() -> None:
     issue = _bronze(1)
     classification = Classification(
@@ -178,6 +284,7 @@ def test_pipeline_can_force_regrade_cached_content() -> None:
         component_labels=("comp:db",),
         reasoning="Refreshed",
         content_hash=issue.content().content_hash,
+        reported_type=IssueType.BUG,
     )
     classifier = FakeClassifier(classification)
     classifications = FakeClassifications({1: classification})

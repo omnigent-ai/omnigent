@@ -111,6 +111,7 @@ PREFER_WHEEL = {
     "grpcio",
     "httptools",
     "markupsafe",
+    "pillow",
     "protobuf",
     "pyyaml",
     "regex",

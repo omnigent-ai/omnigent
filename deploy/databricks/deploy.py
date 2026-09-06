@@ -65,6 +65,9 @@ _ENV_VARS_TO_CLEAR = (
 _BUNDLE_RESOURCE_KEY = "omnigent"
 
 _WHEEL_PREFIXES = ("omnigent-", "omnigent_client-", "omnigent_ui_sdk-")
+_BUILTIN_EXTENSION_WHEEL_PREFIXES = ("omnigent_canvas-",)
+_ENABLE_CANVAS_ENV_VAR = "OMNIGENT_ENABLE_CANVAS"
+_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes"})
 
 
 def _log(msg: str) -> None:
@@ -202,7 +205,12 @@ def _dist_web_ui_archive() -> Path:
     return _repo_root() / "dist" / _WEB_UI_ARCHIVE_NAME
 
 
-def _build_wheels(skip_web_ui: bool) -> list[Path]:
+def _env_var_is_truthy(name: str) -> bool:
+    """Return whether an environment variable contains a supported true value."""
+    return os.environ.get(name, "").strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def _build_wheels(skip_web_ui: bool, *, enable_canvas: bool = False) -> list[Path]:
     """Invoke build.sh and return the resulting wheel paths."""
     root = _repo_root()
     build_sh = _deploy_dir() / "build.sh"
@@ -217,7 +225,14 @@ def _build_wheels(skip_web_ui: bool) -> list[Path]:
         env["EXTERNALIZE_WEB_UI"] = "1"
         env.pop("SKIP_WEB_UI", None)
         env.pop("OMNIGENT_SKIP_WEB_UI", None)
-    _log(f"$ {build_sh}" + (" (SKIP_WEB_UI=1)" if skip_web_ui else " (EXTERNALIZE_WEB_UI=1)"))
+    if enable_canvas and not skip_web_ui:
+        env[_ENABLE_CANVAS_ENV_VAR] = "1"
+    else:
+        env.pop(_ENABLE_CANVAS_ENV_VAR, None)
+    modes = ["SKIP_WEB_UI=1" if skip_web_ui else "EXTERNALIZE_WEB_UI=1"]
+    if enable_canvas and not skip_web_ui:
+        modes.append(f"{_ENABLE_CANVAS_ENV_VAR}=1")
+    _log(f"$ {build_sh} ({', '.join(modes)})")
     subprocess.run([str(build_sh)], cwd=root, env=env, check=True)
     wheels = sorted((root / "dist").glob("*.whl"))
     if not wheels:
@@ -253,6 +268,70 @@ def _classify_wheels(wheels: Iterable[Path]) -> _ClassifiedWheels:
         else:
             oversize.append(wheel)
     return _ClassifiedWheels(main=main_wheel, small=small, oversize=oversize)
+
+
+def _partition_built_wheels(
+    wheels: Iterable[Path], explicit_extensions: Iterable[Path] = ()
+) -> tuple[list[Path], list[Path]]:
+    """Separate core release wheels from bundled first-party extensions."""
+    explicit_paths = {wheel.resolve() for wheel in explicit_extensions}
+    core: list[Path] = []
+    extensions: list[Path] = []
+    unexpected: list[Path] = []
+    for wheel in wheels:
+        if wheel.name.startswith(_WHEEL_PREFIXES):
+            core.append(wheel)
+        elif wheel.name.startswith(_BUILTIN_EXTENSION_WHEEL_PREFIXES):
+            extensions.append(wheel)
+        elif wheel.resolve() in explicit_paths:
+            continue
+        else:
+            unexpected.append(wheel)
+    if unexpected:
+        names = ", ".join(wheel.name for wheel in unexpected)
+        raise SystemExit(
+            f"unexpected wheel(s) in dist/: {names}; pass additional extensions "
+            "with --extension-wheel from a separate output directory"
+        )
+    return core, extensions
+
+
+def _is_canvas_wheel(wheel: Path) -> bool:
+    """Return whether ``wheel`` is the first-party Canvas distribution."""
+    return wheel.name.startswith(_BUILTIN_EXTENSION_WHEEL_PREFIXES)
+
+
+def _select_extension_wheels(
+    builtin_extensions: Iterable[Path],
+    explicit_extensions: Iterable[Path],
+    *,
+    enable_canvas: bool,
+) -> list[Path]:
+    """Select deploy extensions while keeping Canvas behind its env opt-in."""
+    builtin = list(builtin_extensions)
+    explicit = list(explicit_extensions)
+    explicit_canvas = [wheel for wheel in explicit if _is_canvas_wheel(wheel)]
+    if explicit_canvas and not enable_canvas:
+        raise SystemExit(
+            f"Canvas is disabled; set {_ENABLE_CANVAS_ENV_VAR}=true instead of "
+            "passing its wheel directly"
+        )
+
+    canvas_wheels = list(
+        {wheel.resolve(): wheel for wheel in [*builtin, *explicit_canvas]}.values()
+    )
+    if enable_canvas and len(canvas_wheels) != 1:
+        names = ", ".join(wheel.name for wheel in canvas_wheels) or "none"
+        raise SystemExit(
+            f"{_ENABLE_CANVAS_ENV_VAR}=true requires exactly one Canvas wheel; "
+            f"found {names}. Rebuild without --skip-build or provide one with "
+            "--extension-wheel."
+        )
+
+    selected = [wheel for wheel in explicit if not _is_canvas_wheel(wheel)]
+    if enable_canvas:
+        selected.insert(0, canvas_wheels[0])
+    return selected
 
 
 def _wheel_version(wheel: Path, prefix: str) -> str:
@@ -306,8 +385,6 @@ def _sweep_local_src_wheels(keep: set[str]) -> None:
         return
     for entry in src.iterdir():
         if not entry.is_file() or entry.suffix != ".whl":
-            continue
-        if not any(entry.name.startswith(p) for p in _WHEEL_PREFIXES):
             continue
         if entry.name in keep:
             continue
@@ -396,10 +473,22 @@ def _wheel_source_path(wheel: Path) -> str:
     )
 
 
+def _wheel_name_version(wheel: Path) -> tuple[str, str]:
+    """
+    Return the normalized distribution name and version from a wheel filename.
+
+    :param wheel: Wheel path, e.g. ``dist/omnigent_canvas-0.1.0-py3-none-any.whl``.
+    :returns: ``("omnigent-canvas", "0.1.0")``.
+    """
+    name, version = wheel.name.split("-")[:2]
+    return name.lower().replace("_", "-"), version
+
+
 def _uv_source_lines(
     main_wheel: Path,
     small_wheels: list[Path],
     oversize_wheels: list[Path],
+    extension_wheels: list[Path] = (),
 ) -> list[str]:
     """Build ``[tool.uv.sources]`` lines for the three deploy wheels.
 
@@ -421,6 +510,21 @@ def _uv_source_lines(
         wheel = next(wheel for name, wheel in wheels.items() if name.startswith(wheel_prefix))
         source = _wheel_source_path(wheel)
         source_lines.append(f"{package_name} = {{ path = {_toml_string(source)} }}")
+    core_names = {"omnigent", "omnigent-client", "omnigent-ui-sdk"}
+    seen: set[str] = set()
+    for wheel in extension_wheels:
+        package_name, _ = _wheel_name_version(wheel)
+        if package_name in core_names:
+            raise SystemExit(
+                f"--extension-wheel {wheel.name} would shadow the core package {package_name}"
+            )
+        if package_name in seen:
+            raise SystemExit(
+                f"--extension-wheel {wheel.name} repeats the extension {package_name}"
+            )
+        seen.add(package_name)
+        source = _wheel_source_path(wheel)
+        source_lines.append(f"{package_name} = {{ path = {_toml_string(source)} }}")
     return source_lines
 
 
@@ -429,6 +533,7 @@ def build_uv_pyproject(
     small_wheels: list[Path],
     oversize_wheels: list[Path],
     deploy_version: str,
+    extension_wheels: list[Path] = (),
 ) -> str:
     """Compose the app-level ``pyproject.toml`` for Databricks Apps.
 
@@ -438,14 +543,20 @@ def build_uv_pyproject(
     :param oversize_wheels: Wheels too large for the app source directory.
     :param deploy_version: Version stamped into the wheels, e.g.
         ``"0.1.0.post123"``.
+    :param extension_wheels: Omnigent extension wheels (``omnigent.extensions``
+        entry points) installed alongside the server, e.g.
+        ``src/omnigent_canvas-0.1.0-py3-none-any.whl``.
     :returns: Complete TOML text for ``src/pyproject.toml``.
     """
-    source_lines = _uv_source_lines(main_wheel, small_wheels, oversize_wheels)
+    source_lines = _uv_source_lines(main_wheel, small_wheels, oversize_wheels, extension_wheels)
     dependencies = [
         f'"omnigent[databricks,tracing]=={deploy_version}"',
         f'"omnigent-client=={deploy_version}"',
         f'"omnigent-ui-sdk=={deploy_version}"',
     ]
+    for wheel in extension_wheels:
+        package_name, version = _wheel_name_version(wheel)
+        dependencies.append(f'"{package_name}=={version}"')
     return (
         "[project]\n"
         'name = "omnigent-databricks-app"\n'
@@ -487,6 +598,7 @@ def write_uv_dependency_files(
     small_wheels: list[Path],
     oversize_wheels: list[Path],
     deploy_version: str,
+    extension_wheels: list[Path] = (),
 ) -> None:
     """Write the uv dependency files Databricks Apps should install.
 
@@ -497,6 +609,7 @@ def write_uv_dependency_files(
     :param oversize_wheels: Wheels too large for ``src``.
     :param deploy_version: Version stamped into the wheels, e.g.
         ``"0.1.0.post123"``.
+    :param extension_wheels: Extension wheels already copied into ``src``.
     """
     requirements = src / "requirements.txt"
     if requirements.exists():
@@ -508,6 +621,7 @@ def write_uv_dependency_files(
         small_wheels,
         oversize_wheels,
         deploy_version,
+        extension_wheels,
     )
     (src / "pyproject.toml").write_text(pyproject)
     _log("src/pyproject.toml:\n" + pyproject)
@@ -718,6 +832,18 @@ def _parse_args() -> argparse.Namespace:
         "--skip-web-ui",
         action="store_true",
         help="Build without the SPA (API-only deploy).",
+    )
+    parser.add_argument(
+        "--extension-wheel",
+        action="append",
+        default=[],
+        type=Path,
+        metavar="WHEEL",
+        help=(
+            "Prebuilt Omnigent extension wheel to install alongside the server "
+            "(repeatable), e.g. dist-ext/omnigent_canvas-0.1.0-py3-none-any.whl. "
+            "The server discovers it through its omnigent.extensions entry point."
+        ),
     )
     parser.add_argument(
         "--app-url",
@@ -979,6 +1105,12 @@ def main() -> int:
     _clear_env_vars()
     _assert_clean_tree(skip=args.allow_dirty)
 
+    enable_canvas = _env_var_is_truthy(_ENABLE_CANVAS_ENV_VAR)
+    if enable_canvas and args.skip_web_ui:
+        _log(f"{_ENABLE_CANVAS_ENV_VAR}=true ignored with --skip-web-ui")
+        enable_canvas = False
+    _log(f"Canvas extension: {'enabled' if enable_canvas else 'disabled'}")
+
     base_version = _read_base_version()
     deploy_version = _compute_deploy_version(base_version, args.version)
     _log(f"deploy version: {deploy_version} (base: {base_version})")
@@ -988,7 +1120,10 @@ def main() -> int:
         if not args.skip_build:
             _clean_build_artifacts()
             backups = _stamp_versions(deploy_version)
-            wheels = _build_wheels(skip_web_ui=args.skip_web_ui)
+            wheels = _build_wheels(
+                skip_web_ui=args.skip_web_ui,
+                enable_canvas=enable_canvas,
+            )
         else:
             dist = _repo_root() / "dist"
             wheels = sorted(dist.glob("*.whl"))
@@ -1007,11 +1142,25 @@ def main() -> int:
         if backups and not args.keep_version_bump:
             _restore_versions(backups)
 
-    classified = _classify_wheels(wheels)
+    explicit_extension_wheels = [wheel.resolve() for wheel in args.extension_wheel]
+    for wheel in explicit_extension_wheels:
+        if not wheel.is_file():
+            raise SystemExit(f"--extension-wheel {wheel} does not exist")
+    core_wheels, builtin_extension_wheels = _partition_built_wheels(
+        wheels, explicit_extension_wheels
+    )
+    classified = _classify_wheels(core_wheels)
+    extension_wheels = _select_extension_wheels(
+        builtin_extension_wheels,
+        explicit_extension_wheels,
+        enable_canvas=enable_canvas,
+    )
     for wheel in wheels:
         size_mb = wheel.stat().st_size / 1024 / 1024
         _log(f"  {wheel.name}  {size_mb:.2f} MB")
-    if classified.oversize:
+    if classified.oversize or any(
+        wheel.stat().st_size > _WORKSPACE_WHEEL_LIMIT_BYTES for wheel in extension_wheels
+    ):
         raise SystemExit(
             "uv-based Databricks Apps deploys require every Omnigent wheel to "
             "fit under the 10 MB Workspace file cap. Reduce the Python payload "
@@ -1027,8 +1176,8 @@ def main() -> int:
     # wheels locally, then copy the new small wheels in.
     src = _src_dir()
     src.mkdir(parents=True, exist_ok=True)
-    _sweep_local_src_wheels(keep={w.name for w in classified.small})
-    for wheel in classified.small:
+    _sweep_local_src_wheels(keep={w.name for w in [*classified.small, *extension_wheels]})
+    for wheel in [*classified.small, *extension_wheels]:
         dest = src / wheel.name
         _log(f"copy {wheel.name} → {dest.relative_to(_repo_root())}")
         shutil.copy2(wheel, dest)
@@ -1045,6 +1194,7 @@ def main() -> int:
         classified.small,
         classified.oversize,
         deploy_version,
+        [src / wheel.name for wheel in extension_wheels],
     )
 
     # 3) Guard every uploaded source file before touching the workspace.

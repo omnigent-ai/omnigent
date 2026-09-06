@@ -1,4 +1,4 @@
-/** UI-only session capability gates, derived from snapshot labels. */
+/** UI-only session capability gates, derived from the live session snapshot. */
 
 const CLAUDE_NATIVE_WRAPPER = "claude-code-native-ui";
 const CODEX_NATIVE_WRAPPER = "codex-native-ui";
@@ -16,12 +16,19 @@ const PI_NATIVE_WRAPPER = "pi-native-ui";
  *     the TUI. cursor-native supports model switching only for now.
  */
 export function supportsEffortControl(
-  session: { labels?: Record<string, string | null> | null } | null | undefined,
+  session:
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+      }
+    | null
+    | undefined,
 ): boolean {
   const wrapper = session?.labels?.["omnigent.wrapper"];
   return (
     wrapper === CLAUDE_NATIVE_WRAPPER ||
     wrapper === CODEX_NATIVE_WRAPPER ||
-    wrapper === PI_NATIVE_WRAPPER
+    wrapper === PI_NATIVE_WRAPPER ||
+    (wrapper == null && session?.harness === "codex-native")
   );
 }

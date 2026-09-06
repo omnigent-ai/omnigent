@@ -80,6 +80,13 @@ def _row(item: RankedIssue) -> dict[str, object]:
         "type": issue.issue_type.label,
         "impact": issue.impact.value,
         "classification_reasoning": issue.classification_reasoning,
+        "reported_type": issue.reported_type.label if issue.reported_type else None,
+        "type_label_mismatch": bool(
+            issue.reported_type and issue.reported_type != issue.issue_type
+        ),
+        "evidence_kind": issue.evidence_kind.value,
+        "information_status": issue.information_status.value,
+        "missing_information": [item.value for item in issue.missing_information],
         "score": float(result.score),
         "current_priority": issue.current_priority.value if issue.current_priority else None,
         "proposed_priority": result.priority.value,

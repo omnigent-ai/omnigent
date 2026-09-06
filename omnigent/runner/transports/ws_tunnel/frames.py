@@ -116,9 +116,16 @@ class ResponseBodyFrame:
 
 @dataclass
 class ResponseEndFrame:
-    """Runner → server: end of response."""
+    """Runner → server: end of response.
+
+    :param error: When set, the stream ended abnormally (e.g. a
+        mid-stream generator raise).  The server routes this as an
+        abort so the consumer receives an exception rather than a
+        clean EOF after partial body.
+    """
 
     id: str
+    error: str | None = None
 
 
 @dataclass
@@ -258,7 +265,10 @@ def encode_frame(frame: Frame) -> str:
             }
         )
     if isinstance(frame, ResponseEndFrame):
-        return json.dumps({"kind": FrameKind.RESPONSE_END.value, "id": frame.id})
+        d: dict[str, object] = {"kind": FrameKind.RESPONSE_END.value, "id": frame.id}
+        if frame.error is not None:
+            d["error"] = frame.error
+        return json.dumps(d)
     if isinstance(frame, RequestCancelFrame):
         return json.dumps(
             {
@@ -364,7 +374,10 @@ def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
         case FrameKind.RESPONSE_BODY:
             return _decode_response_body(msg)
         case FrameKind.RESPONSE_END:
-            return ResponseEndFrame(id=_required_str(msg, "id"))
+            return ResponseEndFrame(
+                id=_required_str(msg, "id"),
+                error=msg.get("error") if isinstance(msg.get("error"), str) else None,
+            )
         case FrameKind.REQUEST_CANCEL:
             return _decode_request_cancel(msg)
         case FrameKind.PING:

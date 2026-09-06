@@ -7,6 +7,7 @@ import {
   type PaletteTokens,
   type ThemePalette,
 } from "./themePalette";
+import { getStyleRoot, getThemeRoots } from "./host";
 
 const STORAGE_KEY = "omnigent:custom-theme";
 const HEX_COLOR = /^#[0-9a-f]{6}$/i;
@@ -472,14 +473,19 @@ export function customThemeSwatches(theme: CustomTheme): {
 }
 
 export function applyCustomTheme(theme: CustomTheme): void {
-  if (typeof document === "undefined") return;
+  // The `--custom-*` variables go on the style root (embedded, the scope root;
+  // else the document root); the `data-custom-translucent-sidebar` attribute
+  // goes on every theme root so both the light `:root[...]` and dark `.dark[...]`
+  // selectors match. Standalone both are the document root, so behavior is the
+  // same as before.
+  const styleRoot = getStyleRoot();
+  if (!styleRoot) return;
   const normalized = normalizeTheme(theme) ?? DEFAULT_CUSTOM_THEME;
   const variants = deriveCustomTheme(normalized);
-  const style = document.documentElement.style;
-  document.documentElement.toggleAttribute(
-    "data-custom-translucent-sidebar",
-    normalized.translucentSidebar,
-  );
+  const style = styleRoot.style;
+  for (const root of getThemeRoots()) {
+    root.toggleAttribute("data-custom-translucent-sidebar", normalized.translucentSidebar);
+  }
   for (const mode of ["light", "dark"] as const) {
     for (const [key, token] of Object.entries(PALETTE_TOKEN_CSS_NAMES) as [
       keyof DerivedThemeVariant,

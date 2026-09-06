@@ -205,7 +205,7 @@ def _send_prompt(page: Page) -> None:
 
     :param page: Playwright page already navigated to ``/c/{id}``.
     """
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill(_PROMPT)
     page.get_by_role("button", name="Send", exact=True).click()

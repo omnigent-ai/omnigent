@@ -86,4 +86,4 @@ def test_session_row_uses_full_title_width_until_actions_are_revealed(
     expect(row.get_by_test_id("quick-pin-conversation")).to_be_visible()
     expect(row.get_by_test_id("conversation-actions")).to_be_visible()
     expect(page.get_by_test_id("session-tooltip-content")).to_be_visible()
-    assert _padding(link) == {"left": 8, "right": 56}
+    assert _padding(link) == {"left": 8, "right": 80}

@@ -21,7 +21,7 @@ from playwright.sync_api import Page, ViewportSize, expect
 # (768px) so ``useIsMobileViewport`` reports mobile and the sheet layout applies.
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 
 
 def _open_palette(page: Page, base_url: str, session_id: str) -> None:

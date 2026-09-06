@@ -46,6 +46,13 @@ def _opt_in_telemetry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     :param monkeypatch: Pytest monkeypatch fixture.
     """
     monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
+    # A dispatching client's ambient trace context would reroute the
+    # response-derived trace assertions below; tests that exercise the
+    # caller-context path set these explicitly.
+    monkeypatch.delenv("TRACEPARENT", raising=False)
+    monkeypatch.delenv("TRACESTATE", raising=False)
+    monkeypatch.delenv(telemetry.DISPATCH_TRACEPARENT_ENV_VAR, raising=False)
+    monkeypatch.delenv(telemetry.DISPATCH_TRACESTATE_ENV_VAR, raising=False)
     token = telemetry._session_id_var.set(None)
     try:
         yield
@@ -278,6 +285,235 @@ def test_trace_context_for_response_shared_across_children(
     assert trace_ids == {_RESP_HEX}, (
         f"expected all spans to share trace_id {_RESP_HEX!r}, got {trace_ids!r}"
     )
+
+
+# ── dispatching-client TRACEPARENT extraction ──────────────────
+
+
+_CALLER_TRACE_HEX = "9fb2e1cf8fbe9c5ecb7742f04c351500"
+_CALLER_SPAN_HEX = "662a3348b2576ccf"
+_CALLER_TRACEPARENT = f"00-{_CALLER_TRACE_HEX}-{_CALLER_SPAN_HEX}-01"
+
+
+def test_run_dispatch_blesses_ambient_traceparent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``capture_dispatch_trace_context`` copies the ambient ``TRACEPARENT``
+    / ``TRACESTATE`` into the dispatch-scoped env vars children inherit.
+    """
+    monkeypatch.setenv("TRACEPARENT", _CALLER_TRACEPARENT)
+    monkeypatch.setenv("TRACESTATE", "vendor=abc")
+    telemetry.capture_dispatch_trace_context()
+    assert os.environ[telemetry.DISPATCH_TRACEPARENT_ENV_VAR] == _CALLER_TRACEPARENT
+    assert os.environ[telemetry.DISPATCH_TRACESTATE_ENV_VAR] == "vendor=abc"
+
+
+def test_dispatch_capture_clears_stale_vars_without_ambient_traceparent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With no ambient ``TRACEPARENT``, capture must clear any *inherited*
+    dispatch vars — a nested run must not extract a parent dispatch's
+    stale caller context.
+    """
+    monkeypatch.delenv("TRACEPARENT", raising=False)
+    monkeypatch.delenv("TRACESTATE", raising=False)
+    monkeypatch.setenv(telemetry.DISPATCH_TRACEPARENT_ENV_VAR, _CALLER_TRACEPARENT)
+    monkeypatch.setenv(telemetry.DISPATCH_TRACESTATE_ENV_VAR, "vendor=abc")
+    telemetry.capture_dispatch_trace_context()
+    assert telemetry.DISPATCH_TRACEPARENT_ENV_VAR not in os.environ
+    assert telemetry.DISPATCH_TRACESTATE_ENV_VAR not in os.environ
+
+
+def test_dispatch_capture_overwrites_inherited_tracestate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With an ambient ``TRACEPARENT`` but no ``TRACESTATE``, an inherited
+    dispatch tracestate must not survive alongside the fresh traceparent.
+    """
+    monkeypatch.setenv("TRACEPARENT", _CALLER_TRACEPARENT)
+    monkeypatch.delenv("TRACESTATE", raising=False)
+    monkeypatch.setenv(telemetry.DISPATCH_TRACESTATE_ENV_VAR, "vendor=stale")
+    telemetry.capture_dispatch_trace_context()
+    assert os.environ[telemetry.DISPATCH_TRACEPARENT_ENV_VAR] == _CALLER_TRACEPARENT
+    assert telemetry.DISPATCH_TRACESTATE_ENV_VAR not in os.environ
+
+
+def test_ambient_traceparent_alone_is_not_extracted(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A raw ``TRACEPARENT`` inherited by a long-lived server (never blessed
+    by a ``run`` dispatch) must NOT reroute traces — otherwise every
+    session of that server would funnel into one stale caller trace.
+    """
+    monkeypatch.setenv("TRACEPARENT", _CALLER_TRACEPARENT)
+    tracer = otel_trace.get_tracer("test")
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with tracer.start_as_current_span("invoke_agent"):
+            pass
+
+    spans = in_memory_exporter.get_finished_spans()
+    assert format(spans[0].context.trace_id, "032x") == _RESP_HEX
+
+
+def test_spans_join_dispatching_clients_trace(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With a dispatch-blessed caller ``TRACEPARENT``, spans opened inside
+    ``trace_context_for_response`` ride the caller's trace id, not the
+    response-derived one.
+    """
+    monkeypatch.setenv(telemetry.DISPATCH_TRACEPARENT_ENV_VAR, _CALLER_TRACEPARENT)
+    tracer = otel_trace.get_tracer("test")
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with tracer.start_as_current_span("invoke_agent"):
+            pass
+
+    spans = in_memory_exporter.get_finished_spans()
+    assert len(spans) == 1
+    actual_hex = format(spans[0].context.trace_id, "032x")
+    assert actual_hex == _CALLER_TRACE_HEX, (
+        f"span trace_id {actual_hex!r} should join the caller's trace "
+        f"{_CALLER_TRACE_HEX!r}, not the response-derived one"
+    )
+
+
+def test_spans_parent_under_dispatching_clients_span(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The first span opened under a caller ``TRACEPARENT`` is parented on
+    the caller's span id, so trace viewers nest the run under the
+    dispatching client's span.
+    """
+    monkeypatch.setenv(telemetry.DISPATCH_TRACEPARENT_ENV_VAR, _CALLER_TRACEPARENT)
+    tracer = otel_trace.get_tracer("test")
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with tracer.start_as_current_span("invoke_agent"):
+            pass
+
+    spans = in_memory_exporter.get_finished_spans()
+    assert spans[0].parent is not None
+    assert format(spans[0].parent.span_id, "016x") == _CALLER_SPAN_HEX
+
+
+def test_tracestate_carried_with_dispatching_clients_trace(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A caller ``TRACESTATE`` env var rides along with the extracted
+    ``TRACEPARENT`` so vendor-specific context survives the boundary.
+    """
+    monkeypatch.setenv(telemetry.DISPATCH_TRACEPARENT_ENV_VAR, _CALLER_TRACEPARENT)
+    monkeypatch.setenv(telemetry.DISPATCH_TRACESTATE_ENV_VAR, "vendor=abc")
+    tracer = otel_trace.get_tracer("test")
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with tracer.start_as_current_span("invoke_agent"):
+            pass
+
+    spans = in_memory_exporter.get_finished_spans()
+    state = spans[0].parent.trace_state if spans[0].parent else None
+    assert state is not None and state.get("vendor") == "abc"
+
+
+def test_malformed_traceparent_falls_back_to_response_trace(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A malformed ``TRACEPARENT`` is ignored: spans fall back to the
+    response-derived trace id instead of erroring or rooting randomly.
+    """
+    monkeypatch.setenv(telemetry.DISPATCH_TRACEPARENT_ENV_VAR, "not-a-w3c-traceparent")
+    tracer = otel_trace.get_tracer("test")
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with tracer.start_as_current_span("invoke_agent"):
+            pass
+
+    spans = in_memory_exporter.get_finished_spans()
+    assert format(spans[0].context.trace_id, "032x") == _RESP_HEX
+
+
+def test_all_zero_traceparent_falls_back_to_response_trace(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An all-zero trace id (invalid per W3C) is treated as absent — the
+    response-derived trace applies.
+    """
+    monkeypatch.setenv(telemetry.DISPATCH_TRACEPARENT_ENV_VAR, f"00-{'0' * 32}-{'0' * 16}-01")
+    tracer = otel_trace.get_tracer("test")
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with tracer.start_as_current_span("invoke_agent"):
+            pass
+
+    spans = in_memory_exporter.get_finished_spans()
+    assert format(spans[0].context.trace_id, "032x") == _RESP_HEX
+
+
+def test_unsampled_traceparent_falls_back_to_response_trace(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An unsampled caller context (trace-flags ``00``) is not joined: the
+    default ``ParentBased`` sampler would drop every omnigent span under
+    it, going dark on an operator who opted into telemetry. Fall back to
+    the always-sampled response-derived trace instead.
+    """
+    monkeypatch.setenv(
+        telemetry.DISPATCH_TRACEPARENT_ENV_VAR,
+        f"00-{_CALLER_TRACE_HEX}-{_CALLER_SPAN_HEX}-00",
+    )
+    tracer = otel_trace.get_tracer("test")
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with tracer.start_as_current_span("invoke_agent"):
+            pass
+
+    spans = in_memory_exporter.get_finished_spans()
+    assert format(spans[0].context.trace_id, "032x") == _RESP_HEX
+
+
+def test_dispatching_client_context_absent_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without a dispatch-blessed ``TRACEPARENT`` there is no caller context."""
+    monkeypatch.delenv(telemetry.DISPATCH_TRACEPARENT_ENV_VAR, raising=False)
+    assert telemetry.dispatching_client_context() is None
+
+
+def test_dispatching_client_context_blank_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A whitespace-only dispatch ``TRACEPARENT`` counts as absent."""
+    monkeypatch.setenv(telemetry.DISPATCH_TRACEPARENT_ENV_VAR, "   ")
+    assert telemetry.dispatching_client_context() is None
+
+
+def test_sub_agents_share_dispatching_clients_trace(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A sub-agent invocation (``root_response_id`` set) also joins the
+    caller's trace — the whole spawn tree stays in one trace.
+    """
+    monkeypatch.setenv(telemetry.DISPATCH_TRACEPARENT_ENV_VAR, _CALLER_TRACEPARENT)
+    tracer = otel_trace.get_tracer("test")
+    with telemetry.trace_context_for_response(
+        response_id="resp_" + "a" * 32,
+        root_response_id=_RESP_ID,
+    ):
+        with tracer.start_as_current_span("invoke_agent sub"):
+            pass
+
+    spans = in_memory_exporter.get_finished_spans()
+    assert format(spans[0].context.trace_id, "032x") == _CALLER_TRACE_HEX
 
 
 # ── get_traceparent_env ─────────────────────────────────

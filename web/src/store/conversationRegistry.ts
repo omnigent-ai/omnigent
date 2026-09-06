@@ -88,6 +88,9 @@ export type ConversationGetter = () => ConversationState;
 /** Notified whenever an entry's state changes, so the root store can mirror it. */
 type ChangeListener = (id: string) => void;
 
+/** Notified when an entry is disposed (released, evicted, or cleared). */
+type DisposeListener = (id: string) => void;
+
 /**
  * One conversation's live state and stream.
  *
@@ -115,6 +118,7 @@ export interface ConversationEntry {
 export class ConversationRegistry {
   private readonly entries = new Map<string, ConversationEntry>();
   private readonly listeners = new Set<ChangeListener>();
+  private readonly disposeListeners = new Set<DisposeListener>();
   /** Conversation currently on screen; exempt from eviction. */
   private activeId: string | null = null;
 
@@ -127,6 +131,17 @@ export class ConversationRegistry {
   subscribe(listener: ChangeListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * Subscribe to entry disposal (release / eviction / clear). Disposal is not a
+   * state change and never reaches `subscribe`, so anything that must run when a
+   * conversation goes away — settling its live telemetry spans — hooks here.
+   * Returns an unsubscribe function.
+   */
+  subscribeDisposed(listener: DisposeListener): () => void {
+    this.disposeListeners.add(listener);
+    return () => this.disposeListeners.delete(listener);
   }
 
   /** The entry for `id`, or `undefined` when not live. */
@@ -277,6 +292,7 @@ export class ConversationRegistry {
         entry.disposed = true;
         // Ends the reconnect loop and cancels the in-flight fetch.
         state.abortController?.abort();
+        for (const listener of this.disposeListeners) listener(id);
       },
     };
     return entry;

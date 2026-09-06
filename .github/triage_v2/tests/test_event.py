@@ -10,11 +10,13 @@ from issue_prioritization.classification import Classification
 from issue_prioritization.config import ScoringConfig
 from issue_prioritization.domain import Impact, IssueType
 from issue_prioritization.event import (
+    _apply_intake,
     prioritize_issue,
     target_for_labels,
     write_event_artifacts,
     write_event_status,
 )
+from issue_prioritization.intake import IntakePlan
 from issue_prioritization.labels import LabelDefinition, LabelManifest
 from issue_prioritization.pipeline import PipelineMode
 from issue_prioritization.scoring import ScoreEngine
@@ -70,6 +72,7 @@ def test_event_grades_and_plans_labels_for_one_issue() -> None:
     assert classification.impact == Impact.HIGH
     assert run.ranked[0].result.score == Decimal("72.00")
     assert set(run.mutations[0].labels_add) == {
+        "Bug",
         "P1-high",
         "comp:db",
     }
@@ -88,7 +91,7 @@ def test_event_preserves_human_priority_and_retires_severity_label() -> None:
 
     assert run.ranked[0].issue.impact == Impact.HIGH
     assert run.ranked[0].result.priority.value == "P1-high"
-    assert run.mutations[0].labels_add == ("comp:db",)
+    assert run.mutations[0].labels_add == ("Bug", "comp:db")
     assert run.mutations[0].labels_remove == ("severity:S3",)
     assert run.mutations[0].blocked == ("priority_human_override",)
 
@@ -122,8 +125,13 @@ def test_event_artifact_contains_classification_and_mutation(tmp_path) -> None:
     assert payload["schema_version"] == 2
     assert payload["classification"]["impact"] == "high"
     assert payload["classification"]["reasoning"] == "Breaks session startup."
+    assert payload["classification"]["evidence_kind"] == "none"
+    assert payload["classification"]["information_status"] == "not_applicable"
+    assert payload["classification"]["missing_information"] == []
     assert payload["score"]["score"] == 72.0
     assert payload["mutation"]["target"]["priority"] == "P1-high"
+    assert payload["mutation"]["target"]["issue_type"] == "Bug"
+    assert payload["mutation"]["target"]["needs_info"] is False
     assert payload["model_endpoint"] == "test-endpoint"
     assert payload["source_revision"] == "abc123"
     assert "<!-- omnigent-issue-prioritization-v2" in payload["comment"]["body"]
@@ -169,3 +177,39 @@ def test_event_ignores_a_retired_severity_label_when_recomputing() -> None:
     )
 
     assert target.priority == "P1-high"
+
+
+def test_intake_assigns_before_duplicate_closure() -> None:
+    events = []
+
+    class Client:
+        def apply_labels(self, issue_number, labels_add, labels_remove):
+            events.append("labels")
+
+        def comment_on_issue_once(self, issue_number, marker, body):
+            events.append("comment")
+
+        def issue_data(self, issue_number):
+            return {"state": "open", "assignees": []}
+
+        def assign_issue(self, issue_number, assignee):
+            events.append("assign")
+
+        def close_as_duplicate(self, issue_number, duplicate_of):
+            events.append("close")
+
+    plan = IntakePlan(
+        ("triaged", "duplicate"),
+        ("needs-triage",),
+        "owner",
+        "duplicate",
+        3,
+        (),
+        0.99,
+        "<!-- omnigent-duplicate-check -->\nClosing",
+        True,
+    )
+
+    _apply_intake(Client(), 7, plan)
+
+    assert events == ["labels", "comment", "assign", "close"]

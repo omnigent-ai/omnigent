@@ -1288,6 +1288,113 @@ async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_on_runner_connect_clears_stale_sandbox_failure(
+    tunnel_three_layer_stack: _TunnelStack,
+) -> None:
+    """Reconnect clears a stale sandbox-launch-failed banner.
+
+    When a managed runner takes longer than the connect timeout, the
+    launch pipeline publishes ``sandbox_status = "failed"`` and caches
+    it. If the runner connects afterward (slow but alive), the red
+    banner must clear -- the sandbox is operational.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
+    from omnigent.server.schemas import SandboxStatus
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    fake_pm = tunnel_three_layer_stack.fake_pm
+
+    session_id = await _bind_failed_session(
+        ap_client,
+        error_code="runner_disconnected",
+        error_message="Runner disconnected unexpectedly.",
+    )
+
+    # Seed a stale sandbox failure -- the state _wait_for_managed_runner_tunnel
+    # leaves behind when the runner misses its connect timeout.
+    _session_sandbox_status_cache[session_id] = SandboxStatus(
+        stage="failed",
+        error="managed runner did not connect after launch",
+    )
+
+    try:
+        async with _reconnect_fires_connect_hook(ap_app, fake_pm, wait_for_recover=session_id):
+            # The reconnect must have evicted the stale sandbox failure.
+            assert session_id not in _session_sandbox_status_cache
+    finally:
+        _session_sandbox_status_cache.pop(session_id, None)
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_on_runner_connect_keeps_in_flight_sandbox_launch(
+    tunnel_three_layer_stack: _TunnelStack,
+) -> None:
+    """Reconnect must NOT short-circuit a launch that is still in flight.
+
+    Only a cached ``failed`` stage is stale evidence. A ``provisioning`` /
+    ``connecting`` entry belongs to a launch still running; an older
+    runner's reconnect says nothing about it and must leave it alone.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
+    from omnigent.server.schemas import SandboxStatus
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    fake_pm = tunnel_three_layer_stack.fake_pm
+
+    session_id = await _bind_failed_session(
+        ap_client,
+        error_code="runner_disconnected",
+        error_message="Runner disconnected unexpectedly.",
+    )
+    _session_sandbox_status_cache[session_id] = SandboxStatus(stage="provisioning")
+
+    try:
+        async with _reconnect_fires_connect_hook(ap_app, fake_pm, wait_for_recover=session_id):
+            cached = _session_sandbox_status_cache.get(session_id)
+            assert cached is not None and cached.stage == "provisioning"
+    finally:
+        _session_sandbox_status_cache.pop(session_id, None)
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_on_runner_connect_no_op_when_no_sandbox_failure(
+    tunnel_three_layer_stack: _TunnelStack,
+) -> None:
+    """Reconnect does not inject a sandbox-ready event for non-sandbox sessions."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    fake_pm = tunnel_three_layer_stack.fake_pm
+
+    session_id = await _bind_failed_session(
+        ap_client,
+        error_code="runner_disconnected",
+        error_message="Runner disconnected unexpectedly.",
+    )
+
+    # No sandbox status seeded -- this is a laptop-host session.
+    assert session_id not in _session_sandbox_status_cache
+
+    try:
+        async with _reconnect_fires_connect_hook(ap_app, fake_pm, wait_for_recover=session_id):
+            # Still absent -- no spurious "ready" event published.
+            assert session_id not in _session_sandbox_status_cache
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
 async def test_on_runner_connect_preserves_genuine_failure_on_reconnect(
     tunnel_three_layer_stack: _TunnelStack,
 ) -> None:

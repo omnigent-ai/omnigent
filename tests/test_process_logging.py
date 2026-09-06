@@ -6,6 +6,7 @@ import contextlib
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -17,14 +18,19 @@ from omnigent.process_logging import (
     LOG_TO_STDERR_ENV_VAR,
     LOG_TTY_FD_ENV_VAR,
     PROCESS_LOG_FILE_ENV_VAR,
+    RedactingLogFormatter,
     TerminalLogFormatter,
     _debug_sink_target_loggers,
+    _log_once_seen,
     _unlink_if_empty,
     child_logging_popen_kwargs,
     configure_process_logging,
     current_process_log_path,
+    log_info_once,
+    log_once,
     process_log_dir_reference,
     process_log_reference,
+    redact_log_text,
     terminal_stream_handler,
     terminal_supports_color,
 )
@@ -103,6 +109,85 @@ def test_terminal_log_formatter_colors_level_name() -> None:
     assert record.levelname == "INFO"
     assert "source_name" not in record.__dict__
     assert "func_name" not in record.__dict__
+
+
+def test_redact_log_text_filters_labeled_and_unlabeled_token_shapes() -> None:
+    """Secrets are removed even when they have no provider-specific prefix."""
+    opaque = "aB3" + "xY7" * 12
+    labeled = "lowercase123" * 4
+    jwt = ".".join(("eyJ" + "HeaderA1" * 2, "PayloadB2" * 2, "SignatureC3" * 2))
+    provider_key = "sk-" + "TestKey123" * 2
+    workspace_pat = "dapi" + "Test1234567890"
+
+    samples = (
+        (f"Authorization: Bearer {labeled}", labeled),
+        (f'headers={{"token": "{labeled}"}}', labeled),
+        ("bearer abc:def", "abc:def"),
+        ("password=;supersecret", ";supersecret"),
+        ("password=p@ss,word", "p@ss,word"),
+        ('{"password":"p@ss,word"}', "p@ss,word"),
+        (f"response contained {opaque}", opaque),
+        (f"session credential {jwt}", jwt),
+        (f"provider key {provider_key}", provider_key),
+        (f"workspace PAT {workspace_pat}", workspace_pat),
+    )
+
+    for sample, secret in samples:
+        redacted = redact_log_text(sample)
+        assert "[REDACTED]" in redacted
+        assert secret not in redacted
+        assert redact_log_text(redacted) == redacted
+
+
+def test_redact_log_text_handles_large_non_token_input_in_linear_time() -> None:
+    """Punctuation-heavy log lines do not trigger quadratic regex backtracking."""
+    text = "+" * 20_000
+
+    started = time.perf_counter()
+    output = redact_log_text(text)
+    elapsed = time.perf_counter() - started
+
+    assert output == text
+    assert elapsed < 0.5
+
+
+def test_redact_log_text_preserves_normal_identifiers() -> None:
+    """UUIDs, session IDs, hashes, and ordinary prose remain useful in logs."""
+    values = (
+        "conv_0123456789abcdef0123456789abcdef",
+        "123e4567-e89b-12d3-a456-426614174000",
+        "0123456789abcdef0123456789abcdef01234567",
+        "claude-sonnet-4-20250514",
+    )
+
+    for value in values:
+        assert redact_log_text(value) == value
+
+
+def test_redacting_log_formatter_scrubs_interpolated_args_and_tracebacks() -> None:
+    """Redaction runs after message interpolation and exception rendering."""
+    secret = "aB3" + "xY7" * 12
+    formatter = RedactingLogFormatter(use_colors=False)
+    try:
+        raise ValueError(f"token={secret}")
+    except ValueError:
+        import sys
+
+        record = logging.LogRecord(
+            "omnigent.example",
+            logging.ERROR,
+            __file__,
+            1,
+            "request failed for %s",
+            (secret,),
+            sys.exc_info(),
+            "send",
+        )
+
+    output = formatter.format(record)
+
+    assert secret not in output
+    assert output.count("[REDACTED]") >= 2
 
 
 def test_terminal_log_formatter_abbreviates_warning_and_source() -> None:
@@ -272,6 +357,45 @@ def test_configure_process_logging_publishes_its_log_path(
             handler.close()
 
 
+def test_configure_process_logging_forwards_custom_debug_log_send(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent import debug_logging
+
+    captured: list[object] = []
+
+    def send(batch: list[dict[str, object]]) -> None:
+        captured.append(batch)
+
+    def attach(
+        loggers: list[logging.Logger],
+        *,
+        source: str,
+        level: int,
+        send: debug_logging.DebugLogSend | None = None,
+    ) -> None:
+        captured.extend((loggers, source, level, send))
+
+    monkeypatch.setattr(debug_logging, "attach_debug_log_sink", attach)
+    logger_name = "omnigent.test_custom_debug_send"
+    configure_process_logging(
+        "integration",
+        log_path=tmp_path / "integration.log",
+        level=logging.WARNING,
+        logger_names=(logger_name,),
+        root=False,
+        debug_log_send=send,
+    )
+    try:
+        assert captured[1:] == ["integration", logging.WARNING, send]
+    finally:
+        logger = logging.getLogger(logger_name)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+
 def test_unlink_if_empty_sweeps_only_empty_files(tmp_path: Path) -> None:
     """The exit sweep removes an empty log, keeps a written one, tolerates absence."""
     empty = tmp_path / "empty.log"
@@ -348,3 +472,39 @@ def test_debug_sink_targets_follow_non_propagating_package_logger() -> None:
         assert targets == [logging.getLogger()]
     finally:
         logger.propagate = original
+
+
+def test_log_info_once_dedupes_identical_and_relogs_changed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Same formatted line logs once per process; a changed line logs again."""
+    logger = logging.getLogger("omnigent.test.log_info_once")
+    # The dedup set is process-global; clear it so a prior test cannot mask this.
+    _log_once_seen.clear()
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        log_info_once(logger, "routing decision provider=%s", "alpha")
+        log_info_once(logger, "routing decision provider=%s", "alpha")  # identical -> dropped
+        log_info_once(logger, "routing decision provider=%s", "beta")  # changed -> logged
+    messages = [r.getMessage() for r in caplog.records if r.name == logger.name]
+    assert messages == [
+        "routing decision provider=alpha",
+        "routing decision provider=beta",
+    ]
+
+
+def test_log_once_respects_level_and_captures_exc_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """log_once emits at the given level with the traceback, then dedupes repeats."""
+    logger = logging.getLogger("omnigent.test.log_once")
+    _log_once_seen.clear()
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            log_once(logger, logging.WARNING, "codex catalog probe failed", exc_info=True)
+            log_once(logger, logging.WARNING, "codex catalog probe failed", exc_info=True)
+    records = [r for r in caplog.records if r.name == logger.name]
+    assert len(records) == 1  # identical repeat dropped
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info is not None  # first occurrence keeps its traceback

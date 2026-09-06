@@ -70,7 +70,10 @@ def test_git_status_failure_surfaces_in_files_panel(
     # The changed-files list — where the git-status error renders — is now the
     # Changes rail tab (a peer of Files). Select it explicitly so the assertion
     # does not depend on the remembered tab from a prior session.
-    rail.get_by_role("tab", name=re.compile("^Changes")).click()
+    changes_tab = rail.get_by_role("tab", name=re.compile("^Changes"))
+    changes_tab.click()
+    expect(changes_tab).to_have_attribute("aria-selected", "true")
+    expect(rail.get_by_role("heading", name="Changes", exact=True)).to_be_visible()
 
     # The panel surfaces the server's reason verbatim, in the destructive style —
     # not a bare status code and not the misleading empty state.

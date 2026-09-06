@@ -207,6 +207,13 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.disk_gb: int | None = None
         self.idle_pause_after_s: int | None = None
         self.cluster: str | None = None
+        # Microsandbox ctor wiring (captured by
+        # install_fake_microsandbox_launcher).
+        self.cpus: int | None = None
+        self.memory_mib: int | None = None
+        self.idle_timeout_s: int | None = None
+        self.network: str | None = None
+        self.host_ports: list[int] | None = None
         # Kubernetes ctor wiring (captured by install_fake_kubernetes_launcher).
         self.namespace: str | None = None
         self.secret_name: str | None = None
@@ -218,6 +225,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.pvc_mounts: list[dict[str, object]] | None = None
         self.secret_mounts: list[dict[str, object]] | None = None
         self.pod_ready_timeout_s: int | None = None
+        self.runtime_class: str | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -483,6 +491,46 @@ def install_fake_islo_launcher(
     monkeypatch.setattr(islo_mod, "IsloSandboxLauncher", _ctor)
 
 
+def install_fake_microsandbox_launcher(
+    monkeypatch: Any,  # Avoid importing pytest in a helpers module.
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``MicrosandboxSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``MicrosandboxSandboxLauncher(image=…,
+    env=…, cpus=…, memory_mib=…, idle_timeout_s=…, network=…)``; the shim
+    records those constructor args on the fake and hands it back, so
+    production code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.microsandbox as microsandbox_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        cpus: int | None = None,
+        memory_mib: int | None = None,
+        idle_timeout_s: int | None = None,
+        network: str | None = None,
+        host_ports: list[int] | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.image = image
+        fake.env = env
+        fake.cpus = cpus
+        fake.memory_mib = memory_mib
+        fake.idle_timeout_s = idle_timeout_s
+        fake.network = network
+        fake.host_ports = host_ports
+        return fake
+
+    monkeypatch.setattr(microsandbox_mod, "MicrosandboxSandboxLauncher", _ctor)
+
+
 def install_fake_e2b_launcher(
     monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
     fake: FakeSandboxLauncher,
@@ -555,7 +603,7 @@ def install_fake_kubernetes_launcher(
     The managed flow constructs ``KubernetesSandboxLauncher(image=…, env=…,
     namespace=…, secret_name=…, service_account=…, node_selector=…,
     kubeconfig=…, in_cluster=…, resources=…, pvc_mounts=…, secret_mounts=…,
-    pod_ready_timeout_s=…)``; the shim records those constructor args on the
+    pod_ready_timeout_s=…, runtime_class=…)``; the shim records those constructor args on the
     fake and hands it back, so production code runs unmodified against it.
 
     :param monkeypatch: The test's ``pytest.MonkeyPatch``.
@@ -577,6 +625,7 @@ def install_fake_kubernetes_launcher(
         pvc_mounts: list[dict[str, object]] | None = None,
         secret_mounts: list[dict[str, object]] | None = None,
         pod_ready_timeout_s: int | None = None,
+        runtime_class: str | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
@@ -591,6 +640,7 @@ def install_fake_kubernetes_launcher(
         fake.pvc_mounts = pvc_mounts
         fake.secret_mounts = secret_mounts
         fake.pod_ready_timeout_s = pod_ready_timeout_s
+        fake.runtime_class = runtime_class
         return fake
 
     monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)

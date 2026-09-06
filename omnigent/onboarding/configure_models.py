@@ -276,7 +276,7 @@ def cli_display_name(cli: str) -> str:
         or ``"ChatGPT"`` for ``codex`` (the ChatGPT plan drives codex).
         Falls back to a title-cased form for any other value.
     """
-    return {"claude": "Claude (Pro/Max)", "codex": "ChatGPT"}.get(cli, cli.title())
+    return {"claude": "Claude (Pro/Max)", "codex": "ChatGPT", "pi": "Pi"}.get(cli, cli.title())
 
 
 def kind_glyph(kind: str) -> str:
@@ -456,6 +456,12 @@ def add_menu_options() -> list[AddOption]:
             SUBSCRIPTION_KIND,
             cli="claude",
         ),
+        _opt(
+            "Pi — original auth",
+            "Use Pi's own auth (~/.pi/agent) as-is, without Omnigent managing the provider.",
+            SUBSCRIPTION_KIND,
+            cli="pi",
+        ),
         # Cross-vendor extras, alphabetical (Gateway before OpenRouter).
         _opt(
             "Gateway — custom base URL + key",
@@ -528,6 +534,8 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
             return frozenset({ANTHROPIC_FAMILY})
         if opt.cli == "codex":
             return frozenset({OPENAI_FAMILY})
+        if opt.cli == "pi":
+            return frozenset({PI_SURFACE})
         return frozenset()
     if opt.kind == KEY_KIND:
         if opt.other:
@@ -652,6 +660,32 @@ def _provider_default_families(entry: ProviderEntry, config: dict[str, object]) 
     return result
 
 
+def _subscription_auth_summary(entry: ProviderEntry) -> str:
+    """Return the auth summary for a ``subscription`` provider row.
+
+    A codex "subscription" entry covers *any* usable ``~/.codex/auth.json``,
+    but that file's credential may be an API key rather than a ChatGPT plan
+    (``codex`` itself reports ``auth_mode: apikey``). Naming the effective
+    mode keeps a quota diagnosis pointed at the right credential — a bare
+    "subscription" label looks healthy when the real problem is a dead key.
+
+    :param entry: A ``kind: subscription`` provider entry.
+    :returns: A display string, e.g. ``"via claude CLI"``,
+        ``"via codex CLI (API key login)"``.
+    """
+    from omnigent.onboarding.ambient import codex_cli_effective_auth_mode
+
+    base = f"via {entry.cli} CLI"
+    if entry.cli != "codex":
+        return base
+    mode = codex_cli_effective_auth_mode()
+    if mode == "apikey":
+        return f"{base} (API key login, not a ChatGPT plan)"
+    if mode == "pat":
+        return f"{base} (personal access token)"
+    return base
+
+
 def _entry_models_summary(entry: ProviderEntry) -> str:
     """Return a short model summary for a provider listing row.
 
@@ -666,7 +700,7 @@ def _entry_models_summary(entry: ProviderEntry) -> str:
         databricks profile).
     """
     if entry.kind == SUBSCRIPTION_KIND:
-        return f"via {entry.cli} CLI"
+        return _subscription_auth_summary(entry)
     if entry.kind == DATABRICKS_KIND:
         return f"profile: {entry.profile}"
     if entry.kind == CLI_CONFIG_KIND:

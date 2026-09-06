@@ -112,14 +112,28 @@ def test_build_job_manifest_init_container_prepares_and_clones_workspace() -> No
     assert "mkdir -p /home/omnigent/workspace" in script
     assert "git clone --branch main --single-branch -- " in script
     assert "https://github.com/org/repo.git /home/omnigent/workspace/repo" in script
+    # The per-user broker is wired before the clone, and the init container gets
+    # the launch token (secretKeyRef) so it can reach the broker.
+    assert "configure_clone_credentials" in script
+    assert script.index("configure_clone_credentials") < script.index("git clone")
+    init_env = init[0]["env"]
+    assert any(
+        e["name"] == "OMNIGENT_HOST_TOKEN" and "secretKeyRef" in e.get("valueFrom", {})
+        for e in init_env
+    )
 
 
 def test_build_job_manifest_without_repo_has_no_clone() -> None:
     """No repo → the init container only makes the workspace, no git clone."""
     manifest = build_job_manifest(**_MANIFEST_KW)
-    script = _pod_spec(manifest)["initContainers"][0]["command"][2]
+    init = _pod_spec(manifest)["initContainers"][0]
+    script = init["command"][2]
     assert "mkdir -p /home/omnigent/workspace" in script
     assert "git clone" not in script
+    # No repo → no broker wiring, and the launch token is NOT exposed to the
+    # workspace-less init container.
+    assert "configure_clone_credentials" not in script
+    assert all(e["name"] != "OMNIGENT_HOST_TOKEN" for e in init["env"])
 
 
 def test_build_job_manifest_host_config_is_written_by_init_container() -> None:
@@ -271,6 +285,18 @@ def test_build_job_manifest_node_selector_can_override_arch() -> None:
     selector = _pod_spec(manifest)["nodeSelector"]
     assert selector["kubernetes.io/arch"] == "arm64"
     assert selector["disktype"] == "ssd"
+
+
+def test_build_job_manifest_omits_runtime_class_by_default() -> None:
+    """No runtime_class → no runtimeClassName key: the cluster default runtime."""
+    manifest = build_job_manifest(**_MANIFEST_KW)
+    assert "runtimeClassName" not in _pod_spec(manifest)
+
+
+def test_build_job_manifest_runtime_class_sets_runtime_class_name() -> None:
+    """An operator runtime_class lands verbatim as spec.runtimeClassName."""
+    manifest = build_job_manifest(**{**_MANIFEST_KW, "runtime_class": "kata"})
+    assert _pod_spec(manifest)["runtimeClassName"] == "kata"
 
 
 def test_build_job_manifest_pvc_mounts_land_on_host_container_only() -> None:
@@ -458,11 +484,15 @@ def test_render_workspace_prep_command(
     expect_branch: bool,
 ) -> None:
     """The init command always mkdir's the workspace and clones only when asked."""
-    command = k8s._render_workspace_prep_command("/ws", clone_dir, repo_url, repo_branch)
+    command = k8s._render_workspace_prep_command(
+        "/ws", clone_dir, repo_url, repo_branch, "http://srv.example.com", "host_abc"
+    )
     script = command[2]
     assert "mkdir -p /ws" in script
     assert ("git clone" in script) is expect_clone
     assert ("--branch release-1.2 --single-branch" in script) is expect_branch
+    # The per-user broker is wired (connected-gated at runtime) only when cloning.
+    assert ("configure_clone_credentials" in script) is expect_clone
 
 
 def test_new_pod_name_and_token_secret_name() -> None:
@@ -494,6 +524,37 @@ def test_env_var_name_override_is_validated(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv(k8s.NAMESPACE_ENV_VAR, "Not_A_Valid_NS")
     with pytest.raises(click.ClickException, match="not a valid Kubernetes name"):
         KubernetesSandboxLauncher()._resolve_namespace()
+
+
+def test_pod_ready_timeout_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no config and no env var, the hardcoded default wins."""
+    monkeypatch.delenv(k8s._POD_READY_TIMEOUT_ENV_VAR, raising=False)
+    assert k8s._resolve_pod_ready_timeout_s(None) == k8s._POD_READY_TIMEOUT_S
+
+
+def test_pod_ready_timeout_env_var_overrides_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no explicit config, the env var overrides the hardcoded default."""
+    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "300")
+    assert k8s._resolve_pod_ready_timeout_s(None) == 300
+
+
+def test_pod_ready_timeout_config_wins_over_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """sandbox.kubernetes.pod_ready_timeout_s takes precedence over the env var."""
+    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "300")
+    assert k8s._resolve_pod_ready_timeout_s(45) == 45
+
+
+def test_pod_ready_timeout_env_var_accepts_float_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A float-looking env value is accepted, matching the E2B lifetime resolver."""
+    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "120.0")
+    assert k8s._resolve_pod_ready_timeout_s(None) == 120
+
+
+def test_pod_ready_timeout_env_var_rejects_non_numeric(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A malformed env value fails fast with a clear error instead of a raw ValueError."""
+    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "not-a-number")
+    with pytest.raises(click.ClickException, match="must be a number of seconds"):
+        k8s._resolve_pod_ready_timeout_s(None)
 
 
 # ── SDK-driven tests (fake kubernetes client) ───────────────

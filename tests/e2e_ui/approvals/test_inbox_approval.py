@@ -36,7 +36,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 _INBOX_ITEM = '[data-testid="inbox-item"]'
 _AGENT_TURN_TIMEOUT_MS = 120_000

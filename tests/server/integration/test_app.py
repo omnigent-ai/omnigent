@@ -391,9 +391,9 @@ async def test_web_ui_serves_service_worker_uncached(
     """
     ``sw.js`` is served from the SPA static mount with ``no-cache``.
 
-    The PWA is retired and ``sw.js`` is now a tombstone that unregisters the old
-    worker, but the header exemption must outlive it: a cached ``sw.js`` would
-    otherwise shadow any service worker served at this path later.
+    The PWA is retired and its tombstone ``sw.js`` was deleted in 0.11.0, but
+    the header exemption must outlive it: a cached ``sw.js`` would otherwise
+    shadow any service worker served at this path later.
 
     :param runtime_init: Fixture that initializes the runtime with a mock LLM.
     :param db_uri: Test database URI.

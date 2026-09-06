@@ -85,7 +85,7 @@ def test_mobile_collapses_rail_and_surfaces_kebab(
 
     # The composer renders, confirming the chat surface is the primary
     # mobile view (no rail competing for space).
-    expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
 
     # Desktop rail is in the DOM but collapsed off-screen (hidden md:flex).
     # A DOM-scoped locator makes not_to_be_visible() genuinely assert
@@ -314,7 +314,7 @@ def test_mobile_chat_send_and_response(
     page.set_viewport_size(_MOBILE_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
 
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill(prompt)
     page.get_by_role("button", name="Send", exact=True).click()

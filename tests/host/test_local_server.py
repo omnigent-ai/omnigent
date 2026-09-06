@@ -221,6 +221,24 @@ def test_server_config_signature_changes_with_features(
     assert sig_on == local_server.server_config_signature()
 
 
+def test_server_config_signature_changes_with_session_title_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    config_path = config_home / "config.yaml"
+    config_path.write_text("{}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    sig_default = local_server.server_config_signature()
+
+    config_path.write_text("session_title_instructions: Prefix titles with the current date.\n")
+    sig_custom = local_server.server_config_signature()
+
+    assert sig_default != sig_custom
+    assert sig_custom == local_server.server_config_signature()
+
+
 def test_remote_daemon_signature_ignores_local_server_features(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

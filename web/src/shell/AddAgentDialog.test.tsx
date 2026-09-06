@@ -164,6 +164,17 @@ describe("AddAgentDialog", () => {
     expect(JSON.stringify(initialItems)).toContain("designs/feature-x.md");
   });
 
+  it("gives the form scroll region room for the fields' focus ring", () => {
+    renderDialog();
+
+    const scrollRegion = screen.getByTestId("add-agent-dialog").querySelector(".overflow-y-auto");
+    if (!scrollRegion) throw new Error("add-agent scroll region not found");
+    // overflow-y-auto also clips horizontally at the padding box, so the
+    // full-width fields need horizontal padding or their 3px focus ring is
+    // chopped at the container's left/right edges.
+    expect(scrollRegion).toHaveClass("px-1", "-mx-1");
+  });
+
   it("shows an empty-state and a disabled submit when no agents are available", () => {
     mockAgents([]);
     renderDialog();

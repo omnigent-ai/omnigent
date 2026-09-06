@@ -95,7 +95,7 @@ jobs:
         # checked here so Electron's large native devDependencies are not fetched.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: pnpm install --frozen-lockfile --filter web --filter omnigent-vscode
+        run: pnpm install --frozen-lockfile --filter web --filter omnigent-vscode --filter @omnigent/canvas
 
       # The pnpm equivalent of the `uv sync --locked` gate above.
       # `pnpm install --frozen-lockfile` only checks the lockfile is CONSISTENT

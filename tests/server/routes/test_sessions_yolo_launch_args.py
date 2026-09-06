@@ -16,6 +16,12 @@ These tests exercise the pure translation helper
 string-coerced config values the spec parser actually produces (it
 stringifies every ``executor.config`` value, so ``yolo: true`` becomes
 ``"True"``).
+
+Top-level / self-resolved creates use the same helper with
+``headless_defaults=False``: those sessions are interactive (a human can
+answer an ApprovalCard), so only the spec's EXPLICIT declarations
+translate and the codex-native / cursor-native headless default bypass
+does not apply. The ``*_without_headless_defaults`` tests pin that mode.
 """
 
 from __future__ import annotations
@@ -304,3 +310,69 @@ def test_antigravity_native_non_string_mode_is_fail_closed() -> None:
 
     spec = _spec_with_config({"harness": "antigravity-native", "permission_mode": _EqAnything()})
     assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
+def test_codex_native_explicit_yolo_translates_without_headless_defaults() -> None:
+    """
+    codex-native ``yolo: true`` reaches a top-level launch too.
+
+    A custom top-level agent whose own bundle declares ``yolo: true``
+    (string-coerced to ``"True"`` by the parser) opted into full bypass
+    explicitly. A failure here reproduces the reported journey: the
+    bundle's declared bypass never reaches the interactive session, codex
+    launches at its default approval stance, and the user's unattended
+    orchestrator parks on approval prompts.
+    """
+    spec = _spec_with_config({"harness": "codex-native", "yolo": "True"})
+    assert _derive_terminal_launch_args_from_spec(spec, headless_defaults=False) == [
+        "--dangerously-bypass-approvals-and-sandbox",
+    ]
+
+
+def test_codex_native_undeclared_yolo_stays_unset_without_headless_defaults() -> None:
+    """
+    The headless default bypass must NOT leak into interactive sessions.
+
+    A codex-native spec that never mentions ``yolo`` gets full bypass as a
+    headless WORKER (nobody can answer its prompts) but must stay unset on
+    a top-level create — a human is present to answer the ApprovalCard, so
+    silently bypassing approvals and sandbox would widen every custom
+    codex agent's blast radius without any opt-in.
+    """
+    spec = _spec_with_config({"harness": "codex-native"})
+    assert _derive_terminal_launch_args_from_spec(spec, headless_defaults=False) is None
+
+
+def test_codex_native_yolo_false_stays_unset_without_headless_defaults() -> None:
+    """An explicit ``yolo: false`` opt-out also holds on top-level creates."""
+    spec = _spec_with_config({"harness": "codex-native", "yolo": "False"})
+    assert _derive_terminal_launch_args_from_spec(spec, headless_defaults=False) is None
+
+
+def test_cursor_native_explicit_yolo_translates_without_headless_defaults() -> None:
+    """cursor-native ``yolo: true`` is an explicit opt-in and still maps."""
+    spec = _spec_with_config({"harness": "cursor-native", "yolo": "True"})
+    assert _derive_terminal_launch_args_from_spec(spec, headless_defaults=False) == ["--yolo"]
+
+
+def test_cursor_native_undeclared_yolo_stays_unset_without_headless_defaults() -> None:
+    """cursor-native's headless ``--yolo`` default is worker-only."""
+    spec = _spec_with_config({"harness": "cursor-native"})
+    assert _derive_terminal_launch_args_from_spec(spec, headless_defaults=False) is None
+
+
+def test_cursor_native_auto_mode_translates_without_headless_defaults() -> None:
+    """An explicit Smart Auto mode is a declaration, not a headless default."""
+    spec = _spec_with_config({"harness": "cursor-native", "permission_mode": "auto"})
+    assert _derive_terminal_launch_args_from_spec(spec, headless_defaults=False) == [
+        "--auto-review",
+    ]
+
+
+def test_claude_native_permission_mode_translates_without_headless_defaults() -> None:
+    """claude-native's opt-in ``permission_mode`` behaves the same in both modes."""
+    spec = _spec_with_config({"harness": "claude-native", "permission_mode": "bypassPermissions"})
+    assert _derive_terminal_launch_args_from_spec(spec, headless_defaults=False) == [
+        "--permission-mode",
+        "bypassPermissions",
+    ]

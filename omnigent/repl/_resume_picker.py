@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Protocol, TextIO
 
 if TYPE_CHECKING:
     from omnigent_client import OmnigentClient
+    from omnigent_client._sessions import SessionListItem
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.key_binding.key_processor import KeyPressEvent
     from prompt_toolkit.styles import Style
@@ -74,6 +75,12 @@ from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 # Small enough that a 24-line terminal shows the whole page; big enough
 # that a typical user finds their conversation in the first page.
 _PAGE_SIZE = 10
+
+# Backoff schedule for transient 429s on the picker's session-list
+# call. Two short retries keep a momentary rate-limit invisible to the
+# user; a persistent one still surfaces (as a typed error the caller
+# renders concisely, never a raw traceback).
+_SESSION_LIST_RETRY_DELAYS_S: tuple[float, ...] = (0.5, 1.0)
 
 _CANCEL_TOKEN = "cancel"
 
@@ -897,6 +904,46 @@ def _page_start_for_selection(selected_index: int) -> int:
     return (selected_index // _PAGE_SIZE) * _PAGE_SIZE
 
 
+async def _list_sessions_with_retry(
+    client: OmnigentClient,
+    *,
+    limit: int = 200,
+    agent_id: str | None = None,
+    agent_name: str | None = None,
+    order: str = "desc",
+) -> list[SessionListItem]:
+    """Call ``client.sessions.list`` with bounded retries on 429.
+
+    A transient rate-limit on the picker's single list call should not
+    abort the resume journey: retry on the short
+    :data:`_SESSION_LIST_RETRY_DELAYS_S` schedule and re-raise only
+    when the 429 persists past the last attempt. Every other error
+    propagates immediately — only the transient-by-definition status
+    is worth waiting out.
+
+    :param client: SDK client whose ``sessions.list`` to call.
+    :param limit: Maximum number of session rows to fetch.
+    :param agent_id: Scope to this agent; ``None`` lists across agents.
+    :param agent_name: Scope to sessions whose bound agent has this name.
+    :param order: Sort order forwarded to ``list``.
+    :returns: The session rows.
+    :raises omnigent_client.RateLimitedError: When every attempt was
+        rate-limited.
+    """
+    from omnigent_client import RateLimitedError
+
+    for delay_s in _SESSION_LIST_RETRY_DELAYS_S:
+        try:
+            return await client.sessions.list(
+                limit=limit, agent_id=agent_id, agent_name=agent_name, order=order
+            )
+        except RateLimitedError:
+            await asyncio.sleep(delay_s)
+    return await client.sessions.list(
+        limit=limit, agent_id=agent_id, agent_name=agent_name, order=order
+    )
+
+
 async def pick_conversation_from_sdk(
     client: OmnigentClient,
     *,
@@ -917,7 +964,8 @@ async def pick_conversation_from_sdk(
         has this name. Used for session-scoped agents that share a
         YAML name but intentionally do not share ``agent_id``.
     """
-    convos = await client.sessions.list(
+    convos = await _list_sessions_with_retry(
+        client,
         limit=200,
         agent_id=agent_id,
         agent_name=agent_name_filter,
@@ -932,6 +980,7 @@ async def pick_conversation_by_wrapper_label_from_sdk(
     *,
     wrapper_value: str,
     agent_name: str,
+    host_id: str | None = None,
     out: TextIO | None = None,
     in_: TextIO | None = None,
 ) -> str | None:
@@ -948,13 +997,26 @@ async def pick_conversation_by_wrapper_label_from_sdk(
     user for the chdir prompt the wrapper raises after they pick.
     The cwd comes from the wrapper's client-side persistent state
     (``~/.omnigent/claude-native/``); sessions created on a
-    different machine will show as having no recorded cwd."""
-    all_convos = await client.sessions.list(limit=200, agent_id=None, order="desc")
+    different machine will show as having no recorded cwd.
+
+    :param host_id: When set, keep only rows bound to this host (the
+        invoking machine). Native transcript and workspace state are
+        host-local, so a wrapper session bound to another host is a
+        dead end in this picker — resuming it cannot work here. Rows
+        without a recorded ``host_id`` (never bound, or an older
+        server that predates the field) are kept: dropping them would
+        hide resumable local sessions. ``None`` disables host
+        filtering (explicit ``--resume <id>`` stays unrestricted for
+        diagnostics / migration workflows — it never routes through
+        this picker).
+    """
+    all_convos = await _list_sessions_with_retry(client, limit=200, agent_id=None, order="desc")
     convos = [
         c
         for c in all_convos
         if getattr(c, "labels", None)
         and c.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) == wrapper_value
+        and (host_id is None or getattr(c, "host_id", None) is None or c.host_id == host_id)
     ]
     previews = await _collect_previews_async(client, convos)
     return pick_conversation(
@@ -988,7 +1050,7 @@ async def pick_conversation_cross_agent_from_sdk(
     the caller's identity could not be resolved, or the server runs
     without permissions (``owner`` unset, no sharing to filter).
     """
-    convos = await client.sessions.list(limit=200, agent_id=None, order="desc")
+    convos = await _list_sessions_with_retry(client, limit=200, agent_id=None, order="desc")
     if owner_user_id is not None:
         convos = [c for c in convos if c.owner == owner_user_id]
     previews = await _collect_previews_async(client, convos)

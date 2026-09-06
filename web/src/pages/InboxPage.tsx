@@ -62,7 +62,11 @@ import { conversationDisplayLabel, getConversationAgentType } from "@/shell/side
 /** Optimistic verdicts keyed by elicitation id, mirroring the chat store's flip. */
 type RespondedMap = Record<
   string,
-  { action: "accept" | "decline"; content?: Record<string, unknown> }
+  {
+    action: "accept" | "decline";
+    content?: Record<string, unknown>;
+    _meta?: Record<string, unknown>;
+  }
 >;
 
 export function InboxPage() {
@@ -157,16 +161,20 @@ export function InboxPage() {
   // rollback on error. Success invalidates the session list so the row's
   // count (and the sidebar badge) drop without waiting for the socket.
   const makeSubmit = (item: InboxItem): SubmitApprovalFn => {
-    return (elicitationId, action, content) => {
+    return (elicitationId, action, content, meta) => {
       setResponded((prev) => ({
         ...prev,
-        [elicitationId]: content === undefined ? { action } : { action, content },
+        [elicitationId]: {
+          action,
+          ...(content === undefined ? {} : { content }),
+          ...(meta === undefined ? {} : { _meta: meta }),
+        },
       }));
-      void approve(
-        item.resolveSessionId,
-        elicitationId,
-        content === undefined ? { action } : { action, content },
-      ).then(
+      void approve(item.resolveSessionId, elicitationId, {
+        action,
+        ...(content === undefined ? {} : { content }),
+        ...(meta === undefined ? {} : { _meta: meta }),
+      }).then(
         () => {
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });
         },
@@ -327,6 +335,7 @@ export function InboxPage() {
                   codexCommand={item.elicitation.codexCommand}
                   allowAllEdits={item.elicitation.allowAllEdits}
                   rememberScope={item.elicitation.rememberScope}
+                  codexPersistModes={item.elicitation.codexPersistModes}
                   onSubmit={makeSubmit(item)}
                 />
               )}

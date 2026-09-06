@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from omnigent import native_bridge_common
+
 _logger = logging.getLogger(__name__)
 
 ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.antigravity_native.bridge_id"
@@ -246,7 +248,24 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
     bridge_dir = bridge_dir_for_bridge_id(bridge_id)
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(bridge_dir, 0o700)
+    # Owner-pid marker for the periodic dead-owner prune; refreshed every
+    # turn so it always names the current runner. See native_bridge_common.
+    native_bridge_common.write_owner_pid_marker(bridge_dir)
     return bridge_dir
+
+
+def prune_orphaned_bridge_dirs() -> int:
+    """
+    Remove antigravity-native bridge dirs whose owner process is provably dead.
+
+    Delegates to the shared sweep against this harness's bridge root; the
+    runner calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
+    at startup to reclaim dirs leaked by a prior runner that died without
+    running the explicit delete path.
+
+    :returns: The number of orphaned bridge dirs removed.
+    """
+    return native_bridge_common.prune_orphaned_dirs(bridge_root())
 
 
 # ── Omnigent MCP relay wiring (sys_* tools) ──────────────────────────────────
@@ -511,8 +530,10 @@ def seed_isolated_agy_home(
 ) -> dict[str, str]:
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
-    Copies known file-based agy OAuth markers + onboarding/migration state (NEVER
-    moving or modifying the real files) into ``<bridge_dir>/agy-home/.gemini``.
+    Copies known file-based agy OAuth markers, the user's ``settings.json``
+    (backend config such as the GCP project/location block), and
+    onboarding/migration state (NEVER moving or modifying the real files) into
+    ``<bridge_dir>/agy-home/.gemini``.
     The runner keeps agy's real ``HOME`` intact and passes this directory through
     ``--gemini_dir``; on macOS that is required because agy uses keyring-backed
     auth that is not portable to a relocated ``HOME``. The relay's
@@ -546,22 +567,8 @@ def seed_isolated_agy_home(
             dst.write_bytes(src.read_bytes())
             os.chmod(dst, 0o600)
 
-    # Seed the onboarding-complete marker so the first-run wizard never blocks a
-    # headless launch (same state ``ensure_agy_onboarding_complete`` writes).
-    onboarding = iso_gemini / "antigravity-cli" / "cache" / "onboarding.json"
-    with contextlib.suppress(OSError):
-        onboarding.write_text(
-            json.dumps(
-                {
-                    "consumerOnboardingComplete": True,
-                    "enterpriseOnboardingComplete": False,
-                    "onboardingComplete": True,
-                },
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+    _seed_isolated_agy_settings(real_home, iso_gemini)
+    _seed_isolated_agy_onboarding_marker(real_home, iso_gemini)
 
     # Seed the migration marker so agy does not churn a from-scratch migration on
     # first launch under the fresh Gemini dir (cosmetic; agy creates it itself otherwise).
@@ -575,6 +582,66 @@ def seed_isolated_agy_home(
         _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
 
     return {}
+
+
+def _seed_isolated_agy_settings(real_home: Path, iso_gemini: Path) -> None:
+    """Seed the user's real ``settings.json`` as the base of the isolated one.
+
+    The real settings carry backend config agy needs at turn time — notably the
+    ``gcp`` block (project + location) for GCP/enterprise logins, without which
+    every turn fails server-side with ``invalid location: ""``. Copied only when
+    the isolated file is absent so a re-seed never clobbers per-session edits
+    (the trust / survey seeders then merge their keys on top). Best-effort: a
+    failed copy only means agy runs without the user's settings.
+
+    :param real_home: The user's real home directory.
+    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
+    """
+    real_settings = real_home / ".gemini" / "antigravity-cli" / "settings.json"
+    iso_settings = iso_gemini / "antigravity-cli" / "settings.json"
+    if real_settings.is_file() and not iso_settings.exists():
+        with contextlib.suppress(OSError):
+            iso_settings.write_bytes(real_settings.read_bytes())
+            os.chmod(iso_settings, 0o600)
+
+
+def _seed_isolated_agy_onboarding_marker(real_home: Path, iso_gemini: Path) -> None:
+    """Seed the onboarding-complete marker so the first-run wizard never blocks.
+
+    The user's real marker is preferred: it carries auth-flow state the
+    synthetic default lacks (``enterpriseOnboardingComplete``,
+    ``previousAuthMethod``), without which an enterprise/GCP login re-enters
+    the first-run wizard and blocks TUI injection. The marker is intentionally
+    re-written on every seed (unlike the guarded settings copy): it is a
+    regenerable, non-secret wizard gate that agy does not meaningfully edit
+    per-session, so the freshest real-home state always wins.
+
+    The synthetic fallback (no real marker, e.g. a cleared agy cache) marks
+    BOTH onboarding flows complete: the marker's only job here is suppressing
+    an unhookable wizard on a headless launch, and ``enterpriseOnboardingComplete:
+    false`` verifiably re-triggers the wizard for enterprise/GCP accounts.
+
+    :param real_home: The user's real home directory.
+    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
+    """
+    onboarding = iso_gemini / "antigravity-cli" / "cache" / "onboarding.json"
+    real_onboarding = real_home / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json"
+    with contextlib.suppress(OSError):
+        if real_onboarding.is_file():
+            onboarding.write_bytes(real_onboarding.read_bytes())
+        else:
+            onboarding.write_text(
+                json.dumps(
+                    {
+                        "consumerOnboardingComplete": True,
+                        "enterpriseOnboardingComplete": True,
+                        "onboardingComplete": True,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
 
 def _seed_isolated_agy_plugins(real_home: Path, iso_gemini: Path) -> None:
@@ -651,6 +718,7 @@ def _link_into_isolated_gemini_dir(real: Path, link: Path) -> None:
 # writes exactly ``"showFeedbackSurvey": false`` here (``disableFeedback`` is an
 # unrelated internal proto field, NOT a settings key — it would be ignored).
 _AGY_FEEDBACK_SURVEY_SETTING = "showFeedbackSurvey"
+_AGY_MODEL_PROVIDER_SETTING = "modelProvider"
 
 
 def ensure_agy_feedback_survey_disabled(home: Path) -> None:
@@ -666,10 +734,11 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
     the survey itself would be brittle to agy wording changes).
 
     Merge-only + idempotent: existing keys (``model``, ``trustedWorkspaces``,
-    ``enableTelemetry``, …) are preserved; a missing file is created with just
-    this key; a malformed / non-object file is left UNTOUCHED rather than
-    clobbered. Best-effort — a read/write failure is logged and the launch
-    proceeds (the survey is a degradation, not a hard blocker).
+    ``enableTelemetry``, …) are preserved. When ``GEMINI_API_KEY`` is present,
+    ``modelProvider`` is set to ``"gemini"``; when the key disappears that
+    bridge-owned value is removed so OAuth can take over on resume. A malformed
+    / non-object file is left UNTOUCHED rather than clobbered. Best-effort — a
+    read/write failure is logged and the launch proceeds.
 
     :param home: The HOME agy launches under (the per-session isolated home, or
         the real home when the harness runs agy under it). Settings live at
@@ -723,9 +792,17 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
             )
             return
         data = loaded
-    if data.get(_AGY_FEEDBACK_SURVEY_SETTING) is False:
+    desired: dict[str, object] = {_AGY_FEEDBACK_SURVEY_SETTING: False}
+    if (os.environ.get("GEMINI_API_KEY") or "").strip():
+        desired[_AGY_MODEL_PROVIDER_SETTING] = "gemini"
+    provider_removed = False
+    current_provider = data.get(_AGY_MODEL_PROVIDER_SETTING)
+    if _AGY_MODEL_PROVIDER_SETTING not in desired and current_provider == "gemini":
+        del data[_AGY_MODEL_PROVIDER_SETTING]
+        provider_removed = True
+    if not provider_removed and all(data.get(key) == value for key, value in desired.items()):
         return  # already disabled — avoid a needless rewrite
-    data[_AGY_FEEDBACK_SURVEY_SETTING] = False
+    data.update(desired)
     # The write is atomic (mkstemp + os.replace) so a concurrent reader/writer never
     # sees a torn file. Both launch paths pass the per-session isolated agy dir, so
     # the only writer that can race here is the session's own agy; the idempotent
@@ -929,9 +1006,10 @@ def update_conversation_id(
 # delivery; no shared tmux helper exists, so the small primitives are duplicated
 # per the established per-harness convention.
 
-# tmux probe/command timeout. Short: these are local IPC calls to the runner's
-# own tmux server.
-_TMUX_SEND_TIMEOUT_S = 5.0
+# Per-command tmux budget. These are local IPC calls to the runner's own tmux
+# server, but that server can stall past 5s under parallel worker boots on a
+# large worktree while still healthy — 10s matches every other native bridge.
+_TMUX_SEND_TIMEOUT_S = 10.0
 # Per-readiness-gate wait (tmux.json advertised, then the agy input box mounted).
 _TMUX_READY_TIMEOUT_S = 30.0
 # Poll cadence for the readiness / paste-commit / submit-verify loops.

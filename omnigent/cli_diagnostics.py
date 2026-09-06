@@ -28,7 +28,6 @@ import contextlib
 import io
 import logging
 import os
-import re
 import sys
 import time
 from dataclasses import dataclass
@@ -38,12 +37,16 @@ from typing import cast
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.process_logging import (
-    TerminalLogFormatter,
+    RedactingLogFormatter,
     effective_log_level,
     env_truthy,
     process_log_dir,
+    redact_log_text,
     terminal_supports_color,
 )
+
+_RedactingFormatter = RedactingLogFormatter
+_redact = redact_log_text
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -103,65 +106,6 @@ class _LoggingStreamSnapshot:
 
 
 _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
-
-# ---------------------------------------------------------------------------
-# Secret redaction filter
-# ---------------------------------------------------------------------------
-
-#: Patterns that match values likely to be secrets.  Applied to every
-#: log record's formatted message before it hits the file.
-_SECRET_PATTERNS: list[re.Pattern[str]] = [
-    # Header values: "Authorization: Bearer xxx" or "bearer xxx"
-    re.compile(r"(?i)(authorization\s*[:=]\s*)\S+"),
-    re.compile(r"(?i)(bearer\s+)\S+"),
-    # Env-var style keys: FOO_TOKEN=xxx, FOO_API_KEY=xxx, ...
-    re.compile(r"(?i)(\b\w*(?:token|api_key|secret|password)\s*[:=]\s*)\S+"),
-    # Anthropic / OpenAI style keys
-    re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
-    # Databricks PATs
-    re.compile(r"\bdapi[A-Za-z0-9]{10,}\b"),
-]
-_REDACTED = "[REDACTED]"
-
-
-def _redact(text: str) -> str:
-    """
-    Replace secret-shaped substrings in *text* with :data:`_REDACTED`.
-
-    :param text: Arbitrary log text (may include tracebacks).
-    :returns: Scrubbed text.
-    """
-    for pat in _SECRET_PATTERNS:
-        text = pat.sub(
-            lambda m: m.group(1) + _REDACTED if m.lastindex else _REDACTED,
-            text,
-        )
-    return text
-
-
-class _RedactingFormatter(TerminalLogFormatter):
-    """
-    Formatter that scrubs obvious secrets from the *final* formatted
-    output — after ``%``-interpolation of ``record.args`` and after
-    traceback rendering.
-
-    A ``logging.Filter`` on ``record.msg`` would run *before*
-    formatting, so secrets passed as ``logger.info("key=%s", secret)``
-    or appearing in exception tracebacks would slip through.
-    Overriding :meth:`format` is the correct interception point
-    because the base class returns the fully-assembled string
-    (message + traceback) and nothing downstream mutates it before
-    the handler writes.
-    """
-
-    def format(self, record: logging.LogRecord) -> str:
-        """
-        Format *record* then redact secrets from the result.
-
-        :param record: The log record to format.
-        :returns: Formatted, redacted string ready for the handler.
-        """
-        return _redact(super().format(record))
 
 
 class _RedactingStderr(io.TextIOBase):

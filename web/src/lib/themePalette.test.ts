@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { setEmbedRoot, setEmbedScopeRoot } from "./host";
 import {
   applyThemePalette,
   DEFAULT_PALETTE,
@@ -15,6 +16,8 @@ const STORAGE_KEY = "omnigent:ui-theme-palette";
 
 afterEach(() => {
   localStorage.clear();
+  setEmbedScopeRoot(null);
+  setEmbedRoot(null);
   document.documentElement.removeAttribute("data-theme");
 });
 
@@ -84,6 +87,22 @@ describe("themePalette", () => {
     expect(document.documentElement.getAttribute("data-theme")).toBe("github");
     applyThemePalette(DEFAULT_PALETTE);
     expect(document.documentElement.hasAttribute("data-theme")).toBe(false);
+  });
+
+  it("stamps data-theme on both embed roots when embedded (light + dark selectors)", () => {
+    // The light `:root[data-theme]` selectors match the scope root; the dark
+    // `.dark[data-theme]` selectors match the inner `.dark` root — both need it.
+    const scope = document.createElement("div");
+    const inner = document.createElement("div");
+    setEmbedScopeRoot(scope);
+    setEmbedRoot(inner);
+    applyThemePalette("dracula");
+    expect(scope.getAttribute("data-theme")).toBe("dracula");
+    expect(inner.getAttribute("data-theme")).toBe("dracula");
+    expect(document.documentElement.hasAttribute("data-theme")).toBe(false);
+    applyThemePalette(DEFAULT_PALETTE);
+    expect(scope.hasAttribute("data-theme")).toBe(false);
+    expect(inner.hasAttribute("data-theme")).toBe(false);
   });
 
   it("exposes swatch metadata for every selectable palette, default first", () => {

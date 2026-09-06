@@ -11,10 +11,9 @@ it is stale and terminates itself.
 The flock also serves reuse: :func:`record_flock_is_held` probes it so a
 spin-up can tell a live daemon (reuse it) from a dead one (reap + respawn),
 with a PID check as the fallback when the lock is free or unprobeable. This
-relies on the record being rewritten in place (``Path.write_text``, see
-``cli._write_daemon_record``): an atomic-rename write would swap the inode and
-strand the daemon's flock on the old one, so takeover must keep modifying the
-existing file.
+relies on the record being rewritten in place (see :func:`write_daemon_record`):
+an atomic-rename write would swap the inode and strand the daemon's flock on
+the old one, so takeover must keep modifying the existing file.
 """
 
 from __future__ import annotations
@@ -24,6 +23,7 @@ import hashlib
 import json
 import logging
 import os
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from omnigent.process_logging import data_dir
@@ -36,6 +36,33 @@ except ImportError:  # pragma: no cover - Windows has no flock.
 _logger = logging.getLogger(__name__)
 
 _LOCAL_DAEMON_MARKER = "local"
+DAEMON_CONFIG_SIG_ENV_VAR = "OMNIGENT_HOST_DAEMON_CONFIG_SIG"
+
+
+@dataclass(frozen=True)
+class HostDaemonRecord:
+    """Registry metadata for one host daemon process.
+
+    :param pid: Process id of the daemon.
+    :param target: Normalized server URL or ``"local"``.
+    :param mode: Launch mode, either ``"server"`` or ``"local"``.
+    :param server_url: Requested URL in server mode; ``None`` in local mode.
+    :param log_path: Captured daemon log, or ``None`` for foreground hosts.
+    :param started_at: Unix epoch seconds when the daemon started.
+    :param host_id: Stable host id advertised to the server.
+    :param resolved_server_url: Concrete URL owned by a local-mode daemon.
+    :param config_sig: Signature of server-affecting launch configuration.
+    """
+
+    pid: int
+    target: str
+    mode: str
+    server_url: str | None
+    log_path: str | None
+    started_at: int
+    host_id: str | None = None
+    resolved_server_url: str | None = None
+    config_sig: str | None = None
 
 
 def normalize_daemon_target(server_url: str | None) -> str:
@@ -68,6 +95,21 @@ def daemon_record_path(target: str, *, base_dir: Path | None = None) -> Path:
     :returns: JSON record path.
     """
     return daemon_registry_dir(base_dir) / f"{_target_digest(target)}.json"
+
+
+def write_daemon_record(
+    record: HostDaemonRecord,
+    *,
+    base_dir: Path | None = None,
+    update_legacy_pidfile: bool = False,
+) -> None:
+    """Persist *record* in place while preserving its lifecycle-lock inode."""
+    root = base_dir if base_dir is not None else data_dir()
+    path = daemon_record_path(record.target, base_dir=root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(record), indent=2, sort_keys=True) + "\n")
+    if update_legacy_pidfile:
+        (root / "host.pid").write_text(f"{record.pid}\n{record.target}\n")
 
 
 def record_flock_is_held(record_path: Path) -> bool | None:
@@ -158,15 +200,24 @@ class DaemonLifecycleLock:
         """Take the exclusive lifetime lock on the record file.
 
         Best-effort: a failure (no ``fcntl``, contended lock, IO error) is
-        logged and reported, never raised — the record-based ownership check
-        still guards the daemon even without a held lock. The record's content
-        is owned by the CLI, so we only open + lock it, never truncate or write
-        (that would clobber the record the launching CLI wrote).
+        reported, never raised. The lock handle only opens the file; the
+        elected daemon persists its metadata separately after claiming it.
 
         :returns: ``True`` if the flock is now held by this process.
         """
+        return self.try_acquire() is True
+
+    def try_acquire(self) -> bool | None:
+        """Try to claim this target, distinguishing contention from no support.
+
+        :returns: ``True`` when acquired, ``False`` when another daemon owns
+            the target, or ``None`` when locking is unavailable so callers can
+            retain the historical best-effort fallback.
+        """
+        if self._fd is not None:
+            return True
         if fcntl is None:
-            return False
+            return None
         fd: int | None = None
         try:
             self._record_path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,6 +227,11 @@ class DaemonLifecycleLock:
                 0o600,
             )
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            return False
         except OSError:
             _logger.warning(
                 "daemon lifecycle lock acquire failed for %s", self._target, exc_info=True
@@ -183,7 +239,7 @@ class DaemonLifecycleLock:
             if fd is not None:
                 with contextlib.suppress(OSError):
                     os.close(fd)
-            return False
+            return None
         self._fd = fd
         return True
 

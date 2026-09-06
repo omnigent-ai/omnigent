@@ -413,7 +413,7 @@ export function FilesPanel({
     >
       {/* Header — single row: [title · workingDir] [eye] [close?] */}
       <div className="flex shrink-0 items-center gap-2 px-3 py-2">
-        <span className="shrink-0 font-medium text-ui">Working folder</span>
+        <h2 className="shrink-0 font-medium text-ui">{flatView ? "Changes" : "Working folder"}</h2>
         {workingDir && workspaceRoot && (
           <BrowseLocationBar
             current={workingDir}

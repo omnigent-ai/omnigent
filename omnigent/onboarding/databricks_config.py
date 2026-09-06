@@ -42,16 +42,10 @@ def normalize_workspace_url(raw: str) -> str:
 
 # The install command surfaced wherever a Databricks flow is gated on the
 # `databricks` extra (the add-provider menu, `setup --internal-beta`).
-# Matches the README's canonical `uv tool install` path. Dev clones use
-# `uv sync --extra databricks` instead, but the tool install is the path
-# end users actually took. The repo URL sits on its own line: the slug
-# differs per distribution, and inlining it into the hint string would
-# make the line's width — and therefore its ruff formatting — depend on
-# which slug a checkout carries.
-_SOURCE_REPO_URL = "https://github.com/omnigent-ai/omnigent.git"
-DATABRICKS_EXTRA_INSTALL_HINT = (
-    f'uv tool install --force "omnigent[databricks] @ git+{_SOURCE_REPO_URL}"'
-)
+# Matches the README's canonical `uv tool install` path: install from the
+# package index, not git. Dev clones use `uv sync --extra databricks`
+# instead, but the tool install is the path end users actually took.
+DATABRICKS_EXTRA_INSTALL_HINT = 'uv tool install --force "omnigent[databricks]"'
 
 
 def databricks_sdk_installed() -> bool:

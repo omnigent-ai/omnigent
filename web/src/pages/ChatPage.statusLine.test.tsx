@@ -21,6 +21,13 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   };
 });
 
+// ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
+// (default: no PR) so these tests don't need a QueryClientProvider, matching
+// the workspace-files stub above.
+vi.mock("@/hooks/useGithub", () => ({
+  useGithubInfo: () => ({ data: undefined }),
+}));
+
 // HostBadge now lives in the status-line tray (left of the worktree branch).
 // It reads the session's host binding via these hooks; stub them so the badge
 // renders deterministically without a QueryClient / RunnerHealth provider. The

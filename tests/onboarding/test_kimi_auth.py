@@ -162,13 +162,81 @@ def test_non_kimi_provider_ignored(tmp_path: Path) -> None:
     """A provider that is neither a Kimi type nor a Kimi host is ignored.
 
     An unrelated provider the user added to kimi's config (e.g. OpenAI) must not
-    make the Kimi harness read as configured.
+    make the Kimi harness read as configured when it is not the default.
     """
     config = tmp_path / "config.toml"
     _write_config(
         config,
         '[providers.openai]\ntype = "openai"\n'
         'base_url = "https://api.openai.com/v1"\napi_key = "sk-abc123"\n',
+    )
+    assert ka.kimi_api_key_configured(config) is False
+
+
+def test_default_custom_provider_detected(tmp_path: Path) -> None:
+    """A custom OpenAI-compatible provider selected by ``default_model`` counts.
+
+    Kimi Code works fully with e.g. an OpenRouter provider as the configured
+    default, so readiness must treat that install as configured.
+    """
+    config = tmp_path / "config.toml"
+    _write_config(
+        config,
+        'default_model = "openrouter/moonshotai/kimi-k3"\n'
+        '[providers.openrouter]\ntype = "openai"\n'
+        'base_url = "https://openrouter.ai/api/v1"\napi_key = "sk-or-abc123"\n',
+    )
+    assert ka.kimi_api_key_configured(config) is True
+
+
+def test_default_custom_provider_env_key_detected(tmp_path: Path) -> None:
+    """A default custom provider keyed via its ``env`` table counts."""
+    config = tmp_path / "config.toml"
+    _write_config(
+        config,
+        'default_model = "openrouter/moonshotai/kimi-k3"\n'
+        '[providers.openrouter]\ntype = "openai"\n'
+        '[providers.openrouter.env]\nKIMI_API_KEY = "sk-or-abc123"\n',
+    )
+    assert ka.kimi_api_key_configured(config) is True
+
+
+def test_default_custom_provider_without_key_not_detected(tmp_path: Path) -> None:
+    """The default custom provider still needs a non-empty API key."""
+    config = tmp_path / "config.toml"
+    _write_config(
+        config,
+        'default_model = "openrouter/moonshotai/kimi-k3"\n'
+        '[providers.openrouter]\ntype = "openai"\n'
+        'base_url = "https://openrouter.ai/api/v1"\n',
+    )
+    assert ka.kimi_api_key_configured(config) is False
+
+
+def test_non_default_custom_provider_ignored(tmp_path: Path) -> None:
+    """A keyed custom provider that ``default_model`` does not select is ignored.
+
+    ``default_model`` routing to a different provider means kimi does not
+    authenticate with this one by default, so it must not count as Kimi auth.
+    """
+    config = tmp_path / "config.toml"
+    _write_config(
+        config,
+        'default_model = "other/some-model"\n'
+        '[providers.openrouter]\ntype = "openai"\n'
+        'base_url = "https://openrouter.ai/api/v1"\napi_key = "sk-or-abc123"\n',
+    )
+    assert ka.kimi_api_key_configured(config) is False
+
+
+def test_default_model_without_provider_segment_ignored(tmp_path: Path) -> None:
+    """A ``default_model`` with no ``provider/`` prefix selects no provider."""
+    config = tmp_path / "config.toml"
+    _write_config(
+        config,
+        'default_model = "kimi-k3"\n'
+        '[providers.openrouter]\ntype = "openai"\n'
+        'base_url = "https://openrouter.ai/api/v1"\napi_key = "sk-or-abc123"\n',
     )
     assert ka.kimi_api_key_configured(config) is False
 

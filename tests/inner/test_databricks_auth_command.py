@@ -179,10 +179,46 @@ def test_the_recorded_command_runs_when_the_named_profile_yields_nothing(
 
 
 @pytest.mark.posix_only
-def test_an_injected_bearer_short_circuits_both_the_profile_and_the_fallback(
+def test_a_working_profile_outranks_an_ambient_bearer(
     tmp_path: Path,
 ) -> None:
-    """The runner already resolved a token; nothing else should be consulted."""
+    """
+    A stale shell bearer must not poison auth when the profile can mint.
+
+    Ambient ``DATABRICKS_BEARER`` exports linger past their ~1h TTL, and when
+    one shadowed the configured profile every turn failed 403 and re-login
+    didn't help — the mint was never consulted. The profile is the configured
+    identity, so its token wins whenever it can produce one.
+    """
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    command = databricks_bearer_token_command(
+        "https://example.databricks.com", "agent", fallback_command=_recorded_fallback(tmp_path)
+    )
+
+    assert (
+        _run_generated_helper(
+            command,
+            tmp_path,
+            force_refresh_works=False,
+            cached_token_works=True,
+            bearer="stale-shell-export",
+        )
+        == "cached"
+    )
+    assert not (tmp_path / "fallback-ran").exists()
+
+
+@pytest.mark.posix_only
+def test_the_ambient_bearer_backstops_a_profile_that_cannot_mint(
+    tmp_path: Path,
+) -> None:
+    """An injected bearer still carries an environment with no mintable profile.
+
+    CI and runner launches export a resolved token precisely because the
+    profile there has no OAuth state; when the mint yields nothing the bearer
+    must be served, and the recorded fallback stays out of it.
+    """
     from omnigent.inner.databricks_executor import databricks_bearer_token_command
 
     command = databricks_bearer_token_command(

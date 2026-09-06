@@ -34,7 +34,7 @@ import re
 
 from playwright.sync_api import Page, expect
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _LEFT_CHORD = "Control+Alt+BracketLeft"
 _RIGHT_CHORD = "Control+Alt+BracketRight"
 

@@ -359,7 +359,9 @@ def startup_theme_picker(
                 if next_c is None:
                     # Bare Escape — accept current.
                     break
-                if next_c == "[":
+                # "[" is normal cursor mode, "O" application cursor mode
+                # (DECCKM) — terminals send either for ↑/↓.
+                if next_c in ("[", "O"):
                     arrow = _read_raw_byte_timeout(fd, timeout=0.05)
                     if arrow == "A":  # Up
                         selected = (selected - 1) % len(_ITEMS)

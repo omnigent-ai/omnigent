@@ -36,7 +36,7 @@ from playwright.sync_api import Page, expect
 
 _QUEUED_STRIP = '[data-testid="composer-queued-strip"]'
 _PILL = '[data-testid="background-task-pill"]'
-_COMPOSER_PLACEHOLDER_IDLE = "Ask the agent anything…"
+_COMPOSER_PLACEHOLDER_IDLE = "Send a message…"
 
 _SEND_MSG = "sentinel-bg-send-2a9c sent while a background task runs"
 _RELOAD_SEND_MSG = "sentinel-bg-send-7f31 sent after reopening the session"

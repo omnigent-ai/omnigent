@@ -12,6 +12,7 @@ from omnigent.harness_plugins import (
     install_specs,
     model_env_keys,
 )
+from omnigent.onboarding.harness_install import required_cli_for_harness
 from tests.e2e._harness_probes import HARNESS_PROBES, HarnessProbe
 from tests.harness_bench.profile import BenchProfile
 from tests.harness_bench.verdict import Verdict
@@ -107,15 +108,24 @@ _NATIVE_CREDENTIAL_MODELS: dict[str, str] = {
 }
 _NATIVE_DEFAULT_MODEL = "databricks-claude-sonnet-4-6"
 
-_NATIVE_CLI_BINARY: dict[str, str] = {
-    "cursor-native": "cursor-agent",
-    "kiro-native": "kiro-cli",
-}
+
+def _native_cli_binary(harness: str) -> str:
+    """Return the CLI binary omnigent launches for a native TUI harness.
+
+    Resolves through the install-spec registry (the same source the launchers
+    and setup flows use), so harnesses whose binary differs from their slug
+    (``antigravity-native`` → ``agy``, ``cursor-native`` → ``cursor-agent``)
+    gate on the binary that actually exists on a correctly set-up machine.
+    """
+    spec = required_cli_for_harness(harness)
+    if spec is not None:
+        return spec.binary
+    return harness.removesuffix("-native")
 
 
 def _native_profile(harness: str) -> BenchProfile:
     caps = harness_capabilities().get(harness)
-    cli_binary = _NATIVE_CLI_BINARY.get(harness, harness.removesuffix("-native"))
+    cli_binary = _native_cli_binary(harness)
     env_prefix = "HARNESS_" + harness.upper().replace("-", "_") + "_"
     marker = harness.upper().replace("-", "_") + "_OK"
     return BenchProfile(

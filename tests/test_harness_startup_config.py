@@ -317,3 +317,71 @@ def test_args_alias_canonicalized() -> None:
 
 def test_args_no_config_layer() -> None:
     assert resolve_harness_args("codex", ("--verbose",), cfg=None) == ["--verbose"]
+
+
+# ── isaac wrapper shape (the runner auto-create's contract) ──────────
+# The runner's native terminal auto-create resolves command+args through the
+# resolvers above; these pin the exact `isaac -- <args>` / `isaac codex --
+# <args>` shape a downstream integration configures. The config `args` base
+# prepends before Omnigent's already-augmented args, so the `--` stays first.
+def test_isaac_wrap_shape_claude_native() -> None:
+    cfg = {"harness": {"claude-native": {"command": "isaac", "args": ["--"]}}}
+    assert resolve_harness_command("claude-native", default="claude", cfg=cfg) == "isaac"
+    built = ("--model", "x", "--mcp-config", "{}")
+    assert resolve_harness_args("claude-native", built, cfg=cfg) == ["--", *built]
+
+
+def test_isaac_wrap_shape_codex_native() -> None:
+    cfg = {"harness": {"codex-native": {"command": "isaac", "args": ["codex", "--"]}}}
+    assert resolve_harness_command("codex-native", default="codex", cfg=cfg) == "isaac"
+    built = ("--remote", "ws://127.0.0.1:9876")
+    assert resolve_harness_args("codex-native", built, cfg=cfg) == ["codex", "--", *built]
+
+
+# ── CLI persists RAW args; the runner is the single merge point ──────
+
+
+@pytest.mark.parametrize("harness", ["codex", "claude"])
+def test_native_cli_persists_raw_args_not_config_merged(
+    harness: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The native ``codex``/``claude`` CLI must hand *raw* pass-through args to
+    ``run_*_native``. The daemon runner is the single ``harness.<id>.args`` merge
+    point (``_auto_create_*_terminal``), and every CLI launch reaches it; if the
+    CLI also pre-merged, a managed session wrapped twice (``isaac codex -- codex
+    -- …``), which broke the launch. Regression for that double-apply.
+    """
+    import click
+    from click.testing import CliRunner
+
+    import omnigent.claude_native as claude_native
+    import omnigent.cli as _cli
+    import omnigent.cli_native as cli_native
+    import omnigent.codex_native as codex_native
+
+    cfg = {
+        "harness": {
+            "claude-native": {"command": "isaac", "args": ["--"]},
+            "codex-native": {"command": "isaac", "args": ["codex", "--"]},
+        }
+    }
+    # Both are late-bound in cli_native to the omnigent.cli module (see _late_bound).
+    monkeypatch.setattr(_cli, "_load_effective_config", lambda: dict(cfg))
+    monkeypatch.setattr(_cli, "_ensure_backend", lambda server: "https://example/api/2.0/omnigent")
+
+    captured: dict[str, tuple[str, ...]] = {}
+    monkeypatch.setattr(
+        codex_native, "run_codex_native", lambda **kw: captured.update(args=kw["extra_args"])
+    )
+    monkeypatch.setattr(
+        claude_native, "run_claude_native", lambda **kw: captured.update(args=kw["extra_args"])
+    )
+
+    group = click.Group()
+    cli_native.register_native_commands(group)
+    result = CliRunner().invoke(group, [harness, "userarg"], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    # Raw pass-through only — NOT the config-merged ("codex", "--", "userarg")
+    # or ("--", "userarg") that a second merge on the runner would double.
+    assert captured["args"] == ("userarg",)

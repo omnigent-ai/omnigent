@@ -304,6 +304,56 @@ def test_thread_settings_updated_records_effort_and_collaboration_mode() -> None
     assert state.collaboration_mode == "plan"
 
 
+def test_thread_settings_updated_records_approval_preset() -> None:
+    """
+    ``thread/settings/updated`` resolves the live ``/permissions`` preset.
+
+    A TUI approval change arrives here; the forwarder must map the approval
+    fields to a preset value so the sync helper can mirror it to the web
+    read-back label. If this regresses, a TUI-side switch never reaches the UI.
+    """
+    state = fwd._CodexForwarderState()
+
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+                "activePermissionProfile": {"id": ":danger-full-access", "extends": None},
+            }
+        }
+    )
+
+    assert state.approval_preset == "full-access"
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_approval_mode_change_posts_preset_and_dedupes() -> None:
+    """
+    Codex ``/permissions`` changes mirror the runtime preset to Omnigent once.
+
+    The post must carry ``approval_mode`` so the server stamps the read-back
+    label + publishes; a second sync with the same preset must not re-post.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(approval_preset="read-only")
+
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {"approval_mode": "read-only"},
+            },
+        )
+    ]
+    assert state.posted_approval_preset == "read-only"
+
+
 @pytest.mark.asyncio
 async def test_sync_reasoning_effort_change_posts_and_dedupes() -> None:
     """
@@ -453,7 +503,10 @@ async def test_sync_codex_approval_mode_change_posts_and_dedupes() -> None:
                         'approval_policy="never"',
                         "-c",
                         'approvals_reviewer="auto_review"',
-                    ]
+                    ],
+                    # Same event now also carries the runtime preset (danger sandbox
+                    # → full-access) for the web read-back label.
+                    "approval_mode": "full-access",
                 },
             },
         )
@@ -466,6 +519,7 @@ async def test_sync_codex_approval_mode_change_posts_and_dedupes() -> None:
         "-c",
         'approvals_reviewer="auto_review"',
     ]
+    assert state.posted_approval_preset == "full-access"
 
 
 def test_codex_permission_settings_fall_back_to_legacy_policy_args() -> None:
@@ -3236,3 +3290,64 @@ def test_refresh_developer_instructions_from_config_reads_current_value(
     fwd._refresh_developer_instructions_from_config(tmp_path, state)
 
     assert state.developer_instructions == "Be a concise coding assistant."
+
+
+# ---------------------------------------------------------------------------
+# _thread_started_is_ephemeral
+# ---------------------------------------------------------------------------
+
+
+def _make_thread_started(thread: dict) -> dict:
+    """Wrap a thread dict in a ``thread/started`` envelope."""
+    return {"method": "thread/started", "params": {"thread": thread}}
+
+
+def test_thread_started_is_ephemeral_true_for_ephemeral_system_thread() -> None:
+    """The exact 0.150.1 ephemeral system event is classified as ephemeral."""
+    event = _make_thread_started(
+        {
+            "id": "0195aaaa-system",
+            "ephemeral": True,
+            "path": None,
+            "threadSource": "system",
+            "source": "vscode",
+        }
+    )
+    assert fwd._thread_started_is_ephemeral(event) is True
+
+
+def test_thread_started_is_ephemeral_false_for_persistent_clear_thread() -> None:
+    """A real ``/clear`` thread (``ephemeral=false``) is not ephemeral."""
+    event = _make_thread_started(
+        {
+            "id": "0195bbbb-user-clear",
+            "ephemeral": False,
+            "path": "/rollout/0195bbbb.jsonl",
+            "threadSource": "user",
+        }
+    )
+    assert fwd._thread_started_is_ephemeral(event) is False
+
+
+def test_thread_started_is_ephemeral_false_when_ephemeral_absent() -> None:
+    """Missing ``ephemeral`` key is treated as non-ephemeral (safe default)."""
+    event = _make_thread_started({"id": "0195cccc-no-ephemeral-key"})
+    assert fwd._thread_started_is_ephemeral(event) is False
+
+
+def test_thread_started_is_ephemeral_false_for_wrong_method() -> None:
+    """Non-``thread/started`` events never count as ephemeral."""
+    event = {"method": "thread/updated", "params": {"thread": {"id": "t", "ephemeral": True}}}
+    assert fwd._thread_started_is_ephemeral(event) is False
+
+
+def test_thread_started_is_ephemeral_false_for_missing_params() -> None:
+    """Event with no params is not ephemeral."""
+    event = {"method": "thread/started"}
+    assert fwd._thread_started_is_ephemeral(event) is False
+
+
+def test_thread_started_is_ephemeral_false_for_missing_thread() -> None:
+    """Event with params but no thread is not ephemeral."""
+    event = {"method": "thread/started", "params": {}}
+    assert fwd._thread_started_is_ephemeral(event) is False

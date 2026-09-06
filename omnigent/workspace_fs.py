@@ -43,6 +43,7 @@ from omnigent.entities.environment_filesystem import InvalidPath
 from omnigent.entities.pagination import paginate_in_memory
 from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.inner.os_env import _DEFAULT_READ_LIMIT
+from omnigent.runner import github_resource
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
     _glob_to_regex,
@@ -467,3 +468,31 @@ class WorkspaceReader:
             "before": before,
             "after": after,
         }
+
+    # ── GitHub integration (read-only) ────────────────────────────
+    # Serve the same read-only PR metadata + the PR's files / diff the runner's
+    # GitHub endpoints do, so the tab keeps working when the runner is offline
+    # but the host still holds the workspace. Delegates to the shared
+    # ``github_resource`` helpers against this reader's confined root; the list
+    # and patch come from ``gh`` (the developer's authenticated CLI) and only the
+    # per-file reader shells out to a read-only ``git show``.
+
+    def github_info(self) -> _WorkspacePayload:
+        """GitHub context (repo, branch, base ref, PR) for the workspace."""
+        return cast("_WorkspacePayload", github_resource.github_info(str(self._root)))
+
+    def github_changes(self) -> _WorkspacePayload:
+        """The PR's changed files (empty when the branch has no PR)."""
+        return cast("_WorkspacePayload", github_resource.github_changed_files(str(self._root)))
+
+    def github_file_diff(self, base: str | None, relative_path: str) -> _WorkspacePayload:
+        """Before/after content for one file, HEAD vs the base merge-base."""
+        resolved = github_resource.resolve_base_ref(str(self._root), base)
+        return cast(
+            "_WorkspacePayload",
+            github_resource.github_file_diff(str(self._root), resolved or "", relative_path),
+        )
+
+    def github_pr_diff(self) -> _WorkspacePayload:
+        """The whole PR as one unified diff patch (empty when there's no PR)."""
+        return cast("_WorkspacePayload", github_resource.github_pr_diff(str(self._root)))

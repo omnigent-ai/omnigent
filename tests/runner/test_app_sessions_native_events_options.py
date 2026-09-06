@@ -470,10 +470,9 @@ async def test_events_compact_on_native_session_types_slash_command(
     types the slash command into the pane.
 
     The 200 (not 204) is load-bearing: the Omnigent server reads it to know
-    the control was handled in the terminal and skips its own
-    in-process compaction. A regression returning 204 here would make
-    the Omnigent server fall through to ``_run_compact_locked``, which 400s
-    on the LLM-less claude-native pseudo-agent — the original bug.
+    the control was handled in the terminal. A regression returning 204 here
+    would make the server return a 400 "not available for this session type"
+    error instead of the native compact succeeding.
     """
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
@@ -542,11 +541,9 @@ async def test_events_compact_on_native_session_types_slash_command(
                 if isinstance(item, dict):
                     queued_events.append(item)
 
-    # 200 = native dispatch routed to the compact handler and it
-    # injected successfully. 204 would mean the handler returned the
-    # in-process no-op (wrong harness branch) → Omnigent falls through to
-    # _run_compact_locked and 400s. 404 = the dispatch fell through to
-    # the generic harness-forward.
+    # 200 = native dispatch routed to the compact handler and injected
+    # successfully. 204 would mean the wrong harness branch fired (→ server
+    # returns 400). 404 = dispatch fell through to the generic forward.
     assert resp.status_code == 200, (
         f"Native compact must return 200 from /events; got {resp.status_code}: {resp.text}"
     )
@@ -746,13 +743,12 @@ async def test_events_compact_on_codex_native_injects_slash_command(
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> None:
+async def test_events_compact_on_codex_native_returns_503_when_no_terminal() -> None:
     """
-    Codex-native compact returns 204 when no live terminal is registered.
+    Codex-native compact returns 503 when no live terminal is registered.
 
-    Without a running codex terminal the ``/compact`` slash command
-    has nowhere to go.  204 tells the Omnigent server to fall back to
-    its own AP-side compaction (or skip it).
+    Without a running codex terminal the ``/compact`` slash command has
+    nowhere to go. 503 tells the caller to reconnect first.
     """
     codex_native_spec = AgentSpec(
         spec_version=1,
@@ -789,8 +785,8 @@ async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> 
             json={"type": "compact"},
         )
 
-    assert resp.status_code == 204, (
-        f"Codex-native compact with no terminal must return 204; "
+    assert resp.status_code == 503, (
+        f"Codex-native compact with no terminal must return 503; "
         f"got {resp.status_code}: {resp.text}"
     )
 
@@ -875,9 +871,8 @@ async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinn
     cursor-agent manages its own context window in the TUI, so explicit
     compaction must run there (its built-in ``/summarize`` command) rather
     than as AP-side compaction — the same rationale as the claude-native
-    path.  The 200 (not 204) is load-bearing: the Omnigent server reads it to
-    skip its own ``_run_compact_locked`` (which 400s on the LLM-less native
-    pseudo-agent).
+    path. The 200 (not 204) is load-bearing: the Omnigent server reads it to
+    know the control was handled in the terminal.
 
     Two properties are pinned here:
 
@@ -1262,7 +1257,7 @@ async def test_events_compact_on_qwen_native_submits_compress_and_raises_spinner
     Unlike cursor, injection is file-based: a ``submit`` line routes through
     qwen's ``RemoteInputWatcher`` then ``submitQuery``, which processes the slash
     command (no autocomplete-dropdown trap). The 200 is load-bearing (server
-    skips its own ``_run_compact_locked``). The handler publishes only
+    reads it to know the control was handled). The handler publishes only
     ``in_progress``; the ``completed`` edge is the compaction mirror's job once
     the ``chat_compression`` record lands (covered in test_qwen_native_forwarder).
     """
@@ -1746,14 +1741,15 @@ async def test_events_compact_on_opencode_native_summarizes_from_model_override(
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_204_when_model_unresolvable(
+async def test_events_compact_on_opencode_native_503_when_model_unresolvable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    No resolvable model → 204 and ``/summarize`` is never called.
+    No resolvable model → 503 and ``/summarize`` is never called.
 
-    The 204 tells the Omnigent server to run its own AP-side compaction.
+    Without a model the compaction has nowhere to go; 503 tells the caller
+    to switch the model first.
     """
     resp, client = await _drive_opencode_native_compact(
         monkeypatch,
@@ -1764,8 +1760,8 @@ async def test_events_compact_on_opencode_native_204_when_model_unresolvable(
         model_override=None,
     )
 
-    assert resp.status_code == 204, (
-        f"opencode-native compact must 204 when no model resolves; "
+    assert resp.status_code == 503, (
+        f"opencode-native compact must 503 when no model resolves; "
         f"got {resp.status_code}: {resp.text}"
     )
     assert client.summarize_calls == [], (
@@ -1820,12 +1816,10 @@ async def test_events_compact_on_non_native_session_is_204_noop(
     """
     Non-native sessions accept compact and 204 without side effects.
 
-    For in-process harnesses, explicit compaction is an AP-side
-    operation (``_run_compact_locked`` → ``compact_conversation_now``).
-    The Omnigent server forwards ``compact`` to ``/events`` for every harness
-    (it stays harness-agnostic), so the runner must accept the event
-    and 204 — never reach the slash-command injector. The 204 tells the
-    Omnigent server to run its own compaction.
+    The Omnigent server forwards ``compact`` to ``/events`` for every harness,
+    so the runner must accept the event and 204 — never reach the
+    slash-command injector. The server then returns a 400 to the client
+    (SDK harnesses control their own context; AP-side compaction is not available).
     """
     from omnigent.spec.types import ExecutorSpec
 

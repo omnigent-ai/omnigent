@@ -519,6 +519,11 @@ class MainActivity : AppCompatActivity() {
         serverUrl: String,
         newOrigin: String,
     ) {
+        // Cancel any in-flight login before pinning the new origin: the poll runs
+        // against the old server and its token must never land on the new origin's
+        // cookie store. cancel() also resets inFlight so the new server can start
+        // its own login immediately rather than waiting up to 5 minutes.
+        loginManager.cancel()
         removeBridge()
         pinnedOrigin = newOrigin
         pageLoaded = false

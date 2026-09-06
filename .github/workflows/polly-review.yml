@@ -235,7 +235,7 @@ jobs:
           # this dir's node_modules empty.
           CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
           mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.212
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
           node node_modules/@anthropic-ai/claude-code/install.cjs
           echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
@@ -398,13 +398,14 @@ jobs:
           """ if is_external else ""
 
           # The "Missing visual demonstration" report item + rule are only included
-          # for external contributors; otherwise the review has just the 4 standard
+          # for external contributors; otherwise the review has just the 5 standard
           # sections. Build the numbered list so the numbering stays contiguous
           # regardless of whether the visual item is present.
           standard_items = [
               "**Blocking issues** — correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.",
               "**Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.",
               "**Non-blocking notes** — design concerns or edge cases worth flagging (brief).",
+              "**Approach** — is there a materially simpler or more consistent way to reach the PR's stated goal, given existing patterns in the repo (config surfaces, variables, helpers, conventions)? Name the concrete alternative briefly, or say the approach is sound. Never blocking.",
               "**Summary** — one-paragraph overall assessment.",
           ]
           visual_item = [

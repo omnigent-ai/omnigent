@@ -365,15 +365,15 @@ def test_claude_native_picker_saves_model_while_host_asleep(
     _force_asleep_liveness(page, session_id)
     patch_bodies = _patch_session_as_claude_native(page, session_id, host_asleep=True)
 
-    page.goto(f"{base_url}/c/{session_id}")
-
-    # Wait for liveness to resolve to host_asleep (the composer's resume
-    # placeholder) so the gear assertions exercise the asleep state, not the
-    # initial not-yet-polled window.
-    composer = page.get_by_label("Message the agent")
-    expect(composer).to_have_attribute(
-        "placeholder", re.compile("resume the sandbox host"), timeout=15_000
-    )
+    # Wait for the /health poll that resolves liveness to host_asleep to land
+    # before the gear assertions, so they exercise the settled asleep state and
+    # not the initial not-yet-polled window. (The composer placeholder is no
+    # longer state-specific, so it can't be the signal.)
+    with page.expect_response(
+        lambda r: urlparse(r.url).path == "/health" and r.status == 200,
+        timeout=15_000,
+    ):
+        page.goto(f"{base_url}/c/{session_id}")
 
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_have_attribute("aria-disabled", "false")

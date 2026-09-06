@@ -9,6 +9,7 @@
 //   │  - gutter icon → add comment    │                  │
 //   └──────────────────────────────────┴──────────────────┘
 
+import { toast } from "sonner";
 import {
   lazy,
   Suspense,
@@ -35,6 +36,7 @@ import {
   EyeOffIcon,
   FileDiffIcon,
   Link2Icon,
+  ListIcon,
   Loader2Icon,
   MessageSquareTextIcon,
   MoreHorizontalIcon,
@@ -66,7 +68,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { fileContentToBlob, triggerBrowserDownload, useFileContent } from "@/hooks/useFileContent";
+import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import {
   type Comment,
@@ -89,6 +91,7 @@ import {
   MONACO_SPLIT_BREAKPOINT,
   type SaveStatus,
   detectLang,
+  isBinaryPath,
   isImageFile,
   isModelFile,
   isNotebookPath,
@@ -404,6 +407,13 @@ function FileViewerBody({
   // null = not yet measured (or zero, e.g. jsdom) — treat as "wide enough" so
   // the toggle shows by default and only hides once a real narrow width lands.
   const contentAreaRef = useRef<HTMLDivElement | null>(null);
+  // The viewer's outer element, used to scope Cmd+F to when focus is inside the
+  // file viewer (vs the chat/composer, which owns find-in-page). Callback ref so
+  // one handle serves both the framed <aside> and the frameless <div> root.
+  const viewerRootRef = useRef<HTMLElement | null>(null);
+  const setViewerRoot = useCallback((el: HTMLElement | null) => {
+    viewerRootRef.current = el;
+  }, []);
   const [contentWidth, setContentWidth] = useState<number | null>(null);
   // Tracks the in-progress comment textarea body. Used by MarkdownCommentPlugin
   // to decide whether to preserve the pending mark when the user clicks away.
@@ -416,11 +426,14 @@ function FileViewerBody({
   const [linkCopied, setLinkCopied] = useState(false);
   const linkCopiedTimerRef = useRef<number>(0);
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
+  // TOC panel state (for markdown preview)
+  const [tocOpen, setTocOpen] = useState(false);
   // Reset selection state whenever the file changes.
   useEffect(() => {
     setActiveSelection(null);
     setIsEditorDirty(false);
     setSaveStatus("idle");
+    setTocOpen(false);
   }, [path]);
   // Reset comments initialization when the viewer transitions from closed to open,
   // so the panel state is derived from the freshly-opened file's comments.
@@ -486,10 +499,8 @@ function FileViewerBody({
   );
 
   const downloadFile = useCallback(() => {
-    const data = fileQuery.data;
-    if (!data) return;
-    triggerBrowserDownload(fileContentToBlob(data), path.split("/").pop() ?? path);
-  }, [fileQuery.data, path]);
+    downloadWorkspaceFile(conversationId, path).catch(() => toast.error("Download failed"));
+  }, [conversationId, path]);
 
   // Pop the HTML artifact into its own browser tab. The artifact is rendered in
   // a sandboxed, opaque-origin iframe (see `openHtmlArtifactInNewTab`), so it
@@ -642,6 +653,9 @@ function FileViewerBody({
   // they have no meaningful source/diff/preview text representation, so diff is
   // suppressed and they always resolve to the (viewer-owning) source surface.
   const isModel = isModelFile(path, fileQuery.data?.content_type);
+  // Binary/base64 files render CodeViewer's "Preview not available" notice, not
+  // Monaco — mirrors CodeViewer's own base64/binary-path check.
+  const isBinary = fileQuery.data?.encoding === "base64" || isBinaryPath(path);
   // Show Δ button only when the file appears in the session's changed-files list.
   const isDiffAvailable =
     !isImage &&
@@ -695,6 +709,15 @@ function FileViewerBody({
     initialCommentIdRef.current ? path : null,
   );
 
+  // Switch a markdown file to the rich-text editor — the surface where text-
+  // selection commenting works. Used by the preview's "switch to edit mode"
+  // hint. Coming from preview/source there are no edits to guard, so it applies
+  // directly (mirrors the toolbar's switchTo for the non-editor case).
+  const handleRequestEditMode = useCallback(() => {
+    setDeepLinkBiasPath(null);
+    setPreviewableViewMode("editor");
+  }, []);
+
   // Persist the global view preferences so they survive a refresh. commentsOpen
   // is intentionally excluded — it's contextual (per-open), not a sticky
   // preference. Idempotent on mount (writes back the seeded values).
@@ -725,6 +748,75 @@ function FileViewerBody({
   const viewMode: "editor" | "preview" | "source" | "diff" =
     diffActive && isDiffAvailable ? "diff" : fileViewMode;
   const diffViewActive = viewMode === "diff";
+
+  // Cmd/Ctrl+F opens find-in-file on the Monaco-backed surfaces (code
+  // source/editor and the diff view). Those surfaces would otherwise rely on
+  // Monaco's own Cmd+F keybinding, which needs editor DOM focus and does not
+  // fire inside the managed (same-root embed) host — so cmd+f silently did
+  // nothing there. Driving `searchOpen` runs Monaco's find action imperatively
+  // instead, matching how the Shiki/markdown surfaces (handled by their own
+  // window listeners in CodeViewer) already open find. Gated to the Monaco
+  // surfaces so it never double-handles the CodeViewer-owned ones.
+  // The find toggle only reaches a Monaco surface: the diff view, or a non-diff
+  // file that CodeViewer renders in Monaco. Exclude the surfaces CodeViewer
+  // returns *before* the Monaco block — markdown (rich editor / its own find
+  // bar), previews, and the image/PDF/model/binary viewers — otherwise Cmd+F
+  // would swallow the browser's find-in-page with no find widget to show.
+  const isMonacoFindSurface =
+    diffViewActive ||
+    (lang !== "markdown" && viewMode !== "preview" && !isImage && !isPdf && !isModel && !isBinary);
+  // Cmd+F must open find-in-file only while the file viewer is the surface the
+  // user is working in. The viewer stays mounted beside the chat, so `open`
+  // alone can't tell them apart, and reading `document.activeElement` at
+  // keypress time is unreliable — clicking a non-focusable chat area drops focus
+  // to <body>, which reads the same as "nothing focused yet". Instead we track
+  // the last surface the user interacted with: seeded to the viewer (opening a
+  // file makes it active) and flipped by clicks / focus moves. When the user
+  // works in the chat/composer, Cmd+F falls through to the browser's find.
+  const viewerIsActiveSurfaceRef = useRef(true);
+  useEffect(() => {
+    // Opening the viewer (or switching files within it) makes it the active
+    // surface again. Keyed on `open` too, so reopening the same path after the
+    // user had clicked into the chat re-seeds the ref instead of staying stale.
+    if (open) viewerIsActiveSurfaceRef.current = true;
+  }, [open, path]);
+  useEffect(() => {
+    if (!open) return;
+    const track = (e: Event) => {
+      const root = viewerRootRef.current;
+      const target = e.target;
+      if (root !== null && target instanceof Node) {
+        viewerIsActiveSurfaceRef.current = root.contains(target);
+      }
+    };
+    window.addEventListener("mousedown", track, true);
+    window.addEventListener("focusin", track, true);
+    return () => {
+      window.removeEventListener("mousedown", track, true);
+      window.removeEventListener("focusin", track, true);
+    };
+  }, [open]);
+  useEffect(() => {
+    if (!open || !isMonacoFindSurface) return;
+    const handler = (e: KeyboardEvent) => {
+      if (!((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === "f")) return;
+      if (!viewerIsActiveSurfaceRef.current) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setSearchOpen(true);
+    };
+    // Capture phase so the embed claims Cmd+F ahead of the host page's own
+    // listeners and the browser's native find (which would search the whole
+    // host page, not the file).
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [open, isMonacoFindSurface, setSearchOpen]);
+
+  // Reset the toggle when find is closed from inside Monaco (Escape or the
+  // widget's ✕) so the next Cmd+F re-opens it instead of no-opping. Shared by
+  // the diff view; the non-diff CodeViewer resets its own copy internally.
+  const handleSearchHandled = useCallback(() => setSearchOpen(false), [setSearchOpen]);
+
   // Persist where the reader was in the content area (markdown source, plain
   // text). The view mode is part of the key because each mode renders a
   // different height, so sharing one offset across modes would drop the reader
@@ -921,6 +1013,16 @@ function FileViewerBody({
       onSelect: openHtmlInNewTab,
     });
   }
+  // Table of contents for markdown preview
+  if (lang === "markdown" && viewMode === "preview") {
+    toolbarActions.push({
+      key: "toc",
+      label: tocOpen ? "Hide table of contents" : "Show table of contents",
+      icon: <ListIcon className="size-4" />,
+      active: tocOpen,
+      onSelect: () => setTocOpen((prev) => !prev),
+    });
+  }
   // PDFs render through PdfViewer with text-layer comment anchors.
   toolbarActions.push({
     key: "comments",
@@ -973,9 +1075,7 @@ function FileViewerBody({
     settingsMenu.push({
       key: "download",
       label: "Download file",
-      tooltip: fileQuery.data.truncated
-        ? "Download (file was truncated — content may be incomplete)"
-        : "Download",
+      tooltip: "Download",
       icon: <DownloadIcon className="size-4" />,
       active: false,
       onSelect: downloadFile,
@@ -1432,6 +1532,8 @@ function FileViewerBody({
                   activeSelection={activeSelection}
                   onSetActiveSelection={handleSetActiveSelection}
                   pendingBodyRef={pendingBodyRef}
+                  searchOpen={searchOpen}
+                  onSearchHandled={handleSearchHandled}
                 />
               </Suspense>
             )
@@ -1452,6 +1554,9 @@ function FileViewerBody({
               setSearchOpen={setSearchOpen}
               searchInputRef={searchInputRef}
               viewMode={viewMode}
+              tocOpen={tocOpen}
+              onTocToggle={() => setTocOpen((prev) => !prev)}
+              onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
             />
           )}
         </div>
@@ -1554,6 +1659,7 @@ function FileViewerBody({
   if (frameless) {
     return (
       <div
+        ref={setViewerRoot}
         data-testid="file-viewer"
         className="flex flex-col flex-1 min-h-0 overflow-hidden bg-card"
       >
@@ -1564,6 +1670,7 @@ function FileViewerBody({
 
   return (
     <aside
+      ref={setViewerRoot}
       data-testid="file-viewer"
       style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(

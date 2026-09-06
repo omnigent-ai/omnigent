@@ -270,6 +270,52 @@ def test_codex_auth_without_credential_not_detected(clean_env, auth_json: str) -
     assert detect_providers() == []
 
 
+@pytest.mark.parametrize(
+    ("auth_json", "expected_mode"),
+    [
+        # apikey mode: only a baked-in OpenAI API key.
+        ('{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-codex-real"}', "apikey"),
+        # chatgpt mode: OAuth tokens.
+        (
+            '{"auth_mode": "chatgpt", "tokens": {"access_token": "at-real", '
+            '"refresh_token": "", "id_token": ""}}',
+            "chatgpt",
+        ),
+        # refresh-token-only still authenticates as the ChatGPT plan.
+        ('{"tokens": {"access_token": "", "refresh_token": "rt-real"}}', "chatgpt"),
+        # tokens win over a co-present API key (mirrors codex's own resolution).
+        (
+            '{"OPENAI_API_KEY": "sk-x", "tokens": {"access_token": "at-real"}}',
+            "chatgpt",
+        ),
+        # enterprise / external-token integration.
+        ('{"personal_access_token": "pat-real"}', "pat"),
+        # no usable credential at all.
+        ("{}", None),
+        ('{"OPENAI_API_KEY": ""}', None),
+        ("not json at all", None),
+    ],
+)
+def test_codex_auth_effective_mode(clean_env, auth_json: str, expected_mode: str | None) -> None:
+    """``codex_auth_effective_mode`` names the credential the login really uses.
+
+    This is what lets the provider listing say "API key login" instead of a
+    bare "subscription" — a drift that sent quota diagnoses at the wrong
+    credential. Failure means the mode discriminator no longer mirrors the
+    codex CLI's own ``auth_mode`` resolution.
+    """
+    cred_dir = clean_env / ".codex"
+    cred_dir.mkdir()
+    auth_path = cred_dir / "auth.json"
+    auth_path.write_text(auth_json, encoding="utf-8")
+    assert ambient.codex_auth_effective_mode(auth_path) == expected_mode
+
+
+def test_codex_auth_effective_mode_missing_file(clean_env) -> None:
+    """A missing ``auth.json`` yields no mode (no login to describe)."""
+    assert ambient.codex_auth_effective_mode(clean_env / ".codex" / "auth.json") is None
+
+
 def test_claude_macos_keychain_login_detected(clean_env, monkeypatch: pytest.MonkeyPatch) -> None:
     """On macOS with no creds file, a Keychain login (CLI status) is detected.
 

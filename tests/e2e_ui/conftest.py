@@ -756,63 +756,6 @@ def _write_codex_unknown_version_shim(directory: Path, codex_path: str) -> Path:
     return shim
 
 
-def _assert_service_worker_tombstone(build_output: Path) -> None:
-    """Fail if the built SPA ships anything but the tombstone service worker.
-
-    The PWA is retired: ``sw.js`` exists only to unregister workers still
-    installed in browsers, and the manifest/version sentinel must be gone. The
-    dangerous direction matters most — a worker that intercepted requests could
-    serve a stale shell and white-screen users after a deploy, and an unscoped
-    cache purge could delete Cache Storage belonging to a future feature.
-
-    Delete this guard together with ``sw-src/sw.js`` in 0.11.0.
-    """
-    if not (build_output / "index.html").is_file():
-        pytest.fail(f"SPA build is missing index.html at {build_output}")
-    if not (build_output / "sw.js").is_file():
-        pytest.fail(
-            f"SPA build is missing the tombstone sw.js at {build_output} — without it, "
-            "service workers already registered in browsers are never unregistered"
-        )
-    for name in ("manifest.webmanifest", "version.json"):
-        if (build_output / name).is_file():
-            pytest.fail(f"SPA build still emits the retired PWA asset {name}")
-    # Strip line comments first so prose that mentions these tokens can neither
-    # fake nor mask a regression.
-    sw = (build_output / "sw.js").read_text(encoding="utf-8")
-    sw_code = re.sub(r"//[^\n]*", "", sw)
-    if "registration.unregister" not in sw_code:
-        pytest.fail(
-            "sw.js does not call registration.unregister() — it must remove itself, "
-            "or the retired worker stays registered in users' browsers"
-        )
-    if "__BUILD_VERSION__" in sw:
-        pytest.fail(
-            "sw.js still carries the __BUILD_VERSION__ token but nothing substitutes "
-            "it any more; the tombstone is byte-stable and needs no fingerprint"
-        )
-    responders = sw_code.count("respondWith")
-    if responders:
-        pytest.fail(
-            f"sw.js has {responders} respondWith() call(s); the tombstone must intercept "
-            "nothing — any responder risks serving a stale shell after a deploy"
-        )
-    # The purge must match the retired worker's exact cache-name shape
-    # (`omnigent-pwa-<8 lowercase hex>`), not a bare prefix: a tombstone lingering
-    # in some browser must not be able to delete a future feature's Cache Storage
-    # even if that feature reuses the prefix. Checked by marker rather than
-    # structurally — the pattern is held in a const, so a same-line regex would
-    # only be asserting the current formatting.
-    if "caches.delete" in sw_code and not (
-        r"/^omnigent-pwa-[0-9a-f]{8}$/" in sw_code and ".filter(" in sw_code
-    ):
-        pytest.fail(
-            "sw.js deletes caches without filtering on the retired cache-name shape "
-            "/^omnigent-pwa-[0-9a-f]{8}$/ — the purge must not touch caches it does "
-            "not own, and a bare prefix match is too broad"
-        )
-
-
 @pytest.fixture(scope="session")
 def built_spa(request: pytest.FixtureRequest) -> None:
     """
@@ -832,7 +775,6 @@ def built_spa(request: pytest.FixtureRequest) -> None:
     if request.config.getoption("--ui-base-url"):
         return
     if request.config.getoption("--ui-skip-build"):
-        _assert_service_worker_tombstone(_BUILD_OUTPUT)
         return
 
     lock_path = _WEB_DIR / ".build.lock"
@@ -858,8 +800,6 @@ def built_spa(request: pytest.FixtureRequest) -> None:
             stdin=subprocess.DEVNULL,
             env=env,
         )
-
-    _assert_service_worker_tombstone(_BUILD_OUTPUT)
 
 
 def _spawn_runner_against_external_server(

@@ -1,8 +1,11 @@
-"""Detect Google Antigravity (``agy``) OAuth credentials for ``antigravity-native``.
+"""Detect Google Antigravity (``agy``) credentials for ``antigravity-native``.
 
 The ``agy`` CLI authenticates via a browser OAuth flow on first interactive run
 — it has no ``agy login`` / ``agy auth status`` subcommand. *Where* and *how* it
 persists the resulting token is **platform-specific**:
+
+As of agy 1.1.13, it can instead use a non-empty ambient ``GEMINI_API_KEY``
+with ``modelProvider: "gemini"`` in its settings.
 
 - macOS through agy 1.0.10 writes ``~/.gemini/oauth_creds.json`` — a flat
   OAuth2 object (verified live against agy 1.0.10)::
@@ -78,6 +81,7 @@ GEMINI_OAUTH_CRED_PATHS: tuple[Path, ...] = (DEFAULT_GEMINI_OAUTH_CREDS, LINUX_G
 # stores them flat (macOS) or nested under ``token`` (Linux); detection looks in
 # both places.
 _OAUTH_CRED_FIELDS: tuple[str, ...] = ("access_token", "refresh_token")
+_GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 
 
 def _file_carries_token(path: Path) -> bool:
@@ -117,9 +121,10 @@ def _file_carries_token(path: Path) -> bool:
 
 
 def gemini_auth_has_credential(creds_path: Path | None = None) -> bool:
-    """Return whether ``agy`` has a usable OAuth login on this machine.
+    """Return whether ``agy`` has a usable API key or OAuth login.
 
-    With *creds_path* unset, checks every known platform location
+    First accepts a non-empty ambient ``GEMINI_API_KEY``. With *creds_path*
+    unset, checks every known platform location
     (:data:`GEMINI_OAUTH_CRED_PATHS`) and returns ``True`` if any carries a
     usable token — so a logged-in user is recognized on both macOS
     (``oauth_creds.json``) and Linux
@@ -140,13 +145,13 @@ def gemini_auth_has_credential(creds_path: Path | None = None) -> bool:
 
     :param creds_path: A specific credential file to check; ``None`` checks all
         of :data:`GEMINI_OAUTH_CRED_PATHS`, then the macOS CLI fallback.
-    :returns: ``True`` when a usable Gemini credential is present — a token file
-        on any platform, or a Keychain credential seen through the macOS CLI
-        fallback. ``False`` when every checked file is missing, unreadable,
-        non-UTF-8, not JSON, not an object, or token-less, and the fallback
-        either does not apply (non-macOS, or an explicit *creds_path*) or
-        reports no login.
+    :returns: ``True`` when a usable Gemini credential is present — an ambient
+        API key, a token file on any platform, or a Keychain credential seen
+        through the macOS CLI fallback. ``False`` when none is available.
     """
+    api_key = os.environ.get(_GEMINI_API_KEY_ENV)
+    if api_key is not None and api_key.strip():
+        return True
     paths = (creds_path,) if creds_path is not None else GEMINI_OAUTH_CRED_PATHS
     if any(_file_carries_token(path) for path in paths):
         return True
@@ -163,17 +168,18 @@ def gemini_auth_has_credential(creds_path: Path | None = None) -> bool:
 
 
 def gemini_login_detected() -> bool:
-    """Return whether a usable ``agy`` OAuth credential is present on this machine.
+    """Return whether a usable ``agy`` credential is present on this machine.
 
     Thin wrapper over :func:`gemini_auth_has_credential` across all known
     platform locations (:data:`GEMINI_OAUTH_CRED_PATHS`). Used by the readiness
-    layer to check whether the ``antigravity-native`` harness has a Google
-    subscription credential. This is a hard launch gate, not a hint — a wrong
+    layer to check whether the ``antigravity-native`` harness has a Gemini API
+    key or Google subscription credential. This is a hard launch gate — a wrong
     ``True`` lets a runner spawn that dies on its first turn — so the signal has
     to prove a credential rather than merely suggest one.
 
-    :returns: ``True`` when a token file (macOS ``~/.gemini/oauth_creds.json``,
-        Linux ``~/.gemini/antigravity-cli/antigravity-oauth-token``) carries a
+    :returns: ``True`` when ``GEMINI_API_KEY`` is non-empty, a token file
+        (macOS ``~/.gemini/oauth_creds.json``, Linux
+        ``~/.gemini/antigravity-cli/antigravity-oauth-token``) carries a
         usable credential, or — on macOS only, where agy 1.1.7+ stores OAuth in
         the Keychain — ``agy models`` reports a signed-in CLI; ``False``
         otherwise.

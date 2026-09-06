@@ -16,6 +16,7 @@ import contextlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -31,6 +32,27 @@ from omnigent.terminals.control_bridge import (
 )
 
 _HAS_TMUX = shutil.which("tmux") is not None
+
+
+def _tmux_supports_bracket_paste_flag() -> bool:
+    """tmux exposes ``#{bracket_paste_flag}`` only since 3.7."""
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        return False
+    try:
+        out = subprocess.run(
+            [tmux, "-V"], capture_output=True, text=True, check=True, timeout=5
+        ).stdout.strip()
+        # "tmux 3.7b" / "tmux next-3.7" — take the trailing version token and
+        # strip any suffix letters.
+        version = out.split()[-1].removeprefix("next-")
+        major, minor = version.rstrip("abcdefghijklmnopqrstuvwxyz").split(".")[:2]
+        return (int(major), int(minor)) >= (3, 7)
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return False
+
+
+_HAS_TMUX_BRACKET_PASTE_FLAG = _tmux_supports_bracket_paste_flag()
 
 
 def test_unescape_control_output_round_trips_control_bytes() -> None:
@@ -602,6 +624,59 @@ async def test_seed_replays_alt_screen_and_mouse_modes() -> None:
         # Modes the program never set stay unset.
         assert b"\x1b[?1002h" not in seed
         assert b"\x1b[?1000h" not in seed
+    finally:
+        await _kill_tmux(sock)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_seed_rejoins_soft_wrapped_lines() -> None:
+    """A pane line wrapped across rows seeds as one logical line.
+
+    ``capture-pane`` without ``-J`` emits one entry per screen row, so a long
+    line would seed into xterm as hard lines and copying it back out would
+    insert a newline at each wrap point (xterm only rejoins rows it flagged
+    as wrapped itself).
+    """
+    from omnigent.terminals.control_bridge import _run_tmux_capture
+
+    # 150 chars in an 80-col pane wraps across two rows.
+    sock, target = await _new_private_tmux(
+        'python3 -c \'import sys,time; sys.stdout.write("x" * 150); '
+        "sys.stdout.flush(); time.sleep(30)'"
+    )
+    await asyncio.sleep(0.5)
+    try:
+        seed = await _run_tmux_capture(str(sock), target)
+        assert seed is not None
+        assert b"x" * 150 in seed, "soft-wrapped line was not rejoined in the seed"
+    finally:
+        await _kill_tmux(sock)
+
+
+@pytest.mark.skipif(
+    not _HAS_TMUX_BRACKET_PASTE_FLAG,
+    reason="tmux #{bracket_paste_flag} requires tmux >= 3.7",
+)
+@pytest.mark.asyncio
+async def test_seed_replays_bracketed_paste_mode() -> None:
+    """The seed replays bracketed paste when the pane program enabled it.
+
+    A shell/TUI that enabled bracketed paste (``?2004h``) BEFORE this client
+    attached would otherwise leave the browser xterm unaware, so a multi-line
+    paste arrives as raw newlines and readline executes each line on arrival.
+    """
+    from omnigent.terminals.control_bridge import _run_tmux_capture
+
+    sock, target = await _new_private_tmux(
+        "python3 -c 'import sys,time; "
+        'sys.stdout.write("\\x1b[?2004h"); sys.stdout.flush(); time.sleep(30)\''
+    )
+    await asyncio.sleep(0.5)
+    try:
+        seed = await _run_tmux_capture(str(sock), target)
+        assert seed is not None
+        assert b"\x1b[?2004h" in seed, "bracketed paste mode not replayed in seed"
     finally:
         await _kill_tmux(sock)
 

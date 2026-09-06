@@ -26,6 +26,7 @@ from omnigent._native_post_delivery import (
     replay_dead_letters,
 )
 from omnigent.claude_native_bridge import url_component
+from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.codex_native_app_server import (
     CodexAppServerClient,
     CodexMessage,
@@ -408,6 +409,8 @@ class _CodexForwarderState:
     posted_collaboration_mode: str | None = None
     terminal_launch_args: list[str] | None = None
     posted_terminal_launch_args: list[str] | None = None
+    approval_preset: str | None = None
+    posted_approval_preset: str | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
@@ -880,10 +883,17 @@ class _CodexForwarderState:
             self.collaboration_mode = mode
 
     def _note_approval_mode_fields(self, payload: _JsonObject) -> None:
-        """Record Codex approval/sandbox settings as launch args."""
+        """Record Codex approval/sandbox settings as launch args + a runtime preset."""
         args = _codex_terminal_launch_args_from_settings(payload)
         if args is not None:
             self.terminal_launch_args = args
+        # Also resolve the /permissions preset for the web read-back label. A
+        # payload that maps to no preset (e.g. a custom permission profile) has no
+        # preset value to show, so the last-known one stays put — the picker keeps
+        # its prior value rather than blanking. Known limitation for custom profiles.
+        preset = codex_permission_preset_from_thread_settings(payload)
+        if preset is not None:
+            self.approval_preset = preset
 
 
 @dataclass(frozen=True)
@@ -2014,6 +2024,12 @@ async def _maybe_rotate_session_on_thread_started(
     # its own Omnigent child session by ``_handle_event``.
     if _thread_started_is_subagent(event):
         return False
+    # Codex CLI 0.150.1 emits a second ``thread/started`` mid-turn for an
+    # internal system/housekeeping thread (``ephemeral=true``, ``path=null``).
+    # That thread is never persistable and cannot host goals; rotating onto it
+    # strands the real turn's output as stale. Ignore all ephemeral threads.
+    if _thread_started_is_ephemeral(event):
+        return False
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()
     old_usage_coalescer = target.usage_coalescer
@@ -2134,6 +2150,9 @@ async def _create_thread_replacement_session(
                 if state is not None
                 else str(codex_home_for_bridge_dir(bridge_dir))
             ),
+            # Carry the workspace across the rotation, or the executor
+            # falls back to the harness process's own cwd for new turns.
+            cwd=state.cwd if state is not None else None,
         ),
     )
 
@@ -3020,19 +3039,35 @@ async def _sync_codex_approval_mode_change(
     session_id: str,
     forwarder_state: _CodexForwarderState,
 ) -> None:
-    """Mirror Codex ``/permissions`` changes into session metadata."""
+    """Mirror Codex ``/permissions`` changes into session metadata.
+
+    Posts two things the server persists differently: ``terminal_launch_args``
+    (the create/fork/resume vocabulary) and ``approval_mode`` (the runtime
+    ``/permissions`` preset that drives the web read-back label + live picker).
+    """
     args = forwarder_state.terminal_launch_args
-    if args is None or args == forwarder_state.posted_terminal_launch_args:
+    preset = forwarder_state.approval_preset
+    args_changed = args is not None and args != forwarder_state.posted_terminal_launch_args
+    preset_changed = preset is not None and preset != forwarder_state.posted_approval_preset
+    if not args_changed and not preset_changed:
         return
+    data: _JsonObject = {}
+    if args is not None:
+        data["terminal_launch_args"] = args
+    if preset is not None:
+        data["approval_mode"] = preset
     response = await _post_session_event(
         client,
         session_id,
         event_type="external_codex_approval_mode_change",
-        data={"terminal_launch_args": args},
+        data=data,
     )
     _log_failed_session_event_post("external_codex_approval_mode_change", response)
     if response is not None and response.status_code < 400:
-        forwarder_state.posted_terminal_launch_args = list(args)
+        if args is not None:
+            forwarder_state.posted_terminal_launch_args = list(args)
+        if preset is not None:
+            forwarder_state.posted_approval_preset = preset
 
 
 async def _maybe_handle_turn_event(
@@ -3800,7 +3835,7 @@ async def _codex_elicitation_hook_result(
     :param client: HTTP client for Omnigent hook posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param event: Codex JSON-RPC request envelope.
-    :returns: Parsed JSON-RPC result payload, or ``None``.
+    :returns: Parsed JSON-RPC result, a safe command rejection, or ``None``.
     """
     method = event.get("method")
     request_id = event.get("id")
@@ -3818,6 +3853,10 @@ async def _codex_elicitation_hook_result(
             response.status_code,
             response.text[:512],
         )
+        # A malformed optional execpolicy decision must not leave Codex's
+        # command request unanswered and strand the active turn.
+        if method == _CODEX_COMMAND_EXECUTION_REQUEST_APPROVAL_METHOD:
+            return {"decision": "decline"}
         return None
     if not response.content:
         _logger.info(
@@ -6973,10 +7012,33 @@ def _thread_started_is_subagent(event: CodexMessage) -> bool:
     return _thread_spawn_source(thread) is not None
 
 
+def _thread_started_is_ephemeral(event: CodexMessage) -> bool:
+    """
+    Return whether a ``thread/started`` event announces an ephemeral thread.
+
+    Codex CLI 0.150.1 emits a second ``thread/started`` mid-turn for an
+    internal system/housekeeping thread marked ``ephemeral=true``. These
+    threads cannot host goals or persist history; rotating onto one strands
+    the real turn's output and breaks goal reads.
+
+    :param event: Codex app-server notification envelope.
+    :returns: ``True`` when the started thread carries ``ephemeral=true``.
+    """
+    if event.get("method") != "thread/started":
+        return False
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return False
+    thread = params.get("thread")
+    if not isinstance(thread, dict):
+        return False
+    return thread.get("ephemeral") is True
+
+
 async def wait_for_thread_started(
     client: CodexAppServerClient,
     *,
-    timeout: float = _THREAD_START_TIMEOUT_SECONDS,
+    timeout: float | None = _THREAD_START_TIMEOUT_SECONDS,
 ) -> str:
     """
     Wait for a freshly launched Codex TUI to create its app-server thread.
@@ -6992,7 +7054,10 @@ async def wait_for_thread_started(
 
     :param client: A connected :class:`CodexAppServerClient` listening for
         app-server notifications.
-    :param timeout: Seconds to wait for ``thread/started`` before failing.
+    :param timeout: Seconds to wait for ``thread/started`` before failing,
+        or ``None`` to wait without a deadline (used when startup failure
+        was already recorded up front and the wait only serves a possible
+        interactive sign-in).
     :returns: The Codex thread id, e.g.
         ``"019e8720-98d7-7b23-ac0a-bfb0eb02e0c9"``.
     :raises TimeoutError: If no ``thread/started`` arrives within *timeout*.

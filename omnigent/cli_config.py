@@ -37,6 +37,7 @@ from omnigent.onboarding.ucode_setup import (
     find_ucode_command,
     model_gateway_workspace_urls,
 )
+from omnigent.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
@@ -149,6 +150,35 @@ def _node_dependency_problem() -> str | None:
     version = _node_version(node)
     detected = f" (detected {version})" if version else ""
     return f"Node.js is too old{detected} — Claude, Codex, and Pi need {_NODE_MIN_VERSION_HINT}."
+
+
+def _tmux_dependency_problem() -> str | None:
+    """
+    Return a one-line problem if tmux is missing or too old, else ``None``.
+
+    The native tmux-backed harnesses (``omnigent claude`` / ``codex`` and
+    every managed terminal) need a tmux at or above
+    :data:`omnigent.tmux_compat.MIN_TMUX_VERSION`. Managed terminals enable
+    ``allow-passthrough``, which tmux added in 3.3. Parses ``tmux -V`` (e.g.
+    ``"tmux 3.3a"`` — suffix letters are ignored) and compares the
+    ``(major, minor)`` pair against the floor.
+
+    :returns: A human-readable description suitable for a warning bullet,
+        or ``None`` when tmux is present and new enough. A flaky/timed-out
+        probe or unparsable version also yields ``None`` — setup should
+        not block on it.
+    """
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        return "tmux not found — native Claude/Codex need tmux (macOS: `brew install tmux`)."
+    version = tmux_version(tmux)
+    if version is None or version >= MIN_TMUX_VERSION:
+        return None
+    detected = f"{version[0]}.{version[1]}"
+    return (
+        f"tmux is too old (detected tmux {detected}) — native Claude/Codex need "
+        f"tmux {MIN_TMUX_VERSION_HINT} or newer (macOS: `brew upgrade tmux`)."
+    )
 
 
 @contextlib.contextmanager
@@ -317,10 +347,9 @@ def _warn_missing_harness_dependencies() -> None:
     node_problem = _node_dependency_problem()
     if node_problem is not None:
         problems.append(node_problem)
-    if shutil.which("tmux") is None:
-        problems.append(
-            "tmux not found — native Claude/Codex need tmux (macOS: `brew install tmux`)."
-        )
+    tmux_problem = _tmux_dependency_problem()
+    if tmux_problem is not None:
+        problems.append(tmux_problem)
     if not problems:
         return
     ui.warn("Some harnesses need external tools:")
@@ -766,54 +795,54 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         )
 
     elif kind == "subscription":
-        cli_name = chosen.cli  # preset by the flat option (claude / codex)
+        cli_name = chosen.cli  # preset by the flat option (claude / codex / pi)
         if cli_name is None:
             raise click.ClickException("internal: subscription option missing a cli login")
-        from omnigent.onboarding.harness_install import harness_install_spec, harness_login
+        from omnigent.onboarding.configure_models import cli_display_name
 
-        login_family = {agent: fam for fam, agent in _FAMILY_UCODE_AGENT.items()}.get(cli_name)
-        if login_family is None:
-            raise click.ClickException(f"internal: no login family for cli {cli_name!r}")
-        spec = harness_install_spec(login_family)
-        disp = spec.display if spec is not None else cli_name
-        # A harness has at most ONE subscription — the CLI's own login. If one
-        # is already configured for this CLI (under any name, including an
-        # ambient login adopted as e.g. ``claude``), adding another just
-        # duplicates it — the ``claude`` + ``claude-subscription`` bug. Offer to
-        # replace the existing one; declining aborts before we touch the login.
+        # A harness has at most ONE subscription. If one is already configured
+        # for this CLI (under any name), offer to replace it — declining aborts
+        # before we touch any login.
         existing_subs = [
             n
             for n, e in load_providers(_load_global_config()).items()
             if e.kind == SUBSCRIPTION_KIND and e.cli == cli_name
         ]
         if existing_subs:
-            brand = _CLI_LOGIN_BRAND.get(cli_name, cli_name)
             replace = select(
-                f"A {brand} subscription is already configured. Replace it?",
+                f"A {cli_display_name(cli_name)} subscription is already configured. Replace it?",
                 ["Replace it", "Keep the current one"],
                 default=0,
                 clear_on_exit=True,
             )
             if replace != 0:  # "Keep the current one" or Esc — abort the add
                 return None
-        # Configure is the single place to sign in: drive the harness's own
-        # login (a no-op if already logged in). Only record the subscription
-        # once the CLI is actually authenticated — otherwise we'd persist a
-        # phantom subscription that strands the user at the harness's own login
-        # screen at run time (the exact bug this whole flow fixes).
-        console.print(f"  [dim]Signing in to {disp} (its login will open)…[/dim]")
-        if not harness_login(login_family):
-            return f"✗ {disp} login not completed — subscription not added"
-        # Login succeeded — drop the existing subscription(s) for this CLI so the
-        # canonical entry is the only one left (clearing the old default lets the
-        # new entry re-claim the family default below). Done AFTER login so a
-        # failed login leaves the existing subscription intact.
+        # CLIs listed in _CLI_LOGIN_BRAND (claude / codex) require a login step.
+        # CLIs not listed (pi) manage their own auth — no login step needed.
+        if cli_name in _CLI_LOGIN_BRAND:
+            from omnigent.onboarding.harness_install import harness_install_spec, harness_login
+
+            login_family = {agent: fam for fam, agent in _FAMILY_UCODE_AGENT.items()}.get(cli_name)
+            if login_family is None:
+                raise click.ClickException(f"internal: no login family for cli {cli_name!r}")
+            spec = harness_install_spec(login_family)
+            disp = spec.display if spec is not None else cli_name
+            # Configure is the single place to sign in: drive the harness's own
+            # login (a no-op if already logged in). Only record the subscription
+            # once the CLI is actually authenticated — otherwise we'd persist a
+            # phantom subscription that strands the user at the harness's own login
+            # screen at run time (the exact bug this whole flow fixes).
+            console.print(f"  [dim]Signing in to {disp} (its login will open)…[/dim]")
+            if not harness_login(login_family):
+                return f"✗ {disp} login not completed — subscription not added"
+        # Drop the existing subscription(s) now that we know we're proceeding.
+        # Done after any login so a failed login leaves the existing entry intact.
         if existing_subs:
             block = _load_global_config().get("providers")
             if isinstance(block, dict):
                 remaining = {k: v for k, v in block.items() if k not in existing_subs}
-                _save_global_config({"providers": remaining})  # wholesale replace
-        # Subscription name is derived from the CLI login — no prompt.
+                _save_global_config({"providers": remaining})
+        # Subscription name is derived from the CLI — no prompt.
         name = f"{cli_name}-subscription"
         entry = build_subscription_provider_entry(cli_name)
 
@@ -1318,6 +1347,8 @@ def _credential_label(name: str, entry: ProviderEntry) -> str:
         gateway = _claude_managed_gateway_label()
         if gateway is not None:
             return gateway
+    if entry.kind == SUBSCRIPTION_KIND and entry.cli == "pi":
+        return "Pi original auth"
     return credential_label(
         entry.kind, name, profile=entry.profile, display_name=entry.display_name
     )
@@ -3574,7 +3605,7 @@ def _run_configure_harnesses_interactive() -> None:
     _KIRO = "\x00kiro"
     # Sentinel marking the Kimi Code row — like Cursor/Antigravity/Qwen it is
     # not a provider family. Auth lives entirely in the kimi CLI (``kimi login``
-    # / ``kimi provider add`` → ~/.kimi/config.toml), so it dispatches to its
+    # / ``kimi provider add`` → ~/.kimi-code/config.toml), so it dispatches to its
     # own drill-in rather than ``_manage_harness_providers``.
     _KIMI = "\x00kimi"
     # Sentinels for the generic-ACP rows. Each configured agent gets its own row

@@ -109,10 +109,10 @@ runs:
       run: uv run playwright install --with-deps chromium
 
     - name: Build HEAD SPA
-      # Always build the HEAD SPA so the built_spa fixture's tombstone assertion
-      # passes. In Config B OMNIGENT_WEB_UI_DIST is then set to the old bundle,
-      # so the server serves that instead — but the HEAD build must exist for the
-      # fixture's structural check.
+      # Tests run with --ui-skip-build, so the built_spa fixture never builds
+      # and nothing else produces the SPA the server serves. In Config B
+      # OMNIGENT_WEB_UI_DIST is then set to the old bundle, so the server serves
+      # that instead — but the HEAD build must still exist in its static mount.
       shell: bash
       env:
         NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
@@ -173,9 +173,9 @@ runs:
           echo "Could not locate built SPA under $src" >&2; exit 1
         fi
         # Set OMNIGENT_WEB_UI_DIST so the HEAD server serves this old bundle.
-        # The HEAD SPA is still built above (built_spa fixture needs it for the
-        # tombstone assertion); the server uses OMNIGENT_WEB_UI_DIST to override
-        # which bundle it actually mounts.
+        # The HEAD SPA is still built above (the fixture never builds under
+        # --ui-skip-build, and the static mount must exist); the server uses
+        # OMNIGENT_WEB_UI_DIST to override which bundle it actually mounts.
         echo "OMNIGENT_WEB_UI_DIST=$built" >> "$GITHUB_ENV"
 
     - name: Run UI compat tests

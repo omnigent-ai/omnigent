@@ -1,7 +1,7 @@
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { useRef } from "react";
+import { useLayoutEffect, useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type TerminalInfo, useTerminals } from "@/hooks/useTerminals";
 import { MainTerminalView } from "./MainTerminalView";
@@ -90,6 +90,7 @@ const BASH_SHELL: TerminalInfo = {
 function makeCtx(
   isNativeWrapper: boolean,
   setView: (view: "chat" | "terminal") => void = () => {},
+  overrides: Partial<TerminalFirstContextValue> = {},
 ): TerminalFirstContextValue {
   return {
     isClaudeNative: isNativeWrapper,
@@ -101,40 +102,50 @@ function makeCtx(
     setView,
     terminalsAvailable: true,
     terminalStartingUp: false,
+    ...overrides,
   } as TerminalFirstContextValue;
 }
 
-function renderView({
+function viewTree({
   terminals,
   isNativeWrapper = false,
   initialTerminalKey = null,
+  visible = true,
   readOnly = false,
   conversationId = "conv_sdk",
   runnerOnline,
   onResume,
   setView,
+  terminalStartingUp = false,
 }: {
   terminals: TerminalInfo[];
   isNativeWrapper?: boolean;
   initialTerminalKey?: string | null;
+  visible?: boolean;
   readOnly?: boolean;
   conversationId?: string;
   runnerOnline?: boolean;
   onResume?: () => void | Promise<void>;
   setView?: (view: "chat" | "terminal") => void;
+  terminalStartingUp?: boolean;
 }) {
   useTerminalsMock.mockReturnValue({ terminals, isLoading: false, error: null });
-  return render(
-    <TerminalFirstContextProvider value={makeCtx(isNativeWrapper, setView)}>
+  return (
+    <TerminalFirstContextProvider value={makeCtx(isNativeWrapper, setView, { terminalStartingUp })}>
       <MainTerminalView
         conversationId={conversationId}
         initialTerminalKey={initialTerminalKey}
+        visible={visible}
         readOnly={readOnly}
         runnerOnline={runnerOnline}
         onResume={onResume}
       />
-    </TerminalFirstContextProvider>,
+    </TerminalFirstContextProvider>
   );
+}
+
+function renderView(args: Parameters<typeof viewTree>[0]) {
+  return render(viewTree(args));
 }
 
 beforeEach(() => {
@@ -144,11 +155,12 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("MainTerminalView — terminal-first SDK sessions", () => {
-  it("renders the REPL chrome-free: shells and the + stay out of the pill view", () => {
+  it("renders the REPL chrome-free: shells and the + stay out of the pill view", async () => {
     renderView({ terminals: [REPL_TERMINAL, BASH_SHELL] });
 
-    // The agent's terminal fills the pane.
-    expect(screen.getByTestId("terminal-view")).toHaveAttribute(
+    // The agent's terminal fills the pane. findByTestId waits for the lazy
+    // TerminalView chunk to resolve through its Suspense boundary.
+    expect(await screen.findByTestId("terminal-view")).toHaveAttribute(
       "data-terminal-id",
       "terminal_tui_main",
     );
@@ -240,6 +252,87 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
   });
 });
 
+describe("MainTerminalView — terminal startup in progress", () => {
+  it("shows a passive loading status, never Resume, while a fresh session initializes", () => {
+    // The reported regression: a fresh terminal-first session with no PTY
+    // yet must render the passive startup state, never the actionable
+    // stopped-session UI — even when the poll reports the runner down.
+    const onResume = vi.fn().mockResolvedValue(undefined);
+    renderView({ terminals: [], runnerOnline: false, onResume, terminalStartingUp: true });
+
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent("Starting up…");
+    expect(screen.queryByText("The harness is not running.")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    expect(onResume).not.toHaveBeenCalled();
+  });
+
+  it("keeps a genuinely stopped session resumable once startup has settled", () => {
+    // Guards the stopped-session behavior: an idle stopped session (not
+    // starting) keeps the Resume action for the same empty inventory.
+    const onResume = vi.fn().mockResolvedValue(undefined);
+    renderView({ terminals: [], runnerOnline: false, onResume, terminalStartingUp: false });
+
+    expect(screen.getByText("The harness is not running.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("replaces the loading state with the terminal once the PTY appears", () => {
+    const { rerender } = renderView({ terminals: [], terminalStartingUp: true });
+    expect(screen.getByRole("status")).toHaveTextContent("Starting up…");
+
+    rerender(viewTree({ terminals: [REPL_TERMINAL], terminalStartingUp: false }));
+
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute(
+      "data-terminal-id",
+      "terminal_tui_main",
+    );
+  });
+
+  it("renders the arrived PTY in the same commit — no stopped/empty flash", () => {
+    // activeKey normalizes in a passive effect one commit after the PTY
+    // lands; a layout-effect probe captures each commit's DOM before it
+    // runs — the transient frame must be the terminal, never stopped/empty.
+    const commits: string[] = [];
+    function CommitProbe() {
+      useLayoutEffect(() => {
+        commits.push(
+          document.querySelector('[data-testid="main-terminal-view"]')?.textContent ?? "",
+        );
+      });
+      return null;
+    }
+    const onResume = vi.fn().mockResolvedValue(undefined);
+    const tree = (terminalStartingUp: boolean) => (
+      <TerminalFirstContextProvider value={makeCtx(false, () => {}, { terminalStartingUp })}>
+        <MainTerminalView conversationId="conv_sdk" runnerOnline={false} onResume={onResume} />
+        <CommitProbe />
+      </TerminalFirstContextProvider>
+    );
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+    const { rerender } = render(tree(true));
+    expect(screen.getByRole("status")).toHaveTextContent("Starting up…");
+
+    useTerminalsMock.mockReturnValue({
+      terminals: [REPL_TERMINAL],
+      isLoading: false,
+      error: null,
+    });
+    rerender(tree(false));
+
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute(
+      "data-terminal-id",
+      "terminal_tui_main",
+    );
+    expect(commits.some((text) => text.includes("The harness is not running."))).toBe(false);
+    expect(commits.some((text) => text.includes("Agent terminal unavailable."))).toBe(false);
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    expect(onResume).not.toHaveBeenCalled();
+  });
+});
+
 describe("MainTerminalView — native wrapper sessions", () => {
   it("renders the vendor pane chrome-free, same as the SDK REPL", () => {
     const claudePane: TerminalInfo = {
@@ -326,7 +419,7 @@ describe("MainTerminalView — native wrapper sessions", () => {
 });
 
 describe("MainTerminalView — persistent hidden mount", () => {
-  it("keeps the terminal mounted (same instance) across a hide/show flip", () => {
+  it("toggles inert without remounting the terminal across a hide/show flip", () => {
     // ChatPage keeps this surface mounted as a hidden overlay while the
     // user is in chat. A new data-instance after the round-trip means
     // the flip tore down the xterm + WS it exists to preserve.
@@ -334,6 +427,7 @@ describe("MainTerminalView — persistent hidden mount", () => {
     const view = screen.getByTestId("terminal-view");
     const instance = view.getAttribute("data-instance");
     expect(screen.getByTestId("main-terminal-view")).toHaveAttribute("data-visible", "true");
+    expect(screen.getByTestId("main-terminal-view")).not.toHaveAttribute("inert");
 
     rerender(
       <TerminalFirstContextProvider value={makeCtx(false)}>
@@ -346,6 +440,7 @@ describe("MainTerminalView — persistent hidden mount", () => {
       </TerminalFirstContextProvider>,
     );
     expect(screen.getByTestId("main-terminal-view")).toHaveAttribute("data-visible", "false");
+    expect(screen.getByTestId("main-terminal-view")).toHaveAttribute("inert", "");
     expect(screen.getByTestId("terminal-view").getAttribute("data-instance")).toBe(instance);
 
     rerender(
@@ -358,7 +453,17 @@ describe("MainTerminalView — persistent hidden mount", () => {
         />
       </TerminalFirstContextProvider>,
     );
+    expect(screen.getByTestId("main-terminal-view")).toHaveAttribute("data-visible", "true");
+    expect(screen.getByTestId("main-terminal-view")).not.toHaveAttribute("inert");
     expect(screen.getByTestId("terminal-view").getAttribute("data-instance")).toBe(instance);
+  });
+
+  it("makes an initially hidden pre-warmed terminal inert on mount", () => {
+    renderView({ terminals: [REPL_TERMINAL], visible: false });
+
+    expect(screen.getByTestId("main-terminal-view")).toHaveAttribute("data-visible", "false");
+    expect(screen.getByTestId("main-terminal-view")).toHaveAttribute("inert", "");
+    expect(screen.getByTestId("terminal-view")).toBeInTheDocument();
   });
 
   it("falls back to the agent pane when the restored target no longer exists", () => {

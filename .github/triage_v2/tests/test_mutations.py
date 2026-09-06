@@ -172,3 +172,42 @@ def test_legacy_human_priority_is_not_adopted() -> None:
     )
 
     assert planner.resolve_state(1, ("P2-medium",), None) is None
+
+
+def test_classification_corrects_type_and_requests_missing_information() -> None:
+    planner = MutationPlanner(_manifest(), FakeStates())
+    target = MutationTarget(1, "P1-high", ("comp:db",), "Bug", True)
+
+    plan = planner.plan_one(target, ("Feature",), None)
+
+    assert set(plan.labels_add) == {"Bug", "P1-high", "comp:db", "needs-info"}
+    assert plan.labels_remove == ("Feature",)
+
+
+def test_sufficient_reassessment_removes_needs_info() -> None:
+    planner = MutationPlanner(_manifest(), FakeStates())
+    target = MutationTarget(1, "P1-high", ("comp:db",), "Bug", False)
+
+    plan = planner.plan_one(target, ("Bug", "needs-info"), None)
+
+    assert "needs-info" in plan.labels_remove
+
+
+def test_security_issue_is_exempt_from_needs_info_lifecycle() -> None:
+    planner = MutationPlanner(_manifest(), FakeStates())
+    target = MutationTarget(1, "P1-high", ("comp:db",), "Bug", True)
+
+    plan = planner.plan_one(target, ("Bug", "security"), None)
+
+    assert "needs-info" not in plan.labels_add
+    assert "needs_info_security_exempt" in plan.blocked
+
+
+def test_duplicate_is_exempt_and_drops_stale_needs_info() -> None:
+    planner = MutationPlanner(_manifest(), FakeStates())
+    target = MutationTarget(1, "P1-high", ("comp:db",), "Bug", True)
+
+    plan = planner.plan_one(target, ("Bug", "duplicate", "needs-info"), None)
+
+    assert "needs-info" in plan.labels_remove
+    assert "needs_info_duplicate_exempt" in plan.blocked

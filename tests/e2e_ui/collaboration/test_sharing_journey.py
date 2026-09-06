@@ -38,7 +38,7 @@ from tests.e2e_ui.conftest import (
     _server_state,
 )
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _READONLY_PLACEHOLDER = "You have read-only access to this session"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _BUBBLE = '[data-testid="message-bubble"]'
@@ -145,16 +145,18 @@ def _goto_expecting_snapshot(page: Page, base_url: str, session_id: str) -> int:
     assertions deterministic: a 404 means the SPA cannot render a
     composer afterwards, with no settle-time race.
     """
+    request_id = uuid.uuid4().hex
+    page_url = f"{base_url}/c/{session_id}?e2e_snapshot_request={request_id}"
     with page.expect_response(
-        # Match on the path: the chat surface requests the slim snapshot
-        # (?include_items=false&include_liveness=false), so the URL no
-        # longer *ends* with the session id.
+        # A previous document can still have a snapshot in flight when the
+        # next navigation begins. Match the same-origin referrer of this load.
         lambda r: (
             r.url.split("?")[0].endswith(f"/v1/sessions/{session_id}")
             and r.request.method == "GET"
+            and f"e2e_snapshot_request={request_id}" in r.request.headers.get("referer", "")
         )
     ) as resp_info:
-        page.goto(f"{base_url}/c/{session_id}")
+        page.goto(page_url)
     return resp_info.value.status
 
 

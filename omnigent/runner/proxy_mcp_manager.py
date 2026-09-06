@@ -58,6 +58,71 @@ def _response_json_object(response: httpx.Response) -> _JsonObject:
     return result
 
 
+def _input_response(
+    verdict: pending_approvals.Verdict,
+    input_request: _JsonObject | None,
+) -> _JsonObject:
+    """
+    Build the MRTR ``inputResponses`` entry for one resolved elicitation.
+
+    Carries the person's ``content`` when the prompt collected fields, so a
+    server that asked "which environment?" is told which one rather than
+    only that someone said yes. The content arrives from a browser, so it is
+    validated against the request's ``requestedSchema`` first — an answer
+    that does not fit (undeclared keys, wrong types, values outside an enum)
+    is not forwarded across the trust boundary; the entry declines rather
+    than smuggling unvalidated fields or substituting an answer nobody gave.
+
+    :param verdict: The resolved verdict for this elicitation.
+    :param input_request: The ``inputRequests`` entry this verdict answers,
+        carrying ``params.requestedSchema``; ``None`` when unavailable.
+    :returns: The wire object for this elicitation id.
+    """
+    from omnigent.tools._elicitation_schema import (
+        build_accept_content_from_schema,
+        schema_requires_fields,
+        validate_content_against_schema,
+    )
+
+    if not verdict.approved:
+        return {"action": "decline"}
+    # The Omnigent server always populates ``params.requestedSchema`` on its
+    # InputRequiredResult; a missing schema with supplied content fails closed.
+    params = _json_object(input_request.get("params")) if input_request else None
+    schema = _json_object(params.get("requestedSchema")) if params else None
+    schema_dict = cast("dict[str, object]", schema) if schema is not None else None
+    content = validate_content_against_schema(verdict.content, schema_dict)
+    if content is None and verdict.content:
+        # An answer WAS given but does not conform — fail closed instead of
+        # forwarding it or letting the server act on a value nobody chose.
+        _logger.warning(
+            "MCP proxy elicitation answer does not conform to the "
+            "requestedSchema — declining instead of forwarding it"
+        )
+        return {"action": "decline"}
+    if content is None and schema_requires_fields(schema_dict):
+        # Nobody chose, but the server requires fields — the surface
+        # collected none (a bare approve card, or the REPL's y/n prompt).
+        # Fall back to the schema auto-fill the inline path uses, so a
+        # consent-shaped schema (e.g. the policy-ASK required boolean)
+        # still accepts instead of inverting the person's answer.
+        content = build_accept_content_from_schema(schema_dict) if schema_dict else None
+        if content is None:
+            # Nothing to fall back on either (e.g. a required free-form
+            # field): an accept without the fields the server requires is
+            # malformed — it rejects it and the MRTR retry loop spins — so
+            # decline, matching the inline path's required-aware gate.
+            _logger.info(
+                "MCP proxy elicitation accepted with no content for a schema "
+                "that requires fields — declining instead"
+            )
+            return {"action": "decline"}
+    response: _JsonObject = {"action": "accept"}
+    if content is not None:
+        response["content"] = cast(object, content)
+    return response
+
+
 def _json_object_list(value: object) -> list[_JsonObject]:
     """Return only object entries from a JSON array."""
     if not isinstance(value, list):
@@ -330,7 +395,7 @@ class ProxyMcpManager:
                     if self._publish_event is not None
                     else (lambda _s, _e: None)
                 )
-                approved = await pending_approvals.wait_for_user_approval(
+                verdict = await pending_approvals.wait_for_user_verdict(
                     elicitation_id=elicitation_id,
                     conversation_id=self._session_id,
                     publish_event=publisher,
@@ -345,7 +410,9 @@ class ProxyMcpManager:
                         "arguments": arguments,
                         "requestState": request_state,
                         "inputResponses": {
-                            elicitation_id: {"action": "accept" if approved else "decline"}
+                            elicitation_id: _input_response(
+                                verdict, _json_object(input_requests.get(elicitation_id))
+                            ),
                         },
                     },
                 }

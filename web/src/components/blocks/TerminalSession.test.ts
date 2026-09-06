@@ -224,6 +224,29 @@ describe("terminalKeyEventPayload", () => {
     expect(terminalKeyEventPayload(keyEvent({ key: "Enter" }))).toBeNull();
   });
 
+  it("releases Shift+Enter to xterm during an IME composition", () => {
+    // xterm consults the custom handler BEFORE its CompositionHelper; claiming
+    // the key mid-conversion skips the helper's finalize path and the composed
+    // text is dropped. The payload must be null so xterm runs composition
+    // handling instead of us sending CSI-u bytes to the PTY.
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, isComposing: true })),
+    ).toBeNull();
+    // The 229 keyCode path (Safari/legacy) cannot be set through the
+    // constructor init dict, so exercise it with a stub.
+    expect(
+      terminalKeyEventPayload({
+        key: "Enter",
+        shiftKey: true,
+        keyCode: 229,
+      } as unknown as KeyboardEvent),
+    ).toBeNull();
+    // Without either composition signal the CSI-u payload still applies.
+    expect(terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true }))).toBe(
+      SHIFT_ENTER_CSI_U,
+    );
+  });
+
   it("does not override other modified Enter combinations", () => {
     expect(terminalKeyEventPayload(keyEvent({ key: "Enter", altKey: true }))).toBeNull();
     expect(terminalKeyEventPayload(keyEvent({ key: "Enter", ctrlKey: true }))).toBeNull();
@@ -496,6 +519,7 @@ describe("TerminalSession", () => {
     onInput?: () => void,
     clipboardEnabled = true,
     onClipboardRequest?: (text: string) => void,
+    focusOnConnect = true,
   ) {
     const states: ConnectionState[] = [];
     const container = document.createElement("div");
@@ -509,6 +533,7 @@ describe("TerminalSession", () => {
       onInput,
       clipboardEnabled,
       onClipboardRequest,
+      focusOnConnect,
     );
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
@@ -526,6 +551,31 @@ describe("TerminalSession", () => {
       (m) => typeof m === "string" && m.includes('"type":"resize"'),
     );
     expect(resizeFrame).toBeDefined();
+    session.dispose();
+  });
+
+  it("grabs keyboard focus on open when focusOnConnect is set", () => {
+    // WHY: a foreground surface should claim the keyboard as it comes up.
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const focusSpy = vi.spyOn(term, "focus");
+
+    socket.open();
+
+    expect(focusSpy).toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("does not grab focus on open when focusOnConnect is false", () => {
+    // WHY: the workspace-rail shell connects in the background on a session
+    // switch — it must not yank focus off the chat composer.
+    const { socket, session } = makeSession(undefined, undefined, true, undefined, false);
+    const term = (session as unknown as { term: Terminal }).term;
+    const focusSpy = vi.spyOn(term, "focus");
+
+    socket.open();
+
+    expect(focusSpy).not.toHaveBeenCalled();
     session.dispose();
   });
 

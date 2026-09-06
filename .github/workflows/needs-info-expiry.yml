@@ -1,0 +1,57 @@
+name: Close expired needs-info issues
+
+on:
+  schedule:
+    - cron: "17 0 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Close eligible issues instead of previewing them
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: needs-info-expiry
+  cancel-in-progress: false
+
+jobs:
+  expire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Check out default branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+
+      - name: Preview or close expired issues
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CLOSE_ENABLED: ${{ vars.ISSUE_TRIAGE_CLOSE_NEEDS_INFO || 'false' }}
+          V2_ENABLED: ${{ vars.ISSUE_PRIORITIZATION_V2_ENABLED || 'false' }}
+          MANUAL_APPLY: ${{ inputs.apply || false }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          args=()
+          if { [ "$EVENT_NAME" = "schedule" ] && [ "$CLOSE_ENABLED" = "true" ]; } || \
+             [ "$MANUAL_APPLY" = "true" ]; then
+            if [ "$V2_ENABLED" != "true" ]; then
+              echo "::error::Expiry apply requires ISSUE_PRIORITIZATION_V2_ENABLED=true"
+              exit 1
+            fi
+            args+=(--apply)
+          fi
+          uv run --frozen --project .github/triage_v2 issue-needs-info-expiry \
+            --github-repo "${{ github.repository }}" "${args[@]}"

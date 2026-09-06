@@ -113,7 +113,7 @@ def test_opencode_native_model_command_opens_picker_and_persists_pick(
     expect(page.get_by_test_id("composer-config-gear-tooltip")).to_contain_text("OpenCode")
 
     # Bare /model opens the config modal with the session-scoped catalog.
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     composer.fill("/model ")
     composer.press("Enter")
     expect(page.get_by_test_id("composer-config-modal")).to_be_visible()

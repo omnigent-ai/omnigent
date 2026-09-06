@@ -1260,14 +1260,27 @@ _CONNECTION_ERROR_TYPES = (
 )
 
 
+# The streamable-HTTP transport reports a dead server-side session as
+# ``ErrorData(code=32600, message="Session terminated")`` (mcp 1.29.0,
+# mcp/client/streamable_http.py). The code is an upstream typo of JSON-RPC's
+# invalid-request ``-32600`` -- positive 32600 is not in the specification --
+# so match on both the code and the message: the SDK could fix the sign of the
+# code at any time, and the message is what the session-lost path emits.
+_SESSION_TERMINATED_CODE = 32600
+_SESSION_TERMINATED_MESSAGE = "session terminated"
+
+
 def _is_connection_error(exc: BaseException) -> bool:
     """
     Determine if an exception indicates a dead MCP connection.
 
     Returns ``True`` for transport-level failures (broken pipe,
     EOF, connection reset) and MCP-level connection-closed
-    errors. Returns ``False`` for tool-level errors (invalid
-    args, tool not found) which should not trigger a reconnect.
+    errors, including the streamable-HTTP transport's
+    ``Session terminated`` (32600) raised when the server no longer
+    knows the session id (e.g. it restarted). Returns ``False`` for
+    tool-level errors (invalid args, tool not found) which should not
+    trigger a reconnect.
 
     :param exc: The exception to classify.
     :returns: ``True`` if the error is connection-related.
@@ -1275,7 +1288,12 @@ def _is_connection_error(exc: BaseException) -> bool:
     if isinstance(exc, _CONNECTION_ERROR_TYPES):
         return True
     if isinstance(exc, McpError):
-        return exc.error.code == CONNECTION_CLOSED
+        if exc.error.code == CONNECTION_CLOSED:
+            return True
+        return exc.error.code == _SESSION_TERMINATED_CODE or (
+            isinstance(exc.error.message, str)
+            and exc.error.message.strip().lower() == _SESSION_TERMINATED_MESSAGE
+        )
     return False
 
 

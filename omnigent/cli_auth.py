@@ -266,6 +266,14 @@ def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | 
     if entry is None:
         return None
 
+    # Records holding no session JWT — Databricks pointer records, malformed
+    # entries — read as "nothing stored". Checking expiry first would treat
+    # their missing expires_at as 0 and warn "expired on 1970-01-01" on
+    # every process, even though no login session ever existed.
+    token = entry.get("token")
+    if not isinstance(token, str):
+        return None
+
     expires_at = entry.get("expires_at", 0)
     if isinstance(expires_at, (int, float)) and expires_at < time.time():
         _warn_expired_once(server_url, expires_at, has_refresh="refresh_token" in entry)
@@ -279,8 +287,7 @@ def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | 
     ):
         return None
 
-    token = entry.get("token")
-    return token if isinstance(token, str) else None
+    return token
 
 
 # Servers already warned about an expired stored token, so a poll/retry

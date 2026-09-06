@@ -3,9 +3,11 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const {
+  DATABRICKS_INTERNAL_FEATURES_KEY,
   MAX_SERVER_URLS,
   SERVER_URLS_KEY,
   excludingManagedServers,
+  getDatabricksInternalFeaturesEnabled,
   getManagedServerUrls,
   parseManagedServerUrls,
 } = require("../src/managed_preferences");
@@ -74,6 +76,56 @@ describe("managed server preferences", () => {
         },
       }),
       [],
+    );
+  });
+
+  it("reads the Databricks-internal-features boolean on macOS", () => {
+    const calls = [];
+    const enabled = getDatabricksInternalFeaturesEnabled({
+      platform: "darwin",
+      getUserDefault: (...args) => {
+        calls.push(args);
+        return true;
+      },
+    });
+
+    assert.deepEqual(calls, [[DATABRICKS_INTERNAL_FEATURES_KEY, "boolean"]]);
+    assert.equal(enabled, true);
+  });
+
+  it("fails the internal-features flag closed", () => {
+    // Non-darwin platforms never read preferences.
+    let reads = 0;
+    assert.equal(
+      getDatabricksInternalFeaturesEnabled({
+        platform: "linux",
+        getUserDefault: () => {
+          reads += 1;
+          return true;
+        },
+      }),
+      false,
+    );
+    assert.equal(reads, 0);
+    // Only an explicit boolean true enables; truthy junk does not.
+    for (const value of [undefined, null, "true", 1, [true]]) {
+      assert.equal(
+        getDatabricksInternalFeaturesEnabled({
+          platform: "darwin",
+          getUserDefault: () => value,
+        }),
+        false,
+      );
+    }
+    // A read error also reads as disabled.
+    assert.equal(
+      getDatabricksInternalFeaturesEnabled({
+        platform: "darwin",
+        getUserDefault: () => {
+          throw new Error("NSUserDefaults unavailable");
+        },
+      }),
+      false,
     );
   });
 

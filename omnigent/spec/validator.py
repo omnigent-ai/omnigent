@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from omnigent.reasoning_effort import EFFORT_VALUES, validate_effort
 from omnigent.spec.types import AgentSpec, ToolRuntime
 
 _SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
@@ -86,6 +87,7 @@ def validate(spec: AgentSpec) -> ValidationResult:
     _validate_spec_version(spec, result)
     _validate_executor_type(spec, result)
     _validate_llm(spec, result)
+    _validate_reasoning_effort(spec, result)
     _validate_interaction(spec, result)
     _validate_skills(spec, result)
     _validate_mcp_servers(spec, result)
@@ -219,6 +221,25 @@ def _validate_llm(spec: AgentSpec, result: ValidationResult) -> None:
             f"executor.model ({spec.executor.model!r}) and llm.model "
             f"({spec.llm.model!r}) disagree — use executor.model only",
         )
+
+
+def _validate_reasoning_effort(spec: AgentSpec, result: ValidationResult) -> None:
+    """
+    Validate ``executor.reasoning_effort`` against the shared effort vocabulary.
+
+    Runs the same check as session create, so a spec that validates cannot be
+    rejected when a session is created; harness-specific support is enforced
+    downstream at launch.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
+    if spec.executor.reasoning_effort is None:
+        return
+    try:
+        validate_effort(spec.executor.reasoning_effort, "reasoning_effort", EFFORT_VALUES)
+    except ValueError as exc:
+        result.add("executor.reasoning_effort", str(exc))
 
 
 def _validate_interaction(spec: AgentSpec, result: ValidationResult) -> None:

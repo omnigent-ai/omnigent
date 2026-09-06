@@ -422,9 +422,7 @@ def _sub_spec_to_agent_tool(sub: AgentSpec) -> AgentTool:
 
     Inverse of :func:`_agent_tool_to_sub_spec`. Reads the sub-spec's
     ``llm.model`` and ``executor.config`` (harness / profile) to
-    reconstruct the omnigent :class:`ExecutorSpec`. Lossy fields
-    (``max_sessions``, ``os_env``, ``pass_history``,
-    ``pass_histories``) are left at omnigent defaults.
+    reconstruct the omnigent :class:`ExecutorSpec`.
 
     :param sub: The nested :class:`AgentSpec` representing a
         sub-agent exposed to the parent as a tool.
@@ -444,6 +442,9 @@ def _sub_spec_to_agent_tool(sub: AgentSpec) -> AgentTool:
         description=sub.description,
         prompt=sub.instructions,
         os_env=sub.os_env,
+        pass_history=sub.pass_history,
+        pass_histories=(list(sub.pass_histories) if sub.pass_histories is not None else None),
+        max_sessions=sub.max_sessions,
         executor=OmniExecutorSpec(
             model=model,
             harness=harness,
@@ -1310,11 +1311,6 @@ def _agent_tool_to_sub_spec(
     :class:`AgentSpec` with ``executor.type == "omnigent"`` so the
     :class:`OmnigentExecutor` runs it when spawned.
 
-    Lossy fields (not modeled on Omnigent' AgentSpec yet):
-    ``max_sessions``, ``pass_history``, ``pass_histories``.
-    omnigent' runtime falls back to its defaults for these on
-    the reverse trip.
-
     :param tool_name: The YAML key under which this AgentTool is
         declared on the parent, e.g. ``"claude_worker"``.
     :param tool: The parsed omnigent :class:`AgentTool`.
@@ -1420,6 +1416,9 @@ def _agent_tool_to_sub_spec(
             parent_harness=parent_harness,
         ),
         os_env=sub_os_env,
+        pass_history=tool.pass_history,
+        pass_histories=(list(tool.pass_histories) if tool.pass_histories is not None else None),
+        max_sessions=tool.max_sessions,
         terminals=sub_terminals,
         sub_agents=child_sub_agents,
         local_tools=child_local_tools,
