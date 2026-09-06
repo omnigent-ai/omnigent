@@ -1316,9 +1316,13 @@ export function LatestTurnSpacer({
           captureAttemptsRef.current < ANCHOR_CAPTURE_MAX_RETRIES &&
           typeof requestAnimationFrame === "function"
         ) {
-          captureAttemptsRef.current += 1;
-          cancelAnimationFrame(captureFrameRef.current);
-          captureFrameRef.current = requestAnimationFrame(() => measure());
+          if (captureFrameRef.current === 0) {
+            captureFrameRef.current = requestAnimationFrame(() => {
+              captureFrameRef.current = 0;
+              captureAttemptsRef.current += 1;
+              measure();
+            });
+          }
           return;
         }
       }

@@ -1139,6 +1139,12 @@ describe("LatestTurnSpacer", () => {
     expect(spacer.style.height || "0px").toBe("0px");
     expect(frames.length).toBeGreaterThan(0);
 
+    // Synchronous layout/observer measurements can fire repeatedly before the
+    // browser advances a frame. They must not consume the frame retry budget.
+    for (let i = 0; i < 12; i += 1) {
+      act(() => holder.cb?.());
+    }
+
     // The row mounts; the next scheduled frame fires and capture succeeds.
     const anchor = document.createElement("div");
     anchor.dataset.role = "user";
