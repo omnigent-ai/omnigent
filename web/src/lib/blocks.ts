@@ -365,6 +365,12 @@ export interface RetryBlock {
 export interface CompactionInProgressBlock {
   type: "compaction_loading";
   ctx: BlockContext;
+  /**
+   * Unix epoch seconds when the server first saw this compaction in
+   * progress — the authoritative anchor for the elapsed counter. Absent
+   * when the emitter doesn't track it (fall back to client receive time).
+   */
+  startedAtS?: number;
 }
 
 /** Conversation compaction finished. Emitted from `response.compaction.completed`. */

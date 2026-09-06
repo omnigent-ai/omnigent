@@ -1100,7 +1100,7 @@
         "type": "object"
       },
       "CompactionInProgressEvent": {
-        "description": "Conversation history is being compacted.\n\nEmitted by `omnigent/runtime/compaction.py` while a\ncompaction step runs so clients can render a \"summarizing\nhistory\u2026\" indicator. Wire shape matches `compaction.py:765`.",
+        "description": "Conversation history is being compacted.\n\nEmitted by `omnigent/runtime/compaction.py` while a\ncompaction step runs so clients can render a \"summarizing\nhistory\u2026\" indicator. Wire shape matches `compaction.py:765`.\n\nA long compaction is announced repeatedly (once per status poll), so\nclients must treat every event carrying the same `started_at` as one\ncompaction \u2014 refreshing their indicator rather than stacking another.",
         "properties": {
           "sequence_number": {
             "anyOf": [
@@ -1114,6 +1114,20 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unix epoch timestamp (seconds) when this compaction was first reported in progress. Stable across repeated progress events for the same compaction, so clients can anchor an elapsed counter to the true start \u2014 including after a page reload. `None` when the emitter does not track it.",
+            "title": "Started At"
           },
           "type": {
             "const": "response.compaction.in_progress",

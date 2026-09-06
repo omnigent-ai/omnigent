@@ -438,7 +438,9 @@ function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
     const startTimeMs = createdAtS != null ? createdAtS * 1000 : Date.now();
 
     const updateElapsed = () => {
-      setElapsed(Math.round((Date.now() - startTimeMs) / 1000));
+      // Clamp: a server-provided start marginally ahead of this client's
+      // clock must read as "just started", not a negative count.
+      setElapsed(Math.max(0, Math.round((Date.now() - startTimeMs) / 1000)));
     };
 
     updateElapsed();

@@ -502,7 +502,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
 
   // Compaction.
   if (eventType === "response.compaction.in_progress") {
-    return { type: "compaction_in_progress" } satisfies CompactionInProgress;
+    const startedAt = data.started_at;
+    return {
+      type: "compaction_in_progress",
+      ...(typeof startedAt === "number" ? { startedAtS: startedAt } : {}),
+    } satisfies CompactionInProgress;
   }
   if (eventType === "response.compaction.completed") {
     const tt = data.total_tokens;
