@@ -553,3 +553,83 @@ def test_parse_condition_non_mapping_rejected() -> None:
     expected value or whitelist)."""
     with pytest.raises(OmnigentError, match=r"must be a mapping"):
         _parse_condition(["integrity", "0"], policy_name="p")  # type: ignore[arg-type]
+
+
+def test_parse_function_policy_warns_on_ignored_response_on_field(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An authored ``on: [response]`` on a ``type: function`` policy is
+    discarded (the callable self-selects its phases at runtime) — the
+    parser must say so instead of silently misleading the bundle author
+    into believing an output gate is bound."""
+    with caplog.at_level("WARNING", logger="omnigent.spec"):
+        spec = _parse_guardrails(
+            _yaml("""
+policies:
+  output_gate:
+    type: function
+    on: [response]
+    function: myorg.policies.check
+""")
+        )
+    assert spec is not None and spec.policies is not None
+    assert spec.policies[0].on is None
+    warnings = [
+        rec
+        for rec in caplog.records
+        if rec.levelname == "WARNING" and "output_gate" in rec.message
+    ]
+    assert warnings, "expected a warning naming the policy whose on: was discarded"
+    assert "ignored" in warnings[0].message
+
+
+def test_parse_function_policy_warns_on_ignored_llm_response_on_field(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``on: [llm_response]`` is the other output phase an author might
+    expect to bind — it is discarded just as silently, so it must warn
+    the same way ``response`` does."""
+    with caplog.at_level("WARNING", logger="omnigent.spec"):
+        spec = _parse_guardrails(
+            _yaml("""
+policies:
+  llm_output_gate:
+    type: function
+    on: [llm_response]
+    function: myorg.policies.check
+""")
+        )
+    assert spec is not None and spec.policies is not None
+    assert spec.policies[0].on is None
+    warnings = [
+        rec
+        for rec in caplog.records
+        if rec.levelname == "WARNING" and "llm_output_gate" in rec.message
+    ]
+    assert warnings, "expected a warning naming the policy whose on: was discarded"
+    assert "ignored" in warnings[0].message
+
+
+def test_parse_function_policy_no_warning_for_non_output_on_field(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``tool_call`` annotation (or no ``on:`` at all) warns nothing —
+    self-selection is the documented contract and a tool-phase note is
+    harmless documentation, not a policy hole."""
+    with caplog.at_level("WARNING", logger="omnigent.spec"):
+        spec = _parse_guardrails(
+            _yaml("""
+policies:
+  annotated:
+    type: function
+    on: [tool_call]
+    function: myorg.policies.check
+  quiet:
+    type: function
+    function: myorg.policies.check
+""")
+        )
+    assert spec is not None and spec.policies is not None
+    assert not [
+        rec for rec in caplog.records if rec.levelname == "WARNING" and "ignored" in rec.message
+    ]

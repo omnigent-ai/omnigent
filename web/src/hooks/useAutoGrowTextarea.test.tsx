@@ -1,5 +1,5 @@
 import { render } from "@testing-library/react";
-import { useRef } from "react";
+import { useLayoutEffect, useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoGrowTextarea } from "./useAutoGrowTextarea";
 
@@ -161,5 +161,213 @@ describe("useAutoGrowTextarea", () => {
     stubScrollHeight(ta, 800);
     roCallback?.([], {} as ResizeObserver);
     expect(growth.at(-1)).toBe(180);
+  });
+
+  it("pins the textarea's overflow while collapsed and restores it after", () => {
+    // Gecko paints the collapsed one-row box's overflow of its draft as a
+    // caret jump for the layout the measure lasts. Assert the invariant that
+    // prevents it: the textarea clips its own overflow for exactly as long
+    // as it is collapsed. Blink suppresses the intermediate paint, which is
+    // why only Firefox-based browsers show the bounce.
+    const { getByTestId } = render(<Harness value="two\nlines" />);
+    const ta = getByTestId("ta") as HTMLTextAreaElement;
+    const wrapper = getByTestId("wrapper") as HTMLDivElement;
+    wrapper.getBoundingClientRect = () => ({ height: 100 }) as DOMRect;
+
+    let overflowWhileCollapsed: string | null = null;
+    Object.defineProperty(ta, "scrollHeight", {
+      configurable: true,
+      get: () => {
+        overflowWhileCollapsed = ta.style.overflowY;
+        return 40;
+      },
+    });
+    roCallback?.([], {} as ResizeObserver);
+
+    expect(overflowWhileCollapsed).toBe("hidden");
+    // Released once the real height is on, so a capped draft still scrolls
+    // (the CSS class governs overflow between measures).
+    expect(ta.style.overflowY).toBe("");
+    expect(ta.style.height).toBe("40px");
+  });
+
+  it("restores the scroll offset the collapse clamped away", () => {
+    // Setting ``height:auto`` collapses the box and Gecko drops its scroll
+    // offset along the way, leaving a capped draft mid-scroll read as
+    // scrolled-to-top on every re-measure. jsdom has no layout, so model the
+    // loss: the backing offset resets while the box is collapsed. The hook
+    // must put the pre-collapse offset back once the height lands, bounded
+    // by the new box exactly as the browser would clamp it.
+    const { getByTestId } = render(<Harness value="long draft" />);
+    const ta = getByTestId("ta") as HTMLTextAreaElement;
+    const wrapper = getByTestId("wrapper") as HTMLDivElement;
+    wrapper.getBoundingClientRect = () => ({ height: 100 }) as DOMRect;
+
+    // Back the element's scroll offset so the hook's save and restore go
+    // through the property the browser would.
+    let scrollTop = 300;
+    Object.defineProperty(ta, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (v: number) => {
+        scrollTop = v;
+      },
+    });
+    stubScrollHeight(ta, 800);
+    // The capped box: 800px of draft in a 10-row (200px) tall viewport.
+    Object.defineProperty(ta, "clientHeight", {
+      configurable: true,
+      get: () => 200,
+    });
+    Object.defineProperty(ta, "scrollHeight", {
+      configurable: true,
+      get: () => {
+        // Gecko drops the offset when the box collapses.
+        if (ta.style.height === "auto") scrollTop = 0;
+        return 800;
+      },
+    });
+    roCallback?.([], {} as ResizeObserver);
+
+    expect(ta.style.height).toBe("200px");
+    expect(scrollTop).toBe(300);
+  });
+
+  it("reports growth only after the measurement guards are released", () => {
+    // A caller reacts to growth by re-pinning a sibling viewport (the
+    // transcript under a growing composer) in the same task as the height
+    // change. That pin must read the released geometry: while the wrapper is
+    // still pinned at its old height the sibling hasn't shrunk yet, so a pin
+    // written then is a silent no-op and the next paint bounces anyway.
+    let observed: { ta: HTMLTextAreaElement; wrapper: HTMLDivElement } | null = null;
+    const guardStates: { px: number; released: boolean }[] = [];
+    const probe = (px: number) => {
+      // The mount-time measure reports 0 before `observed` is set; only the
+      // post-observer reports (the ones this test is about) are recorded.
+      if (!observed) return;
+      const { ta, wrapper } = observed;
+      guardStates.push({
+        px,
+        released:
+          wrapper.style.height === "" && wrapper.style.overflow === "" && ta.style.overflowY === "",
+      });
+    };
+    const { getByTestId } = render(<Harness value="two\nlines" onGrowth={probe} />);
+    const ta = getByTestId("ta") as HTMLTextAreaElement;
+    const wrapper = getByTestId("wrapper") as HTMLDivElement;
+    observed = { ta, wrapper };
+
+    wrapper.getBoundingClientRect = () => ({ height: 100 }) as DOMRect;
+    stubScrollHeight(ta, 40);
+    roCallback?.([], {} as ResizeObserver);
+
+    // The reported growth: 40px box minus the 20px resting row.
+    expect(guardStates.at(-1)?.px).toBe(20);
+    expect(guardStates.at(-1)?.released).toBe(true);
+  });
+
+  it("restores ancestor scrollTop if style.height = auto triggers parent scroll offset drop", () => {
+    let parentScrollTop = 150;
+    function ScrollParentHarness({ value }: { value: string }) {
+      const parentRef = useRef<HTMLDivElement>(null);
+      const ref = useRef<HTMLTextAreaElement>(null);
+      useAutoGrowTextarea(ref, value, 10);
+
+      useLayoutEffect(() => {
+        if (parentRef.current) {
+          Object.defineProperty(parentRef.current, "scrollTop", {
+            configurable: true,
+            get: () => parentScrollTop,
+            set: (v: number) => {
+              parentScrollTop = v;
+            },
+          });
+        }
+      }, []);
+
+      return (
+        <div
+          ref={parentRef}
+          data-testid="scroll-parent"
+          style={{ overflow: "auto", height: "200px" }}
+        >
+          <div data-testid="wrapper">
+            <textarea
+              ref={ref}
+              data-testid="ta"
+              value={value}
+              onChange={() => {}}
+              style={{ lineHeight: "20px", paddingTop: "0px", paddingBottom: "0px" }}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    const { getByTestId } = render(<ScrollParentHarness value="hello" />);
+    const ta = getByTestId("ta") as HTMLTextAreaElement;
+
+    stubScrollHeight(ta, 40);
+
+    // When ta collapses, Gecko might adjust parent.scrollTop
+    Object.defineProperty(ta, "scrollHeight", {
+      configurable: true,
+      get: () => {
+        if (ta.style.height === "auto") {
+          parentScrollTop = 0;
+        }
+        return 40;
+      },
+    });
+
+    roCallback?.([], {} as ResizeObserver);
+    expect(ta.style.height).toBe("40px");
+    expect(parentScrollTop).toBe(150);
+  });
+
+  it("skips style.height = auto collapse when text is appending", () => {
+    let collapsedToAutoCount = 0;
+    function DynamicHarness({ value }: { value: string }) {
+      const ref = useRef<HTMLTextAreaElement>(null);
+      useAutoGrowTextarea(ref, value, 10);
+      return (
+        <div data-testid="wrapper">
+          <textarea
+            ref={ref}
+            data-testid="ta"
+            value={value}
+            onChange={() => {}}
+            style={{ lineHeight: "20px", paddingTop: "0px", paddingBottom: "0px" }}
+          />
+        </div>
+      );
+    }
+
+    const { getByTestId, rerender } = render(<DynamicHarness value="line 1" />);
+    const ta = getByTestId("ta") as HTMLTextAreaElement;
+    stubScrollHeight(ta, 20);
+
+    let observedHeight = "";
+    Object.defineProperty(ta, "scrollHeight", {
+      configurable: true,
+      get: () => {
+        if (ta.style.height === "auto") {
+          collapsedToAutoCount++;
+        }
+        return observedHeight === "40px" ? 40 : 20;
+      },
+    });
+
+    // Mount measure runs with testForHeightReduction=true
+    roCallback?.([], {} as ResizeObserver);
+    const initialCollapses = collapsedToAutoCount;
+
+    // Now append text: "line 1" -> "line 1\nline 2"
+    observedHeight = "40px";
+    rerender(<DynamicHarness value="line 1\nline 2" />);
+
+    // Appending must NOT have collapsed ta.style.height to "auto"
+    expect(collapsedToAutoCount).toBe(initialCollapses);
+    expect(ta.style.height).toBe("40px");
   });
 });

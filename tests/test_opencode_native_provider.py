@@ -40,6 +40,9 @@ def test_build_omnigent_mcp_server_points_serve_mcp_at_bridge_dir() -> None:
     entry = block["omnigent"]
     assert entry["type"] == "local"
     assert entry["enabled"] is True
+    # Milliseconds: must exceed the bridge's outer relay hop (330 s) so the
+    # relay's clean timeout error beats opencode's client-side kill.
+    assert entry["timeout"] == 360_000
     cmd = entry["command"]
     # Launches the SHARED serve-mcp relay, pointed at THIS bridge dir.
     assert cmd[-3:] == ["serve-mcp", "--bridge-dir", "/tmp/bridge-xyz"]
@@ -569,3 +572,89 @@ def test_merge_user_provider_config_handles_jsonc_trailing_commas(
 
     result = maybe_merge_user_provider_config({})
     assert result["provider"]["my-openai"]["options"]["baseURL"] == "https://my-gw/v1"
+
+
+def test_build_mcp_block_preserves_custom_timeout() -> None:
+    from types import SimpleNamespace as N
+
+    from omnigent.opencode_native_provider import build_opencode_mcp_block
+
+    servers = [
+        N(
+            name="local_custom",
+            transport="stdio",
+            command="python",
+            args=["-m", "custom_server"],
+            env={},
+            url=None,
+            headers={},
+            timeout=120,
+        ),
+        N(
+            name="remote_custom",
+            transport="http",
+            url="https://remote.mcp/api",
+            headers={},
+            command=None,
+            args=[],
+            env={},
+            timeout=45.5,
+        ),
+    ]
+    block = build_opencode_mcp_block(servers)
+    # MCPServerConfig.timeout is seconds; the opencode entry is milliseconds.
+    assert block["local_custom"]["timeout"] == 120_000
+    assert block["remote_custom"]["timeout"] == 45_500
+
+
+def test_extract_progress_token_variants() -> None:
+    from omnigent.claude_native_bridge import _extract_progress_token
+
+    # Meta style (MCP standard)
+    assert _extract_progress_token({"_meta": {"progressToken": "tok-123"}}) == "tok-123"
+    assert _extract_progress_token({"_meta": {"progressToken": 42}}) == 42
+    # Top-level fallback
+    assert _extract_progress_token({"progressToken": "tok-456"}) == "tok-456"
+    # None or malformed
+    assert _extract_progress_token(None) is None
+    assert _extract_progress_token({}) is None
+    assert _extract_progress_token({"_meta": {}}) is None
+    assert _extract_progress_token({"_meta": {"progressToken": ["invalid"]}}) is None
+
+
+def test_mcp_progress_heartbeat_lifecycle() -> None:
+    import itertools
+    import threading
+    import time
+
+    lock = threading.Lock()
+    written_messages: list[dict[str, object]] = []
+
+    def fake_write(
+        payload: dict[str, object],
+        stdout_lock: threading.Lock,
+        **_kwargs: object,
+    ) -> None:
+        with stdout_lock:
+            written_messages.append(payload)
+
+    import omnigent.claude_native_bridge as bridge_mod
+
+    orig_write = bridge_mod._write_jsonrpc
+    bridge_mod._write_jsonrpc = fake_write
+    try:
+        # With interval = 0.05s, should emit progress notifications
+        with bridge_mod._McpProgressHeartbeat("test-token", lock, interval_s=0.05):
+            time.sleep(0.12)
+        assert len(written_messages) >= 2
+        assert all(m["method"] == "notifications/progress" for m in written_messages)
+        assert all(m["params"]["progressToken"] == "test-token" for m in written_messages)
+        progresses = [m["params"]["progress"] for m in written_messages]
+        assert all(b > a for a, b in itertools.pairwise(progresses))
+
+        # Once exited, no more messages are emitted
+        count_at_exit = len(written_messages)
+        time.sleep(0.1)
+        assert len(written_messages) == count_at_exit
+    finally:
+        bridge_mod._write_jsonrpc = orig_write

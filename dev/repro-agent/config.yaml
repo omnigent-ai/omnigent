@@ -52,8 +52,10 @@ description: >-
 executor:
   type: omnigent
   context_window: 1000000
+  reasoning_effort: xhigh
   config:
     harness: claude-sdk
+    permission_mode: bypassPermissions
 
 # The full operating procedure lives in AGENTS.md, read at startup.
 instructions: AGENTS.md

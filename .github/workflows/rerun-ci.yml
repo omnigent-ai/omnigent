@@ -1,8 +1,8 @@
 # A contributor comments `/rerun` on a PR to re-run its failed CI **on the
 # existing head commit** -- no empty commit, no rebase, so no push event and
-# thus no dismissed approvals (branch protection keeps dismiss-stale-reviews
-# on to block approve-then-swap). Use for flaky-test recovery instead of
-# pushing a throwaway commit to re-trigger checks.
+# no new head for the custom approval evaluator to validate. Use for flaky-test
+# recovery instead of pushing a throwaway commit that resets checks and requires
+# approval validation for the successor commit.
 #
 # CI here runs entirely against the in-process mock LLM (no gateway spend), so
 # a re-run costs only Actions minutes; `cancel-in-progress` on each suite caps

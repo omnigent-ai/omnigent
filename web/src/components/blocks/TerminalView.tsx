@@ -10,7 +10,7 @@
 
 import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
-import { useTheme } from "next-themes";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { copyText } from "@/lib/clipboard";
@@ -103,6 +103,15 @@ interface TerminalViewProps {
    */
   active?: boolean;
   /**
+   * Whether the terminal grabs keyboard focus when its WS connects. Defaults
+   * to ``active`` — a foreground surface claims the keyboard as it comes up.
+   * The workspace-rail shell overrides this to false so a shell restored on a
+   * session switch connects in the background without yanking focus off the
+   * chat composer; it stays fully interactive (clipboard, reconnect) either
+   * way. It still grabs focus on the reveal edge and on an explicit open.
+   */
+  focusOnConnect?: boolean;
+  /**
    * Loopback attach URL advertised by the session's runner (from the
    * terminal resource's ``metadata.direct_attach_url``). When set, each
    * connection attempt probes it first and uses it if the listener
@@ -123,6 +132,7 @@ export function TerminalView({
   onResume,
   resumePending = false,
   active = true,
+  focusOnConnect = active,
   directAttachUrl,
 }: TerminalViewProps) {
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
@@ -186,7 +196,7 @@ export function TerminalView({
   // Lets the close handler tell "stable connection finally dropped"
   // (reset the budget) from "re-dial died straight away" (burn it).
   const connectedAtRef = useRef<number | null>(null);
-  const { resolvedTheme } = useTheme();
+  const resolvedMode = useResolvedThemeMode();
   // Terminal theme is independent of the app theme: "auto" follows the app's
   // resolved appearance, while "light"/"dark" pin the terminal. Reading the
   // pref as state (seeded at mount, updated via the pub/sub) lets a Settings
@@ -195,7 +205,7 @@ export function TerminalView({
     readTerminalThemeMode(),
   );
   useEffect(() => subscribeTerminalTheme(setTerminalMode), []);
-  const isDark = resolveTerminalIsDark(terminalMode, resolvedTheme === "dark");
+  const isDark = resolveTerminalIsDark(terminalMode, resolvedMode === "dark");
   // Stable ref so the theme-update effect can reach the live session
   // without adding isDark to the attachSession deps (which would
   // reconnect the WebSocket on every theme change).
@@ -211,6 +221,8 @@ export function TerminalView({
   onInputRef.current = onInput;
   const activeRef = useRef(active);
   activeRef.current = active;
+  const focusOnConnectRef = useRef(focusOnConnect);
+  focusOnConnectRef.current = focusOnConnect;
   // Track whether this terminal has already tried a keyless re-dial after a
   // 4400 wrong-replica close. If keyless still fails with 4400, the host is
   // genuinely unreachable — stop retrying.
@@ -571,6 +583,7 @@ export function TerminalView({
           notifyInput,
           !readOnly && activeRef.current,
           notifyClipboardRequest,
+          focusOnConnectRef.current,
         );
         sessionRef.current = terminalSession;
         // Relay-connected with a direct URL on offer: negotiate the

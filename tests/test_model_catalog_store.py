@@ -134,6 +134,39 @@ async def test_ensure_catalog_stale_refresh_failure_keeps_serving() -> None:
     assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
 
 
+async def test_reprobe_catalog_joins_the_background_probe_and_persists() -> None:
+    """
+    An awaited refresh reuses the stale hit's in-flight probe and returns its rows.
+    """
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    _age_entry("claude-native", "abc123", store.CATALOG_STALE_AFTER_S + 60)
+    refreshed = [{"id": "haiku", "model": "claude-haiku-4-5", "isDefault": True}]
+    probes: list[int] = []
+
+    async def _probe() -> list[dict[str, object]]:
+        probes.append(1)
+        return refreshed
+
+    assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
+    assert await store.reprobe_catalog("claude-native", "abc123", _probe) == refreshed
+    assert probes == [1], "the awaited refresh must join the probe already in flight"
+    assert store.read_catalog("claude-native", "abc123") == refreshed
+    assert store.catalog_is_stale("claude-native", "abc123") is False
+
+
+async def test_reprobe_catalog_failure_returns_none_and_keeps_serving() -> None:
+    """
+    A failed awaited refresh reports ``None`` and leaves the stored rows alone.
+    """
+    store.write_catalog("claude-native", "abc123", _ROWS)
+
+    async def _probe() -> list[dict[str, object]]:
+        raise OSError("provider unreachable")
+
+    assert await store.reprobe_catalog("claude-native", "abc123", _probe) is None
+    assert store.read_catalog("claude-native", "abc123") == _ROWS
+
+
 # ── binary_identity ──────────────────────────────────────
 
 

@@ -13,8 +13,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
+import type { ExtensionCatalogItem } from "@/extensions/types";
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
@@ -60,6 +63,10 @@ const {
 
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: useHostsMock,
+  // The project-settings dialog (mounted by Sidebar rows) resolves model
+  // options through this hook; no test here opens it, so an empty catalog is
+  // enough to keep the module contract satisfied.
+  useHostModelOptions: () => ({ data: [] }),
 }));
 
 // Mutation hooks are only invoked on row actions; stub them. useConversations
@@ -219,16 +226,20 @@ function renderSidebar(
   initialEntry = "/",
   onOpenSearch?: () => void,
   info?: ServerInfo,
+  extensions: ExtensionCatalogItem[] = [],
+  onClose = vi.fn(),
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const sidebar = <Sidebar open={open} onClose={vi.fn()} onOpenSearch={onOpenSearch} />;
+  const sidebar = <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />;
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={[initialEntry]}>
-          {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
-        </MemoryRouter>
-      </TooltipProvider>
+      <ExtensionCatalogProvider extensions={extensions}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[initialEntry]}>
+            {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
+          </MemoryRouter>
+        </TooltipProvider>
+      </ExtensionCatalogProvider>
     </QueryClientProvider>,
   );
 }
@@ -269,6 +280,7 @@ beforeEach(() => {
   useHostsMock.mockReturnValue({ data: [] });
   localStorage.clear();
   clearSessionDrafts();
+  clearOptimisticTitles();
   projectsMock.length = 0;
   moveToProjectSpy.mockReset();
   deleteProjectSpy.mockReset();
@@ -289,6 +301,42 @@ function seedPins(ids: string[]) {
 }
 afterEach(cleanup);
 
+const TEST_EXTENSION: ExtensionCatalogItem = {
+  object: "extension",
+  id: "acme.review",
+  display_name: "Review",
+  distribution: "acme-review",
+  version: "1.0.0",
+  extension_api: 1,
+  status: "enabled",
+  permissions: [],
+  pages: [
+    {
+      id: "acme.review.inbox-page",
+      title: "Extension Inbox",
+      route: "inbox",
+      view: "inbox",
+    },
+  ],
+  primary_navigation: [
+    {
+      id: "acme.review.primary-nav",
+      label: "Extension Inbox",
+      page: "acme.review.inbox-page",
+      icon: "puzzle",
+      order: 500,
+      when: null,
+    },
+  ],
+  browser: {
+    declared: true,
+    has_styles: false,
+    digest: "digest",
+    script_url: "/script",
+    style_url: null,
+  },
+};
+
 describe("Sidebar session list", () => {
   it("uses the interface text token for the empty session-list state", () => {
     mockConversations([]);
@@ -296,6 +344,26 @@ describe("Sidebar session list", () => {
 
     expect(screen.getByText("No sessions")).toHaveClass("text-ui");
     expect(screen.getByText("No sessions")).not.toHaveClass("text-sm");
+  });
+
+  it("flips a just-created session's row to its provisional first-prompt label", () => {
+    mockConversations([
+      conv("conv_opt", "Claude Code", {
+        title: null,
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      }),
+    ]);
+    renderSidebar();
+
+    // Before the landing form's stash lands (and for sessions born
+    // elsewhere), the row reads as the wrapper name.
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+
+    act(() => recordOptimisticTitle("conv_opt", "debug the login redirect"));
+
+    const label = screen.getByText("debug the login redirect");
+    expect(label).toHaveClass("italic", "text-muted-foreground");
+    expect(screen.queryByText("Claude Code")).not.toBeInTheDocument();
   });
 
   it("uses the interface text token for session-list errors", () => {
@@ -350,13 +418,13 @@ describe("Sidebar session list", () => {
     // as desktop; only desktop hover widens it for the revealed controls.
     expect(row).toHaveClass("pr-2");
     expect(row.className).not.toMatch(/(?:^|\s)pr-28(?:\s|$)/);
-    expect(row.className).toContain("md:group-hover:pr-14");
+    expect(row.className).toContain("md:group-hover:pr-20");
     // Keyed on `:focus-visible`, matching when the trailing controls appear and
     // the state marker fades. `focus-within` would also fire for a plain click,
     // narrowing the reserve on the selected row while the marker stayed put.
-    expect(row.className).toContain("md:group-has-[:focus-visible]:pr-14");
-    expect(row.className).not.toContain("md:group-focus-within:pr-14");
-    expect(row.className).not.toMatch(/(?:^|\s)md:pr-14(?:\s|$)/);
+    expect(row.className).toContain("md:group-has-[:focus-visible]:pr-20");
+    expect(row.className).not.toContain("md:group-focus-within:pr-20");
+    expect(row.className).not.toMatch(/(?:^|\s)md:pr-20(?:\s|$)/);
   });
 
   it("narrows the awaiting row's reserve on the same trigger that fades its tag", () => {
@@ -379,7 +447,7 @@ describe("Sidebar session list", () => {
     // Every state that narrows the reserve must also fade the tag, and vice
     // versa, so the two can never disagree about whether the space is free.
     for (const trigger of ["md:group-hover:", "md:group-has-[:focus-visible]:"]) {
-      expect(row.className).toContain(`${trigger}pr-14`);
+      expect(row.className).toContain(`${trigger}pr-20`);
       expect(tag.parentElement!.className).toContain(`${trigger}opacity-0`);
     }
     // `focus-within` fires for a plain mouse click, which the tag's fade does
@@ -555,13 +623,15 @@ describe("Sidebar session list", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
-    // The sidebar requests the session list with `includeArchived`
-    // hard-wired to true, so the "Archived sessions" filter has something to
-    // show. A regression to false would leave that filter perpetually empty.
-    expect(useConvMock.mock.calls.length).toBeGreaterThanOrEqual(1);
-    for (const call of useConvMock.mock.calls) {
-      expect(call).toEqual(["", true, { reconcileWhileConnected: true }]);
-    }
+    // The sidebar makes two useConversations calls: one all-sessions query
+    // (includeArchived: true, reconcileWhileConnected: true — for inbox counts
+    // and WS reconciliation) and one tab-scoped filtered query (includeArchived:
+    // false, for display). Assert the all-sessions call is present and correct.
+    const calls = useConvMock.mock.calls;
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    const allSessionsCall = calls.find((call) => call[0] === "" && call[1] === true);
+    expect(allSessionsCall).toBeDefined();
+    expect(allSessionsCall?.[2]).toMatchObject({ reconcileWhileConnected: true });
   });
 
   it("opens the command palette when the Search button is clicked", () => {
@@ -727,17 +797,20 @@ describe("Sidebar session list", () => {
     expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
     expect(selectSessions.parentElement).toHaveClass(
-      "md:opacity-0",
-      "md:group-hover/header:opacity-100",
-      "md:group-focus-within/header:opacity-100",
-      "md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
 
     const filterSessions = within(sessionsSection!).getByRole("button", {
       name: "Filter sessions",
     });
+    // The filter never fades; its wrapper re-enables hit-testing inside the
+    // pointer-events-gated outer box (see the overlay hit-test spec below).
     expect(filterSessions.parentElement).not.toHaveClass("md:opacity-0");
-    expect(filterSessions.parentElement).toHaveClass("absolute", "right-1", "flex");
+    expect(filterSessions.parentElement).toHaveClass("pointer-events-auto", "flex");
+    expect(filterSessions.parentElement!.parentElement).toHaveClass("absolute", "right-1", "flex");
 
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
@@ -782,6 +855,37 @@ describe("Sidebar session list", () => {
       "dark:hover:bg-[var(--sidebar-active)]",
       "dark:hover:text-[var(--sidebar-active-foreground)]",
     );
+  });
+
+  it("renders and activates an extension nav row without activating core rows", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/extensions/acme.review/inbox", undefined, undefined, [TEST_EXTENSION]);
+
+    const extension = screen.getByTestId("extension-nav-acme.review.primary-nav");
+    expect(extension).toHaveAttribute("href", "/extensions/acme.review/inbox");
+    expect(extension).toHaveAttribute("aria-current", "page");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveAttribute("aria-current");
+    expect(screen.getByTestId("inbox-button")).not.toHaveAttribute("aria-current");
+  });
+
+  it("closes the mobile sidebar when an extension nav row is selected", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    const onClose = vi.fn();
+    renderSidebar(true, "/", undefined, undefined, [TEST_EXTENSION], onClose);
+
+    fireEvent.click(screen.getByTestId("extension-nav-acme.review.primary-nav"));
+
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("leaves the primary nav unchanged for an empty extension catalog", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    expect(screen.queryByTestId(/^extension-nav-/)).toBeNull();
+    expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
+    expect(screen.getByTestId("scheduled-tasks-nav")).toBeInTheDocument();
+    expect(screen.getByTestId("inbox-button")).toBeInTheDocument();
   });
 
   it("does NOT close the sidebar when the footer Settings is tapped", () => {
@@ -1331,6 +1435,12 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
   });
 
   it("auto-fetches the next page when the sentinel scrolls into view (infinite scroll)", () => {
+    // Start on the "all" tab so the background all-sessions paginator doesn't
+    // fire on mount (it only runs on "mine"/"shared" tabs). The default tab is
+    // "mine" (DEFAULT_SESSION_FILTER), so force "all" via localStorage before
+    // rendering. This isolates the test to sentinel-triggered pagination only.
+    localStorage.setItem("omnigent:session-filter", "all");
+
     // Capture the IntersectionObserver callback so the test can simulate the
     // sentinel entering the scroll viewport.
     let observerCallback: IntersectionObserverCallback | undefined;
@@ -1380,6 +1490,62 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
     expect(fetchNextPage).toHaveBeenCalledTimes(1);
 
     vi.unstubAllGlobals();
+  });
+});
+
+// The sidebar uses two queries: an all-sessions query for inbox/WS and a
+// tab-scoped query for display on the "mine" and "shared" tabs. The tab-scoped
+// query passes `visibility` to the server so the server paginates only the
+// relevant sessions (proper fix for OMNI-6002).
+describe("Sidebar visibility filter (server-side mine/shared split)", () => {
+  it('calls useConversations with visibility="mine" when on the mine tab', () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+
+    // Sidebar always renders on the "mine" tab by default. Check that one of the
+    // useConversations calls passes visibility="mine" (the tab-scoped query).
+    const calls = useConvMock.mock.calls;
+    const mineCall = calls.find((args) => args[4] === "mine");
+    expect(mineCall).toBeDefined();
+    // The tab-scoped query uses includeArchived=false and enabled=true.
+    expect(mineCall![1]).toBe(false);
+    expect((mineCall![2] as { enabled?: boolean }).enabled).toBe(true);
+  });
+
+  it('calls useConversations with visibility="shared" when on the shared tab', () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+    selectSessionFilter("shared");
+
+    const calls = useConvMock.mock.calls;
+    const sharedCall = calls.find((args) => args[4] === "shared");
+    expect(sharedCall).toBeDefined();
+    expect(sharedCall![1]).toBe(false);
+    expect((sharedCall![2] as { enabled?: boolean }).enabled).toBe(true);
+  });
+
+  it("disables the tab-scoped query when on the all tab", () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+    selectSessionFilter("all");
+
+    const calls = useConvMock.mock.calls;
+    // No call should pass visibility="mine" or "shared" — the tab-scoped query
+    // is disabled (enabled=false) when the active tab is "all".
+    const disabledTabCalls = calls.filter(
+      (args) => (args[2] as { enabled?: boolean })?.enabled === false,
+    );
+    expect(disabledTabCalls.length).toBeGreaterThan(0);
+  });
+
+  it("renders sessions from the tab-scoped query on the mine tab", () => {
+    // When on the "mine" tab the display query is the filtered one. Both calls
+    // return the same mock data here, so the visible session row reflects the
+    // tab-scoped result.
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
   });
 });
 
@@ -1725,28 +1891,137 @@ describe("Sidebar project sections", () => {
     );
   });
 
-  it("folds the new-session pencil into the kebab on mobile", async () => {
-    // The pencil is desktop-only (max-md:hidden); on mobile the same action is
-    // offered as a md:hidden "New session" kebab item pre-filed under the
-    // project (same ?project= link as the pencil).
+  it("keeps New session in the project menu when the pencil requires hover", async () => {
+    // The pencil is a redundant shortcut for the kebab's always-present "New
+    // session" item, so without a fine hover pointer it is genuinely absent
+    // (display:none via `hidden`), NOT sr-only — an sr-only pencil would stay
+    // focusable and announce a duplicate "New session" alongside the kebab's
+    // item. On hover+fine it is display-flex, revealed on hover/focus by the
+    // overlay's opacity. The kebab (not this pencil) carries the touch a11y path.
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     renderSidebar();
 
-    // Pencil stays in the tree but is hidden below the md breakpoint.
-    expect(screen.getByTestId("project-new-session")).toHaveClass("max-md:hidden");
+    const pencil = screen.getByTestId("project-new-session");
+    expect(pencil).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:flex");
+    // Genuinely absent on touch — not merely clipped — so it leaves the a11y
+    // tree and tab order, unlike the kebab.
+    // Separate assertions: toHaveClass with multiple classes only fails when
+    // ALL are present, so a partial regression (e.g. adding just `sr-only`)
+    // would slip past a combined negation while clipping the pencil invisible
+    // on hover+fine.
+    expect(pencil).not.toHaveClass("sr-only");
+    expect(pencil).not.toHaveClass("focus-visible:not-sr-only");
 
-    // Open the kebab → a mobile-only "New session" item linking to the same
-    // pre-filed composer.
+    // The menu remains a touch/long-press fallback even when the hover shortcut
+    // is eligible, because a touchscreen tap cannot reveal that shortcut first.
     fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
       button: 0,
       ctrlKey: false,
     });
     const menuItem = await screen.findByTestId("project-new-session-menu");
-    expect(menuItem).toHaveClass("md:hidden");
+    for (const hiddenClass of [
+      "hidden",
+      "md:hidden",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:hidden",
+    ]) {
+      expect(menuItem).not.toHaveClass(hiddenClass);
+    }
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
+  });
+
+  it("keeps the project kebab off the row but reachable without a fine hover pointer", () => {
+    // jsdom can't evaluate @media, so the capability contract is asserted via
+    // classes; the recorded demo is the behavioral guardrail. The base classes
+    // stand for every pointer lacking fine hover — a 390px phone and an 810px
+    // unfolded foldable alike (coarse, hover:none) — where the kebab is
+    // sr-only: absent from the row, zero layout, yet in the a11y tree.
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    const kebab = screen.getByTestId("project-actions");
+    // sr-only at rest; revealed only where a fine hover pointer exists, at ANY
+    // width — no md gate that would drop it on a narrow hover desktop.
+    expect(kebab).toHaveClass(
+      "sr-only",
+      "[@media((hover:hover)_and_(pointer:fine))]:not-sr-only",
+      "[@media((hover:hover)_and_(pointer:fine))]:flex",
+    );
+    // Never display:none — that would strip it from the a11y tree and tab order
+    // on touch, where the long-press contextmenu isn't reliably dispatched.
+    expect(kebab).not.toHaveClass("hidden");
+    // Keyboard focus un-clips it (`:focus-visible` isn't raised by a touch tap),
+    // so a sighted keyboard/switch user on a touchscreen laptop gets a visible
+    // focus ring instead of one clipped off-screen.
+    expect(kebab).toHaveClass("focus-visible:not-sr-only");
+    // No un-capability-gated display utility at md would re-expose it on a wide
+    // touch screen (the reported foldable bug) — broader than the one literal.
+    for (const cls of kebab.classList) {
+      expect(cls).not.toMatch(
+        /^md:(flex|inline-flex|block|inline-block|inline|grid|inline-grid|table|contents|flow-root)$/,
+      );
+    }
+  });
+
+  it("gives the touch kebab the sr-only (not display:none) class contract", () => {
+    // The touch/coarse case (390px and 810px). No CSS is loaded in jsdom, so a
+    // display:none button is equally findable/focusable here — the meaningful
+    // guard is the class contract: sr-only (kept in the a11y tree, unlike
+    // `hidden`) plus focus-visible:not-sr-only (a focused control becomes
+    // visible). The demo is the behavioral guardrail for the effective render.
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    const kebab = screen.getByRole("button", { name: "Project actions for Customer X" });
+    expect(kebab).toHaveClass("sr-only", "focus-visible:not-sr-only");
+    expect(kebab).not.toHaveClass("hidden");
+  });
+
+  it("reveals the folder kebab on hover at every width, narrow hover desktops included", () => {
+    // The regression case: a fine-pointer, hover-capable desktop narrower than
+    // md (~500px window) and a wide 1280px desktop share one gate. The reveal
+    // keys off the pointer capability alone (no md), so hover brings the kebab
+    // back at any width instead of stranding a mouse-only user in a narrow
+    // window. jsdom can't evaluate @media; the demo shows the effective reveal.
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_running", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    const kebab = screen.getByTestId("project-actions");
+    const revealWrapper = kebab.closest("div[class*=transition-opacity]")!;
+    // Opacity reveal is capability-gated with NO md: hidden at rest, shown on
+    // hover, at every width for a fine hover pointer.
+    expect(revealWrapper).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-100",
+    );
+    for (const cls of revealWrapper.classList) {
+      expect(cls).not.toMatch(/:md:opacity-0$/);
+    }
+    // A collapsed folder (marker shown) protects that marker from the kebab's
+    // at-rest hit target with the same capability-only (no md) gate, so a
+    // narrow hover desktop doesn't let an invisible control swallow the tap.
+    const outerBox = kebab.closest("div[class*=absolute]")!;
+    expect(outerBox).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:pointer-events-none",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:pointer-events-auto",
+    );
+    for (const cls of outerBox.classList) {
+      expect(cls).not.toMatch(/:md:pointer-events-none$/);
+    }
   });
 });
 
@@ -1816,10 +2091,30 @@ describe("Sidebar collapsed project marker", () => {
     // Fixed centered box so the dot centers on the same vertical line as the
     // rows' dots.
     expect(slot).toHaveClass("w-6", "justify-center");
-    // Folder headers use px-2, so on desktop the slot trims the trailing
-    // padding to the rows' right-1 (4px) edge. (The header also carries a
-    // kebab, so the mobile reserve is mr-14 and the -mr-1 is md-gated.)
-    expect(slot).toHaveClass("md:-mr-1");
+    // Hover-only controls never reserve a rest column, keeping the marker at
+    // the rows' right edge.
+    expect(slot).toHaveClass("-mr-1");
+    expect(slot).not.toHaveClass("mr-14");
+    expect(slot).not.toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1");
+    // The hover-driven fades track the fine-hover reveal (hover only exists on
+    // fine), so they stay pointer-gated with no md.
+    expect(slot).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0",
+    );
+    // The focus-within fade tracks the pointer-UNgated focus-visible reveal, so
+    // it is ungated too: a coarse-pointer tablet + keyboard can focus the kebab,
+    // and the spinner must clear there as well or the revealed kebab overlaps
+    // it. Asserted separately below (it must NOT carry the pointer/hover gate).
+    expect(slot).toHaveClass("group-has-[[data-header-controls]:focus-within]/header:opacity-0");
+    expect(slot).not.toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
+    );
+    // No width-gated fade survives for a hover-only action — that mismatch is
+    // the narrow-hover overlap regression.
+    for (const cls of slot.classList) {
+      expect(cls).not.toMatch(/:md:group-(hover|has-).*opacity-0$/);
+    }
   });
 
   // The "awaiting" pill is wider than the dot markers; constraining it to the

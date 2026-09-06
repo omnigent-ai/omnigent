@@ -55,6 +55,11 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
     isLoading: false,
   })),
 }));
+// AppShell reads the GitHub info to gate the rail's GitHub tab; keep it
+// loading here so no network-backed query fires.
+vi.mock("@/hooks/useGithub", () => ({
+  useGithubInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
+}));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module — childSessionsQueryKey, MAX_TREE_DEPTH, and
   // cachedTreeContains (which reads the query cache seeded below) stay

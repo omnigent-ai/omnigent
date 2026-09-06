@@ -888,6 +888,36 @@ def test_askquestion_preview_translates_to_web_form_shape() -> None:
     assert all(q["multiSelect"] is False for q in payload["questions"])
 
 
+def test_askquestion_payload_translates_allow_multiple_to_multiselect() -> None:
+    """cursor's ``allowMultiple`` flag becomes the web form's ``multiSelect``.
+
+    cursor marks a multi-select question with ``allowMultiple`` (proto
+    ``allow_multiple``); the web form renders checkboxes only when its own
+    ``multiSelect`` is true, so the flag must survive translation. Anything
+    other than a literal ``True`` (absent, false, or a truthy non-bool) stays
+    single-select.
+    """
+
+    def _payload_for(question_extra: dict[str, object]) -> dict[str, object]:
+        args: dict[str, object] = {
+            "questions": [
+                {
+                    "id": "features",
+                    "prompt": "Which features should I enable?",
+                    "options": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
+                    **question_extra,
+                }
+            ]
+        }
+        return cnp._askquestion_payload(args)["questions"][0]
+
+    assert _payload_for({"allowMultiple": True})["multiSelect"] is True
+    assert _payload_for({"allowMultiple": False})["multiSelect"] is False
+    assert _payload_for({})["multiSelect"] is False
+    # A stray string is not a multi-select marker.
+    assert _payload_for({"allowMultiple": "yes"})["multiSelect"] is False
+
+
 def test_askquestion_keystrokes_navigate_to_chosen_options() -> None:
     """Chosen labels map to Down-navigation + Space + Enter per question."""
     # First option of each question (index 0): just Space + Enter.
@@ -906,6 +936,27 @@ def test_askquestion_keystrokes_navigate_to_chosen_options() -> None:
         {"demo_topic": "A workflow/planning question", "demo_depth": "Detailed"},
     )
     assert keys == ["Down", "Space", "Enter", "Down", "Space", "Enter"]
+
+
+def test_askquestion_keystrokes_toggle_every_option_of_a_multiselect_answer() -> None:
+    """A list answer Space-toggles each chosen option before advancing.
+
+    A multi-select answer arrives as a list of labels; the picker must toggle
+    every one (Down to each row in ascending order, Space on each) and only
+    then press Enter.
+    """
+    keys = cnp._askquestion_keystrokes(
+        _ASKQUESTION_ARGS,
+        {
+            "demo_topic": [
+                "A coding-related question (Recommended)",
+                "A fun preference question",
+            ],
+            "demo_depth": "Brief (Recommended)",
+        },
+    )
+    # Q1: Space on row 0, Down twice to row 2, Space; Enter. Q2: Space, Enter.
+    assert keys == ["Space", "Down", "Down", "Space", "Enter", "Space", "Enter"]
 
 
 def test_askquestion_keystrokes_types_into_other_row_for_custom_answer() -> None:

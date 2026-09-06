@@ -17,9 +17,10 @@
 
 import { type ReactNode, useCallback, useEffect, useRef } from "react";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
-import { isSessionDeleting } from "@/hooks/useConversations";
+import { isSessionDeleting, markRecentlyCreated } from "@/hooks/useConversations";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
@@ -58,6 +59,7 @@ function applyItemsToCache(
   queryClient: QueryClient,
   items: SessionListWireItem[],
   activeId: string | undefined,
+  viewerId?: string | null,
 ): { missingIds: string[]; needsRefetch: boolean } {
   // Frames are full rows with explicit nulls; convert null → undefined so a
   // cleared field overlays the cache in the same shape GET /v1/sessions
@@ -88,10 +90,14 @@ function applyItemsToCache(
       missingHere,
       filters,
       isSessionDeleting,
+      viewerId,
     );
-    for (const id of inserted) {
-      const wire = itemsById.get(id);
-      if (wire?.project_id == null && !wire?.labels?.[PROJECT_LABEL_KEY]) foundAnywhere.add(id);
+    for (const row of inserted) {
+      if (row.project_id == null && !row.labels?.[PROJECT_LABEL_KEY]) foundAnywhere.add(row.id);
+      // Keep the new row in the list-fetch until the search index catches up,
+      // so the create-path refetch (or any reconcile) can't drop it before it's
+      // queryable — otherwise it flashes in and out. Mirrors the delete tombstone.
+      markRecentlyCreated(row);
     }
     if (next !== data) queryClient.setQueryData(key, next);
   }
@@ -336,6 +342,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             queryClient,
             frame.items,
             activeIdRef.current,
+            getCurrentUserId(),
           );
           // A watched id absent from every page is a new session whose sort
           // position we can't place locally. Membership-affecting deltas

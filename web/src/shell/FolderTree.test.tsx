@@ -4,7 +4,34 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+
+// Drive lazy-directory listings from a fixture so the tree's central
+// `useWorkspaceDirectories` controller resolves nested lazy dirs without a
+// network. `lazyChildren` maps a dir path to the entries the "runner" would
+// return; the hook returns a Map only for the paths the tree currently asks
+// for, so descending into a deeper level requires the shallower level's data
+// to already be present — exactly the incremental-widening path.
+const { lazyChildren, lazyErrors } = vi.hoisted(() => ({
+  lazyChildren: new Map<string, unknown[]>(),
+  lazyErrors: new Set<string>(),
+}));
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
+  useWorkspaceDirectories: (_c: string | undefined, dirPaths: string[]) => {
+    const map = new Map();
+    for (const p of dirPaths) {
+      const errored = lazyErrors.has(p);
+      map.set(p, {
+        data: lazyChildren.get(p),
+        isLoading: !errored && !lazyChildren.has(p),
+        isError: errored,
+      });
+    }
+    return map;
+  },
+}));
 import { RunnerOfflineError, type WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import {
   ROW_ACTION_SIZE_CLASS,
   ROW_META_SLOT_CLASS,
@@ -267,5 +294,92 @@ describe("FolderTree double-click to open a folder", () => {
     fireEvent.doubleClick(folder);
 
     expect(folder).toBeInTheDocument();
+  });
+});
+
+describe("FolderTree nested lazy loading", () => {
+  beforeEach(() => {
+    lazyChildren.clear();
+    lazyErrors.clear();
+  });
+
+  it("shows an error row when a lazy directory's listing fails", async () => {
+    lazyErrors.add("src");
+    renderTree({ files: [dir("src")], conversationId: "conv_lazy_error" });
+
+    fireEvent.click(screen.getByRole("button", { name: "src/" }));
+
+    expect(await screen.findByText("Failed to load this folder.")).toBeInTheDocument();
+  });
+
+  it("loads a deep lazy level on a restored multi-level expansion (no per-level clicks)", async () => {
+    // Regression guard for B1. The bug only shows on RESTORE/RE-ROOT, where a
+    // multi-level expansion is seeded at once rather than clicked open level by
+    // level — interactive expansion masks it, because each click mutates
+    // expandedPaths and re-runs the fetch-set computation anyway. Here we build
+    // the expansion with clicks (which caches src + src/deep as expanded), then
+    // REMOUNT: the fresh tree seeds both expanded paths from the cache in one
+    // shot, and its fetch set starts from nothing. The controller must widen
+    // past the first level on its own as src's listing lands, or src/deep never
+    // fetches and renders as an empty folder. A fetch-set computation that
+    // ignores freshly-arrived data resolves only src and leaves leaf.ts missing.
+    const conversationId = "conv_restore_deep";
+    lazyChildren.set("src", [dir("src/deep")]);
+    lazyChildren.set("src/deep", [file("src/deep/leaf.ts", 42)]);
+
+    const { unmount } = renderTree({ files: [dir("src")], conversationId });
+    fireEvent.click(screen.getByRole("button", { name: "src/" }));
+    fireEvent.click(await screen.findByRole("button", { name: "deep/" }));
+    expect(await screen.findByText("leaf.ts")).toBeInTheDocument();
+
+    // Restore: remount the same conversation. Expansion comes back from the
+    // cache with no clicks; the deep level must fetch and render on its own.
+    unmount();
+    renderTree({ files: [dir("src")], conversationId });
+    expect(await screen.findByText("leaf.ts")).toBeInTheDocument();
+  });
+});
+
+describe("FolderTree default expansion on conversation switch", () => {
+  const baseProps = {
+    isLoading: false,
+    isError: false,
+    error: null,
+    onFileSelect: vi.fn(),
+    showHidden: false,
+    changedFiles: undefined,
+    sort: "alpha" as const,
+  };
+
+  it("seeds a switched-to conversation's expansion from its own files, not the previous one's", () => {
+    // Regression guard: FolderTree isn't keyed by conversation, so a switch
+    // re-renders the same instance and a layout effect seeds the new
+    // conversation's default-expansion cache. The All-files query intentionally
+    // drops cross-key placeholderData, so on a real switch `files` goes
+    // undefined before the new conversation's list arrives — the effect must
+    // early-return on that undefined frame and then seed defaults from the NEW
+    // conversation's files. (A cross-key placeholder would instead leave the
+    // previous conversation's files on screen under the new key, seeding it
+    // with the wrong auto-expanded folders for the rest of the session.)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = (conversationId: string, files: WorkspaceFile[] | undefined) => (
+      <QueryClientProvider client={client}>
+        <FolderTree {...baseProps} conversationId={conversationId} files={files} />
+      </QueryClientProvider>
+    );
+
+    // Conversation A: a nested file makes its intermediate dir auto-expand.
+    const { rerender } = render(view("conv_A", [file("alpha/a.ts")]));
+    expect(screen.getByText("a.ts")).toBeInTheDocument();
+
+    // Switch to B: with no cross-key placeholder the files blank to undefined
+    // first, then B's real files arrive.
+    rerender(view("conv_B", undefined));
+    rerender(view("conv_B", [file("beta/b.ts")]));
+
+    // B auto-expands its OWN nested dir; A's folder is gone entirely.
+    expect(screen.getByText("b.ts")).toBeInTheDocument();
+    expect(screen.queryByText("a.ts")).toBeNull();
+    expect(screen.getByRole("button", { name: "beta/" })).toHaveAttribute("aria-expanded", "true");
   });
 });

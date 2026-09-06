@@ -1753,7 +1753,7 @@ def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     captured = capsys.readouterr()
     assert exit_code == 0
     result = json.loads(captured.out)
-    assert result["hookSpecificOutput"]["permissionDecision"] == "deny", result
+    assert result["hookSpecificOutput"]["permissionDecision"] == "ask", result
     assert result["hookSpecificOutput"]["permissionDecisionReason"]
 
 
@@ -2112,9 +2112,9 @@ def test_evaluate_policy_fails_closed_when_reauth_unavailable(
     captured = capsys.readouterr()
     assert exit_code == 0
     result = json.loads(captured.out)
-    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert result["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert result["hookSpecificOutput"]["permissionDecisionReason"].startswith(
-        native_policy_hook._EVAL_UNAVAILABLE_REASON
+        native_policy_hook._EVAL_UNAVAILABLE_ASK_REASON
     )
 
 

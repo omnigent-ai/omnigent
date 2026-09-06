@@ -6,6 +6,14 @@ from dataclasses import dataclass
 from enum import Enum
 
 
+def concrete_reported_model(value: object) -> str | None:
+    """Keep model reports verbatim, excluding Claude Code's local-error marker."""
+    if not isinstance(value, str):
+        return None
+    model = value.strip()
+    return model if model and model != "<synthetic>" else None
+
+
 class ModelIntent(str, Enum):
     """Stable purpose requested by a model-selection caller."""
 

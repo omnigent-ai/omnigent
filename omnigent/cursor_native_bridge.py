@@ -125,6 +125,28 @@ def _ensure_dir(path: Path) -> None:
         os.chmod(path, 0o700)
 
 
+def _ensure_secure_bridge_dir(bridge_dir: Path) -> None:
+    """Create/validate *bridge_dir* as an owner-only chain before writing secrets.
+
+    ``_ensure_dir`` only ``mkdir(parents=True, exist_ok=True)`` + a suppressed
+    ``chmod`` on the leaf: it trusts pre-existing ancestors, so on a shared host
+    an attacker could pre-create ``$TMPDIR/omnigent-<uid>`` (or a deeper ancestor)
+    as a symlink / world-writable dir and redirect the bridge tree. That tree now
+    holds ``bridge.json`` — a bearer token for the relay's localhost control
+    endpoint — so its directory must be hardened. Delegate to the same
+    ``_ensure_secure_dir`` the shared relay (``start_tool_relay``) already applies
+    to token-bearing trees; it rejects symlinked / non-owned / group-or-other
+    accessible ancestors (the cursor-native root is in its allowlist). Lazy import
+    avoids a cycle (``claude_native_bridge`` resolves cursor's ``bridge_root``
+    lazily in turn).
+
+    :raises RuntimeError: If any ancestor fails owner-only validation.
+    """
+    from omnigent.claude_native_bridge import _ensure_secure_dir
+
+    _ensure_secure_dir(bridge_dir)
+
+
 #: File the runner drops into a fork's bridge dir holding the prior-conversation
 #: text preamble, consumed once by the executor on the first injected message.
 #: cursor's conversation is server-backed (a synthesized local store.db is NOT
@@ -287,8 +309,12 @@ def build_mcp_config(
 
 
 def write_mcp_bridge_config(bridge_dir: Path) -> None:
-    """Write the token config required by the shared Omnigent MCP bridge."""
-    _ensure_dir(bridge_dir)
+    """Write the token config required by the shared Omnigent MCP bridge.
+
+    :raises RuntimeError: If the bridge dir fails owner-only validation
+        (:func:`_ensure_secure_bridge_dir`) — the token is not written.
+    """
+    _ensure_secure_bridge_dir(bridge_dir)
     config_path = bridge_dir / _BRIDGE_CONFIG_FILE
     if config_path.exists():
         return

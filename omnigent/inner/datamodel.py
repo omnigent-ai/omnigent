@@ -577,6 +577,9 @@ class OSEnvSandboxSpec:
     # Matching is by basename, so an entry ``".venv"`` allows
     # ``cwd/.venv``,
     # ``cwd/services/api/.venv``, and ``<read_path>/.venv`` alike.
+    # The explicit entry ``"*"`` allows every dotpath while the
+    # escaping-symlink defense remains active. Use it only for trusted
+    # roots whose hidden files must persist across helper invocations.
     # ``None`` means "use the backend's documented default" (both
     # bwrap and seatbelt expand ``None`` to ``[".venv"]`` so a
     # typical Python project keeps working out of the box). An empty

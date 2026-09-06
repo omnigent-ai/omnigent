@@ -67,3 +67,22 @@ def test_require_json_object_reports_empty_body_without_content_type() -> None:
     assert "status=200" in message
     assert "no content-type header" in message
     assert "<empty body>" in message
+
+
+def test_raise_for_status_429_raises_rate_limited_error() -> None:
+    """HTTP 429 maps to the typed transient error, not the base class.
+
+    Callers that absorb momentary rate-limits (e.g. the resume
+    picker's bounded session-list retry) need to catch exactly the
+    transient case without also swallowing 4xx client bugs.
+    """
+    from omnigent_client._errors import RateLimitedError, raise_for_status
+
+    body = {"error": {"code": "rate_limited", "message": "rate limited"}}
+    with pytest.raises(RateLimitedError) as exc_info:
+        raise_for_status(429, body)
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.code == "rate_limited"
+    # Still an OmnigentError, so existing broad handlers keep working.
+    assert isinstance(exc_info.value, OmnigentError)

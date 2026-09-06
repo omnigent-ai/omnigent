@@ -314,6 +314,13 @@ class ExecutorAdapter(HarnessApp):
                                 error=event.message,
                             )
                             agent_span = None
+                        # Keep any usage the executor observed before the
+                        # failure: the scaffold's terminal-event builder reads
+                        # ctx.provider_usage, so the response.failed event still
+                        # carries context_tokens and the occupancy meter doesn't
+                        # freeze at the previous turn's value.
+                        if event.usage is not None:
+                            ctx.provider_usage = event.usage
                         # Guard: empty message surfaces as "inner executor error: " with no detail.
                         detail = event.message or "no detail reported (see runner/harness logs)"
                         raise RuntimeError(f"inner executor error: {detail}")

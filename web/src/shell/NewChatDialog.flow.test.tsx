@@ -8,6 +8,7 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { clearOptimisticTitles, getOptimisticTitle } from "@/lib/optimisticTitles";
 import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -267,6 +268,7 @@ beforeEach(() => {
   // Clear the module-level landing draft so a base branch (or other field)
   // left behind by an unmounting test doesn't seed the next one.
   resetLandingDraft();
+  clearOptimisticTitles();
   localStorage.clear();
   vi.mocked(useHostModelOptions).mockReturnValue({
     data: [
@@ -573,6 +575,26 @@ describe("NewChatLandingScreen create flow", () => {
         skill: null,
         files: [],
       }),
+    );
+    expect(navigateMock).toHaveBeenCalledWith("/c/conv_new");
+  });
+
+  it("stashes the first prompt as the session's optimistic label", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("  read the README\nand refactor  ");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    // The sidebar reads this while the server's seed title is still in
+    // flight — same whitespace-collapsed text the seed will carry, so the
+    // swap is invisible.
+    await waitFor(() =>
+      expect(getOptimisticTitle("conv_new")).toBe("read the README and refactor"),
     );
     expect(navigateMock).toHaveBeenCalledWith("/c/conv_new");
   });

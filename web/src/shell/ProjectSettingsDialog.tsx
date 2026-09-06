@@ -4,12 +4,13 @@
 // isolated-worktree default when starting a session in the project.
 //
 // Scope mirrors what the composer prefills today: host, workspace, agent,
-// whether new sessions start in a fresh git worktree, and the base branch a
+// whether new sessions start in a fresh git worktree, the base branch a
 // worktree forks from (which overrides the user-global default in Settings ›
-// Git). Model / reasoning-effort / harness are per-agent run config,
-// deliberately out of scope here. The host and agent pickers reuse the
-// composer's components; the working directory reuses its filesystem browser
-// (inline, so it scrolls inside the modal).
+// Git), and — when the default agent is a native harness with a model choice
+// (Claude Code / Codex) — a default model for new sessions. Reasoning-effort /
+// harness stay per-agent run config, out of scope here. The host and agent
+// pickers reuse the composer's components; the working directory reuses its
+// filesystem browser (inline, so it scrolls inside the modal).
 // Fields are optional: an unset one stores no default (an absent key), and an
 // all-default dialog stores an empty config.
 
@@ -34,13 +35,18 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { useHosts } from "@/hooks/useHosts";
+import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { selectableSessionAgents } from "@/lib/agentGrouping";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
-import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
+import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import {
+  isNativeCodingAgent,
+  nativeAgentHasCapability,
+  nativeCodingAgentForAvailableAgent,
+} from "@/lib/nativeCodingAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { AgentHarnessPicker } from "./NewChatDialog";
@@ -131,6 +137,9 @@ export function ProjectSettingsDialog({
   // alongside the worktree default, but kept independent so it survives toggling.
   const [baseBranch, setBaseBranch] = useState("");
   const [agentId, setAgentId] = useState<string | null>(null);
+  // Default model for new sessions, only meaningful when the default agent is
+  // a native harness with a model choice; NONE stores no default (unset key).
+  const [model, setModel] = useState<string>(NONE);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
 
   // The agent picker and the host Select portal their dropdowns OUTSIDE
@@ -176,6 +185,7 @@ export function ProjectSettingsDialog({
     setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
+    setModel(c.model ?? NONE);
     setWorkspaceOpen(false);
   }, [open, stored, loadFailed]);
 
@@ -209,6 +219,15 @@ export function ProjectSettingsDialog({
     const base = useWorktree ? trimOrUndef(baseBranch) : undefined;
     if (base) config.base_branch = base;
     else delete config.base_branch;
+    // A model default is only meaningful for an agent whose harness takes a
+    // model override — drop it otherwise so a stale alias can't linger after
+    // the default agent changes to one without a model choice. While the
+    // stored default agent hasn't resolved from discovery yet, its capability
+    // is unknowable — keep the stored model (already in the spread) so an
+    // unrelated save during that window can't silently delete a valid default.
+    const agentUnresolved = agentId != null && selectedAgent === null;
+    if (supportsModelDefault && model !== NONE) config.model = model;
+    else if (!agentUnresolved) delete config.model;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
@@ -241,6 +260,45 @@ export function ProjectSettingsDialog({
   const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
   const selectedAgent = agentList.find((a) => a.id === agentId) ?? null;
   const agentLabel = selectedAgent ? selectedAgent.display_name : "No default";
+  // Model default is offered for harnesses whose create call carries a model
+  // override — the declared modelPicker capability, plus Codex, whose picker
+  // is host-resolved rather than capability-flagged (mirrors the composer's
+  // model_override gate in NewChatDialog).
+  const selectedNativeSpec = nativeCodingAgentForAvailableAgent(selectedAgent);
+  const harnessTakesModel =
+    nativeAgentHasCapability(selectedAgent, "modelPicker") ||
+    selectedNativeSpec?.harness === "codex-native";
+  // Live host-resolved model options. The project's default host when set,
+  // else the first online host (the composer's auto-pick) — without the
+  // fallback a Codex project (no static catalog) could never populate the
+  // picker unless a host default was also stored.
+  const modelCatalogHostId = browsableHostId ?? onlineHosts[0]?.host_id ?? null;
+  const { data: hostModelOptions } = useHostModelOptions(
+    modelCatalogHostId,
+    selectedNativeSpec?.harness ?? "",
+    harnessTakesModel && modelCatalogHostId !== null,
+  );
+  const modelOptions = useMemo(() => {
+    const live = (hostModelOptions ?? []).map((o) => ({
+      id: o.id,
+      label: o.displayName ?? o.id,
+    }));
+    if (live.length > 0) return live;
+    return selectedNativeSpec?.harness === "claude-native"
+      ? CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }))
+      : [];
+  }, [hostModelOptions, selectedNativeSpec]);
+  // Keep a stored model the current options don't list as a labeled fallback
+  // item, so opening + saving the dialog doesn't silently drop the default.
+  const storedModelMissing = model !== NONE && !modelOptions.some((m) => m.id === model);
+  // With no catalog resolved and nothing stored, the select could only offer
+  // "No default" — an action it can't perform. Degrade honestly (documented
+  // catalog gap for host-resolved harnesses): disable it and say why, rather
+  // than hide the field the harness legitimately supports.
+  const modelPickerEmpty = modelOptions.length === 0 && model === NONE;
+  // Offer the control only for a model-taking harness; when it can only render
+  // "No default" it stays visible but disabled with an explanatory hint.
+  const supportsModelDefault = harnessTakesModel;
   // The host the agent picker's readiness badges check against (its config
   // hints show whether a harness is set up there). Null when no concrete host.
   const warningHost = onlineHosts.find((h) => h.host_id === browsableHostId) ?? null;
@@ -421,7 +479,12 @@ export function ProjectSettingsDialog({
                 agentLabel={agentLabel}
                 hasAgents={agentList.length > 0}
                 host={warningHost}
-                onSelectAgent={(a) => setAgentId(a.id)}
+                onSelectAgent={(a) => {
+                  // A model default belongs to the picked harness's vocab —
+                  // don't carry an alias onto a different agent.
+                  if (a.id !== agentId) setModel(NONE);
+                  setAgentId(a.id);
+                }}
                 pendingAgent={null}
                 pendingAgentId="__unused_pending_agent__"
                 onSelectPending={() => {}}
@@ -453,13 +516,47 @@ export function ProjectSettingsDialog({
                   variant="ghost"
                   size="sm"
                   className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
-                  onClick={() => setAgentId(null)}
+                  onClick={() => {
+                    setAgentId(null);
+                    setModel(NONE);
+                  }}
                 >
                   Clear
                 </Button>
               )}
             </div>
           </Field>
+
+          {supportsModelDefault && (
+            <Field
+              label="Model"
+              hint={
+                modelPickerEmpty
+                  ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
+                  : "Default model for new sessions with this agent"
+              }
+            >
+              <Select
+                value={model}
+                onValueChange={setModel}
+                onOpenChange={onDropdownOpenChange}
+                disabled={isLoading || modelPickerEmpty}
+              >
+                <SelectTrigger className="w-full" data-testid="project-settings-model">
+                  <SelectValue placeholder="No default" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NONE}>No default</SelectItem>
+                  {modelOptions.map((m) => (
+                    <SelectItem key={m.id} value={m.id}>
+                      {m.label}
+                    </SelectItem>
+                  ))}
+                  {storedModelMissing && <SelectItem value={model}>{model}</SelectItem>}
+                </SelectContent>
+              </Select>
+            </Field>
+          )}
 
           {loadFailed && (
             <p

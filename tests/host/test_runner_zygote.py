@@ -32,6 +32,10 @@ from omnigent.runner._zygote import (
     _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR,
     _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR,
     _disk_build_stamp,
+    _GraphStamp,
+    _package_source_stamps,
+    _source_file_stamps,
+    _source_files_match,
     _ZygoteServer,
 )
 
@@ -95,10 +99,16 @@ def test_import_graph_is_single_threaded() -> None:
     probe = "\n".join(
         [
             "from omnigent.runner._zygote import _import_runner_graph",
+            "import sys",
             "import threading",
             "_import_runner_graph()",
             "print(threading.active_count())",
             "print([t.name for t in threading.enumerate()])",
+            "print(all(name in sys.modules for name in (",
+            "    'omnigent.runner.background_titles.claude_native',",
+            "    'omnigent.runner.background_titles.codex_native',",
+            "    'omnigent.runner.background_titles.sdk',",
+            ")))",
         ]
     )
     result = subprocess.run(
@@ -108,8 +118,9 @@ def test_import_graph_is_single_threaded() -> None:
         timeout=120,
     )
     assert result.returncode == 0, result.stderr
-    first_line = result.stdout.strip().splitlines()[0]
-    assert first_line == "1", result.stdout
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == "1", result.stdout
+    assert lines[-1] == "True", result.stdout
 
 
 def test_manager_starts_and_pings(manager: ZygoteManager) -> None:
@@ -514,6 +525,36 @@ def test_disk_build_stamp_resolves_package_dir_without_top_level_file(monkeypatc
     assert probed == [Path(_zygote.__file__).resolve().parents[1] / "_build_info.py"]
 
 
+def test_package_source_stamps_include_lazy_modules(tmp_path) -> None:
+    """The source baseline covers modules that the imported graph has not loaded."""
+    package_dir = tmp_path / "omnigent"
+    lazy_module = package_dir / "provider" / "lazy.py"
+    lazy_module.parent.mkdir(parents=True)
+    lazy_module.write_text("VALUE = 1\n")
+
+    stamps = _package_source_stamps(package_dir)
+
+    assert stamps is not None
+    assert [stamp.path for stamp in stamps] == [lazy_module]
+
+
+def test_source_stamps_ignore_metadata_only_changes(tmp_path) -> None:
+    """Permission changes do not force direct spawning when source is unchanged."""
+    source = tmp_path / "module.py"
+    source.write_text("VALUE = 1\n")
+    stamps = _source_file_stamps([source])
+    assert stamps is not None
+
+    source.chmod(source.stat().st_mode ^ 0o100)
+
+    assert _source_files_match(stamps)
+
+
+def test_source_stamp_capture_fails_closed_for_missing_file(tmp_path) -> None:
+    """An unreadable baseline is represented as incomplete rather than omitted."""
+    assert _source_file_stamps([tmp_path / "missing.py"]) is None
+
+
 def _dispatch_fork(
     server: _ZygoteServer, conn: socket.socket, peer: socket.socket, cmd: str
 ) -> dict:
@@ -548,12 +589,15 @@ def test_fork_refused_after_in_place_upgrade(monkeypatch, cmd, kind) -> None:
     """
     daemon, daemon_peer = socket.socketpair()
     conn, peer = socket.socketpair()
-    server = _ZygoteServer(daemon, graph_stamp=(1000.0, "oldsha"))
+    server = _ZygoteServer(
+        daemon,
+        graph_stamp=_GraphStamp(build=(1000.0, "oldsha"), sources=()),
+    )
     monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (2000.0, "newsha"))
     monkeypatch.setattr(os, "fork", lambda: pytest.fail(f"must not fork a mixed-version {kind}"))
     try:
         reply = _dispatch_fork(server, conn, peer, cmd)
-        assert "upgraded on disk" in reply["error"]
+        assert "changed on disk" in reply["error"]
         assert kind in reply["error"]
         assert server._live == set()
     finally:
@@ -574,13 +618,67 @@ def test_fork_proceeds_while_disk_stamp_matches(monkeypatch, cmd) -> None:
     """
     daemon, daemon_peer = socket.socketpair()
     conn, peer = socket.socketpair()
-    server = _ZygoteServer(daemon, graph_stamp=(1000.0, "sha"))
+    server = _ZygoteServer(
+        daemon,
+        graph_stamp=_GraphStamp(build=(1000.0, "sha"), sources=()),
+    )
     monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (1000.0, "sha"))
     monkeypatch.setattr(os, "fork", lambda: 4242)
     try:
         reply = _dispatch_fork(server, conn, peer, cmd)
         assert reply == {"pid": 4242}
         assert 4242 in server._live
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
+
+
+@pytest.mark.parametrize(("cmd", "kind"), [("fork", "runner"), ("fork_harness", "harness")])
+def test_fork_refused_after_source_change_with_stale_build_info(
+    monkeypatch, tmp_path, cmd, kind
+) -> None:
+    """Changed package source refuses a fork even when build metadata is stale."""
+    source = tmp_path / "service.py"
+    source.write_text("old = True\n")
+    graph_stamp = _GraphStamp(
+        build=(1000.0, "stale-sha"),
+        sources=_source_file_stamps([source]),
+    )
+    source.write_text("new = True\n")
+
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(daemon, graph_stamp=graph_stamp)
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (1000.0, "stale-sha"))
+    monkeypatch.setattr(os, "fork", lambda: pytest.fail(f"must not fork a mixed-version {kind}"))
+    try:
+        reply = _dispatch_fork(server, conn, peer, cmd)
+        assert "changed on disk" in reply["error"]
+        assert kind in reply["error"]
+        assert server._live == set()
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
+
+
+@pytest.mark.parametrize(("cmd", "kind"), [("fork", "runner"), ("fork_harness", "harness")])
+def test_fork_refused_when_source_baseline_is_incomplete(monkeypatch, cmd, kind) -> None:
+    """An incomplete initial source baseline fails closed onto direct spawning."""
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(
+        daemon,
+        graph_stamp=_GraphStamp(build=(1000.0, "sha"), sources=None),
+    )
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (1000.0, "sha"))
+    monkeypatch.setattr(os, "fork", lambda: pytest.fail(f"must not fork a mixed-version {kind}"))
+    try:
+        reply = _dispatch_fork(server, conn, peer, cmd)
+        assert "changed on disk" in reply["error"]
+        assert kind in reply["error"]
+        assert server._live == set()
     finally:
         server._sel.close()
         for sock in (daemon, daemon_peer, conn, peer):

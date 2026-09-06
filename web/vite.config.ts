@@ -248,6 +248,13 @@ export default defineConfig({
         "src/**/*StoryFixtures.{ts,tsx}",
         // Vendored UI kit, not product code (see tests/e2e_ui/COVERAGE_GAPS.md).
         "src/components/ai-elements/**",
+        // Onboarding wizard pieces with no jsdom-testable logic: the WebGL2
+        // shader + its canvas wrapper (no GL context in jsdom) and the Electron
+        // entry (createRoot against the preload bridge). The flow's real logic
+        // (steps, URL normalization) stays counted and is unit-tested.
+        "src/components/onboarding/PixelBlast.tsx",
+        "src/components/onboarding/AnimatedOmnigentPanel.tsx",
+        "src/server-selector-v2.tsx",
       ],
       reportsDirectory: "./coverage",
       // text-summary: human-readable console line; json-summary: machine-

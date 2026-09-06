@@ -1,5 +1,6 @@
 import type { Conversation } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
@@ -157,6 +158,9 @@ export function getConversationAgentType(conversation: Conversation): string {
 
 export function conversationDisplayLabel(conversation: Conversation): string {
   if (conversation.title) return conversation.title;
+  // Just-created session: its first prompt stands in until a real title lands.
+  const optimistic = getOptimisticTitle(conversation.id);
+  if (optimistic !== undefined) return optimistic;
   const label = nativeWrapperLabel(conversation);
   if (label !== null) return label;
   return UNTITLED_CONVERSATION_LABEL;

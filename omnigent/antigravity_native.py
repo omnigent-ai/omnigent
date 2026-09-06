@@ -1159,6 +1159,7 @@ async def _attach_terminal(
                 attach_url=_attach_url(base_url, prepared.session_id, prepared.terminal_id),
                 headers=headers,
                 recover=recover,
+                session_name="Antigravity",
                 base_url=base_url,
                 session_id=prepared.session_id,
                 terminal_id=prepared.terminal_id,

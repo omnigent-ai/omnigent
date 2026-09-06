@@ -331,11 +331,17 @@ def test_build_wheels_requests_the_spa_archive_outside_the_wheel(
     deploy_mod._build_wheels(skip_web_ui=False)
     assert captured["EXTERNALIZE_WEB_UI"] == "1"
     assert "SKIP_WEB_UI" not in captured
+    assert "OMNIGENT_ENABLE_CANVAS" not in captured
 
     captured.clear()
-    deploy_mod._build_wheels(skip_web_ui=True)
+    deploy_mod._build_wheels(skip_web_ui=False, enable_canvas=True)
+    assert captured["OMNIGENT_ENABLE_CANVAS"] == "1"
+
+    captured.clear()
+    deploy_mod._build_wheels(skip_web_ui=True, enable_canvas=True)
     assert captured["SKIP_WEB_UI"] == "1"
     assert "EXTERNALIZE_WEB_UI" not in captured
+    assert "OMNIGENT_ENABLE_CANVAS" not in captured
 
 
 def test_build_wheels_mode_ignores_the_ambient_environment(
@@ -361,10 +367,12 @@ def test_build_wheels_mode_ignores_the_ambient_environment(
 
     monkeypatch.setenv("SKIP_WEB_UI", "1")
     monkeypatch.setenv("EXTERNALIZE_WEB_UI", "stale")
+    monkeypatch.setenv("OMNIGENT_ENABLE_CANVAS", "true")
 
     deploy_mod._build_wheels(skip_web_ui=False)
     assert "SKIP_WEB_UI" not in captured
     assert captured["EXTERNALIZE_WEB_UI"] == "1"
+    assert "OMNIGENT_ENABLE_CANVAS" not in captured
 
     captured.clear()
     deploy_mod._build_wheels(skip_web_ui=True)

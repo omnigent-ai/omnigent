@@ -377,6 +377,27 @@ describe("buildBubbles — bubble grouping", () => {
     ]);
   });
 
+  it("error block level reaches the render item", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_1" }),
+        content: [{ type: "input_text", text: "First" }],
+      },
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_info", responseId: "resp_1" }),
+        source: "harness",
+        code: "codex_thread_reset",
+        message: "Codex started a fresh thread.",
+        level: "info",
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    const asst = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    expect(asst.items[0]).toMatchObject({ kind: "error", level: "info" });
+  });
+
   it("compaction block becomes a standalone compaction bubble", () => {
     const blocks: AnyBlock[] = [
       {

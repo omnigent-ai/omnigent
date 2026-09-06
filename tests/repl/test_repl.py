@@ -11,6 +11,7 @@ tab) or an unrelated tool result to skip.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 from prompt_toolkit.document import Document
@@ -2822,6 +2823,166 @@ def test_sessions_adapter_session_id_surfaces_as_conversation_id() -> None:
     assert result == "conv_sess_abc123", (
         f"Expected adapter session_id to take precedence, got {result!r}."
     )
+
+
+@pytest.mark.asyncio
+async def test_sessions_adapter_retries_transient_elicitation_resolution() -> None:
+    """A transient resolve POST failure must not escape the event task.
+
+    The verdict may already have reached the server when the HTTP response
+    connection drops. Retrying is safe: a second successful POST completes
+    the elicitation, while an already-resolved response is handled by the
+    existing ``not_found`` branch.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import httpx
+    from omnigent_client import StreamHooks
+
+    client = MagicMock()
+    client.sessions.resolve_elicitation = AsyncMock(
+        side_effect=[httpx.ConnectError("connection dropped"), None],
+    )
+    adapter = _SessionsChatReplAdapter(
+        client=client,
+        agent_name="test-agent",
+        hooks=StreamHooks(on_elicitation_request=AsyncMock(return_value=True)),
+        session_id="conv_abc",
+    )
+    event = SimpleNamespace(
+        elicitation_id="elicit_abc",
+        message="approve?",
+        requested_schema={},
+        mode="form",
+        phase="tool_call",
+        policy_name="test-policy",
+        content_preview="",
+        url=None,
+    )
+
+    await adapter._handle_elicitation("conv_abc", event)
+
+    assert client.sessions.resolve_elicitation.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_sessions_adapter_contains_repeated_elicitation_transport_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Exhausted transport retries must not crash the REPL event loop."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import httpx
+    from omnigent_client import StreamHooks
+
+    client = MagicMock()
+    client.sessions.resolve_elicitation = AsyncMock(
+        side_effect=httpx.ConnectError("connection dropped"),
+    )
+    adapter = _SessionsChatReplAdapter(
+        client=client,
+        agent_name="test-agent",
+        hooks=StreamHooks(on_elicitation_request=AsyncMock(return_value=True)),
+        session_id="conv_abc",
+    )
+    event = SimpleNamespace(
+        elicitation_id="elicit_abc",
+        message="approve?",
+        requested_schema={},
+        mode="form",
+        phase="tool_call",
+        policy_name="test-policy",
+        content_preview="",
+        url=None,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="omnigent.repl._repl"):
+        await adapter._handle_elicitation("conv_abc", event)
+
+    assert client.sessions.resolve_elicitation.await_count == 3
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert [r.getMessage() for r in warnings] == [
+        "Could not resolve elicitation after transport retries"
+    ]
+    # No traceback on the WARNING: the REPL configures no handlers, so
+    # exc_info would reach ``logging.lastResort`` and paint ~15 lines over
+    # the TUI frame. The postmortem belongs on the DEBUG sibling.
+    assert warnings[0].exc_info is None
+    assert any(r.levelno == logging.DEBUG and r.exc_info is not None for r in caplog.records), (
+        "expected the traceback to survive on a DEBUG record"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sessions_adapter_surfaces_undeliverable_elicitation_verdict() -> None:
+    """An undeliverable verdict must reach the user, not just the log.
+
+    Exhausted retries leave the elicitation parked server-side, so the turn
+    waits on an answer that will never arrive. Without a rendered error the
+    user sits at an apparently live prompt with no idea their approval was
+    dropped.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import httpx
+    from omnigent_client import StreamHooks
+
+    client = MagicMock()
+    client.sessions.resolve_elicitation = AsyncMock(
+        side_effect=httpx.ConnectError("connection dropped"),
+    )
+    adapter = _SessionsChatReplAdapter(
+        client=client,
+        agent_name="test-agent",
+        hooks=StreamHooks(on_elicitation_request=AsyncMock(return_value=True)),
+        session_id="conv_abc",
+    )
+    rendered: list[object] = []
+    adapter._on_event = rendered.append
+    event = SimpleNamespace(
+        elicitation_id="elicit_abc",
+        message="approve?",
+        requested_schema={},
+        mode="form",
+        phase="tool_call",
+        policy_name="test-policy",
+        content_preview="",
+        url=None,
+    )
+
+    await adapter._handle_elicitation("conv_abc", event)
+
+    assert len(rendered) == 1, f"expected one rendered error event, got {rendered}"
+    emitted = rendered[0]
+    assert emitted.type == "response.error"
+    assert emitted.error.code == "elicitation_resolve_failed"
+    # Names the surface that can still answer: the terminal prompt is gone
+    # by now, so pointing the user back at it would be a dead end.
+    assert "web UI" in emitted.error.message
+    assert "still waiting" in emitted.error.message
+
+
+def test_is_recoverable_sse_transport_error_for_write_errors() -> None:
+    """A peer dropping the connection mid-request-send is transient too.
+
+    An aborted connection can surface on the write side (the request
+    body was still being sent) rather than the read side. Both are the
+    same transient interruption; write errors must classify as
+    recoverable so the elicitation-resolve retry covers them.
+    """
+    import httpcore
+    import httpx
+
+    assert _is_recoverable_sse_transport_error(httpx.WriteError("connection reset")), (
+        "httpx.WriteError must classify as recoverable — a mid-send "
+        "connection drop is the write-side twin of a read-side drop."
+    )
+    assert _is_recoverable_sse_transport_error(httpcore.WriteError("connection reset"))
+    assert _is_recoverable_sse_transport_error(httpx.WriteTimeout("write stalled"))
+    assert _is_recoverable_sse_transport_error(httpcore.WriteTimeout("write stalled"))
 
 
 def test_legacy_session_falls_back_to_conversation_id() -> None:

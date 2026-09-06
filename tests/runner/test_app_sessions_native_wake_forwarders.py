@@ -1189,3 +1189,258 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         )
     finally:
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+
+async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A thread codex cannot read falls back to a fresh thread on the same app-server.
+
+    The large-rollout incident shape: codex's thread-store rejects the
+    persisted rollout (``-32603 failed to read thread … invalid UTF-8``) on
+    every ``thread/resume``, so re-raising failed every turn of the session
+    for good. The fallback must keep the app-server, take the fresh-thread
+    path (discovery listener connected, TUI launched without the thread id,
+    discovery forwarder) and log the Codex-side context it drops.
+
+    :param tmp_path: Temporary directory for isolated bridge state.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Log capture for the fallback warning.
+    """
+    import omnigent.codex_native_app_server as codex_app_mod
+
+    session_id = "c8e3d2f1bb225c63c8d3a2e4f5b6c7d8"
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936d"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    posted: list[dict[str, Any]] = []
+
+    class _SnapshotServerClient:
+        """Server client whose snapshot carries a persisted resume thread."""
+
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            """
+            Return the session snapshot / items consumed by the helper.
+
+            :param url: Request path, e.g. ``"/v1/sessions/conv_..."``.
+            :param kwargs: Request keyword arguments (ignored).
+            :returns: HTTP 200 response carrying launch config or items.
+            """
+            del kwargs
+            if url == f"/v1/sessions/{session_id}/items":
+                return httpx.Response(
+                    200,
+                    json={"data": [], "has_more": False},
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                json={"external_session_id": thread_id},
+                request=httpx.Request("GET", url),
+            )
+
+        async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+            """
+            Record the notice the fallback posts and accept it.
+
+            :param url: Request path, e.g. ``"/v1/sessions/conv_.../events"``.
+            :param kwargs: Request keyword arguments (``json`` is the event body).
+            :returns: HTTP 202 acknowledgement.
+            """
+            posted.append({"url": url, "json": kwargs.get("json")})
+            return httpx.Response(
+                202,
+                json={"queued": False, "item_id": "notice_1"},
+                request=httpx.Request("POST", url),
+            )
+
+    closed: list[str] = []
+
+    class _FakeCodexAppServer:
+        """Minimal app-server recording whether it was closed."""
+
+        codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
+
+        def __init__(self) -> None:
+            """:returns: None."""
+            self.env = {"OPENAI_API_KEY": "sk-test"}
+            self.codex_home = tmp_path / "unconfigured-codex-home"
+            self.listen_url: str | None = None
+            self.config_overrides: list[str] = []
+
+        async def start(self) -> None:
+            """:returns: None."""
+
+        async def close(self) -> None:
+            """Record a teardown the fallback must not perform."""
+            closed.append("closed")
+
+    def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
+        """
+        Build a fake app-server bound to the requested CODEX_HOME.
+
+        :param kwargs: Keyword arguments passed by the runner helper.
+        :returns: Fresh fake app-server.
+        """
+        app_server = _FakeCodexAppServer()
+        app_server.codex_home = kwargs["codex_home"]
+        return app_server
+
+    connected: list[str] = []
+
+    class _RecordingClient:
+        """Event client recording the fresh-thread discovery connect."""
+
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            """
+            :param ws_url: App-server WebSocket URL.
+            :param client_name: JSON-RPC client name.
+            """
+            self.ws_url = ws_url
+            self.client_name = client_name
+
+        async def connect(self) -> None:
+            """Record the connect the fresh-thread path owes."""
+            connected.append(self.client_name)
+
+        async def close(self) -> None:
+            """:returns: None."""
+
+    async def _unreadable_preload(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
+        """
+        Refuse the resume the way codex's thread-store does for a bad rollout.
+
+        :param transport: App-server transport URL (ignored).
+        :param loaded_thread_id: Thread id passed to ``thread/resume``.
+        :raises CodexAppServerResponseError: Always, mirroring the app-server.
+        """
+        del transport, terminal_launch_args
+        raise codex_app_mod.CodexAppServerResponseError(
+            {
+                "code": -32603,
+                "message": (
+                    "failed to read thread: thread-store internal error: failed to "
+                    f"load thread history /codex-home/rollout-{loaded_thread_id}.jsonl: "
+                    "stream did not contain valid UTF-8"
+                ),
+            }
+        )
+
+    launched_args: list[list[str]] = []
+
+    class _FakeResourceRegistry:
+        """Captures the TUI argv instead of launching tmux."""
+
+        async def launch_auxiliary_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the launch argv and return a terminal resource view."""
+            del terminal_name, session_key, resource_role, parent_os_env
+            launched_args.append(list(spec.args))
+            return SessionResourceView(
+                id="terminal_codex_main",
+                type="terminal",
+                session_id=session_id,
+                name="Codex",
+            )
+
+    runs: list[_ForwarderRun] = []
+
+    async def _parking_discover_thread(**kwargs: Any) -> None:
+        """Park forever in place of the fresh-thread discovery forwarder."""
+        del kwargs
+        run = _ForwarderRun(task=asyncio.current_task())
+        runs.append(run)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            run.cancelled = True
+            raise
+
+    async def _unexpected_known_thread(**kwargs: Any) -> None:
+        """Fail if the unreadable thread is still forwarded as known."""
+        del kwargs
+        raise AssertionError("an unreadable thread must not be forwarded as a known thread")
+
+    monkeypatch.setattr(
+        codex_app_mod,
+        "build_codex_native_server",
+        _fake_build_codex_native_server,
+    )
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _RecordingClient)
+    monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _unreadable_preload)
+    monkeypatch.setattr(
+        runner_app_mod, "_codex_discover_thread_and_forward", _parking_discover_thread
+    )
+    monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _unexpected_known_thread)
+
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="codex",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native", "model": "gpt-5-default"},
+        ),
+    )
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            await runner_app_mod._auto_create_codex_terminal(
+                session_id,
+                _FakeResourceRegistry(),  # type: ignore[arg-type]
+                lambda _sid, _evt: None,
+                agent_spec=agent_spec,
+                server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+            )
+        await asyncio.sleep(0)
+
+        assert closed == [], "the fallback must keep the app-server for the fresh thread"
+        assert [p["url"] for p in posted] == [f"/v1/sessions/{session_id}/events"], (
+            "the fallback must surface exactly one notice into the session"
+        )
+        notice = posted[0]["json"]
+        assert notice["type"] == "external_conversation_item"
+        assert notice["data"]["item_type"] == "error"
+        assert notice["data"]["item_data"]["code"] == "codex_thread_reset"
+        assert notice["data"]["item_data"]["level"] == "info"
+        # The body names codex as the source and quotes its own error text.
+        assert "Codex reported an internal error" in notice["data"]["item_data"]["message"]
+        assert "stream did not contain valid UTF-8" in notice["data"]["item_data"]["message"]
+        assert connected == ["omnigent-codex-native-auto"], (
+            "the fresh-thread path must connect the discovery listener"
+        )
+        assert launched_args and thread_id not in launched_args[0], (
+            f"the TUI must not resume the unreadable thread: argv={launched_args}"
+        )
+        assert len(runs) == 1 and runs[0].cancelled is False, (
+            "exactly one live discovery forwarder must mirror the fresh thread"
+        )
+        assert any(
+            thread_id in record.getMessage() and "starting a fresh thread" in record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ), "dropping the Codex-side context must leave a warning naming the thread"
+    finally:
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        await _drain_forwarder_runs(runs)

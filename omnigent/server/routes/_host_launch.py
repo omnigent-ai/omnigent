@@ -80,6 +80,30 @@ def resolve_host_owner(
     return host
 
 
+def host_absent_error(host: Host) -> OmnigentError:
+    """Classify a "host not on this replica" miss for a host-scoped route.
+
+    Every route that reaches a host over its live tunnel looks it up in the
+    local (this-replica) ``HostRegistry``. When replicas are sharded by host, a
+    request keyed to ``host_id`` can land on a replica that doesn't hold the
+    tunnel — the same wrong-replica case ``RunnerRouter`` handles for runner
+    dispatch. Tell the two apart from the host record the caller already loaded:
+
+    - still **live** (online + fresh heartbeat) → up on some replica, just not
+      here → :data:`~ErrorCode.WRONG_REPLICA` (400) so the client re-addresses
+      WITHOUT the key.
+    - otherwise → genuinely offline → ``CONFLICT`` (409).
+
+    :param host: The host's persistent record (owner-checked by the caller).
+    :returns: The ``OmnigentError`` to raise; the global handler maps its code
+        to the HTTP status and the ``{"error": {"code": ...}}`` body the
+        client's re-address matches on.
+    """
+    if host_is_live(host):
+        return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
+    return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
+
+
 def resolve_host_launch(
     *,
     user_id: str | None,
@@ -129,15 +153,7 @@ def resolve_host_launch(
 
     conn = host_registry.get(host_id)
     if conn is None:
-        # The host's tunnel isn't on this replica. If the store shows it still
-        # live (online + fresh heartbeat), it's up on another replica — a
-        # wrong-replica landing — so surface WRONG_REPLICA (400, distinct code)
-        # and let the client re-address keyless. Otherwise it's genuinely
-        # offline → CONFLICT (409). Mirrors RunnerRouter._runner_absent_code
-        # and hosts._host_absent_error.
-        if host_is_live(host):
-            raise OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
-        raise OmnigentError("host is offline", code=ErrorCode.CONFLICT)
+        raise host_absent_error(host)
 
     conv = conversation_store.get_conversation(session_id)
     if conv is None:

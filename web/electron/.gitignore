@@ -7,3 +7,7 @@ dist/
 # Built desktop update overlay island (produced by web's build:overlay,
 # shipped into the app by electron-builder). Generated, not committed.
 overlay/
+
+# Built server selector v2 page (produced by web's build:server-selector-v2,
+# shipped into the app by electron-builder). Generated, not committed.
+server-selector-v2/

@@ -113,11 +113,18 @@ def _is_recoverable_sse_transport_error(exc: BaseException) -> bool:
         httpx.ReadTimeout,
         httpx.ConnectError,
         httpx.ConnectTimeout,
+        # A peer that drops the connection while the request is still
+        # being sent surfaces as a write error — the same transient
+        # interruption as a read-side drop, just caught one syscall earlier.
+        httpx.WriteError,
+        httpx.WriteTimeout,
         httpcore.RemoteProtocolError,
         httpcore.ReadError,
         httpcore.ReadTimeout,
         httpcore.ConnectError,
         httpcore.ConnectTimeout,
+        httpcore.WriteError,
+        httpcore.WriteTimeout,
     )
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -1197,7 +1204,7 @@ def _server_event_to_sdk_event(event: object) -> object | None:
     if isinstance(event, CompletedEvent):
         return ResponseCompleted(response=_resp(event))
     if isinstance(event, FailedEvent):
-        return ResponseFailed(response=_resp(event))
+        return ResponseFailed(response=_resp(event), source=event.source)
     if isinstance(event, CancelledEvent):
         return ResponseCancelled(response=_resp(event))
     if isinstance(event, IncompleteEvent):
@@ -2007,6 +2014,41 @@ class _SessionsChatReplAdapter:
             )
         )
 
+    def _emit_elicitation_resolve_error(self, exc: Exception) -> None:
+        """
+        Render an undeliverable elicitation verdict in the error panel.
+
+        Bounded transport retries can still end with the verdict
+        undelivered, which leaves the elicitation parked server-side and
+        the turn waiting on an answer that will never arrive. Emitting the
+        same typed error event normal streams use lets the existing REPL
+        renderer show it, so the user learns to re-answer rather than
+        sitting at an apparently live prompt.
+
+        :param exc: Last transport failure raised by the resolve POST,
+            e.g. an ``httpx.ConnectError``.
+        :returns: None.
+        """
+        if self._on_event is None:
+            return
+
+        from omnigent.server.schemas import ErrorEvent, RetryErrorDetail
+
+        self._on_event(
+            ErrorEvent(
+                type="response.error",
+                source="execution",
+                error=RetryErrorDetail(
+                    code="elicitation_resolve_failed",
+                    message=(
+                        f"Could not deliver your answer to the server: {exc}. "
+                        "The request is still waiting for an answer, and this "
+                        "prompt is gone, so answer it from the web UI."
+                    ),
+                ),
+            )
+        )
+
     def _runner_recovery_error_message(self, exc: Exception) -> str:
         """
         Build the user-facing message for a recovery failure.
@@ -2599,23 +2641,42 @@ class _SessionsChatReplAdapter:
                 else:
                     resolve_payload["action"] = "decline"
 
-        try:
-            # URL-based elicitation: deliver the verdict to the
-            # elicitation's dedicated resolve URL rather than as an
-            # in-band ``approval`` session event. Same server-side
-            # effect (both converge on ``_resolve_elicitation``).
-            await self._client.sessions.resolve_elicitation(
-                session_id,
-                elicitation_id,
-                resolve_payload,
-            )
-        except OmnigentError as exc:
-            if exc.code == "not_found":
-                # Elicitation already resolved by another client (e.g. web
-                # UI approved while the terminal prompt was still open).
-                # The harness already received the verdict — treat as no-op.
+        # URL-based elicitation: deliver the verdict to the elicitation's
+        # dedicated resolve URL rather than as an in-band ``approval`` event.
+        # A transport error can happen after the server accepted the POST but
+        # before the client received its response, so retrying is safe: the
+        # server either accepts the retry or reports the elicitation resolved.
+        for attempt in range(3):
+            try:
+                await self._client.sessions.resolve_elicitation(
+                    session_id,
+                    elicitation_id,
+                    resolve_payload,
+                )
                 return
-            raise
+            except OmnigentError as exc:
+                if exc.code == "not_found":
+                    # Another client may have resolved it while the terminal
+                    # prompt was open, or the first POST reached the server.
+                    return
+                raise
+            except Exception as exc:
+                if not _is_recoverable_sse_transport_error(exc):
+                    raise
+                if attempt == 2:
+                    # One line here, postmortem behind DEBUG: the REPL
+                    # configures no log handlers, so a WARNING carrying
+                    # exc_info falls through to ``logging.lastResort`` and
+                    # paints a traceback over the TUI frame. Same split
+                    # ``_stream_pump`` makes for the same reason.
+                    _log.warning("Could not resolve elicitation after transport retries")
+                    _log.debug("elicitation resolve failed", exc_info=exc)
+                    # The elicitation is still parked server-side, so the
+                    # turn waits on a verdict that will never arrive. Say so
+                    # instead of leaving an apparently live prompt.
+                    self._emit_elicitation_resolve_error(exc)
+                    return
+                await asyncio.sleep(0.1 * (2**attempt))
 
     async def _prompt_schema_fields(
         self,
@@ -3907,7 +3968,7 @@ async def run_repl(
                 fmt.format_error(
                     ErrorBlock(
                         message=msg,
-                        source="llm",
+                        source=sdk_ev.source,
                         ctx=BlockContext(agent=None, depth=0, turn=0),
                     ),
                 )

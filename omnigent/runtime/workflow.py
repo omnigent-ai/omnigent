@@ -47,6 +47,7 @@ from omnigent.onboarding.detected import (
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     BEDROCK_KIND,
+    CHAT_WIRE_API,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
     OPENAI_FAMILY,
@@ -438,7 +439,7 @@ _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     # NB: no ``antigravity`` — it has no Databricks/gateway path (Gemini-native).
     # NB: no ``kimi`` — upstream kimi has no per-spawn provider override flag,
     # so Omnigent cannot thread a Databricks gateway through. Users configure
-    # providers via ``kimi provider add`` in ``~/.kimi/config.toml``
+    # providers via ``kimi provider add`` in ``~/.kimi-code/config.toml``
     # (Omnigent-side provider injection is a deferred follow-up).
 }
 
@@ -741,8 +742,18 @@ def _apply_provider_family(
     :param harness_type: ``"claude-sdk"`` or ``"codex"``.
     :param family: The resolved provider family for this harness.
     :raises OmnigentError: If no model is resolvable (neither the spec nor
-        the family declares one).
+        the family declares one), or if a Codex provider is configured for
+        the unsupported Chat Completions wire API.
     """
+    if harness_type == "codex" and family.wire_api == CHAT_WIRE_API:
+        raise OmnigentError(
+            "The 'codex' harness requires an OpenAI Responses API endpoint, but "
+            f"provider endpoint {family.base_url!r} is configured with "
+            "'wire_api: chat'. Choose a Responses-capable endpoint and set "
+            "'wire_api: responses', or use a harness that supports Chat Completions.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
     cfg = _UCODE_HARNESS_CONFIGS[harness_type]
     env[_HARNESS_GATEWAY_FLAG[harness_type]] = "true"
     env[cfg.base_url_key] = family.base_url
@@ -1987,7 +1998,7 @@ def _build_kimi_spawn_env(
     The upstream Kimi Code CLI has no per-spawn provider override flag
     (no ``--config-file`` / ``--mcp-config-file``), so this builder
     only threads the model, working directory, and ``os_env`` sandbox
-    spec. Provider routing for kimi lives in ``~/.kimi/config.toml``
+    spec. Provider routing for kimi lives in ``~/.kimi-code/config.toml``
     and is managed out-of-band via ``kimi provider add``. Unlike the
     sibling builders, ``_build_kimi_spawn_env`` never calls
     :func:`configure_agent_harness_with_provider` (there is no env-var
@@ -2017,7 +2028,8 @@ def _build_kimi_spawn_env(
             "auth injection: upstream kimi has no per-spawn config override "
             "(no ``--config-file`` / ``--mcp-config-file``). Remove "
             "``executor.auth`` from the spec and configure the provider once "
-            "via `kimi provider add` in ~/.kimi/config.toml, then pin the "
+            "via `kimi provider add` in $KIMI_CODE_HOME/config.toml (default "
+            "~/.kimi-code/config.toml), then pin the "
             "resulting model id in the agent spec. Omnigent-side provider "
             "injection is a deferred follow-up.",
             code=ErrorCode.INVALID_INPUT,

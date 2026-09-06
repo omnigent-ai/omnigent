@@ -239,6 +239,11 @@ _TAGS: list[dict[str, str]] = [
         "description": "Discover the built-in agents available to bind to a session.",
     },
     {
+        "name": "extensions",
+        "x-displayName": "Extensions",
+        "description": "Inspect installed extension pages and navigation contributions.",
+    },
+    {
         "name": "hosts",
         "x-displayName": "Hosts",
         "description": (

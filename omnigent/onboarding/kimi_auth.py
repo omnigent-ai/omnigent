@@ -115,21 +115,43 @@ def _provider_has_key(provider: dict[str, object]) -> bool:
     return False
 
 
-def _has_kimi_api_key(config: dict[str, object]) -> bool:
-    """Return whether *config* declares a usable Kimi / Moonshot API-key provider.
+def _default_provider_name(config: dict[str, object]) -> str | None:
+    """Return the provider name ``default_model`` selects, if any.
 
-    A usable provider is a Kimi / Moonshot provider (by ``type`` or endpoint
-    host) that carries a non-empty API key — covering both pay-per-use paths:
-    the Moonshot open platform (``kimi provider catalog add moonshotai``) and
-    the Kimi Code coding endpoint (a manual ``type = "kimi"`` block).
+    Kimi Code's ``default_model`` is spelled ``"<provider>/<model...>"``
+    (e.g. ``"openrouter/moonshotai/kimi-k3"``); the segment before the first
+    ``/`` names the provider table kimi routes to by default.
+    """
+    default_model = config.get("default_model")
+    if not isinstance(default_model, str):
+        return None
+    provider, sep, _model = default_model.strip().partition("/")
+    if not sep or not provider:
+        return None
+    return provider
+
+
+def _has_kimi_api_key(config: dict[str, object]) -> bool:
+    """Return whether *config* declares a usable API-key provider for kimi.
+
+    A usable provider is one carrying a non-empty API key that kimi will
+    actually authenticate with: a Kimi / Moonshot provider (by ``type`` or
+    endpoint host — both pay-per-use paths), or the provider ``default_model``
+    routes to — Kimi Code supports custom OpenAI-compatible providers (e.g.
+    OpenRouter), and one selected as the default makes kimi fully usable
+    without any Moonshot credential. An unrelated provider that is neither
+    Kimi nor the configured default still does not count.
     """
     providers = config.get("providers")
     if not isinstance(providers, dict):
         return False
-    for provider in providers.values():
+    default_provider = _default_provider_name(config)
+    for name, provider in providers.items():
         if not isinstance(provider, dict):
             continue
-        if _provider_is_kimi(provider) and _provider_has_key(provider):
+        if not _provider_has_key(provider):
+            continue
+        if _provider_is_kimi(provider) or name == default_provider:
             return True
     return False
 
@@ -138,10 +160,11 @@ def kimi_api_key_configured(config_path: Path | None = None) -> bool:
     """Return whether a Kimi API key is configured in ``config.toml``.
 
     Reads the user's Kimi Code config (respecting ``$KIMI_CODE_HOME``) and
-    checks for at least one Kimi / Moonshot provider (by ``type`` or endpoint
-    host) carrying a non-empty API key — the pay-per-use / API-platform path
-    that does not require an interactive ``kimi login``. Covers both the
-    Moonshot open platform and the Kimi Code coding endpoint.
+    checks for at least one provider carrying a non-empty API key that kimi
+    authenticates with: a Kimi / Moonshot provider (by ``type`` or endpoint
+    host — the Moonshot open platform or the Kimi Code coding endpoint), or a
+    custom OpenAI-compatible provider (e.g. OpenRouter) selected by
+    ``default_model``. None of these require an interactive ``kimi login``.
 
     :param config_path: A specific config file to check; ``None`` uses
         ``$KIMI_CODE_HOME/config.toml``.

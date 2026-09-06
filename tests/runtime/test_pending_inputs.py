@@ -369,3 +369,11 @@ def test_restore_returns_a_drained_entry_to_the_front() -> None:
     # The restored entry drains again as the oldest.
     redrained = pending_inputs.resolve_oldest("conv_r")
     assert redrained is not None and redrained.pending_id == first
+
+
+def test_has_pending_tracks_parked_messages() -> None:
+    assert pending_inputs.has_pending("conv_hp") is False
+    pending_id = pending_inputs.record("conv_hp", [_text_block("hello")])
+    assert pending_inputs.has_pending("conv_hp") is True
+    pending_inputs.resolve("conv_hp", pending_id)
+    assert pending_inputs.has_pending("conv_hp") is False

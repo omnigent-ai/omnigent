@@ -505,6 +505,15 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
             "PYTHONUTF8",
             "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
             "DATABRICKS_CODEX_TOKEN",  # env_key in ~/.codex/config.toml's DB provider
+            # Service-principal M2M credentials, so a Databricks-gateway
+            # ``auth.command`` can mint an OAuth token from the SP on each
+            # refresh. Only DATABRICKS_BEARER survived before, forcing a
+            # pre-minted (expiring) token or an inlined secret; these let the
+            # standard client-credentials mint work on a non-interactive host.
+            # DATABRICKS_CONFIG_PROFILE / DATABRICKS_TOKEN are deliberately NOT
+            # here (they stay host secrets, gated behind env_passthrough).
+            "DATABRICKS_CLIENT_ID",
+            "DATABRICKS_CLIENT_SECRET",
             *_CODEX_OMNIGENT_LAUNCH_ENV_VARS,
         ),
         deny_exact=_CODEX_ENV_DENY_EXACT,

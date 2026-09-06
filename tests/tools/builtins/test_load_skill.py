@@ -205,3 +205,108 @@ def test_list_skill_resources_lists_root_files_before_subdirs(tmp_path: Path) ->
         "EXTRA.md",
         "references/style-guide.md",
     ]
+
+
+def _spec(name: str, content: str = "body") -> SkillSpec:
+    """A minimal in-memory skill spec named *name*."""
+    return SkillSpec(name=name, description=f"{name} skill.", content=content)
+
+
+def test_find_skill_by_name_exact_match_wins() -> None:
+    """An exact name match is returned even when an alias also matches."""
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    exact = _spec("myplugin:review", "namespaced body")
+    bare = _spec("review", "bare body")
+    assert find_skill_by_name([bare, exact], "myplugin:review") is exact
+    assert find_skill_by_name([bare, exact], "review") is bare
+
+
+def _plugin_skill(tmp_path: Path, plugin: str, name: str, content: str = "body") -> SkillSpec:
+    """A skill whose ``skill_dir`` carries plugin-cache provenance."""
+    skill_dir = tmp_path / "plugins" / "cache" / "mkt" / plugin / "1.0.0" / "skills" / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(content)
+    return SkillSpec(name=name, description=f"{name} skill.", content=content, skill_dir=skill_dir)
+
+
+def test_find_skill_by_name_namespaced_falls_back_to_bare(tmp_path: Path) -> None:
+    """
+    ``plugin:skill`` resolves to the bare ``skill`` entry when no exact
+    namespaced entry exists and the bare skill's on-disk provenance shows
+    it came from that plugin — the name a claude-family surface shows for a
+    plugin skill must work on a codex session that exposes only the bare name.
+    """
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    bare = _plugin_skill(tmp_path, "myplugin", "brand-review")
+    assert find_skill_by_name([bare], "myplugin:brand-review") is bare
+
+
+def test_find_skill_by_name_wrong_plugin_namespace_does_not_hijack(tmp_path: Path) -> None:
+    """
+    ``pluginb:skill`` must NOT resolve a bare ``skill`` that belongs to a
+    different plugin (or to no plugin at all) — the alias fallback requires
+    matching provenance, so an unrelated namespace cannot hijack the skill.
+    """
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    plugin_a = _plugin_skill(tmp_path, "plugina", "deploy")
+    assert find_skill_by_name([plugin_a], "pluginb:deploy") is None
+    # A bare skill with no on-disk provenance at all is not aliasable either.
+    in_memory = _spec("deploy")
+    assert find_skill_by_name([in_memory], "pluginb:deploy") is None
+
+
+def test_find_skill_by_name_plugin_named_path_component_is_not_provenance(
+    tmp_path: Path,
+) -> None:
+    """
+    A skill under a directory that merely *contains* the plugin name as a
+    path component (e.g. a user or workspace dir named like the plugin) is
+    not plugin-derived: provenance requires the full plugin-cache layout
+    ``cache/<marketplace>/<plugin>/<version>/skills/<skill>``.
+    """
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    skill_dir = tmp_path / "home" / "myplugin" / "workspace" / "skills" / "deploy"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("body")
+    lookalike = SkillSpec(
+        name="deploy", description="deploy skill.", content="body", skill_dir=skill_dir
+    )
+    assert find_skill_by_name([lookalike], "myplugin:deploy") is None
+
+
+def test_find_skill_by_name_bare_falls_back_to_unique_namespaced() -> None:
+    """A bare name resolves to the sole plugin exposing that skill."""
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    namespaced = _spec("myplugin:brand-review")
+    assert find_skill_by_name([namespaced], "brand-review") is namespaced
+
+
+def test_find_skill_by_name_ambiguous_bare_alias_stays_unresolved() -> None:
+    """Two plugins exposing the same bare skill name: don't guess."""
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    a = _spec("plugina:brand-review")
+    b = _spec("pluginb:brand-review")
+    assert find_skill_by_name([a, b], "brand-review") is None
+
+
+def test_find_skill_by_name_unknown_names_return_none() -> None:
+    """Unknown bare and namespaced names still miss."""
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    skills = [_spec("brand-review"), _spec("myplugin:other")]
+    assert find_skill_by_name(skills, "nonexistent") is None
+    assert find_skill_by_name(skills, "myplugin:nonexistent") is None
+
+
+def test_load_skill_tool_accepts_namespaced_alias(tmp_path: Path, tool_ctx: ToolContext) -> None:
+    """The load_skill tool resolves ``plugin:skill`` to the bare skill."""
+    skill = _plugin_skill(tmp_path, "myplugin", "brand-review", "Review the brand.")
+    tool = LoadSkillTool([skill])
+    result = tool.invoke(json.dumps({"name": "myplugin:brand-review"}), tool_ctx)
+    assert result == "Review the brand."

@@ -60,6 +60,7 @@ const mobileMenu = {
 function renderHeader(props: {
   sidebarOpen: boolean;
   isChildSession?: boolean;
+  subAgentName?: string | null;
   conversationId?: string;
   actionConversation?: Conversation | null;
   conversationTitle?: string | null;
@@ -86,6 +87,7 @@ function renderHeader(props: {
             sidebarOpen={props.sidebarOpen}
             onOpenSidebar={props.onOpenSidebar ?? (() => {})}
             isChildSession={props.isChildSession ?? false}
+            subAgentName={props.subAgentName ?? null}
             // Defaults to no active session: PresenceAvatars / AgentInfoButton /
             // right-panel toggle / rail entries all gate on conversationId and
             // stay unmounted, isolating the left-slot affordances under test.
@@ -260,6 +262,38 @@ describe("ChatHeader — conversation breadcrumb", () => {
     expect(screen.getByText("check-account-eligibility")).toBeInTheDocument();
   });
 
+  it("names the session's own sub-agent, not the parent bundle's agent row", () => {
+    // A `sys_session_send` child is bound to its PARENT bundle's agent row,
+    // so boundAgent.name is the parent's name. The session's own
+    // sub_agent_name must win, or the child masquerades as its parent.
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      subAgentName: "comic_one",
+      conversationTitle: "Joke night",
+      titleLinkTo: "/c/parent-123",
+      boundAgent: { id: "a1", name: "joke_director" },
+    });
+    expect(screen.getByText("comic_one")).toBeInTheDocument();
+    expect(screen.queryByText("joke_director")).toBeNull();
+  });
+
+  it("falls back past a blank sub_agent_name to the bound agent's name", () => {
+    // An empty/whitespace sub_agent_name must not render a blank identity
+    // segment — the fallback chain continues to boundAgent.name.
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      subAgentName: "  ",
+      conversationTitle: "Fix the login bug",
+      titleLinkTo: "/c/parent-123",
+      boundAgent: { id: "a1", name: "check-account-eligibility" },
+    });
+    expect(screen.getByText("check-account-eligibility")).toBeInTheDocument();
+  });
+
   it("names the product, not the internal wrapper row, on a native sub-agent", () => {
     // A Claude Code Task child is bound to its parent's `claude-native-ui`
     // agent — an Omnigent internal the server hides everywhere else
@@ -275,6 +309,24 @@ describe("ChatHeader — conversation breadcrumb", () => {
     });
     expect(screen.getByText("Claude Code")).toBeInTheDocument();
     expect(screen.queryByText("claude-native-ui")).toBeNull();
+  });
+
+  it("prefers the vendor product name over sub_agent_name on a native sub-agent", () => {
+    // A native child carries BOTH a wrapper label and a sub_agent_name; the
+    // product name (matching the Agents rail and composer) outranks the raw
+    // sub-agent identifier.
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      subAgentName: "general-purpose",
+      conversationTitle: "Fix the login bug",
+      titleLinkTo: "/c/parent-123",
+      boundAgent: { id: "a1", name: "claude-native-ui" },
+      wrapperLabel: "claude-code-native-ui-subagent",
+    });
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.queryByText("general-purpose")).toBeNull();
   });
 
   it("falls back to a 'Sub-agent' segment before the agent snapshot loads", () => {
@@ -516,6 +568,23 @@ describe("ChatHeader — floating mobile controls", () => {
       "max-md:bg-background/70",
       "max-md:backdrop-blur-xl",
     );
+  });
+
+  it("keeps the page touchable while the fallback menu is open on mobile", () => {
+    // Modal mode's body-wide pointer-events:none leaves the menu as the only
+    // touch target, so touch-target adjustment snaps outside taps onto it and
+    // a phone can never dismiss the menu (see HeaderConversationMenu).
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv-1",
+      canShare: true,
+      hasHeaderMenu: true,
+    });
+
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(document.body.style.pointerEvents).not.toBe("none");
   });
 });
 

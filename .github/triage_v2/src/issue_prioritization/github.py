@@ -23,6 +23,8 @@ from issue_prioritization.mutations import (
 )
 from issue_prioritization.pipeline import PipelineRun
 
+DUPLICATE_COMMENT_MARKER = "<!-- omnigent-duplicate-check -->"
+
 
 class GitHubLabels(Protocol):
     def sync_missing_labels(self, manifest: LabelManifest) -> None: ...
@@ -116,12 +118,99 @@ class GitHubClient:
     def comment_on_issue(self, issue_number: int, body: str) -> None:
         self.transport("POST", f"/issues/{issue_number}/comments", {"body": body})
 
+    def comment_on_issue_once(self, issue_number: int, marker: str, body: str) -> bool:
+        comments = self.issue_comments(issue_number)
+        if any(marker in str(comment.get("body", "")) for comment in comments):
+            return False
+        self.comment_on_issue(issue_number, body)
+        return True
+
+    def issue_corpus(self, limit: int = 2000) -> tuple[dict[str, object], ...]:
+        issues = []
+        page = 1
+        while len(issues) < limit:
+            value = self.transport(
+                "GET",
+                f"/issues?state=all&sort=created&direction=desc&per_page=100&page={page}",
+                None,
+            )
+            if not isinstance(value, list):
+                raise ValueError("GitHub issues response must be an array")
+            issues.extend(
+                issue for issue in value if isinstance(issue, dict) and "pull_request" not in issue
+            )
+            if len(value) < 100:
+                break
+            page += 1
+        return tuple(issues[:limit])
+
+    def assignee_load(self, limit: int = 500) -> dict[str, int]:
+        load: dict[str, int] = {}
+        for issue in self._open_issues(limit):
+            assignees = issue.get("assignees", [])
+            if not isinstance(assignees, list):
+                continue
+            for assignee in assignees:
+                if not isinstance(assignee, dict) or not assignee.get("login"):
+                    continue
+                login = str(assignee["login"])
+                load[login] = load.get(login, 0) + 1
+        return load
+
+    def assign_issue(self, issue_number: int, assignee: str) -> None:
+        self.transport("POST", f"/issues/{issue_number}/assignees", {"assignees": [assignee]})
+
+    def close_as_duplicate(self, issue_number: int, duplicate_of: int) -> None:
+        issue_id = self._issue_node_id(issue_number)
+        duplicate_id = self._issue_node_id(duplicate_of)
+        result = self.transport(
+            "POST",
+            "/graphql",
+            {
+                "query": (
+                    "mutation($input: CloseIssueInput!) { "
+                    "closeIssue(input: $input) { issue { id state stateReason } } }"
+                ),
+                "variables": {
+                    "input": {
+                        "issueId": issue_id,
+                        "stateReason": "DUPLICATE",
+                        "duplicateIssueId": duplicate_id,
+                    }
+                },
+            },
+        )
+        if isinstance(result, dict) and result.get("errors"):
+            raise RuntimeError(f"GitHub duplicate closure failed: {result['errors']}")
+
     def close_issue(self, issue_number: int) -> None:
         self.transport(
             "PATCH",
             f"/issues/{issue_number}",
             {"state": "closed", "state_reason": "not_planned"},
         )
+
+    def _issue_node_id(self, issue_number: int) -> str:
+        value = self.issue_data(issue_number)
+        node_id = value.get("node_id")
+        if not node_id:
+            raise ValueError(f"GitHub issue #{issue_number} response must include node_id")
+        return str(node_id)
+
+    def _open_issues(self, limit: int) -> tuple[dict[str, object], ...]:
+        issues = []
+        page = 1
+        while len(issues) < limit:
+            value = self.transport("GET", f"/issues?state=open&per_page=100&page={page}", None)
+            if not isinstance(value, list):
+                raise ValueError("GitHub issues response must be an array")
+            issues.extend(
+                issue for issue in value if isinstance(issue, dict) and "pull_request" not in issue
+            )
+            if len(value) < 100:
+                break
+            page += 1
+        return tuple(issues[:limit])
 
     def open_issue(self, issue_number: int) -> BronzeIssue | None:
         value = self.issue_data(issue_number)
@@ -261,8 +350,13 @@ class GitHubClient:
 
     def _request(self, method: str, path: str, payload: object | None) -> object:
         body = json.dumps(payload).encode() if payload is not None else None
+        url = (
+            "https://api.github.com/graphql"
+            if path == "/graphql"
+            else f"https://api.github.com/repos/{self.repo}{path}"
+        )
         request = Request(
-            f"https://api.github.com/repos/{self.repo}{path}",
+            url,
             data=body,
             method=method,
             headers={

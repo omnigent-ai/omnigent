@@ -310,6 +310,13 @@ export function HeaderConversationMenu({
     <>
       <DropdownMenu
         open={menuOpen}
+        // Radix's modal mode sets `pointer-events: none` on <body> while the
+        // menu is open, leaving the menu as the only touch target on screen.
+        // Browser touch-target adjustment then snaps outside taps near the
+        // menu onto it, so on a phone the menu can't be dismissed. Non-modal
+        // keeps the page interactive, so an outside tap lands on real content
+        // and dismisses the menu.
+        modal={!isMobile}
         onOpenChange={(open) => {
           setMenuOpen(open);
           if (!open) setProjectPickerOpen(false);

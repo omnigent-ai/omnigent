@@ -12,6 +12,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import (
     Agent,
 )
@@ -180,6 +181,7 @@ def register_permissions_routes(
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
         _announce_session_added(body.user_id, session_id)
+        add_audit_attrs(target_user_id=body.user_id, level=body.level)
         return PermissionObject(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
@@ -274,6 +276,7 @@ def register_permissions_routes(
         # The leaver's own tab drops the row via the client mutation's success
         # handler; their other tabs converge on the next watch-set diff, which
         # reports the now-inaccessible id as removed. No extra push needed.
+        add_audit_attrs(target_user_id=target_user_id, left_self=leaving_self)
         return Response(status_code=204)
 
     @router.get(

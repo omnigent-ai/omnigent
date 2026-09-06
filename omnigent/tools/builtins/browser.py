@@ -14,8 +14,9 @@ the tool was misrouted to the server-side path — the base class raises
 ``NotImplementedError`` loudly in that case.
 
 Descriptions for the five browser tools that drive the Omnigent
-desktop app's embedded browser; they fail cleanly when no desktop
-renderer is subscribed (the action times out with a clear error).
+desktop app's embedded browser. Request-driven harnesses omit them when
+the turn starts without a stream subscriber; native harnesses have a
+session-scoped relay surface, but unclaimed calls still fail promptly.
 """
 
 from __future__ import annotations

@@ -181,6 +181,10 @@ def build_opencode_mcp_block(
             entry = {"type": "remote", "url": url, "enabled": True}
             if headers:
                 entry["headers"] = headers
+        timeout = getattr(server, "timeout", None)
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
+            # MCPServerConfig.timeout is seconds; opencode's mcp entry wants ms.
+            entry["timeout"] = int(timeout * 1000)
         block[str(name)] = entry
     return block
 
@@ -208,7 +212,7 @@ def build_opencode_omnigent_mcp_server(
         runner interpreter (has ``omnigent`` importable).
     :returns: A one-entry ``mcp`` block ``{"omnigent": {type:"local", …}}``.
     """
-    from omnigent.claude_native_bridge import build_mcp_config
+    from omnigent.claude_native_bridge import _TOOL_RELAY_POST_TIMEOUT_S, build_mcp_config
 
     claude_cfg = build_mcp_config(bridge_dir, python_executable=python_executable)
     # build_mcp_config returns {"mcpServers": {"<name>": {command, args, env}}};
@@ -231,6 +235,14 @@ def build_opencode_omnigent_mcp_server(
         "type": "local",
         "command": [command, *args],
         "enabled": True,
+        # opencode's mcp timeout is in MILLISECONDS and flows straight into the
+        # MCP SDK's per-request deadline (default 60 s). Give the client more
+        # headroom than the bridge's outer relay hop so the relay's own clean
+        # timeout error always arrives before opencode kills the call. This is
+        # server-wide, so a hung local (non-relay) tool also gets this window
+        # before the client kills it — an accepted trade-off; local tools get
+        # no heartbeat, so they stay killable at this deadline.
+        "timeout": int((_TOOL_RELAY_POST_TIMEOUT_S + 30.0) * 1000),
     }
     env_value = server.get("env")
     if env_value is None:

@@ -6,6 +6,8 @@ import { createContext, useContext } from "react";
 
 interface FileViewerContextType {
   openFile: (path: string) => void;
+  /** Reveal the workspace rail and switch it to the GitHub tab. */
+  openGithubTab: () => void;
   /**
    * Returns true when `path` is a known workspace file (present in the
    * session's changed-files list). Used as the synchronous fast path for
@@ -40,6 +42,14 @@ export const FileViewerContext = createContext<FileViewerContextType | null>(nul
  */
 export function useFileViewer(): ((path: string) => void) | null {
   return useContext(FileViewerContext)?.openFile ?? null;
+}
+
+/**
+ * Returns a callback that reveals the workspace rail's GitHub tab, or `null`
+ * when used outside AppShell (tests, Storybook).
+ */
+export function useOpenGithubTab(): (() => void) | null {
+  return useContext(FileViewerContext)?.openGithubTab ?? null;
 }
 
 // Stable fallback used when the context is absent (tests, Storybook).

@@ -2067,6 +2067,61 @@ async def test_patch_session_requires_edit_access(
     assert f"--fork {session_id}" in error_msg, "403 message should suggest the fork CLI command."
 
 
+@pytest.mark.parametrize(
+    ("caller", "grant_level", "expected_status"),
+    [
+        pytest.param(None, None, 401, id="unauthenticated"),
+        pytest.param("unrelated", None, 404, id="unrelated"),
+        pytest.param("collaborator", LEVEL_READ, 403, id="reader"),
+        pytest.param("collaborator", LEVEL_EDIT, 200, id="editor"),
+        pytest.param("model-owner", None, 200, id="owner"),
+    ],
+)
+async def test_model_override_reset_requires_edit_access(
+    auth_client: httpx.AsyncClient,
+    caller: str | None,
+    grant_level: int | None,
+    expected_status: int,
+) -> None:
+    """Only the owner or an editor may conditionally clear a saved model pick."""
+    owner = "model-owner"
+    owner_headers = {"X-Forwarded-Email": owner}
+    agent = await create_test_agent(auth_client, user=owner)
+    session = await _create_session_as(auth_client, agent["id"], owner)
+    session_path = f"/v1/sessions/{session['id']}"
+    pick = "gpt-5.4-retired"
+    seeded = await auth_client.patch(
+        session_path,
+        json={"model_override": pick, "silent": True},
+        headers=owner_headers,
+    )
+    assert seeded.status_code == 200, seeded.text
+    assert seeded.json()["model_override"] == pick
+    if grant_level is not None:
+        assert caller is not None
+        grant = await _grant_permission(
+            auth_client,
+            session["id"],
+            granter=owner,
+            target_user=caller,
+            level=grant_level,
+        )
+        assert grant.status_code == 200, grant.text
+
+    reset = await auth_client.post(
+        f"{session_path}/model-override/reset",
+        json={"expected_model_override": pick},
+        headers={"X-Forwarded-Email": caller} if caller is not None else {},
+    )
+
+    assert reset.status_code == expected_status, reset.text
+    if expected_status == 200:
+        assert reset.json() == {"reset": True}
+    snapshot = await auth_client.get(session_path, headers=owner_headers)
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["model_override"] == (None if expected_status == 200 else pick)
+
+
 # ── GET /sessions/{id}/items with read access ──────────────
 
 

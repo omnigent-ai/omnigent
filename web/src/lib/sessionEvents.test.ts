@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import type {
   ElicitationRequest,
   SessionAgentChangedEvent,
+  SessionCodexApprovalModeEvent,
   SessionCollaborationModeEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
@@ -875,6 +876,29 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     const ev = out[0] as ElicitationRequest;
     expect(ev.rememberScope).toBeNull();
   });
+
+  it("lifts Codex MCP persistence modes from approval metadata", () => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_codex_mcp",
+      params: {
+        mode: "form",
+        message: 'Allow the omnigent MCP server to run tool "sys_read_inbox"?',
+        phase: "codex_mcp_elicitation",
+        policy_name: "codex_native_mcp_elicitation",
+        content_preview: "{}",
+        requestedSchema: {},
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+          persist: ["session", "always", "unsupported", "session"],
+        },
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.codexPersistModes).toEqual(["session", "always"]);
+  });
 });
 
 describe("response.elicitation_resolved (FLAT envelope)", () => {
@@ -1450,6 +1474,28 @@ describe("session.permission_mode (FLAT envelope)", () => {
 
   it("rejects missing conversation_id", () => {
     expect(parse("session.permission_mode", { permission_mode: "auto" })).toEqual([]);
+  });
+});
+
+describe("session.codex_approval_mode (FLAT envelope)", () => {
+  it("lifts conversation_id and approval_mode string", () => {
+    const events = parse("session.codex_approval_mode", {
+      conversation_id: "conv_abc",
+      approval_mode: "approve-for-me",
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionCodexApprovalModeEvent;
+    expect(ev.type).toBe("session_codex_approval_mode");
+    expect(ev.conversationId).toBe("conv_abc");
+    expect(ev.approvalMode).toBe("approve-for-me");
+  });
+
+  it("rejects missing approval_mode", () => {
+    expect(parse("session.codex_approval_mode", { conversation_id: "conv_abc" })).toEqual([]);
+  });
+
+  it("rejects missing conversation_id", () => {
+    expect(parse("session.codex_approval_mode", { approval_mode: "approve-for-me" })).toEqual([]);
   });
 });
 

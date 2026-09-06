@@ -155,6 +155,12 @@ def use_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_error_with_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MockExecutor that yields an ExecutorError carrying observed usage."""
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "error_with_usage")
+
+
+@pytest.fixture
 def use_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     """MockExecutor that yields a provider-side TurnCancelled."""
     monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "cancelled")
@@ -401,6 +407,41 @@ async def test_executor_error_terminates_with_response_failed(
     # via the RuntimeError wrap in the adapter; the scaffold
     # builds an ErrorDetail with the exception's str().
     assert "mock error" in error_detail["message"]
+
+
+async def test_executor_error_usage_reaches_response_failed(
+    use_error_with_usage: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """An ExecutorError's observed usage rides on the response.failed event.
+
+    A turn that fails after the model call started has already observed its
+    prompt size. The adapter must stash that usage on the turn context so the
+    scaffold's terminal ``response.failed`` carries it — otherwise the web
+    client's context-occupancy ring freezes at the previous successful turn's
+    value exactly when the session is in trouble.
+
+    Regression guard: pre-fix the adapter dropped ``ExecutorError.usage``
+    and the failed response carried ``usage: null``.
+    """
+    conv_id = "conv_err_usage"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.failed"
+    usage = events[-1].data["response"]["usage"]
+    assert usage is not None
+    # context_tokens is the window-fill figure the ring renders from.
+    assert usage["context_tokens"] == 100_000
+    assert usage["input_tokens"] == 400
+    # The failure is still a failure — the error detail must not be
+    # displaced by the usage payload.
+    assert events[-1].data["response"]["error"] is not None
 
 
 async def test_turn_cancelled_terminates_with_response_cancelled(

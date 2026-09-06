@@ -37,6 +37,7 @@ from omnigent.onboarding.ucode_setup import (
     find_ucode_command,
     model_gateway_workspace_urls,
 )
+from omnigent.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
@@ -149,6 +150,35 @@ def _node_dependency_problem() -> str | None:
     version = _node_version(node)
     detected = f" (detected {version})" if version else ""
     return f"Node.js is too old{detected} — Claude, Codex, and Pi need {_NODE_MIN_VERSION_HINT}."
+
+
+def _tmux_dependency_problem() -> str | None:
+    """
+    Return a one-line problem if tmux is missing or too old, else ``None``.
+
+    The native tmux-backed harnesses (``omnigent claude`` / ``codex`` and
+    every managed terminal) need a tmux at or above
+    :data:`omnigent.tmux_compat.MIN_TMUX_VERSION`. Managed terminals enable
+    ``allow-passthrough``, which tmux added in 3.3. Parses ``tmux -V`` (e.g.
+    ``"tmux 3.3a"`` — suffix letters are ignored) and compares the
+    ``(major, minor)`` pair against the floor.
+
+    :returns: A human-readable description suitable for a warning bullet,
+        or ``None`` when tmux is present and new enough. A flaky/timed-out
+        probe or unparsable version also yields ``None`` — setup should
+        not block on it.
+    """
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        return "tmux not found — native Claude/Codex need tmux (macOS: `brew install tmux`)."
+    version = tmux_version(tmux)
+    if version is None or version >= MIN_TMUX_VERSION:
+        return None
+    detected = f"{version[0]}.{version[1]}"
+    return (
+        f"tmux is too old (detected tmux {detected}) — native Claude/Codex need "
+        f"tmux {MIN_TMUX_VERSION_HINT} or newer (macOS: `brew upgrade tmux`)."
+    )
 
 
 @contextlib.contextmanager
@@ -317,10 +347,9 @@ def _warn_missing_harness_dependencies() -> None:
     node_problem = _node_dependency_problem()
     if node_problem is not None:
         problems.append(node_problem)
-    if shutil.which("tmux") is None:
-        problems.append(
-            "tmux not found — native Claude/Codex need tmux (macOS: `brew install tmux`)."
-        )
+    tmux_problem = _tmux_dependency_problem()
+    if tmux_problem is not None:
+        problems.append(tmux_problem)
     if not problems:
         return
     ui.warn("Some harnesses need external tools:")
@@ -3576,7 +3605,7 @@ def _run_configure_harnesses_interactive() -> None:
     _KIRO = "\x00kiro"
     # Sentinel marking the Kimi Code row — like Cursor/Antigravity/Qwen it is
     # not a provider family. Auth lives entirely in the kimi CLI (``kimi login``
-    # / ``kimi provider add`` → ~/.kimi/config.toml), so it dispatches to its
+    # / ``kimi provider add`` → ~/.kimi-code/config.toml), so it dispatches to its
     # own drill-in rather than ``_manage_harness_providers``.
     _KIMI = "\x00kimi"
     # Sentinels for the generic-ACP rows. Each configured agent gets its own row

@@ -6,10 +6,10 @@
 //     hover-revealed edit/remove affordances (the OMNI-3742 design).
 
 import { type CSSProperties, lazy, Suspense, useState } from "react";
-import { useTheme } from "next-themes";
 import { FolderIcon, Loader2Icon, PencilIcon, Trash2Icon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
 import { useUpdateProjectConfig } from "@/hooks/useConversations";
 import type { ProjectConfig } from "@/lib/projectsApi";
@@ -23,13 +23,13 @@ const loadEmojiData = async () => (await import("@emoji-mart/data")).default;
 
 /** A themed emoji-mart picker. Calls `onSelect` with the chosen unicode glyph. */
 export function EmojiPicker({ onSelect }: { onSelect: (native: string) => void }) {
-  const { resolvedTheme } = useTheme();
+  const mode = useResolvedThemeMode();
   return (
     <Suspense fallback={<div className="h-[420px] w-[352px]" aria-hidden />}>
       <Picker
         data={loadEmojiData}
         onEmojiSelect={(emoji: { native: string }) => onSelect(emoji.native)}
-        theme={resolvedTheme === "dark" ? "dark" : "light"}
+        theme={mode}
         navPosition="top"
         previewPosition="none"
         skinTonePosition="none"

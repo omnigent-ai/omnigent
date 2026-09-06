@@ -182,7 +182,29 @@ describe("archive flow", () => {
     );
   });
 
-  // Unarchive moved out of the sidebar: archived sessions no longer render
-  // here (they're on the Settings page), so the "Unarchive" affordance is
-  // covered by SettingsPage.test.tsx instead.
+  it("archives from the row's quick-archive hover button", () => {
+    mockConversations([CONV]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByTestId("quick-archive-conversation"));
+
+    // Same single-PATCH contract as the kebab item, just a different affordance.
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
+    expect(mocks.stop.mutate).not.toHaveBeenCalled();
+  });
+
+  it("unarchives from the quick button on an archived row", () => {
+    // Archived rows render under the "Archived sessions" filter; the quick
+    // button flips to its unarchive affordance there.
+    mockConversations([{ ...CONV, archived: true }]);
+    renderSidebar();
+    // Radix menu opens on pointerdown; pick the Archived filter.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0 });
+    fireEvent.click(screen.getByTestId("session-filter-archived"));
+
+    fireEvent.click(screen.getByTestId("quick-archive-conversation"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: false });
+  });
 });

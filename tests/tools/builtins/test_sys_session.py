@@ -21,6 +21,7 @@ import pytest
 
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.runtime import pending_elicitations
+from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -291,6 +292,20 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "harness",
         "cost_budget",
     }
+
+
+def test_send_description_announces_wake_notice() -> None:
+    """
+    The dispatch tool tells the model the exact wake notice the runtime
+    posts when a child finishes, so the notice is recognised as
+    runtime-originated instead of read as a user-typed instruction.
+    """
+    tool = SysSessionSendTool(
+        {"claude": AgentSpec(spec_version=1, name="claude", description="Review helper.")}
+    )
+    desc = tool.get_schema()["function"]["description"]
+    assert SUBAGENT_WAKE_NOTICE_SHAPE in desc
+    assert "not from a person" in desc
 
 
 def test_peek_schema_required_fields_and_no_extra_props() -> None:

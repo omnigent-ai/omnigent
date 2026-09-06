@@ -151,7 +151,11 @@ def _killpg(pid: int, sig: int) -> bool:
         return False
     try:
         target_pgid = _getpgid_fn(pid)
-        if target_pgid == _getpgid_fn(0):
+        # pgid <= 1 is never a real agent group: killpg(1, sig) is kill(-1,
+        # sig) - a broadcast to every process this user may signal (it took
+        # down the CI runner when a mocked pid coerced to 1) - and 0/negative
+        # would re-target our own group.
+        if target_pgid <= 1 or target_pgid == _getpgid_fn(0):
             return False
         _killpg_fn(target_pgid, sig)
         return True

@@ -45,6 +45,16 @@ describe("ChatPlanAccordion", () => {
     expect(screen.getByText("(1/3)")).toBeInTheDocument();
   });
 
+  it("keeps the native-shell stylesheet hook on the layout row", () => {
+    // WHY: index.css offsets `.chat-plan-accordion` under [data-ios-native] /
+    // [data-android-native] so the tracker clears the safe-area-shifted
+    // header. Dropping the hook silently re-overlaps the floating controls
+    // onto the Plan bar on notched phones.
+    h.todos = [{ content: "a", status: "pending", activeForm: "a" }];
+    const { container } = render(<ChatPlanAccordion />);
+    expect(container.firstElementChild).toHaveClass("chat-plan-accordion");
+  });
+
   it("lists the tasks in the expandable body", () => {
     // WHY: the expanded section reuses TodoPanel, so each task's content shows.
     h.todos = [

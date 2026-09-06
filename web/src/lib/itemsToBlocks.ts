@@ -372,6 +372,7 @@ function errorToBlock(item: ErrorItem): ErrorBlock {
     source: item.source,
     code: item.code,
     message: item.message,
+    ...(item.level ? { level: item.level } : {}),
     ...structuredErrorFields(item),
   };
 }
