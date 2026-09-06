@@ -1,4 +1,5 @@
-import { memo, useEffect, useMemo, useRef } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Conversation,
   ConversationContent,
@@ -146,6 +147,24 @@ function TranscriptImpl({
     sessionStatus,
   ]);
 
+  // Virtualizer-derived geometry (scroll handle, active turn, range nonce),
+  // published by VirtualBubbleList. The rail reads the active turn and the
+  // spacer the range nonce, all from the virtualizer's model rather than the
+  // windowed DOM. `scrollToItem` is held in a ref so `ensureItemVisible` keeps a
+  // stable identity; the reactive fields are lifted to state.
+  const scrollToItemRef = useRef<((itemId: string) => boolean) | null>(null);
+  const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
+  const [spacerMeasureNonce, setSpacerMeasureNonce] = useState(0);
+  const onGeometryChange = useCallback((geometry: TranscriptGeometry) => {
+    scrollToItemRef.current = geometry.scrollToItem;
+    setActiveTurnId(geometry.activeTurnId);
+    setSpacerMeasureNonce(geometry.rangeNonce);
+  }, []);
+  const ensureItemVisible = useCallback(
+    (itemId: string) => scrollToItemRef.current?.(itemId) ?? false,
+    [],
+  );
+
   // Single nav instance shared by hotkey + buttons. System-message bubbles are
   // excluded — the hotkey is for navigating real user turns, not markers.
   const userMessageIds = useMemo(
@@ -157,7 +176,7 @@ function TranscriptImpl({
         .map((b) => b.itemId),
     [bubbles],
   );
-  const nav = useUserMessageNav(userMessageIds);
+  const nav = useUserMessageNav(userMessageIds, ensureItemVisible);
 
   // One rail tick per real user turn, paired with a preview of the reply that
   // followed. Mirrors the transcript's loaded window and grows lazily.
@@ -268,14 +287,13 @@ function TranscriptImpl({
               <>
                 {/* Older pages prepend here while their request is in flight. */}
                 {loadingMoreHistory && <HistoryLoadingIndicator />}
-                {streamBubbles.map((bubble, bubbleIndex) => (
-                  <BubbleView
-                    key={bubbleKey(bubble)}
-                    bubble={bubble}
-                    isLastAssistant={bubbleIndex === lastAssistantIndex}
-                    showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
-                  />
-                ))}
+                <VirtualBubbleList
+                  bubbles={streamBubbles}
+                  scrollEl={scroller?.el ?? null}
+                  lastAssistantIndex={lastAssistantIndex}
+                  showsWorking={showsWorking}
+                  onGeometryChange={onGeometryChange}
+                />
                 {/* Pending elicitation cards, floated to the bottom of the chat
                 so an outstanding question stays in view. Newest renders last,
                 nearest the composer. Above the Working… indicator. */}
@@ -306,6 +324,7 @@ function TranscriptImpl({
               scrollElement={scroller?.el ?? null}
               topGapPx={hasTasks ? 16 : undefined}
               measureRef={spacerMeasureRef}
+              remeasureNonce={spacerMeasureNonce}
             />
           </ConversationContent>
           <ConversationScrollButton />
@@ -332,13 +351,235 @@ function TranscriptImpl({
         {!isMobileViewport && (
           <TurnRail
             turns={turns}
-            scroller={scroller}
             hasMoreHistory={hasMoreHistory}
             loadingMoreHistory={loadingMoreHistory}
+            ensureItemVisible={ensureItemVisible}
+            activeTurnId={activeTurnId}
           />
         )}
       </div>
     </>
+  );
+}
+
+/**
+ * The user turn that owns a given bubble index: the nearest user bubble at or
+ * before it (a turn spans from its user bubble to the next). Falls back to the
+ * first user turn when the index sits above every one. Pure so the active-tick
+ * mapping is testable without the virtualizer, which supplies `midIndex` via
+ * `getVirtualItemForOffset` — a lookup over ALL items, so it resolves a turn
+ * whose row is windowed out above or below the viewport just the same.
+ */
+export function activeTurnIdAtBubbleIndex(bubbles: Bubble[], midIndex: number): string | null {
+  const isUserTurn = (b: Bubble): b is Extract<Bubble, { kind: "user" }> =>
+    b.kind === "user" && !isSystemBubble(b);
+  if (bubbles.length === 0) return null;
+  const start = Math.min(Math.max(midIndex, 0), bubbles.length - 1);
+  for (let i = start; i >= 0; i--) {
+    const b = bubbles[i];
+    if (b && isUserTurn(b)) return b.itemId;
+  }
+  return bubbles.find(isUserTurn)?.itemId ?? null;
+}
+
+/**
+ * Windows the bubble list off the StickToBottom scroll container so only the
+ * on-screen slice mounts — switching into a long conversation no longer pays to
+ * mount every bubble's markdown/tool subtree at once.
+ *
+ * The window is one flex child of the content div, sized to the full measured
+ * height (`getTotalSize`) with each row absolutely positioned. Keeping the
+ * wrapper at full height preserves `scrollHeight`, so StickToBottom's
+ * at-bottom math, the TranscriptScrollbar, and the LatestTurnSpacer all keep
+ * measuring the whole transcript even though most rows are unmounted. Rows are
+ * keyed by `bubbleKey` so measured heights follow a bubble across a streaming
+ * rebuild or a history prepend.
+ */
+/**
+ * Transcript geometry derived from the virtualizer's model (all items, mounted
+ * or not) — the single source of truth the rail and spacer read instead of
+ * scanning the windowed DOM.
+ */
+export interface TranscriptGeometry {
+  /** Pulls a turn's row into the mounted window; false if its id isn't found. */
+  scrollToItem: (itemId: string) => boolean;
+  /** itemId of the user turn owning the viewport midpoint, or null. */
+  activeTurnId: string | null;
+  /** Bumps whenever the mounted range changes, so the spacer can re-measure a
+   *  windowed-out anchor that has since remounted. */
+  rangeNonce: number;
+}
+
+function VirtualBubbleList({
+  bubbles,
+  scrollEl,
+  lastAssistantIndex,
+  showsWorking,
+  onGeometryChange,
+}: {
+  bubbles: Bubble[];
+  scrollEl: HTMLElement | null;
+  lastAssistantIndex: number;
+  showsWorking: boolean;
+  /** Publishes virtualizer-derived geometry up to the rail/spacer. */
+  onGeometryChange: (geometry: TranscriptGeometry) => void;
+}) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  // The list isn't the scroll container's first child — indicators, padding,
+  // and the task tracker sit above it — so its top offset feeds the virtualizer
+  // as scrollMargin. Without it every row's computed `start` is shifted and the
+  // wrong window mounts. It goes stale whenever content ABOVE the list changes
+  // height without changing `bubbles.length` (the history-loading indicator
+  // toggling, the `pt-4 ↔ pt-20` task padding), so it is remeasured by watching
+  // the content element — which reflows on any such change — not just the
+  // scroll container (whose box size those changes leave untouched).
+  const [scrollMargin, setScrollMargin] = useState(0);
+  useLayoutEffect(() => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper || !scrollEl) return;
+    const measure = () => {
+      const offset =
+        wrapper.getBoundingClientRect().top -
+        scrollEl.getBoundingClientRect().top +
+        scrollEl.scrollTop;
+      setScrollMargin((prev) => (Math.abs(prev - offset) >= 1 ? offset : prev));
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(scrollEl); // viewport height changes
+    if (wrapper.parentElement) observer.observe(wrapper.parentElement); // content reflow above
+    return () => observer.disconnect();
+  }, [scrollEl, bubbles.length]);
+
+  const virtualizer = useVirtualizer({
+    count: bubbles.length,
+    getScrollElement: () => scrollEl,
+    // Corrected per row by measureElement; a middling bubble keeps the initial
+    // total close enough that the first paint doesn't jump.
+    estimateSize: () => 280,
+    getItemKey: (index) => bubbleKey(bubbles[index]!),
+    // Replaces the content column's `gap-4` between bubbles, which absolute
+    // positioning would otherwise drop.
+    gap: 16,
+    overscan: 6,
+    scrollMargin,
+  });
+
+  // Latest bubbles/virtualizer read through refs so published callbacks keep a
+  // stable identity across renders.
+  const bubblesRef = useRef(bubbles);
+  bubblesRef.current = bubbles;
+  const virtualizerRef = useRef(virtualizer);
+  virtualizerRef.current = virtualizer;
+
+  const scrollToItem = useCallback((itemId: string): boolean => {
+    const index = bubblesRef.current.findIndex((b) => b.kind === "user" && b.itemId === itemId);
+    if (index < 0) return false;
+    virtualizerRef.current.scrollToIndex(index, { align: "center" });
+    return true;
+  }, []);
+
+  const totalSize = virtualizer.getTotalSize();
+  const range = virtualizer.range;
+
+  // The user turn owning the viewport midpoint, from the virtualizer's model —
+  // NOT the windowed DOM. `getVirtualItemForOffset` maps a scroll offset to a
+  // bubble index across ALL items (mounted or not), so a turn whose row is
+  // unmounted above OR below the viewport is still resolved correctly; the
+  // active turn is the nearest user bubble at or before that index.
+  const activeTurnId = useMemo(() => {
+    const scrollOffset = virtualizer.scrollOffset;
+    if (scrollOffset === null || bubbles.length === 0) return null;
+    const viewport = scrollEl?.clientHeight ?? 0;
+    const midItem = virtualizer.getVirtualItemForOffset(scrollOffset + viewport / 2);
+    return activeTurnIdAtBubbleIndex(bubbles, midItem?.index ?? bubbles.length - 1);
+    // `range` and `totalSize` are deps so the active turn recomputes as the
+    // window scrolls and as measurements settle; `scrollOffset` alone isn't a
+    // render trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bubbles, scrollEl, range, totalSize, virtualizer]);
+
+  // Older-history prepend compensation. Absolute rows are out of normal flow,
+  // so the browser's native scroll anchoring — which `HistoryAutoLoader` leans
+  // on to hold the read position across a prepend — can't act on them. Rather
+  // than compensate by the total-height delta (which double-counts any change
+  // ABOVE the list in the same commit, e.g. the HistoryLoadingIndicator being
+  // removed), capture a still-present anchor row's offset before the prepend
+  // and restore scrollTop so that row sits at the same viewport position after.
+  // Measured purely from the virtualizer, so content above the list is
+  // irrelevant. react-virtual then corrects the estimate→actual delta itself as
+  // the freshly-mounted top rows measure.
+  const prevFirstKeyRef = useRef<string | undefined>(undefined);
+  // Snapshot of the previous render's first mounted row (top of the window,
+  // nearest an incoming prepend): its key and the offset it held THEN. The
+  // effect reads this (still the pre-prepend value) before overwriting it with
+  // the current render's snapshot, so a prepend restores that row to the same
+  // viewport position.
+  const anchorSnapshotRef = useRef<{ key: string; offset: number } | null>(null);
+  const firstVisible = virtualizer.getVirtualItems()[0];
+  const currentSnapshot =
+    firstVisible && typeof firstVisible.key === "string"
+      ? { key: firstVisible.key, offset: firstVisible.start }
+      : null;
+  useLayoutEffect(() => {
+    const firstKey = bubbles.length > 0 ? bubbleKey(bubbles[0]!) : undefined;
+    const prevFirstKey = prevFirstKeyRef.current;
+    const prevSnapshot = anchorSnapshotRef.current;
+    prevFirstKeyRef.current = firstKey;
+    anchorSnapshotRef.current = currentSnapshot;
+    // Only a prepend (grew at the top, old first key still present). A switch
+    // replaces the list (old first key gone) — handled by mount scroll-to-
+    // bottom. Streaming appends leave the first key unchanged.
+    if (!scrollEl || prevFirstKey === undefined || firstKey === prevFirstKey || !prevSnapshot) {
+      return;
+    }
+    if (!bubbles.some((b) => bubbleKey(b) === prevFirstKey)) return;
+    // Where the pre-prepend anchor row sits now, by key (its index shifted by
+    // the prepend). Restore scrollTop so it holds its pre-prepend viewport
+    // offset — measured purely from the virtualizer, so anything removed ABOVE
+    // the list in the same commit (the HistoryLoadingIndicator) doesn't matter.
+    const newIndex = bubbles.findIndex((b) => bubbleKey(b) === prevSnapshot.key);
+    if (newIndex < 0) return;
+    const newStart = virtualizer.getOffsetForIndex(newIndex, "start")?.[0];
+    if (newStart === undefined) return;
+    const delta = newStart - prevSnapshot.offset;
+    if (delta > 0 && scrollEl.scrollTop > 1) scrollEl.scrollTop += delta;
+    // currentSnapshot is intentionally captured per render; the effect only
+    // needs the previous one, stored above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bubbles, scrollEl, virtualizer]);
+
+  // Publish geometry (scroll handle, active turn, range nonce) up to the rail
+  // and spacer. rangeNonce bumps on any mounted-range change so a windowed-out
+  // spacer anchor that has remounted gets a fresh measure.
+  const rangeNonce = (range?.startIndex ?? -1) * 100003 + (range?.endIndex ?? -1);
+  useEffect(() => {
+    onGeometryChange({ scrollToItem, activeTurnId, rangeNonce });
+  }, [onGeometryChange, scrollToItem, activeTurnId, rangeNonce]);
+
+  return (
+    <div ref={wrapperRef} className="relative w-full" style={{ height: `${totalSize}px` }}>
+      {virtualizer.getVirtualItems().map((item) => {
+        const bubble = bubbles[item.index];
+        if (!bubble) return null;
+        return (
+          <div
+            key={item.key}
+            data-index={item.index}
+            ref={virtualizer.measureElement}
+            className="absolute top-0 left-0 w-full"
+            style={{ transform: `translateY(${item.start - scrollMargin}px)` }}
+          >
+            <BubbleView
+              bubble={bubble}
+              isLastAssistant={item.index === lastAssistantIndex}
+              showsWorking={showsWorking && item.index === lastAssistantIndex}
+            />
+          </div>
+        );
+      })}
+    </div>
   );
 }
 

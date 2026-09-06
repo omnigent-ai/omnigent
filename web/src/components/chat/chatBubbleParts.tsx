@@ -809,6 +809,7 @@ function AssistantBubble({
         from="assistant"
         data-testid="message-bubble"
         data-role="assistant"
+        data-response-stable-id={bubble.stableId}
         className={
           spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
         }
@@ -1163,6 +1164,9 @@ const PINNED_ANCHOR_TOP_GAP_PX = 96;
  */
 const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
 
+/** Frames to wait for the windowed anchor row to mount before settling capture. */
+const ANCHOR_CAPTURE_MAX_RETRIES = 10;
+
 /**
  * Trailing spacer that pins the initially loaded turn's anchor to the top of
  * the viewport. The anchor is captured once when the hydrated chat surface
@@ -1180,10 +1184,16 @@ export function LatestTurnSpacer({
   // the spacer's own ResizeObserver delivery runs a frame later, and the
   // intervening paint is the visible transcript jump.
   measureRef,
+  // Bumped by the transcript when the virtualizer's mounted range changes, so a
+  // windowed-out anchor that has since remounted (which needn't resize any
+  // observed element) triggers a fresh measure — the ResizeObserver alone would
+  // miss it, leaving a stale reservation.
+  remeasureNonce = 0,
 }: {
   scrollElement?: HTMLElement | null;
   topGapPx?: number;
   measureRef?: React.RefObject<(() => void) | null>;
+  remeasureNonce?: number;
 } = {}) {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
@@ -1193,9 +1203,17 @@ export function LatestTurnSpacer({
   // conversation switch, which captures that conversation's initial anchor.
   const blockCount = useChatStore((s) => s.blocks.length);
   const spacerRef = useRef<HTMLDivElement>(null);
-  // `undefined` means capture has not run; `null` is a completed capture with
-  // no suitable initial anchor (for example a brand-new empty conversation).
-  const initialAnchorRef = useRef<HTMLElement | null | undefined>(undefined);
+  // The anchor is stored by stable id, not by node reference: the transcript is
+  // windowed, so its DOM node is destroyed when the row scrolls out and a fresh
+  // node is mounted when it returns — a captured node reference would stay
+  // detached forever, and a semantic "last assistant text" would silently
+  // retarget to whatever earlier turn is still mounted. `undefined` = capture
+  // not run yet; a resolved value is a {kind,id} anchor (a committed user
+  // message, or an assistant response by its stable id) or `null` (a settled
+  // capture with no suitable anchor, e.g. a brand-new conversation).
+  const initialAnchorRef = useRef<{ kind: "user" | "assistant"; id: string } | null | undefined>(
+    undefined,
+  );
   const initialCommittedUserIdsRef = useRef<Set<string> | null>(null);
   if (initialCommittedUserIdsRef.current === null) {
     const ids = new Set<string>();
@@ -1210,6 +1228,18 @@ export function LatestTurnSpacer({
     }
     initialCommittedUserIdsRef.current = ids;
   }
+  // Bounded rAF retries for capturing the anchor when committed blocks exist but
+  // their rows haven't mounted yet (windowed transcript, published a frame
+  // before the virtualizer fills its window). A resize we could observe isn't
+  // guaranteed — the wrapper height is fixed to the estimate — so we drive the
+  // retry ourselves rather than wait for one. When the budget runs out (e.g. a
+  // tool-only trailing turn that never has an anchor) capture settles to `null`.
+  const captureFrameRef = useRef(0);
+  const captureAttemptsRef = useRef(0);
+  // The anchor node measured last, and a flag the ResizeObserver sets to force
+  // the next measure past the same-node skip (viewport/content size changed).
+  const lastAnchorNodeRef = useRef<HTMLElement | null>(null);
+  const forceMeasureRef = useRef(true);
 
   const measure = useCallback(() => {
     const scrollEl = scrollElement ?? ctx.scrollRef?.current;
@@ -1218,29 +1248,93 @@ export function LatestTurnSpacer({
     if (initialAnchorRef.current === undefined) {
       // Match DOM bubbles against committed blocks so an optimistic pending
       // send visible during this first layout can never become the anchor.
+      // Defer capture until a bubble is actually mounted — on a windowed
+      // transcript the scroll element can be published a frame before the
+      // virtualizer mounts any rows, and settling on `null` then would freeze
+      // the spacer with no anchor.
       const users = scrollEl.querySelectorAll<HTMLElement>(
         '[data-role="user"][data-user-message-id]',
       );
-      let initialUser: HTMLElement | null = null;
+      let initialUserId: string | null = null;
       for (let index = users.length - 1; index >= 0; index -= 1) {
-        const candidate = users[index]!;
-        const itemId = candidate.dataset.userMessageId;
+        const itemId = users[index]!.dataset.userMessageId;
         if (itemId !== undefined && initialCommittedUserIdsRef.current!.has(itemId)) {
-          initialUser = candidate;
+          initialUserId = itemId;
           break;
         }
       }
-      const texts = scrollEl.querySelectorAll<HTMLElement>(
-        '[data-testid="assistant-text-section"]',
-      );
-      initialAnchorRef.current = initialUser ?? texts[texts.length - 1] ?? null;
+      // No committed user anchor: pin the LAST assistant response by its stable
+      // id (the same id the bubble is keyed by), captured now while it's mounted
+      // at the bottom, so re-resolution later targets that exact turn — not
+      // whichever assistant text happens to be last in the windowed set.
+      let initialAssistantId: string | null = null;
+      if (initialUserId === null) {
+        const texts = scrollEl.querySelectorAll<HTMLElement>(
+          '[data-testid="assistant-text-section"]',
+        );
+        const lastText = texts[texts.length - 1];
+        initialAssistantId =
+          lastText?.closest<HTMLElement>("[data-role='assistant']")?.dataset.responseStableId ??
+          null;
+      }
+      if (initialUserId === null && initialAssistantId === null) {
+        const hasCommittedAnchor =
+          initialCommittedUserIdsRef.current!.size > 0 ||
+          useChatStore.getState().blocks.some((b) => b.type !== "user_message");
+        // Rows not mounted yet: retry on the next frame, up to a small budget,
+        // so a resize that never comes can't leave the spacer uncaptured — and
+        // an anchorless turn (tool-only trailing bubble) still settles instead
+        // of retrying forever. The `requestAnimationFrame` guard keeps this a
+        // no-op in environments without it rather than throwing.
+        if (
+          hasCommittedAnchor &&
+          captureAttemptsRef.current < ANCHOR_CAPTURE_MAX_RETRIES &&
+          typeof requestAnimationFrame === "function"
+        ) {
+          captureAttemptsRef.current += 1;
+          cancelAnimationFrame(captureFrameRef.current);
+          captureFrameRef.current = requestAnimationFrame(() => measure());
+          return;
+        }
+      }
+      initialAnchorRef.current =
+        initialUserId !== null
+          ? { kind: "user", id: initialUserId }
+          : initialAssistantId !== null
+            ? { kind: "assistant", id: initialAssistantId }
+            : null;
     }
-    const anchor = initialAnchorRef.current;
-    if (!anchor) {
+    const anchorKey = initialAnchorRef.current;
+    if (anchorKey === null) {
       // Do not let the always-mounted sentinel become a zero-height flex item.
       spacerEl.style.display = "none";
       return;
     }
+    // Re-resolve the live node by id every measure so a windowed row that was
+    // unmounted and remounted (a new DOM node) is picked up again.
+    const anchor =
+      anchorKey.kind === "user"
+        ? scrollEl.querySelector<HTMLElement>(
+            `[data-role="user"][data-user-message-id="${CSS.escape(anchorKey.id)}"]`,
+          )
+        : scrollEl.querySelector<HTMLElement>(
+            `[data-role="assistant"][data-response-stable-id="${CSS.escape(anchorKey.id)}"] [data-testid="assistant-text-section"]`,
+          );
+    // The transcript is windowed, so the anchor can be scrolled out of the
+    // mounted set. A missing node would report a zeroed rect that blows the
+    // reservation up — hold the last good height until the anchor re-mounts.
+    if (!anchor) return;
+    // The reservation depends only on the anchor NODE and the viewport height,
+    // both scroll-invariant. This effect also fires on every windowed-range
+    // change (a scroll-frequency signal), so skip the forced-layout rect reads
+    // below whenever neither changed — a viewport resize routes through the
+    // ResizeObserver, which sets `forceMeasureRef` to bypass this guard. Keeps
+    // ordinary scrolling free of per-frame getBoundingClientRect reflows while
+    // still re-measuring when the anchor node actually (re)mounts.
+    const forced = forceMeasureRef.current;
+    forceMeasureRef.current = false;
+    if (!forced && anchor === lastAnchorNodeRef.current) return;
+    lastAnchorNodeRef.current = anchor;
     // rect diffs are scroll-invariant, and the spacer's top is fixed by the
     // content above it, so this is stable across the height we're about to set.
     const spacerRect = spacerEl.getBoundingClientRect();
@@ -1263,15 +1357,28 @@ export function LatestTurnSpacer({
     if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
   }, [ctx.scrollRef, scrollElement, topGapPx]);
 
+  // A block-count change shifts content; force past the same-node skip. The
+  // range nonce (scroll) does NOT force — the guard skips it when the anchor
+  // node is unchanged, which is the whole point of decoupling scroll from the
+  // spacer's forced layout.
   useLayoutEffect(() => {
+    forceMeasureRef.current = true;
     measure();
-  }, [measure, blockCount]);
+    // remeasureNonce is a dep so a windowed-out anchor's remount re-measures,
+    // but it must NOT force — the same-node guard makes that path cheap.
+  }, [measure, blockCount, remeasureNonce]);
 
   useLayoutEffect(() => {
     if (!measureRef) return;
-    measureRef.current = measure;
+    // The composer's same-task growth pin reads geometry right after; force a
+    // real measure so it reflects the shrunk viewport, not a skipped no-op.
+    const forcedMeasure = () => {
+      forceMeasureRef.current = true;
+      measure();
+    };
+    measureRef.current = forcedMeasure;
     return () => {
-      if (measureRef.current === measure) measureRef.current = null;
+      if (measureRef.current === forcedMeasure) measureRef.current = null;
     };
   }, [measure, measureRef]);
 
@@ -1279,11 +1386,17 @@ export function LatestTurnSpacer({
     const scrollEl = scrollElement ?? ctx.scrollRef?.current;
     const contentEl = spacerRef.current?.parentElement;
     if (!scrollEl || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => measure());
+    const observer = new ResizeObserver(() => {
+      forceMeasureRef.current = true; // viewport / content size changed
+      measure();
+    });
     observer.observe(scrollEl); // viewport (clientHeight) changes
     if (contentEl) observer.observe(contentEl); // streaming / reflow growth
     return () => observer.disconnect();
   }, [ctx.scrollRef, measure, scrollElement]);
+
+  // Cancel any pending capture-retry frame when the surface unmounts.
+  useEffect(() => () => cancelAnimationFrame(captureFrameRef.current), []);
 
   return <div ref={spacerRef} aria-hidden style={{ flexShrink: 0 }} />;
 }
