@@ -205,6 +205,13 @@ interface SessionResponseWire {
     created_by?: string;
   }[];
   /**
+   * Ids of persisted user-message items steered into a running turn
+   * that the agent loop has not consumed yet, oldest first. Rendered
+   * in the same intermediate (pending) state the live
+   * `session.input.delivered` event drives. Empty otherwise.
+   */
+  unconsumed_input_ids?: string[];
+  /**
    * Numeric permission level (1=read, 2=edit, 3=manage, 4=owner) the
    * authenticated user holds on this session. Optional on the wire
    * because the server omits it when permissions are disabled
@@ -341,6 +348,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
       content: p.content,
       ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
     })),
+    unconsumedInputIds: wire.unconsumed_input_ids ?? [],
     permissionLevel: wire.permission_level ?? null,
     parentSessionId: wire.parent_session_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,

@@ -439,6 +439,27 @@ describe("buildPendingBubbles", () => {
     expect(bubble.createdBy).toBe("bob@example.com");
   });
 
+  it("marks a delivered-but-unconsumed (steered) entry pending; ordinary sends stay unmarked", () => {
+    // The intermediate state: an entry the server acknowledged as parked
+    // for the running turn renders with the not-yet-consumed affordance.
+    // A plain in-flight send (no deliveredItemId) must NOT be marked —
+    // its look is unchanged from before the steered-state fix.
+    const entries = [
+      { tempId: "tmp_plain", content: [{ type: "input_text" as const, text: "plain" }] },
+      {
+        tempId: "tmp_steer",
+        content: [{ type: "input_text" as const, text: "steered" }],
+        deliveredItemId: "msg_steered_1",
+      },
+    ];
+    const [plain, steered] = buildPendingBubbles(entries, null) as [
+      Extract<Bubble, { kind: "user" }>,
+      Extract<Bubble, { kind: "user" }>,
+    ];
+    expect(plain.pending).toBeUndefined();
+    expect(steered.pending).toBe(true);
+  });
+
   it("carries the send-time stamp; replayed entries show no re-stamped time", () => {
     // A fresh send was stamped once in the store at send time — the
     // optimistic bubble shows THAT time, not a drifting render-time

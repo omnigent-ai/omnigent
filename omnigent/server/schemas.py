@@ -2023,6 +2023,13 @@ class SessionResponse(BaseModel):
         bubble; replaying these re-hydrates it. Empty list otherwise.
         Sourced from the in-memory
         :mod:`omnigent.runtime.pending_inputs` index.
+    :param unconsumed_input_ids: Ids of persisted user-message items
+        that were steered into a running turn and are still awaiting
+        harness consumption at snapshot time, oldest first. Clients
+        render these in the intermediate (pending) state the live
+        ``session.input.delivered`` event drives. Empty otherwise.
+        Sourced from the in-memory
+        :mod:`omnigent.runtime.unconsumed_inputs` index.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. Set when the
         session was bound to a host workspace at create-time, or
@@ -2134,6 +2141,13 @@ class SessionResponse(BaseModel):
     # message at POST time and thus already carry it in ``items``.
     # Source: :mod:`omnigent.runtime.pending_inputs`.
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
+    # Ids of persisted user-message items steered into a running turn
+    # that the agent loop has not consumed yet, oldest first. A cold-
+    # loading client renders these items in the same intermediate
+    # (pending) state the live ``session.input.delivered`` event drives,
+    # instead of full-strength. Empty when nothing is awaiting the
+    # harness. Source: :mod:`omnigent.runtime.unconsumed_inputs`.
+    unconsumed_input_ids: list[str] = Field(default_factory=list)
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
@@ -3457,6 +3471,32 @@ class SessionInputConsumedEvent(_SSEEventBase):
     data: SessionInputConsumedPayload
 
 
+class SessionInputDeliveredEvent(_SSEEventBase):
+    """
+    A persisted input item was parked for a running turn, not consumed.
+
+    Emitted by ``POST /v1/sessions/{id}/events`` when a message is
+    steered into an already-active turn: the item is persisted into
+    conversation history and delivered into the turn's message buffer,
+    but the agent loop has verifiably NOT seen it yet. Clients render
+    the message in an intermediate (pending) state until the follow-up
+    ``session.input.consumed`` for the same ``item_id`` arrives — which
+    the server publishes only once the runner reports the buffered
+    message was actually drained into a turn.
+
+    Wire shape uses the NESTED envelope with the same payload as
+    :class:`SessionInputConsumedEvent` (``cleared_pending_id`` is always
+    ``None`` here), so consumers can decode both with one parser.
+
+    :param type: Always ``"session.input.delivered"``.
+    :param data: The delivered-item payload — see
+        :class:`SessionInputConsumedPayload`.
+    """
+
+    type: Literal["session.input.delivered"]
+    data: SessionInputConsumedPayload
+
+
 class SessionInterruptedPayload(BaseModel):
     """
     Inner payload of a :class:`SessionInterruptedEvent`.
@@ -4572,6 +4612,7 @@ ServerStreamEvent = Annotated[
     | SessionSkillsEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent
+    | SessionInputDeliveredEvent
     | SessionInterruptedEvent
     | SessionCreatedEvent
     | SessionSupersededEvent

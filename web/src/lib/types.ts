@@ -421,6 +421,13 @@ export interface Session {
    */
   pendingInputs?: PendingInput[];
   /**
+   * Ids of persisted user-message items steered into a running turn
+   * that the agent loop has not consumed yet, oldest first. The chat
+   * store re-renders these as delivered (not-yet-consumed) pending
+   * bubbles instead of full-strength committed ones. Empty otherwise.
+   */
+  unconsumedInputIds?: string[];
+  /**
    * Requesting user's numeric permission level on this session
    * (1=read, 2=edit, 3=manage, 4=owner). ``null`` when permissions
    * are disabled or the user has no grant. For sub-agent (child)

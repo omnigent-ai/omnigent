@@ -5536,6 +5536,161 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("session.input.delivered (steered message awaiting the harness)", () => {
+    it("stamps the oldest pending entry with the item id instead of promoting it", () => {
+      // A steered message was parked for the running turn: the bubble must
+      // STAY pending (rendered with the not-yet-consumed affordance), not
+      // commit — the agent loop hasn't seen it. Pre-fix, the server sent
+      // session.input.consumed here and the bubble committed immediately,
+      // indistinguishable from a consumed message.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_steer", content: [{ type: "input_text", text: "steer me" }] },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_delivered",
+        itemId: "msg_steered_1",
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "steer me" }] },
+      });
+
+      const state = useChatStore.getState();
+      // Nothing committed — the bubble stays in the pending sidecar.
+      expect(state.blocks).toEqual([]);
+      expect(state.pendingUserMessages).toHaveLength(1);
+      const entry = state.pendingUserMessages[0]!;
+      // Same entry (React key stable), now carrying the server id.
+      expect(entry.tempId).toBe("pend_steer");
+      expect(entry.deliveredItemId).toBe("msg_steered_1");
+      expect(entry.posted).toBe(true);
+    });
+
+    it("creates a delivered pending bubble for viewers with no local echo", () => {
+      // Another client steered the message: this viewer has no optimistic
+      // bubble, so the event payload materializes one — every collaborator
+      // sees the intermediate state, not just the sender.
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+
+      handleSessionEvent({
+        type: "session_input_delivered",
+        itemId: "msg_steered_2",
+        itemType: "message",
+        createdBy: "alice@example.com",
+        data: { role: "user", content: [{ type: "input_text", text: "from alice" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toEqual([]);
+      expect(state.pendingUserMessages).toEqual([
+        {
+          tempId: "delivered:msg_steered_2",
+          content: [{ type: "input_text", text: "from alice" }],
+          posted: true,
+          deliveredItemId: "msg_steered_2",
+          author: "alice@example.com",
+        },
+      ]);
+    });
+
+    it("is idempotent across an SSE replay of the same delivered event", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_steer", content: [{ type: "input_text", text: "steer me" }] },
+        ],
+      });
+      const event = {
+        type: "session_input_delivered",
+        itemId: "msg_steered_1",
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "steer me" }] },
+      } as const;
+
+      handleSessionEvent(event);
+      handleSessionEvent(event);
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toHaveLength(1);
+      expect(state.pendingUserMessages[0]!.deliveredItemId).toBe("msg_steered_1");
+    });
+
+    it("consumed promotes the delivered entry by exact id, not FIFO position", () => {
+      // A second (not-yet-delivered) send sits ahead in FIFO order; the
+      // consumed event for the steered item must still promote the entry
+      // that carries its id, leaving the other bubble pending.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_other", content: [{ type: "input_text", text: "other send" }] },
+          {
+            tempId: "pend_steer",
+            content: [{ type: "input_text", text: "steer me" }],
+            posted: true,
+            deliveredItemId: "msg_steered_1",
+          },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_steered_1",
+        itemType: "message",
+        clearedPendingId: null,
+        data: { role: "user", content: [{ type: "input_text", text: "steer me" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toHaveLength(1);
+      const promoted = state.blocks[0] as UserMessageBlock;
+      expect(promoted.ctx.itemId).toBe("msg_steered_1");
+      // The promoted bubble keeps the delivered entry's React key.
+      expect(promoted.stableKey).toBe("pend_steer");
+      // The unrelated send is untouched.
+      expect(state.pendingUserMessages).toEqual([
+        { tempId: "pend_other", content: [{ type: "input_text", text: "other send" }] },
+      ]);
+    });
+
+    it("terminal status promotes (not drops) a delivered entry whose consumed event was lost", () => {
+      // The delivered item is server-persisted: if the drain marker never
+      // arrives (relay hiccup), the idle edge must settle the bubble to a
+      // committed block rather than vanish it until reload.
+      useChatStore.setState({
+        blocks: [],
+        status: "idle",
+        pendingUserMessages: [
+          { tempId: "pend_plain", content: [{ type: "input_text", text: "denied maybe" }] },
+          {
+            tempId: "pend_steer",
+            content: [{ type: "input_text", text: "steer me" }],
+            posted: true,
+            deliveredItemId: "msg_steered_1",
+          },
+        ],
+      });
+
+      const statusEvent: SessionStatusEvent = {
+        type: "session_status",
+        conversationId: "conv_abc",
+        status: "idle",
+      };
+      handleSessionEvent(statusEvent);
+
+      const state = useChatStore.getState();
+      // The plain entry is dropped (consumed-raced or denied — today's
+      // behavior); the delivered one commits with its server id.
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.blocks).toHaveLength(1);
+      const settled = state.blocks[0] as UserMessageBlock;
+      expect(settled.type).toBe("user_message");
+      expect(settled.ctx.itemId).toBe("msg_steered_1");
+      expect(settled.content).toEqual([{ type: "input_text", text: "steer me" }]);
+    });
+  });
+
   describe("slash_command (claude-native skill / surfaced command)", () => {
     it("pops the FIFO head of pendingUserMessages so the optimistic bubble clears", () => {
       // Claude-native skips `session.input.consumed` for slash invocations;

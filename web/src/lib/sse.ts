@@ -37,6 +37,7 @@ import type {
   SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
+  SessionInputDeliveredEvent,
   SessionInterruptedEvent,
   SessionPresenceEvent,
   SessionResource,
@@ -832,6 +833,30 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       data: payload,
       clearedPendingId: typeof clearedPendingId === "string" ? clearedPendingId : null,
     } satisfies SessionInputConsumedEvent;
+  }
+  if (eventType === "session.input.delivered") {
+    // Nested envelope, same payload shape as session.input.consumed.
+    const inner = data.data;
+    if (!inner || typeof inner !== "object" || Array.isArray(inner)) return null;
+    const p = inner as Record<string, unknown>;
+    const itemId = p.item_id;
+    const itemType = p.type;
+    const itemData = p.data;
+    if (typeof itemId !== "string" || !itemId) return null;
+    if (typeof itemType !== "string" || !itemType) return null;
+    const payload =
+      itemData && typeof itemData === "object" && !Array.isArray(itemData)
+        ? (itemData as Record<string, unknown>)
+        : {};
+    const createdBy = p.created_by;
+    return {
+      type: "session_input_delivered",
+      itemId,
+      itemType,
+      isMeta: payload.is_meta === true,
+      ...(typeof createdBy === "string" ? { createdBy } : {}),
+      data: payload,
+    } satisfies SessionInputDeliveredEvent;
   }
   if (eventType === "session.interrupted") {
     // Nested envelope: `{type, data: {requested_at}}`.

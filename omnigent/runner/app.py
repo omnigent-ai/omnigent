@@ -2906,6 +2906,30 @@ def create_runner_app(
                 _native_pane_status[session_id] = _status_value
         _fan_out_child_delta_to_parent(session_id, event_body)
 
+    def _publish_input_drained(session_id: str, message_body: Mapping[str, object]) -> None:
+        """Report a buffered steered message as actually drained into a turn.
+
+        A message parked for an active turn was acknowledged to the server
+        as ``buffered`` (delivered, not consumed). The moment its buffered
+        copy leaves the buffer for a turn's history — a live injection the
+        executor accepted, or the continuation-turn drain — the server must
+        upgrade the item's delivered state to consumed for clients. The
+        marker is runner-internal: the server relay translates it into the
+        canonical ``session.input.consumed`` and never forwards it raw.
+        No-op for bodies without a ``persisted_item_id`` (native-terminal
+        messages are not persisted at POST time and reconcile through the
+        transcript forwarder instead).
+
+        :param session_id: Session/conversation identifier.
+        :param message_body: The buffered message body being drained.
+        """
+        _pid = message_body.get("persisted_item_id")
+        if isinstance(_pid, str) and _pid:
+            _publish_event(
+                session_id,
+                {"type": "session.input.drained", "item_id": _pid},
+            )
+
     def _child_preview_from_status(
         session_id: str,
         *,
@@ -6803,6 +6827,7 @@ def create_runner_app(
                         "content": next_body.get("content", []),
                     }
                 )
+                _publish_input_drained(session_id, next_body)
             else:
                 all_bodies = list(buf)
                 buf.clear()
@@ -6816,6 +6841,7 @@ def create_runner_app(
                             "content": body.get("content", []),
                         }
                     )
+                    _publish_input_drained(session_id, body)
                 next_body = all_bodies[-1]
 
             _begin_turn_slot(session_id)
@@ -8089,6 +8115,11 @@ def create_runner_app(
                                                     "content": _m.get("content", []),
                                                 }
                                             )
+                                            # The live injection was consumed by
+                                            # the executor — tell the server so
+                                            # it upgrades the item's delivered
+                                            # state to consumed for clients.
+                                            _publish_input_drained(conv_id, _m)
                                     continue
                                 if _evt_type == "response.output_text.delta":
                                     delta = event.get("delta")

@@ -940,6 +940,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
     case "session_sandbox_status":
     case "session_mcp_startup":
     case "session_input_consumed":
+    case "session_input_delivered":
     case "session_created":
       return;
 

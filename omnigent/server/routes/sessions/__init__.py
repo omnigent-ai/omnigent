@@ -472,6 +472,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_external_output_text_delta as _publish_external_output_text_delta,
     _publish_external_tool_output_delta as _publish_external_tool_output_delta,
     _publish_input_consumed as _publish_input_consumed,
+    _publish_input_delivered as _publish_input_delivered,
     _publish_input_deny_terminal as _publish_input_deny_terminal,
     _publish_interrupted as _publish_interrupted,
     _publish_mcp_startup as _publish_mcp_startup,
