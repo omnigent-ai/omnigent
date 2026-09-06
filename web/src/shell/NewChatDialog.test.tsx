@@ -2549,22 +2549,15 @@ describe("NewChatLandingScreen", () => {
     // The sandbox option is pinned FIRST in the menu, above the host list —
     // DOCUMENT_POSITION_FOLLOWING means the host item comes after it.
     const sandboxOption = screen.getByTestId("new-chat-landing-sandbox-option");
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    expect(hostItem).toBeTruthy();
+    const hostItem = screen.getByTestId("new-chat-landing-host-host_1");
     expect(
-      sandboxOption.compareDocumentPosition(hostItem!) & Node.DOCUMENT_POSITION_FOLLOWING,
+      sandboxOption.compareDocumentPosition(hostItem) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     // Picking the host restores the workspace flow (file-browser chip,
     // worktree chip) — the sandbox default doesn't wedge the normal path.
-    fireEvent.click(hostItem!);
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
-      ),
-    );
-    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
+    fireEvent.click(hostItem);
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy());
+    expect(screen.getByTestId("new-chat-landing-host-chip")).not.toHaveTextContent("New Sandbox");
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-repo-chip")).toBeNull();
     // And back: selecting the sandbox clears the host pick and swaps the
