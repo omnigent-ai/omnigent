@@ -926,11 +926,13 @@ function SidebarImpl({
           // floating-card positioning below (same `md:` layer, source order wins).
           !peek && "md:relative md:inset-auto",
           open || peek ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
-          // Peek: float as a card 4px off the viewport edge (capped at 300px wide),
-          // ringed and shadowed, sliding+fading in from the left so it reads as an
-          // overlay rather than a push.
+          // Peek: float as a ringed card sliding in from the left, its top
+          // clearing the chat header (md:h-12) — the card mounts under a pointer
+          // resting on the header's open-sidebar toggle, and covering that
+          // toggle would steal the click meant to pin the sidebar open (it
+          // landed on the card's brand link and navigated home instead).
           peek &&
-            "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
+            "is-peek md:absolute md:inset-x-2 md:top-12 md:bottom-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
         )}
         style={
           {
