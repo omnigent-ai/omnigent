@@ -3291,11 +3291,9 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_forkfork")).to_have_count(
                 0
             )
-            # Top level: the built-in Claude row + the "Custom agents" submenu
-            # trigger — no duplicate "Claude Code" sneaks in via a leaked clone.
-            await expect(page.get_by_role("menuitem")).to_have_count(2)
-            # The genuinely custom agent survives, inside the Custom agents submenu.
-            await page.get_by_test_id("new-chat-landing-custom-agents").click()
+            # The genuinely custom Agent survives in the inline Custom agents
+            # section; the create action is the only additional top-level item.
+            await expect(page.get_by_test_id("new-chat-landing-create-agent")).to_be_visible()
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_doc")).to_be_visible()
         finally:
             await browser.close()
