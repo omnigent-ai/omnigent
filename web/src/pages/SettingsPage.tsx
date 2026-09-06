@@ -105,6 +105,7 @@ import {
   type GithubConnectionStatus,
 } from "@/lib/githubIntegration";
 import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import { reloadOnMissingChunk } from "@/lib/lazyChunkRecovery";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
@@ -228,15 +229,22 @@ import { cn } from "@/lib/utils";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
-// Lazy-loaded to keep the settings chunk small.
-const MembersPage = lazy(() =>
-  import("@/pages/MembersPage").then((m) => ({ default: m.MembersPage })),
+// Lazy-loaded to keep the settings chunk small; `reloadOnMissingChunk` recovers
+// a stale tab whose hashed chunk a redeploy deleted (see lib/lazyChunkRecovery).
+const MembersPage = lazy(
+  reloadOnMissingChunk(() =>
+    import("@/pages/MembersPage").then((m) => ({ default: m.MembersPage })),
+  ),
 );
-const PoliciesPage = lazy(() =>
-  import("@/pages/PoliciesPage").then((m) => ({ default: m.PoliciesPage })),
+const PoliciesPage = lazy(
+  reloadOnMissingChunk(() =>
+    import("@/pages/PoliciesPage").then((m) => ({ default: m.PoliciesPage })),
+  ),
 );
-const SharingPage = lazy(() =>
-  import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
+const SharingPage = lazy(
+  reloadOnMissingChunk(() =>
+    import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
+  ),
 );
 
 /**

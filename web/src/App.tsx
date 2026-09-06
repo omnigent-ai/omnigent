@@ -2,9 +2,11 @@ import { lazy, Suspense, type ComponentType } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
+import { RouteChunkErrorBoundary } from "@/components/RouteChunkErrorBoundary";
 import { useOmnigentPageView } from "@/lib/analytics";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { reloadOnMissingChunk } from "@/lib/lazyChunkRecovery";
 import { AppShell } from "@/shell/AppShell";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
@@ -27,38 +29,62 @@ function withPageView<P extends object>(id: string, Component: ComponentType<P>)
 // so a non-accounts (header / OIDC) deploy doesn't ship them in the main chunk —
 // their routes aren't registered there, so the chunk never downloads. (Members /
 // Policies are lazy inside SettingsPage now that they're settings sub-categories.)
+//
+// Every lazy factory goes through `reloadOnMissingChunk`: a redeploy deletes
+// the old hashed chunks, so a stale tab's next navigation would reject the
+// import and blank the router — instead, reload once to pick up the new graph.
 const ChatPage = withPageView("chat", ChatPageImpl);
 const NotFoundPage = withPageView("not_found", NotFoundPageImpl);
 const LoginPage = withPageView(
   "login",
-  lazy(() => import("@/pages/LoginPage").then((m) => ({ default: m.LoginPage }))),
+  lazy(
+    reloadOnMissingChunk(() => import("@/pages/LoginPage").then((m) => ({ default: m.LoginPage }))),
+  ),
 );
 const RegisterPage = withPageView(
   "register",
-  lazy(() => import("@/pages/RegisterPage").then((m) => ({ default: m.RegisterPage }))),
+  lazy(
+    reloadOnMissingChunk(() =>
+      import("@/pages/RegisterPage").then((m) => ({ default: m.RegisterPage })),
+    ),
+  ),
 );
 const SetupPage = withPageView(
   "setup",
-  lazy(() => import("@/pages/SetupPage").then((m) => ({ default: m.SetupPage }))),
+  lazy(
+    reloadOnMissingChunk(() => import("@/pages/SetupPage").then((m) => ({ default: m.SetupPage }))),
+  ),
 );
 const ApprovePage = withPageView(
   "approve",
-  lazy(() => import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage }))),
+  lazy(
+    reloadOnMissingChunk(() =>
+      import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage })),
+    ),
+  ),
 );
 const InboxPage = withPageView(
   "inbox",
-  lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
+  lazy(
+    reloadOnMissingChunk(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
+  ),
 );
 const TasksPage = withPageView(
   "tasks",
-  lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
+  lazy(
+    reloadOnMissingChunk(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
+  ),
 );
 const UsagePage = withPageView(
   "usage",
-  lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
+  lazy(
+    reloadOnMissingChunk(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
+  ),
 );
-const SettingsPage = lazy(() =>
-  import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
+const SettingsPage = lazy(
+  reloadOnMissingChunk(() =>
+    import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
+  ),
 );
 
 interface AppProps {
@@ -132,62 +158,66 @@ function App({ basename }: AppProps = {}) {
   // after the first admin exists.
   if (info.accounts_enabled && info.needs_setup) {
     return (
-      <Suspense fallback={null}>
-        <Routes>
-          <Route path={basename ? `${prefix}/*` : "*"} element={<SetupPage />} />
-        </Routes>
-      </Suspense>
+      <RouteChunkErrorBoundary>
+        <Suspense fallback={null}>
+          <Routes>
+            <Route path={basename ? `${prefix}/*` : "*"} element={<SetupPage />} />
+          </Routes>
+        </Suspense>
+      </RouteChunkErrorBoundary>
     );
   }
 
   return (
-    <Suspense fallback={null}>
-      <Routes>
-        {info.accounts_enabled && (
-          <>
-            <Route path={`${prefix}/login`} element={<LoginPage />} />
-            <Route path={`${prefix}/register`} element={<RegisterPage />} />
-          </>
-        )}
-        <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
-        <Route element={<AppShell />}>
-          <Route path={prefix || "/"} element={<ChatPage />} />
-          <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
-          <Route path={`${prefix}/inbox`} element={<InboxPage />} />
-          <Route path={`${prefix}/tasks`} element={<TasksPage />} />
-          {isFeatureEnabled(info, "usage_page") && (
-            <Route path={`${prefix}/usage`} element={<UsagePage />} />
+    <RouteChunkErrorBoundary>
+      <Suspense fallback={null}>
+        <Routes>
+          {info.accounts_enabled && (
+            <>
+              <Route path={`${prefix}/login`} element={<LoginPage />} />
+              <Route path={`${prefix}/register`} element={<RegisterPage />} />
+            </>
           )}
-          {/* Settings renders into the chat outlet so the conversations
+          <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
+          <Route element={<AppShell />}>
+            <Route path={prefix || "/"} element={<ChatPage />} />
+            <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+            <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+            <Route path={`${prefix}/tasks`} element={<TasksPage />} />
+            {isFeatureEnabled(info, "usage_page") && (
+              <Route path={`${prefix}/usage`} element={<UsagePage />} />
+            )}
+            {/* Settings renders into the chat outlet so the conversations
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section
               is carried in the URL (/settings/<section>); bare /settings
               redirects to the canonical General section. */}
-          <Route
-            path={`${prefix}/settings`}
-            element={<Navigate to={`${prefix}/settings/general`} replace />}
-          />
-          <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
-          <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
-          {/* Members / Policies are now settings sub-categories
+            <Route
+              path={`${prefix}/settings`}
+              element={<Navigate to={`${prefix}/settings/general`} replace />}
+            />
+            <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
+            <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
+            {/* Members / Policies are now settings sub-categories
               (/settings/members, /settings/policies) so entering them
               keeps the settings sidebar nav instead of dropping back to
               the conversation list. Redirect the old standalone paths so
               existing bookmarks / links still land in the right place.
               Registered in every multi-user mode (accounts AND OIDC) —
               the sections self-gate to admins. */}
-          <Route
-            path={`${prefix}/members`}
-            element={<Navigate to={`${prefix}/settings/members`} replace />}
-          />
-          <Route
-            path={`${prefix}/policies`}
-            element={<Navigate to={`${prefix}/settings/policies`} replace />}
-          />
-          <Route path={basename ? `${prefix}/*` : "*"} element={<NotFoundPage />} />
-        </Route>
-      </Routes>
-    </Suspense>
+            <Route
+              path={`${prefix}/members`}
+              element={<Navigate to={`${prefix}/settings/members`} replace />}
+            />
+            <Route
+              path={`${prefix}/policies`}
+              element={<Navigate to={`${prefix}/settings/policies`} replace />}
+            />
+            <Route path={basename ? `${prefix}/*` : "*"} element={<NotFoundPage />} />
+          </Route>
+        </Routes>
+      </Suspense>
+    </RouteChunkErrorBoundary>
   );
 }
 
