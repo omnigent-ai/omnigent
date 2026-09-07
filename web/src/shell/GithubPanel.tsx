@@ -926,35 +926,51 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
         className="flex h-full min-h-0 flex-col gap-0"
       >
         {/* Header: repo + PR metadata + the Summary/Changes tabs. Refreshes on
-            its own — via the git-activity SSE signal and the panel's CI poll. */}
-        <div className="shrink-0 border-b border-border p-2">
-          <span className="block min-w-0 truncate text-xs text-muted-foreground">
-            {data.repo?.name_with_owner ?? "GitHub"}
-            {data.branch && (
-              <>
-                {" · "}
-                <span className="font-mono">{data.branch}</span>
-                {baseRef && <span className="text-muted-foreground"> → {baseRef}</span>}
-              </>
-            )}
-          </span>
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <a
-              href={pr.url}
-              target="_blank"
-              rel="noreferrer"
-              className="group inline-flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
-            >
-              <span className="truncate">{pr.title}</span>
-              <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
-              <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
-            </a>
+            its own — via the git-activity SSE signal and the panel's CI poll.
+            Padding lives on the title block (not the outer container) so the tabs
+            align to the gutter; pb-2 leaves room for the active tab's underline
+            (anchored 5px below the trigger) to sit just above the border. */}
+        <div className="shrink-0 border-b border-border pb-2">
+          <div className="px-2 pt-2">
+            <span className="block min-w-0 truncate text-xs text-muted-foreground">
+              {data.repo?.name_with_owner ?? "GitHub"}
+              {data.branch && (
+                <>
+                  {" · "}
+                  <span className="font-mono">{data.branch}</span>
+                  {baseRef && <span className="text-muted-foreground"> → {baseRef}</span>}
+                </>
+              )}
+            </span>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <a
+                href={pr.url}
+                target="_blank"
+                rel="noreferrer"
+                className="group inline-flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
+              >
+                <span className="truncate">{pr.title}</span>
+                <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
+                <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
+              </a>
+            </div>
           </div>
-          {/* Tab bar (Summary | Changes). The diff controls live inside the
-            Changes tab on their own line, so they don't crowd the tabs. */}
-          <TabsList variant="line" aria-label="Pull request" className="mt-1.5 h-auto gap-3 p-0">
-            <TabsTrigger value="summary">Summary</TabsTrigger>
-            <TabsTrigger value="changes">Changes</TabsTrigger>
+          {/* Tab bar (Summary | Changes); the diff controls live inside the
+            Changes tab on their own line, so they don't crowd the tabs. Each
+            trigger owns its px-1.5, so pl-0.5 nudges the list right to align
+            "Summary" with the title gutter; gap-0 + flex-none keep the two
+            labels close and content-sized (the default flex-1 equalizes them). */}
+          <TabsList
+            variant="line"
+            aria-label="Pull request"
+            className="mt-1.5 h-auto gap-0 p-0 pl-0.5"
+          >
+            <TabsTrigger value="summary" className="flex-none">
+              Summary
+            </TabsTrigger>
+            <TabsTrigger value="changes" className="flex-none">
+              Changes
+            </TabsTrigger>
           </TabsList>
         </div>
 
