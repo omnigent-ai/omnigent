@@ -34,7 +34,6 @@ Two guards, one per facet:
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
@@ -344,9 +343,8 @@ def test_agent_reaches_for_embedded_browser_on_neutral_browse_ask(
         time.sleep(3.0)
         items = _transcript_items(live_server, session_id)
         call_names = _tool_call_names(items)
-        transcript_blob = json.dumps(items)
 
-        assert "browser_navigate" in transcript_blob, (
+        assert "browser_navigate" in call_names, (
             "asked to look at a web page, the agent never reached "
             "for the Omnigent embedded browser (no browser_navigate call in "
             "the transcript) — it used its own web tooling instead. Tool "
