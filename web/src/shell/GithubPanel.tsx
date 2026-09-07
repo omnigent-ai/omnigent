@@ -930,7 +930,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
             Padding lives on the title block (not the outer container) so the
             tabs align to the gutter and the underline row spans full width. */}
         <div className="shrink-0 border-b border-border pb-0.5">
-          <div className="px-2 pt-2">
+          <div className="px-3 pt-2">
             <span className="block min-w-0 truncate text-xs text-muted-foreground">
               {data.repo?.name_with_owner ?? "GitHub"}
               {data.branch && (
@@ -959,10 +959,10 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
             flex-none keep the two labels close and content-sized (the default
             flex-1 equalizes and spreads them). */}
           <TabsList variant="line" aria-label="Pull request" className="h-auto gap-0 p-0">
-            <TabsTrigger value="summary" className="flex-none leading-none">
+            <TabsTrigger value="summary" className="flex-none px-3 leading-none">
               Summary
             </TabsTrigger>
-            <TabsTrigger value="changes" className="flex-none leading-none">
+            <TabsTrigger value="changes" className="flex-none px-3 leading-none">
               Changes
             </TabsTrigger>
           </TabsList>
