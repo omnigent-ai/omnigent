@@ -10327,11 +10327,18 @@ def create_runner_app(
             merged: list[SkillSpec] = [s for s in spec.skills if s.user_invocable]
             seen = {s.name for s in spec.skills}
             seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
+            # Claude Code resolves its user scope from $CLAUDE_CONFIG_DIR
+            # (default ~/.claude); the terminal inherits this env, so the
+            # menu must read the same tier or the two surfaces diverge.
+            configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
             ctx = SkillSourceContext(
                 roots=tuple(roots),
                 home=Path.home(),
                 skills_filter=spec.skills_filter,
                 bundle_dir=_resolved_spec_workdir(entry),
+                claude_config_dir=(
+                    Path(configured_claude_dir).expanduser() if configured_claude_dir else None
+                ),
             )
             harness = canonicalize_harness(spec.executor.harness_kind)
             for hs in resolve_harness_skills(ctx, harness):

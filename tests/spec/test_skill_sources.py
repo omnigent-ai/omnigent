@@ -26,10 +26,19 @@ def _write_skill(skills_dir: Path, name: str, *, user_invocable: bool | None = N
     (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {name} desc\n{ui}---\nbody\n")
 
 
-def _ctx(root: Path, home: Path, skills_filter: str | list[str] = "all") -> SkillSourceContext:
+def _ctx(
+    root: Path,
+    home: Path,
+    skills_filter: str | list[str] = "all",
+    claude_config_dir: Path | None = None,
+) -> SkillSourceContext:
     """Build a context with a single discovery root and a pinned home."""
     return SkillSourceContext(
-        roots=(root,), home=home, skills_filter=skills_filter, bundle_dir=None
+        roots=(root,),
+        home=home,
+        skills_filter=skills_filter,
+        bundle_dir=None,
+        claude_config_dir=claude_config_dir,
     )
 
 
@@ -88,6 +97,114 @@ def test_none_harness_falls_back_to_generic_host_walk(
 
     out = resolve_harness_skills(_ctx(workspace, home), None)
     assert [s.name for s in out] == ["ws-skill"]
+
+
+def test_claude_provider_excludes_agents_skills_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude Code does not read ``.agents/skills``, so its menu must not.
+
+    A claude-family session's ``/name`` is expanded by the Claude CLI
+    itself; listing a skill it never discovers surfaces a command that
+    fails when invoked (the terminal/web parity gap).
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    workspace = tmp_path / "ws"
+    _write_skill(workspace / ".claude" / "skills", "claude-tier-skill")
+    _write_skill(workspace / ".agents" / "skills", "workspace-agents-skill")
+    _write_skill(home / ".agents" / "skills", "home-agents-skill")
+
+    out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
+    assert [s.name for s in out] == ["claude-tier-skill"]
+
+
+def test_claude_provider_sources_user_skills_from_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured Claude config dir replaces ``~/.claude`` as the user tier.
+
+    Claude Code loads user skills from ``$CLAUDE_CONFIG_DIR/skills`` when
+    set — and then no longer reads ``~/.claude/skills`` — so the menu must
+    follow the same tier or the surfaces diverge in both directions.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".claude" / "skills", "default-home-skill")
+    cfg = tmp_path / "claude-config"
+    _write_skill(cfg / "skills", "config-dir-skill")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    out = resolve_harness_skills(_ctx(workspace, home, claude_config_dir=cfg), "claude-sdk")
+    assert [s.name for s in out] == ["config-dir-skill"]
+
+
+def test_claude_provider_defaults_user_tier_to_home_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a configured config dir the user tier stays ``~/.claude/skills``."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".claude" / "skills", "default-home-skill")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
+    assert [s.name for s in out] == ["default-home-skill"]
+
+
+def test_claude_provider_workspace_skill_wins_user_tier_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace ``.claude/skills`` name shadows the user tier's (project wins)."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    workspace = tmp_path / "ws"
+    ws_dir = workspace / ".claude" / "skills" / "shared-name"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "SKILL.md").write_text(
+        "---\nname: shared-name\ndescription: workspace copy\n---\nbody\n"
+    )
+    home_dir = home / ".claude" / "skills" / "shared-name"
+    home_dir.mkdir(parents=True)
+    (home_dir / "SKILL.md").write_text(
+        "---\nname: shared-name\ndescription: user copy\n---\nbody\n"
+    )
+
+    out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
+    assert [(s.name, s.description) for s in out] == [("shared-name", "workspace copy")]
+
+
+def test_claude_plugins_read_from_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plugin settings/manifests follow the configured Claude config dir.
+
+    With ``$CLAUDE_CONFIG_DIR`` set, Claude Code keeps ``settings.json``
+    and ``plugins/`` under that dir, so plugin slash-commands must be
+    resolved from there rather than ``~/.claude``.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    cfg = tmp_path / "claude-config"
+    install = cfg / "plugins" / "cache" / "mkt" / "toolkit" / "1.0.0"
+    _write_skill(install / "skills", "review")
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.json").write_text(json.dumps({"enabledPlugins": {"toolkit@mkt": True}}))
+    (cfg / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {"toolkit@mkt": [{"scope": "user", "installPath": str(install)}]},
+            }
+        )
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    out = resolve_harness_skills(_ctx(workspace, home, claude_config_dir=cfg), "claude-native")
+    assert [s.name for s in out] == ["toolkit:review"]
 
 
 def _claude_home_with_plugin(

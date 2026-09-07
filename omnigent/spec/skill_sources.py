@@ -79,12 +79,16 @@ class SkillSourceContext:
     :param skills_filter: The spec's ``skills:`` filter
         (``"all"`` / ``"none"`` / list of names).
     :param bundle_dir: The materialized bundle root, or ``None``.
+    :param claude_config_dir: Claude Code's user config dir when configured
+        (``$CLAUDE_CONFIG_DIR``), else ``None`` for the ``home/.claude``
+        default; injected so tests can pin it.
     """
 
     roots: tuple[Path, ...]
     home: Path
     skills_filter: str | list[str]
     bundle_dir: Path | None
+    claude_config_dir: Path | None = None
 
 
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
@@ -107,6 +111,67 @@ def _generic_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     out: list[SkillSpec] = []
     for root in ctx.roots:
         out.extend(discover_host_skills(root, ctx.skills_filter))
+    return _dedup(out)
+
+
+def _claude_user_dir(ctx: SkillSourceContext) -> Path:
+    """
+    Claude Code's user-scope config dir (its skills/plugins/settings root).
+
+    Mirrors Claude's own resolution (``CLAUDE_CONFIG_DIR`` when set,
+    otherwise ``~/.claude``) the way :mod:`omnigent.session_import.local`
+    and ``claude_native_status_file`` already do.
+    """
+    return ctx.claude_config_dir if ctx.claude_config_dir is not None else ctx.home / ".claude"
+
+
+def _claude_code_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+    """
+    The skill tiers Claude Code itself loads, and no others.
+
+    Claude Code reads workspace/ancestor ``.claude/skills`` plus the user
+    tier ``$CLAUDE_CONFIG_DIR/skills`` (default ``~/.claude/skills``). It
+    does NOT read ``.agents/skills`` (live-verified against its slash
+    menu), so the generic host walk over-reports for this family: a menu
+    entry the CLI can't expand just fails, since a native session sends
+    ``/name`` to the CLI as plaintext.
+    """
+    if ctx.skills_filter == "none":
+        return []
+    filter_names: set[str] | None = (
+        set(ctx.skills_filter) if isinstance(ctx.skills_filter, list) else None
+    )
+    dirs: list[Path] = []
+    seen_dirs: set[Path] = set()
+
+    def _add(candidate: Path) -> None:
+        if candidate in seen_dirs or not candidate.is_dir():
+            return
+        seen_dirs.add(candidate)
+        dirs.append(candidate)
+
+    # Workspace-first: each root's .claude/skills, then its ancestors'.
+    for root in ctx.roots:
+        current = root.resolve()
+        while True:
+            _add(current / ".claude" / "skills")
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+    # User tier last, so a workspace skill wins a name collision.
+    _add(_claude_user_dir(ctx) / "skills")
+
+    out: list[SkillSpec] = []
+    for skills_dir in dirs:
+        skipped: list[str] = []
+        for spec in _discover_skills(skills_dir, skipped=skipped):
+            if filter_names is not None and spec.name not in filter_names:
+                continue
+            out.append(spec)
+        # Surface dropped skills so a missing command is diagnosable.
+        for detail in skipped:
+            _log.warning("Skipping skill under %s: %s", skills_dir, detail)
     return _dedup(out)
 
 
@@ -163,8 +228,13 @@ def _enabled_plugin_settings_files(ctx: SkillSourceContext) -> list[Path]:
     :returns: Candidate settings paths in increasing precedence order.
     """
     files: list[Path] = []
-    # ``reversed`` puts the primary workspace (roots[0]) last → strongest.
-    for scope in (ctx.home, *reversed(ctx.roots)):
+    # User scope first (weakest): $CLAUDE_CONFIG_DIR itself carries the
+    # settings files (default ~/.claude). ``reversed`` then puts the primary
+    # workspace (roots[0]) last → strongest.
+    user_dir = _claude_user_dir(ctx)
+    files.append(user_dir / "settings.json")
+    files.append(user_dir / "settings.local.json")
+    for scope in reversed(ctx.roots):
         files.append(scope / ".claude" / "settings.json")
         files.append(scope / ".claude" / "settings.local.json")
     return files
@@ -185,7 +255,7 @@ def _managed_plugin_keys(ctx: SkillSourceContext) -> set[str]:
     :returns: The set of managed ``<plugin>@<marketplace>`` keys, empty when
         the file is absent, unreadable, or malformed.
     """
-    data = _read_json(ctx.home / ".claude" / "plugins" / "managed_plugins.json")
+    data = _read_json(_claude_user_dir(ctx) / "plugins" / "managed_plugins.json")
     if data is None:
         return set()
     managed = data.get("managed_plugins")
@@ -234,7 +304,7 @@ def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
 
 def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[str, Path]:
     """Map ``<plugin>@<marketplace>`` → installPath for enabled+installed plugins."""
-    data = _read_json(ctx.home / ".claude" / "plugins" / "installed_plugins.json")
+    data = _read_json(_claude_user_dir(ctx) / "plugins" / "installed_plugins.json")
     if data is None:
         return {}
     plugins = data.get("plugins")
@@ -244,7 +314,7 @@ def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[st
     # the Claude plugins cache root; anything pointing elsewhere is logged and
     # skipped so a tampered/odd manifest can't turn an arbitrary directory into
     # a discovery root.
-    plugins_root = (ctx.home / ".claude" / "plugins").resolve()
+    plugins_root = (_claude_user_dir(ctx) / "plugins").resolve()
     out: dict[str, Path] = {}
     for key, entries in plugins.items():
         if key not in enabled or not isinstance(entries, list):
@@ -308,8 +378,8 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
 
 def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
-    """Generic host walk (``~/.claude/skills`` etc.) plus enabled plugins."""
-    return _generic_host_skills(ctx) + _claude_plugin_skills(ctx)
+    """The tiers Claude Code itself loads plus its enabled plugins."""
+    return _claude_code_skills(ctx) + _claude_plugin_skills(ctx)
 
 
 def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
