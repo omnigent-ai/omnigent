@@ -8,6 +8,7 @@ from tests.e2e_ui.conftest import _server_state
 
 _TURNS = 80
 _ANCHOR_TOLERANCE_PX = 24
+_TARGET_PROMPT = "alpha prompt 60"
 
 
 def _seed_turns(session_id: str, prefix: str) -> None:
@@ -53,11 +54,7 @@ def _seed_turns(session_id: str, prefix: str) -> None:
 
 _FIND_SCROLLER = """
   const log = document.querySelector('[role="log"]');
-  let el = log;
-  log?.querySelectorAll('*').forEach((candidate) => {
-    if (candidate.scrollHeight > candidate.clientHeight + 4 &&
-        (!el || candidate.scrollHeight > el.scrollHeight)) el = candidate;
-  });
+  const el = log?.firstElementChild;
 """
 
 _READ_SCROLLER = f"""
@@ -74,13 +71,6 @@ _SCROLL_TO_BOTTOM = f"""
 }}
 """
 
-_SCROLL_TO_MIDDLE = f"""
-() => {{
-  {_FIND_SCROLLER}
-  if (el) el.scrollTop = Math.round((el.scrollHeight - el.clientHeight) * 0.45);
-}}
-"""
-
 _BOTTOM_DISTANCE = f"""
 () => {{
   {_FIND_SCROLLER}
@@ -88,25 +78,14 @@ _BOTTOM_DISTANCE = f"""
 }}
 """
 
-_CAPTURE_ANCHOR = f"""
-() => {{
+_CAPTURE_TARGET = f"""
+(node) => {{
   {_FIND_SCROLLER}
   if (!el) return null;
-  const top = el.getBoundingClientRect().top;
-  const rows = [...el.querySelectorAll('[data-bubble-key^="user:"]')]
-    .map((node) => {{
-      const rect = node.getBoundingClientRect();
-      return {{
-        id: node.getAttribute('data-bubble-key'),
-        offset: rect.top - top,
-      }};
-    }})
-    .filter((row) => row.id);
-  return rows
-    .filter((row) => row.offset <= 0)
-    .sort((a, b) => b.offset - a.offset)[0]
-    ?? rows.sort((a, b) => a.offset - b.offset)[0]
-    ?? null;
+  return {{
+    id: node.getAttribute('data-bubble-key'),
+    offset: node.getBoundingClientRect().top - el.getBoundingClientRect().top,
+  }};
 }}
 """
 
@@ -154,21 +133,29 @@ def test_mid_scroll_anchor_survives_conversation_switch(
     page: Page,
     seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """A measured bubble returns to the same viewport displacement."""
+    """A known user turn returns to the same viewport displacement."""
     base_url, session_a, session_b = _open_seeded_pair(page, seeded_session_pair)
-    page.evaluate(_SCROLL_TO_MIDDLE)
+    target = page.locator('[data-bubble-key^="user:"]', has_text=_TARGET_PROMPT)
+    page.locator(".transcript-hide-native-scrollbar").hover()
+    for _ in range(20):
+        page.mouse.wheel(0, -1_000)
+        page.wait_for_timeout(100)
+        if target.is_visible():
+            break
+    expect(target).to_be_visible(timeout=30_000)
+    target.evaluate("(node) => node.scrollIntoView({ block: 'start' })")
     page.wait_for_timeout(500)
-    # The direct scrollTop assignment fires before virtual row measurements
-    # settle. Mirror the reader's final scroll event so the saved semantic
-    # offset reflects the geometry captured below.
+    # TurnRail navigation and virtual measurements have settled. Mirror the
+    # reader's final scroll event so this exact turn's offset is persisted.
     page.evaluate(
         f"""() => {{
           {_FIND_SCROLLER}
           el?.dispatchEvent(new Event('scroll'));
         }}"""
     )
-    before = page.evaluate(_CAPTURE_ANCHOR)
+    before = target.evaluate(_CAPTURE_TARGET)
     assert before is not None
+    assert page.evaluate(_BOTTOM_DISTANCE) > 100
 
     page.locator(f'a[href="/c/{session_b}"]').click()
     expect(page).to_have_url(f"{base_url}/c/{session_b}", timeout=15_000)
@@ -178,7 +165,7 @@ def test_mid_scroll_anchor_survives_conversation_switch(
 
     after = None
     for _ in range(50):
-        after = page.evaluate(_CAPTURE_ANCHOR)
+        after = target.evaluate(_CAPTURE_TARGET) if target.count() else None
         if (
             after is not None
             and after["id"] == before["id"]

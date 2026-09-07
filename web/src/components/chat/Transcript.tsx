@@ -585,6 +585,10 @@ export function VirtualBubbleList({
   ctxRef.current = ctx;
   const storeConvId = useChatStore((s) => s.conversationId);
   const restoringRef = useRef<string | null>(null);
+  const latestSnapshotRef = useRef<{
+    conversationId: string;
+    snapshot: TranscriptViewSnapshot;
+  } | null>(null);
 
   const wrapperRef = useRef<HTMLDivElement>(null);
   // The list isn't the scroll container's first child — indicators, padding,
@@ -644,25 +648,29 @@ export function VirtualBubbleList({
     const save = () => {
       if (storeConvId !== conversationId || restoringRef.current === conversationId) return;
       if (isElAtBottom(scrollEl)) {
-        rememberTranscriptView(conversationId, { atBottom: true });
+        const snapshot = { atBottom: true } as const;
+        latestSnapshotRef.current = { conversationId, snapshot };
+        rememberTranscriptView(conversationId, snapshot);
         return;
       }
       const top = scrollEl.scrollTop;
       const anchor = virtualizerRef.current.getVirtualItemForOffset(top);
       const bubble = anchor ? bubblesRef.current[anchor.index] : undefined;
-      rememberTranscriptView(
-        conversationId,
-        captureTranscriptViewSnapshot({
-          atBottom: false,
-          scrollTop: top,
-          anchor: anchor && bubble ? { key: bubbleKey(bubble), start: anchor.start } : undefined,
-        }),
-      );
+      const snapshot = captureTranscriptViewSnapshot({
+        atBottom: false,
+        scrollTop: top,
+        anchor: anchor && bubble ? { key: bubbleKey(bubble), start: anchor.start } : undefined,
+      });
+      latestSnapshotRef.current = { conversationId, snapshot };
+      rememberTranscriptView(conversationId, snapshot);
     };
     save();
     scrollEl.addEventListener("scroll", save, { passive: true });
     return () => {
-      save();
+      const latest = latestSnapshotRef.current;
+      if (latest?.conversationId === conversationId) {
+        rememberTranscriptView(conversationId, latest.snapshot);
+      }
       scrollEl.removeEventListener("scroll", save);
     };
   }, [conversationId, scrollEl, storeConvId]);
