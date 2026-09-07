@@ -174,6 +174,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _spawn_archive_stop,
 )
 from omnigent.server.schemas import (
+    ArchivedSessionFacetsResponse,
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
     CreatedSessionResponse,
@@ -895,6 +896,56 @@ def register_core_routes(
 
         return await asyncio.to_thread(_list_union)
 
+    @router.get(
+        "/sessions/archived-facets",
+        response_model=ArchivedSessionFacetsResponse,
+    )
+    async def list_archived_session_facets(
+        request: Request,
+        response: Response,
+        search_query: str | None = Query(default=None),
+        search_scope: str = Query(default="title", pattern="^(title|content)$"),
+        project: str | None = Query(default=None),
+        host_id: str | None = Query(default=None),
+        agent_name: str | None = Query(default=None),
+        created_after: int | None = Query(default=None, ge=0),
+        created_before: int | None = Query(default=None, ge=0),
+        active_after: int | None = Query(default=None, ge=0),
+        active_before: int | None = Query(default=None, ge=0),
+        archived_after: int | None = Query(default=None, ge=0),
+        archived_before: int | None = Query(default=None, ge=0),
+    ) -> ArchivedSessionFacetsResponse:
+        """Return linked filter values for the visible archived-session set.
+
+        The candidate query applies search and date bounds once, then the three
+        facet sets are computed while excluding each facet's own current value.
+        This keeps Project/Host/Agent switchable while removing combinations
+        that cannot produce a result.
+        """
+        response.headers["Cache-Control"] = "no-store"
+        user_id = _require_user(request, auth_provider)
+        facets = await asyncio.to_thread(
+            conversation_store.list_archived_facets,
+            user_id,
+            search_query=search_query if search_query else None,
+            search_scope=search_scope,
+            project=project,
+            host_id=host_id,
+            agent_name=agent_name,
+            created_after=created_after,
+            created_before=created_before,
+            active_after=active_after,
+            active_before=active_before,
+            archived_after=archived_after,
+            archived_before=archived_before,
+        )
+        agent_names_by_id = await asyncio.to_thread(agent_store.get_names, facets.agent_ids)
+        return ArchivedSessionFacetsResponse(
+            projects=facets.projects,
+            host_ids=facets.host_ids,
+            agent_names=sorted(set(agent_names_by_id.values())),
+        )
+
     # ── PUT /sessions/{session_id}/read-state ─────────────────────
     #
     # The per-user read-state *write* path. The *read* path is the
@@ -1061,9 +1112,23 @@ def register_core_routes(
         agent_id: str | None = Query(default=None),
         agent_name: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-        sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at)$"),
+        sort_by: str = Query(
+            default="created_at",
+            pattern="^(created_at|updated_at|archived_at|title)$",
+        ),
         search_query: str | None = Query(default=None),
+        search_scope: str = Query(default="all", pattern="^(all|title|content)$"),
         include_archived: bool = Query(default=False),
+        archived_only: bool = Query(default=False),
+        host_id: str | None = Query(default=None),
+        created_after: int | None = Query(default=None, ge=0),
+        created_before: int | None = Query(default=None, ge=0),
+        updated_after: int | None = Query(default=None, ge=0),
+        updated_before: int | None = Query(default=None, ge=0),
+        active_after: int | None = Query(default=None, ge=0),
+        active_before: int | None = Query(default=None, ge=0),
+        archived_after: int | None = Query(default=None, ge=0),
+        archived_before: int | None = Query(default=None, ge=0),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
@@ -1091,14 +1156,16 @@ def register_core_routes(
             have distinct bundles. ``None`` disables the filter.
         :param order: Sort direction, ``"desc"`` (newest-first)
             or ``"asc"`` (oldest-first).
-        :param sort_by: Column to sort on, ``"created_at"`` or
-            ``"updated_at"``.
+        :param sort_by: Column to sort on: ``"created_at"``,
+            ``"updated_at"``, ``"archived_at"``, or ``"title"``.
         :param search_query: Case-insensitive substring filter on
             the session title or conversation content. ``None``
             or empty string disables the filter. A session
             matches if its title contains the query or any of
             its conversation items' text does. Powers the
             sidebar's session search.
+        :param search_scope: Limit search to ``"title"`` or ``"content"``;
+            ``"all"`` keeps the existing combined behavior.
         :param include_archived: When ``False`` (default), archived
             sessions are omitted. When ``True``, archived sessions
             are returned alongside active ones (the sidebar groups
@@ -1184,6 +1251,14 @@ def register_core_routes(
             shared_only_param = False
             include_archived_param = include_archived
             archived_only_param = False
+        if archived_only:
+            include_archived_param = True
+            archived_only_param = True
+        if sort_by == "archived_at" and not archived_only_param:
+            raise OmnigentError(
+                "sort_by='archived_at' requires an archived-only view",
+                code=ErrorCode.INVALID_INPUT,
+            )
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -1202,8 +1277,18 @@ def register_core_routes(
             order=order,
             sort_by=sort_by,
             search_query=normalized_query,
+            search_scope=search_scope,
             include_archived=include_archived_param,
             archived_only=archived_only_param,
+            host_id=host_id,
+            created_after=created_after,
+            created_before=created_before,
+            updated_after=updated_after,
+            updated_before=updated_before,
+            active_after=active_after,
+            active_before=active_before,
+            archived_after=archived_after,
+            archived_before=archived_before,
             project=project,
             pinned=pinned,
             # Pins are per-user: filter to the caller's own pin key.

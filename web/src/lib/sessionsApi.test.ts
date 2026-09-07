@@ -12,6 +12,7 @@ import {
   bindOnlyOnlineRunner,
   createSession,
   fetchSessionItemsPage,
+  fetchSessionItemsWindow,
   forkSession,
   getSession,
   getSessionSlim,
@@ -95,6 +96,9 @@ describe("createSession", () => {
       hostResumable: false,
       status: "idle",
       createdAt: 1704067200,
+      updatedAt: 1704067200,
+      archivedAt: null,
+      archived: false,
       title: null,
       items: [],
       queuedItems: undefined,
@@ -686,6 +690,9 @@ describe("getSession", () => {
         agent_id: "agent_xyz",
         status: "idle",
         created_at: 1704067200,
+        updated_at: 1704067300,
+        archived_at: 1704067250,
+        archived: true,
         items: [],
       }),
     );
@@ -701,6 +708,9 @@ describe("getSession", () => {
     );
     expect(session.agentId).toBe("agent_xyz");
     expect(session.items).toEqual([]);
+    expect(session.updatedAt).toBe(1704067300);
+    expect(session.archivedAt).toBe(1704067250);
+    expect(session.archived).toBe(true);
   });
 
   it("getSessionSlim can request a runner-backed state refresh", async () => {
@@ -870,6 +880,35 @@ describe("fetchSessionItemsPage", () => {
     // (the pre-fix shape) would return the conversation's start instead.
     expect(String(fetchMock.mock.calls[0]![0])).toBe(
       "/v1/sessions/conv_abc/items?limit=25&order=desc&after=msg_50",
+    );
+  });
+});
+
+describe("fetchSessionItemsWindow", () => {
+  it("requests and parses a bounded chronological window around an item", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        object: "session.items.window",
+        data: [{ id: "msg_anchor", type: "message", role: "user", content: [] }],
+        anchor_id: "msg_anchor",
+        first_id: "msg_anchor",
+        last_id: "msg_anchor",
+        has_older: true,
+        has_newer: false,
+      }),
+    );
+
+    const window = await fetchSessionItemsWindow("conv with space", "msg/anchor", {
+      before: 12,
+      after: 8,
+    });
+
+    expect(window.items.map((item) => item.id)).toEqual(["msg_anchor"]);
+    expect(window.anchorId).toBe("msg_anchor");
+    expect(window.hasOlder).toBe(true);
+    expect(window.hasNewer).toBe(false);
+    expect(String(fetchMock.mock.calls[0]![0])).toBe(
+      "/v1/sessions/conv%20with%20space/items/window?anchor_id=msg%2Fanchor&before=12&after=8",
     );
   });
 });

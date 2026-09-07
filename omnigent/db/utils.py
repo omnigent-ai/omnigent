@@ -1090,6 +1090,22 @@ def delete_fts_by_conversation_ids(session: Session, conv_ids: list[str]) -> Non
 
 # ── Search text extraction ─────────────────────────────
 
+CLAUDE_COMPACTION_SUMMARY_PREFIX = "This session is being continued from a previous conversation"
+CLAUDE_TASK_NOTIFICATION_MARKERS = (
+    "<task-notification>",
+    "<task-id>",
+    "</task-notification>",
+)
+
+
+def _is_hidden_archive_message_text(text: str) -> bool:
+    """Return whether a legacy durable prompt message is hidden by the chat UI."""
+    stripped = text.lstrip()
+    return text.startswith(CLAUDE_COMPACTION_SUMMARY_PREFIX) or (
+        stripped.startswith(CLAUDE_TASK_NOTIFICATION_MARKERS[0])
+        and all(marker in stripped for marker in CLAUDE_TASK_NOTIFICATION_MARKERS)
+    )
+
 
 def extract_search_text(item: NewConversationItem) -> str:
     """
@@ -1116,11 +1132,21 @@ def extract_search_text(item: NewConversationItem) -> str:
 
     data = item.data.model_dump()
     if item.type == "message":
-        return " ".join(
+        # Framework/meta messages are durable prompt context, not user-visible
+        # archive material. Keep them out of new search rows so a query cannot
+        # expose internal instructions as a result or citation target.
+        if getattr(item.data, "is_meta", False):
+            return ""
+        text_blocks = [
             block["text"]
             for block in data["content"]
             if isinstance(block, dict) and block.get("text")
-        )
+        ]
+        if data.get("role") == "user" and any(
+            _is_hidden_archive_message_text(text) for text in text_blocks
+        ):
+            return ""
+        return " ".join(text_blocks)
     if item.type == "function_call":
         return f"{data['name']} {data['arguments']}"
     if item.type == "function_call_output":

@@ -243,6 +243,15 @@ class SessionConnectivity:
     runner_last_seen: int | None = None
 
 
+@dataclass(frozen=True)
+class ArchivedConversationFacets:
+    """Distinct linked filter values for an archived-session query."""
+
+    projects: list[str]
+    host_ids: list[str]
+    agent_ids: list[str]
+
+
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
 # replica refreshes live runners every ~30s (the tunnel ping interval),
 # so 3 missed refreshes = offline — the same budget the tunnel's own
@@ -653,6 +662,17 @@ class ConversationStore(ABC):
         order: str = "desc",
         sort_by: str = "created_at",
         search_query: str | None = None,
+        search_scope: str = "all",
+        include_search_match: bool = True,
+        host_id: str | None = None,
+        created_after: int | None = None,
+        created_before: int | None = None,
+        updated_after: int | None = None,
+        updated_before: int | None = None,
+        active_after: int | None = None,
+        active_before: int | None = None,
+        archived_after: int | None = None,
+        archived_before: int | None = None,
         accessible_by: str | None = None,
         owned_by: str | None = None,
         shared_only: bool = False,
@@ -736,6 +756,22 @@ class ConversationStore(ABC):
             contains the query OR any of its items' search text
             does. Powers the sidebar's session search on
             ``GET /v1/sessions?search_query=...``.
+        :param search_scope: ``"title"`` limits matching to session titles;
+            ``"content"`` limits matching to transcript text; ``"all"``
+            matches either surface.
+        :param include_search_match: Populate a stable matching item locator
+            and body-match count for content searches.
+        :param host_id: Keep sessions bound to this Host.
+        :param created_after: Keep sessions created on or after this timestamp.
+        :param created_before: Keep sessions created before this timestamp.
+        :param updated_after: Keep sessions updated on or after this timestamp.
+        :param updated_before: Keep sessions updated before this timestamp.
+        :param active_after: Keep sessions whose activity interval ends on or
+            after this timestamp.
+        :param active_before: Keep sessions whose activity interval starts
+            before this exclusive timestamp.
+        :param archived_after: Keep sessions archived on or after this timestamp.
+        :param archived_before: Keep sessions archived before this timestamp.
         :param accessible_by: When set, filter to sessions the
             user has access to via ``session_permissions``. Uses
             a UNION subquery: sessions the user has a direct
@@ -798,6 +834,26 @@ class ConversationStore(ABC):
         :param limit: Maximum number of results to return.
         :returns: A list of matching :class:`ConversationItem`
             objects ranked by relevance.
+        """
+        ...
+
+    @abstractmethod
+    def search_visible_items_literal(
+        self,
+        conversation_id: str,
+        query: str,
+        limit: int = 20,
+    ) -> list[ConversationItem]:
+        """Search one transcript by literal user-visible text.
+
+        This reader-facing contract differs from the general ranked FTS API:
+        operators and SQL wildcards are plain text, internal prompt rows never
+        consume the result bound, and results are chronological.
+
+        :param conversation_id: Conversation whose committed items are searched.
+        :param query: Literal case-insensitive substring.
+        :param limit: Maximum number of items returned.
+        :returns: Chronological matching items.
         """
         ...
 
@@ -1017,6 +1073,31 @@ class ConversationStore(ABC):
             project owned by someone else — but with a session shared to
             the user — from appearing as one of the user's own folders.
         :returns: List of project names ordered alphabetically.
+        """
+        ...
+
+    @abstractmethod
+    def list_archived_facets(
+        self,
+        accessible_by: str | None = None,
+        *,
+        search_query: str | None = None,
+        search_scope: str = "title",
+        project: str | None = None,
+        host_id: str | None = None,
+        agent_name: str | None = None,
+        created_after: int | None = None,
+        created_before: int | None = None,
+        active_after: int | None = None,
+        active_before: int | None = None,
+        archived_after: int | None = None,
+        archived_before: int | None = None,
+    ) -> ArchivedConversationFacets:
+        """Aggregate linked Archive filter values in the storage layer.
+
+        Each returned facet excludes its own selected value while retaining
+        the other filters. Implementations return compact distinct values and
+        must not materialize full conversation entities.
         """
         ...
 
