@@ -249,16 +249,15 @@ class ResponsesNamespace:
                     await resp.aread()
                     raise_for_status(resp.status_code, response_body(resp))
                 elif 300 <= resp.status_code < 400:
-                    # Redirects are disabled on this client (httpx defaults
-                    # follow_redirects=False), so a 3xx here is a proxy or
-                    # gateway hop we never followed. raise_for_status is a
-                    # no-op below 400, and parse_sse_stream over the
-                    # redirect's non-SSE body would complete with no events —
-                    # a silent, error-free, empty stream. Fail loud instead.
-                    await resp.aread()
+                    # An unfollowed redirect: OmnigentClient follows
+                    # redirects, so a 3xx here means the hop could not be
+                    # chased (no Location header, or a caller-supplied client
+                    # with redirects disabled). Parsing its non-SSE body
+                    # would yield a silent, error-free, empty stream — fail
+                    # loud instead.
                     raise OmnigentError(
-                        f"stream open was redirected (status {resp.status_code}); "
-                        "this client does not follow redirects on a stream",
+                        f"stream open ended on an unfollowed redirect "
+                        f"(status {resp.status_code})",
                         resp.status_code,
                     )
 

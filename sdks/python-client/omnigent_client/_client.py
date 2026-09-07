@@ -79,6 +79,10 @@ class OmnigentClient:
             headers=default_headers,
             auth=auth,
             timeout=httpx.Timeout(timeout),
+            # Follow proxy/gateway redirects (3xx) transparently, streams
+            # included. httpx strips Authorization on cross-origin hops and
+            # raises TooManyRedirects on loops.
+            follow_redirects=True,
             # A proxy cannot reach our loopback server, so bypass the
             # environment for local targets. Loopback is plain HTTP with
             # explicit headers, so losing netrc/CA env with it costs nothing.
