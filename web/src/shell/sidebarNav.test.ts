@@ -6,6 +6,7 @@ import {
   bareConversationId,
   computeNextActiveOverride,
   conversationDisplayLabel,
+  conversationProjectName,
   dedupeConversationsById,
   filterConversations,
   getConversationIconKind,
@@ -19,7 +20,12 @@ function conversation(
   id: string,
   title: string | null,
   createdAt: Date,
-  options: { labels?: Record<string, string>; updatedAt?: Date; archived?: boolean } = {},
+  options: {
+    labels?: Record<string, string>;
+    updatedAt?: Date;
+    archived?: boolean;
+    projectId?: string | null;
+  } = {},
 ): Conversation {
   return {
     id,
@@ -30,6 +36,7 @@ function conversation(
     labels: options.labels ?? {},
     permission_level: null,
     archived: options.archived,
+    project_id: options.projectId,
   };
 }
 
@@ -461,6 +468,50 @@ describe("conversationDisplayLabel", () => {
         }),
       ),
     ).toBe("Claude Code");
+  });
+});
+
+describe("conversationProjectName", () => {
+  it("resolves the first-class project name via the id map", () => {
+    const conv = conversation("conv_a", "Title", new Date(2026, 4, 14, 9), {
+      projectId: "proj_1",
+    });
+    const projectNamesById = new Map([["proj_1", "Website Redesign"]]);
+    expect(conversationProjectName(conv, projectNamesById)).toBe("Website Redesign");
+  });
+
+  it("falls through to the legacy label when the project_id isn't in the map", () => {
+    const conv = conversation("conv_a", "Title", new Date(2026, 4, 14, 9), {
+      projectId: "proj_missing",
+      labels: { omni_project: "Legacy Name" },
+    });
+    expect(conversationProjectName(conv, new Map())).toBe("Legacy Name");
+  });
+
+  it("returns null when the project_id isn't in the map and there's no label", () => {
+    const conv = conversation("conv_a", "Title", new Date(2026, 4, 14, 9), {
+      projectId: "proj_missing",
+    });
+    expect(conversationProjectName(conv, new Map())).toBeNull();
+  });
+
+  it("resolves the legacy omni_project label when there's no first-class project_id", () => {
+    const conv = conversation("conv_a", "Title", new Date(2026, 4, 14, 9), {
+      labels: { omni_project: "Legacy Only" },
+    });
+    expect(conversationProjectName(conv, new Map())).toBe("Legacy Only");
+  });
+
+  it("treats an empty-string label as unfiled", () => {
+    const conv = conversation("conv_a", "Title", new Date(2026, 4, 14, 9), {
+      labels: { omni_project: "" },
+    });
+    expect(conversationProjectName(conv, new Map())).toBeNull();
+  });
+
+  it("returns null when neither a project_id nor a label is present", () => {
+    const conv = conversation("conv_a", "Title", new Date(2026, 4, 14, 9));
+    expect(conversationProjectName(conv, new Map())).toBeNull();
   });
 });
 

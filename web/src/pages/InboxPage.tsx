@@ -35,12 +35,13 @@
  * the prompt timing out) is what clears an approval.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangleIcon,
   ArrowRightIcon,
   ChevronDownIcon,
+  FolderIcon,
   InboxIcon,
   Loader2Icon,
 } from "lucide-react";
@@ -49,7 +50,7 @@ import { PageScroll } from "@/components/PageScroll";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
-import { useConversations } from "@/hooks/useConversations";
+import { useConversations, useProjects } from "@/hooks/useConversations";
 import { collectInboxItems, type InboxItem, type InboxSource } from "@/lib/inbox";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
@@ -57,7 +58,28 @@ import { useOmnigentAnalytics } from "@/lib/analytics";
 import { approve, getSession } from "@/lib/sessionsApi";
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
-import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
+import {
+  conversationDisplayLabel,
+  conversationProjectName,
+  getConversationAgentType,
+} from "@/shell/sidebarNav";
+
+/** The owning project's folder icon + truncated name, shown on inbox cards for
+    a filed session. Mirrors the muted small-icon look of the sidebar's
+    pinned-project flyout (`PinnedProjectFlyoutContent`). */
+function InboxProjectTag({ name }: { name: string }) {
+  return (
+    <span
+      data-testid="inbox-project"
+      className="flex min-w-0 shrink items-center gap-1 text-sm text-muted-foreground"
+    >
+      <FolderIcon className="size-3.5 shrink-0" />
+      <span className="max-w-[12rem] truncate" title={name}>
+        {name}
+      </span>
+    </span>
+  );
+}
 
 /** Optimistic verdicts keyed by elicitation id, mirroring the chat store's flip. */
 type RespondedMap = Record<
@@ -74,6 +96,17 @@ export function InboxPage() {
   const { trackClick } = useOmnigentAnalytics();
   const conversationsQuery = useConversations("", false, { reconcileWhileConnected: true });
   const [responded, setResponded] = useState<RespondedMap>({});
+
+  // id → name for resolving each row's first-class `project_id` into a
+  // display name, same construction the sidebar uses.
+  const { data: projects = [] } = useProjects();
+  const projectNamesById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const p of projects) {
+      if (p.id !== null) map.set(p.id, p.name);
+    }
+    return map;
+  }, [projects]);
   // Manual expand/collapse toggles keyed by elicitation id. Anything
   // not in the map falls back to the default: expanded only for the
   // first (newest) item. Keying by id (not index) keeps a user's
@@ -266,6 +299,7 @@ export function InboxPage() {
           // sessions, where the wrapper label IS the display label).
           const title = conversationDisplayLabel(item.row);
           const agentLabel = getConversationAgentType(item.row);
+          const projectName = conversationProjectName(item.row, projectNamesById);
           return (
             <div
               key={elicitationId}
@@ -292,7 +326,20 @@ export function InboxPage() {
                       !expanded && "-rotate-90",
                     )}
                   />
-                  <span className="min-w-0 shrink-0 truncate text-ui font-medium">
+                  {projectName != null && (
+                    <>
+                      <InboxProjectTag name={projectName} />
+                      <span aria-hidden className="shrink-0 text-muted-foreground">
+                        /
+                      </span>
+                    </>
+                  )}
+                  {/* No shrink-0 here: a filed session's project tag eats into this
+                      row's width budget, and a long title needs to be able to
+                      truncate under that pressure — otherwise it overflows and
+                      visually collides with the time/Open-session group instead
+                      of giving way. */}
+                  <span className="min-w-0 truncate text-ui font-medium">
                     {title}
                     {agentLabel !== title && (
                       <span className="ml-2 text-sm font-normal text-muted-foreground">
@@ -348,6 +395,7 @@ export function InboxPage() {
           // "You" fallback (the only human in that mode is the viewer).
           const author = comment.created_by ?? "You";
           const sessionTitle = conversationDisplayLabel(item.row);
+          const projectName = conversationProjectName(item.row, projectNamesById);
           return (
             <div
               key={comment.id}
@@ -398,7 +446,15 @@ export function InboxPage() {
                 <p className="line-clamp-3 text-ui break-words whitespace-pre-wrap">
                   {comment.body}
                 </p>
-                <span className="text-sm text-muted-foreground">{sessionTitle}</span>
+                {projectName != null ? (
+                  <span className="flex min-w-0 items-center gap-1 text-sm text-muted-foreground">
+                    <InboxProjectTag name={projectName} />
+                    <span aria-hidden>/</span>
+                    <span className="truncate">{sessionTitle}</span>
+                  </span>
+                ) : (
+                  <span className="text-sm text-muted-foreground">{sessionTitle}</span>
+                )}
               </div>
             </div>
           );

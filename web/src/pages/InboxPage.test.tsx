@@ -49,6 +49,7 @@ vi.mock("@/components/blocks/ApprovalCard", () => ({
 vi.mock("@/hooks/useConversations", async (importActual) => ({
   ...(await importActual<typeof conversationsHook>()),
   useConversations: vi.fn(),
+  useProjects: vi.fn(),
 }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
 vi.mock("@/lib/sessionsApi", () => ({ getSession: vi.fn(), approve: vi.fn() }));
@@ -88,6 +89,11 @@ function conversationsStub(rows: Conversation[], overrides: Record<string, unkno
   } as unknown as ReturnType<typeof conversationsHook.useConversations>;
 }
 
+/** Build a useProjects stub for the given project summaries. */
+function projectsStub(projects: { id: string | null; name: string }[]) {
+  return { data: projects } as unknown as ReturnType<typeof conversationsHook.useProjects>;
+}
+
 /** Build a CommentInbox stub; empty and settled by default. */
 function commentInboxStub(overrides: Partial<CommentInbox> = {}): CommentInbox {
   return {
@@ -115,6 +121,9 @@ function renderPage() {
 
 beforeEach(() => {
   vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([]));
+  vi.mocked(conversationsHook.useProjects).mockReturnValue({
+    data: [],
+  } as unknown as ReturnType<typeof conversationsHook.useProjects>);
   vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(commentInboxStub());
   vi.mocked(sessionsApi.getSession).mockResolvedValue({
     pendingElicitations: [],
@@ -324,6 +333,110 @@ describe("InboxPage approval items", () => {
     await waitFor(() =>
       expect(sessionsApi.approve).toHaveBeenCalledWith("child", "eli_child", { action: "accept" }),
     );
+  });
+});
+
+describe("InboxPage project names", () => {
+  it("renders the project name on an approval card when project_id resolves via useProjects", async () => {
+    // WHY: a session filed via the first-class project_id shows its owning
+    // project's name next to the title, without hiding the title itself.
+    const row = conversation({ id: "sess_1", title: "My Session", project_id: "proj_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(
+      projectsStub([{ id: "proj_1", name: "Website Redesign" }]),
+    );
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    expect(await screen.findByTestId("inbox-project")).toHaveTextContent("Website Redesign");
+    expect(screen.getByText("My Session")).toBeInTheDocument();
+  });
+
+  it("renders no project tag for a session with no project_id and no omni_project label", async () => {
+    // WHY: an unfiled session's card stays exactly as it renders today —
+    // no folder icon, no separator, no empty element.
+    const row = conversation({ id: "sess_1", title: "My Session" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    await screen.findByText("My Session");
+    expect(screen.queryByTestId("inbox-project")).not.toBeInTheDocument();
+  });
+
+  it("renders the project name for a session filed only via the legacy omni_project label", async () => {
+    // WHY: sessions filed before the first-class project_id migration still
+    // resolve their project name from the legacy label.
+    const row = conversation({
+      id: "sess_1",
+      title: "My Session",
+      labels: { omni_project: "Legacy Project" },
+    });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    expect(await screen.findByTestId("inbox-project")).toHaveTextContent("Legacy Project");
+  });
+
+  it("carries the full project name in a title attribute for a long name", async () => {
+    // WHY: the project segment truncates visually via CSS, but the full
+    // name must stay available on hover via a native title attribute.
+    const longName =
+      "A Very Long Project Name That Should Truncate Visually But Not In The Title Attribute";
+    const row = conversation({ id: "sess_1", title: "My Session", project_id: "proj_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(
+      projectsStub([{ id: "proj_1", name: longName }]),
+    );
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    const tag = await screen.findByTestId("inbox-project");
+    expect(within(tag).getByTitle(longName)).toHaveClass("truncate");
+  });
+
+  it("shows the project name next to the session name on a comment card", async () => {
+    // WHY: comment cards resolve the same project name as approval cards,
+    // rendered next to the session name line.
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(
+      projectsStub([{ id: "proj_1", name: "Website Redesign" }]),
+    );
+    vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(
+      commentInboxStub({
+        items: [
+          {
+            row: conversation({
+              id: "sess_1",
+              title: "My Session",
+              pending_elicitations_count: 0,
+              project_id: "proj_1",
+            }),
+            comment: {
+              id: "cm_1",
+              path: "src/app.ts",
+              body: "Please reconsider this line.",
+              created_by: "alice",
+              created_at: 1_700_000_000,
+              updated_at: 1_700_000_000_000,
+              status: "draft",
+            } as CommentInbox["items"][number]["comment"],
+          },
+        ],
+      }),
+    );
+    renderPage();
+
+    expect(await screen.findByTestId("inbox-project")).toHaveTextContent("Website Redesign");
+    expect(screen.getByText("My Session")).toBeInTheDocument();
   });
 });
 
