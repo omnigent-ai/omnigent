@@ -138,6 +138,12 @@ export interface SendOptions {
    * `send` already set `conversationId` before the callback.
    */
   onConversationCreated?: (conversationId: string) => void;
+  /**
+   * Stable id to reuse for this send instead of generating a fresh one.
+   * Set by ChatPage when retrying a `failedSendDraft` so the server-side
+   * dedup recognises the retry and does not re-dispatch to the runner.
+   */
+  stableId?: string;
 }
 
 /**
@@ -435,7 +441,7 @@ export interface ConversationState {
    * into — but the landing path binds a session first, so the reported flow
    * is covered.
    */
-  failedSendDraft: { conversationId: string; text: string; files: File[] } | null;
+  failedSendDraft: { conversationId: string; text: string; files: File[]; stableId: string } | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -1604,7 +1610,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!agentId) {
       throw new Error("chatStore.send: no agentId");
     }
-    const stableId = crypto.randomUUID().replace(/-/g, "");
+    const stableId = opts?.stableId ?? crypto.randomUUID().replace(/-/g, "");
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
     // into the running task's inbox. Keep `activeResponse` untouched in
@@ -1779,7 +1785,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const draftSessionId = postedSessionId ?? submitConversationId;
       if (draftSessionId !== null && (text.trim() !== "" || (files?.length ?? 0) > 0)) {
         setterFor(draftSessionId)({
-          failedSendDraft: { conversationId: draftSessionId, text, files: files ?? [] },
+          failedSendDraft: { conversationId: draftSessionId, text, files: files ?? [], stableId },
         });
       }
       // Settle the conversation this send targeted, wherever the user is now:

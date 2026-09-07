@@ -377,3 +377,29 @@ def test_has_pending_tracks_parked_messages() -> None:
     assert pending_inputs.has_pending("conv_hp") is True
     pending_inputs.resolve("conv_hp", pending_id)
     assert pending_inputs.has_pending("conv_hp") is False
+
+
+def test_record_with_same_stable_id_returns_existing_pending_id() -> None:
+    """A retry POST carrying the same stable_id does not create a new entry."""
+    stable = "ab" * 16
+    first = pending_inputs.record("conv_dedup", [_text_block("hi")], stable_id=stable)
+    second = pending_inputs.record("conv_dedup", [_text_block("hi")], stable_id=stable)
+    assert first == second
+    # Only one entry in the queue — the runner is not re-dispatched.
+    assert len(pending_inputs.snapshot_for("conv_dedup")) == 1
+
+
+def test_record_without_stable_id_always_creates_new_entry() -> None:
+    """Messages without stable_id are never deduplicated."""
+    first = pending_inputs.record("conv_nodedup", [_text_block("hello")])
+    second = pending_inputs.record("conv_nodedup", [_text_block("hello")])
+    assert first != second
+    assert len(pending_inputs.snapshot_for("conv_nodedup")) == 2
+
+
+def test_stable_id_dedup_scoped_per_conversation() -> None:
+    """Same stable_id in different conversations does not collide."""
+    stable = "cd" * 16
+    id_a = pending_inputs.record("conv_scope_a", [_text_block("x")], stable_id=stable)
+    id_b = pending_inputs.record("conv_scope_b", [_text_block("x")], stable_id=stable)
+    assert id_a != id_b

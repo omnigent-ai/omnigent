@@ -221,10 +221,17 @@ def record(
         send one.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
     """
-    pending_id = f"pending_{uuid.uuid4().hex}"
-    entry = _Entry(pending_id=pending_id, content=content, created_by=created_by, stable_id=stable_id)
     with _lock:
-        _evict_stale_locked(conversation_id, entry.created_at)
+        _evict_stale_locked(conversation_id, _now())
+        # If a live entry already carries this stable_id, return its pending_id
+        # without creating a new entry — the runner already received this message
+        # and re-dispatching it would duplicate the turn.
+        if stable_id is not None:
+            for existing in _pending.get(conversation_id, {}).values():
+                if existing.stable_id == stable_id:
+                    return existing.pending_id
+        pending_id = f"pending_{uuid.uuid4().hex}"
+        entry = _Entry(pending_id=pending_id, content=content, created_by=created_by, stable_id=stable_id)
         _pending.setdefault(conversation_id, {})[pending_id] = entry
     return pending_id
 
