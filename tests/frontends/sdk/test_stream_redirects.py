@@ -22,6 +22,7 @@ from __future__ import annotations
 import httpx
 import pytest
 from omnigent_client import OmnigentClient
+from omnigent_client._client import _redirect_stays_on_origin
 from omnigent_client._errors import OmnigentError
 from omnigent_client._events import TextDelta
 from omnigent_client._responses import ResponsesNamespace
@@ -144,6 +145,30 @@ async def test_cross_origin_redirect_is_refused_and_nothing_is_forwarded() -> No
 
     assert excinfo.value.status_code == 302
     assert seen_hosts == ["127.0.0.1"]
+
+
+@pytest.mark.parametrize(
+    ("base", "location", "allowed"),
+    [
+        # Default-port http→https upgrade — the one cross-scheme hop allowed.
+        ("http://h/v1/x", "https://h/v1/x", True),
+        ("http://h:80/v1/x", "https://h:443/v1/x", True),
+        # Any other port combination is a different service — refused.
+        ("http://h:8080/v1/x", "https://h:444/v1/x", False),
+        ("http://h/v1/x", "https://h:8443/v1/x", False),
+        ("http://h:8080/v1/x", "https://h:443/v1/x", False),
+        # Same origin, default ports normalized.
+        ("http://h:8080/v1/x", "http://h:8080/v2/y", True),
+        ("http://h/v1/x", "http://h:80/v2/y", True),
+        # Downgrade and cross-host — refused.
+        ("https://h/v1/x", "http://h/v1/x", False),
+        ("http://h/v1/x", "http://other/v1/x", False),
+        ("http://h/v1/x", "//other/v1/x", False),
+    ],
+)
+def test_redirect_stays_on_origin_port_matrix(base: str, location: str, allowed: bool) -> None:
+    """The origin predicate matches httpx's rule, port dimension included."""
+    assert _redirect_stays_on_origin(httpx.URL(base), location) is allowed
 
 
 @pytest.mark.asyncio

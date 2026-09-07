@@ -20,11 +20,19 @@ from ._sessions_chat import SessionsChat, ToolCallable
 from ._tool_handler import StreamHooks, ToolHandler
 
 
+def _port_or_default(url: httpx.URL) -> int | None:
+    """The URL's explicit port, or its scheme's default (80/443)."""
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+
 def _redirect_stays_on_origin(request_url: httpx.URL, location: str) -> bool:
     """True when a redirect target keeps the request's origin.
 
-    Same scheme/host/port, or an http→https upgrade on the same host — the
-    same rule httpx uses to keep auth headers across a redirect.
+    Same scheme/host/port (default ports normalized), or the default-port
+    http→https upgrade (80→443) on the same host — the same rule httpx's
+    ``_is_https_redirect`` uses to keep auth headers across a redirect.
     """
     try:
         target = request_url.join(location)
@@ -32,9 +40,16 @@ def _redirect_stays_on_origin(request_url: httpx.URL, location: str) -> bool:
         return False
     if target.host != request_url.host:
         return False
-    if target.scheme == request_url.scheme and target.port == request_url.port:
+    if target.scheme == request_url.scheme and _port_or_default(target) == _port_or_default(
+        request_url
+    ):
         return True
-    return request_url.scheme == "http" and target.scheme == "https"
+    return (
+        request_url.scheme == "http"
+        and target.scheme == "https"
+        and _port_or_default(request_url) == 80
+        and _port_or_default(target) == 443
+    )
 
 
 async def _refuse_cross_origin_redirects(response: httpx.Response) -> None:

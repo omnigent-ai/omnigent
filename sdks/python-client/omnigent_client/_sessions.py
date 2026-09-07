@@ -1235,6 +1235,8 @@ async def _stream_session_events(
         ``data:`` payload.
     :raises OmnigentError: If the stream open fails with a non-2xx
         status, including a redirect that was not followed.
+    :raises httpx.TooManyRedirects: If on-origin redirects loop past
+        httpx's limit.
     """
     async with http.stream(
         "GET",
