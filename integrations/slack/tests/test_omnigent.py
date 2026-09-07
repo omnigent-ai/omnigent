@@ -153,6 +153,52 @@ async def test_client_create_and_submit_request_shapes() -> None:
 
 
 @respx.mock
+async def test_client_upload_session_file_posts_multipart() -> None:
+    upload = respx.post("http://omnigent.test/v1/sessions/conv_1/resources/files").mock(
+        return_value=httpx.Response(201, json={"id": "file_1", "filename": "shot.png"})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        resource = await client.upload_session_file(
+            "conv_1", filename="shot.png", content_type="image/png", data=b"\x89PNG"
+        )
+    finally:
+        await client.aclose()
+
+    assert resource == {"id": "file_1", "filename": "shot.png"}
+    request = upload.calls.last.request
+    assert request.headers["content-type"].startswith("multipart/form-data")
+    body = request.read()
+    assert b"shot.png" in body
+    assert b"image/png" in body
+    assert b"\x89PNG" in body
+
+
+@respx.mock
+async def test_client_submit_message_appends_attachment_blocks() -> None:
+    submit = respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        await client.submit_message(
+            "conv_1",
+            "(file attached)",
+            [{"type": "input_image", "file_id": "file_1", "filename": "shot.png"}],
+        )
+    finally:
+        await client.aclose()
+
+    assert submit.calls.last.request.read() == (
+        b'{"type":"message","data":{"role":"user","content":[{"type":"input_text",'
+        b'"text":"(file attached)"},{"type":"input_image","file_id":"file_1",'
+        b'"filename":"shot.png"}]}}'
+    )
+
+
+@respx.mock
 async def test_check_health_probes_health_endpoint() -> None:
     health = respx.get("http://omnigent.test/health").mock(
         return_value=httpx.Response(200, json={"status": "ok"})
