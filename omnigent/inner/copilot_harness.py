@@ -24,7 +24,11 @@ Env vars read at startup:
   ``None`` falls back to ``os_env.cwd`` then the process cwd.
 - ``HARNESS_COPILOT_GITHUB_TOKEN``: GitHub token carrying Copilot access, used
   as the SDK ``github_token``. ``None`` falls back to an inherited
-  ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN``.
+  ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN``, then the ``gh``
+  CLI's stored login.
+- ``HARNESS_COPILOT_GITHUB_HOST``: GitHub Enterprise hostname (e.g.
+  ``"acme.ghe.com"``) to authenticate against. ``None`` falls back to the
+  configured ``copilot.github_host``, then Copilot's default ``github.com``.
 - ``HARNESS_COPILOT_OS_ENV``: JSON-encoded :class:`OSEnvSpec` (its ``cwd`` is
   used when ``HARNESS_COPILOT_CWD`` is unset). Defaults to
   ``caller_process + sandbox=none``.
@@ -53,6 +57,7 @@ _logger = logging.getLogger(__name__)
 _ENV_MODEL = "HARNESS_COPILOT_MODEL"
 _ENV_CWD = "HARNESS_COPILOT_CWD"
 _ENV_GITHUB_TOKEN = "HARNESS_COPILOT_GITHUB_TOKEN"
+_ENV_GITHUB_HOST = "HARNESS_COPILOT_GITHUB_HOST"
 _ENV_OS_ENV = "HARNESS_COPILOT_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_COPILOT_SKILLS_FILTER"
 _ENV_BUNDLE_DIR = "HARNESS_COPILOT_BUNDLE_DIR"
@@ -133,6 +138,7 @@ def _build_copilot_executor() -> Executor:
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL) or None,
         github_token=os.environ.get(_ENV_GITHUB_TOKEN) or None,
+        github_host=os.environ.get(_ENV_GITHUB_HOST) or None,
         bundle_dir=bundle_dir,
         agent_name=os.environ.get(_ENV_AGENT_NAME, "").strip() or None,
         skills_filter=_resolve_skills_filter(),

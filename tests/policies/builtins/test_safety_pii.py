@@ -313,3 +313,53 @@ def test_ssn_variations(ssn: str) -> None:
     event = llm_request_event(system_prompt_preview=f"The number is {ssn}.")
     result = policy(event)
     assert result["result"] == "DENY", f"SSN '{ssn}' should be caught by the default pattern."
+
+
+# ── REQUEST phase, structured {"user_content", "attachments"} shape ───────────
+
+
+def _request_event(user_content: str, attachments: list[dict[str, str]]) -> dict[str, object]:
+    """Build a request event with the structured dict data shape."""
+    return {
+        "type": "request",
+        "target": None,
+        "data": {"user_content": user_content, "attachments": attachments},
+        "context": {"actor": {}, "usage": {}},
+        "session_state": {},
+    }
+
+
+def test_denies_pii_in_attachment() -> None:
+    """PII in an uploaded text attachment triggers DENY.
+
+    Regression for #2906: an attached CSV reaches the model base64-inlined and
+    isn't in ``user_content``, so the policy must scan each attachment's text.
+    """
+    policy = deny_pii_in_llm_request()
+    event = _request_event(
+        "print this file",
+        [{"filename": "data.csv", "content_type": "text/csv", "text": "cc 4111 1111 1111 1111"}],
+    )
+    result = policy(event)
+    assert result["result"] == "DENY", (
+        "Credit card in an attachment should be denied. If ALLOW, the request "
+        "branch is not scanning attachments."
+    )
+    assert "credit card" in result["reason"].lower()
+
+
+def test_denies_pii_in_user_content_of_dict() -> None:
+    """PII in ``user_content`` of the structured request dict triggers DENY."""
+    policy = deny_pii_in_llm_request()
+    result = policy(_request_event("my ssn is 123-45-6789", []))
+    assert result["result"] == "DENY"
+
+
+def test_allows_clean_request_dict() -> None:
+    """A structured request with no PII (message or attachments) passes."""
+    policy = deny_pii_in_llm_request()
+    event = _request_event(
+        "summarize this",
+        [{"filename": "notes.txt", "content_type": "text/plain", "text": "no pii here"}],
+    )
+    assert policy(event)["result"] == "ALLOW"

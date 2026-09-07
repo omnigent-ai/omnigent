@@ -7,6 +7,8 @@ import importlib
 import io
 import logging
 import os
+import signal
+import sys
 import tarfile
 import time
 from pathlib import Path
@@ -17,10 +19,15 @@ import pytest
 
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
+    _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
     _agent_cache_dest,
+    _InitialAuthTokenFactory,
+    _install_crash_logging,
+    _install_signal_handlers,
     _load_runner_idle_timeout_s_from_config,
     _make_auth_token_factory,
     _make_managed_mint_factory,
+    _ManagedMintTokenFactory,
     _mint_managed_owner_token,
     _parent_is_orphaned,
     _parent_process_is_alive,
@@ -28,13 +35,17 @@ from omnigent.runner._entry import (
     _run_inactivity_monitor,
     _run_parent_death_killer,
     _runner_parent_pid_from_env,
+    _runner_threadpool_max_workers,
     _runner_tunnel_binding_token_from_env,
     _runner_workspace_from_env,
     _RunnerDatabricksAuth,
     _server_url_from_env,
     main,
 )
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+from omnigent.runner.identity import (
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+)
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 
 # Force-load the MCP streamable-http client before any test monkeypatches
@@ -210,17 +221,198 @@ def test_make_auth_token_factory_uses_managed_mint_when_only_binding_token(
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
     monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "managed-binding-token")
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
     monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk)
     monkeypatch.setattr(
         "omnigent.runner._entry._mint_managed_owner_token",
-        lambda mint_url, server_url, binding_token: ("managed-jwt", time.time() + 1800),
+        lambda mint_url, server_url, binding_token, **_kw: ("managed-jwt", time.time() + 1800),
     )
 
     factory = _make_auth_token_factory()
 
     assert factory is not None
     assert factory() == "managed-jwt"
+
+
+def test_make_auth_token_factory_prefers_host_delegation_over_user_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host-launched runners mint a scoped bearer without resolving user auth."""
+    resolve_calls: list[int] = []
+
+    def _unexpected_sdk_auth(*args: Any, **kwargs: Any) -> tuple[Any, str]:
+        del args, kwargs
+        resolve_calls.append(1)
+        raise AssertionError("delegated runners must not resolve host Databricks auth")
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        _unexpected_sdk_auth,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner._entry._mint_managed_owner_token",
+        lambda mint_url, server_url, binding_token, **_kw: ("delegated-jwt", time.time() + 1800),
+    )
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert factory() == "delegated-jwt"
+    assert resolve_calls == []
+
+
+def test_initial_host_token_defers_local_auth_until_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host bearer covers startup and resolves runner auth only on rejection."""
+    resolve_calls: list[int] = []
+    mint_calls: list[int] = []
+
+    class _SdkAuth:
+        """Refreshable runner-local auth stand-in."""
+
+        def current_token(self) -> str:
+            return "runner-refreshed-token"
+
+    def _resolve(*args: Any, **kwargs: Any) -> tuple[_SdkAuth, str]:
+        del args, kwargs
+        resolve_calls.append(1)
+        return _SdkAuth(), "https://workspace.cloud.databricks.com"
+
+    def _unexpected_mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        del args, kwargs
+        mint_calls.append(1)
+        raise AssertionError("SDK auth available — fallback must prefer it over managed mint")
+
+    # A host-launched runner: has an initial bearer and SDK auth, but no
+    # managed-sandbox delegation — OMNIGENT_RUNNER_DELEGATED_AUTH is absent.
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.delenv("OMNIGENT_RUNNER_DELEGATED_AUTH", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _unexpected_mint)
+
+    factory = _make_auth_token_factory()
+
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    assert RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR not in os.environ
+    assert factory() == "host-bootstrap-token"
+    assert factory() == "host-bootstrap-token"
+    assert resolve_calls == []
+    assert mint_calls == []
+
+    request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
+    redirect = httpx.Response(302, headers={"Location": "/oidc/oauth2/v2.0/authorize"})
+    captured = _drive_auth_flow(_RunnerDatabricksAuth(factory), request, redirect)
+
+    assert captured == [
+        "Bearer host-bootstrap-token",
+        "Bearer runner-refreshed-token",
+    ]
+    assert resolve_calls == [1]
+    assert mint_calls == []
+
+
+def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the host bearer is rejected, a managed runner falls back to managed mint.
+
+    When no SDK/OIDC credential is available (managed sandbox with no user
+    credential), the fallback must reach the managed-mint path rather than
+    returning None and bricking all HTTP callbacks.
+    """
+    mint_calls: list[int] = []
+
+    def _no_sdk_auth(*args: Any, **kwargs: Any) -> tuple[None, None]:
+        from omnigent.inner.databricks_executor import DatabricksAuthError
+
+        raise DatabricksAuthError("no credential configured")
+
+    def _mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        mint_calls.append(1)
+        return "managed-minted-token", time.time() + 3600
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk_auth
+    )
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint)
+
+    factory = _make_auth_token_factory()
+
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    assert factory() == "host-bootstrap-token"
+    assert mint_calls == []
+
+    request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
+    redirect = httpx.Response(302, headers={"Location": "/oidc/oauth2/v2.0/authorize"})
+    captured = _drive_auth_flow(_RunnerDatabricksAuth(factory), request, redirect)
+
+    # After the initial bearer is rejected, the fallback must mint via the
+    # managed-mint path rather than returning None and bricking callbacks.
+    assert captured == [
+        "Bearer host-bootstrap-token",
+        "Bearer managed-minted-token",
+    ]
+    assert len(mint_calls) >= 1
+
+
+def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Apps OAuth redirect makes delegation fall back to refreshable auth."""
+    mint_calls: list[int] = []
+
+    class _SdkAuth:
+        """Refreshable Databricks auth stand-in."""
+
+        def current_token(self) -> str:
+            return "workspace-token"
+
+    def _apps_redirect(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Model the Apps edge intercepting the mint request before Omnigent."""
+        del server_url, binding_token
+        mint_calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        response = httpx.Response(
+            302,
+            headers={
+                "Location": (
+                    "https://workspace.cloud.databricks.com/oidc/oauth2/v2.0/authorize"
+                    "?redirect_uri=https%3A%2F%2Fapp.databricksapps.com%2F.auth%2Fcallback"
+                )
+            },
+            request=request,
+        )
+        raise httpx.HTTPStatusError("redirected to login", request=request, response=response)
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda *args, **kwargs: (_SdkAuth(), "https://workspace.cloud.databricks.com"),
+    )
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _apps_redirect)
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert factory() == "workspace-token"
+    assert mint_calls == [1]
 
 
 def test_make_auth_token_factory_none_without_creds_or_binding_token(
@@ -243,7 +435,7 @@ def test_make_auth_token_factory_none_without_creds_or_binding_token(
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
     monkeypatch.delenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", raising=False)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
     monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk)
 
     assert _make_auth_token_factory() is None
@@ -263,7 +455,9 @@ def test_managed_mint_factory_caches_token_until_refresh_skew(
     """
     calls: list[int] = []
 
-    def _fake_mint(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+    def _fake_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
         """Return a distinct token per call, expiring well beyond the skew."""
         calls.append(1)
         return (f"jwt-{len(calls)}", time.time() + 1800)
@@ -294,7 +488,9 @@ def test_managed_mint_factory_serves_cached_token_when_refresh_fails(
     """
     calls: list[int] = []
 
-    def _fake_mint(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+    def _fake_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
         """First call mints a near-expiry token; the refresh attempt fails."""
         calls.append(1)
         if len(calls) == 1:
@@ -329,7 +525,9 @@ def test_managed_mint_factory_no_factory_when_server_definitively_refuses(
     :returns: None.
     """
 
-    def _refuses(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+    def _refuses(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
         """Reject the mint the way a no-auth / header-mode server does (400)."""
         request = httpx.Request("POST", mint_url)
         raise httpx.HTTPStatusError(
@@ -347,15 +545,17 @@ def test_managed_mint_factory_installs_for_retry_on_transient_boot_failure(
     """A transient probe failure still installs the factory (armed to retry).
 
     If the mint endpoint has a blip at the instant the runner boots (network
-    error, 5xx), the factory must still install so a later callback re-mints
-    — otherwise the runner is left permanently unauthenticated until process
-    restart.
+    error, timeout), the factory must still install so a later callback
+    re-mints — otherwise the runner is left permanently unauthenticated until
+    process restart.
 
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
     """
 
-    def _blip(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+    def _blip(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
         """A transient failure — the endpoint is momentarily unreachable."""
         raise httpx.ConnectError("mint endpoint unreachable at boot")
 
@@ -379,7 +579,9 @@ def test_managed_mint_factory_recovers_after_transient_boot_failure(
     """
     calls: list[int] = []
 
-    def _fake_mint(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+    def _fake_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
         """Fail the boot probe once, then mint successfully."""
         calls.append(1)
         if len(calls) == 1:
@@ -414,7 +616,7 @@ def test_managed_mint_factory_declines_at_request_time_and_auth_sends_bare(
     calls: list[int] = []
 
     def _boot_blip_then_refuse(
-        mint_url: str, server_url: str, binding_token: str
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
     ) -> tuple[str, float]:
         """Fail the boot probe with a connection error, then 400 every mint."""
         calls.append(1)
@@ -440,6 +642,530 @@ def test_managed_mint_factory_declines_at_request_time_and_auth_sends_bare(
     sent2 = next(auth.auth_flow(request2))
     assert "Authorization" not in sent2.headers
     assert len(calls) == 2  # probe blip + the single definitive 400
+
+
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+def test_managed_mint_factory_latches_declined_on_5xx_with_no_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    """A 5xx before any successful mint latches ``declined`` → bare requests.
+
+    An intermediary (e.g. a Databricks Apps relay answering 502 Bad Gateway)
+    can respond for the mint endpoint so the request never reaches the
+    server. With no cached token, treating that as transient means the
+    factory returns ``None`` forever and ``auth_flow`` raises on every
+    callback — bricking the session at spec resolve. The 5xx must latch
+    ``declined`` so callbacks fall back to bare requests.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param status_code: The 5xx status the intermediary answers with.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _bad_gateway(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer every mint the way an intermediary's 5xx page does."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "bad gateway",
+            request=request,
+            response=httpx.Response(status_code, request=request),
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _bad_gateway)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+    assert factory.proxy_auth_failed is False
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    sent = next(auth.auth_flow(request))  # must NOT raise (fail closed)
+    assert "Authorization" not in sent.headers
+
+    # The latch short-circuits: later calls never re-hit the endpoint.
+    assert factory() is None
+    assert len(calls) == 1
+
+
+def test_declined_latch_recovers_when_bare_request_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected bare request clears the 5xx decline and re-mints.
+
+    The decline latched by an intermediary 5xx is a guess that the server
+    doesn't need auth. When a bare callback then gets a re-auth signal
+    (401/403/OIDC redirect), the guess was wrong — the server was merely
+    down. The auth flow must clear the latch, mint a fresh token from the
+    recovered server, and retry the request authenticated, so the runner
+    heals without a process restart.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _5xx_then_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer 502 for the first mint (server down), then mint fine."""
+        calls.append(1)
+        if len(calls) == 1:
+            request = httpx.Request("POST", mint_url)
+            raise httpx.HTTPStatusError(
+                "bad gateway",
+                request=request,
+                response=httpx.Response(502, request=request),
+            )
+        return ("jwt-recovered", time.time() + 1800)
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _5xx_then_mint)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    gen = auth.auth_flow(request)
+    bare = next(gen)
+    assert "Authorization" not in bare.headers
+
+    # The authenticated server rejects the bare request → the flow clears
+    # the latch, re-mints, and retries with the fresh bearer.
+    retried = gen.send(httpx.Response(401))
+    assert retried.headers.get("Authorization") == "Bearer jwt-recovered"
+    assert factory.declined is False
+    with pytest.raises(StopIteration):
+        gen.send(httpx.Response(200))
+
+
+def test_declined_latch_stays_bare_when_bare_request_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful bare request keeps the decline latched (no-auth server).
+
+    On a genuine no-auth/header-mode server, bare requests succeed; the
+    auth flow must not clear the latch or re-hit the mint endpoint on
+    every callback.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _bad_gateway(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer every mint with 502."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "bad gateway",
+            request=request,
+            response=httpx.Response(502, request=request),
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _bad_gateway)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    gen = auth.auth_flow(request)
+    bare = next(gen)
+    assert "Authorization" not in bare.headers
+
+    with pytest.raises(StopIteration):
+        gen.send(httpx.Response(200))
+    assert factory.declined is True
+    assert len(calls) == 1  # the latch kept later calls off the endpoint
+
+
+def test_managed_mint_factory_5xx_after_prior_mint_keeps_cached_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 5xx after a successful mint is transient — serve the cache, no latch.
+
+    Once the server has proven it mints for this runner, a mid-session 5xx
+    (server restart, brief gateway hiccup) must not permanently flip the
+    factory to bare requests: the still-valid cached token is served and
+    the next refresh retries the mint.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _mint_then_5xx(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Mint a near-expiry token once, then answer 502 to refreshes."""
+        calls.append(1)
+        if len(calls) == 1:
+            # Within the refresh skew → the next call attempts a re-mint.
+            return ("jwt-1", time.time() + 250)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "bad gateway",
+            request=request,
+            response=httpx.Response(502, request=request),
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint_then_5xx)
+
+    factory = _make_managed_mint_factory("https://s.example.com", "btok")
+    assert factory is not None
+    assert isinstance(factory, _ManagedMintTokenFactory)
+
+    # Refresh attempt gets the 502; the still-valid cached token is served.
+    assert factory() == "jwt-1"
+    assert factory.declined is False
+    assert factory.proxy_auth_failed is False
+    assert len(calls) == 2
+
+
+def test_managed_mint_factory_probe_5xx_installs_declined_factory_that_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A construction-probe 5xx installs the factory with declined latched.
+
+    Callbacks then go out bare (non-blocking), and once the intermediary
+    stops answering for the server a rejected bare request can clear the
+    latch and re-mint — dropping the factory at boot would lose that
+    recovery path permanently.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _5xx_then_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer the probe with 502, then mint successfully."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        if len(calls) == 1:
+            raise httpx.HTTPStatusError(
+                "bad gateway",
+                request=request,
+                response=httpx.Response(502, request=request),
+            )
+        return "jwt-recovered", time.time() + 3600
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _5xx_then_mint)
+
+    factory = _make_managed_mint_factory("https://s.example.com", "btok")
+    assert isinstance(factory, _ManagedMintTokenFactory)
+    assert factory.declined is True
+    assert factory.declined_by_server_error is True
+    # Declined: calls return None without touching the network.
+    assert factory() is None
+    assert len(calls) == 1
+    # A rejected bare request clears the latch; the next call re-mints.
+    factory.reset_decline()
+    assert factory() == "jwt-recovered"
+    assert factory.declined is False
+
+
+def test_managed_mint_factory_snapshot_pairs_token_with_declined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """call_with_declined returns a consistent (token, declined) pair.
+
+    auth_flow decides raise-vs-bare from this snapshot; taking both values
+    under one lock acquisition means a concurrent decline-reset+mint can
+    never make a callback observe no-token alongside a stale declined=False
+    and raise spuriously.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _5xx_then_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer the first mint with 502, then mint successfully."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        if len(calls) == 1:
+            raise httpx.HTTPStatusError(
+                "bad gateway",
+                request=request,
+                response=httpx.Response(502, request=request),
+            )
+        return "jwt-snap", time.time() + 3600
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _5xx_then_mint)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    # 5xx latches declined; the snapshot reports both halves consistently.
+    assert factory.call_with_declined() == (None, True)
+    factory.reset_decline()
+    assert factory.call_with_declined() == ("jwt-snap", False)
+
+
+def test_declined_latch_from_definitive_refusal_is_not_reset_on_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine 400/404 decline stays latched when a bare request is rejected.
+
+    Only a 5xx-latched decline (``declined_by_server_error``) is a guess
+    worth retracting. A no-auth/header-mode server that answered 400/404
+    definitively refused to mint; a later rejected bare request (e.g. an
+    unrelated 403) must not make ``auth_flow`` re-probe the mint endpoint
+    on every callback.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _refuse(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer every mint with the definitive 400 of a no-auth server."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "no auth provider", request=request, response=httpx.Response(400, request=request)
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+    assert factory.declined_by_server_error is False
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    gen = auth.auth_flow(request)
+    bare = next(gen)
+    assert "Authorization" not in bare.headers
+
+    # A rejected bare request must NOT clear the definitive latch or re-mint.
+    with pytest.raises(StopIteration):
+        gen.send(httpx.Response(401))
+    assert factory.declined is True
+    assert len(calls) == 1
+
+
+def test_managed_mint_factory_proxy_auth_failure_falls_through_to_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403 on the proxy bearer sets proxy_auth_failed → factory not installed."""
+    calls: list[int] = []
+
+    def _proxy_rejects(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        calls.append(1)
+        request = httpx.Request("POST", "https://s.example.com/v1/runners/r/token")
+        raise httpx.HTTPStatusError(
+            "403",
+            request=request,
+            response=httpx.Response(403, request=request),
+        )
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://s.example.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _proxy_rejects)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "bind-tok",
+        proxy_bearer="expired-bearer",
+    )
+    result = factory()
+
+    assert result is None
+    assert factory.proxy_auth_failed is True
+    assert factory.declined is False
+
+    # _make_managed_mint_factory must not install the factory when the
+    # construction probe gets a proxy auth failure.
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    installed = _make_managed_mint_factory(
+        "https://s.example.com", "bind-tok", proxy_bearer="expired-bearer"
+    )
+    assert installed is None
+
+
+def test_initial_host_token_re_resolves_to_sdk_when_proxy_auth_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When managed mint proxy_auth_fails, _InitialAuthTokenFactory falls back to SDK/OIDC."""
+
+    class _SdkAuth:
+        def current_token(self) -> str:
+            return "sdk-token"
+
+    def _resolve(*args: Any, **kwargs: Any) -> tuple[_SdkAuth, str]:
+        return _SdkAuth(), "https://workspace.cloud.databricks.com"
+
+    def _proxy_rejects(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        request = httpx.Request("POST", "https://app.databricksapps.com/v1/runners/r/token")
+        raise httpx.HTTPStatusError(
+            "403", request=request, response=httpx.Response(403, request=request)
+        )
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN", "expired-host-bearer")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _proxy_rejects)
+
+    factory = _make_auth_token_factory()
+
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    # Simulate the initial bearer expiring and being invalidated.
+    factory.invalidate()
+
+    # The fallback tries managed mint first (proxy bearer = expired-host-bearer).
+    # That 403s → proxy_auth_failed → re-resolves to SDK/OIDC.
+    token = factory()
+    assert token == "sdk-token"
+
+
+def test_managed_mint_403_after_prior_mint_latches_proxy_auth_failed_at_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-mint 403 latches ``proxy_auth_failed`` once the cache fully expires.
+
+    The OMNI-2529 deadlock: an idle session crosses the owner JWT's 60-minute
+    lifetime, so the re-mint presents the already-expired JWT as its own proxy
+    bearer and the Apps edge answers 403. The old 401/403 branch only latched
+    when no mint had *ever* succeeded, so this state set neither latch and
+    ``auth_flow`` raised ``httpx.RequestError`` forever. Walks the full
+    timeline: mint OK → 403 inside the refresh-skew window (cache still
+    served, no latch) → 403 after full expiry (latch).
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _mint_ok_then_403(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Mint once, then 403 every re-mint like an Apps edge on a dead bearer."""
+        calls.append(1)
+        if len(calls) == 1:
+            return ("minted-jwt", time.time() + 3600)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "Invalid Token", request=request, response=httpx.Response(403, request=request)
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint_ok_then_403)
+
+    factory = _make_managed_mint_factory(
+        "https://s.example.com", "btok", proxy_bearer="host-bearer"
+    )
+    assert factory is not None
+    assert factory() == "minted-jwt"  # served from the probe's cache
+
+    # 403 inside the refresh-skew window: the cached JWT is still valid, so it
+    # keeps being served and nothing latches (the next attempt may succeed).
+    factory._cached_expires_at = time.time() + 60.0
+    assert factory() == "minted-jwt"
+    assert factory.proxy_auth_failed is False
+    assert factory.declined is False
+
+    # 403 after full expiry: no still-valid cache remains, so the mint loop
+    # cannot renew itself — proxy_auth_failed must latch so callers re-resolve
+    # SDK/OIDC instead of failing closed on every callback.
+    factory._cached_expires_at = time.time() - 1.0
+    assert factory() is None
+    assert factory.proxy_auth_failed is True
+    assert factory.declined is False  # bare requests would be wrong here
+
+
+def test_initial_host_token_re_resolves_to_sdk_when_remint_403s_after_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-install mint 403 at full expiry re-resolves SDK/OIDC in the same call.
+
+    Extends the construction-time fallback above to the mid-session case: the
+    managed mint worked (the runner ran on minted JWTs), then the session
+    outlived the JWT and the re-mint 403s. The factory chain must hand the
+    *current* request an SDK/OIDC token rather than returning ``None`` — one
+    ``None`` here means a raised callback, and before the fix it was ``None``
+    forever.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+
+    class _SdkAuth:
+        def current_token(self) -> str:
+            return "sdk-token"
+
+    def _resolve(*args: Any, **kwargs: Any) -> tuple[_SdkAuth, str]:
+        return _SdkAuth(), "https://workspace.cloud.databricks.com"
+
+    calls: list[int] = []
+
+    def _mint_ok_then_403(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        calls.append(1)
+        if len(calls) == 1:
+            return ("minted-jwt", time.time() + 3600)
+        request = httpx.Request("POST", "https://app.databricksapps.com/v1/runners/r/token")
+        raise httpx.HTTPStatusError(
+            "403", request=request, response=httpx.Response(403, request=request)
+        )
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN", "host-bearer")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint_ok_then_403)
+
+    factory = _make_auth_token_factory()
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    factory.invalidate()
+    assert factory() == "minted-jwt"  # managed mint installed and serving
+
+    mint_factory = factory._fallback_factory
+    assert isinstance(mint_factory, _ManagedMintTokenFactory)
+    # The session outlives the minted JWT, and the edge 403s the re-mint.
+    mint_factory._cached_expires_at = time.time() - 1.0
+
+    assert factory() == "sdk-token"
 
 
 def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
@@ -482,6 +1208,68 @@ def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
     assert captured["method"] == "POST"
     assert captured["binding_token"] == "the-binding-token"
     assert captured["url"].endswith("/v1/runners/runner_token_abc/token")
+
+
+def test_mint_managed_owner_token_includes_proxy_bearer_when_provided(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """proxy_bearer is forwarded as Authorization so an Apps proxy lets the request through."""
+    captured: dict[str, str] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers.get("authorization", "")
+        captured["binding_token"] = request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER, "")
+        return httpx.Response(200, json={"token": "owner-jwt", "expires_at": 1234567890})
+
+    real_client = httpx.Client
+
+    def _fake_client(**kwargs: Any) -> httpx.Client:
+        return real_client(transport=httpx.MockTransport(_handler), **kwargs)
+
+    monkeypatch.setattr("omnigent.runner._entry.httpx.Client", _fake_client)
+
+    _mint_managed_owner_token(
+        "https://s.example.com/v1/runners/runner_token_abc/token",
+        "https://s.example.com",
+        "the-binding-token",
+        proxy_bearer="host-initial-bearer",
+    )
+
+    assert captured["authorization"] == "Bearer host-initial-bearer"
+    assert captured["binding_token"] == "the-binding-token"
+
+
+def test_managed_mint_factory_promotes_minted_jwt_to_proxy_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the first mint, the factory uses the minted JWT as proxy bearer on re-mints."""
+    mint_call_bearers: list[str | None] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        mint_call_bearers.append(request.headers.get("authorization"))
+        return httpx.Response(200, json={"token": "minted-jwt", "expires_at": time.time() + 1800})
+
+    real_client = httpx.Client
+
+    def _fake_client(**kwargs: Any) -> httpx.Client:
+        return real_client(transport=httpx.MockTransport(_handler), **kwargs)
+
+    monkeypatch.setattr("omnigent.runner._entry.httpx.Client", _fake_client)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/runner_token_abc/token",
+        "https://s.example.com",
+        "binding-token",
+        proxy_bearer="seed-bearer",
+    )
+
+    # Force two mints by expiring the cache between calls.
+    factory()
+    factory._cached_expires_at = 0.0  # expire
+    factory()
+
+    assert mint_call_bearers[0] == "Bearer seed-bearer"
+    assert mint_call_bearers[1] == "Bearer minted-jwt"
 
 
 def test_runner_databricks_auth_injects_fresh_token_per_request() -> None:
@@ -955,6 +1743,116 @@ def test_load_runner_idle_timeout_rejects_invalid_values(
         _load_runner_idle_timeout_s_from_config()
 
 
+def test_runner_threadpool_defaults_when_config_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Missing runner config uses the default threadpool size.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param tmp_path: Isolated config home.
+    :returns: None.
+    """
+    monkeypatch.delenv("OMNIGENT_RUNNER_THREADPOOL_MAX_WORKERS", raising=False)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+    assert _runner_threadpool_max_workers() == _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS
+
+
+def test_runner_threadpool_reads_nested_runner_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``runner.threadpool_max_workers`` configures the default executor size.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param tmp_path: Isolated config home.
+    :returns: None.
+    """
+    monkeypatch.delenv("OMNIGENT_RUNNER_THREADPOOL_MAX_WORKERS", raising=False)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "runner:\n  threadpool_max_workers: 4\n",
+        encoding="utf-8",
+    )
+
+    assert _runner_threadpool_max_workers() == 4
+
+
+def test_runner_threadpool_env_overrides_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The env override wins over the config file value.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param tmp_path: Isolated config home.
+    :returns: None.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "runner:\n  threadpool_max_workers: 4\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMNIGENT_RUNNER_THREADPOOL_MAX_WORKERS", "16")
+
+    assert _runner_threadpool_max_workers() == 16
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        pytest.param("runner: disabled\n", id="runner-not-mapping"),
+        pytest.param("runner:\n  threadpool_max_workers: 0\n", id="zero"),
+        pytest.param("runner:\n  threadpool_max_workers: -1\n", id="negative"),
+        pytest.param("runner:\n  threadpool_max_workers: true\n", id="boolean"),
+        pytest.param("runner:\n  threadpool_max_workers: many\n", id="string"),
+    ],
+)
+def test_runner_threadpool_rejects_invalid_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    config_text: str,
+) -> None:
+    """Invalid threadpool config fails loud during runner startup.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param tmp_path: Isolated config home.
+    :param config_text: Invalid config body under test.
+    :returns: None.
+    """
+    monkeypatch.delenv("OMNIGENT_RUNNER_THREADPOOL_MAX_WORKERS", raising=False)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(config_text, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="runner"):
+        _runner_threadpool_max_workers()
+
+
+@pytest.mark.parametrize(
+    "raw_env",
+    [
+        pytest.param("0", id="zero"),
+        pytest.param("-3", id="negative"),
+        pytest.param("lots", id="non-integer"),
+    ],
+)
+def test_runner_threadpool_rejects_invalid_env(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_env: str,
+) -> None:
+    """Invalid ``OMNIGENT_RUNNER_THREADPOOL_MAX_WORKERS`` fails loud.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param raw_env: Invalid env value under test.
+    :returns: None.
+    """
+    monkeypatch.setenv("OMNIGENT_RUNNER_THREADPOOL_MAX_WORKERS", raw_env)
+
+    with pytest.raises(RuntimeError, match="THREADPOOL_MAX_WORKERS"):
+        _runner_threadpool_max_workers()
+
+
 @pytest.mark.asyncio
 async def test_inactivity_monitor_requests_shutdown_when_idle() -> None:
     """Expired idle timeout requests graceful runner shutdown.
@@ -1126,9 +2024,128 @@ def test_run_parent_death_killer_stands_down_when_adopted() -> None:
     )
 
 
+def test_run_parent_death_killer_logs_reason_before_hard_exit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The hard-exit backstop records why it is killing the runner.
+
+    ``os._exit`` skips the exit-reason logging in the tunnel loop's
+    ``finally`` block, so the killer must log the reason itself before
+    hard-exiting — otherwise the parent-death path leaves no explanation
+    in the runner log. Uses an already-orphaned pid, tiny grace, and an
+    injected exit function so the real ``os._exit`` never fires.
+
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    exit_calls: list[int] = []
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner._entry"):
+        _run_parent_death_killer(
+            os.getppid() + 100000,  # already "orphaned"
+            lambda: None,
+            poll_interval_s=0.01,
+            grace_s=0.01,
+            exit_fn=exit_calls.append,
+        )
+
+    assert exit_calls == [0]
+    assert any(
+        "runner exiting" in record.message and "parent process died" in record.message
+        for record in caplog.records
+    ), f"expected a parent-death exit log line, got {[r.message for r in caplog.records]}"
+
+
+def test_install_crash_logging_records_uncaught_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An uncaught exception is logged with its type before the process dies.
+
+    This is the "runner randomly died" case: without the hook the only
+    trace is a bare traceback on stderr. The installed ``sys.excepthook``
+    must record the exception (with traceback) to the runner log and then
+    defer to the previously-installed hook so default behavior is intact.
+
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    original_hook = sys.excepthook
+    forwarded: list[str] = []
+    try:
+        sys.excepthook = lambda *args: forwarded.append(args[0].__name__)
+        _install_crash_logging()
+        installed = sys.excepthook
+
+        with caplog.at_level(logging.CRITICAL, logger="omnigent.runner._entry"):
+            try:
+                raise ValueError("boom")
+            except ValueError:
+                installed(*sys.exc_info())
+    finally:
+        sys.excepthook = original_hook
+
+    assert forwarded == ["ValueError"], "the prior excepthook must still run"
+    crash_records = [r for r in caplog.records if "uncaught" in r.message]
+    assert crash_records, "expected the crash hook to log the uncaught exception"
+    record = crash_records[0]
+    assert "ValueError" in record.message
+    assert record.exc_info is not None, "traceback must be attached for diagnosis"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGTERM") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_records_signal_reason() -> None:
+    """A shutdown signal both sets the stop event and records its name.
+
+    The recorded reason is what the exit-log line reports, so it must
+    carry the specific signal (e.g. ``SIGTERM``) that stopped the runner
+    rather than a generic "shutdown requested". Delivers a real SIGTERM to
+    this process and waits for the loop handler to fire.
+
+    :returns: None.
+    """
+    from omnigent.runner._entry import _install_signal_handlers
+
+    stop_event = asyncio.Event()
+    reasons: list[str] = []
+    _install_signal_handlers(stop_event, record_reason=reasons.append)
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+    finally:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
+
+    assert reasons == ["received SIGTERM"]
+
+
+def test_install_crash_logging_is_idempotent() -> None:
+    """Installing the crash hook twice does not stack wrappers.
+
+    ``main`` runs once per process, but tests call it repeatedly; a
+    non-idempotent install would chain a new wrapper each time and log the
+    same crash N times. The second install must be a no-op.
+
+    :returns: None.
+    """
+    original_hook = sys.excepthook
+    try:
+        _install_crash_logging()
+        first = sys.excepthook
+        _install_crash_logging()
+        assert sys.excepthook is first, "second install must not re-wrap"
+    finally:
+        sys.excepthook = original_hook
+
+
 @pytest.mark.asyncio
 async def test_runner_shutdown_closes_terminal_registry(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """The --server local runner shuts down terminal-owned resources.
 
@@ -1138,6 +2155,7 @@ async def test_runner_shutdown_closes_terminal_registry(
     startup/shutdown hooks directly and verifies shutdown includes the
     TerminalRegistry, not just harness subprocesses and MCPs.
     """
+    import omnigent.inner.terminal as terminal_mod
     import omnigent.runner._entry as entry_mod
 
     process_managers: list[_FakeProcessManager] = []
@@ -1186,6 +2204,10 @@ async def test_runner_shutdown_closes_terminal_registry(
         return client
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
+    # create_app() performs its production orphan sweep during construction.
+    # Keep this lifecycle unit test away from terminals owned by other local
+    # runners and test sessions.
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
     monkeypatch.setattr(
         "omnigent.runtime.harnesses.process_manager.HarnessProcessManager",
         _FakeProcessManager,
@@ -1445,30 +2467,28 @@ def test_main_reports_tunnel_rejection_without_traceback(
     assert "Traceback" not in stderr
 
 
-def test_main_installs_timestamped_runner_log_format(
+def test_main_configures_runner_process_logging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Runner process logs include timestamps at the formatter boundary.
-
-    Host-spawned runners redirect stderr to
-    ``~/.omnigent/logs/host-runner/runner-*.log``. The entrypoint's
-    logging formatter therefore has to include ``asctime`` globally; adding
-    timestamps to individual messages would miss library and framework logs.
+    Runner process logs are configured through the shared process logger.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
     captured: dict[str, Any] = {}
 
-    def _capture_basic_config(**kwargs: Any) -> None:
+    def _capture_process_logging(destination: str, **kwargs: Any) -> None:
         """
-        Record the logging configuration requested by ``main``.
+        Record the process logging configuration requested by ``main``.
 
-        :param kwargs: Keyword arguments passed to ``logging.basicConfig``.
+        :param destination: Process-log destination.
+        :param kwargs: Keyword arguments passed to ``configure_process_logging``.
         :returns: None.
         """
+        captured["destination"] = destination
         captured.update(kwargs)
+        return
 
     async def _stop_immediately() -> None:
         """
@@ -1478,8 +2498,8 @@ def test_main_installs_timestamped_runner_log_format(
         """
 
     monkeypatch.setattr(
-        "omnigent.runner._entry.logging.basicConfig",
-        _capture_basic_config,
+        "omnigent.process_logging.configure_process_logging",
+        _capture_process_logging,
     )
     monkeypatch.setattr(
         "omnigent.runner._entry._run_tunnel_from_env",
@@ -1488,10 +2508,40 @@ def test_main_installs_timestamped_runner_log_format(
 
     main()
 
-    assert captured["level"] == logging.INFO
-    assert captured["format"].startswith("%(asctime)s ")
-    assert "%(levelname)s:%(name)s:%(message)s" in captured["format"]
-    assert captured["datefmt"] == "%Y-%m-%dT%H:%M:%S%z"
+    assert captured == {"destination": "runner", "force": True}
+
+
+def test_main_makes_the_workspace_importable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``main`` puts the workspace back on ``sys.path`` for local tools.
+
+    The runner is spawned with ``-P`` so its workspace cannot shadow the
+    installed omnigent. Spec-declared local tools are still imported by dotted
+    path, so the workspace has to be restored once omnigent itself is imported.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Stands in for the session workspace.
+    :returns: None.
+    """
+
+    async def _stop_immediately() -> None:
+        """Let ``main`` return once the path is set up.
+
+        :returns: None.
+        """
+
+    monkeypatch.setattr(
+        "omnigent.runner._entry._run_tunnel_from_env",
+        _stop_immediately,
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "path", [p for p in sys.path if p != str(tmp_path)])
+
+    main()
+
+    assert str(tmp_path) in sys.path
 
 
 def test_main_preserves_unexpected_runtime_errors(
@@ -1566,7 +2616,7 @@ def test_make_auth_token_factory_resolves_sdk_auth_once(
 
     monkeypatch.setattr(dbx, "_resolve_databricks_auth", _fake_resolve)
     # No stored OIDC token → the factory falls through to the SDK path.
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
 
     factory = _make_auth_token_factory(server_url="https://ex.databricks.com")
     assert factory is not None
@@ -1647,3 +2697,112 @@ def test_agent_cache_dest_normal_id_round_trips(tmp_path: Path) -> None:
     dest = _agent_cache_dest(cache_root, "ag_abc123", "3")
 
     assert dest == cache_root / "ag_abc123-v3"
+
+
+@pytest.mark.asyncio
+async def test_install_signal_handlers_degrades_when_wakeup_fd_unusable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken signal wakeup fd must degrade, not crash the runner.
+
+    Zygote-forked runners crash-looped when the loop's wakeup fd came up
+    in blocking mode ("the fd 6 must be in non-blocking mode"): the
+    RuntimeError from ``add_signal_handler`` escaped ``main``. Handler
+    registration must warn and stop after the first failure instead.
+    """
+    loop = asyncio.get_running_loop()
+    attempts: list[int] = []
+
+    def _broken_add_signal_handler(sig: int, *args: Any) -> None:
+        attempts.append(sig)
+        raise RuntimeError("the fd 6 must be in non-blocking mode")
+
+    monkeypatch.setattr(loop, "add_signal_handler", _broken_add_signal_handler)
+
+    _install_signal_handlers(asyncio.Event())
+
+    # First failure marks the loop degraded; SIGTERM is skipped, not retried.
+    assert attempts == [signal.SIGINT]
+
+
+def test_maybe_prewarm_ambient_detection_gates_on_launch_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only claude-native launches prewarm ambient detection at boot.
+
+    Terminal auto-create resolves provider config with an ambient sweep (a
+    ~0.6-0.9s ``claude auth status`` subprocess on macOS); the boot prewarm
+    overlaps that with runner boot. Other harnesses never resolve it, so
+    they must not pay a speculative subprocess on every launch.
+    """
+    from omnigent.onboarding import ambient
+    from omnigent.runner._entry import _maybe_prewarm_ambient_detection
+    from omnigent.runner.identity import RUNNER_LAUNCH_HARNESS_ENV_VAR
+
+    prewarms: list[str] = []
+    monkeypatch.setattr(ambient, "prewarm_detect_providers", lambda: prewarms.append("prewarm"))
+
+    monkeypatch.delenv(RUNNER_LAUNCH_HARNESS_ENV_VAR, raising=False)
+    _maybe_prewarm_ambient_detection()
+    monkeypatch.setenv(RUNNER_LAUNCH_HARNESS_ENV_VAR, "codex-native")
+    _maybe_prewarm_ambient_detection()
+    assert prewarms == []
+
+    monkeypatch.setenv(RUNNER_LAUNCH_HARNESS_ENV_VAR, "claude-native")
+    _maybe_prewarm_ambient_detection()
+    assert prewarms == ["prewarm"]
+
+
+def test_auth_token_factory_refreshes_expired_oidc_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wiring that actually keeps an unattended host alive: when the stored
+    OIDC token has lapsed but a login-issued refresh grant is present, the
+    auth-token factory returns the REFRESHED token — so the next reconnect
+    authenticates instead of crash-looping. Guards the load->refresh->fallback
+    integration in ``_factory`` (only the unit-level refresh was covered before).
+    """
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    # A plain `omnigent login` host on the stored-OIDC-token path: no host
+    # bootstrap bearer and no managed-sandbox delegation.
+    monkeypatch.delenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.delenv("OMNIGENT_RUNNER_DELEGATED_AUTH", raising=False)
+    # Stored token reads as unusable (expired / inside the renewal window)...
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    # ...but the refresh grant mints a fresh session JWT.
+    refresh_calls: list[str] = []
+
+    def _refresh(url: str) -> str:
+        refresh_calls.append(url)
+        return "refreshed-jwt"
+
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", _refresh)
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert factory() == "refreshed-jwt"
+    assert refresh_calls, "the refresh path must have run"
+
+
+def test_create_app_wires_native_bridge_dir_startup_sweep() -> None:
+    """The runner startup path must invoke the native bridge-dir sweep.
+
+    The prune logic is dead unless ``create_app`` actually calls
+    ``reap_orphaned_native_bridge_dirs`` — the highest-risk path in the
+    bridge-dir-reaping change. A full ``create_app()`` call needs heavy
+    server/token/process-manager scaffolding, so the wiring is guarded by
+    inspecting the factory's source: the sweep must be present and must run
+    after the terminal reap (the placement the design requires).
+
+    :returns: None.
+    """
+    import inspect
+
+    from omnigent.runner._entry import create_app
+
+    src = inspect.getsource(create_app)
+
+    assert "reap_orphaned_native_bridge_dirs()" in src
+    # The native bridge-dir sweep runs after the terminal reap.
+    assert src.index("reap_orphaned_terminals()") < src.index("reap_orphaned_native_bridge_dirs()")

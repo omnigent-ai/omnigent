@@ -1,27 +1,62 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, type ComponentType } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
-import { ChatPage } from "@/pages/ChatPage";
-import { NotFoundPage } from "@/pages/NotFoundPage";
+import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
+import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
+import { useOmnigentPageView } from "@/lib/analytics";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
-// Lazy-load the accounts pages so the bundle a header / OIDC
-// deploy ships (where accounts is off) doesn't include them in the
-// main entry chunk. They're separate chunks that only download
-// when the user actually navigates to /login or /register — which
-// never happens in non-accounts deploys because the route table
-// below doesn't register them. (Members / Policies are lazy-loaded
-// too, but inside SettingsPage now that they're settings
-// sub-categories rather than standalone routes.)
-const LoginPage = lazy(() => import("@/pages/LoginPage").then((m) => ({ default: m.LoginPage })));
-const RegisterPage = lazy(() =>
-  import("@/pages/RegisterPage").then((m) => ({ default: m.RegisterPage })),
+// Bind a page component to its analytics page-view id. Declaring the id here,
+// beside the component, keeps the route table clean and means no route ships
+// without one. Re-fires on pathname change (see useOmnigentPageView), so a page
+// kept mounted across a param change (ChatPage across `/` ↔ `/c/:id`) still emits
+// one view per destination under the same id.
+//
+// SettingsPage opts out (stays unwrapped): its id is param-derived
+// (`settings.<section>`), so it calls useOmnigentPageView itself.
+function withPageView<P extends object>(id: string, Component: ComponentType<P>): ComponentType<P> {
+  return function WithPageView(props: P) {
+    useOmnigentPageView(id);
+    return <Component {...props} />;
+  };
+}
+
+// Every `*Page` here is wrapped with its page-view id. Accounts pages stay lazy
+// so a non-accounts (header / OIDC) deploy doesn't ship them in the main chunk —
+// their routes aren't registered there, so the chunk never downloads. (Members /
+// Policies are lazy inside SettingsPage now that they're settings sub-categories.)
+const ChatPage = withPageView("chat", ChatPageImpl);
+const NotFoundPage = withPageView("not_found", NotFoundPageImpl);
+const LoginPage = withPageView(
+  "login",
+  lazy(() => import("@/pages/LoginPage").then((m) => ({ default: m.LoginPage }))),
 );
-const SetupPage = lazy(() => import("@/pages/SetupPage").then((m) => ({ default: m.SetupPage })));
-const ApprovePage = lazy(() =>
-  import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage })),
+const RegisterPage = withPageView(
+  "register",
+  lazy(() => import("@/pages/RegisterPage").then((m) => ({ default: m.RegisterPage }))),
 );
-const InboxPage = lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage })));
+const SetupPage = withPageView(
+  "setup",
+  lazy(() => import("@/pages/SetupPage").then((m) => ({ default: m.SetupPage }))),
+);
+const ApprovePage = withPageView(
+  "approve",
+  lazy(() => import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage }))),
+);
+const InboxPage = withPageView(
+  "inbox",
+  lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
+);
+const TasksPage = withPageView(
+  "tasks",
+  lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
+);
+const UsagePage = withPageView(
+  "usage",
+  lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
+);
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
@@ -83,11 +118,6 @@ function App({ basename }: AppProps = {}) {
   // the original relative route table.
   const prefix = basename ?? "";
   const info = useServerInfo();
-  // While the probe is in flight, render nothing — first paint is
-  // ~30ms after boot anyway, and flashing the chrome we may
-  // immediately tear down once the probe returns is worse than a
-  // tiny blank moment.
-  if (info === "loading") return null;
 
   // First-run: accounts on but no admin claimed yet. Route EVERY path to
   // the Create-admin form so the first visitor lands on it no matter how
@@ -95,7 +125,7 @@ function App({ basename }: AppProps = {}) {
   // /auth/setup is server-gated to the zero-admin state, and needs_setup
   // flips false the instant it succeeds — so this whole branch disappears
   // after the first admin exists.
-  if (info.accounts_enabled && info.needs_setup) {
+  if (info !== "loading" && info.accounts_enabled && info.needs_setup) {
     return (
       <Suspense fallback={null}>
         <Routes>
@@ -108,7 +138,7 @@ function App({ basename }: AppProps = {}) {
   return (
     <Suspense fallback={null}>
       <Routes>
-        {info.accounts_enabled && (
+        {info !== "loading" && info.accounts_enabled && (
           <>
             <Route path={`${prefix}/login`} element={<LoginPage />} />
             <Route path={`${prefix}/register`} element={<RegisterPage />} />
@@ -119,13 +149,21 @@ function App({ basename }: AppProps = {}) {
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+          <Route path={`${prefix}/tasks`} element={<TasksPage />} />
+          {isFeatureEnabled(info, "usage_page") && (
+            <Route path={`${prefix}/usage`} element={<UsagePage />} />
+          )}
           {/* Settings renders into the chat outlet so the conversations
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section
               is carried in the URL (/settings/<section>); bare /settings
-              defaults to Appearance. */}
-          <Route path={`${prefix}/settings`} element={<SettingsPage />} />
+              redirects to the canonical General section. */}
+          <Route
+            path={`${prefix}/settings`}
+            element={<Navigate to={`${prefix}/settings/general`} replace />}
+          />
           <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
+          <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
           {/* Members / Policies are now settings sub-categories
               (/settings/members, /settings/policies) so entering them
               keeps the settings sidebar nav instead of dropping back to

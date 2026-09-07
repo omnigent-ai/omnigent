@@ -264,6 +264,92 @@ def test_malformed_named_section_does_not_silently_fall_back_to_default(
     assert "malformed" in msg.lower() or "token" in msg
 
 
+def test_oauth_profile_without_token_is_not_malformed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # An OAuth profile (auth_type = databricks-cli) legitimately has no
+    # static ``token`` — only the SDK path can mint one. When that path
+    # fails (autouse fixture forces the SDK to raise), the configparser
+    # fallback must NOT report the profile as "malformed" and tell the
+    # user to fix/remove it. It should raise an actionable error that
+    # points at the SDK path / OAuth session instead.
+    cfg = _write_cfg(
+        tmp_path,
+        (
+            "[oss]\nhost = https://oss.example.com\nauth_type = databricks-cli\n"
+            # NOTE: no token line — expected for OAuth
+        ),
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    # SDK is importable in the test env but the autouse fixture forces
+    # authenticate() to fail → the "installed but auth failed" branch.
+    with pytest.raises(OSError) as excinfo:
+        resolve_databricks_workspace(profile="oss")
+
+    msg = str(excinfo.value)
+    assert "[oss]" in msg
+    # Must NOT defame a valid OAuth profile as malformed.
+    assert "malformed" not in msg.lower()
+    # Should steer the user toward the real fix (SDK / OAuth session).
+    assert "OAuth" in msg
+    assert "databricks auth login" in msg
+
+
+def test_oauth_profile_error_recommends_extra_when_sdk_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # When databricks-sdk is not installed (base install, no extra),
+    # the OAuth profile is unresolvable and the error must tell the user
+    # to install the `databricks` extra — not to mess with their CLI /
+    # OAuth session, which are irrelevant when the package is missing.
+    cfg = _write_cfg(
+        tmp_path,
+        "[oss]\nhost = https://oss.example.com\nauth_type = databricks-cli\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    # Simulate the base install: the SDK package is not importable.
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks._databricks_sdk_importable",
+        lambda: False,
+    )
+
+    with pytest.raises(OSError) as excinfo:
+        resolve_databricks_workspace(profile="oss")
+
+    msg = str(excinfo.value)
+    assert "[oss]" in msg
+    assert "malformed" not in msg.lower()
+    # Points at the missing package / extra, not the CLI/login session.
+    assert "omnigent[databricks]" in msg
+    assert "databricks auth login" not in msg
+
+
+def test_non_cli_sdk_profile_does_not_recommend_databricks_auth_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A token-less SDK-only profile whose auth_type is NOT databricks-cli
+    # (e.g. azure-cli) must not be told to run `databricks auth login` —
+    # that command only refreshes databricks-cli OAuth-U2M sessions. The
+    # SDK is importable in the test env; the autouse fixture forces auth
+    # to fail → the "SDK present but auth failed" branch.
+    cfg = _write_cfg(
+        tmp_path,
+        "[az]\nhost = https://az.example.com\nauth_type = azure-cli\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    with pytest.raises(OSError) as excinfo:
+        resolve_databricks_workspace(profile="az")
+
+    msg = str(excinfo.value)
+    assert "[az]" in msg
+    assert "malformed" not in msg.lower()
+    # Names the actual auth_type; does NOT misdirect to the CLI login.
+    assert "azure-cli" in msg
+    assert "databricks auth login" not in msg
+
+
 def test_resolves_via_sdk_when_sdk_returns_creds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

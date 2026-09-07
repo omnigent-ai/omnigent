@@ -94,6 +94,10 @@ class EgressRule:
             return False
         return self._path_matches(path)
 
+    def allows_all_requests_to(self, host: str) -> bool:
+        """Return whether this rule allows every method and path for *host*."""
+        return "*" in self.methods and self.path_pattern == "/**" and self._host_matches(host)
+
     def _method_matches(self, method: str) -> bool:
         if "*" in self.methods:
             return True
@@ -144,7 +148,10 @@ def parse_rule(rule_str: str) -> EgressRule:
 
     methods_str, url_part = parts
 
-    methods = frozenset(m.strip().upper() for m in methods_str.split(",") if m.strip())
+    method_parts = [m.strip() for m in methods_str.split(",")]
+    if any(not m for m in method_parts):
+        raise ValueError(f"Empty HTTP method in rule: {rule_str!r}")
+    methods = frozenset(m.upper() for m in method_parts)
     if not methods:
         raise ValueError(f"No methods specified in rule: {rule_str!r}")
     bad = methods - _VALID_METHODS

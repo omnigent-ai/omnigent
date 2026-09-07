@@ -28,6 +28,22 @@
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 
 /**
+ * Extra hints for the badge on shells that render it as a tappable OS
+ * notification. Android has no numeric icon badge, so the count is surfaced as
+ * a notification — without these it's a dead, generic "N pending" toast. They
+ * let that notification open a target and carry descriptive text. Ignored by
+ * shells with a real icon badge (Electron dock, iOS app icon).
+ */
+export interface BadgeActivation {
+  /** In-app path to open when the badge notification is tapped, e.g. "/inbox". */
+  navigatePath?: string;
+  /** Notification title; falls back to the app name when absent. */
+  title?: string;
+  /** Notification body; falls back to a generic "N pending" when absent. */
+  body?: string;
+}
+
+/**
  * Minimal API surface exposed by native shells. Electron exposes the legacy
  * `window.omnigentDesktop`; newer shells expose `window.omnigentNative`.
  * Kept intentionally tiny and string/number only so it survives bridge
@@ -36,8 +52,15 @@ export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 interface NativeShellApi {
   /** Discriminator so feature detection is unambiguous. */
   kind: "electron" | "ios" | "android";
-  /** Paint the dock/taskbar badge; 0 clears it. */
-  setBadgeCount: (count: number) => void;
+  /**
+   * Paint the dock/taskbar badge; 0 clears it. `activation` is consumed only by
+   * the Android shell, which renders the badge as a tray notification and needs
+   * a tap target + descriptive text; Electron/iOS paint a real icon badge and
+   * ignore it.
+   */
+  setBadgeCount: (count: number, activation?: BadgeActivation) => void;
+  /** Tell the shell which theme source the user selected. */
+  setColorScheme?: (scheme: "light" | "dark" | "system") => void;
   /** Fire an OS notification; resolves true when it was shown. */
   notify: (params: NativeNotifyParams) => Promise<boolean>;
   // Optional: a shell older than this SPA may lack notification-click routing,
@@ -48,6 +71,13 @@ interface NativeShellApi {
    * path the notification carried (its `navigatePath`); returns an unsubscribe.
    */
   onNotificationActivated?: (callback: (path: string) => void) => () => void;
+  /**
+   * Subscribe to in-app navigation from the desktop shell. Native menu actions
+   * and same-server deep links send a basename-less path so the SPA can route
+   * in place without reloading. Absent on older shells / outside Electron;
+   * returns an unsubscribe.
+   */
+  onOpenPath?: (callback: (path: string) => void) => () => void;
   /**
    * Subscribe to native sidebar-drag events. The iOS shell streams a left-edge
    * swipe here (the gesture it repurposed from back-navigation) so the renderer
@@ -68,13 +98,26 @@ interface NativeShellApi {
    */
   setSidebarOpen?: (open: boolean) => void;
   /**
-   * Drive the native Chat/Terminal switcher (iOS). The web app owns the truth
-   * and pushes the current mode, whether the terminal is reachable / booting,
-   * and whether the switcher should be shown at all. Absent on older shells,
-   * in which case the web renders its own in-page pill instead.
+   * Current server origin + managed/recent choices, or null on a foreign page.
+   * Optional: shells older than the sidebar server picker lack it — the SPA
+   * then falls back to that shell's own selection chrome (the floating pill on
+   * older iOS shells).
+   */
+  getServerPicker?: () => Promise<ServerPickerInfo | null>;
+  /** Re-point this window/shell to a server URL returned by the picker. */
+  switchServer?: (url: string) => Promise<void>;
+  /** Return to the shell's "connect to server" setup page. */
+  openServerSetup?: () => void;
+  /**
+   * Drive the native Chat/Terminal bar's visibility (iOS). The web app owns
+   * the truth and only ever pushes it hidden now that the switcher lives in
+   * the header. Absent on older shells.
    */
   setViewMode?: (params: NativeViewModeParams) => void;
-  /** Subscribe to taps on the native switcher; returns an unsubscribe. */
+  /**
+   * Subscribe to taps on the native switcher; returns an unsubscribe. Still
+   * exposed by the shell, but unused now that the pill is kept hidden.
+   */
   onViewModeChanged?: (callback: (mode: NativeViewMode) => void) => () => void;
   /**
    * Subscribe to the footprint (CSS px, excluding the OS safe area) of the
@@ -85,6 +128,8 @@ interface NativeShellApi {
    */
   onNativeInsets?: (callback: (insets: NativeInsets) => void) => () => void;
 }
+
+export type ThemeSource = "light" | "dark" | "system";
 
 /** Footprints (CSS px) of the native floating bars, reported by the shell. */
 export interface NativeInsets {
@@ -114,18 +159,26 @@ export interface NativeViewModeParams {
  */
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
-  /** Current server origin + recent servers, or null on a foreign page. */
-  getServerPicker?: () => Promise<ServerPickerInfo | null>;
-  /** Re-point this window to a previously-connected server URL. */
-  switchServer?: (url: string) => Promise<void>;
-  /** Return this window to the shell's "connect to server" setup page. */
-  openServerSetup?: () => void;
+  /**
+   * Desktop auto-update bridge — CONFIG ONLY on current shells. Update
+   * notifications are shell-owned (native corner overlay + Server menu); this
+   * bridge is used for update preferences (mode, auto-install) + check. The
+   * shell delivers it "banner-safe": status values that would trigger the
+   * in-page UpdateBanner (available/downloaded/error-security) are collapsed to
+   * idle, so the web never shows a (duplicate) banner. Absent on older shells.
+   */
+  updates?: ElectronUpdateBridge;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
   getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
   controlHost?: (action: HostControlAction) => Promise<HostActionResult>;
   /** Subscribe to host status-change pings (re-read on fire); returns an unsubscribe. */
   onHostStatusChanged?: (callback: () => void) => () => void;
+  /** Desktop feature gates (MDM-managed); absent on older shells. */
+  getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
+  /** Connect the user's Arca instance to the window's server as a host. */
+  connectArcaHost?: () => Promise<ArcaConnectResult>;
+
   /** The local `omni` CLI status (installed, resolved path, version, source). */
   getCliStatus?: () => Promise<CliStatus | null>;
   /** Clear the CLI-path override (revert to auto-detection); resolves status. */
@@ -141,10 +194,49 @@ interface ElectronDesktopApi extends NativeShellApi {
     bounds?: unknown,
     opts?: { force?: boolean; agent?: boolean },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  /**
+   * Hide/show the active embedded browser view while a DOM overlay is open.
+   * The native view paints above the renderer, so this is how overlays
+   * (dialogs, menus, tooltips, toasts) avoid being covered. Absent on shells
+   * predating the feature — callers must optional-chain.
+   */
+  browserSetSuppressed?: (suppressed: boolean) => Promise<{ ok: boolean; error?: string }>;
 }
 
 /** A lifecycle action for the host daemon. */
 export type HostControlAction = "start" | "stop" | "restart";
+
+/** Result of connecting the Arca instance as a host, from the desktop shell. */
+export interface ArcaConnectResult extends HostActionResult {
+  /**
+   * The box's host daemon was already connected to this server (the command
+   * reused it) — so no new host will appear in the host list.
+   */
+  alreadyRunning?: boolean;
+  /**
+   * The user deliberately declined or dismissed the connect console (before
+   * or during the run) — not a failure; UIs should stay silent.
+   */
+  canceled?: boolean;
+  /**
+   * The outcome (success or failure) was already displayed in the connect
+   * console's terminal — UIs must not echo it a second time.
+   */
+  shownInConsole?: boolean;
+}
+
+/**
+ * Desktop-shell feature gates the server can't know about, sourced from MDM
+ * managed preferences. All fields optional: an older shell reports fewer.
+ */
+export interface DesktopFeatures {
+  /**
+   * Databricks-internal features (e.g. the Arca host option) are enabled.
+   * Already scoped by the shell: true only when the MDM flag is set AND the
+   * window's server is Databricks-managed.
+   */
+  databricksInternalFeatures?: boolean;
+}
 
 /** Status of the local `omni` CLI, from the desktop shell. */
 export interface CliStatus {
@@ -160,6 +252,8 @@ export interface CliStatus {
   installCommand: string;
   /** Whether a just-submitted path was accepted (present on pick/set results). */
   accepted?: boolean;
+  /** MDM policy disables set/browse/reset of custom CLI paths. */
+  customizationDisabled?: boolean;
 }
 
 /** This machine's identity, read from local config (fast — no subprocess). */
@@ -174,14 +268,144 @@ export interface HostIdentity {
 export interface HostActionResult {
   ok: boolean;
   error?: string;
+  /**
+   * True when the failure was an authentication/sign-in problem — e.g. the
+   * server needs a Databricks/OIDC login the desktop couldn't complete
+   * headlessly — so the UI can offer a sign-in/retry affordance rather than a
+   * generic error. Set by the desktop's `omnigent:host-control` handler.
+   */
+  authError?: boolean;
+}
+
+export type UpdateMode = "none" | "manual" | "start" | "default";
+
+export interface UpdateConfig {
+  mode: UpdateMode;
+  autoInstall: boolean;
+  skippedVersion: string | null;
+}
+
+export type UpdateStatus = {
+  /** Installed Electron app version; absent on older desktop shells. */
+  currentVersion?: string;
+} & (
+  | {
+      state: "idle" | "checking" | "none";
+      info?: undefined;
+      progress?: undefined;
+      lastError?: string;
+    }
+  | {
+      state: "available" | "downloaded";
+      info?: { version: string; releaseNotes?: string };
+      progress?: undefined;
+      lastError?: string;
+    }
+  | {
+      state: "downloading";
+      info?: { version: string; releaseNotes?: string };
+      progress?: { percent: number };
+      lastError?: string;
+    }
+  | {
+      state: "error-security";
+      info?: { version: string; releaseNotes?: string };
+      progress?: undefined;
+      lastError?: string;
+    }
+);
+
+export interface ElectronUpdateBridge {
+  getConfig: () => Promise<UpdateConfig>;
+  getStatus: () => Promise<UpdateStatus>;
+  check: () => Promise<void>;
+  download: () => Promise<void>;
+  installNow: () => Promise<void>;
+  setConfig: (patch: Partial<UpdateConfig>) => Promise<UpdateConfig>;
+  onStatus: (callback: (status: UpdateStatus) => void) => () => void;
+  /** Shell-owned update card height; optional on older desktop builds. */
+  getOverlayHeight?: () => Promise<number>;
+  /** Subscribe to shell-owned update card height changes. */
+  onOverlayHeight?: (callback: (height: number) => void) => () => void;
 }
 
 /** Data backing the title-bar server picker, from the Electron shell. */
 export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
+  /**
+   * Server URLs supplied through macOS Managed Preferences. Optional because a
+   * newer server-served SPA can run inside a desktop shell that predates MDM.
+   */
+  managedServers?: string[];
   /** Recently-connected server URLs, most recent first. */
   recentServers: string[];
+  /**
+   * The connected server's version manifest (`/.well-known/omnigent.json`),
+   * forwarded by the shell. Optional: shells older than the manifest simply
+   * don't send it — see {@link serverManifestOf}, which supplies the
+   * pre-manifest baseline so callers never handle `undefined`.
+   */
+  serverManifest?: ServerManifest;
+}
+
+/**
+ * The server's version manifest, as forwarded by the desktop shell from
+ * `GET /.well-known/omnigent.json`.
+ *
+ * Read it through {@link serverManifestOf} and gate on `manifestVersion >= N`,
+ * never `=== N`: a newer server must keep working with an older client, which
+ * is the entire point of the document.
+ */
+export interface ServerManifest {
+  /**
+   * Envelope version. `0` is the pre-manifest baseline — a server older than
+   * the manifest route, or one the shell could not read — so the ordinary
+   * `>= 1` gate excludes it without callers testing for null.
+   */
+  manifestVersion: number;
+  /** Installed omnigent package version. Display only, never gate on it. */
+  serverVersion: string | null;
+  /** Oldest supported desktop build, or null for no floor (the normal case). */
+  minDesktopVersion: string | null;
+  /**
+   * Where server-driven chrome lives. `server_picker` is `"sidebar"` on builds
+   * that dock the picker at the sidebar's bottom, `"titlebar"` on older ones.
+   * Loosely typed on purpose: unknown keys are the extension point, so a newer
+   * server can add shapes this build has never heard of.
+   */
+  ui: Record<string, unknown>;
+}
+
+/**
+ * The pre-manifest baseline: what a server implies when it has no manifest —
+ * every server older than the route — or when the shell is too old to forward
+ * one. `manifestVersion: 0` fails every `>= 1` gate, so callers fall back to
+ * existing behavior without distinguishing "absent" from "unreadable".
+ */
+export const PRE_MANIFEST_BASELINE: ServerManifest = {
+  manifestVersion: 0,
+  serverVersion: null,
+  minDesktopVersion: null,
+  ui: {},
+};
+
+/**
+ * The manifest carried by a picker payload, or the pre-manifest baseline.
+ *
+ * Use this rather than reading `info.serverManifest` directly: the field is
+ * absent on older shells, and this collapses that case into a real manifest so
+ * every caller can gate on `manifestVersion` unconditionally.
+ *
+ * @param info A payload from {@link getServerPicker}, or null off-shell.
+ */
+export function serverManifestOf(info: ServerPickerInfo | null): ServerManifest {
+  const manifest = info?.serverManifest;
+  // Validate rather than trust: this crosses the IPC boundary from a shell
+  // whose version is unknown, so a malformed/partial object degrades to the
+  // baseline instead of yielding NaN comparisons downstream.
+  if (!manifest || typeof manifest.manifestVersion !== "number") return PRE_MANIFEST_BASELINE;
+  return manifest;
 }
 
 /** The Electron preload bridge, or undefined outside the Electron shell. */
@@ -199,9 +423,26 @@ function nativeApi(): NativeShellApi | undefined {
   return electronApi();
 }
 
+function callSetColorScheme(scheme: ThemeSource): boolean {
+  const native = nativeApi();
+  if (!native?.setColorScheme) return false;
+  try {
+    native.setColorScheme(scheme);
+  } catch (err) {
+    console.warn("[nativeBridge] setColorScheme failed:", err);
+    return false;
+  }
+  return true;
+}
+
 /** True when running inside the Electron desktop shell. */
 export function isElectronShell(): boolean {
   return electronApi() !== undefined;
+}
+
+/** Desktop auto-update bridge, or undefined outside Electron / older shells. */
+export function updateBridge(): ElectronUpdateBridge | undefined {
+  return electronApi()?.updates;
 }
 
 /**
@@ -229,6 +470,24 @@ export function isMacElectronShell(): boolean {
 /** True when running inside the iOS WKWebView native shell. */
 export function isIOSShell(): boolean {
   return nativeApi()?.kind === "ios";
+}
+
+/**
+ * True when the surrounding shell exposes the complete server-picker bridge —
+ * data ({@link getServerPicker}) plus both actions the picker offers
+ * ({@link switchServer}, {@link openServerSetup}). Shells with the picker
+ * surface server selection in the sidebar; shells without it (older iOS
+ * builds) fall back to their own selection chrome, the floating pill. All
+ * three methods are required so a partial/version-skewed shell never hides
+ * its own pill while the sidebar offers actions it cannot perform.
+ */
+export function supportsNativeServerPicker(): boolean {
+  const native = nativeApi();
+  return (
+    typeof native?.getServerPicker === "function" &&
+    typeof native.switchServer === "function" &&
+    typeof native.openServerSetup === "function"
+  );
 }
 
 /**
@@ -316,6 +575,27 @@ export function onNativeNotificationActivated(callback: (path: string) => void):
 }
 
 /**
+ * Subscribe to in-app navigation from the desktop shell. Native menu actions
+ * and same-server deep links send basename-less paths such as `/settings` and
+ * `/c/<id>` so the SPA can route in place without reloading. The embedded
+ * build's `basenamedRouting` rebases them under the mount.
+ *
+ * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
+ * outside the Electron shell or under a shell too old to support in-app
+ * navigation, so callers can register it unconditionally.
+ */
+export function onOpenPath(callback: (path: string) => void): () => void {
+  const native = nativeApi();
+  if (!native?.onOpenPath) return () => {};
+  try {
+    return native.onOpenPath(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onOpenPath failed:", err);
+    return () => {};
+  }
+}
+
+/**
  * Subscribe to native sidebar-drag events from the iOS shell's left-edge swipe
  * (the gesture it repurposed from back-navigation), so the renderer can drive
  * its sidebar as an interactive drawer — tracking the finger on `begin`/`move`
@@ -345,12 +625,29 @@ export function onNativeSidebarDrag(
  * No-op outside the Electron shell. The Electron main process calls
  * `app.setBadgeCount`, which on Windows is unsupported at the app level — we
  * intentionally don't paper over that.
+ *
+ * `activation` is only meaningful on the Android shell, where the badge is a
+ * tray notification: it makes that notification open a target and show
+ * descriptive text. Electron/iOS have a real icon badge and ignore it.
  */
-export async function setBadgeCount(count: number): Promise<void> {
+/**
+ * Tell the native shell which theme source the user selected. The shell drives
+ * its own OS-level night mode so that native chrome and the WebView agree.
+ * No-op outside supported shells. Fire-and-forget.
+ */
+export function setThemeSource(themeSource: ThemeSource): void {
+  callSetColorScheme(themeSource);
+}
+
+export async function setBadgeCount(count: number, activation?: BadgeActivation): Promise<void> {
   const native = nativeApi();
   if (!native) return;
   try {
-    native.setBadgeCount(count);
+    // Forward `activation` only when present so shells (and tests) that expect
+    // the single-arg call keep matching; Android reads it to make the badge
+    // notification actionable + descriptive.
+    if (activation) native.setBadgeCount(count, activation);
+    else native.setBadgeCount(count);
   } catch (err) {
     console.warn("[nativeBridge] native setBadgeCount failed:", err);
   }
@@ -391,11 +688,10 @@ export function setNativeSidebarOpen(open: boolean): void {
 }
 
 /**
- * Push the current Chat/Terminal state to the native switcher (iOS). The web
- * app owns this state; the native bar is a thin control surface that renders it
- * and reports taps back via {@link onNativeViewModeChanged}. No-op on shells
- * without the native switcher (older iOS shells, Electron, plain browser) — the
- * caller renders its own in-page pill there.
+ * Push the Chat/Terminal bar state to the iOS shell. The switcher now lives in
+ * the web header (ViewModeToggle) on every shell, so the SPA only ever pushes
+ * `visible: false` — keeping the shell's legacy bottom pill hidden (see
+ * hideNativeChatTerminalBar). No-op on shells without the method.
  */
 export function setNativeViewMode(params: NativeViewModeParams): void {
   setInsetVar("--omnigent-bottom-bar-visible", params.visible ? "1" : "0");
@@ -405,22 +701,6 @@ export function setNativeViewMode(params: NativeViewModeParams): void {
     native.setViewMode(params);
   } catch (err) {
     console.warn("[nativeBridge] native setViewMode failed:", err);
-  }
-}
-
-/**
- * Subscribe to taps on the native Chat/Terminal switcher. The shell sends the
- * mode the user selected; route it into the web view's own state. Returns an
- * unsubscribe; a no-op outside a shell that exposes the native switcher.
- */
-export function onNativeViewModeChanged(callback: (mode: NativeViewMode) => void): () => void {
-  const native = nativeApi();
-  if (!native?.onViewModeChanged) return () => {};
-  try {
-    return native.onViewModeChanged(callback);
-  } catch (err) {
-    console.warn("[nativeBridge] native onViewModeChanged failed:", err);
-    return () => {};
   }
 }
 
@@ -443,51 +723,52 @@ export function onNativeInsets(callback: (insets: NativeInsets) => void): () => 
 }
 
 /**
- * Fetch the title-bar server picker data from the Electron shell: the
- * window's current server origin plus the recently-connected server list.
+ * Fetch server picker data from the native shell (Electron or iOS): the
+ * current origin plus organization-provided and recently-connected server
+ * lists.
  *
- * Resolves `null` outside the Electron shell, under a shell too old to
- * support the picker, or on a page the shell doesn't recognize as a
- * connected server — callers hide the picker in all of those cases.
+ * Resolves `null` outside a native shell, under a shell too old to support
+ * the picker, or on a page the shell doesn't recognize as a connected
+ * server — callers hide the picker in all of those cases.
  */
 export async function getServerPicker(): Promise<ServerPickerInfo | null> {
-  const electron = electronApi();
-  if (!electron?.getServerPicker) return null;
+  const native = nativeApi();
+  if (!native?.getServerPicker) return null;
   try {
-    return await electron.getServerPicker();
+    return await native.getServerPicker();
   } catch (err) {
-    console.warn("[nativeBridge] electron getServerPicker failed:", err);
+    console.warn("[nativeBridge] native getServerPicker failed:", err);
     return null;
   }
 }
 
 /**
- * Ask the Electron shell to re-point this window to another
- * previously-connected server URL (one of `ServerPickerInfo.recentServers`).
- * The shell navigates the whole window, so on success this page unloads.
+ * Ask the native shell to re-point this window to another URL returned in
+ * `ServerPickerInfo.managedServers` or `recentServers`. The shell navigates the
+ * whole window, so on success this page unloads.
  */
 export async function switchServer(url: string): Promise<void> {
-  const electron = electronApi();
-  if (!electron?.switchServer) return;
+  const native = nativeApi();
+  if (!native?.switchServer) return;
   try {
-    await electron.switchServer(url);
+    await native.switchServer(url);
   } catch (err) {
-    console.warn("[nativeBridge] electron switchServer failed:", err);
+    console.warn("[nativeBridge] native switchServer failed:", err);
   }
 }
 
 /**
- * Ask the Electron shell to return this window to its "connect to server"
+ * Ask the native shell to return this window to its "connect to server"
  * setup page (the picker's "+ Connect to new server…" action). The window
  * navigates away on success.
  */
 export function openServerSetup(): void {
-  const electron = electronApi();
-  if (!electron?.openServerSetup) return;
+  const native = nativeApi();
+  if (!native?.openServerSetup) return;
   try {
-    electron.openServerSetup();
+    native.openServerSetup();
   } catch (err) {
-    console.warn("[nativeBridge] electron openServerSetup failed:", err);
+    console.warn("[nativeBridge] native openServerSetup failed:", err);
   }
 }
 
@@ -520,6 +801,41 @@ export async function controlHost(action: HostControlAction): Promise<HostAction
     return await electron.controlHost(action);
   } catch (err) {
     console.warn("[nativeBridge] electron controlHost failed:", err);
+    return { ok: false, error: String(err) };
+  }
+}
+
+/**
+ * Fetch the desktop shell's feature gates (MDM-managed). Resolves `null`
+ * outside the Electron shell or under a shell too old to expose them — callers
+ * must treat null / a missing field as disabled.
+ */
+export async function getDesktopFeatures(): Promise<DesktopFeatures | null> {
+  const electron = electronApi();
+  if (!electron?.getDesktopFeatures) return null;
+  try {
+    return await electron.getDesktopFeatures();
+  } catch (err) {
+    console.warn("[nativeBridge] electron getDesktopFeatures failed:", err);
+    return null;
+  }
+}
+
+/**
+ * Connect the user's Arca instance (Databricks-internal sandbox) to the
+ * window's server as a host, via the desktop shell. The shell asks native
+ * consent and runs `arca ssh` — resolving only once the remote host daemon
+ * started (or failed). A no-op `{ ok: false }` outside the shell.
+ */
+export async function connectArcaHost(): Promise<ArcaConnectResult> {
+  const electron = electronApi();
+  if (!electron?.connectArcaHost) {
+    return { ok: false, error: "not running under the desktop shell" };
+  }
+  try {
+    return await electron.connectArcaHost();
+  } catch (err) {
+    console.warn("[nativeBridge] electron connectArcaHost failed:", err);
     return { ok: false, error: String(err) };
   }
 }

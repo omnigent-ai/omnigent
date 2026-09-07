@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+// Routing API for AI gateways.
+//
+// This schema is versioned independently of any particular gateway
+// implementation so that the request and response contracts can evolve
+// (v1, v2, ...) without being coupled to a gateway's release cycle, while
+// still being served under a gateway's existing API scope.
+package omnigent.api.routing.v1;
+
+import "google/protobuf/struct.proto";
+
+// A candidate destination a request may be routed to.
+message RouteOption {
+  // Identifier of the model to serve the request, e.g. "gpt-5-5".
+  optional string model = 1;
+
+  // Harness that drives the model. May be omitted for a native harness;
+  // required when the model is served through a meta-harness.
+  optional string harness = 2;
+}
+
+// Selects the routing strategy to apply and its configuration.
+//
+// A gateway resolves `router_name` to a routing implementation and passes
+// `config` to it. Both the set of available routers and their configuration
+// are gateway-defined, so `config` is an opaque structure rather than a fixed
+// message. Examples:
+//
+//   Server-side judge model (implementation is a gateway-side black box):
+//     {
+//       "router_name": "judge_v20260708",
+//       "config": {
+//         "user_guidance": "prefer the most capable model available",
+//         "org_guidance": "keep cost reasonable"
+//       }
+//     }
+//
+//   Fixed model and harness:
+//     {
+//       "router_name": "fixed",
+//       "config": { "model": "gpt-5-5", "harness": "codex" }
+//     }
+//
+//   User-supplied lambda:
+//     {
+//       "router_name": "python_lambda",
+//       "config": { "lambda": "gpt-5-5 if len(prompt) > 10 else kimi" }
+//     }
+message RouteSelector {
+  // Name of the routing strategy to invoke.
+  optional string router_name = 1;
+
+  // Router-specific configuration, interpreted by the selected router.
+  optional google.protobuf.Struct config = 2;
+}
+
+// The routing decision produced for a single request.
+message RouteSelection {
+  // The chosen destination.
+  optional RouteOption route_option = 1;
+
+  // Router-specific parameters emitted alongside the decision, interpreted
+  // by the caller or the serving path.
+  optional google.protobuf.Struct params = 2;
+}
+
+// A single unit of work submitted for routing.
+message Task {
+  // The prompt to be served.
+  optional string prompt = 1;
+}
+
+// One prior turn in a session: the task that was submitted and the routing
+// decision made for it.
+message SessionTurn {
+  optional Task task = 1;
+  optional RouteSelection route_selection = 2;
+}
+
+// The routing history for a session, ordered oldest to newest. Routers may
+// use it to keep successive turns consistent.
+message SessionHistory {
+  repeated SessionTurn session_turns = 1;
+}
+
+// Request to select a route for a task.
+message SelectRouteRequest {
+  // Candidate destinations the router may choose from.
+  repeated RouteOption route_options = 1;
+
+  // The task to route.
+  optional Task task = 2;
+
+  // The routing strategy to apply. Required in practice; a gateway rejects a
+  // request that omits it.
+  optional RouteSelector route_selector = 3;
+
+  // Prior turns in the session, when available.
+  optional SessionHistory session_history = 4;
+}
+
+// Response containing the selected route.
+message SelectRouteResponse {
+  // The routing decision.
+  repeated RouteSelection route_selection = 1;
+
+  // Human-readable explanation of why this route was selected.
+  optional string rationale = 2;
+}

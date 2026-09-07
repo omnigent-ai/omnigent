@@ -523,6 +523,12 @@ def test_oidc_source_returns_none_for_missing_cookie() -> None:
     assert provider.get_user_id(request) is None
 
 
+def test_oidc_source_returns_none_for_missing_cookie_config() -> None:
+    provider = UnifiedAuthProvider(source="oidc")
+
+    assert provider.get_user_id(_mock_request()) is None
+
+
 def test_oidc_source_returns_none_for_tampered_cookie() -> None:
     """OIDC source rejects a cookie signed with a different secret.
 
@@ -582,6 +588,43 @@ def test_oidc_source_rejects_reserved_sub_claims(reserved: str) -> None:
         ttl_hours=8,
         provider="google",
     )
+    request = _mock_request(cookies={config.session_cookie_name: token})
+    assert provider.get_user_id(request) is None
+
+
+def test_oidc_source_rejects_non_string_sub_claim() -> None:
+    config = _make_oidc_config()
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
+    token = jwt.encode(
+        {
+            "sub": 123,
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 3600,
+            "provider": "google",
+        },
+        _TEST_SECRET,
+        algorithm="HS256",
+    )
+
+    request = _mock_request(cookies={config.session_cookie_name: token})
+    assert provider.get_user_id(request) is None
+
+
+def test_oidc_source_rejects_non_string_grant_id_claim() -> None:
+    config = _make_oidc_config()
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
+    token = jwt.encode(
+        {
+            "sub": "alice@example.com",
+            "grant_id": 123,
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 3600,
+            "provider": "google",
+        },
+        _TEST_SECRET,
+        algorithm="HS256",
+    )
+
     request = _mock_request(cookies={config.session_cookie_name: token})
     assert provider.get_user_id(request) is None
 

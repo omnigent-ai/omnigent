@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parseSystemMessage } from "./systemMessage";
+import type { MessageContentBlock } from "@/lib/blocks";
+import { isSystemUserContent, parseSystemMessage } from "./systemMessage";
 
 describe("parseSystemMessage", () => {
   it("returns null for plain user text", () => {
@@ -126,5 +127,33 @@ describe("parseSystemMessage", () => {
     // user genuinely talking about interrupts still renders as their message.
     expect(parseSystemMessage("can you handle [Request interrupted by user]?")).toBeNull();
     expect(parseSystemMessage("[Request interrupted by user?]")).toBeNull();
+  });
+});
+
+describe("isSystemUserContent", () => {
+  const text = (s: string): MessageContentBlock[] => [{ type: "input_text", text: s }];
+
+  it("flags a [System: …] marker as a system (non-turn) message", () => {
+    expect(isSystemUserContent(text("[System: timer t1 fired]"))).toBe(true);
+  });
+
+  it("treats a plain user message as a real turn", () => {
+    expect(isSystemUserContent(text("what's the weather?"))).toBe(false);
+  });
+
+  it("still sees the marker after stripping an [Attached: …] prefix", () => {
+    // The bubble render strips attachment markers before showing text, so the
+    // predicate must too — otherwise the leading marker would hide the header.
+    expect(isSystemUserContent(text("[Attached: foo.txt] [System: timer t1 fired]"))).toBe(true);
+  });
+
+  it("never treats a message with real attachments as a system marker", () => {
+    // A genuine upload is always a real user turn, even if its text parses as
+    // a marker — attachments can't ride along on a runtime notice.
+    const withImage: MessageContentBlock[] = [
+      { type: "input_text", text: "[System: timer t1 fired]" },
+      { type: "input_image", file_id: "f1" },
+    ];
+    expect(isSystemUserContent(withImage)).toBe(false);
   });
 });

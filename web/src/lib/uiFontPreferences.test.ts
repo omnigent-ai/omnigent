@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { setEmbedScopeRoot } from "./host";
 import {
+  applyDesktopUiFontSize,
   applyUiFontFamily,
-  applyUiFontScale,
   readUiFontFamily,
   readUiFontSizePx,
   UI_FONT_FAMILY_DEFAULT,
@@ -17,13 +18,15 @@ const FAMILY_STORAGE_KEY = "omnigent:ui-font-family";
 
 afterEach(() => {
   localStorage.clear();
-  document.documentElement.style.removeProperty("--ui-font-scale");
+  setEmbedScopeRoot(null);
+  document.documentElement.style.removeProperty("--desktop-ui-font-size");
   document.documentElement.style.removeProperty("--ui-font-family");
 });
 
 describe("uiFontPreferences", () => {
   it("returns the default when nothing is stored", () => {
     expect(readUiFontSizePx()).toBe(UI_FONT_SIZE_DEFAULT);
+    expect(UI_FONT_SIZE_DEFAULT).toBe(13);
   });
 
   it("round-trips a valid size", () => {
@@ -59,16 +62,28 @@ describe("uiFontPreferences", () => {
     expect(readUiFontSizePx()).toBe(UI_FONT_SIZE_DEFAULT);
   });
 
-  it("applies the size as a scale multiplier on the document root", () => {
-    applyUiFontScale(20);
-    // 20 / 16 base = 1.25.
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.25");
+  it("applies the discrete desktop size on the document root", () => {
+    applyDesktopUiFontSize(18);
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("18px");
   });
 
-  it("clamps before applying the scale", () => {
-    applyUiFontScale(99);
-    // Clamped to the 20px max → 20 / 16 = 1.25.
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.25");
+  it("clamps before applying the desktop size", () => {
+    applyDesktopUiFontSize(99);
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("18px");
+  });
+
+  it("applies onto the embed scope root when embedded, not the document root", () => {
+    // Embedded, the scoped `.omnigent-app` redefines the font tokens locally, so
+    // a value set on <html> is shadowed for the subtree — it must land on the
+    // scope root instead.
+    const scope = document.createElement("div");
+    setEmbedScopeRoot(scope);
+    applyDesktopUiFontSize(16);
+    applyUiFontFamily("Comic Sans");
+    expect(scope.style.getPropertyValue("--desktop-ui-font-size")).toBe("16px");
+    expect(scope.style.getPropertyValue("--ui-font-family")).toBe("Comic Sans, var(--font-sans)");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("");
+    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
   });
 });
 

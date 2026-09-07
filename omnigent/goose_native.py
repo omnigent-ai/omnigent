@@ -25,13 +25,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
 
 import click
 import httpx
 import yaml
 
 from omnigent._native_resume_hint import echo_native_cold_resume_hint, echo_native_resume_hint
+from omnigent._platform import resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import GOOSE_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
@@ -40,9 +40,11 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -54,6 +56,9 @@ from omnigent.native_terminal import (
     DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
 )
 from omnigent.native_terminal import bind_session_runner as _bind_session_runner
+from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
 from omnigent.native_terminal import url_component
 
 _DEFAULT_GOOSE_COMMAND = "goose"
@@ -126,7 +131,7 @@ def resolve_goose_executable(
     env = os.environ if env is None else env
     which = shutil.which if which is None else which
     command = _configured_goose_command(env)
-    resolved = which(command)
+    resolved = resolve_cli_binary(command, which=which)
     if resolved is None:
         install_url = "https://github.com/block/goose/releases/download/stable/download_cli.sh"
         raise click.ClickException(
@@ -153,7 +158,8 @@ def run_goose_native(
     *,
     server: str | None,
     session_id: str | None,
-    goose_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    goose_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
 ) -> None:
@@ -168,6 +174,9 @@ def run_goose_native(
         URL after launch.
     :returns: None after the terminal attach session ends.
     """
+    goose_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=goose_args, legacy_param="goose_args"
+    )
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
@@ -194,7 +203,7 @@ def _materialize_goose_agent_spec(tmpdir: Path) -> Path:
     :returns: Path to the generated YAML spec.
     """
     yaml_path = tmpdir / "goose-native-ui.yaml"
-    raw: dict[str, Any] = {
+    raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
             "Goose is running in the session terminal. The user drives the "
@@ -238,7 +247,7 @@ def _run_with_remote_server(
     from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=None)
     try:
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
@@ -309,17 +318,21 @@ async def _prepare_goose_terminal_via_daemon(
     """
     persist_args = list(goose_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         reattached = False
         cold_resumed = False
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Goose session requires a session bundle.")
             _update_startup_progress(startup_progress, "Creating Goose session...")
-            session_id = await _create_goose_session(
-                client,
-                session_bundle,
-                terminal_launch_args=persist_args or None,
+            session_id, _ = await asyncio.gather(
+                _create_goose_session(
+                    client,
+                    session_bundle,
+                    terminal_launch_args=persist_args or None,
+                ),
+                wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
         else:
             _update_startup_progress(startup_progress, "Loading Goose session...")
@@ -362,13 +375,15 @@ async def _prepare_goose_terminal_via_daemon(
                         f"({resp.status_code}): {error_text(resp)}"
                     )
 
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+        if not fresh_session:
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_startup_progress(startup_progress, "Starting runner...")
         runner_id = await launch_or_reuse_daemon_runner(
             client,
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
@@ -398,7 +413,7 @@ async def _create_goose_session(
     terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Create a bundled terminal-first goose-native session."""
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
@@ -418,7 +433,7 @@ async def _create_goose_session(
     return new_session_id
 
 
-async def _fetch_goose_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_goose_session(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:

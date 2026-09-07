@@ -1,7 +1,8 @@
 """E2E: task lists render as bullet-free checkboxes in chat message bubbles.
 
-Chat counterpart to ``files/test_markdown_task_lists.py`` (which covers the file
-editor). Chat bubbles render markdown via Streamdown + remark-gfm: remark-gfm
+Chat counterpart to the rich-text editor's task-list rendering (unit-covered by
+``web/src/shell/TipTapTaskList.test.ts``). Chat bubbles render markdown via
+Streamdown + remark-gfm: remark-gfm
 tags each task item ``task-list-item`` with a disabled ``<input type="checkbox">``
 but Streamdown also applies Tailwind ``list-disc``, so without the task-list CSS
 a disc renders right next to the checkbox. This pins the

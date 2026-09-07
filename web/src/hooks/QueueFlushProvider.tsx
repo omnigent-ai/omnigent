@@ -44,5 +44,5 @@ export function QueueFlushProvider({ children }: { children: ReactNode }) {
     return unsubscribe;
   }, [queryClient, flushBackgroundQueues]);
 
-  return <>{children}</>;
+  return children;
 }

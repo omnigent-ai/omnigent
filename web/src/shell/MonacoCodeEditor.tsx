@@ -17,13 +17,11 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Editor, type EditorProps, type OnChange, type OnMount } from "@monaco-editor/react";
-import { useTheme } from "next-themes";
 import { AlertTriangleIcon, MessageSquareOffIcon } from "lucide-react";
-import { normalizeResolvedTheme } from "@/components/theme/themeMode";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import {
   codeFontFamilyForEditor,
-  readCodeFontFamily,
-  readCodeFontSizePx,
+  readCodeFont,
   subscribeCodeFont,
 } from "@/lib/codeFontPreferences";
 import type { Comment } from "@/hooks/useComments";
@@ -40,10 +38,26 @@ import {
   monacoLanguageId,
   resolvedThemeToMonaco,
 } from "./monacoSetup";
+import type { monaco } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
+import { attachEditorScrollRestore } from "./useScrollRestore";
 import "./monacoCodeEditor.css";
 
 type EditorOptions = EditorProps["options"];
+
+// Monaco's find contribution isn't a public export, so we reach it by its
+// registered id and describe only the slice of its API we drive: read whether
+// the find widget is open, close it, and subscribe to open/close changes.
+const FIND_CONTROLLER_ID = "editor.contrib.findController";
+interface FindController extends monaco.editor.IEditorContribution {
+  getState: () => {
+    readonly isRevealed: boolean;
+    onFindReplaceStateChange: (listener: (e: { isRevealed: boolean }) => void) => {
+      dispose: () => void;
+    };
+  };
+  closeFindWidget: () => void;
+}
 
 // How long the transient "Saved" badge stays up before the status chip clears
 // itself back to idle — long enough to register, short enough not to linger.
@@ -74,12 +88,16 @@ interface MonacoCodeEditorProps extends CommentProps {
   /** Reports the auto-save lifecycle up to FileViewer's toolbar status chip. */
   onSaveStatusChange?: (status: SaveStatus) => void;
   /**
-   * True when the FileViewer "Find in file" button wants Monaco's native find
-   * opened. The editor opens find once it has mounted (so a request made while
-   * the lazy chunk is still loading isn't dropped), then calls onSearchHandled.
+   * Toolbar "Find in file" toggle. The editor mirrors Monaco's native find
+   * widget to this flag once mounted (so a request made while the lazy chunk is
+   * still loading isn't dropped): true opens find, false closes it.
    */
   searchOpen?: boolean;
-  /** Called after the editor has opened find, so the parent can reset the flag. */
+  /**
+   * Called when the find widget is closed from within Monaco (Escape or the
+   * widget's ✕) so the parent can reset the toggle and keep the toolbar button
+   * in sync — otherwise the next click would no-op instead of re-opening.
+   */
   onSearchHandled?: () => void;
 }
 
@@ -201,8 +219,7 @@ function MonacoCodeEditorInner({
   pendingBodyRef,
 }: InnerProps) {
   const lang = detectLang(path);
-  const { resolvedTheme } = useTheme();
-  const monacoTheme = resolvedThemeToMonaco(normalizeResolvedTheme(resolvedTheme));
+  const monacoTheme = resolvedThemeToMonaco(useResolvedThemeMode());
 
   // Gate rendering until Shiki has registered the github themes + this file's
   // grammar, so the editor never flashes Monaco's default 'vs' theme.
@@ -268,6 +285,12 @@ function MonacoCodeEditorInner({
   const flushRef = useRef(autoSave.flush);
   flushRef.current = autoSave.flush;
 
+  // Monaco scrolls internally, so its offset is cached per conversation + file
+  // rather than via the DOM scroll-restore hook. Held in a ref so the mount-time
+  // onDidScrollChange subscription always writes the current file's key.
+  const scrollKeyRef = useRef("");
+  scrollKeyRef.current = `viewer:${conversationId}:${path}`;
+
   const handleMount: OnMount = useCallback(
     (editor, monaco) => {
       editorInstanceRef.current = editor;
@@ -286,7 +309,7 @@ function MonacoCodeEditorInner({
       // Route ⌘S through the same single-flight + trailing-save engine as
       // auto-save, so a manual save during an in-flight/debounced auto-save can't
       // start an overlapping PUT.
-      // oxlint-disable-next-line eslint(no-bitwise) -- Monaco keybindings are bit-OR'd flags.
+      // Monaco keybindings are bitwise OR'd flags.
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
         flushRef.current();
       });
@@ -308,6 +331,13 @@ function MonacoCodeEditorInner({
         setDirty(false);
         if (viewState) ed.restoreViewState(viewState);
       };
+      // Reopening a file (or switching sessions and back) lands where the user
+      // left off, and further scrolling is cached under the current file's key.
+      attachEditorScrollRestore(
+        editor,
+        () => scrollKeyRef.current,
+        () => editorInstanceRef.current === editor,
+      );
       setMounted(true);
     },
     [setContentRef, setDirty, content],
@@ -320,16 +350,38 @@ function MonacoCodeEditorInner({
     [setContentRef],
   );
 
-  // Open Monaco's native find when the toolbar requests it. Gated on `mounted`
-  // so a Find pressed while the lazy chunk was still loading isn't dropped —
-  // when the editor mounts, `mounted` flips and this re-runs with searchOpen
-  // still true. Calling getAction before the find contribution loads would
-  // no-op, which is why we wait for the editor instance.
+  // Mirror Monaco's native find widget to the toolbar toggle. Gated on `mounted`
+  // so a Find pressed while the lazy chunk was still loading isn't dropped — when
+  // the editor mounts, `mounted` flips and this re-runs with the current flag.
+  // `searchOpen` true opens find; false closes it (so re-clicking the toolbar
+  // button, which toggles the flag, hides the widget). The controller drives the
+  // close directly rather than the open action so it's a real toggle, not a
+  // second open.
   useEffect(() => {
-    if (!mounted || !searchOpen) return;
-    editorInstanceRef.current?.getAction("actions.find")?.run();
-    onSearchHandled?.();
-  }, [mounted, searchOpen, onSearchHandled]);
+    if (!mounted) return;
+    const editor = editorInstanceRef.current;
+    if (!editor) return;
+    if (searchOpen) {
+      editor.getAction("actions.find")?.run();
+    } else {
+      const controller = editor.getContribution<FindController>(FIND_CONTROLLER_ID);
+      if (controller?.getState().isRevealed) controller.closeFindWidget();
+    }
+  }, [mounted, searchOpen]);
+
+  // Reflect a find close initiated inside Monaco (Escape or the widget's ✕) back
+  // to the toolbar toggle, so its state matches the visible widget and the next
+  // click re-opens instead of no-opping.
+  useEffect(() => {
+    if (!mounted) return;
+    const controller =
+      editorInstanceRef.current?.getContribution<FindController>(FIND_CONTROLLER_ID);
+    if (!controller) return;
+    const sub = controller.getState().onFindReplaceStateChange((e) => {
+      if (e.isRevealed && !controller.getState().isRevealed) onSearchHandled?.();
+    });
+    return () => sub.dispose();
+  }, [mounted, onSearchHandled]);
 
   const handleChange: OnChange = useCallback(
     (value) => {
@@ -365,10 +417,12 @@ function MonacoCodeEditorInner({
     else status = "idle";
     onSaveStatusChangeRef.current?.(status);
     // "Saved" is transient: clear it back to idle so the chip doesn't linger.
-    if (status === "saved") {
-      const t = window.setTimeout(() => onSaveStatusChangeRef.current?.("idle"), SAVED_BADGE_MS);
-      return () => window.clearTimeout(t);
-    }
+    if (status !== "saved") return undefined;
+    const timeout = window.setTimeout(
+      () => onSaveStatusChangeRef.current?.("idle"),
+      SAVED_BADGE_MS,
+    );
+    return () => window.clearTimeout(timeout);
   }, [writePending, writeError, writeSuccess, saveDisabled, isDirty]);
 
   // Clear the toolbar chip when this editor goes away (file switch / mode change
@@ -393,8 +447,9 @@ function MonacoCodeEditorInner({
     path,
   });
 
-  const options = useMemo<EditorOptions>(
-    () => ({
+  const options = useMemo<EditorOptions>(() => {
+    const font = readCodeFont();
+    return {
       readOnly: !canEdit,
       minimap: { enabled: false },
       scrollBeyondLastLine: false,
@@ -402,25 +457,26 @@ function MonacoCodeEditorInner({
       // changes arrive via updateOptions in the effect below. An unset family
       // resolves to the shared mono stack, so the editor matches the terminal
       // rather than falling back to Monaco's own platform default.
-      fontSize: readCodeFontSizePx(),
-      fontFamily: codeFontFamilyForEditor(readCodeFontFamily()),
+      fontSize: font.sizePx,
+      fontFamily: codeFontFamilyForEditor(font.family),
+      fontWeight: String(font.weight),
       automaticLayout: true,
       renderLineHighlight: canEdit ? "line" : "none",
       // Read-only buffers still allow selection + copy; just hide the caret.
       cursorStyle: canEdit ? "line" : "underline-thin",
-    }),
-    [canEdit],
-  );
+    };
+  }, [canEdit]);
 
   // Apply live code-font changes to the mounted editor. Monaco is a fixed-pixel
   // widget with no CSS-variable path like the chrome font, so the new
-  // size/family must be pushed imperatively; the options memo seeds the initial
+  // options must be pushed imperatively; the options memo seeds the initial
   // value at creation.
   useEffect(() => {
     return subscribeCodeFont((font) => {
       editorInstanceRef.current?.updateOptions({
         fontSize: font.sizePx,
         fontFamily: codeFontFamilyForEditor(font.family),
+        fontWeight: String(font.weight),
       });
     });
   }, []);
@@ -431,7 +487,7 @@ function MonacoCodeEditorInner({
       {canEdit &&
         isDirty &&
         (hasExternalUpdate ? (
-          <div className="flex items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground shrink-0">
+          <div className="flex items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground shrink-0">
             <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
             <span className="flex-1">
               This file was modified externally while you were editing.
@@ -452,19 +508,19 @@ function MonacoCodeEditorInner({
             </button>
           </div>
         ) : (
-          <div className="flex items-center gap-1.5 border-b border-border bg-muted/50 px-4 py-1.5 text-xs text-muted-foreground shrink-0">
+          <div className="flex items-center gap-1.5 border-b border-border bg-muted/50 px-4 py-1.5 text-sm text-muted-foreground shrink-0">
             <MessageSquareOffIcon className="size-3.5 shrink-0" />
             Save your changes to enable commenting on selections.
           </div>
         ))}
       <div className="relative min-h-0 flex-1">
         {loadError && (
-          <div className="flex items-center justify-center p-8 text-destructive text-sm">
+          <div className="flex items-center justify-center p-8 text-destructive text-ui">
             Failed to load the editor.
           </div>
         )}
         {!loadError && !ready && (
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading…
           </div>
         )}

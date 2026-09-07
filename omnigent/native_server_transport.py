@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -71,10 +71,10 @@ class NativePrompt:
     """
 
     text: str
-    attachments: tuple[Mapping[str, Any], ...] = ()
+    attachments: tuple[Mapping[str, object], ...] = ()
     system_prompt: str | None = None
     model: str | None = None
-    metadata: Mapping[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, object] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         """:returns: ``True`` when there is nothing to send."""
@@ -94,8 +94,8 @@ class NativeEvent:
 
     id: str | None
     type: str
-    payload: Mapping[str, Any]
-    raw: Mapping[str, Any]
+    payload: Mapping[str, object]
+    raw: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -139,7 +139,7 @@ class NativeServerTransport(Protocol):
         """Resume ``launch.external_session_id`` or create a new session id."""
         raise NotImplementedError
 
-    async def send_prompt(self, session_id: str, prompt: NativePrompt) -> Mapping[str, Any]:
+    async def send_prompt(self, session_id: str, prompt: NativePrompt) -> Mapping[str, object]:
         """Inject a prompt into the native session."""
         raise NotImplementedError
 
@@ -151,7 +151,7 @@ class NativeServerTransport(Protocol):
         """Stream native events for *session_id*."""
         raise NotImplementedError
 
-    async def list_history(self, session_id: str) -> list[Mapping[str, Any]]:
+    async def list_history(self, session_id: str) -> list[Mapping[str, object]]:
         """Return the native session's message history."""
         raise NotImplementedError
 

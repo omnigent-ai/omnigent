@@ -19,7 +19,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-react";
 import { useEditor, EditorContent } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
+import { StarterKit } from "@tiptap/starter-kit";
 import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
 import { ListItem, TaskItem, TaskList } from "@tiptap/extension-list";
 import { Markdown } from "@tiptap/markdown";
@@ -30,20 +30,35 @@ import { ToolbarPlugin } from "./MarkdownEditorToolbar";
 import { TableHandles } from "./TableBubbleMenu";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useMarkdownEditorSync } from "./useMarkdownEditorSync";
+import { useScrollRestore } from "./useScrollRestore";
 import { useEditorAutoSave } from "./useEditorAutoSave";
 import { MarkdownCommentPlugin } from "./MarkdownCommentPlugin";
+import { MarkdownSearchBar } from "./MarkdownSearchBar";
 import {
   createCommentDecorationExtension,
   type CommentDecorationState,
 } from "./TipTapCommentExtension";
+import {
+  createSearchDecorationExtension,
+  type SearchDecorationState,
+} from "./TipTapSearchExtension";
 import { createWorkspaceImageExtension, ImageAwareLink } from "./TipTapWorkspaceImage";
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
-import { installMarkdownSerializerPatch } from "./tiptapMarkdownPatches";
+import {
+  installMarkdownParserPatch,
+  installMarkdownSerializerPatch,
+} from "./tiptapMarkdownPatches";
 
 // Minimal-escaping serialiser override (see tiptapMarkdownPatches.ts) —
 // installed once at module load, before any editor instance is created.
 installMarkdownSerializerPatch();
+
+// Post-parse normalisation wrapping loose inline runs (a standalone image in
+// document flow, `1. ![x](y)`) in a paragraph so block+ containers never get
+// a bare inline child — the crash residual #2320 documented (see
+// tiptapMarkdownPatches.ts).
+installMarkdownParserPatch();
 
 // @tiptap/markdown parses a list item whose first child is a non-paragraph
 // block — a nested list, a fenced code block, a blockquote, a heading, or a
@@ -81,6 +96,11 @@ interface MarkdownRichTextViewerProps {
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   /** Ref to the in-progress comment body; forwarded to MarkdownCommentPlugin. */
   pendingBodyRef?: React.RefObject<string>;
+  /** True when the toolbar "Find in file" toggle wants the search bar open. */
+  searchOpen?: boolean;
+  /** Called when the search bar is closed (Escape / ✕) so the parent can reset the toggle. */
+  onSearchHandled?: () => void;
+  searchInputRef?: React.RefObject<HTMLInputElement | null>;
 }
 
 export function MarkdownRichTextViewer({
@@ -94,6 +114,9 @@ export function MarkdownRichTextViewer({
   activeSelection,
   onSetActiveSelection,
   pendingBodyRef,
+  searchOpen,
+  onSearchHandled,
+  searchInputRef,
 }: MarkdownRichTextViewerProps) {
   // A truncated buffer must never be editable, regardless of permission.
   const canEdit = useCanEdit(conversationId) && !truncated;
@@ -123,6 +146,8 @@ export function MarkdownRichTextViewer({
 
   // This ref is shared across remounts — the ProseMirror plugin reads it.
   const commentStateRef = useRef<CommentDecorationState | null>(null);
+  // Shared with the search plugin (find-in-file highlights).
+  const searchStateRef = useRef<SearchDecorationState | null>(null);
 
   return (
     <MarkdownRichTextViewerInner
@@ -148,6 +173,10 @@ export function MarkdownRichTextViewer({
       onSetActiveSelection={onSetActiveSelection}
       pendingBodyRef={pendingBodyRef}
       commentStateRef={commentStateRef}
+      searchStateRef={searchStateRef}
+      searchOpen={searchOpen ?? false}
+      onSearchHandled={onSearchHandled}
+      searchInputRef={searchInputRef}
       setContentRef={setContentRef}
     />
   );
@@ -175,6 +204,10 @@ interface InnerProps {
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   pendingBodyRef?: React.RefObject<string>;
   commentStateRef: React.RefObject<CommentDecorationState | null>;
+  searchStateRef: React.RefObject<SearchDecorationState | null>;
+  searchOpen: boolean;
+  onSearchHandled?: () => void;
+  searchInputRef?: React.RefObject<HTMLInputElement | null>;
   setContentRef: React.RefObject<((content: string) => void) | null>;
 }
 
@@ -196,6 +229,10 @@ function MarkdownRichTextViewerInner({
   onSetActiveSelection,
   pendingBodyRef,
   commentStateRef,
+  searchStateRef,
+  searchOpen,
+  onSearchHandled,
+  searchInputRef,
   setContentRef,
 }: InnerProps) {
   const [isCopied, setIsCopied] = useState(false);
@@ -207,6 +244,18 @@ function MarkdownRichTextViewerInner({
     [],
   );
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  // Persist/restore the editor's scroll position across unmount/remount and
+  // session switches. Content is present at mount (the parent gates on the
+  // file query), so the restore is ready immediately.
+  const handleScrollPersist = useScrollRestore(
+    scrollContainerRef,
+    conversationId && path ? `viewer-mdedit:${conversationId}:${path}` : null,
+    true,
+  );
+  // Fall back to a local ref when the parent doesn't pass one (the toolbar
+  // path always does; this keeps the bar usable in isolation/tests).
+  const fallbackSearchInputRef = useRef<HTMLInputElement>(null);
+  const localSearchInputRef = searchInputRef ?? fallbackSearchInputRef;
 
   const handleCopyContent = useCallback(() => {
     if (!navigator?.clipboard?.writeText) return;
@@ -303,6 +352,7 @@ function MarkdownRichTextViewerInner({
       Markdown,
       createWorkspaceImageExtension(conversationId, path),
       createCommentDecorationExtension(commentStateRef),
+      createSearchDecorationExtension(searchStateRef),
     ],
     // commentStateRef is stable and a path change remounts this component
     // (editorKey), so the closed-over conversationId/path can't go stale;
@@ -398,6 +448,13 @@ function MarkdownRichTextViewerInner({
   return (
     <div className="relative flex flex-col h-full">
       {truncated && <TruncatedBanner />}
+      <MarkdownSearchBar
+        editor={editor}
+        searchStateRef={searchStateRef}
+        open={searchOpen}
+        onClose={() => onSearchHandled?.()}
+        inputRef={localSearchInputRef}
+      />
       {canEdit && (
         <ToolbarPlugin
           editor={editor}
@@ -415,6 +472,7 @@ function MarkdownRichTextViewerInner({
       )}
       <div
         ref={scrollContainerRef}
+        onScroll={handleScrollPersist}
         className="relative flex-1 overflow-auto px-8 py-6"
         // Link following. The Link extension runs with openOnClick:false so a
         // plain click in edit mode positions the cursor instead of navigating.
@@ -435,7 +493,7 @@ function MarkdownRichTextViewerInner({
             type="button"
             title="Copy"
             onClick={handleCopyContent}
-            className="absolute top-3 right-3 z-10 flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+            className="absolute top-3 right-3 z-10 flex items-center gap-1 rounded px-2 py-1 text-sm text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
           >
             {isCopied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
             {isCopied ? "Copied!" : "Copy"}
@@ -443,14 +501,14 @@ function MarkdownRichTextViewerInner({
         )}
         <EditorContent
           editor={editor}
-          className="outline-none max-w-none text-sm text-foreground [&_*::selection]:bg-blue-300/40 [&_*::selection]:text-foreground [&::selection]:bg-blue-300/40 [&::selection]:text-foreground tiptap-md-content"
+          className="outline-none max-w-none text-ui text-foreground [&_*::selection]:bg-blue-300/40 [&_*::selection]:text-foreground [&::selection]:bg-blue-300/40 [&::selection]:text-foreground tiptap-md-content"
         />
       </div>
       {canEdit && editor && (
         <TableHandles editor={editor} scrollContainerRef={scrollContainerRef} />
       )}
       {canEdit && isDirty && hasExternalUpdate && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-2 border-t border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground backdrop-blur-sm">
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-2 border-t border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground backdrop-blur-sm">
           <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
           <span className="flex-1">This file was modified externally while you were editing.</span>
           <button
@@ -470,13 +528,13 @@ function MarkdownRichTextViewerInner({
         </div>
       )}
       {canEdit && isDirty && !hasExternalUpdate && saveDisabled && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground backdrop-blur-sm">
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground backdrop-blur-sm">
           <MessageSquareOffIcon className="size-3.5 shrink-0 text-warning" />
           Runner offline — changes save and commenting resumes once it reconnects.
         </div>
       )}
       {canEdit && isDirty && !hasExternalUpdate && !saveDisabled && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-muted/50 px-4 py-1.5 text-xs text-muted-foreground backdrop-blur-sm">
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-muted/50 px-4 py-1.5 text-sm text-muted-foreground backdrop-blur-sm">
           <MessageSquareOffIcon className="size-3.5 shrink-0" />
           {writeFile.isPending ? "Saving…" : "Unsaved changes —"} commenting is available once
           saved.

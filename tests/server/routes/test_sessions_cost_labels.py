@@ -166,13 +166,15 @@ def _seed_session(
     :returns: The new session/conversation id.
     """
     conversation_store, agent_store, permission_store = stores
-    if agent_store.get("ag_test") is None:
+    if agent_store.get("087b7cb7ac30abf4debfaa578d052ec6") is None:
         agent_store.create(
-            agent_id="ag_test",
+            agent_id="087b7cb7ac30abf4debfaa578d052ec6",
             name="test-agent",
-            bundle_location="ag_test/bundle",
+            bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
         )
-    conv = conversation_store.create_conversation(title="advised session", agent_id="ag_test")
+    conv = conversation_store.create_conversation(
+        title="advised session", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
+    )
     if owner is not None:
         permission_store.ensure_user(owner)
         permission_store.grant(owner, conv.id, LEVEL_OWNER)
@@ -399,7 +401,7 @@ def test_create_session_rejects_cost_control_label_seed(
     resp = TestClient(app).post(
         "/v1/sessions",
         json={
-            "agent_id": "ag_test",
+            "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
             "labels": {COST_CONTROL_PLAN_LABEL: _FORGED_PLAN},
         },
         # Sentinel Origin: first-party client past the require_trusted_origin guard.
@@ -447,7 +449,7 @@ def test_create_session_with_ordinary_labels_succeeds(
 
     resp = TestClient(app).post(
         "/v1/sessions",
-        json={"agent_id": "ag_test", "labels": {"team": "ml"}},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "labels": {"team": "ml"}},
         # Sentinel Origin: first-party client past the require_trusted_origin guard.
         headers={"X-Forwarded-Email": ALICE, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
     )

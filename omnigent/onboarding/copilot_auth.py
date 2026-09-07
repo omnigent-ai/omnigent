@@ -45,6 +45,11 @@ COPILOT_SECRET_NAME = "copilot"
 COPILOT_CONFIG_KEY = "copilot"
 _TOKEN_REF_FIELD = "github_token_ref"
 _TOKEN_FIELD = "github_token"
+_HOST_FIELD = "github_host"
+
+# The Copilot CLI's own GHE hostname override (``copilot help environment``). It
+# wins over ``GH_HOST``, so setting only this leaves a user's ``gh`` host alone.
+COPILOT_HOST_ENV_VAR = "COPILOT_GH_HOST"
 
 # Ambient GitHub-token env vars, in the precedence the Copilot CLI/SDK honors.
 COPILOT_TOKEN_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
@@ -54,6 +59,30 @@ COPILOT_TOKEN_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 # never lock anyone out of their own token. Classic ``ghp_`` PATs are excluded
 # because Copilot rejects them.
 _GITHUB_TOKEN_PREFIXES = ("github_pat_", "gho_", "ghu_", "ghs_")
+
+
+def gh_cli_github_token(host: str | None = None) -> str | None:
+    """Return the ``gh`` CLI's stored OAuth token, or ``None`` if unavailable.
+
+    The Copilot CLI honors a ``gh`` login only by reading ``oauth_token`` out of
+    ``~/.config/gh/hosts.yml``. On macOS (and any host with a working credential
+    helper) ``gh`` keeps the token in the OS keychain and omits it from that
+    file, so a logged-in user still looks credential-less to Copilot. Asking
+    ``gh`` itself works on every platform.
+
+    :param host: GitHub hostname to fetch the token for, e.g. ``"acme.ghe.com"``;
+        ``None`` lets ``gh`` pick its default host.
+    :returns: The token, or ``None`` when ``gh`` is absent, logged out, or fails.
+    """
+    argv = ["gh", "auth", "token"]
+    if host:
+        argv += ["--hostname", host]
+    try:
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    token = completed.stdout.strip()
+    return token if completed.returncode == 0 and token else None
 
 
 def looks_like_github_copilot_token(value: str) -> bool:
@@ -189,14 +218,73 @@ def copilot_github_token_configured(config: dict[str, object] | None = None) -> 
     return resolve_copilot_github_token(config) is not None
 
 
+def copilot_github_host(config: dict[str, object] | None = None) -> str | None:
+    """Return the configured GitHub Enterprise hostname, if any.
+
+    Reads ``copilot.github_host`` from the global config. Organizations reaching
+    Copilot through a GHE (data-residency) instance need auth and API calls
+    pointed at their own host rather than ``github.com``.
+
+    :param config: A pre-loaded config mapping; ``None`` loads the global config.
+    :returns: The hostname (e.g. ``"acme.ghe.com"``), or ``None`` when unset.
+        A scheme, if pasted, is stripped — the CLI wants a bare hostname.
+    """
+    cfg = load_config() if config is None else config
+    block = cfg.get(COPILOT_CONFIG_KEY)
+    if not isinstance(block, dict):
+        return None
+    host = block.get(_HOST_FIELD)
+    if not isinstance(host, str) or not host.strip():
+        return None
+    return host.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+
+
+def copilot_github_host_settings(host: str | None) -> dict[str, object]:
+    """Build the ``{"copilot": {...}}`` settings dict recording *host*.
+
+    Preserves the existing token reference: the saver replaces the whole
+    ``copilot:`` block, so dropping the token here would unset it.
+
+    :param host: The GHE hostname to record; ``None`` / empty clears the field.
+    :returns: The ``copilot:`` block to persist.
+    """
+    block: dict[str, object] = {}
+    ref = copilot_github_token_ref()
+    if ref is not None:
+        block[_TOKEN_REF_FIELD] = ref
+    if host and host.strip():
+        block[_HOST_FIELD] = host.strip()
+    return {COPILOT_CONFIG_KEY: block}
+
+
+def copilot_token_removal_settings() -> dict[str, object] | None:
+    """Return the ``copilot:`` block that must remain after removing the token.
+
+    Preserves ``github_host``: the saver replaces the whole block, so unsetting
+    it wholesale would silently discard a configured GHE host.
+
+    :returns: The block to persist, or ``None`` when nothing is left to keep and
+        the whole ``copilot:`` key can be unset.
+    """
+    host = copilot_github_host()
+    return {COPILOT_CONFIG_KEY: {_HOST_FIELD: host}} if host else None
+
+
 def copilot_github_token_settings(ref: str) -> dict[str, object]:
     """Build the ``{"copilot": {...}}`` settings dict that records *ref*.
 
     Handed to :func:`omnigent.cli._save_global_config` (a shallow update, so it
     replaces the whole ``copilot:`` block) to persist the reference.
 
+    Preserves any configured ``github_host`` — the saver replaces the whole
+    ``copilot:`` block, so omitting it here would silently unset the GHE host.
+
     :param ref: The secret reference to record, e.g. ``"keychain:copilot"`` or
         ``"env:GH_TOKEN"``.
-    :returns: ``{"copilot": {"github_token_ref": ref}}``.
+    :returns: ``{"copilot": {"github_token_ref": ref, ...}}``.
     """
-    return {COPILOT_CONFIG_KEY: {_TOKEN_REF_FIELD: ref}}
+    block: dict[str, object] = {_TOKEN_REF_FIELD: ref}
+    host = copilot_github_host()
+    if host is not None:
+        block[_HOST_FIELD] = host
+    return {COPILOT_CONFIG_KEY: block}

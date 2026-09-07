@@ -99,6 +99,22 @@ function freshAuthHeaders(fallback) {
   return fallback || {};
 }
 
+// Return the relay URL and token from config.json when available. The runner
+// writes relayUrl + relayToken into config.json after the tool relay starts,
+// so policy POSTs can use the relay's non-expiring local token instead of a
+// baked server bearer.
+function relayCredentials() {
+  const cfg = readConfig();
+  if (
+    cfg &&
+    typeof cfg.relayUrl === "string" &&
+    typeof cfg.relayToken === "string"
+  ) {
+    return { url: cfg.relayUrl, token: cfg.relayToken };
+  }
+  return null;
+}
+
 /**
  * Evaluate a TOOL_CALL policy for a native Pi tool via the Omnigent server's
  * session-level HTTP endpoint (POST /v1/sessions/{sessionId}/policies/evaluate).
@@ -153,7 +169,11 @@ async function evalNativePolicyHttp(config, toolName, args) {
     typeof fetch !== "function"
   )
     return null;
-  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
+  // Prefer relay (non-expiring local token); fall back to direct server call.
+  const relay = relayCredentials();
+  const url = relay
+    ? `${relay.url}/policies/evaluate`
+    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
   // Mint one stable re-attach id for this tool call. Every (re)POST carries
   // it so a re-park lands on the SAME elicitation — no duplicate approval
   // card. Kept for the whole call, across both the park loop and any
@@ -168,10 +188,15 @@ async function evalNativePolicyHttp(config, toolName, args) {
     },
     _omnigent_elicitation_id: elicitationId,
   });
-  const reqHeaders = {
-    "content-type": "application/json",
-    ...freshAuthHeaders(config.authHeaders),
-  };
+  const reqHeaders = relay
+    ? {
+        "content-type": "application/json",
+        authorization: `Bearer ${relay.token}`,
+      }
+    : {
+        "content-type": "application/json",
+        ...freshAuthHeaders(config.authHeaders),
+      };
 
   const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
   // Independent transient-error budget so a server that is actually down
@@ -332,7 +357,11 @@ function piResultFromMcpResponse(json) {
   // masquerading as a successful tool result. callOmnigentTool detects and
   // resolves the ASK round-trip BEFORE calling this; treat a stray one as a
   // fail-closed error so an unresolved approval never reports success.
-  if (result && typeof result === "object" && result.resultType === "input_required") {
+  if (
+    result &&
+    typeof result === "object" &&
+    result.resultType === "input_required"
+  ) {
     return {
       content: [
         {
@@ -346,7 +375,11 @@ function piResultFromMcpResponse(json) {
   if (result && Array.isArray(result.content)) {
     const parts = [];
     for (const block of result.content) {
-      if (block && typeof block === "object" && typeof block.text === "string") {
+      if (
+        block &&
+        typeof block === "object" &&
+        typeof block.text === "string"
+      ) {
         parts.push(block.text);
       }
     }
@@ -375,7 +408,11 @@ function piResultFromMcpResponse(json) {
  */
 function mcpInputRequired(json) {
   const result = json && typeof json === "object" ? json.result : undefined;
-  if (!result || typeof result !== "object" || result.resultType !== "input_required") {
+  if (
+    !result ||
+    typeof result !== "object" ||
+    result.resultType !== "input_required"
+  ) {
     return null;
   }
   const inputRequests =
@@ -565,6 +602,10 @@ function textFromContent(content) {
   const parts = [];
   for (const block of content) {
     if (!block || typeof block !== "object") continue;
+    // OpenAI o-series / gpt-oss models return content as an array with typed
+    // blocks: {type:"text",text:"..."} and {type:"reasoning",summary:[...]}.
+    // Only collect text blocks; skip reasoning/summary blocks.
+    if (block.type === "reasoning") continue;
     const text =
       block.text || block.input_text || block.output_text || block.content;
     if (typeof text === "string") parts.push(text);
@@ -820,7 +861,184 @@ async function triggerCompaction(config, ctx, customInstructions) {
   }
 }
 
-function startInboxPoller(pi, config, handleInterrupt, handleCompact) {
+/**
+ * Apply a web-picked model switch to the resident Pi process.
+ *
+ * Pi owns the active model inside this TUI process, so a model picked in the
+ * Omnigent web UI must be applied here (the ``--model`` launch arg is baked in
+ * at spawn). Resolves *modelId* against the session's ``modelRegistry`` (the
+ * same catalog Pi's own ``/model`` picker uses, sourced from the generated
+ * models.json) and calls Pi's ``setModel`` — immediate, no ``/reload``.
+ *
+ * Outcomes (mirrors triggerCompaction's visible-error contract so a web pick
+ * never silently vanishes — the runner already returned 204, so there is no
+ * server-side fallback):
+ *   - No resident context / registry: post an error item, return false.
+ *   - Model id not in the registry: post an error item, return false.
+ *   - setModel returned false (no API key for the model): post an error item,
+ *     return false.
+ *   - Applied: return true. The paired ``model_select`` handler mirrors the
+ *     resulting model back to Omnigent, so the web pill reflects the switch.
+ */
+async function applyModelChange(pi, config, ctx, modelId) {
+  const id = typeof modelId === "string" ? modelId.trim() : "";
+  if (!id) return false;
+  const registry = ctx ? ctx.modelRegistry : undefined;
+  // Resolve against whichever listing method exists. Accept EITHER getAll or
+  // getAvailable so the resolve path can never be narrower than the picker's:
+  // postModelOptions lists from getAvailable(), so gating apply on getAll alone
+  // would fail every switch on a hypothetical Pi build exposing only
+  // getAvailable. getAll (the full catalog) is a superset of getAvailable, so
+  // prefer it to resolve; fall back to getAvailable when getAll is absent.
+  const listModels =
+    registry && typeof registry.getAll === "function"
+      ? () => registry.getAll()
+      : registry && typeof registry.getAvailable === "function"
+        ? () => registry.getAvailable()
+        : null;
+  if (!pi || typeof pi.setModel !== "function" || !listModels) {
+    await postModelChangeError(
+      config,
+      `Omnigent: could not switch to model "${id}" — this Pi session exposes ` +
+        "no model-switch API (the model or Pi version may not support it).",
+    );
+    return false;
+  }
+  let model;
+  try {
+    const models = listModels();
+    const separator = id.indexOf("/");
+    if (separator > 0) {
+      const provider = id.slice(0, separator);
+      const bareId = id.slice(separator + 1);
+      model = models.find(
+        (candidate) =>
+          candidate && candidate.id === bareId && candidate.provider === provider,
+      );
+      if (!model) model = models.find((candidate) => candidate && candidate.id === id);
+      if (!model && registry && typeof registry.find === "function") {
+        model = registry.find(provider, bareId);
+      }
+      if (!model) {
+        model = models.find(
+          (candidate) => candidate && candidate.id === bareId && !candidate.provider,
+        );
+      }
+    } else {
+      model = models.find((candidate) => candidate && candidate.id === id);
+    }
+  } catch (_err) {
+    model = undefined;
+  }
+  if (!model) {
+    await postModelChangeError(
+      config,
+      `Omnigent: model "${id}" is not available in this Pi session.`,
+    );
+    return false;
+  }
+  try {
+    const applied = await pi.setModel(model);
+    if (applied === false) {
+      await postModelChangeError(
+        config,
+        `Omnigent: could not switch to model "${id}" — no API key is ` +
+          "configured for it.",
+      );
+      return false;
+    }
+    return true;
+  } catch (_err) {
+    await postModelChangeError(
+      config,
+      `Omnigent: switching to model "${id}" failed inside Pi.`,
+    );
+    return false;
+  }
+}
+
+async function postModelChangeError(config, message) {
+  await postEvent(config, {
+    type: "external_conversation_item",
+    data: {
+      response_id: `pi-model-change-error-${Date.now()}`,
+      item_type: "error",
+      item_data: {
+        source: "execution",
+        code: "pi_model_change_failed",
+        message,
+      },
+    },
+  });
+}
+
+function modelReference(model) {
+  const modelId = model && typeof model.id === "string" ? model.id : "";
+  if (!modelId) return "";
+  const provider = model && typeof model.provider === "string" ? model.provider : "";
+  return provider ? `${provider}/${modelId}` : modelId;
+}
+
+/**
+ * Report Pi's live model catalog to Omnigent for the Web UI model picker.
+ *
+ * Sourced from Pi's model registry — the models Pi actually loaded for THIS
+ * session, whatever their origin: an Omnigent-configured provider's generated
+ * models.json, or Pi's own ``/login`` / ``~/.pi`` config. Posting the live
+ * registry (rather than the server reading a launch-written file) means the
+ * picker populates in every auth path, including ``/login`` where no Omnigent
+ * models.json exists.
+ *
+ * Prefers ``getAvailable()`` — only models with configured auth — over
+ * ``getAll()`` (Pi's entire built-in catalog spanning every vendor, most with
+ * no credentials). This scopes the picker to models the user can actually
+ * switch to, and naturally to whichever provider(s) they are logged into.
+ * Falls back to ``getAll()`` only when ``getAvailable()`` is unavailable
+ * (older Pi). Best-effort and fire-and-forget: an empty or unavailable
+ * registry posts nothing, leaving the picker hidden.
+ */
+async function postModelOptions(config, ctx) {
+  const registry = ctx ? ctx.modelRegistry : undefined;
+  if (!registry) return;
+  let models;
+  try {
+    if (typeof registry.getAvailable === "function") {
+      models = registry.getAvailable();
+    } else if (typeof registry.getAll === "function") {
+      models = registry.getAll();
+    } else {
+      return;
+    }
+  } catch (_err) {
+    return;
+  }
+  if (!Array.isArray(models) || models.length === 0) return;
+  const options = [];
+  const seen = new Set();
+  for (const model of models) {
+    const modelId = model && typeof model.id === "string" ? model.id : "";
+    const id = modelReference(model);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const name =
+      model && typeof model.name === "string" && model.name ? model.name : modelId;
+    options.push({ id, model: id, displayName: name });
+  }
+  if (options.length === 0) return;
+  await postEvent(config, {
+    type: "external_model_options",
+    data: { models: options },
+  });
+}
+
+function startInboxPoller(
+  pi,
+  config,
+  handleInterrupt,
+  handleCompact,
+  handleModelChange,
+  handleThinkingLevelChange,
+) {
   if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
   // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
   // long-lived TUI mustn't grow it unboundedly.
@@ -938,6 +1156,27 @@ function startInboxPoller(pi, config, handleInterrupt, handleCompact) {
           );
         }
       }
+      if (payload.type === "model_change") {
+        // Point-in-time like compact/interrupt: one delivery attempt against
+        // the resident context, then always consume the file (below).
+        // handleModelChange owns its visible-error item and posts nothing on
+        // success — the paired model_select handler mirrors the applied model
+        // back — so the returned promise is intentionally discarded.
+        handleModelChange(
+          typeof payload.model === "string" ? payload.model : undefined,
+        );
+      }
+      if (payload.type === "thinking_level_change") {
+        // Point-in-time: one delivery attempt, then always consume the file.
+        // Pi's setThinkingLevel is async but fire-and-forget here — success is
+        // visible in Pi's TUI menu and the returned promise is discarded.
+        if (
+          typeof handleThinkingLevelChange === "function" &&
+          typeof payload.thinkingLevel === "string"
+        ) {
+          handleThinkingLevelChange(payload.thinkingLevel);
+        }
+      }
       if (id !== null) rememberSeen(id);
       try {
         fs.unlinkSync(fullPath);
@@ -951,6 +1190,14 @@ module.exports = function (pi) {
   let sequence = 0;
   let turnOrdinal = 0;
   let activeResponseId = null;
+  // Response id shared across a turn's ``running`` → ``idle`` status pair.
+  // The web store only clears its local "streaming" flag when an ``idle``
+  // edge's response_id matches the ``running`` edge that opened the turn; a
+  // fresh id per edge would leave the composer stuck in "queued" until a tab
+  // switch resets the store. Minted on agent_start, reused on agent_end.
+  // Must be separate from activeResponseId — turn_start overwrites that with a
+  // turn-level id between agent_start and agent_end.
+  let turnStatusResponseId = null;
   // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
   // as the no-isIdle() fallback for requestInterrupt instead of
   // !activeResponseId: agent_start resets activeResponseId to null and only
@@ -963,6 +1210,7 @@ module.exports = function (pi) {
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
   const postedReasoning = new Set();
+  const streamedReasoningBlocks = new Set();
   const toolCallsById = new Map();
   const pendingInterruptMs = 30_000;
   // Live streaming state for assistant text deltas. Pi emits
@@ -1035,6 +1283,157 @@ module.exports = function (pi) {
     }
   }
 
+  let taskList = [];
+
+  function normalizeTaskList(value) {
+    if (!Array.isArray(value)) return null;
+    const statuses = new Set(["not-started", "in-progress", "completed"]);
+    const normalized = [];
+    for (const task of value) {
+      if (
+        !task ||
+        typeof task !== "object" ||
+        !Number.isInteger(task.id) ||
+        typeof task.title !== "string" ||
+        typeof task.description !== "string" ||
+        !statuses.has(task.status)
+      ) {
+        return null;
+      }
+      normalized.push({
+        id: task.id,
+        title: task.title,
+        description: task.description,
+        status: task.status,
+      });
+    }
+    return normalized;
+  }
+
+  async function publishTaskList() {
+    const status = {
+      "not-started": "pending",
+      "in-progress": "in_progress",
+      completed: "completed",
+    };
+    await postEvent(config, {
+      type: "external_session_todos",
+      data: {
+        todos: taskList.map((task) => ({
+          content: task.title,
+          status: status[task.status],
+          activeForm: task.description || task.title,
+        })),
+      },
+    });
+  }
+
+  function restoreTaskList(ctx) {
+    taskList = [];
+    const entries =
+      ctx &&
+      ctx.sessionManager &&
+      typeof ctx.sessionManager.getBranch === "function"
+        ? ctx.sessionManager.getBranch()
+        : [];
+    for (const entry of entries) {
+      const message = entry && entry.type === "message" ? entry.message : null;
+      if (
+        !message ||
+        message.role !== "toolResult" ||
+        message.toolName !== "manage_todo_list"
+      ) {
+        continue;
+      }
+      const restored = normalizeTaskList(
+        message.details && message.details.todos,
+      );
+      if (restored) taskList = restored;
+    }
+  }
+
+  function registerTaskToolIfMissing() {
+    if (typeof pi.registerTool !== "function") return;
+    const existing =
+      typeof pi.getAllTools === "function"
+        ? pi.getAllTools().some((tool) => tool.name === "manage_todo_list")
+        : false;
+    if (existing) return;
+    pi.registerTool({
+      name: "manage_todo_list",
+      label: "Task Plan",
+      description:
+        "Read or replace the task plan shown in the Omnigent Tasks panel.",
+      promptSnippet: "Read or replace the current task plan",
+      promptGuidelines: [
+        "For every multi-step task, you must call manage_todo_list before using other tools to create a plan, then update it after each step until all tasks are completed.",
+      ],
+      parameters: {
+        type: "object",
+        properties: {
+          operation: { type: "string", enum: ["read", "write"] },
+          todoList: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "integer" },
+                title: { type: "string" },
+                description: { type: "string" },
+                status: {
+                  type: "string",
+                  enum: ["not-started", "in-progress", "completed"],
+                },
+              },
+              required: ["id", "title", "description", "status"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["operation"],
+        additionalProperties: false,
+      },
+      async execute(_toolCallId, params) {
+        if (params && params.operation === "read") {
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(taskList, null, 2) },
+            ],
+            details: { operation: "read", todos: taskList },
+          };
+        }
+        if (!params || params.operation !== "write") {
+          throw new Error("operation must be read or write");
+        }
+        const next = normalizeTaskList(params.todoList);
+        if (!next) throw new Error("todoList must contain valid task items");
+        taskList = next;
+        await publishTaskList();
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Task plan updated (${taskList.length} task${taskList.length === 1 ? "" : "s"}).`,
+            },
+          ],
+          details: { operation: "write", todos: taskList },
+        };
+      },
+    });
+  }
+
+  async function syncTaskListFromResult(event) {
+    if (!event || event.toolName !== "manage_todo_list" || event.isError)
+      return;
+    const result =
+      event.result && typeof event.result === "object" ? event.result : event;
+    const next = normalizeTaskList(result.details && result.details.todos);
+    if (!next) return;
+    const changed = JSON.stringify(next) !== JSON.stringify(taskList);
+    taskList = next;
+    if (changed) await publishTaskList();
+  }
+
   // Cumulative session token usage. Pi reports PER-MESSAGE counts (one
   // assistant message per LLM call); session billing is their SUM — each call
   // is billed for the full context it re-sent, so summing per-message inputs is
@@ -1068,7 +1467,8 @@ module.exports = function (pi) {
   // carries no identity field at all.
   function usageMessageKey(message, usage) {
     if (message && typeof message === "object") {
-      if (typeof message.id === "string" && message.id) return `id:${message.id}`;
+      if (typeof message.id === "string" && message.id)
+        return `id:${message.id}`;
       if (typeof message.responseId === "string" && message.responseId)
         return `rid:${message.responseId}`;
       if (typeof message.timestamp === "number")
@@ -1225,13 +1625,19 @@ module.exports = function (pi) {
     });
   }
 
-  async function postReasoningText(text, responseId, keyHint) {
+  async function postCompletedReasoning(text, responseId, keyHint, streamed) {
     if (typeof text !== "string" || !text.trim()) return;
     const textKey = `${responseId}:text:${fingerprint(text)}`;
     const key = `${responseId}:${keyHint || fingerprint(text)}`;
     if (postedReasoning.has(key) || postedReasoning.has(textKey)) return;
     postedReasoning.add(key);
     postedReasoning.add(textKey);
+    if (!streamed) {
+      await postEvent(config, {
+        type: "external_output_reasoning_delta",
+        data: { delta: text, started: true },
+      });
+    }
     await postEvent(config, {
       type: "external_conversation_item",
       data: {
@@ -1243,6 +1649,21 @@ module.exports = function (pi) {
           content: [{ type: "reasoning_text", text }],
         },
       },
+    });
+  }
+
+  function reasoningBlockKey(responseId, contentIndex) {
+    return `${responseId}:msg:${streamingMessageOrdinal}:thinking:${contentIndex}`;
+  }
+
+  async function postReasoningDelta(update, responseId) {
+    if (typeof update.delta !== "string" || !update.delta) return;
+    const blockKey = reasoningBlockKey(responseId, update.contentIndex);
+    const started = !streamedReasoningBlocks.has(blockKey);
+    streamedReasoningBlocks.add(blockKey);
+    await postEvent(config, {
+      type: "external_output_reasoning_delta",
+      data: { delta: update.delta, started },
     });
   }
 
@@ -1312,7 +1733,13 @@ module.exports = function (pi) {
       if (block.type === "thinking") {
         const text = typeof block.thinking === "string" ? block.thinking : "";
         const key = block.thinkingSignature || `${turnOrdinal}:${index}`;
-        await postReasoningText(text, responseId, key);
+        const blockKey = reasoningBlockKey(responseId, index);
+        await postCompletedReasoning(
+          text,
+          responseId,
+          key,
+          streamedReasoningBlocks.has(blockKey),
+        );
       }
     }
   }
@@ -1329,6 +1756,9 @@ module.exports = function (pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
+    registerTaskToolIfMissing();
+    restoreTaskList(ctx);
+    if (taskList.length) await publishTaskList();
     setOmnigentStatus(config, ctx, "linked");
     startInboxPoller(
       pi,
@@ -1336,15 +1766,58 @@ module.exports = function (pi) {
       () => requestInterrupt(latestContext),
       (customInstructions) =>
         triggerCompaction(config, latestContext, customInstructions),
+      (model) => applyModelChange(pi, config, latestContext, model),
+      (level) => pi.setThinkingLevel(level),
     );
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId
         ? ctx.sessionManager.getSessionId()
         : undefined;
     await patchExternalSessionId(config, nativeSessionId);
+    // Publish Pi's live model catalog so the Web UI picker populates from what
+    // Pi actually loaded, independent of how it authenticated.
+    await postModelOptions(config, ctx);
+    // Report the model Pi launched with so the composer pill and the picker's
+    // active row reflect the current model from the start. Without this, a
+    // ``/login`` session (no Omnigent ``model_override``, no ``llm_model``)
+    // shows no active model until the user switches. Mirrors the
+    // ``model_select`` handler, but for the startup value ``ctx.model``.
+    const startupModel = modelReference(ctx ? ctx.model : undefined);
+    if (startupModel) {
+      await postEvent(config, {
+        type: "external_model_change",
+        data: { model: startupModel },
+      });
+    }
     await postEvent(config, {
       type: "external_session_status",
       data: { status: "idle", response_id: `pi-${Date.now()}-${++sequence}` },
+    });
+  });
+
+  pi.on("session_tree", async (_event, ctx) => {
+    restoreTaskList(ctx);
+    await publishTaskList();
+  });
+
+  pi.on("model_select", async (event, ctx) => {
+    rememberContext(ctx);
+    // Mirror a model switch made inside the Pi TUI (the ``/model`` command or
+    // Ctrl+P cycling) back to Omnigent so the web picker reflects it. Skip
+    // ``restore`` — that is Pi re-applying the session's saved model at
+    // startup, not a user switch, and posting it could clobber a pending
+    // web-side override. The server dedups against ``model_override``, so a
+    // web-initiated switch (which already persisted the value before queuing
+    // the inbox ``model_change``) round-trips here as a no-op.
+    const source =
+      event && typeof event.source === "string" ? event.source : "";
+    if (source === "restore") return;
+    const model = event && event.model ? event.model : undefined;
+    const selectedModel = modelReference(model);
+    if (!selectedModel) return;
+    await postEvent(config, {
+      type: "external_model_change",
+      data: { model: selectedModel },
     });
   });
 
@@ -1363,15 +1836,21 @@ module.exports = function (pi) {
     postedToolCalls.clear();
     postedToolResults.clear();
     postedReasoning.clear();
+    streamedReasoningBlocks.clear();
     toolCallsById.clear();
     streamedTextIndex.clear();
     finalizedTextBlocks.clear();
     streamingMessageOrdinal = 0;
+    // Pin the response_id for this agent loop. agent_end MUST emit the same id
+    // so the web client can match the idle edge to the running edge and clear
+    // the "streaming" status — which unblocks queued follow-up messages.
+    // Use a dedicated variable: activeResponseId is overwritten by turn_start.
+    turnStatusResponseId = `pi-${Date.now()}-${++sequence}`;
     await postEvent(config, {
       type: "external_session_status",
       data: {
         status: "running",
-        response_id: `pi-${Date.now()}-${++sequence}`,
+        response_id: turnStatusResponseId,
       },
     });
   });
@@ -1394,9 +1873,14 @@ module.exports = function (pi) {
       if (accumulateUsage(message)) changed = true;
     }
     if (changed) await postSessionUsage();
+    // Reuse the agent_start response_id so the web client matches the idle
+    // edge and clears the "streaming" status, unblocking queued follow-ups.
+    const endResponseId =
+      turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
+    turnStatusResponseId = null;
     await postEvent(config, {
       type: "external_session_status",
-      data: { status: "idle", response_id: `pi-${Date.now()}-${++sequence}` },
+      data: { status: "idle", response_id: endResponseId },
     });
   });
 
@@ -1421,13 +1905,23 @@ module.exports = function (pi) {
       await postTextDelta(update, responseId);
       return;
     }
+    if (update.type === "thinking_delta") {
+      await postReasoningDelta(update, responseId);
+      return;
+    }
     if (update.type === "toolcall_end") {
       await postToolCall(update.toolCall, responseId);
       return;
     }
     if (update.type === "thinking_end") {
       const key = `${turnOrdinal}:${update.contentIndex}`;
-      await postReasoningText(update.content, responseId, key);
+      const blockKey = reasoningBlockKey(responseId, update.contentIndex);
+      await postCompletedReasoning(
+        update.content,
+        responseId,
+        key,
+        streamedReasoningBlocks.has(blockKey),
+      );
     }
   });
 
@@ -1480,6 +1974,7 @@ module.exports = function (pi) {
   pi.on("tool_result", async (event, ctx) => {
     rememberContext(ctx);
     replayPendingInterrupt(ctx);
+    await syncTaskListFromResult(event);
     await postToolResult(event, currentResponseId());
   });
 
@@ -1522,12 +2017,38 @@ module.exports = function (pi) {
     // posted and this finalize agree on the id regardless of whether Pi
     // fires message_start.
     await finalizeStreamingMessage(responseId);
-    streamingMessageOrdinal += 1;
     await mirrorAssistantMessage(message, responseId);
+    streamingMessageOrdinal += 1;
     // ``message_end`` is the primary usage-capture site (one completed
     // assistant message per LLM call); fold its token counts into the
     // cumulative session totals and flush to the server for pricing.
     if (accumulateUsage(message)) await postSessionUsage();
+    // Surface Pi-reported errors (e.g. 404 for unknown model ids, 400 for
+    // unsupported API types) as visible error items in the web UI so users
+    // aren't left staring at an empty turn.
+    const stopReason =
+      message && typeof message.stopReason === "string"
+        ? message.stopReason
+        : "";
+    const errorMessage =
+      message && typeof message.errorMessage === "string"
+        ? message.errorMessage
+        : "";
+    if (stopReason === "error" && errorMessage) {
+      await postEvent(config, {
+        type: "external_conversation_item",
+        data: {
+          response_id: responseId,
+          item_type: "error",
+          item_data: {
+            source: "execution",
+            code: "RuntimeError",
+            message: `Pi model error: ${errorMessage}`,
+          },
+        },
+      });
+      return;
+    }
     const text = textFromMessage(message);
     if (!text) return;
     // The authoritative assistant item. The web UI retires + replaces the

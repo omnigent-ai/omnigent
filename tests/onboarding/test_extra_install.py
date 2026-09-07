@@ -96,11 +96,39 @@ def test_extra_install_command_uv_tool_git_source(monkeypatch: pytest.MonkeyPatc
 
 
 def test_extra_install_command_uv_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With uv on PATH (non-tool), produces ``uv pip install``."""
+    """With uv on PATH (non-tool), produces ``uv pip install`` for this interpreter."""
     monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
     monkeypatch.setattr(extra_install.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(extra_install.sys, "executable", "/opt/venv/bin/python")
     cmd = extra_install_command("antigravity")
-    assert cmd == ["uv", "pip", "install", "omnigent[antigravity]"]
+    assert cmd == [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        "/opt/venv/bin/python",
+        "omnigent[antigravity]",
+    ]
+
+
+def test_extra_install_command_uv_on_path_targets_running_interpreter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``uv pip install`` is pinned to the running interpreter, not the active venv.
+
+    Regression test: a Homebrew/pipx/system install with ``uv`` merely on PATH
+    has no active virtualenv for ``uv pip install`` to discover, so the bare
+    form fails with "No virtual environment found" and the extra never lands.
+    ``--python sys.executable`` also keeps the install off an unrelated
+    virtualenv that happens to be active in the user's shell.
+    """
+    brew_python = "/opt/homebrew/Cellar/omnigent/0.8.2/libexec/bin/python"
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
+    monkeypatch.setattr(extra_install.shutil, "which", lambda name: "/opt/homebrew/bin/uv")
+    monkeypatch.setattr(extra_install.sys, "executable", brew_python)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    cmd = extra_install_command("copilot")
+    assert cmd == ["uv", "pip", "install", "--python", brew_python, "omnigent[copilot]"]
 
 
 def test_extra_install_command_pip_fallback(monkeypatch: pytest.MonkeyPatch) -> None:

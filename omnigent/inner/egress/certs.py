@@ -17,7 +17,7 @@ from pathlib import Path
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
 from cryptography.x509.oid import NameOID
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,20 @@ class HostCertCache:
 
     def __init__(self, ca_cert_path: Path, ca_key_path: Path) -> None:
         self._ca_cert = x509.load_pem_x509_certificate(ca_cert_path.read_bytes())
-        self._ca_key = serialization.load_pem_private_key(ca_key_path.read_bytes(), password=None)
+        ca_public_key = self._ca_cert.public_key()
+        if not isinstance(
+            ca_public_key,
+            rsa.RSAPublicKey | dsa.DSAPublicKey | ec.EllipticCurvePublicKey,
+        ):
+            raise ValueError("CA certificate must use an RSA, DSA, or EC public key")
+        ca_key = serialization.load_pem_private_key(ca_key_path.read_bytes(), password=None)
+        if not isinstance(
+            ca_key,
+            rsa.RSAPrivateKey | dsa.DSAPrivateKey | ec.EllipticCurvePrivateKey,
+        ):
+            raise ValueError("CA private key must use an RSA, DSA, or EC signing key")
+        self._ca_public_key = ca_public_key
+        self._ca_key = ca_key
         self._get_or_create = functools.lru_cache(maxsize=_CACHE_MAX_SIZE)(self._generate)
 
     def get_ssl_context(self, hostname: str) -> ssl.SSLContext:
@@ -83,7 +96,7 @@ class HostCertCache:
                 critical=False,
             )
             .add_extension(
-                x509.AuthorityKeyIdentifier.from_issuer_public_key(self._ca_cert.public_key()),
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(self._ca_public_key),
                 critical=False,
             )
         )

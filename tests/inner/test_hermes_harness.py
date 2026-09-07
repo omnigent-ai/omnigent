@@ -61,6 +61,7 @@ def test_executor_factory_reads_env_vars(
     monkeypatch.setenv("HARNESS_HERMES_MODEL", "test-model-id")
     monkeypatch.setenv("HARNESS_HERMES_CWD", "/tmp/test-cwd")
     monkeypatch.setenv("HARNESS_HERMES_PATH", "/custom/path/hermes")
+    monkeypatch.delenv("OMNIGENT_HERMES_PATH", raising=False)
 
     executor = hermes_harness._build_hermes_executor()
 
@@ -76,6 +77,7 @@ def test_executor_factory_defaults_when_env_unset(
     monkeypatch.delenv("HARNESS_HERMES_MODEL", raising=False)
     monkeypatch.delenv("HARNESS_HERMES_CWD", raising=False)
     monkeypatch.delenv("HARNESS_HERMES_PATH", raising=False)
+    monkeypatch.delenv("OMNIGENT_HERMES_PATH", raising=False)
 
     executor = hermes_harness._build_hermes_executor()
 

@@ -123,14 +123,21 @@ def looks_like_test_db(db_uri: str) -> bool:
         return True
 
     path = _sqlite_path(db_uri)
-    # Only treat a ``test`` token as proof for file-backed SQLite paths.
-    # Non-SQLite authorities such as ``postgresql://prod-test-cluster/app``
-    # may contain ``test`` in a real host name and must not be silently
-    # accepted as throwaway DBs.
-    if path is not None and _sqlite_path_has_test_token(path):
-        return True
-    if path is not None and _under_temp_dir(path):
-        return True
+    if path is not None:
+        # Resolve symlinks before trusting the path. A file in a world-writable
+        # dir like /tmp may be a symlink an attacker (or a stale fixture)
+        # planted to point a "throwaway" test DB at a real database; classify
+        # the resolved target, not the link, so we never green-light mutating a
+        # production DB reached through ``sqlite:////tmp/test.db``.
+        resolved = _resolve(path)
+        # Only treat a ``test`` token as proof for file-backed SQLite paths.
+        # Non-SQLite authorities such as ``postgresql://prod-test-cluster/app``
+        # may contain ``test`` in a real host name and must not be silently
+        # accepted as throwaway DBs.
+        if _sqlite_path_has_test_token(resolved):
+            return True
+        if _under_temp_dir(resolved):
+            return True
 
     return False
 

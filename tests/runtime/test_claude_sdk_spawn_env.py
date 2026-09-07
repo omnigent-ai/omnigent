@@ -38,6 +38,10 @@ def _isolate_global_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     :param tmp_path: Temporary directory for the isolated config.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_catalog_default_model",
+        lambda provider_name, family, *, context: f"catalog-{provider_name}-{family}-default",
+    )
 
 
 def _make_spec(
@@ -85,6 +89,30 @@ def test_databricks_auth_sets_databricks_env_vars() -> None:
 
     assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
     assert env["HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE"] == "my-profile"
+
+
+def test_anthropic_prefixed_model_is_stripped_for_the_claude_cli() -> None:
+    """
+    ``executor.model: anthropic/<name>`` hands the claude CLI the bare
+    ``<name>`` — the CLI rejects vendor-prefixed model ids.
+
+    Failure means a spec pinning the provider-routed spelling gets its
+    prefixed id forwarded verbatim to the Anthropic Messages endpoint,
+    where the claude CLI errors with "There's an issue with the selected
+    model".
+    """
+    spec = _make_spec(model="anthropic/claude-sonnet-4-6")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+
+
+def test_bare_model_is_passed_through_unchanged() -> None:
+    """A bare (unprefixed) model id reaches the claude CLI as written."""
+    spec = _make_spec(model="claude-sonnet-4-6")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
 
 
 def test_api_key_auth_sets_helper_env_var() -> None:
@@ -225,7 +253,7 @@ def test_ucode_state_without_model_falls_back_to_databricks_default(
 
     assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
     # The verified routable gateway endpoint name, not the CLI's own default.
-    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-opus-4-8"
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "catalog-databricks-claude-default"
 
 
 def test_ucode_state_with_model_is_not_overridden_by_default(

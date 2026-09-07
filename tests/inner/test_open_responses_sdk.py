@@ -183,6 +183,42 @@ class TestConvertMessages(unittest.TestCase):
         self.assertEqual(result[0]["name"], "calc")
         self.assertEqual(result[1]["type"], "function_call_output")
 
+    def test_tool_result_redacts_inline_base64_data_uri(self):
+        payload = "QUJD" * 100
+        msgs = [
+            {"role": "tool_call", "content": {"tool": "screenshot", "args": {}}},
+            {
+                "role": "tool_result",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{payload}",
+                    }
+                ],
+            },
+        ]
+
+        result = _convert_messages_to_responses(msgs)
+        output = result[1]["output"]
+
+        self.assertIn("[image/attachment: image/png, 400 base64 chars]", output)
+        self.assertNotIn(payload, output)
+
+    def test_orphan_tool_result_and_unknown_role_redact_inline_base64(self):
+        payload = "QUJD" * 100
+        content = {"preview": f"prefix data:image/jpeg;base64,{payload} suffix"}
+
+        result = _convert_messages_to_responses(
+            [
+                {"role": "tool_result", "content": content},
+                {"role": "unknown", "content": content},
+            ]
+        )
+
+        for item in result:
+            self.assertIn("[image/attachment: image/jpeg, 400 base64 chars]", item["content"])
+            self.assertNotIn(payload, item["content"])
+
     def test_invalid_tool_name_is_normalized_in_history_replay(self):
         msgs = [
             {
@@ -315,6 +351,31 @@ class TestNormalizeResponseOutput(unittest.TestCase):
 
 
 class TestOpenResponsesExecutor(unittest.TestCase):
+    def test_delta_tool_result_redacts_inline_base64_data_uri(self):
+        payload = "QUJD" * 100
+        executor = OpenResponsesExecutor(client=FakeClient(FakeResponse()))
+        state = executor._get_or_create_session_state("session_1")
+        state.previous_response_id = "resp_1"
+        state.pending_function_calls.append(
+            {"call_id": "call_1", "name": "screenshot", "arguments": "{}"}
+        )
+
+        result = executor._build_delta_input(
+            state,
+            [
+                {
+                    "role": "tool_result",
+                    "content": {
+                        "image_url": f"data:image/png;base64,{payload}",
+                    },
+                }
+            ],
+        )
+        output = result[0]["output"]
+
+        self.assertIn("[image/attachment: image/png, 400 base64 chars]", output)
+        self.assertNotIn(payload, output)
+
     def test_simple_text_response(self):
         async def _t():
             @dataclass

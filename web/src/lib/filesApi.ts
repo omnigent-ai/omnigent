@@ -1,4 +1,5 @@
 import { authenticatedFetch } from "./identity";
+import { apiErrorFromResponse } from "./sessionsApi";
 
 export interface UploadedFile {
   id: string;
@@ -20,7 +21,10 @@ export async function uploadFile(sessionId: string, file: File): Promise<Uploade
       body: form,
     },
   );
-  if (!res.ok) throw new Error(`upload failed: ${res.status} ${res.statusText}`);
+  // Carry the server's reason ("Unsupported attachment type 'application/zip'…"
+  // for 415, the size cap for 413) rather than a bare status number, so the
+  // failure tells the user what to do about it.
+  if (!res.ok) throw await apiErrorFromResponse(res);
   const resource = (await res.json()) as {
     id: string;
     name?: string;

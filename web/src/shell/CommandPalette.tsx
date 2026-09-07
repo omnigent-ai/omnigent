@@ -19,15 +19,20 @@
 import type React from "react";
 import { useEffect, useMemo, useState } from "react";
 import {
+  CalendarClockIcon,
   InboxIcon,
   type LucideIcon,
   PanelLeftIcon,
   PanelRightIcon,
   SettingsIcon,
   SquarePenIcon,
+  XIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
   Command,
@@ -100,6 +105,7 @@ export function CommandPalette({
   onToggleRightSidebar,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
+  const isMobile = useIsMobileViewport();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
 
@@ -135,6 +141,13 @@ export function CommandPalette({
         run: () => navigate("/inbox"),
       },
       {
+        id: "go-tasks",
+        label: "Go to Automations",
+        icon: CalendarClockIcon,
+        keywords: ["scheduled", "recurring", "cron", "automation", "schedule"],
+        run: () => navigate("/tasks"),
+      },
+      {
         id: "go-settings",
         label: "Go to Settings",
         icon: SettingsIcon,
@@ -168,16 +181,16 @@ export function CommandPalette({
     );
   }, [actions, query]);
 
-  // Archived excluded (matches the sidebar default). With an empty query this
-  // shares AppShell's existing `useConversations()` cache entry, so an idle
-  // palette costs no extra fetch; a search keys its own entry.
-  const { data, isFetching } = useConversations(debouncedQuery, false);
+  // includeArchived=true shares the sidebar's cache key; archived rows are
+  // filtered out below so the palette only lists active sessions.
+  const { data, isFetching } = useConversations(debouncedQuery, true);
 
   const sessions = useMemo(() => {
     const seen = new Set<string>();
     const out: { id: string; label: string; agent: string; snippet: string | null }[] = [];
     for (const page of data?.pages ?? []) {
       for (const c of page.data) {
+        if (c.archived) continue;
         if (seen.has(c.id)) continue;
         seen.add(c.id);
         out.push({
@@ -211,21 +224,70 @@ export function CommandPalette({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         aria-describedby={undefined}
-        className="top-1/4 translate-y-0 overflow-hidden p-0 sm:max-w-2xl"
+        // Mobile: a top-anchored full-screen sheet sized to the keyboard-aware
+        // visible viewport (--omnigent-viewport-height), so the input and results
+        // sit above the soft keyboard instead of a centered card whose lower half
+        // hides behind it. Desktop keeps the centered command palette.
+        className={cn(
+          "overflow-hidden p-0",
+          isMobile
+            ? "inset-x-0 top-0 h-full max-h-full w-full max-w-full translate-x-0 translate-y-0 gap-0 rounded-none border-0 shadow-none"
+            : "top-1/4 translate-y-0 sm:max-w-2xl",
+        )}
+        style={
+          isMobile
+            ? {
+                top: 0,
+                height: "var(--omnigent-viewport-height, 100dvh)",
+                maxHeight: "var(--omnigent-viewport-height, 100dvh)",
+                // Pad both insets: safe-top clears the notch, safe-bottom keeps
+                // the last row above the home indicator when the keyboard is
+                // closed (the visible-viewport height then spans the home bar).
+                paddingTop: "var(--omnigent-safe-top, 0px)",
+                paddingBottom: "var(--omnigent-safe-bottom, 0px)",
+              }
+            : undefined
+        }
         showCloseButton={false}
       >
         <DialogTitle className="sr-only">Command palette</DialogTitle>
         {/* shouldFilter=false: the server filters sessions and we filter actions
             (see file header). vimBindings=false: keep Ctrl+K/J from doubling as
             list-nav on Win/Linux, where Ctrl+K is also the opener. */}
+        {/* Command's base class is `size-full`, so it already fills the sheet. */}
         <Command shouldFilter={false} vimBindings={false} label="Command palette">
-          <CommandInput
-            value={query}
-            onValueChange={setQuery}
-            placeholder="Search sessions or run a command"
-            data-testid="command-palette-input"
-          />
-          <CommandList>
+          {isMobile ? (
+            // Search field and an explicit close button share a top row; the
+            // full-screen sheet has no ⌘K/Esc affordance the way the desktop
+            // dialog does, so the X is how touch users dismiss it.
+            <div className="flex items-center gap-1 p-1">
+              <div className="min-w-0 flex-1">
+                <CommandInput
+                  value={query}
+                  onValueChange={setQuery}
+                  placeholder="Search sessions or run a command"
+                  data-testid="command-palette-input"
+                />
+              </div>
+              <Button
+                variant="ghost"
+                size="icon-lg"
+                className="shrink-0 rounded-full"
+                onClick={close}
+                aria-label="Close search"
+              >
+                <XIcon className="size-5 text-muted-foreground" />
+              </Button>
+            </div>
+          ) : (
+            <CommandInput
+              value={query}
+              onValueChange={setQuery}
+              placeholder="Search sessions or run a command"
+              data-testid="command-palette-input"
+            />
+          )}
+          <CommandList className={isMobile ? "max-h-none flex-1" : undefined}>
             <CommandEmpty>
               {isFetching && debouncedQuery ? "Searching…" : "No results found"}
             </CommandEmpty>
@@ -248,12 +310,12 @@ export function CommandPalette({
                       {s.snippet && (
                         // Where the match was found in the chat body — the
                         // session is often unidentifiable from the title alone.
-                        <span className="truncate text-left text-muted-foreground text-xs">
+                        <span className="truncate text-left text-muted-foreground text-sm">
                           <HighlightedText text={s.snippet} query={debouncedQuery} />
                         </span>
                       )}
                     </div>
-                    <span className="ml-2 shrink-0 text-xs text-muted-foreground">{s.agent}</span>
+                    <span className="ml-2 shrink-0 text-sm text-muted-foreground">{s.agent}</span>
                   </CommandItem>
                 ))}
               </CommandGroup>

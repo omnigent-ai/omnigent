@@ -48,7 +48,8 @@ def _make_spec(
     *,
     model: str | None = "databricks-gpt-5-4-mini",
     profile: str | None = None,
-    use_responses: bool | None = None,
+    use_responses: object | None = None,
+    reasoning_item_id_policy: object | None = None,
     auth: ApiKeyAuth | DatabricksAuth | None = None,
 ) -> AgentSpec:
     """
@@ -60,7 +61,8 @@ def _make_spec(
     :param profile: ``spec.executor.config["profile"]``; ``None``
         omits it (no profile declared in YAML).
     :param use_responses: ``spec.executor.config["use_responses"]``;
-        ``None`` omits it (executor default applies).
+        ``None`` omits it (executor default applies). The parser normally
+        supplies this as a string, while direct callers may provide a bool.
     :param auth: Typed auth object placed on ``spec.executor.auth``;
         ``None`` omits it (harness falls back to legacy/env-var paths).
     :returns: A populated :class:`AgentSpec`.
@@ -72,6 +74,8 @@ def _make_spec(
         config["profile"] = profile
     if use_responses is not None:
         config["use_responses"] = use_responses
+    if reasoning_item_id_policy is not None:
+        config["reasoning_item_id_policy"] = reasoning_item_id_policy
     return AgentSpec(
         spec_version=1,
         name="test-openai-agents",
@@ -85,6 +89,29 @@ def test_model_threads_into_env_var() -> None:
     """``executor.config["model"]`` is encoded into ``HARNESS_OPENAI_AGENTS_MODEL``."""
     env = _build_openai_agents_sdk_spawn_env(_make_spec(model="databricks-gpt-5-4-mini"))
     assert env["HARNESS_OPENAI_AGENTS_MODEL"] == "databricks-gpt-5-4-mini"
+
+
+@pytest.mark.parametrize(
+    ("use_responses", "expected"),
+    [
+        ("False", "false"),
+        ("True", "true"),
+        (False, "false"),
+        (True, "true"),
+    ],
+)
+def test_use_responses_config_value_is_interpreted_as_boolean(
+    monkeypatch: pytest.MonkeyPatch, use_responses: object, expected: str
+) -> None:
+    """Stringified YAML booleans must not be evaluated by Python truthiness."""
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build",
+        lambda *args, **kwargs: None,
+    )
+    env = _build_openai_agents_sdk_spawn_env(
+        _make_spec(model="gpt-4o", use_responses=use_responses)
+    )
+    assert env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] == expected
 
 
 def test_explicit_profile_threads_into_env_var() -> None:
@@ -181,6 +208,32 @@ def test_use_responses_absent_omits_env_var() -> None:
     """When ``use_responses`` is unset, the env var is omitted (harness default applies)."""
     env = _build_openai_agents_sdk_spawn_env(_make_spec(use_responses=None))
     assert "HARNESS_OPENAI_AGENTS_USE_RESPONSES" not in env
+
+
+@pytest.mark.parametrize("policy", ["preserve", "omit"])
+def test_reasoning_item_id_policy_threads_into_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build",
+        lambda *args, **kwargs: None,
+    )
+    env = _build_openai_agents_sdk_spawn_env(
+        _make_spec(model="gpt-4o", reasoning_item_id_policy=policy)
+    )
+    assert env["HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY"] == policy
+
+
+def test_reasoning_item_id_policy_absent_omits_env_var() -> None:
+    env = _build_openai_agents_sdk_spawn_env(_make_spec(reasoning_item_id_policy=None))
+    assert "HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY" not in env
+
+
+@pytest.mark.parametrize("policy", ["invalid", True, ["preserve"]])
+def test_reasoning_item_id_policy_rejects_invalid_values(policy: object) -> None:
+    with pytest.raises(ValueError, match="reasoning_item_id_policy"):
+        _build_openai_agents_sdk_spawn_env(_make_spec(reasoning_item_id_policy=policy))
 
 
 def test_no_model_produces_no_model_env_var() -> None:

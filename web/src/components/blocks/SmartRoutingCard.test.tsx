@@ -97,7 +97,7 @@ describe("SmartRoutingCard — judging (in-flight)", () => {
   it("shows the sizing header and per-task placeholders, no pills yet", () => {
     render(<SmartRoutingCard arguments={TWO_TASK_ARGS} output={null} state="input-available" />);
     expect(card().getAttribute("data-state-kind")).toBe("judging");
-    expect(card()).toHaveTextContent("Intelligent routing");
+    expect(card()).toHaveTextContent("Smart routing");
     expect(card()).toHaveTextContent("Weighing 2 tasks…");
     // Rows render immediately from the args so the plan shape is visible
     // while the judge runs.

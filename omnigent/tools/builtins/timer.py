@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
@@ -74,6 +75,10 @@ def validate_timer_set_args(
     if not isinstance(seconds_raw, (int, float)) or isinstance(seconds_raw, bool):
         return "seconds must be a number"
     seconds = float(seconds_raw)
+    # NaN/Inf pass isinstance(float) but fail every comparison, so they
+    # would bypass the non-negative, cap, and repeat>0 guards.
+    if not math.isfinite(seconds):
+        return "seconds must be a finite number"
     if seconds < 0:
         return "seconds must be non-negative"
     if seconds > _MAX_TIMER_SECONDS:
@@ -81,6 +86,10 @@ def validate_timer_set_args(
     repeat = args.get("repeat", False)
     if not isinstance(repeat, bool):
         return "repeat must be a boolean"
+    # repeat=true with seconds=0 would busy-loop sleep(0) + POST forever.
+    # One-shot seconds=0 remains valid (immediate single firing).
+    if repeat and seconds == 0:
+        return "seconds must be > 0 when repeat is true"
     note = args.get("note")
     if note is not None and not isinstance(note, str):
         return "note must be a string"
@@ -137,10 +146,12 @@ class SysTimerSetTool(Tool):
                             "type": "number",
                             "description": (
                                 "Delay before the timer fires, in "
-                                "seconds. Must be non-negative; the "
-                                "first firing happens after this "
-                                "delay. For repeat=true, also the "
-                                "interval between firings."
+                                "seconds. Must be a finite "
+                                "non-negative number; the first "
+                                "firing happens after this delay. "
+                                "For repeat=true, must be > 0 and "
+                                "is also the interval between "
+                                "firings."
                             ),
                         },
                         "repeat": {

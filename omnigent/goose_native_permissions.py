@@ -34,12 +34,19 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 import httpx
 
 from omnigent.goose_native_bridge import capture_goose_pane, send_goose_pane_keys
 
 _logger = logging.getLogger(__name__)
+
+
+class _PendingApproval(TypedDict):
+    elicitation_id: str
+    task: asyncio.Task[None]
+
 
 _POLL_INTERVAL_S = 0.3
 _POST_TIMEOUT_S = 86400.0
@@ -160,12 +167,12 @@ async def supervise_goose_approval_mirror(
     :param auth: Optional httpx auth for the runner's requests.
     :param poll_interval_s: Pane poll cadence in seconds.
     """
-    active: dict[str, object] | None = None
+    active: _PendingApproval | None = None
     episode = 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
                 pane = await asyncio.to_thread(capture_goose_pane, bridge_dir)

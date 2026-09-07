@@ -47,7 +47,7 @@ tests.
 
 ```bash
 cd /path/to/omnigent
-.venv/bin/omni server start          # spawns a detached server on a free loopback port
+.venv/bin/omni server --background          # spawns a detached server on a free loopback port
 .venv/bin/omni server status         # prints the URL, e.g. http://127.0.0.1:6767
 ```
 
@@ -134,7 +134,7 @@ streaming, harness.
 7. **Turns take ~10–60s** — always wrap in `timeout 280`.
 8. **Local-runner topology:** `omni run <bundle> --server <url>` runs the
    harness from your **current checkout**; the server only holds state. The
-   managed `omni server start` server runs from whatever venv launched it.
+   managed `omni server --background` server runs from whatever venv launched it.
 9. **Never print/echo the Gemini key** in logs or commands.
 
 ## Code & tests
@@ -146,7 +146,7 @@ streaming, harness.
 
 ```bash
 # Unit tests (use --frozen; the cwsandbox extra is unsatisfiable on public PyPI here)
-uv run --frozen --extra dev python -m pytest \
+uv run --frozen --group test python -m pytest \
   tests/inner/test_antigravity_executor.py \
   tests/inner/test_antigravity_harness.py \
   tests/runtime/test_antigravity_spawn_env.py \

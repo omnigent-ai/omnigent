@@ -1,23 +1,20 @@
-"""E2E: the Settings → Appearance *code* font size drives Monaco and persists.
+"""E2E: Settings → Appearance code-font preferences drive Monaco and persist.
 
 The code-font controls live on the Settings page (``pages/SettingsPage.tsx``,
-``UiCodeFontSizeControl`` / ``UiCodeFontFamilyControl``) as two rows labelled
-"Code font size" and "Code font family": a segmented pill (``−`` / value /
-``+``) under a ``role="group"`` labelled "Code font size", plus a free-text
-family input. Stepping the size writes the px choice to
-``localStorage["omnigent:code-font-size"]``.
+``UiCodeFontSizeControl`` / ``UiCodeFontFamilyControl`` /
+``UiCodeFontWeightControl``). Stepping the size writes the px choice to
+``localStorage["omnigent:code-font-size"]``; enabling "Heavier code text"
+writes the 500 preset to ``localStorage["omnigent:code-font-weight"]``.
 
 Unlike the chrome font (which rides the ``--ui-font-scale`` CSS variable), the
 code editor (Monaco) and terminal (xterm) are fixed-pixel widgets: they read a
-concrete ``fontSize`` at construction and are updated imperatively via the
-in-module pub/sub in ``lib/codeFontPreferences.ts``. Monaco applies the size as
-an inline ``font-size`` on its ``.view-lines`` element, so opening a non-markdown
-file and reading that computed size is the portable signal that the preference
-reached a real, mounted editor. The default is 13px; the range is 10–24px, so
-the ``−`` / ``+`` buttons disable at the bounds.
+concrete font options at construction and are updated imperatively via the
+in-module pub/sub in ``lib/codeFontPreferences.ts``. Monaco applies them to its
+``.view-lines`` element, so computed size/weight prove the preference reached a
+real mounted editor. The default size is 13px; the range is 10–24px.
 
 No LLM turn is involved — the file is seeded via the filesystem PUT endpoint and
-the size is a pure client-side preference.
+the font choices are pure client-side preferences.
 """
 
 from __future__ import annotations
@@ -30,7 +27,8 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-STORAGE_KEY = "omnigent:code-font-size"
+SIZE_STORAGE_KEY = "omnigent:code-font-size"
+WEIGHT_STORAGE_KEY = "omnigent:code-font-weight"
 
 # The seeded file lands in ``<cwd>/<session_id>/`` (the agent spec uses
 # ``os_env.cwd: .``); mirror test_file_autosave.py's per-session cleanup.
@@ -61,7 +59,12 @@ def seeded_python(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
 
 def _stored_size(page: Page) -> str | None:
     """The persisted code-font size preference, or None when unset (default 13)."""
-    return page.evaluate(f"() => window.localStorage.getItem('{STORAGE_KEY}')")
+    return page.evaluate(f"() => window.localStorage.getItem('{SIZE_STORAGE_KEY}')")
+
+
+def _stored_weight(page: Page) -> str | None:
+    """The persisted code-font weight, or None when the normal default is used."""
+    return page.evaluate(f"() => window.localStorage.getItem('{WEIGHT_STORAGE_KEY}')")
 
 
 def _open_appearance(page: Page, base_url: str) -> None:
@@ -87,6 +90,13 @@ def _open_monaco(page: Page, base_url: str, session_id: str) -> Locator:
 def _monaco_font_size(file_viewer: Locator) -> str:
     """The computed ``font-size`` Monaco applied to its ``.view-lines`` element."""
     return file_viewer.locator(".view-lines").first.evaluate("el => getComputedStyle(el).fontSize")
+
+
+def _monaco_font_weight(file_viewer: Locator) -> str:
+    """The computed ``font-weight`` Monaco applied to its rendered lines."""
+    return file_viewer.locator(".view-lines").first.evaluate(
+        "el => getComputedStyle(el).fontWeight"
+    )
 
 
 def test_code_font_size_defaults_apply_to_monaco(
@@ -139,6 +149,31 @@ def test_code_font_size_step_applies_to_monaco_and_persists(
     assert _monaco_font_size(file_viewer) == "15px", "size was not restored after reload"
 
 
+def test_heavier_code_text_applies_to_monaco_and_persists(
+    page: Page, seeded_python: tuple[str, str]
+) -> None:
+    """The heavier-text switch applies weight 500 to Monaco and survives reload."""
+    base_url, session_id = seeded_python
+
+    _open_appearance(page, base_url)
+    toggle = page.get_by_test_id("heavier-code-text-toggle")
+
+    expect(toggle).to_have_attribute("aria-checked", "false")
+    assert _stored_weight(page) is None
+
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-checked", "true")
+    assert _stored_weight(page) == "500"
+
+    file_viewer = _open_monaco(page, base_url, session_id)
+    assert _monaco_font_weight(file_viewer) == "500", "Monaco did not use heavier code text"
+
+    page.reload()
+    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(file_viewer.locator(".view-lines")).to_contain_text("greet", timeout=30_000)
+    assert _monaco_font_weight(file_viewer) == "500", "weight was not restored after reload"
+
+
 def test_code_font_size_steppers_clamp_at_bounds(
     page: Page, seeded_session: tuple[str, str]
 ) -> None:
@@ -147,7 +182,7 @@ def test_code_font_size_steppers_clamp_at_bounds(
 
     # Seed the max before the app boots so the "+" button renders disabled.
     page.goto(base_url)
-    page.evaluate(f"() => window.localStorage.setItem('{STORAGE_KEY}', '24')")
+    page.evaluate(f"() => window.localStorage.setItem('{SIZE_STORAGE_KEY}', '24')")
     _open_appearance(page, base_url)
 
     value = page.get_by_test_id("code-font-size-input")

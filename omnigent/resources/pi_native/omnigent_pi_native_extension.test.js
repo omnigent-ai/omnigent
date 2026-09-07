@@ -32,18 +32,42 @@ const harnesses = [];
 // Build a fresh extension instance with its own temp inbox directory. Each call
 // produces independent closure state (activeResponseId, pendingInterruptUntil,
 // latestContext, ...).
-function makeHarness() {
+function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
   const inboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-native-inbox-"));
   const configPath = path.join(inboxDir, "config.json");
-  fs.writeFileSync(configPath, JSON.stringify({ inboxDir }));
+  // A serverUrl + sessionId make postEvent attempt a real fetch; with a mock
+  // global fetch that lets a test capture the posted event bodies. Without
+  // them postEvent fails closed (the interrupt tests rely on that).
+  const config = captureEvents
+    ? { inboxDir, serverUrl: "http://mock", sessionId: "conv_test" }
+    : { inboxDir };
+  fs.writeFileSync(configPath, JSON.stringify(config));
   process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
+  // Capture posted event bodies (status edges etc.) instead of hitting network.
+  const postedEvents = [];
+  if (captureEvents) {
+    global.fetch = async (url, opts) => {
+      try {
+        if (opts && typeof opts.body === "string" && String(url).endsWith("/events")) {
+          postedEvents.push(JSON.parse(opts.body));
+        }
+      } catch (_err) {}
+      return { ok: true, status: 204, json: async () => ({}) };
+    };
+  }
+
   const handlers = {};
+  const registeredTools = {};
   const pi = {
     on: (name, fn) => {
       handlers[name] = fn;
     },
     registerCommand: () => {},
+    registerTool: (tool) => {
+      registeredTools[tool.name] = tool;
+    },
+    getAllTools: () => existingTools,
     sendUserMessage: () => {},
   };
 
@@ -52,9 +76,15 @@ function makeHarness() {
   const mod = require(EXT_PATH);
   mod(pi);
 
-  const h = { pi, handlers, inboxDir };
+  const h = { pi, handlers, inboxDir, postedEvents, registeredTools };
   harnesses.push(h);
   return h;
+}
+
+function statusEdges(postedEvents) {
+  return postedEvents
+    .filter((e) => e && e.type === "external_session_status" && e.data)
+    .map((e) => ({ status: e.data.status, responseId: e.data.response_id }));
 }
 
 // ctx mock. `idle` may be true/false (exposes isIdle()) or undefined (no isIdle
@@ -272,8 +302,182 @@ async function testAgentStartClearsStaleWindow() {
   );
 }
 
+async function testTaskPlanPublishesTodos() {
+  const h = makeHarness({ captureEvents: true });
+  await h.handlers.session_start({}, {});
+  const tool = h.registeredTools.manage_todo_list;
+  assert("registers manage_todo_list", !!tool);
+  assert(
+    "requires a task plan before multi-step work",
+    tool.promptGuidelines.some((guideline) =>
+      guideline.includes(
+        "must call manage_todo_list before using other tools",
+      ),
+    ),
+  );
+
+  const result = await tool.execute("todo-1", {
+    operation: "write",
+    todoList: [
+      {
+        id: 1,
+        title: "Trace rendering",
+        description: "Tracing the shared event path",
+        status: "in-progress",
+      },
+      {
+        id: 2,
+        title: "Run checks",
+        description: "Run focused checks",
+        status: "not-started",
+      },
+    ],
+  });
+  const event = h.postedEvents.find(
+    (item) => item.type === "external_session_todos",
+  );
+  assert(
+    "manage_todo_list publishes the shared todo event",
+    JSON.stringify(event && event.data.todos) ===
+      JSON.stringify([
+        {
+          content: "Trace rendering",
+          status: "in_progress",
+          activeForm: "Tracing the shared event path",
+        },
+        {
+          content: "Run checks",
+          status: "pending",
+          activeForm: "Run focused checks",
+        },
+      ]),
+    JSON.stringify(event),
+  );
+  assert(
+    "manage_todo_list persists its current list in tool details",
+    result.details.todos.length === 2 &&
+      result.details.todos[0].status === "in-progress",
+    JSON.stringify(result),
+  );
+
+  const restored = makeHarness({ captureEvents: true });
+  await restored.handlers.session_start(
+    {},
+    {
+      sessionManager: {
+        getBranch: () => [
+          {
+            type: "message",
+            message: {
+              role: "toolResult",
+              toolName: "manage_todo_list",
+              details: { todos: result.details.todos },
+            },
+          },
+        ],
+      },
+    },
+  );
+  const restoredEvent = restored.postedEvents.find(
+    (item) => item.type === "external_session_todos",
+  );
+  assert(
+    "session_start restores and republishes the latest task plan",
+    restoredEvent && restoredEvent.data.todos.length === 2,
+    JSON.stringify(restoredEvent),
+  );
+}
+
+async function testExistingTaskToolIsMirroredWithoutConflict() {
+  const h = makeHarness({
+    captureEvents: true,
+    existingTools: [{ name: "manage_todo_list" }],
+  });
+  await h.handlers.session_start({}, {});
+  assert(
+    "reuses an existing manage_todo_list tool",
+    !h.registeredTools.manage_todo_list,
+  );
+
+  await h.handlers.tool_result(
+    {
+      toolCallId: "external-todo-1",
+      toolName: "manage_todo_list",
+      details: {
+        todos: [
+          {
+            id: 1,
+            title: "Use the shared tool",
+            description: "Using the shared task tool",
+            status: "in-progress",
+          },
+        ],
+      },
+    },
+    {},
+  );
+  const event = h.postedEvents.find(
+    (item) => item.type === "external_session_todos",
+  );
+  assert(
+    "mirrors an existing task tool into the shared todo event",
+    event && event.data.todos[0].content === "Use the shared tool",
+    JSON.stringify(event),
+  );
+}
+
+// The web store only clears its local "streaming" flag when a turn's `idle`
+// status edge carries the same response_id as the `running` edge that opened
+// it. A fresh id per edge left the composer stuck queueing until a tab switch
+// reset the store. Assert agent_start/agent_end share one id.
+async function testRunningIdleShareResponseId() {
+  const h = makeHarness({ captureEvents: true });
+  const ctx = makeCtx({ idle: false });
+
+  await h.handlers.agent_start({}, ctx);
+  await h.handlers.agent_end({ messages: [] }, ctx);
+
+  const edges = statusEdges(h.postedEvents);
+  const running = edges.find((e) => e.status === "running");
+  const idle = edges.find((e) => e.status === "idle");
+
+  assert(
+    "agent_start posts a running edge with a response_id",
+    running !== undefined && typeof running.responseId === "string" && running.responseId.length > 0,
+    JSON.stringify(running),
+  );
+  assert(
+    "agent_end posts an idle edge with a response_id",
+    idle !== undefined && typeof idle.responseId === "string" && idle.responseId.length > 0,
+    JSON.stringify(idle),
+  );
+  assert(
+    "running and idle edges share the same response_id",
+    running && idle && running.responseId === idle.responseId,
+    `running=${running && running.responseId} idle=${idle && idle.responseId}`,
+  );
+
+  // A second turn mints a fresh id, still paired across its own running/idle.
+  await h.handlers.agent_start({}, ctx);
+  await h.handlers.agent_end({ messages: [] }, ctx);
+  const edges2 = statusEdges(h.postedEvents);
+  const running2 = edges2.filter((e) => e.status === "running");
+  const idle2 = edges2.filter((e) => e.status === "idle");
+  assert(
+    "second turn pairs its own running/idle id and differs from the first",
+    running2.length === 2 &&
+      idle2.length === 2 &&
+      running2[1].responseId === idle2[1].responseId &&
+      running2[1].responseId !== running2[0].responseId,
+    `turn1=${running2[0].responseId} turn2=${running2[1].responseId}`,
+  );
+}
+
 (async () => {
   try {
+    await testRunningIdleShareResponseId();
+    await testTaskPlanPublishesTodos();
+    await testExistingTaskToolIsMirroredWithoutConflict();
     await testIdleInterruptDoesNotPoisonNextTurn();
     await testIdleInterruptFallbackNoIsIdle();
     await testMidTurnInterruptStillAborts();

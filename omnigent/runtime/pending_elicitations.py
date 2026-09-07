@@ -78,6 +78,32 @@ def set_elicitation_observer(
     _observer = observer
 
 
+# Optional per-session count sink, fired with the new count whenever the
+# index changes. The server wires it to persist the count on the
+# conversation row so replicas that don't hold this session's runner
+# tunnel still show parked approvals. Must be cheap + non-blocking.
+_count_persist_hook: Callable[[str, int], None] | None = None
+
+
+def set_count_persist_hook(hook: Callable[[str, int], None] | None) -> None:
+    """
+    Register (or clear) the pending-count persist hook.
+
+    :param hook: Callback invoked as ``hook(conversation_id, count)``
+        after every index mutation (publish adds, resolve drops), with
+        the session's new outstanding count. Pass ``None`` to clear.
+    """
+    global _count_persist_hook
+    _count_persist_hook = hook
+
+
+def _notify_count_hook(conversation_id: str, count: int) -> None:
+    """Fire the count persist hook, if any (read-once, like the observer)."""
+    hook = _count_persist_hook
+    if hook is not None:
+        hook(conversation_id, count)
+
+
 def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
     """
     Update the index when an SSE event is published.
@@ -120,7 +146,10 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
         if not isinstance(elicitation_id, str) or not elicitation_id:
             return
         with _lock:
-            _pending.setdefault(conversation_id, {})[elicitation_id] = event
+            ids = _pending.setdefault(conversation_id, {})
+            ids[elicitation_id] = event
+            count = len(ids)
+        _notify_count_hook(conversation_id, count)
         _notify_observer(conversation_id, event)
         return
     if event_type == "response.elicitation_resolved":
@@ -177,9 +206,12 @@ def resolve(conversation_id: str, elicitation_id: str) -> None:
         ids = _pending.get(conversation_id)
         if ids is None:
             return
-        ids.pop(elicitation_id, None)
+        removed = ids.pop(elicitation_id, None) is not None
+        count = len(ids)
         if not ids:
             _pending.pop(conversation_id, None)
+    if removed:
+        _notify_count_hook(conversation_id, count)
 
 
 def count_for(conversation_id: str) -> int:

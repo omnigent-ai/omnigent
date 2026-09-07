@@ -106,9 +106,9 @@ export function AgentCard({
     >
       <Icon className="size-4 shrink-0 text-muted-foreground" />
       <div className="min-w-0 flex-1">
-        <span className="text-xs font-semibold">{agent.display_name}</span>
+        <span className="text-sm font-semibold">{agent.display_name}</span>
         {!compact && agent.description && (
-          <p className="mt-0.5 text-xs text-muted-foreground">{agent.description}</p>
+          <p className="mt-0.5 text-sm text-muted-foreground">{agent.description}</p>
         )}
       </div>
     </button>

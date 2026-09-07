@@ -64,6 +64,18 @@ final class WebViewModel: ObservableObject {
     webView?.evaluateJavaScript(script)
   }
 
+  /// Push a deep-link in-app path (`/c/<id>`) to the SPA so it routes to it
+  /// in-place, without a reload — the deep-link analog of
+  /// `emitNotificationActivation`, kept on a separate JS channel so a deep
+  /// link isn't mislabeled as a notification. Only the main process / app
+  /// shell invokes this for a window currently on its pinned server, so the
+  /// SPA's `onOpenPath` subscriber (mounted once the SPA loads) is the receiver.
+  func emitOpenPath(_ path: String) {
+    guard path.starts(with: "/") else { return }
+    let script = "window.__omnigentNativeEmitOpenPath?.(\(Self.javascriptString(path)));"
+    webView?.evaluateJavaScript(script)
+  }
+
   /// Push the footprint (in CSS px, excluding the OS safe area which the web
   /// layer adds via `env()`) of the native floating bars to the web app. The
   /// web side folds these into its `--omnigent-inset-*` variables so page
@@ -73,6 +85,28 @@ final class WebViewModel: ObservableObject {
     let script =
       "window.__omnigentNativeEmitInsets?.(\(jsNumber(topBar)), \(jsNumber(bottomBar)));"
     webView?.evaluateJavaScript(script)
+  }
+
+  /// Push the server-picker payload (current origin plus the selectable
+  /// managed/recent servers) to the SPA, which surfaces server selection in
+  /// its sidebar instead of the floating pill. The JS bridge caches the value
+  /// so a later-mounting subscriber still receives it.
+  func emitServerPicker(currentOrigin: String?, managedServers: [String], recentServers: [String]) {
+    guard let currentOrigin else { return }
+    struct Payload: Encodable {
+      let currentOrigin: String
+      let managedServers: [String]
+      let recentServers: [String]
+    }
+    let payload = Payload(
+      currentOrigin: currentOrigin,
+      managedServers: managedServers,
+      recentServers: recentServers
+    )
+    guard let data = try? JSONEncoder().encode(payload),
+      let json = String(data: data, encoding: .utf8)
+    else { return }
+    webView?.evaluateJavaScript("window.__omnigentNativeEmitServerPicker?.(\(json));")
   }
 
   /// Tell the web app the user tapped a segment in the native switcher.
@@ -95,7 +129,9 @@ final class WebViewModel: ObservableObject {
     return String(format: "%g", Double(value))
   }
 
-  static func javascriptString(_ value: String) -> String {
+  /// `nonisolated` because it touches no main-actor state — a pure formatter, so
+  /// non-isolated callers (e.g. `WorkspaceChromeScript`) can share it.
+  nonisolated static func javascriptString(_ value: String) -> String {
     guard let data = try? JSONEncoder().encode(value),
       let encoded = String(data: data, encoding: .utf8)
     else {

@@ -3,7 +3,7 @@
 Alongside the light/dark **mode** tiles, ``AppearanceSection``
 (``pages/SettingsPage.tsx``) renders a "Color theme" dropdown (a shadcn
 ``Select``) — one option per palette (Omnigent, Dracula, GitHub, Catppuccin,
-Gruvbox). Choosing one calls ``applyThemePalette`` (``lib/themePalette.ts``),
+Gruvbox, Nord). Choosing one calls ``applyThemePalette`` (``lib/themePalette.ts``),
 which sets ``data-theme`` on ``<html>`` and persists the id to
 ``localStorage["omnigent:ui-theme-palette"]``. The default "Omnigent" palette
 carries no override, so choosing it removes the attribute and clears the key.
@@ -18,6 +18,8 @@ No LLM turn is involved.
 
 from __future__ import annotations
 
+import json
+
 from playwright.sync_api import Locator, Page, expect
 
 
@@ -31,9 +33,82 @@ def _stored_palette(page: Page) -> str | None:
     return page.evaluate("() => window.localStorage.getItem('omnigent:ui-theme-palette')")
 
 
+def _stored_custom_theme(page: Page) -> dict[str, object] | None:
+    """The persisted custom-theme configuration, decoded from localStorage."""
+    raw = page.evaluate("() => window.localStorage.getItem('omnigent:custom-theme')")
+    return json.loads(raw) if raw else None
+
+
 def _html_has_dark(page: Page) -> bool:
     """True when the ``dark`` mode class is applied to ``<html>`` (next-themes)."""
     return page.evaluate("() => document.documentElement.classList.contains('dark')")
+
+
+def _computed_theme_tokens(page: Page) -> dict[str, str]:
+    names = [
+        "background",
+        "card",
+        "sidebar",
+        "border",
+        "ring",
+        "brand-accent",
+        "sidebar-active",
+        "sidebar-active-foreground",
+        "foreground",
+        "card-solid",
+        "card-foreground",
+        "tray",
+        "popover",
+        "popover-foreground",
+        "primary",
+        "primary-foreground",
+        "secondary",
+        "secondary-foreground",
+        "muted",
+        "muted-foreground",
+        "code-bg",
+        "accent",
+        "accent-foreground",
+        "border-strong",
+        "button-border",
+        "input",
+        "sidebar-foreground",
+        "sidebar-primary",
+        "sidebar-primary-foreground",
+        "sidebar-accent",
+        "sidebar-accent-foreground",
+        "sidebar-border",
+        "sidebar-ring",
+    ]
+    colors = page.evaluate(
+        "names => { const probe = document.createElement('div'); "
+        "const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1; "
+        "const context = canvas.getContext('2d'); document.body.append(probe); "
+        "const values = Object.fromEntries(names.map(name => { "
+        "probe.style.color = `var(--${name})`; context.clearRect(0, 0, 1, 1); "
+        "context.fillStyle = getComputedStyle(probe).color; context.fillRect(0, 0, 1, 1); "
+        "return [name, Array.from(context.getImageData(0, 0, 1, 1).data).join(',')]; "
+        "})); probe.remove(); return values; }",
+        names,
+    )
+    backgrounds = page.evaluate(
+        "() => Object.fromEntries([['shell', document.querySelector('.app-shell')], "
+        "['conversation-sidebar', document.querySelector('.conversations-sidebar')]]"
+        ".map(([name, element]) => { const style = getComputedStyle(element); "
+        "return [name, `${style.backgroundColor}|${style.backgroundImage}`]; }))"
+    )
+    return {**colors, **backgrounds}
+
+
+def _set_contrast(page: Page, value: int) -> None:
+    page.get_by_test_id("custom-theme-contrast").evaluate(
+        "(element, next) => { "
+        "const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; "
+        "setter.call(element, String(next)); "
+        "element.dispatchEvent(new Event('input', { bubbles: true })); "
+        "}",
+        value,
+    )
 
 
 def _theme_radiogroup(page: Page) -> Locator:
@@ -52,6 +127,15 @@ def _pick_palette(page: Page, name: str) -> None:
     """Open the color-theme dropdown and choose the option with the given name."""
     _color_theme_select(page).click()
     page.get_by_role("option", name=name).click()
+
+
+def _preset_palette_names(page: Page) -> list[str]:
+    _color_theme_select(page).click()
+    options = page.locator('[data-testid^="palette-"]:not([data-testid="palette-custom"])')
+    expect(options.first).to_be_visible()
+    names = [name.strip() for name in options.all_inner_texts()]
+    page.keyboard.press("Escape")
+    return names
 
 
 def _open_appearance(page: Page, base_url: str) -> None:
@@ -124,3 +208,125 @@ def test_color_palette_composes_with_dark_mode(
     # Both axes are live on <html> simultaneously.
     assert _data_theme(page) == "catppuccin", "palette override lost when switching to Dark"
     assert _html_has_dark(page), "dark class missing — the palette should compose with dark mode"
+
+
+def test_guided_custom_theme_applies_to_both_modes_and_persists(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """Editing a preset creates one custom configuration with light/dark variants."""
+    page.emulate_media(color_scheme="light")
+    base_url, session_id = seeded_session
+    _open_appearance(page, base_url)
+
+    _pick_palette(page, "GitHub")
+    page.get_by_test_id("custom-theme-accent-trigger").click()
+    accent = page.get_by_test_id("custom-theme-accent-input")
+    expect(accent).to_have_value("#1F883D")
+    accent.fill("#2563eb")
+
+    expect(_color_theme_select(page)).to_contain_text("Custom")
+    assert _data_theme(page) == "custom"
+    assert _stored_palette(page) == '"custom"'
+    stored = _stored_custom_theme(page)
+    assert stored is not None
+    assert stored["basePalette"] == "github"
+    assert stored["accent"] == "#2563eb"
+
+    translucent_sidebar = page.get_by_test_id("custom-theme-translucent-sidebar")
+    translucent_sidebar.click()
+    expect(translucent_sidebar).to_have_attribute("aria-checked", "true")
+    sidebar_background = page.locator(".conversations-sidebar").evaluate(
+        "element => getComputedStyle(element).backgroundColor"
+    )
+    assert sidebar_background.startswith("rgba("), "visible sidebar did not become translucent"
+
+    light_background = page.evaluate(
+        "() => getComputedStyle(document.documentElement)"
+        ".getPropertyValue('--custom-light-background').trim()"
+    )
+    dark_background = page.evaluate(
+        "() => getComputedStyle(document.documentElement)"
+        ".getPropertyValue('--custom-dark-background').trim()"
+    )
+    assert light_background and dark_background and light_background != dark_background
+    assert dark_background == "#0d1117"
+
+    dark = _theme_radiogroup(page).get_by_role("radio", name="Dark")
+    dark.click()
+    expect(dark).to_have_attribute("aria-checked", "true")
+    assert _data_theme(page) == "custom", "custom palette was lost when switching modes"
+
+    page.reload()
+    expect(_color_theme_select(page)).to_contain_text("Custom")
+    expect(page.get_by_test_id("custom-theme-accent-trigger")).to_contain_text("#2563EB")
+    assert _data_theme(page) == "custom"
+
+    page.goto(f"{base_url}/c/{session_id}")
+    workspace = page.get_by_role("complementary", name="Workspace")
+    expect(workspace).to_be_visible(timeout=30_000)
+    for rail in [page.locator(".conversations-sidebar"), workspace]:
+        background = rail.evaluate("element => getComputedStyle(element).backgroundColor")
+        assert background.startswith("rgba("), "both sidebars should share translucency"
+
+    workspace_surface = workspace.locator("[data-workspace-panel-content] > *")
+    expect(workspace_surface).to_be_visible()
+    surface_background = workspace_surface.evaluate(
+        "element => getComputedStyle(element).backgroundColor"
+    )
+    assert surface_background == "rgba(0, 0, 0, 0)", (
+        "workspace content should not cover the translucent rail"
+    )
+
+
+def test_contrast_round_trip_restores_preset_tokens(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    page.emulate_media(color_scheme="light")
+    base_url, _session_id = seeded_session
+    _open_appearance(page, base_url)
+
+    for mode in ["Light", "Dark"]:
+        _theme_radiogroup(page).get_by_role("radio", name=mode).click()
+        for palette in _preset_palette_names(page):
+            _pick_palette(page, palette)
+            before = _computed_theme_tokens(page)
+            _set_contrast(page, 53)
+            _set_contrast(page, 50)
+
+            expect(_color_theme_select(page)).to_contain_text("Custom")
+            assert _computed_theme_tokens(page) == before, f"{mode} {palette} did not round-trip"
+
+
+def test_custom_theme_colors_can_be_randomized(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """Randomizing accent and tint updates the picker and persisted theme."""
+    base_url, _session_id = seeded_session
+    _open_appearance(page, base_url)
+    # The color popover animates in and Floating UI repositions it on mount,
+    # which can leave its controls briefly unstable / remounting on a loaded
+    # runner — a click racing that enter transition flakes with "element is not
+    # stable" / "detached from the DOM". Kill transitions/animations so the
+    # popover is clickable the instant it mounts.
+    page.add_style_tag(
+        content="*, *::before, *::after "
+        "{ animation: none !important; transition: none !important; }"
+    )
+    page.evaluate("Math.random = () => 0.5")
+
+    for test_id in ["custom-theme-accent", "custom-theme-tint"]:
+        page.get_by_test_id(f"{test_id}-trigger").click()
+        # Wait for the popover to fully mount (its hex input is visible) before
+        # clicking randomize, so the click can't land on a not-yet-settled node.
+        expect(page.get_by_test_id(f"{test_id}-input")).to_be_visible()
+        page.get_by_test_id(f"{test_id}-randomize").click()
+        expect(page.get_by_test_id(f"{test_id}-input")).to_have_value("#3AD2D2")
+        page.keyboard.press("Escape")
+
+    expect(_color_theme_select(page)).to_contain_text("Custom")
+    assert _data_theme(page) == "custom"
+    assert _stored_palette(page) == '"custom"'
+    stored = _stored_custom_theme(page)
+    assert stored is not None
+    assert stored["accent"] == "#3ad2d2"
+    assert stored["tint"] == "#3ad2d2"

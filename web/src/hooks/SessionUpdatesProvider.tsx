@@ -17,16 +17,22 @@
 
 import { type ReactNode, useCallback, useEffect, useRef } from "react";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
+import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { isSessionDeleting, markRecentlyCreated } from "@/hooks/useConversations";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
   collectConversationIds,
   filtersFromConversationQueryKey,
+  insertNewRowsIntoPages,
   mergeItemsIntoPages,
   nullsToUndefined,
+  PROJECT_LABEL_KEY,
   removeIdsFromPages,
 } from "@/lib/sessionListCache";
+import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 
 // Coalesce bursts of structural changes / watch-set recomputes into one
@@ -53,6 +59,7 @@ function applyItemsToCache(
   queryClient: QueryClient,
   items: SessionListWireItem[],
   activeId: string | undefined,
+  viewerId?: string | null,
 ): { missingIds: string[]; needsRefetch: boolean } {
   // Frames are full rows with explicit nulls; convert null → undefined so a
   // cleared field overlays the cache in the same shape GET /v1/sessions
@@ -64,13 +71,34 @@ function applyItemsToCache(
     queryKey: ["conversations"],
   });
   for (const [key, data] of entries) {
+    const filters = filtersFromConversationQueryKey(key);
     const {
-      data: next,
+      data: merged,
       found,
       needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, filtersFromConversationQueryKey(key), activeId);
+    } = mergeItemsIntoPages(data, itemsById, filters, activeId);
     for (const id of found) foundAnywhere.add(id);
     if (queryNeedsRefetch) needsRefetch = true;
+    // Surface a brand-new watched session (a create here or elsewhere, a share)
+    // at the top now, instead of after the debounced refetch (which lags the
+    // search index). An unfiled row is fully placed → mark it found so it skips
+    // that refetch; a filed row can't be placed in its folder locally → leave it
+    // missing so the folder still reconciles via the scheduled refetch.
+    const missingHere = new Map([...itemsById].filter(([id]) => !found.has(id)));
+    const { data: next, inserted } = insertNewRowsIntoPages(
+      merged,
+      missingHere,
+      filters,
+      isSessionDeleting,
+      viewerId,
+    );
+    for (const row of inserted) {
+      if (row.project_id == null && !row.labels?.[PROJECT_LABEL_KEY]) foundAnywhere.add(row.id);
+      // Keep the new row in the list-fetch until the search index catches up,
+      // so the create-path refetch (or any reconcile) can't drop it before it's
+      // queryable — otherwise it flashes in and out. Mirrors the delete tombstone.
+      markRecentlyCreated(row);
+    }
     if (next !== data) queryClient.setQueryData(key, next);
   }
   // Each project folder fetches its own ["project-sessions", <name>] list, so
@@ -175,6 +203,21 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     // the open session even when it's off-sidebar.
     const active = activeIdRef.current;
     if (active && !ids.includes(active)) ids.push(active);
+    // Include all child session ids from the sub-agent tree caches so the
+    // server streams status changes for them. When a child's changed frame
+    // arrives below, we invalidate its parent's child_sessions query key,
+    // giving the tree views push-style freshness without polling.
+    const childEntries = queryClient.getQueriesData<ChildSessionInfo[]>({
+      queryKey: ["conversation"],
+    });
+    for (const [key, childSessions] of childEntries) {
+      // Only ["conversation", <id>, "child_sessions"] entries carry child lists.
+      if (Array.isArray(key) && key[2] === "child_sessions" && Array.isArray(childSessions)) {
+        for (const child of childSessions) {
+          if (!ids.includes(child.id)) ids.push(child.id);
+        }
+      }
+    }
     sessionUpdatesSocket.setWatched(ids);
   }, [queryClient]);
 
@@ -186,8 +229,48 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     pushWatched();
   }, [pushWatched, activeId]);
 
+  // Freeze the fallback slice key (the modal host over all seen sessions) once
+  // the session list first loads, then start the updates socket — which keys
+  // its `?omnigent_slice_key=` off that frozen value. Gating start() on the
+  // latch (rather than starting eagerly) matters ONLY for this WS: it's a
+  // persistent connection, so starting pre-latch (empty map → no key) and then
+  // re-keying would force a reconnect. Ordinary `authenticatedFetch` fallback
+  // routes (e.g. /v1/hosts) don't gate — they just read the frozen value and a
+  // pre-latch miss self-corrects on their next refetch.
+  //
+  // Latch on the first SUCCESSFUL conversations query, not merely a settled one:
+  // the queryFn seeds `_sessionHosts` from every row before it resolves, so a
+  // success means the map already reflects this user's hosts (an empty map is
+  // then a genuinely zero-session user → null fallback, gate still releases). An
+  // error settle is NOT latched — freezing a null key there would pin the page
+  // even after a retry loads real hosts; react-query retries the list, and the
+  // socket starts on that first success (nothing to stream before the list loads
+  // anyway). The session list itself is NOT gated on the modal (it populates the
+  // map the modal reads; gating it on the modal would deadlock).
   useEffect(() => {
-    sessionUpdatesSocket.start();
+    let cacheUnsub: (() => void) | null = null;
+    const tryResolveAndStart = (): boolean => {
+      const succeeded = queryClient
+        .getQueryCache()
+        .getAll()
+        .some(
+          (q) =>
+            Array.isArray(q.queryKey) &&
+            q.queryKey[0] === "conversations" &&
+            q.state.status === "success",
+        );
+      if (!succeeded) return false;
+      resolveModalHost();
+      sessionUpdatesSocket.start();
+      return true;
+    };
+    // Already succeeded (cache warm from a prior mount)? Start immediately.
+    // Otherwise wait for the first success, then start once and unsubscribe.
+    if (!tryResolveAndStart()) {
+      cacheUnsub = queryClient.getQueryCache().subscribe(() => {
+        if (isModalHostResolved() || tryResolveAndStart()) cacheUnsub?.();
+      });
+    }
 
     let invalidateTimer: ReturnType<typeof setTimeout> | null = null;
     const scheduleInvalidate = () => {
@@ -198,6 +281,10 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         // Converge each project folder's own list too (new/archived/relabeled
         // members the local field-patch can't place).
         void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+        // Another client archiving/relabeling/deleting can add or remove a
+        // project from the Archived view's picker; only local mutations
+        // invalidate this scan otherwise.
+        void queryClient.invalidateQueries({ queryKey: ["archived-project-names"] });
       }, DEBOUNCE_MS);
     };
 
@@ -220,6 +307,9 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       switch (frame.type) {
         case "heartbeat":
           return;
+        case "hosts_changed":
+          void queryClient.invalidateQueries({ queryKey: ["hosts"] });
+          return;
         case "removed":
           for (const id of frame.ids) commentsFingerprintsRef.current.delete(id);
           if (removeIdsFromCache(queryClient, frame.ids)) scheduleInvalidate();
@@ -237,16 +327,36 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
               if (!watchedIds.has(id)) commentsFingerprintsRef.current.delete(id);
             }
           }
+          // For child sessions the server includes parent_session_id in the
+          // wire item. Invalidate the parent's child_sessions cache so tree
+          // views (SubagentsPanel, SubagentsGraphView) pick up status changes
+          // without polling.
+          const parentIds = new Set<string>();
+          for (const item of frame.items) {
+            if (item.parent_session_id) parentIds.add(item.parent_session_id);
+          }
+          for (const parentId of parentIds) {
+            void queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(parentId) });
+          }
           const { missingIds, needsRefetch } = applyItemsToCache(
             queryClient,
             frame.items,
             activeIdRef.current,
+            getCurrentUserId(),
           );
           // A watched id absent from every page is a new session whose sort
           // position we can't place locally. Membership-affecting deltas
           // (archive/search/connected filters) and updated_at resorting need
           // the same server-side reconciliation.
-          if (missingIds.length > 0 || needsRefetch) scheduleInvalidate();
+          //
+          // Skip the active session: its updated_at bumps on open before the
+          // initial list fetch returns, so it lands in missingIds even though
+          // it isn't a genuinely new session. Its data is covered by
+          // useSession and it's pinned in the sidebar via ActiveChatOverride.
+          const sidebarMissingIds = activeIdRef.current
+            ? missingIds.filter((id) => id !== activeIdRef.current)
+            : missingIds;
+          if (sidebarMissingIds.length > 0 || needsRefetch) scheduleInvalidate();
           return;
         }
       }
@@ -273,6 +383,11 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       if (Array.isArray(key) && (key[0] === "conversations" || key[0] === "project-sessions")) {
         scheduleWatch();
       }
+      // Also recompute when a child-sessions list loads so the tree nodes
+      // join the watch-set and the server starts streaming their status.
+      if (Array.isArray(key) && key[0] === "conversation" && key[2] === "child_sessions") {
+        scheduleWatch();
+      }
     });
 
     return () => {
@@ -284,5 +399,5 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     };
   }, [queryClient, pushWatched]);
 
-  return <>{children}</>;
+  return children;
 }

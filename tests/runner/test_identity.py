@@ -10,6 +10,7 @@ import pytest
 
 from omnigent.runner.identity import (
     RUNNER_AUTH_SECRET_ENV_VARS,
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     strip_runner_auth_secrets,
     token_bound_runner_id,
@@ -52,6 +53,7 @@ def test_strip_removes_every_registered_secret_name() -> None:
     :returns: None.
     """
     assert RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR in RUNNER_AUTH_SECRET_ENV_VARS
+    assert RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR in RUNNER_AUTH_SECRET_ENV_VARS
 
     seeded = {name: f"secret-{name}" for name in RUNNER_AUTH_SECRET_ENV_VARS}
     seeded["KEEP_ME"] = "keep"

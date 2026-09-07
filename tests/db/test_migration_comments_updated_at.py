@@ -73,8 +73,20 @@ def test_comments_updated_at_backfilled_from_created_at(tmp_path: Path) -> None:
                     "VALUES (:id, :conv, :path, 0, 5, :body, 'draft', :ts)",
                 ),
                 [
-                    {"id": "cmt_1", "conv": "conv_a", "path": "a.py", "body": "x", "ts": 1_000},
-                    {"id": "cmt_2", "conv": "conv_a", "path": "a.py", "body": "y", "ts": 2_000},
+                    {
+                        "id": "747618b4b2dd94383e50ddf180ceddc3",
+                        "conv": "94c349190e241f85a984b3df8f129696",
+                        "path": "a.py",
+                        "body": "x",
+                        "ts": 1_000,
+                    },
+                    {
+                        "id": "f2686a25fbf1464a1cc2a347237813cd",
+                        "conv": "94c349190e241f85a984b3df8f129696",
+                        "path": "a.py",
+                        "body": "y",
+                        "ts": 2_000,
+                    },
                 ],
             )
 
@@ -92,7 +104,10 @@ def test_comments_updated_at_backfilled_from_created_at(tmp_path: Path) -> None:
         # backfill ignored per-row values and legacy comments would all
         # fingerprint identically.
         us = 1_000_000
-        assert rows == {"cmt_1": (1_000, 1_000 * us), "cmt_2": (2_000, 2_000 * us)}
+        assert rows == {
+            "747618b4b2dd94383e50ddf180ceddc3": (1_000, 1_000 * us),
+            "f2686a25fbf1464a1cc2a347237813cd": (2_000, 2_000 * us),
+        }
     finally:
         engine.dispose()
 

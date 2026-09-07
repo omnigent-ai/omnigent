@@ -150,7 +150,7 @@ def test_files_tab_follows_os_env_across_agent_switch(
     base_url, session_id, with_env_id, no_env_id = os_env_switch_session
 
     page.goto(f"{base_url}/c/{session_id}")
-    expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
 
     # Scope to the desktop "Workspace" rail so the locator can't match
     # the hidden mobile drawer that mirrors the same tab markup.

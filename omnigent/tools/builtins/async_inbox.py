@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.tools.base import Tool
 
 
@@ -148,11 +149,20 @@ class SysCallAsyncTool(Tool):
       meta-dispatch would let the LLM build infinite handle chains
       with no useful semantic; reject explicitly.
 
-    The handle round-trip is identical to the existing async
-    dispatch path (see
-    :class:`~omnigent.runtime.workflow._AsyncToolHandle`):
+    The handle round-trip uses ``handle_id`` as the canonical
+    identifier (cancel via ``sys_cancel_async`` with that same
+    field). Runner dispatch also echoes ``task_id`` with an
+    identical value as a compatibility alias (remove in 0.8.0) for
+    clients that still read the older field name — prefer
+    ``handle_id``; do not confuse it with
+    :class:`SysCancelTaskTool`'s distinct ``task_id`` contract.
 
-    - ``task_id`` — the freshly created child task's id.
+    Handle fields:
+
+    - ``handle_id`` — the freshly created async-work handle id
+      (canonical; pass to ``sys_cancel_async``).
+    - ``task_id`` — compatibility alias, identical to ``handle_id``;
+      remove in 0.8.0.
     - ``tool_name`` — the TARGET tool's name (not
       ``"sys_call_async"``).
     - ``status`` — ``"in_progress"``.
@@ -170,12 +180,14 @@ class SysCallAsyncTool(Tool):
         """:returns: Human-readable description for the LLM."""
         return (
             "Dispatch a local Python tool as a background task. "
-            "Returns a task handle immediately; the result auto-"
-            "delivers as a system message when ready (or call "
-            "sys_read_inbox to drain proactively when that lands "
-            "in 11a.ii). Use this when you want to run a normally-"
-            "synchronous tool concurrently with other work — e.g., "
-            "kicking off several long calls in parallel."
+            "Returns a handle immediately (canonical field: "
+            "handle_id); the result auto-delivers as a system "
+            "message when ready (or call sys_read_inbox to drain "
+            "proactively). To abort, pass that handle_id to "
+            "sys_cancel_async. Use this when you want to run a "
+            "normally-synchronous tool concurrently with other "
+            "work — e.g., kicking off several long calls in "
+            "parallel."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -284,7 +296,10 @@ class SysReadInboxTool(Tool):
             "want to inspect completions before yielding — e.g., "
             "to plan follow-up work based on the results. Returns "
             "a textual summary; an empty inbox returns a sentinel "
-            "string."
+            "string. It is also the expected response to the runtime's "
+            f"sub-agent wake notice `{SUBAGENT_WAKE_NOTICE_SHAPE}`, which "
+            "Omnigent posts into your session when a dispatched child "
+            "finishes; that notice comes from the runtime, not from a person."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -367,12 +382,13 @@ class SysCancelAsyncTool(SysCancelTaskTool):
         """:returns: Human-readable description for the LLM."""
         return (
             "Cancel a task you previously dispatched via "
-            "sys_call_async, using the handle id (the value of the "
-            "task_id field from the handle JSON). Non-blocking — "
-            "the task transitions to cancelled status and a "
-            "[System: task ... cancelled] block arrives in the "
-            "inbox or auto-deliver. Already-terminal tasks return "
-            "without changing state."
+            "sys_call_async, using the handle_id from the handle "
+            "JSON. Non-blocking — the task transitions to "
+            "cancelled status and a [System: task ... cancelled] "
+            "block arrives in the inbox or auto-deliver. "
+            "Already-terminal tasks return without changing "
+            "state. Distinct from sys_cancel_task, which takes "
+            "task_id for non-async-handle cancellations."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -398,10 +414,10 @@ class SysCancelAsyncTool(SysCancelTaskTool):
                         "handle_id": {
                             "type": "string",
                             "description": (
-                                "The handle's task_id — same value "
-                                "as the ``task_id`` field of the "
-                                "handle JSON returned by "
-                                "sys_call_async."
+                                "The ``handle_id`` from the JSON "
+                                "handle returned by "
+                                "sys_call_async (canonical "
+                                "async-dispatch identifier)."
                             ),
                         },
                     },

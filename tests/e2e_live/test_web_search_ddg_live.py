@@ -18,7 +18,7 @@ PR/push gate:
 
 Run it on demand::
 
-    uv run pytest tests/e2e_live/ -m nightly
+    uv run --group test pytest tests/e2e_live/ -m nightly
 
 A FAIL here means DDG drifted: re-capture the golden fixture with
 ``tests/tools/fixtures/refresh_ddg_fixture.py`` and fix the parser in

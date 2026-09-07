@@ -36,6 +36,7 @@ import time
 import uuid
 
 import httpx
+import pytest
 
 from tests.e2e.conftest import (
     configure_mock_llm,
@@ -70,6 +71,7 @@ def _sys_session_send_tool_call(agent: str, title: str, child_args: str) -> dict
     }
 
 
+@pytest.mark.compat_smoke
 def test_runner_does_not_500_old_server_emitting_waiting_status(
     http_client: httpx.Client,
     live_runner_id: str,

@@ -12,17 +12,21 @@ import pytest
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.routes._host_launch import (
     resolve_host_launch,
     resolve_host_owner,
 )
+from omnigent.stores.host_store import now_epoch
 
 
 @dataclass
 class _FakeHost:
     host_id: str = "host_1"
     name: str = "test-host"
-    owner: str = "alice"
+    user_id: str = "alice"
+    status: str = "online"
+    updated_at: int = field(default_factory=now_epoch)
 
 
 @dataclass
@@ -60,20 +64,20 @@ class TestResolveHostOwner:
         assert exc_info.value.status_code == 404
 
     def test_wrong_owner_403(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="bob")
+        host = _FakeHost(host_id="host_1", user_id="bob")
         store = _FakeHostStore(hosts={"host_1": host})
         with pytest.raises(HTTPException) as exc_info:
             resolve_host_owner(user_id="alice", host_id="host_1", host_store=store)
         assert exc_info.value.status_code == 403
 
     def test_correct_owner(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="alice")
+        host = _FakeHost(host_id="host_1", user_id="alice")
         store = _FakeHostStore(hosts={"host_1": host})
         result = resolve_host_owner(user_id="alice", host_id="host_1", host_store=store)
         assert result.host_id == "host_1"
 
     def test_no_auth_skips_owner_check(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="bob")
+        host = _FakeHost(host_id="host_1", user_id="bob")
         store = _FakeHostStore(hosts={"host_1": host})
         result = resolve_host_owner(user_id=None, host_id="host_1", host_store=store)
         assert result.host_id == "host_1"
@@ -84,11 +88,11 @@ class TestResolveHostOwner:
 
 class TestResolveHostLaunch:
     def test_host_offline_409(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="alice")
+        host = _FakeHost(host_id="host_1", user_id="alice", status="offline")
         store = _FakeHostStore(hosts={"host_1": host})
         registry = _FakeHostRegistry()  # empty = no connections
         conv_store = _FakeConversationStore()
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(OmnigentError) as exc_info:
             resolve_host_launch(
                 user_id="alice",
                 host_id="host_1",
@@ -98,10 +102,10 @@ class TestResolveHostLaunch:
                 conversation_store=conv_store,
                 permission_store=None,
             )
-        assert exc_info.value.status_code == 409
+        assert exc_info.value.code == ErrorCode.CONFLICT
 
     def test_missing_session_404(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="alice")
+        host = _FakeHost(host_id="host_1", user_id="alice")
         conn = object()
         store = _FakeHostStore(hosts={"host_1": host})
         registry = _FakeHostRegistry(conns={"host_1": conn})
@@ -119,7 +123,7 @@ class TestResolveHostLaunch:
         assert exc_info.value.status_code == 404
 
     def test_success_no_auth(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="alice")
+        host = _FakeHost(host_id="host_1", user_id="alice")
         conn = object()
         conv = Conversation(
             id="s1",

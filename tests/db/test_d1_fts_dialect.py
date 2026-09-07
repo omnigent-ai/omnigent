@@ -47,7 +47,7 @@ def d1_engine(monkeypatch):
     A real ``cloudflare_d1`` SQLAlchemy engine whose ``/raw`` HTTP endpoint is
     served from one in-memory SQLite connection (autocommit, like D1).
     """
-    # The cloudflare_d1 dialect is a deploy/test dependency (pyproject [dev]);
+    # The cloudflare_d1 dialect is in the repository's test dependency group;
     # skip gracefully if a minimal install lacks it.
     pytest.importorskip("sqlalchemy_cloudflare_d1")
     monkeypatch.setenv("CF_D1_BASE_URL", _D1_BASE)
@@ -95,8 +95,18 @@ def test_fts_lifecycle_on_d1(d1_engine):
 
     # 2. Index two items; only one matches the query.
     with Session(d1_engine) as s:
-        insert_fts(s, "msg_1", "conv_a", "the quick brown fox")
-        insert_fts(s, "msg_2", "conv_a", "lazy dog sleeps")
+        insert_fts(
+            s,
+            "9980c8a9248139f14f4165e5d53088aa",
+            "94c349190e241f85a984b3df8f129696",
+            "the quick brown fox",
+        )
+        insert_fts(
+            s,
+            "0fd4e86b2daa009cd9929641dbd7dab6",
+            "94c349190e241f85a984b3df8f129696",
+            "lazy dog sleeps",
+        )
         s.commit()
 
     # 3. Full-text MATCH finds the right row.
@@ -105,11 +115,11 @@ def test_fts_lifecycle_on_d1(d1_engine):
             text(f"SELECT item_id FROM {_FTS_TABLE} WHERE search_text MATCH :q"),
             {"q": "fox"},
         ).fetchall()
-    assert [r[0] for r in hits] == ["msg_1"]
+    assert [r[0] for r in hits] == ["9980c8a9248139f14f4165e5d53088aa"]
 
     # 4. delete_fts_by_conversation clears the conversation's rows.
     with Session(d1_engine) as s:
-        delete_fts_by_conversation(s, "conv_a")
+        delete_fts_by_conversation(s, "94c349190e241f85a984b3df8f129696")
         s.commit()
     with d1_engine.connect() as conn:
         remaining = conn.execute(text(f"SELECT count(*) FROM {_FTS_TABLE}")).scalar()

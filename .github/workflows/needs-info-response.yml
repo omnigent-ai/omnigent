@@ -1,0 +1,28 @@
+name: Re-evaluate needs-info response
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: needs-info-response-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  retriage:
+    if: >-
+      !endsWith(github.event.sender.login, '[bot]') &&
+      !github.event.issue.pull_request &&
+      github.event.comment.user.login == github.event.issue.user.login &&
+      contains(github.event.issue.labels.*.name, 'needs-info')
+    uses: ./.github/workflows/issue-prioritization-v2.yml
+    with:
+      issue_number: ${{ github.event.issue.number }}
+      # Re-check live state inside the called workflow. The expiry worker may
+      # close the issue after this webhook payload was created.
+      reopen_closed: true
+    secrets: inherit

@@ -41,10 +41,11 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Protocol, cast
 
 from omnigent.policies.base import Policy
+from omnigent.policies.schema import PolicyEvent
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.spec.types import (
     FunctionPolicySpec,
@@ -54,10 +55,9 @@ from omnigent.spec.types import (
     StateUpdateAction,
 )
 
-# Type alias for what a resolved FunctionPolicy callable can be.
-# Distinguishing form handled at call time — the adapter wraps
-# each variant into a uniform async call.
-_PolicyCallable = Callable[..., Any]
+
+class _DynamicCallable(Protocol):
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
 
 
 def _phase_to_event_type(phase: Phase) -> str:
@@ -91,12 +91,10 @@ class FunctionPolicy(Policy):
         (dict-form spec).
     """
 
-    spec: FunctionPolicySpec
-
     def __init__(
         self,
         spec: FunctionPolicySpec,
-        callable_obj: _PolicyCallable,
+        callable_obj: object,
     ) -> None:
         """
         Wrap a resolved callable in the Policy contract.
@@ -106,15 +104,15 @@ class FunctionPolicy(Policy):
             unwrapped from any factory).
         """
         self.spec = spec
-        self._callable = callable_obj
-        self._is_async = inspect.iscoroutinefunction(callable_obj)
+        self._callable = cast(_DynamicCallable, callable_obj)
+        self._is_async = inspect.iscoroutinefunction(self._callable)
         self._arity = _callable_arity(callable_obj)
-        self._config: dict[str, Any] = dict(spec.config) if spec.config else {}
+        self._config: dict[str, str] = dict(spec.config) if spec.config else {}
 
     async def evaluate(
         self,
         ctx: EvaluationContext,
-        context: dict[str, Any],  # noqa: ARG002 — engine contract; callable uses event.context instead
+        context: dict[str, object],  # noqa: ARG002 — engine contract; callable uses event.context instead
     ) -> PolicyResult:
         """
         Build an event dict and invoke the underlying callable.
@@ -170,7 +168,7 @@ class FunctionPolicy(Policy):
     async def _call(
         self,
         ctx: EvaluationContext,
-    ) -> Any:
+    ) -> object:
         """
         Build an event dict and dispatch the callable.
 
@@ -179,17 +177,17 @@ class FunctionPolicy(Policy):
             ``{"result": ..., "reason": ...}`` dict).
         """
         event = _build_event(ctx)
-        args: tuple[Any, ...]
+        args: tuple[object, ...]
         if self._arity >= 2:
             args = (event, self._config)
         else:
             args = (event,)
         if self._is_async:
-            return await self._callable(*args)
+            return await cast(Awaitable[object], self._callable(*args))
         return await asyncio.to_thread(self._callable, *args)
 
 
-def _build_event(ctx: EvaluationContext) -> dict[str, Any]:
+def _build_event(ctx: EvaluationContext) -> PolicyEvent:
     """
     Build an ``event`` dict from an :class:`EvaluationContext`.
 
@@ -214,7 +212,7 @@ def _build_event(ctx: EvaluationContext) -> dict[str, Any]:
     :param ctx: The evaluation context populated by the caller.
     :returns: Event dict ready for the callable.
     """
-    event: dict[str, Any] = {
+    event: dict[str, object] = {
         "type": _phase_to_event_type(ctx.phase),
         "target": ctx.tool_name,
         "data": ctx.content,
@@ -252,7 +250,7 @@ def _build_event(ctx: EvaluationContext) -> dict[str, Any]:
     }
     if ctx.request_data is not None:
         event["request_data"] = ctx.request_data
-    return event
+    return cast(PolicyEvent, event)
 
 
 def resolve_function_policy(spec: FunctionPolicySpec) -> FunctionPolicy:
@@ -281,7 +279,7 @@ def resolve_function_policy(spec: FunctionPolicySpec) -> FunctionPolicy:
             f"FunctionPolicy {spec.name!r} has no function reference; "
             f"parser should have rejected this at spec load.",
         )
-    target = _resolve_dotted_path(func_ref.path)
+    target = cast(_DynamicCallable, _resolve_dotted_path(func_ref.path))
     # ``arguments is not None`` distinguishes factory form (dict,
     # possibly empty ``{}``) from direct-callable form (``None``).
     # Using truthiness (``if func_ref.arguments``) would treat
@@ -319,7 +317,7 @@ def resolve_function_policy(spec: FunctionPolicySpec) -> FunctionPolicy:
     return FunctionPolicy(spec, callable_obj)
 
 
-def _resolve_dotted_path(path: str) -> Any:
+def _resolve_dotted_path(path: str) -> object:
     """
     Resolve a ``module.sub.attr`` style path to its attribute.
 
@@ -342,10 +340,10 @@ def _resolve_dotted_path(path: str) -> Any:
         )
     module_path, attr = path.rsplit(".", 1)
     module = importlib.import_module(module_path)
-    return getattr(module, attr)
+    return cast(object, getattr(module, attr))
 
 
-def _callable_arity(fn: _PolicyCallable) -> int:
+def _callable_arity(fn: object) -> int:
     """
     Count the positional parameters a callable accepts.
 
@@ -364,7 +362,7 @@ def _callable_arity(fn: _PolicyCallable) -> int:
         + ``POSITIONAL_OR_KEYWORD``).
     """
     try:
-        sig = inspect.signature(fn)
+        sig = inspect.signature(cast(_DynamicCallable, fn))
     except (TypeError, ValueError):
         return 1
     positional_kinds = (
@@ -374,7 +372,7 @@ def _callable_arity(fn: _PolicyCallable) -> int:
     return sum(1 for p in sig.parameters.values() if p.kind in positional_kinds)
 
 
-def _has_no_required_params(fn: _PolicyCallable) -> bool:
+def _has_no_required_params(fn: object) -> bool:
     """
     Check whether a callable has zero required positional params.
 
@@ -393,7 +391,7 @@ def _has_no_required_params(fn: _PolicyCallable) -> bool:
         default value.
     """
     try:
-        sig = inspect.signature(fn)
+        sig = inspect.signature(cast(_DynamicCallable, fn))
     except (TypeError, ValueError):
         return False
     positional_kinds = (
@@ -414,7 +412,7 @@ def make_fixed_action_callable(
     set_labels: dict[str, str] | None = None,
     on_phases: list[str] | None = None,
     on_tools: list[str] | None = None,
-) -> _PolicyCallable:
+) -> Callable[[PolicyEvent], dict[str, object] | None]:
     """
     Factory that returns a policy callable emitting a fixed decision.
 
@@ -449,7 +447,7 @@ def make_fixed_action_callable(
     frozen_phases = set(on_phases) if on_phases else None
     frozen_tools = set(on_tools) if on_tools else None
 
-    def _fixed(event: dict[str, Any]) -> dict[str, Any] | None:
+    def _fixed(event: PolicyEvent) -> dict[str, object] | None:
         """Return the fixed decision, or None to abstain."""
         # Phase gate: abstain if the event type is not in the
         # declared phases.
@@ -460,7 +458,7 @@ def make_fixed_action_callable(
         if frozen_tools is not None:
             if event.get("target") not in frozen_tools:
                 return None
-        result: dict[str, Any] = {"result": action, "reason": reason}
+        result: dict[str, object] = {"result": action, "reason": reason}
         if frozen_labels:
             result["set_labels"] = frozen_labels
         return result
@@ -468,7 +466,7 @@ def make_fixed_action_callable(
     return _fixed
 
 
-def _coerce_to_policy_result(raw: Any, *, spec_name: str) -> PolicyResult:
+def _coerce_to_policy_result(raw: object, *, spec_name: str) -> PolicyResult:
     """
     Normalize a FunctionPolicy callable's return value.
 
@@ -538,7 +536,7 @@ def _coerce_to_policy_result(raw: Any, *, spec_name: str) -> PolicyResult:
 
 
 def _policy_result_from_dict(
-    raw: dict[str, Any],
+    raw: dict[str, object],
     *,
     spec_name: str,
 ) -> PolicyResult:
@@ -578,9 +576,10 @@ def _policy_result_from_dict(
         ) from exc
     raw_state_updates = raw.get("state_updates")
     raw_set_labels = raw.get("set_labels")
+    reason = raw.get("reason")
     return PolicyResult(
         action=action,
-        reason=raw.get("reason"),
+        reason=cast("str | None", reason),
         data=raw.get("data"),
         state_updates=_coerce_state_updates(raw_state_updates, spec_name=spec_name),
         set_labels=dict(raw_set_labels) if isinstance(raw_set_labels, dict) else None,
@@ -588,7 +587,7 @@ def _policy_result_from_dict(
 
 
 def _coerce_state_updates(
-    raw: Any,
+    raw: object,
     *,
     spec_name: str,
 ) -> list[StateUpdate] | None:

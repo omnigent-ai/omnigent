@@ -294,7 +294,7 @@ async def test_forward_kiro_session_posts_conversation_messages(
             },
         ],
     )
-    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
     posted: list[tuple[str, str, forwarder._KiroConversationMessage]] = []
     external_ids: list[tuple[str, str]] = []
 
@@ -425,7 +425,7 @@ async def test_forward_kiro_session_posts_cumulative_cost_once(
         ],
         model_id="auto",
     )
-    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
     costs: list[tuple[str, float, str | None]] = []
 
     async def _fake_post_cost(
@@ -543,7 +543,7 @@ async def test_forward_kiro_session_prefers_expected_resume_session(
         bridge_dir,
         forwarder._ForwardState(session_id="stale-session", byte_offset=0),
     )
-    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
     posted: list[forwarder._KiroConversationMessage] = []
     external_ids: list[str] = []
 
@@ -628,7 +628,7 @@ async def test_forward_kiro_session_waits_for_expected_resume_session(
             }
         ],
     )
-    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
     posted: list[forwarder._KiroConversationMessage] = []
     external_ids: list[str] = []
 
@@ -711,7 +711,7 @@ async def test_forward_kiro_session_does_not_post_session_status(
             },
         ],
     )
-    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
 
     posted_event_types: list[str] = []
 
@@ -785,7 +785,7 @@ async def test_forward_kiro_session_mirrors_current_model_once(
         # No metering: proves the model mirror fires at launch, before a turn's cost.
         model_id="claude-haiku-4.5",
     )
-    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
     models: list[tuple[str, str]] = []
 
     async def _fake_post_model(client: httpx.AsyncClient, *, session_id: str, model: str) -> None:

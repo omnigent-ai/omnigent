@@ -6,7 +6,7 @@ and self-contained* so a fresh app can be created and torn down per PR with no
 external state: a SQLite database + local-disk artifact store under a temp dir.
 
 There is no bundled LLM or runner. Omnigent executes agent turns on a runner
-that the user connects from their own machine/sandbox (``omnigent run … --server
+that the user connects from their own machine/sandbox (``omnigent host --server
 <url>``), so the preview only needs to serve the web UI + API. A reviewer browses
 the UI as-is, and can connect their own host to drive a real session.
 

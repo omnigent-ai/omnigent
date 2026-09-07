@@ -10,6 +10,7 @@ view. Spec policies have ``id=None`` and cannot be patched or deleted.
 
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from typing import Any
@@ -28,6 +29,7 @@ from omnigent.runtime import get_caps
 from omnigent.runtime.policies.builder import invalidate_session_policy_specs_cache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id, require_access
+from omnigent.server.routes._errors import session_not_found
 from omnigent.server.schemas import (
     _DOTTED_PATH_RE,
     CreateSessionPolicyRequest,
@@ -37,15 +39,21 @@ from omnigent.spec.types import FunctionPolicySpec, PolicySpec
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.telemetry import emit as _tel_emit
+from omnigent.telemetry.events import PolicyDeletedEvent as _TelPolicyDeletedEvent
+from omnigent.telemetry.events import PolicyRegisteredEvent as _TelPolicyRegisteredEvent
+from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
+
+_logger = logging.getLogger(__name__)
 
 
 def _generate_policy_id() -> str:
     """Generate a unique policy identifier.
 
-    :returns: A string of the form ``"pol_<32-char hex>"``,
-        e.g. ``"pol_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
     """
-    return f"pol_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def _entity_to_response(policy: Policy) -> dict[str, Any]:
@@ -144,7 +152,7 @@ def create_session_policies_router(
         """
         conv = conversation_store.get_conversation(session_id)
         if conv is None:
-            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+            raise session_not_found()
 
     @router.post("/sessions/{session_id}/policies")
     async def create_policy(
@@ -207,6 +215,33 @@ def create_session_policies_router(
                 code=ErrorCode.CONFLICT,
             ) from exc
         invalidate_session_policy_specs_cache(session_id)
+        _logger.info(
+            "session_policies/create: user=%s created policy_id=%s session_id=%s handler=%s",
+            user_id or "(single-user)",
+            policy.id,
+            session_id,
+            policy.handler,
+        )
+        try:
+            import hashlib as _hashlib
+
+            _srv_id = _get_installation_id()
+            _anon: str | None = None
+            if user_id is not None:
+                _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _tel_emit(
+                _TelPolicyRegisteredEvent(
+                    installation_id=_srv_id,
+                    handler=policy.handler,
+                    policy_type=policy.type,
+                    scope="session",
+                    session_id=session_id,
+                    anon_user_id=_anon,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return _entity_to_response(policy)
 
     @router.get("/sessions/{session_id}/policies")
@@ -296,7 +331,9 @@ def create_session_policies_router(
             unchanged.
         :returns: The updated policy as a serialized dict.
         :raises OmnigentError: 401/403 if the user lacks edit
-            permission, or 404 if the policy is not found.
+            permission, 404 if the policy is not found, or 409 if
+            renaming would collide with another policy in this
+            session.
         """
         user_id = get_user_id(request, auth_provider)
         if permission_store is not None:
@@ -330,16 +367,28 @@ def create_session_policies_router(
                         f"must add custom handlers via the 'policy_modules' config.",
                         code=ErrorCode.INVALID_INPUT,
                     )
-        policy = store.update(
-            policy_id,
-            session_id,
-            name=body.name,
-            handler=body.handler,
-            enabled=body.enabled,
-        )
+        try:
+            policy = store.update(
+                policy_id,
+                session_id,
+                name=body.name,
+                handler=body.handler,
+                enabled=body.enabled,
+            )
+        except IntegrityError as exc:
+            raise OmnigentError(
+                f"Policy with name '{body.name}' already exists in this session",
+                code=ErrorCode.CONFLICT,
+            ) from exc
         if policy is None:
             raise OmnigentError("Policy not found", code=ErrorCode.NOT_FOUND)
         invalidate_session_policy_specs_cache(session_id)
+        _logger.info(
+            "session_policies/update: user=%s updated policy_id=%s session_id=%s",
+            user_id or "(single-user)",
+            policy_id,
+            session_id,
+        )
         return _entity_to_response(policy)
 
     @router.delete("/sessions/{session_id}/policies/{policy_id}")
@@ -370,6 +419,30 @@ def create_session_policies_router(
             )
         store.delete(policy_id, session_id)
         invalidate_session_policy_specs_cache(session_id)
+        _logger.info(
+            "session_policies/delete: user=%s deleted policy_id=%s session_id=%s",
+            user_id or "(single-user)",
+            policy_id,
+            session_id,
+        )
+        try:
+            import hashlib as _hashlib
+
+            _srv_id = _get_installation_id()
+            _anon: str | None = None
+            if user_id is not None:
+                _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _tel_emit(
+                _TelPolicyDeletedEvent(
+                    installation_id=_srv_id,
+                    scope="session",
+                    session_id=session_id,
+                    anon_user_id=_anon,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return {"deleted": True}
 
     return router

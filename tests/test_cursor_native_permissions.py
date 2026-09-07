@@ -7,7 +7,10 @@ HTTP boundaries faked:
   ``store.db`` (incl. binary checkpoint frames), suppressing resolved/auto-run
   calls, and the stable elicitation-id format.
 * **Supervisor** — surfacing a settled pending call, the debounce that drops
-  auto-approved calls, and the TUI-resolved release.
+  auto-approved calls, the TUI-resolved release, and the yolo auto-accept path
+  that sends ``y`` without parking a web card — including every way that path
+  refuses to type (no gate on screen, dead pane, undelivered keystroke, retry
+  budget spent) and falls back to the ordinary card.
 * **Verdict delivery** — ``_run_one_approval`` (park → verdict → keystroke,
   incl. the reject → reason-prompt → Enter two-step) and ``_run_one_question``
   (AskQuestion form → picker keystrokes).
@@ -24,6 +27,7 @@ import asyncio
 import contextlib
 import json as _json
 import sqlite3 as _sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -481,6 +485,349 @@ async def test_supervise_transcript_debounces_autoapproved_call(
     assert not any(j.get("type") == "external_elicitation_resolved" for _, j in posts), posts
 
 
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (None, False),
+        ([], False),
+        (["--approve-mcps"], False),
+        (["--auto-review"], False),
+        (["--yolo"], True),
+        (["--force"], True),
+        (["-f"], True),
+        (["--yolo", "--approve-mcps", "--model", "grok"], True),
+        (["--force=true"], True),
+        # An explicit off-value must read as off: this predicate is the safety
+        # gate for typing verdicts into someone's terminal, so it fails closed.
+        (["--yolo=false"], False),
+        (["--force=false"], False),
+        (["--yolo=0"], False),
+        (["--force=no"], False),
+        (["--yolo=OFF"], False),
+        (["--yolo=false", "--approve-mcps"], False),
+        # A bare ``--`` ends cursor-agent's flags; what follows is prompt text.
+        (["--", "-f"], False),
+        (["--", "--yolo"], False),
+        (["--yolo", "--", "-f"], True),
+    ],
+)
+def test_cursor_launch_args_enable_yolo(args: list[str] | None, expected: bool) -> None:
+    """Only the Run Everything CLI flags enable the yolo auto-accept path."""
+    assert cnp.cursor_launch_args_enable_yolo(args) is expected
+
+
+# The block cursor renders for a tool gate. The parenthesised ``(y)`` hint on
+# the accept row is what the yolo path requires on screen before it sends
+# anything, so the fixtures below carry the real shape rather than a bare "y".
+_ACCEPT_PANE = (
+    " $  docker pull example in .\n"
+    " Run this command?\n"
+    " Shell allowlist is empty\n"
+    "  → Run (once) (y)\n"
+    "    Run Everything (shift+tab)\n"
+    "    Skip (esc or n)\n"
+)
+# A live pane with no gate on screen — the stale-marker case, where a keystroke
+# would land in cursor's composer instead of answering anything.
+_IDLE_PANE = "  ~/ws\n  Ask me anything…\n"
+
+_SHELL_CALL = CursorPendingToolCall(
+    tool_call_id="call_shell\nfc",
+    tool_name="Shell",
+    args={"command": "docker pull example"},
+)
+
+
+def _install_supervisor_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    pending: list[CursorPendingToolCall],
+    pane: str | None,
+    deliver_keys: bool = True,
+) -> tuple[list[tuple[str, dict]], list[tuple[str, ...]]]:
+    """Fake the store, pane and HTTP boundaries the supervisor talks to.
+
+    :param pending: Live list of pending calls; mutate it to resolve a gate.
+    :param pane: Pane text ``capture_cursor_pane`` returns, or ``None`` for a
+        dead / unadvertised pane.
+    :param deliver_keys: Whether the keystroke send reports success (``False``
+        models tmux rejecting the send after the capture succeeded).
+    :returns: The recorded ``(posts, keys_sent)`` lists.
+    """
+    posts: list[tuple[str, dict]] = []
+    keys_sent: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
+    (tmp_path / "store.db").write_bytes(b"")
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending))
+    monkeypatch.setattr(cnp, "capture_cursor_pane", lambda _bridge: pane)
+
+    async def _fake_send(_bridge: Path, _session: str, *keys: str) -> bool:
+        keys_sent.append(keys)
+        return deliver_keys
+
+    monkeypatch.setattr(cnp, "_send_cursor_keys", _fake_send)
+
+    class _Resp:
+        status_code = 200
+        content = b""
+
+        def json(self) -> dict:
+            return {}
+
+    class _Client:
+        async def post(self, url: str, json: dict | None = None, **_k):
+            posts.append((url, json or {}))
+            return _Resp()
+
+    monkeypatch.setattr(cnp.httpx, "AsyncClient", lambda **_k: _FakeAsyncCM(_Client()))
+    return posts, keys_sent
+
+
+def _start_supervisor(
+    tmp_path: Path, *, session_id: str, auto_accept_approvals: bool
+) -> asyncio.Task[None]:
+    """Start the supervisor with a fast poll and no settle window."""
+    return asyncio.create_task(
+        cnp.supervise_cursor_transcript_elicitations(
+            base_url="http://x",
+            headers={},
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            workspace="/ws",
+            launch_epoch_ms=0,
+            poll_interval_s=0.01,
+            settle_s=0.0,
+            auto_accept_approvals=auto_accept_approvals,
+        )
+    )
+
+
+async def _wait_for(predicate: Callable[[], bool], *, timeout_s: float = 1.0) -> bool:
+    """Poll *predicate* until it is true or *timeout_s* elapses."""
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return predicate()
+
+
+async def _stop(task: asyncio.Task[None]) -> None:
+    """Cancel a supervisor task and swallow the cancellation."""
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def _hook_posts(posts: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
+    """The parked approval-card POSTs among *posts*."""
+    return [(u, j) for u, j in posts if "hooks/cursor-permission-request" in u]
+
+
+async def test_supervise_transcript_yolo_auto_accepts_without_card(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Under yolo, a settled tool gate is accepted in-pane — no web card.
+
+    cursor-agent's Run Everything mode still sometimes leaves a pending marker
+    long enough for Omnigent to otherwise mirror an ApprovalCard and stall a
+    piloted parent. Auto-accept must send ``y`` and never POST the permission
+    hook.
+    """
+    pending_now = [_SHELL_CALL]
+    posts, keys_sent = _install_supervisor_fakes(
+        monkeypatch, tmp_path, pending=pending_now, pane=_ACCEPT_PANE
+    )
+
+    task = _start_supervisor(tmp_path, session_id="conv_yolo", auto_accept_approvals=True)
+    assert await _wait_for(lambda: bool(keys_sent))
+    # Call resolves after the keystroke (cursor committed it).
+    pending_now.clear()
+    await asyncio.sleep(0.05)
+    await _stop(task)
+
+    assert keys_sent == [("y",)]
+    assert _hook_posts(posts) == []
+    assert not any(j.get("type") == "external_elicitation_resolved" for _, j in posts), posts
+
+
+async def test_supervise_transcript_yolo_caps_retries_then_surfaces_card(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A gate ``y`` never clears is retried a bounded number of times, then mirrored.
+
+    Without a cap the supervisor types ``y`` into the pane every couple of
+    seconds for the life of the session and no human ever sees the gate. After
+    the budget it must fall back to the ApprovalCard the non-yolo path shows.
+    """
+    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_RETRY_S", 0.0)
+    # Stays pending no matter how many times we accept it.
+    pending_now = [_SHELL_CALL]
+    posts, keys_sent = _install_supervisor_fakes(
+        monkeypatch, tmp_path, pending=pending_now, pane=_ACCEPT_PANE
+    )
+
+    task = _start_supervisor(tmp_path, session_id="conv_yolo_cap", auto_accept_approvals=True)
+    assert await _wait_for(lambda: bool(_hook_posts(posts)))
+    # Give the loop several more polls: the card is parked, so nothing more
+    # should be sent and the card must not be re-posted.
+    await asyncio.sleep(0.1)
+    await _stop(task)
+
+    assert keys_sent == [("y",)] * cnp._YOLO_ACCEPT_MAX_ATTEMPTS
+    assert len(_hook_posts(posts)) == 1, posts
+
+
+async def test_supervise_transcript_yolo_never_types_when_no_prompt_on_screen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A pending marker with no gate rendered is mirrored, never typed at.
+
+    This is the stale-marker case the feature exists for. ``tmux send-keys y``
+    against an idle pane types a literal ``y`` into cursor's composer, which
+    then prepends itself to whatever the user types next — so the accept only
+    fires while cursor is actually advertising its accept key.
+    """
+    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_RETRY_S", 0.0)
+    posts, keys_sent = _install_supervisor_fakes(
+        monkeypatch, tmp_path, pending=[_SHELL_CALL], pane=_IDLE_PANE
+    )
+
+    task = _start_supervisor(tmp_path, session_id="conv_yolo_idle", auto_accept_approvals=True)
+    assert await _wait_for(lambda: bool(_hook_posts(posts)))
+    await _stop(task)
+
+    assert keys_sent == []
+    assert len(_hook_posts(posts)) == 1, posts
+
+
+async def test_supervise_transcript_yolo_surfaces_card_when_pane_is_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A dead pane stops the accept immediately instead of spinning on it.
+
+    ``capture_cursor_pane`` returns ``None`` when the tmux target was never
+    advertised or the TUI has exited. A keystroke cannot land, and recording it
+    as delivered would retry forever against a pane that is gone.
+    """
+    posts, keys_sent = _install_supervisor_fakes(
+        monkeypatch, tmp_path, pending=[_SHELL_CALL], pane=None
+    )
+
+    task = _start_supervisor(tmp_path, session_id="conv_yolo_dead", auto_accept_approvals=True)
+    assert await _wait_for(lambda: bool(_hook_posts(posts)))
+    await _stop(task)
+
+    assert keys_sent == []
+    assert len(_hook_posts(posts)) == 1, posts
+
+
+async def test_supervise_transcript_yolo_surfaces_card_when_keystroke_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A send tmux rejects is not counted as an accept that landed."""
+    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_RETRY_S", 0.0)
+    posts, keys_sent = _install_supervisor_fakes(
+        monkeypatch,
+        tmp_path,
+        pending=[_SHELL_CALL],
+        pane=_ACCEPT_PANE,
+        deliver_keys=False,
+    )
+
+    task = _start_supervisor(
+        tmp_path, session_id="conv_yolo_undelivered", auto_accept_approvals=True
+    )
+    assert await _wait_for(lambda: bool(_hook_posts(posts)))
+    await _stop(task)
+
+    # One rejected send is enough to give up — no point retrying a broken pipe.
+    assert keys_sent == [("y",)]
+    assert len(_hook_posts(posts)) == 1, posts
+
+
+async def test_supervise_transcript_without_yolo_never_auto_accepts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without the yolo stance a gate is only ever mirrored, never answered.
+
+    Even with cursor's accept prompt on screen, the default launch must not
+    send a verdict of its own initiative — the card is the only channel.
+    """
+    posts, keys_sent = _install_supervisor_fakes(
+        monkeypatch, tmp_path, pending=[_SHELL_CALL], pane=_ACCEPT_PANE
+    )
+
+    task = _start_supervisor(tmp_path, session_id="conv_plain", auto_accept_approvals=False)
+    assert await _wait_for(lambda: bool(_hook_posts(posts)))
+    await _stop(task)
+
+    assert keys_sent == []
+
+
+async def test_supervise_transcript_yolo_still_parks_askquestion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AskQuestion still mirrors under yolo — that is deliberate human input."""
+    question_call = CursorPendingToolCall(
+        tool_call_id="call_q\nfc",
+        tool_name="AskQuestion",
+        args={
+            "title": "Pick one",
+            "questions": [
+                {
+                    "id": "q1",
+                    "prompt": "Continue?",
+                    "options": [{"id": "yes", "label": "Yes"}, {"id": "no", "label": "No"}],
+                }
+            ],
+        },
+    )
+    posts, keys_sent = _install_supervisor_fakes(
+        monkeypatch, tmp_path, pending=[question_call], pane=_ACCEPT_PANE
+    )
+
+    task = _start_supervisor(tmp_path, session_id="conv_yolo_q", auto_accept_approvals=True)
+    assert await _wait_for(lambda: bool(_hook_posts(posts)))
+    await _stop(task)
+
+    assert keys_sent == []
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_ACCEPT_PANE, True),
+        (_IDLE_PANE, False),
+        ("", False),
+        # The y/n spelling of the same hint.
+        ("  Run this command? (y/n)", True),
+        # A ``y`` in prose is not an advertised key.
+        ("  yes, you may want to run this", False),
+    ],
+)
+def test_pane_shows_accept_prompt(pane: str, expected: bool) -> None:
+    """Only cursor's parenthesised accept hint counts as a gate on screen."""
+    assert cnp._pane_shows_accept_prompt(pane) is expected
+
+
+async def test_send_cursor_keys_reports_undelivered_keystroke(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tmux send that raises reports failure rather than a silent success."""
+
+    def _boom(_bridge: Path, _key: str) -> None:
+        raise RuntimeError("cursor-native tmux target not advertised")
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
+    assert await cnp._send_cursor_keys(tmp_path, "conv_dead", "y") is False
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", lambda *_a, **_k: None)
+    assert await cnp._send_cursor_keys(tmp_path, "conv_live", "y") is True
+
+
 # ── AskQuestion (structured multiple-choice) ─────────────────────────────────
 #
 # cursor's ``AskQuestion`` tool is NOT an approval gate — it is a multi-question
@@ -541,6 +888,36 @@ def test_askquestion_preview_translates_to_web_form_shape() -> None:
     assert all(q["multiSelect"] is False for q in payload["questions"])
 
 
+def test_askquestion_payload_translates_allow_multiple_to_multiselect() -> None:
+    """cursor's ``allowMultiple`` flag becomes the web form's ``multiSelect``.
+
+    cursor marks a multi-select question with ``allowMultiple`` (proto
+    ``allow_multiple``); the web form renders checkboxes only when its own
+    ``multiSelect`` is true, so the flag must survive translation. Anything
+    other than a literal ``True`` (absent, false, or a truthy non-bool) stays
+    single-select.
+    """
+
+    def _payload_for(question_extra: dict[str, object]) -> dict[str, object]:
+        args: dict[str, object] = {
+            "questions": [
+                {
+                    "id": "features",
+                    "prompt": "Which features should I enable?",
+                    "options": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
+                    **question_extra,
+                }
+            ]
+        }
+        return cnp._askquestion_payload(args)["questions"][0]
+
+    assert _payload_for({"allowMultiple": True})["multiSelect"] is True
+    assert _payload_for({"allowMultiple": False})["multiSelect"] is False
+    assert _payload_for({})["multiSelect"] is False
+    # A stray string is not a multi-select marker.
+    assert _payload_for({"allowMultiple": "yes"})["multiSelect"] is False
+
+
 def test_askquestion_keystrokes_navigate_to_chosen_options() -> None:
     """Chosen labels map to Down-navigation + Space + Enter per question."""
     # First option of each question (index 0): just Space + Enter.
@@ -559,6 +936,27 @@ def test_askquestion_keystrokes_navigate_to_chosen_options() -> None:
         {"demo_topic": "A workflow/planning question", "demo_depth": "Detailed"},
     )
     assert keys == ["Down", "Space", "Enter", "Down", "Space", "Enter"]
+
+
+def test_askquestion_keystrokes_toggle_every_option_of_a_multiselect_answer() -> None:
+    """A list answer Space-toggles each chosen option before advancing.
+
+    A multi-select answer arrives as a list of labels; the picker must toggle
+    every one (Down to each row in ascending order, Space on each) and only
+    then press Enter.
+    """
+    keys = cnp._askquestion_keystrokes(
+        _ASKQUESTION_ARGS,
+        {
+            "demo_topic": [
+                "A coding-related question (Recommended)",
+                "A fun preference question",
+            ],
+            "demo_depth": "Brief (Recommended)",
+        },
+    )
+    # Q1: Space on row 0, Down twice to row 2, Space; Enter. Q2: Space, Enter.
+    assert keys == ["Space", "Down", "Down", "Space", "Enter", "Space", "Enter"]
 
 
 def test_askquestion_keystrokes_types_into_other_row_for_custom_answer() -> None:

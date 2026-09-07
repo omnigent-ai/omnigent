@@ -15,8 +15,9 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import TypeAlias
 
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_server_transport import (
     NativeEvent,
     NativeLaunchConfig,
@@ -37,6 +38,8 @@ _logger = logging.getLogger(__name__)
 
 ClientFactory = Callable[[], OpenCodeClient]
 
+_JsonMapping: TypeAlias = Mapping[str, object]
+
 # Public surface of this transport module. ``ClientFactory`` is the documented
 # annotation for ``OpenCodeHttpTransport(client_factory=...)``; export it so the
 # alias reads as intended public API (its only other use is a PEP 563 stringified
@@ -44,7 +47,7 @@ ClientFactory = Callable[[], OpenCodeClient]
 __all__ = ["ClientFactory", "OpenCodeHttpTransport", "build_prompt_payload"]
 
 
-def build_prompt_payload(prompt: NativePrompt) -> dict[str, Any]:
+def build_prompt_payload(prompt: NativePrompt) -> _JsonObject:
     """
     Build an OpenCode prompt request body from a :class:`NativePrompt`.
 
@@ -52,14 +55,14 @@ def build_prompt_payload(prompt: NativePrompt) -> dict[str, Any]:
     :returns: A ``{"parts": [...], ...}`` body for ``POST
         /session/{id}/message`` or ``/prompt_async``.
     """
-    parts: list[dict[str, Any]] = []
+    parts: list[_JsonObject] = []
     if prompt.text:
         parts.append({"type": "text", "text": prompt.text})
     for attachment in prompt.attachments:
         part = _attachment_to_part(attachment)
         if part is not None:
             parts.append(part)
-    payload: dict[str, Any] = {"parts": parts}
+    payload: _JsonObject = {"parts": parts}
     if prompt.system_prompt:
         payload["system"] = prompt.system_prompt
     model = _split_model(prompt.model)
@@ -68,7 +71,7 @@ def build_prompt_payload(prompt: NativePrompt) -> dict[str, Any]:
     return payload
 
 
-def _attachment_to_part(attachment: Mapping[str, Any]) -> dict[str, Any] | None:
+def _attachment_to_part(attachment: _JsonMapping) -> _JsonObject | None:
     """
     Convert an Omnigent attachment block into an OpenCode file part.
 
@@ -85,7 +88,7 @@ def _attachment_to_part(attachment: Mapping[str, Any]) -> dict[str, Any] | None:
         url = attachment.get("file_data") or attachment.get("url")
         if isinstance(url, str) and url:
             mime = _mime_from_data_uri(url) or "application/octet-stream"
-            part: dict[str, Any] = {"type": "file", "mime": mime, "url": url}
+            part: _JsonObject = {"type": "file", "mime": mime, "url": url}
             filename = attachment.get("filename")
             if isinstance(filename, str) and filename:
                 part["filename"] = filename
@@ -206,7 +209,7 @@ class OpenCodeHttpTransport:
         finally:
             await client.aclose()
 
-    async def send_prompt(self, session_id: str, prompt: NativePrompt) -> Mapping[str, Any]:
+    async def send_prompt(self, session_id: str, prompt: NativePrompt) -> _JsonMapping:
         """Inject a prompt via ``POST /session/{id}/prompt_async``."""
         client = self._client()
         try:
@@ -237,7 +240,7 @@ class OpenCodeHttpTransport:
         finally:
             await client.aclose()
 
-    async def list_history(self, session_id: str) -> list[Mapping[str, Any]]:
+    async def list_history(self, session_id: str) -> list[_JsonMapping]:
         """Return the session's message history."""
         client = self._client()
         try:

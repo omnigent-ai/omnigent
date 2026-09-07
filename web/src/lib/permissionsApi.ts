@@ -32,6 +32,22 @@ export function isOwnerLevel(level: number | null): boolean {
 }
 
 /**
+ * Numeric permission level required to mutate the session's shared
+ * workspace. Mirrors ``LEVEL_EDIT`` in ``omnigent/server/auth.py``.
+ */
+export const LEVEL_EDIT = 2;
+
+/**
+ * Return whether a permission level grants edit access — mutating the
+ * session's shared workspace, e.g. opening or closing a shell tab (both
+ * server-gated on ``LEVEL_EDIT``). ``null`` is treated permissively
+ * (single-user / still loading), matching ``isOwnerLevel`` / ``useCanEdit``.
+ */
+export function isEditorLevel(level: number | null): boolean {
+  return level == null || level >= LEVEL_EDIT;
+}
+
+/**
  * Derive the effective permission level for the active conversation.
  *
  * Resolution order:
@@ -41,10 +57,15 @@ export function isOwnerLevel(level: number | null): boolean {
  *    source. Sub-agent (child) sessions are filtered out of the
  *    sidebar list query, so this is the only place their level is
  *    observable.
- * 2. ``activeConv.permission_level`` — sidebar list row. Available
- *    synchronously the moment the user navigates between top-level
- *    conversations, so we use it as a fast path before the single
- *    fetch resolves.
+ * 2. ``activeConv.permission_level`` — sidebar list row, but ONLY when it
+ *    actually carries a level. Available synchronously the moment the user
+ *    navigates between top-level conversations, so it's a fast path before
+ *    the single fetch resolves. A row whose level is ``null`` (a deployment
+ *    whose session list is owner-only and omits the caller's effective
+ *    level, e.g. the Databricks-managed server) carries no conclusion, so we
+ *    skip it and fall through to the authoritative snapshot / fallback
+ *    rather than mistaking the absent level for the permissive ``null``
+ *    sentinel.
  * 3. ``null`` while the single fetch is still in flight (the UI
  *    treats ``null`` permissively, avoiding a read-only flicker
  *    during the snapshot's first round-trip on child sessions).
@@ -60,7 +81,7 @@ export function derivePermissionLevel(
   conversationsLoaded: boolean,
 ): number | null {
   if (session != null) return session.permissionLevel;
-  if (activeConv != null) return activeConv.permission_level ?? null;
+  if (activeConv != null && activeConv.permission_level != null) return activeConv.permission_level;
   if (sessionLoading) return null;
   if (conversationId && conversationsLoaded) return 1;
   return null;
@@ -93,9 +114,27 @@ export interface Permission {
 }
 
 export async function listPermissions(sessionId: string): Promise<Permission[]> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/permissions`);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return (await res.json()) as Permission[];
+  // The endpoint is cursor-paginated ({permissions, next_cursor}); follow the
+  // cursor and concatenate so callers always see the full grant list.
+  const all: Permission[] = [];
+  let after: string | null = null;
+  // Each page provides the cursor for the next request.
+  /* oxlint-disable no-await-in-loop */
+  do {
+    const path = `/v1/sessions/${encodeURIComponent(sessionId)}/permissions${
+      after !== null ? `?after=${encodeURIComponent(after)}` : ""
+    }`;
+    const res = await authenticatedFetch(path);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const data = (await res.json()) as {
+      permissions: Permission[];
+      next_cursor: string | null;
+    };
+    all.push(...data.permissions);
+    after = data.next_cursor;
+  } while (after !== null);
+  /* oxlint-enable no-await-in-loop */
+  return all;
 }
 
 export async function getSessionOwner(sessionId: string): Promise<string | null> {
@@ -119,12 +158,20 @@ export async function grantPermission(
     },
   );
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body?.error?.message ?? `${res.status} ${res.statusText}`);
+    const responseBody = await res.json().catch(() => ({}));
+    throw new Error(responseBody?.error?.message ?? `${res.status} ${res.statusText}`);
   }
   return (await res.json()) as Permission;
 }
 
+/**
+ * Remove a permission grant on a session.
+ *
+ * Passing another user's id revokes them (manage access required). Passing the
+ * caller's OWN id leaves the session — "unshare myself", so a shared session
+ * drops out of your sidebar — which the server allows with only read access.
+ * Either way it refuses to remove the owner's grant (403).
+ */
 export async function revokePermission(sessionId: string, userId: string): Promise<void> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(userId)}`,

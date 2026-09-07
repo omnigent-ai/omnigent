@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import secrets
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -37,14 +38,18 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TypeAlias
+
+from omnigent._platform import stable_user_id
 
 _logger = logging.getLogger(__name__)
+
+_ConfigObject: TypeAlias = dict[str, object]
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_HERMES_NATIVE_BRIDGE_DIR"
 
-_BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{os.getuid()}" / "hermes-native"
+_BRIDGE_ROOT = Path(tempfile.gettempdir()) / f"omnigent-{stable_user_id()}" / "hermes-native"
 _TMUX_FILE = "tmux.json"
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 10.0
@@ -275,7 +280,7 @@ _USER_CONFIG_KEYS = frozenset(
 _HERMES_HOME_SUBDIR = "hermes_home"
 
 
-def _load_user_hermes_config() -> dict:
+def _load_user_hermes_config() -> _ConfigObject:
     """Load inference-relevant keys from the user's ``~/.hermes/config.yaml``."""
     user_config = Path.home() / ".hermes" / "config.yaml"
     if not user_config.is_file():
@@ -297,6 +302,7 @@ def write_policy_hook_config(
     bridge_dir: Path,
     server_url: str,
     session_id: str,
+    hermes_home: Path | None = None,
 ) -> Path:
     """Write per-session ``HERMES_HOME`` with Omnigent policy hook and MCP server.
 
@@ -305,21 +311,32 @@ def write_policy_hook_config(
     1. A ``pre_tool_call`` shell hook that evaluates tool calls against the
        Omnigent policy engine (same hook the headless ``hermes`` harness uses).
     2. An ``mcp_servers.omnigent`` entry that launches the Omnigent MCP stdio
-       server (``serve-mcp``), exposing Omnigent builtin tools
-       (``sys_session_*``, ``sys_agent_*``, ``load_skill``, ``web_fetch``, etc.)
-       to the Hermes model.
+       server (``serve-mcp --bridge-dir <bridge_dir>``), exposing Omnigent
+       builtin tools (``sys_session_*``, ``sys_agent_*``, ``load_skill``,
+       ``web_fetch``, etc.) to the Hermes model.
 
-    Also copies the user's auth/env files so the TUI can still authenticate
-    with its inference provider. Mirrors
-    :func:`omnigent.inner.hermes_executor._populate_hermes_home`.
+    Also copies the user's auth/env files so Hermes can still authenticate with
+    its inference provider. Shared by the ``hermes-native`` TUI path and the
+    headless ``hermes`` executor. The credential-bearing HERMES_HOME and the
+    runner-shared bridge dir are separable: ``bridge_dir`` (predictable, holds
+    only ``bridge.json`` + the relay's ``tool_relay.json``) is the rendezvous
+    the runner and ``serve-mcp`` agree on, while ``hermes_home`` may be a
+    private tempdir so the copied ``.env`` / ``auth.json`` never land on the
+    predictable path. Defaults to ``bridge_dir/hermes_home`` when unset.
 
-    :param bridge_dir: Per-session bridge dir (parent of the HERMES_HOME).
+    :param bridge_dir: Per-session bridge dir (runner<->serve-mcp rendezvous).
     :param server_url: Omnigent server base URL.
     :param session_id: Omnigent session / conversation ID.
+    :param hermes_home: Where to write the credential-bearing home. ``None``
+        places it under ``bridge_dir``.
     :returns: The HERMES_HOME path.
     """
-    hermes_home = bridge_dir / _HERMES_HOME_SUBDIR
-    hermes_home.mkdir(parents=True, exist_ok=True)
+    if hermes_home is None:
+        hermes_home = bridge_dir / _HERMES_HOME_SUBDIR
+    _ensure_dir(bridge_dir)
+    # Owner-only: the home holds the copied .env / auth.json credentials and the
+    # token-bearing hook wrapper.
+    _ensure_dir(hermes_home)
 
     hook_script_path = str(Path(__file__).resolve().parent / "inner" / "hermes_policy_hook.py")
 
@@ -337,11 +354,14 @@ def write_policy_hook_config(
 
     # Merge user config so model/provider/auth settings carry over.
     user_cfg = _load_user_hermes_config()
-    config: dict = {**user_cfg}
+    config: _ConfigObject = {**user_cfg}
 
     config["hooks_auto_accept"] = True
+    existing_hooks = config.get("hooks")
+    if not isinstance(existing_hooks, dict):
+        existing_hooks = {}
     config["hooks"] = {
-        **config.get("hooks", {}),
+        **existing_hooks,
         "pre_tool_call": [
             {
                 "command": str(wrapper),
@@ -352,11 +372,18 @@ def write_policy_hook_config(
 
     # Register the Omnigent MCP stdio server so Hermes can call
     # Omnigent builtin tools (sys_session_*, sys_agent_*, load_skill, etc.).
+    existing_mcp_servers = config.get("mcp_servers")
+    if not isinstance(existing_mcp_servers, dict):
+        existing_mcp_servers = {}
     config["mcp_servers"] = {
-        **config.get("mcp_servers", {}),
+        **existing_mcp_servers,
         "omnigent": {
             "command": sys.executable,
             "args": [
+                # hermes launches MCP servers in the workspace; -I keeps that
+                # cwd off sys.path so a workspace that is an omnigent checkout
+                # can't shadow the installed package (as every other bridge does).
+                "-I",
                 "-m",
                 "omnigent.claude_native_bridge",
                 "serve-mcp",
@@ -389,6 +416,49 @@ def write_policy_hook_config(
     allowlist_path.write_text(json.dumps(allowlist_data, indent=2) + "\n")
 
     return hermes_home
+
+
+def inject_relay_into_policy_hook(
+    bridge_dir: Path,
+    relay_url: str,
+    relay_token: str,
+    server_url: str,
+    session_id: str,
+) -> bool:
+    """Atomically rewrite the policy hook wrapper to use relay credentials.
+
+    Called after the tool relay starts so subsequent hook subprocess
+    invocations authenticate via the relay's non-expiring local token
+    instead of a baked server bearer.
+
+    :returns: ``True`` when the wrapper existed and was rewritten.
+    """
+    hermes_home = bridge_dir / _HERMES_HOME_SUBDIR
+    wrapper = hermes_home / "omnigent-policy-hook.sh"
+    if not wrapper.is_file():
+        return False
+
+    hook_script_path = str(Path(__file__).resolve().parent / "inner" / "hermes_policy_hook.py")
+    from omnigent.native_policy_hook import _RELAY_TOKEN_ENV, _RELAY_URL_ENV
+
+    new_text = (
+        "#!/bin/sh\n"
+        f"export _OMNIGENT_SERVER_URL={shlex.quote(server_url)}\n"
+        f"export _OMNIGENT_SESSION_ID={shlex.quote(session_id)}\n"
+        f"export {_RELAY_URL_ENV}={shlex.quote(relay_url)}\n"
+        f"export {_RELAY_TOKEN_ENV}={shlex.quote(relay_token)}\n"
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(hook_script_path)}\n"
+    )
+    fd, tmp_name = tempfile.mkstemp(prefix="omnigent-policy-hook.", dir=str(hermes_home))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(new_text)
+        os.chmod(tmp_name, 0o700)
+        os.replace(tmp_name, wrapper)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return True
 
 
 def _write_mcp_bridge_config(bridge_dir: Path) -> None:
@@ -457,7 +527,7 @@ def write_tmux_target(
 ) -> None:
     """Advertise the tmux socket + target for the running Hermes terminal."""
     _ensure_dir(bridge_dir)
-    payload: dict[str, Any] = {
+    payload: _ConfigObject = {
         "socket_path": str(socket_path),
         "tmux_target": tmux_target,
         "updated_at": time.time(),

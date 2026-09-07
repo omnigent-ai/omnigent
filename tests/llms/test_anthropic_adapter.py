@@ -1,17 +1,31 @@
 """Tests for llms.adapters.anthropic — translation logic."""
 
+import asyncio
 import base64
 import json
+import logging
 
+import httpx
 import pytest
 
 from omnigent.llms.adapters.anthropic import (
     _anthropic_to_chat,
     _chat_to_anthropic,
+    _clear_model_metadata_cache,
     _convert_tool_choice,
     _convert_tools,
+    _get_anthropic_model_metadata,
+    _stream_request,
     _translate_part_to_anthropic,
 )
+from omnigent.llms.errors import ContextWindowExceededError, PermanentLLMError
+from omnigent.model_metadata import ModelMetadata, ModelReasoningMetadata, ModelReasoningMode
+from omnigent.runtime.llm_retry import classify_llm_error
+
+
+@pytest.fixture(autouse=True)
+def _fresh_model_metadata_cache() -> None:
+    _clear_model_metadata_cache()
 
 
 def test_system_messages_extracted() -> None:
@@ -141,6 +155,52 @@ def test_anthropic_text_response_to_chat() -> None:
     assert chat["choices"][0]["finish_reason"] == "stop"
     assert chat["usage"]["prompt_tokens"] == 10
     assert chat["usage"]["completion_tokens"] == 5
+    assert chat["usage"]["total_tokens"] == 15
+
+
+def test_anthropic_zero_usage_total_is_zero_not_none() -> None:
+    """A genuine zero token total stays ``0``, not ``None``.
+
+    The non-streaming usage builder used ``(a or 0) + (b or 0) or None``, whose
+    precedence collapses a real ``0`` total to ``None`` — yielding an
+    inconsistent ``prompt=0, completion=0, total=None`` and disagreeing with the
+    streaming path, which reports ``input + output`` directly.
+
+    Regression guard: pre-fix ``total_tokens`` is ``None`` here.
+    """
+    resp = {
+        "id": "msg_0",
+        "model": "claude-test",
+        "content": [{"type": "text", "text": ""}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    }
+    chat = _anthropic_to_chat(resp)
+    assert chat["usage"]["prompt_tokens"] == 0
+    assert chat["usage"]["completion_tokens"] == 0
+    assert chat["usage"]["total_tokens"] == 0, (
+        f"total_tokens is {chat['usage']['total_tokens']!r}, expected 0 — a real "
+        "zero total must not collapse to None."
+    )
+
+
+def test_anthropic_missing_usage_counts_are_treated_as_zero() -> None:
+    """Missing non-streaming usage counts normalize to zero."""
+    resp = {
+        "id": "msg_missing_usage",
+        "model": "claude-test",
+        "content": [{"type": "text", "text": ""}],
+        "stop_reason": "end_turn",
+        "usage": {},
+    }
+
+    chat = _anthropic_to_chat(resp)
+
+    assert chat["usage"] == {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": 0,
+    }
 
 
 def test_anthropic_tool_use_response_to_chat() -> None:
@@ -369,11 +429,207 @@ def test_effort_to_budget_low_clamped_to_max_tokens() -> None:
 
 
 def test_reasoning_effort_adds_thinking_to_payload() -> None:
-    """reasoning_effort in extra adds thinking config to the payload."""
+    """Unknown model metadata preserves fixed-budget thinking."""
     messages = [{"role": "user", "content": "Hi"}]
-    payload = _chat_to_anthropic(messages, "claude-test", None, {"reasoning_effort": "high"})
+    payload = _chat_to_anthropic(
+        messages,
+        "claude-test",
+        None,
+        {"reasoning_effort": "high", "temperature": 0.4, "top_p": 0.9},
+    )
     assert payload["thinking"]["type"] == "enabled"
     assert payload["thinking"]["budget_tokens"] == 8192
+    assert "temperature" not in payload
+    assert "top_p" not in payload
+
+
+def test_adaptive_reasoning_uses_effort_and_removes_sampling_controls() -> None:
+    """Live adaptive metadata selects the modern Anthropic payload."""
+    metadata = ModelMetadata(
+        reasoning=ModelReasoningMetadata(
+            modes=frozenset({ModelReasoningMode.ADAPTIVE}),
+            efforts=frozenset({"low", "medium", "high", "xhigh", "max"}),
+        )
+    )
+
+    payload = _chat_to_anthropic(
+        [{"role": "user", "content": "Hi"}],
+        "claude-opus-4-8",
+        None,
+        {"reasoning_effort": "high", "temperature": 0.4, "top_p": 0.9},
+        model_metadata=metadata,
+    )
+
+    assert payload["thinking"] == {"type": "adaptive"}
+    assert payload["output_config"] == {"effort": "high"}
+    assert "temperature" not in payload
+    assert "top_p" not in payload
+
+
+def test_fixed_budget_metadata_keeps_budget_tokens() -> None:
+    """Extended-thinking-only models retain the legacy budget payload."""
+    metadata = ModelMetadata(
+        reasoning=ModelReasoningMetadata(
+            modes=frozenset({ModelReasoningMode.FIXED_BUDGET}),
+        )
+    )
+
+    payload = _chat_to_anthropic(
+        [{"role": "user", "content": "Hi"}],
+        "claude-haiku-4-5",
+        None,
+        {"reasoning_effort": "medium", "temperature": 0.4, "top_p": 0.9},
+        model_metadata=metadata,
+    )
+
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+    assert "output_config" not in payload
+    assert "temperature" not in payload
+    assert "top_p" not in payload
+
+
+def test_adaptive_reasoning_rejects_unsupported_model_effort() -> None:
+    """The live model effort ladder narrows generic Anthropic validation."""
+    metadata = ModelMetadata(
+        reasoning=ModelReasoningMetadata(
+            modes=frozenset({ModelReasoningMode.ADAPTIVE}),
+            efforts=frozenset({"low", "medium", "high", "max"}),
+        )
+    )
+
+    with pytest.raises(PermanentLLMError, match=r"xhigh.*not supported"):
+        _chat_to_anthropic(
+            [{"role": "user", "content": "Hi"}],
+            "claude-sonnet-4-6",
+            None,
+            {"reasoning_effort": "xhigh"},
+            model_metadata=metadata,
+        )
+
+
+@pytest.mark.asyncio
+async def test_model_metadata_lookup_uses_models_api_and_caches() -> None:
+    """Per-model capability metadata is fetched once per cache window."""
+    requests_seen: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "claude-opus-4-8",
+                "max_input_tokens": 1_000_000,
+                "capabilities": {
+                    "thinking": {
+                        "supported": True,
+                        "types": {
+                            "enabled": {"supported": False},
+                            "adaptive": {"supported": True},
+                        },
+                    },
+                    "effort": {
+                        "supported": True,
+                        "low": {"supported": True},
+                        "high": {"supported": True},
+                    },
+                },
+            },
+        )
+
+    transport = httpx.MockTransport(_handler)
+    headers = {"x-api-key": "sk-test", "anthropic-version": "2023-06-01"}
+    first = await _get_anthropic_model_metadata(
+        headers,
+        "https://api.anthropic.com/v1",
+        "claude-opus-4-8",
+        transport=transport,
+    )
+    second = await _get_anthropic_model_metadata(
+        headers,
+        "https://api.anthropic.com/v1",
+        "claude-opus-4-8",
+        transport=transport,
+    )
+
+    assert len(requests_seen) == 1
+    assert str(requests_seen[0].url) == ("https://api.anthropic.com/v1/models/claude-opus-4-8")
+    assert first == second
+    assert first is not None
+    assert first.reasoning is not None
+    assert first.reasoning.modes == frozenset({ModelReasoningMode.ADAPTIVE})
+    assert first.reasoning.efforts == frozenset({"low", "high"})
+    assert first.context_window == 1_000_000
+
+
+@pytest.mark.asyncio
+async def test_model_metadata_lookup_does_not_cache_failures(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A transient lookup failure is retried on the next request."""
+    requests_seen = 0
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests_seen
+        requests_seen += 1
+        if requests_seen == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"id": "claude-opus-4-8"})
+
+    transport = httpx.MockTransport(_handler)
+    headers = {"x-api-key": "sk-test", "anthropic-version": "2023-06-01"}
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.llms.adapters.anthropic"):
+        first = await _get_anthropic_model_metadata(
+            headers,
+            "https://api.anthropic.com/v1",
+            "claude-opus-4-8",
+            transport=transport,
+        )
+    second = await _get_anthropic_model_metadata(
+        headers,
+        "https://api.anthropic.com/v1",
+        "claude-opus-4-8",
+        transport=transport,
+    )
+
+    assert first is None
+    assert second is not None
+    assert requests_seen == 2
+    assert "fixed-budget fallback may be unsupported" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_model_metadata_lookup_deduplicates_concurrent_fetches() -> None:
+    """Concurrent cold lookups share one Models API request."""
+    requests_seen = 0
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests_seen
+        requests_seen += 1
+        await asyncio.sleep(0)
+        return httpx.Response(200, json={"id": "claude-opus-4-8"})
+
+    transport = httpx.MockTransport(_handler)
+    headers = {"x-api-key": "sk-test", "anthropic-version": "2023-06-01"}
+
+    first, second = await asyncio.gather(
+        _get_anthropic_model_metadata(
+            headers,
+            "https://api.anthropic.com/v1",
+            "claude-opus-4-8",
+            transport=transport,
+        ),
+        _get_anthropic_model_metadata(
+            headers,
+            "https://api.anthropic.com/v1",
+            "claude-opus-4-8",
+            transport=transport,
+        ),
+    )
+
+    assert first == second
+    assert first is not None
+    assert requests_seen == 1
 
 
 # ── Stop sequences ───────────────────────────────────────
@@ -555,3 +811,56 @@ def test_max_completion_tokens_alias() -> None:
     messages = [{"role": "user", "content": "Hi"}]
     payload = _chat_to_anthropic(messages, "claude-test", None, {"max_completion_tokens": 2048})
     assert payload["max_tokens"] == 2048
+
+
+# ── Streaming error body buffering ───────────────────────
+
+
+def test_streamed_400_overflow_classified_as_context_window_exceeded(
+    serve_streamed_response,
+) -> None:
+    """
+    A streamed HTTP 400 buffers the error body before raising so
+    ``classify_llm_error`` can detect context-window overflow.
+
+    Without the ``aread()`` guard in ``_stream_request`` the body of a
+    streamed error response is never read; ``exc.response.text`` then
+    raises ``ResponseNotRead``, degrades to
+    ``"<unreadable response body>"``, and a genuine overflow 400 is
+    misclassified as a plain ``PermanentLLMError`` — the workflow's
+    compact-and-retry path never fires.
+
+    Failure meaning: the guard has been removed and streaming
+    Anthropic overflow errors no longer trigger compaction.
+    """
+    overflow_body = json.dumps(
+        {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": ("prompt is too long: 210141 tokens > 200000 maximum"),
+            },
+        }
+    ).encode()
+    serve_streamed_response(400, overflow_body)
+
+    async def _run() -> Exception:
+        gen = _stream_request(
+            headers={},
+            payload={"model": "claude-test", "stream": True},
+            base_url="https://fake-host/v1",
+        )
+        try:
+            async for _ in gen:
+                pass
+        except httpx.HTTPStatusError as exc:
+            return classify_llm_error(exc, [429, 500, 502, 503])
+        raise AssertionError("Expected HTTPStatusError was not raised")
+
+    err = asyncio.run(_run())
+
+    assert isinstance(err, ContextWindowExceededError)
+    assert err.max_context_tokens == 200000
+    assert err.actual_tokens == 210141
+    assert err.detail is not None
+    assert "prompt is too long" in (err.detail.response_body or "")

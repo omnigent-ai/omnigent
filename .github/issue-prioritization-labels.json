@@ -1,0 +1,22 @@
+{
+  "labels": [
+    {"name": "Bug", "color": "d73a4a", "description": "Unexpected or broken behavior"},
+    {"name": "Feature", "color": "a2eeef", "description": "New capability or improvement"},
+    {"name": "Docs", "color": "0075ca", "description": "Documentation change"},
+    {"name": "comp:server", "color": "1d76db", "description": "Server and API"},
+    {"name": "comp:runner", "color": "5319e7", "description": "Agent runner and runtime"},
+    {"name": "comp:repr", "color": "bfdadc", "description": "Representation and storage models"},
+    {"name": "comp:web-ui", "color": "006b75", "description": "Web and desktop UI"},
+    {"name": "comp:tui", "color": "0e8a16", "description": "CLI, REPL, and terminal UI"},
+    {"name": "comp:policies", "color": "b60205", "description": "Policies and guardrails"},
+    {"name": "comp:infra", "color": "cfd3d7", "description": "Infrastructure and CI"},
+    {"name": "comp:harness-t1", "color": "5319e7", "description": "Highest-usage harnesses"},
+    {"name": "comp:harness-t2", "color": "7057ff", "description": "Mainline harnesses"},
+    {"name": "comp:harness-t3", "color": "bfd4f2", "description": "Lower-usage harnesses"},
+    {"name": "comp:sandbox", "color": "b60205", "description": "Sandbox isolation and egress"},
+    {"name": "comp:db", "color": "0e8a16", "description": "Database, persistence, and migrations"},
+    {"name": "comp:ios", "color": "1d76db", "description": "iOS app shell"},
+    {"name": "comp:android", "color": "3ddc84", "description": "Android app shell"},
+    {"name": "comp:auth", "color": "0052cc", "description": "Authentication and credentials"}
+  ]
+}

@@ -82,6 +82,7 @@ from omnigent.inner.executor import (
     Message,
     ToolSpec,
     TurnComplete,
+    describe_exception,
 )
 from omnigent.llms.errors import PermanentLLMError
 from omnigent.reasoning_effort import ANTIGRAVITY_EFFORTS, validate_effort_or_llm_error
@@ -231,7 +232,7 @@ class AntigravityNativeExecutor(Executor):
             try:
                 validate_effort_or_llm_error(effort, "antigravity", ANTIGRAVITY_EFFORTS)
             except PermanentLLMError as exc:
-                yield ExecutorError(message=str(exc))
+                yield ExecutorError(message=describe_exception(exc))
                 return
         text = _latest_user_text(messages, self._bridge_dir)
         if not text:
@@ -453,7 +454,7 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
-        from omnigent.inner.native_attachments import materialize_attachment
+        from omnigent.inner.native_attachments import attachment_reference_line
 
         attachment_lines: list[str] = []
         text_parts: list[str] = []
@@ -466,9 +467,7 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
                 if isinstance(text, str) and text:
                     text_parts.append(text)
             elif block_type in ("input_image", "input_file"):
-                path = materialize_attachment(block, bridge_dir)
-                if path is not None:
-                    attachment_lines.append(f"[Attached: {path}]")
+                attachment_lines.append(attachment_reference_line(block, bridge_dir))
         return "\n".join(attachment_lines + text_parts).strip()
     if content is None:
         return ""

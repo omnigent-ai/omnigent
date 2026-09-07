@@ -52,6 +52,29 @@ describe("sessionWorkspaceState", () => {
     expect(stored).toEqual(Array.from({ length: 20 }, (_, i) => `f${i + 5}`));
   });
 
+  it("persists shell tabs (openTerminals + selectedTerminalKey) per session", () => {
+    writeSessionWorkspaceState("conv_shell", {
+      openTerminals: ["terminal:a", "terminal:b"],
+      selectedTerminalKey: "terminal:b",
+    });
+
+    // Shell tabs round-trip like file tabs so a session switch / reload can
+    // restore the strip. A failure means the fields aren't persisted or the
+    // sanitizer drops them.
+    expect(readSessionWorkspaceState("conv_shell")).toEqual({
+      openTerminals: ["terminal:a", "terminal:b"],
+      selectedTerminalKey: "terminal:b",
+    });
+  });
+
+  it("caps the persisted shell tabs at 20, keeping the most recent", () => {
+    const terminals = Array.from({ length: 25 }, (_, i) => `terminal:t${i}`);
+    writeSessionWorkspaceState("conv_terms", { openTerminals: terminals });
+
+    const stored = readSessionWorkspaceState("conv_terms").openTerminals;
+    expect(stored).toEqual(Array.from({ length: 20 }, (_, i) => `terminal:t${i + 5}`));
+  });
+
   it("prunes the least-recently-touched session past the cap (numeric ids)", () => {
     // Seed exactly MAX_SESSIONS sessions with purely numeric ids ("1".."100").
     // Numeric-string keys are the case a plain object store gets wrong: V8

@@ -38,26 +38,34 @@ def test_workspace_scope_sets_and_resets() -> None:
 def test_insert_stamps_scoped_workspace(db_uri: str) -> None:
     """An ORM insert stamps ``workspace_id`` from the active context."""
     store = SqlAlchemyAgentStore(db_uri)
-    store.create(agent_id="ag_ws0", name="n0", bundle_location="loc")
+    store.create(agent_id="ce2e8b9df3fda6a891350c75625640bf", name="n0", bundle_location="loc")
     with workspace_scope(42):
-        store.create(agent_id="ag_ws42", name="n42", bundle_location="loc")
+        store.create(
+            agent_id="dcfa34ef0735a8784bdfa70b6cad0142", name="n42", bundle_location="loc"
+        )
 
     engine = sa.create_engine(db_uri)
     with engine.connect() as conn:
-        stored = dict(conn.exec_driver_sql("SELECT id, workspace_id FROM agents").fetchall())
+        # Raw driver read bypasses the Uuid16 type, so ids come back as the raw
+        # 16 bytes — decode to bare hex to compare (this test checks workspace_id).
+        rows = conn.exec_driver_sql("SELECT id, workspace_id FROM agents").fetchall()
+        stored = {(k.hex() if isinstance(k, (bytes, bytearray)) else k): v for k, v in rows}
     engine.dispose()
-    assert stored == {"ag_ws0": 0, "ag_ws42": 42}
+    assert stored == {
+        "ce2e8b9df3fda6a891350c75625640bf": 0,
+        "dcfa34ef0735a8784bdfa70b6cad0142": 42,
+    }
 
 
 def test_reads_are_isolated_per_workspace(db_uri: str) -> None:
     """A row created in one workspace is invisible from another."""
     store = SqlAlchemyAgentStore(db_uri)
-    store.create(agent_id="ag_default", name="d", bundle_location="loc")
+    store.create(agent_id="dfcff8d2c8d4ff3cd5be9f2a7194d409", name="d", bundle_location="loc")
     with workspace_scope(42):
-        store.create(agent_id="ag_tenant", name="t", bundle_location="loc")
+        store.create(agent_id="da4899778b7c60ee14cfaee729dbb171", name="t", bundle_location="loc")
         # In workspace 42: sees its own row, not workspace 0's.
-        assert store.get("ag_tenant") is not None
-        assert store.get("ag_default") is None
+        assert store.get("da4899778b7c60ee14cfaee729dbb171") is not None
+        assert store.get("dfcff8d2c8d4ff3cd5be9f2a7194d409") is None
     # Back in the default workspace: the reverse.
-    assert store.get("ag_default") is not None
-    assert store.get("ag_tenant") is None
+    assert store.get("dfcff8d2c8d4ff3cd5be9f2a7194d409") is not None
+    assert store.get("da4899778b7c60ee14cfaee729dbb171") is None

@@ -2,7 +2,7 @@
 Always-on CLI diagnostics log.
 
 Captures exceptions, warnings, and diagnostic info to a per-invocation
-log file under ``~/.omnigent/logs/cli-*.log``. Separate from the
+log file under ``<data-dir>/logs/cli/cli-*.log``. Separate from the
 ``--log`` conversation JSON transcript and the ``--debug-events`` SSE
 tape — this layer is always on so crash context is available even when
 the user didn't know to enable debugging ahead of time.
@@ -28,7 +28,6 @@ import contextlib
 import io
 import logging
 import os
-import re
 import sys
 import time
 from dataclasses import dataclass
@@ -36,14 +35,25 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import cast
 
-from omnigent_ui_sdk import state_dir
+from omnigent.cli_invocation import cli_invocation
+from omnigent.process_logging import (
+    RedactingLogFormatter,
+    effective_log_level,
+    env_truthy,
+    process_log_dir,
+    redact_log_text,
+    terminal_supports_color,
+)
+
+_RedactingFormatter = RedactingLogFormatter
+_redact = redact_log_text
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-#: Subdirectory under :func:`state_dir` for CLI diagnostic logs.
-_LOGS_SUBDIR = "logs"
+#: Destination subdirectory under ``<data-dir>/logs`` for CLI diagnostics.
+_LOG_DESTINATION = "cli"
 
 #: Maximum number of ``cli-*.log`` files kept before pruning.
 MAX_LOG_FILES = 20
@@ -96,65 +106,6 @@ class _LoggingStreamSnapshot:
 
 
 _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
-
-# ---------------------------------------------------------------------------
-# Secret redaction filter
-# ---------------------------------------------------------------------------
-
-#: Patterns that match values likely to be secrets.  Applied to every
-#: log record's formatted message before it hits the file.
-_SECRET_PATTERNS: list[re.Pattern[str]] = [
-    # Header values: "Authorization: Bearer xxx" or "bearer xxx"
-    re.compile(r"(?i)(authorization\s*[:=]\s*)\S+"),
-    re.compile(r"(?i)(bearer\s+)\S+"),
-    # Env-var style keys: FOO_TOKEN=xxx, FOO_API_KEY=xxx, ...
-    re.compile(r"(?i)(\b\w*(?:token|api_key|secret|password)\s*[:=]\s*)\S+"),
-    # Anthropic / OpenAI style keys
-    re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
-    # Databricks PATs
-    re.compile(r"\bdapi[A-Za-z0-9]{10,}\b"),
-]
-_REDACTED = "[REDACTED]"
-
-
-def _redact(text: str) -> str:
-    """
-    Replace secret-shaped substrings in *text* with :data:`_REDACTED`.
-
-    :param text: Arbitrary log text (may include tracebacks).
-    :returns: Scrubbed text.
-    """
-    for pat in _SECRET_PATTERNS:
-        text = pat.sub(
-            lambda m: m.group(1) + _REDACTED if m.lastindex else _REDACTED,
-            text,
-        )
-    return text
-
-
-class _RedactingFormatter(logging.Formatter):
-    """
-    Formatter that scrubs obvious secrets from the *final* formatted
-    output — after ``%``-interpolation of ``record.args`` and after
-    traceback rendering.
-
-    A ``logging.Filter`` on ``record.msg`` would run *before*
-    formatting, so secrets passed as ``logger.info("key=%s", secret)``
-    or appearing in exception tracebacks would slip through.
-    Overriding :meth:`format` is the correct interception point
-    because the base class returns the fully-assembled string
-    (message + traceback) and nothing downstream mutates it before
-    the handler writes.
-    """
-
-    def format(self, record: logging.LogRecord) -> str:
-        """
-        Format *record* then redact secrets from the result.
-
-        :param record: The log record to format.
-        :returns: Formatted, redacted string ready for the handler.
-        """
-        return _redact(super().format(record))
 
 
 class _RedactingStderr(io.TextIOBase):
@@ -224,12 +175,12 @@ def _log_dir() -> Path:
     """
     Return the CLI diagnostics log directory.
 
-    Uses :func:`omnigent_ui_sdk.state_dir` as the shared
-    ``~/.omnigent`` root so the path is defined in one place.
+    Uses the shared Omnigent runtime data dir so ``OMNIGENT_DATA_DIR``
+    isolates diagnostics with the DB, artifacts, and process logs.
 
-    :returns: ``~/.omnigent/logs``.
+    :returns: ``<data-dir>/logs/cli``.
     """
-    return Path(state_dir()) / _LOGS_SUBDIR
+    return process_log_dir(_LOG_DESTINATION)
 
 
 def setup_cli_logging(argv: list[str]) -> CliLogContext:
@@ -261,29 +212,38 @@ def setup_cli_logging(argv: list[str]) -> CliLogContext:
     log_path = log_dir / filename
 
     # Rotating handler — caps a single invocation at MAX_LOG_BYTES.
+    log_level = effective_log_level()
     handler = RotatingFileHandler(
         log_path,
         maxBytes=MAX_LOG_BYTES,
         backupCount=_BACKUP_COUNT,
         encoding="utf-8",
     )
+    handler.setLevel(log_level)
     # Best-effort 0600 permissions on the log file.
     with contextlib.suppress(OSError):
         os.chmod(log_path, 0o600)
 
     handler.setFormatter(
         _RedactingFormatter(
-            fmt="%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
-            datefmt="%H:%M:%S",
+            use_colors=False,
         )
     )
 
-    # Wire our two package hierarchies at INFO so their records reach
+    stream_handler: logging.Handler | None = None
+    if env_truthy(os.environ.get("OMNIGENT_LOG_TO_STDERR")) and sys.stderr.isatty():
+        stream_handler = logging.StreamHandler(sys.stderr)
+        stream_handler.setLevel(log_level)
+        stream_handler.setFormatter(_RedactingFormatter(use_colors=terminal_supports_color()))
+
+    # Wire our two package hierarchies at the effective level so their records reach
     # the file handler.
     for name in ("omnigent", "omnigent_ui_sdk"):
         logger = logging.getLogger(name)
-        logger.setLevel(logging.INFO)
+        logger.setLevel(log_level)
         logger.addHandler(handler)
+        if stream_handler is not None:
+            logger.addHandler(stream_handler)
         logger.propagate = False
 
     # Suppress noisy third-party loggers that are commonly present.
@@ -378,17 +338,14 @@ def log_cli_error_hint(exc: BaseException) -> None:
     print(f"Details logged to {path}", file=dest)
 
 
-def print_setup_hint() -> None:
+def print_stale_host_hint() -> None:
     """
-    Print a one-line configuration-recovery hint on stderr.
+    Print a one-line stale-host recovery hint on stderr.
 
     Used by the top-level :func:`omnigent.cli.main` exception
-    handlers so any error the CLI surfaces ends with a pointer to
-    the model-configuration command. The dominant root cause for CLI
-    failures in the wild is a missing or misconfigured model
-    credential — a hint that nudges the user toward
-    ``omnigent setup`` keeps the recovery path obvious without
-    requiring per-call classification of "is this auth?".
+    handlers so errors that wrap runner startup failures include the
+    recovery path for stale host processes. Those processes can retain
+    invalid server authentication and cause runner tunnel rejections.
 
     Like :func:`log_cli_error_hint`, the line is written through
     to the original ``stderr`` so it survives any logging-driven
@@ -399,8 +356,9 @@ def print_setup_hint() -> None:
     """
     dest = getattr(sys.stderr, "_original_stderr", sys.stderr)
     print(
-        "If this looks like an auth or configuration problem, run "
-        "`omnigent setup` to configure a model credential.",
+        "If this is a runner tunnel rejection (HTTP 401), stale host processes "
+        f"may be the cause. Run `{cli_invocation()} stop` to stop existing Omnigent "
+        "host instances, then try again.",
         file=dest,
     )
 

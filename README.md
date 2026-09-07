@@ -43,10 +43,12 @@ Omnigent lets you:
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
   disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
+  [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
-  [Boxlite](https://github.com/boxlite-ai/boxlite), or
+  [Boxlite](https://github.com/boxlite-ai/boxlite),
+  [microsandbox](https://github.com/superradcompany/microsandbox), or
   [Databricks](https://www.databricks.com) sandboxes, launched from the
   CLI or provisioned by the server per session (*managed hosts*).
 
@@ -68,12 +70,38 @@ curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/i
 ```
 
 <details>
+<summary>Optional integrations and extras</summary>
+
+Need an optional integration? Pass one or more extras to the installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh -s -- --extra databricks
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh -s -- --extra modal,e2b
+```
+
+Available user-facing extras include:
+
+- **Model providers:** `databricks`, `bedrock`, `vertex`
+- **Sandbox providers:** `modal`, `daytona`, `blaxel`, `boxlite`, `microsandbox`,
+  `cwsandbox`, `e2b`, `openshell`, `kubernetes`
+- **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`
+- **Storage and memory:** `s3`, `hindsight`
+
+</details>
+
+<details>
 <summary>Prefer to install manually?</summary>
 
 Omnigent needs **Python 3.12+**. Install the `omnigent` package:
 
 ```bash
 uv tool install omnigent        # or: pip install "omnigent"
+```
+
+Manual installs use the same extras syntax, for example:
+
+```bash
+uv tool install "omnigent[databricks,modal]"
 ```
 
 Or with [Homebrew](https://github.com/omnigent-ai/homebrew-tap):
@@ -96,10 +124,10 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 - **`uv`** (required). https://docs.astral.sh/uv/getting-started/installation/
   The installer offers to set this up for you.
 - **`git`** (required).
-- **Node.js 22 LTS or newer** with **`npm`**, for the npm-installed coding
-  harnesses (Claude, Codex, OpenCode, Pi). `omnigent run` installs the
-  harness CLI you pick.
-  https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
+- **Node.js 22 LTS or newer** with **`npm`** (for the coding-harness CLIs
+  installed by `omnigent run`) and **`pnpm`** (for the web UI). You can get
+  both from a single Node install; pnpm is available via
+  `corepack enable` or `npm install -g pnpm`.
 - **Kiro CLI** (optional), for `omnigent kiro`: install with
   `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
   Kiro tool approvals stay answerable in the embedded Terminal; supported
@@ -173,6 +201,41 @@ mirrors work out of the box; override with `OMNIGENT_INDEX_URL` if needed.
 
 </details>
 
+<details>
+<summary>Uninstalling Omnigent</summary>
+
+Preview the CLI/profile cleanup that would run by default:
+
+```bash
+omnigent uninstall
+```
+
+Remove the CLI and installer-managed PATH entries while keeping your local
+history, credentials, and projects:
+
+```bash
+omnigent uninstall --yes
+```
+
+To also remove Omnigent state under `~/.omnigent`, pass `--purge`; Omnigent
+backs it up outside the target before deletion. Your `~/omnigent` workspace is
+kept unless you explicitly add `--purge-workspace`.
+
+```bash
+omnigent uninstall --purge --yes
+```
+
+If the installed wheel is broken or `omnigent` is not on `PATH`, run the
+standalone script instead:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/uninstall_oss.sh | sh
+```
+
+Add `--yes` to the standalone script to perform the previewed CLI cleanup.
+
+</details>
+
 ### 2. Start your first agent
 
 `omnigent` picks a model with you and starts a session in your terminal. It
@@ -201,10 +264,51 @@ Or launch a specific agent runtime:
 omnigent claude                      # Claude Code, in a session your team can join
 omnigent codex                       # Codex
 omnigent cursor                      # Cursor
+omnigent agy                         # Antigravity
 omnigent opencode                    # OpenCode
 omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 ```
+
+`omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
+direct Gemini API authentication takes precedence over agy's saved OAuth login.
+
+Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
+its coding agents or drive a live OpenClaw Gateway session over ACP.
+
+<details>
+<summary>Grok Build and Devin</summary>
+
+Two more coding agents are built in but have no `omnigent <name>` launcher of
+their own, because each ships a CLI that holds its own login. Install the vendor
+CLI, log in with it, then name the harness:
+
+```bash
+# Grok Build (xAI)
+curl -fsSL https://x.ai/cli/install.sh | bash
+grok login --device-auth              # xAI OAuth
+omnigent run --harness grok           # 'grok-build' also works
+
+# Devin (Cognition)
+curl -fsSL https://cli.devin.ai/install.sh | bash
+devin auth login
+omnigent run --harness devin
+```
+
+Both speak the [Agent Client Protocol](https://agentclientprotocol.com) over
+stdio, and Omnigent stores no credential for either — each CLI reads back the
+login it wrote to disk. That also means `--model` is refused rather than
+silently dropped: both run their account-default model. To pin one, configure an
+`acp:` agent whose command passes the vendor's own model flag.
+
+Use the vendor login rather than an API key. A builtin ACP row has no
+`env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
+credential allowlist, so exporting it in your shell does not reach the agent.
+If you need the key route, pass it explicitly with
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`, or configure an `acp:` agent that
+declares the passthrough.
+
+</details>
 
 #### 🐙 Polly and 🟠🔵 Debby
 
@@ -213,6 +317,7 @@ Two example agents ship with the repo, and they make good first sessions:
 ```bash
 omnigent run examples/polly/
 omnigent run examples/debby/
+omnigent run examples/deep-research/
 
 # ...or on a different harness (sub-agents keep their own):
 omnigent run examples/polly/ --harness <harness>
@@ -230,15 +335,57 @@ side by side. Type `/debate` and the heads critique each other for a few
 rounds before converging. (She needs both a Claude and an OpenAI credential;
 see step 3.)
 
-**Prefer the browser?** Start a server and register your machine as a host:
+**🔎 Deep Research** is a single agent that answers a question with a cited,
+cross-checked report. It plans sub-queries, searches the live web and reads
+full pages through an MCP search server, and verifies each claim across
+independent sources. It's also the simplest example to copy from: one agent
+plus one `tools/mcp/*.yaml` server, no sub-agents.
+
+**Prefer the browser?** One command starts the local server and registers this
+machine as a host:
 
 ```bash
-omnigent server start   # start the local server and web UI in the background
-omnigent host           # (separate terminal) register this machine as a host
+omnigent start   # starts the local server and registers this machine as a host
 ```
 
-In the web UI, hit **New Chat**, pick your machine, and go. Check status with
-`omnigent server status`; stop everything with `omnigent stop`.
+Open the server URL it prints, hit **New Chat**, pick your machine, and go.
+Check status with `omnigent server status`; stop everything with
+`omnigent stop`.
+
+<details>
+<summary>Customize automatic session titles</summary>
+
+Set additional natural-language requirements for the isolated title generator:
+
+```bash
+omnigent config set --global \
+  'session_title_instructions=Prefix titles with the current date as lowercase mon-dd. Use PR-number-short-name for pull requests, issue-number-short-description for issues, and a short snake_case activity otherwise.'
+```
+
+The title generator receives the current date as `YYYY-MM-DD`, then applies
+these requirements to the first user message. The setting is server-owned and
+does not alter an agent's portable instructions. Default generated titles are
+limited to 100 characters; custom title requirements may use up to 200.
+Default titles over 100 characters are rejected, leaving the first-message
+fallback title in place. Custom titles over 200 characters are truncated with
+a trailing ellipsis. Manually assigned titles are also limited to 200
+characters. The setting applies to new sessions after the local Omnigent
+server restarts.
+For longer instructions, edit `~/.omnigent/config.yaml` directly and use a YAML
+block scalar:
+
+```yaml
+session_title_instructions: |
+  Prefix every title with the current date as lowercase mon-dd.
+  For pull requests use mon-dd-PR-number-short-name.
+  For issues use mon-dd-issue-number-short-description.
+  For other work use mon-dd-short_snake_case_activity.
+```
+
+Server operators can set the same key in the YAML passed to
+`omnigent server --config`.
+
+</details>
 
 ### 3. Choose & switch models
 
@@ -292,8 +439,10 @@ Face Spaces**, **Modal**, **Cloudflare** (serverless, scale-to-zero), and
 covered too — and a **Cloudflare quick tunnel** (public) or **Tailscale**
 (private) reaches a server running on your own laptop without a deploy. The
 server can also provision a cloud sandbox per session (*managed hosts*), so no
-laptop has to stay online. The full menu of targets, the database options, and
-the sandbox setup live in
+laptop has to stay online. The full menu of targets, the database options, the
+sandbox setup, and
+[branding/white-labeling](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md#branding-white-labeling)
+live in
 [`deploy/README.md`](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md).
 
 Once the server is up, sign in and register your laptop as a host:
@@ -313,7 +462,7 @@ Omnigent supports **multi-user accounts**, controlled by one environment
 variable:
 
 ```bash
-OMNIGENT_AUTH_ENABLED=1 omnigent server start
+OMNIGENT_AUTH_ENABLED=1 omnigent server --background
 ```
 
 The **Docker deploy in [step 4](#4-deploy-a-server-and-use-it-from-your-phone)
@@ -338,6 +487,9 @@ and they're in. Signup is invite-only.
 
 - **Share a live session.** Hit **Share** in the web UI and send the link;
   teammates watch your agent work and chat with it in real time.
+- **Leave a shared session.** Done with a session someone shared with you?
+  Pick **Leave session** from its sidebar row menu to drop it from your
+  sidebar. Nothing is deleted — the owner keeps it and can share it again.
 - **Co-drive.** A teammate co-attaches to your running session; their
   messages execute on **your** machine. Great for pairing or handing the
   keyboard to a domain expert mid-investigation.
@@ -447,6 +599,17 @@ Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/e
 
 ---
 
+## Telemetry
+
+Omnigent collects anonymized usage data (telemetry) by default. This data
+contains no sensitive or personally identifiable information. If you're using
+Omnigent through a managed service or distribution, please consult your managed
+service agreement to determine any data collection that may impact your use of
+the service. To opt out, follow our instructions in
+[Usage Telemetry](https://omnigent.ai/docs/deploy/telemetry).
+
+---
+
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md) for how to set up your environment, run the checks, and open a pull request.
@@ -463,4 +626,3 @@ Thanks to all of our amazing contributors!
 <a href="https://github.com/omnigent-ai/omnigent/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=omnigent-ai/omnigent" />
 </a>
-

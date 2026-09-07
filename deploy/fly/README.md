@@ -35,14 +35,23 @@ Then:
 1. **Memory** — `fly.toml` pins a **1 GB** machine (`[[vm]] memory = "1gb"`).
    The server idles around ~275 MB RSS, so Fly's 256 MB default OOM-loops.
    Keep it at 1 GB (or `fly scale memory 1024 -a <your-app>` if you changed it).
-2. **Admin password** prints once in the first-boot logs:
+2. **Create the first admin.** No credentials are auto-generated. First boot
+   prints a "No admin yet" line pointing at your `*.fly.dev` URL:
    ```bash
    fly logs -a <your-app>
    ```
-   Look for `Created initial admin account ... password: <generated>` (also
-   written to `/data/admin-credentials` on the volume).
-3. Open `https://<your-app>.fly.dev`, log in as `admin`. The cookie secret and
-   base URL (`FLY_APP_NAME` -> `<app>.fly.dev`) are handled automatically.
+   Open `https://<your-app>.fly.dev` and use the web Create-admin form to pick
+   your own username + password. For a headless deploy, pre-seed
+   `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD` (`fly secrets set …`) before first
+   boot to create the admin directly instead.
+3. Log in with the admin you just created. The cookie secret and base URL
+   (`FLY_APP_NAME` -> `<app>.fly.dev`) are handled automatically.
+
+> **Security note for public deployments:** `POST /auth/setup` is
+> unauthenticated while no password-bearing account exists, so an instance
+> exposed before you reach the Create-admin form can be claimed by the first
+> visitor. Pre-seed `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`, or complete setup
+> promptly after the deploy goes live.
 
 ## Deploy (Fly web-UI Launch)
 

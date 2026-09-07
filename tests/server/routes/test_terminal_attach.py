@@ -638,69 +638,39 @@ async def test_attach_terminal_local_fallback_missing_closes_4404(
     assert exc_info.value.code == 4404
 
 
-async def test_attach_terminal_local_fallback_spawns_tmux(
+async def test_attach_terminal_local_fallback_uses_control_mode(
     app: FastAPI,
     server_registry: TerminalRegistry,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    With a seeded local entry and no WS factory, the route resolves
-    the terminal id back to the registry entry and spawns ``tmux
-    attach -t <target>`` against the local socket path. The fork is
-    intercepted so we can verify the argv without invoking tmux.
-
-    :param app: The FastAPI app fixture.
-    :param server_registry: The runtime registry fixture.
-    :param tmp_path: Pytest tmpdir.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
+    """The local fallback always attaches through tmux control mode."""
     _seed_registry(
         server_registry,
         "conv_local_attach",
         [_make_running_instance("bash", "s1", tmp_path)],
     )
-    # argv (list) and the child env (dict) land under separate keys.
-    captured: dict[str, object] = {}
+    calls: list[tuple[str, str, bool]] = []
 
-    def fake_fork() -> tuple[int, int]:
-        return 0, 0
+    async def fake_control(
+        websocket: object,
+        *,
+        socket_path: str,
+        tmux_target: str,
+        read_only: bool,
+    ) -> None:
+        del websocket
+        calls.append((socket_path, tmux_target, read_only))
 
-    def fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
-        captured["argv"] = argv
-        captured["env"] = env
-        raise OSError("stop child path")
-
-    exit_exc = RuntimeError("child exited")
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.pty.fork", fake_fork)
-    # Production resolves the absolute tmux path and builds the child env
-    # in the parent; the child calls os.execve (no PATH search, explicit
-    # env) — patch execve, not execv/execvp.
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.os.execve", fake_execve)
     monkeypatch.setattr(
-        "omnigent.terminals.ws_bridge.os._exit",
-        lambda code: (_ for _ in ()).throw(exit_exc),
+        "omnigent.server.routes.terminal_attach.bridge_tmux_control_to_websocket",
+        fake_control,
     )
 
-    with pytest.raises(RuntimeError, match="child exited"):
-        with TestClient(app).websocket_connect(
-            # ``?transport=pty`` pins this to the PTY bridge (which forks tmux
-            # attach) independent of the global control-mode default.
-            "/v1/sessions/conv_local_attach/resources/terminals/terminal_bash_s1/attach"
-            "?read_only=true&transport=pty"
-        ):
-            pass
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_local_attach/resources/terminals/terminal_bash_s1/attach"
+        "?read_only=true&transport=pty"
+    ):
+        pass
 
-    # tmux argv must include -r (read-only) and the local socket
-    # path the registry knew about. If the socket path is the wrong
-    # one, the resolver picked up the wrong registry entry.
-    assert captured["argv"][0] == "tmux"
-    assert "-r" in captured["argv"], (
-        f"Expected '-r' in argv for read_only=true, got {captured['argv']!r}"
-    )
-    assert str(tmp_path / "bash-s1.sock") in captured["argv"], (
-        f"Expected the registry's socket path in argv, got {captured['argv']!r}"
-    )
-    # The attach client always advertises the web terminal's real type;
-    # inheriting the ambient TERM broke headless (sandbox) hosts.
-    assert captured["env"]["TERM"] == "xterm-256color"
+    assert calls == [(str(tmp_path / "bash-s1.sock"), "main", True)]

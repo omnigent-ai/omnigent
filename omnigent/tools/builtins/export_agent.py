@@ -7,7 +7,6 @@ location on disk.
 
 from __future__ import annotations
 
-import json
 import shutil
 from pathlib import Path
 
@@ -16,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins._arguments import parse_json_object_arguments
 from omnigent.tools.builtins.upload_file import safe_resolve
 
 _SCHEMA: dict[str, Any] = {
@@ -105,13 +105,16 @@ class ExportAgentTool(Tool):
         :param ctx: Execution context with ``workspace`` path.
         :returns: Success message or error string.
         """
-        parsed: dict[str, Any] = json.loads(arguments) if arguments else {}
+        parsed, error = parse_json_object_arguments(arguments)
+        if error is not None:
+            return f"Error: {error}"
+        assert parsed is not None
         source_rel = parsed.get("source", "")
         target_str = parsed.get("target", "")
 
-        if not source_rel:
+        if not isinstance(source_rel, str) or not source_rel:
             return "Error: 'source' parameter is required."
-        if not target_str:
+        if not isinstance(target_str, str) or not target_str:
             return "Error: 'target' parameter is required."
 
         if ctx.workspace is None:

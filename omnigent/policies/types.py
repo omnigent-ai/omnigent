@@ -28,13 +28,32 @@ and :class:`PolicyResult` from here (or from the
 
 from __future__ import annotations
 
+import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol, cast
 
 from omnigent.spec.types import Phase, PolicyAction, StateUpdate
 
 if TYPE_CHECKING:
-    from omnigent.entities import ConversationItem
+    from omnigent.llms.client import Client
+    from omnigent.llms.types import Response, ResponseStreamEvent
+
+
+class _CreateResponse(Protocol):
+    async def __call__(
+        self,
+        *,
+        input: list[dict[str, object]],
+        model: str,
+        connection_params: dict[str, str] | None,
+        timeout: int | None,
+        instructions: str | None,
+        **kwargs: object,
+    ) -> Response | AsyncIterator[ResponseStreamEvent]: ...
+
+
+_log = logging.getLogger(__name__)
 
 
 # Proto-style phase wire strings (the ``type`` field on events that
@@ -185,19 +204,18 @@ class EvaluationContext:
     """
 
     phase: Phase
-    content: Any
+    content: object
     tool_name: str | None = None
-    trajectory: list[ConversationItem] | None = None
     actor: dict[str, str] | None = None
-    request_data: Any = None
-    session_state: dict[str, Any] | None = None
+    request_data: object | None = None
+    session_state: dict[str, object] | None = None
     usage: dict[str, float] | None = None
     subtree_usage: dict[str, float] | None = None
     user_daily_cost: dict[str, float | str] | None = None
     model: str | None = None
     harness: str | None = None
     labels: dict[str, str] | None = None
-    llm_client: Any = None  # PolicyLLMClient | None — Any to avoid import cycle
+    llm_client: PolicyLLMClient | None = None
 
 
 @dataclass(frozen=True)
@@ -260,7 +278,7 @@ class PolicyResult:
     reason: str | None = None
     set_labels: dict[str, str] | None = None
     deciding_policies: list[str] | None = None
-    data: Any = None
+    data: object | None = None
     state_updates: list[StateUpdate] | None = None
 
     @property
@@ -316,7 +334,7 @@ class ElicitationRequest:
     phase: str
     policy_names: list[str]
     content_preview: str
-    requested_schema: dict[str, Any] = field(default_factory=dict)
+    requested_schema: dict[str, object] = field(default_factory=dict)
 
     @property
     def policy_name(self) -> str:
@@ -353,20 +371,29 @@ class PolicyLLMClient:
         adapter defaults / env vars.
     :param _request_timeout: Request timeout in seconds from the
         server ``llm:`` config, e.g. ``300``.
+    :param _fallback_models: Ordered backup models tried when the
+        primary ``_model`` call fails. Same provider-prefixed
+        format as ``_model``. Empty (the default) preserves
+        single-model behaviour — one attempt, no fallback loop.
+        ``_connection``/``_request_timeout`` are shared across the
+        primary and every fallback, so same-provider fallbacks are
+        the reliable case (a cross-provider fallback only works when
+        ``_connection`` is ``None``).
     """
 
-    _client: Any  # omnigent.llms.client.Client — Any to avoid import cycle
+    _client: Client
     _model: str
     _connection: dict[str, str] | None
     _request_timeout: int
+    _fallback_models: list[str] = field(default_factory=list)
 
     async def create(
         self,
         *,
-        input: list[dict[str, Any]],
+        input: list[dict[str, object]],
         instructions: str | None = None,
-        **kwargs: Any,
-    ) -> Any:
+        **kwargs: object,
+    ) -> Response | AsyncIterator[ResponseStreamEvent]:
         """
         Call the server-level LLM with pre-bound model and credentials.
 
@@ -375,6 +402,18 @@ class PolicyLLMClient:
         from the server config. Callers can override any of these
         via kwargs.
 
+        When ``_fallback_models`` is non-empty and the caller does
+        not override ``model``, the primary model is tried first and
+        each fallback in turn on failure; the last exception is
+        re-raised only after every candidate has failed. A caller
+        that passes an explicit ``model`` opts out of fallback — the
+        single requested model is used as-is.
+
+        Candidates are tried serially, so the worst-case latency of
+        this call is ``(1 + len(_fallback_models)) * timeout``. On
+        the policy hot path this delays the fail-closed (DENY)
+        verdict, so keep the fallback list short.
+
         :param input: Messages in OpenAI Responses API format,
             e.g. ``[{"role": "user", "content": [{"type": "input_text",
             "text": "..."}]}]``.
@@ -382,15 +421,77 @@ class PolicyLLMClient:
         :param kwargs: Additional kwargs forwarded to
             ``client.responses.create()``.
         :returns: A :class:`~omnigent.llms.types.Response`.
+        :raises Exception: The last error encountered when every
+            candidate model fails. Propagates the primary model's
+            exception when no fallbacks are configured.
         """
-        return await self._client.responses.create(
-            input=input,
-            model=kwargs.pop("model", self._model),
-            connection_params=kwargs.pop("connection_params", self._connection),
-            timeout=kwargs.pop("timeout", self._request_timeout),
-            instructions=instructions,
-            **kwargs,
+        create_response = cast(_CreateResponse, self._client.responses.create)
+        connection_params = cast(
+            "dict[str, str] | None",
+            kwargs.pop("connection_params", self._connection),
         )
+        timeout = cast(int | None, kwargs.pop("timeout", self._request_timeout))
+
+        # An explicit model override opts out of the fallback chain —
+        # honour exactly what the caller asked for.
+        if "model" in kwargs:
+            return await create_response(
+                input=input,
+                model=cast(str, kwargs.pop("model")),
+                connection_params=connection_params,
+                timeout=timeout,
+                instructions=instructions,
+                **kwargs,
+            )
+
+        candidates = [self._model, *self._fallback_models]
+        last_exc: Exception | None = None
+        for index, model in enumerate(candidates):
+            try:
+                response = await create_response(
+                    input=input,
+                    model=model,
+                    connection_params=connection_params,
+                    timeout=timeout,
+                    instructions=instructions,
+                    **kwargs,
+                )
+            except Exception as exc:  # noqa: BLE001 — retry next model on any failure
+                last_exc = exc
+                remaining = len(candidates) - index - 1
+                if remaining:
+                    _log.warning(
+                        "PolicyLLMClient: model %r failed (%s); "
+                        "falling back to next of %d remaining",
+                        model,
+                        exc,
+                        remaining,
+                        exc_info=True,
+                    )
+                continue
+            # A non-primary candidate succeeded — record which fallback
+            # recovered the call so the fallback path is visible in logs.
+            if index > 0:
+                _log.warning(
+                    "PolicyLLMClient: recovered on fallback model %r "
+                    "(candidate %d of %d) after primary failure",
+                    model,
+                    index + 1,
+                    len(candidates),
+                )
+            return response
+        # Every candidate failed — surface the last error to the caller.
+        # This is the fail-closed (DENY) path and, because candidates are
+        # tried serially, the caller has now waited up to
+        # ``len(candidates) * timeout``; log it so the latency is visible.
+        _log.error(
+            "PolicyLLMClient: all %d candidate model(s) failed after "
+            "serial attempts (up to %ds each); surfacing last error",
+            len(candidates),
+            timeout,
+        )
+        assert last_exc is not None
+        raise last_exc
 
 
 __all__ = [

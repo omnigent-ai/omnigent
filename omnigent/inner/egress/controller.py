@@ -40,7 +40,6 @@ import threading
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.inner.credential_proxy import CredentialRewriteRule
@@ -92,8 +91,8 @@ class EgressProxyHandle:
     socket_path: Path
     ca_bundle_path: Path
     auth_token: str | None
-    _proxy: Any = field(repr=False)
-    _loop: Any = field(repr=False)
+    _proxy: EgressProxy = field(repr=False)
+    _loop: asyncio.AbstractEventLoop = field(repr=False)
     _thread: threading.Thread = field(repr=False)
     _stopped: bool = field(default=False, repr=False)
 

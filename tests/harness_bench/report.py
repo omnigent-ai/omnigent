@@ -6,7 +6,6 @@ import json
 from typing import Any
 
 from tests.harness_bench.bench import BenchMatrix, CellResult, HarnessReport
-from tests.harness_bench.probes import ALL_PROBES
 from tests.harness_bench.verdict import Verdict
 
 # ANSI colors per verdict, applied only when writing to a TTY.
@@ -28,6 +27,14 @@ _OFFLINE_NOTE = "offline (declared shown)"
 # about which transport produced it (e.g. `claude-sdk [full-server]`). The
 # native-tui driver is abbreviated to `native` to match how it is spoken about.
 _TRANSPORT_LABEL = {"native-tui": "native"}
+
+
+def _matrix_dimensions(matrix: BenchMatrix) -> list[tuple[str, str]]:
+    """Return selected dimensions in their report order."""
+    for report in matrix.reports:
+        if report.cells:
+            return [(cell.probe_name, cell.title) for cell in report.cells]
+    return []
 
 
 def _harness_label(report: HarnessReport) -> str:
@@ -84,12 +91,13 @@ def render_table(
         live table already painted the grid to the same terminal, so the report
         adds the per-cell explanations without re-printing the grid.
     """
-    titles = [p.title for p in ALL_PROBES]
-    names = [p.name for p in ALL_PROBES]
+    dimensions = _matrix_dimensions(matrix)
+    names = [name for name, _ in dimensions]
+    titles = [title for _, title in dimensions]
 
     # Column widths from the visible (uncolored) content.
     labels = {id(r): _harness_label(r) for r in matrix.reports}
-    harness_w = max(len("Harness"), *(len(v) for v in labels.values()))
+    harness_w = max([len("Harness"), *(len(v) for v in labels.values())])
     glyphs: dict[tuple[int, str], str] = {}
     verdicts: dict[tuple[int, str], Verdict] = {}
     for r in matrix.reports:
@@ -169,8 +177,9 @@ def render_markdown(matrix: BenchMatrix, *, declared: bool = False) -> str:
     :param declared: When true (offline mode), render declared glyphs so the
         table shows the claimed matrix rather than a grid of skips.
     """
-    columns = [p.title for p in ALL_PROBES]
-    names = [p.name for p in ALL_PROBES]
+    dimensions = _matrix_dimensions(matrix)
+    names = [name for name, _ in dimensions]
+    columns = [title for _, title in dimensions]
 
     header = "| Harness | " + " | ".join(columns) + " |"
     sep = "| --- | " + " | ".join("---" for _ in columns) + " |"

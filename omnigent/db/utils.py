@@ -10,6 +10,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,12 +21,16 @@ if TYPE_CHECKING:
     from alembic.config import Config
 from sqlalchemy.orm import Session, sessionmaker
 
+from omnigent.db.query_context import query_name_scope
 from omnigent.entities import NewConversationItem
 
 _logger = logging.getLogger(__name__)
 
 # A callable that returns a context manager yielding a Session.
 ManagedSessionMaker = Callable[[], AbstractContextManager[Session]]
+
+# A callable that requires a semantic query-name suffix for each transaction.
+NamedManagedSessionMaker = Callable[[str], AbstractContextManager[Session]]
 
 # A zero-argument callable returning a fresh database password (e.g. a
 # short-lived Lakebase OAuth token). Invoked once per *new* DBAPI connection.
@@ -218,7 +223,7 @@ def _create_engine(db_uri: str) -> Engine:
 
     :param db_uri: SQLAlchemy database connection string, e.g.
         ``"sqlite:///mydb.db"`` or
-        ``"postgresql://user:pass@host/dbname"``.
+        ``"postgresql://<user>:<password>@host/dbname"``.
     :returns: A configured :class:`~sqlalchemy.engine.Engine`.
     """
     is_sqlite = db_uri.startswith("sqlite")
@@ -231,6 +236,18 @@ def _create_engine(db_uri: str) -> Engine:
         engine = create_engine(
             db_uri,
             connect_args={"check_same_thread": False, "timeout": 20.0},
+            # Give SQLite a modest pool above SQLAlchemy's default
+            # QueuePool(5, 10) = 15, which the /health sidebar poll exhausts
+            # under load (surfacing as "QueuePool ... timeout" 500s).
+            # Deliberately NOT sized to the 200-token AnyIO thread limiter
+            # like the Postgres branch below: SQLite serializes at the file
+            # level, so handing out ~200 connections just lets that many
+            # worker threads thrash SQLite's page-cache mutex and burn CPU
+            # instead of queuing cheaply on the pool. ~40 total clears the
+            # exhaustion without inviting lock contention.
+            pool_size=15,
+            max_overflow=25,
+            pool_timeout=10,
         )
 
         # Apply WAL + busy_timeout on every fresh DBAPI connection
@@ -299,7 +316,7 @@ def get_or_create_engine(db_uri: str) -> Engine:
 
     :param db_uri: SQLAlchemy database connection string, e.g.
         ``"sqlite:///mydb.db"`` or
-        ``"postgresql://user:pass@host/dbname"``.
+        ``"postgresql://<user>:<password>@host/dbname"``.
     :returns: A :class:`~sqlalchemy.engine.Engine` for the given URI.
     :raises RuntimeError: If automatic schema migration fails.
     """
@@ -313,6 +330,45 @@ def get_or_create_engine(db_uri: str) -> Engine:
                 instrument_sqlalchemy_engine(engine)
                 _engine_cache[db_uri] = engine
     return _engine_cache[db_uri]
+
+
+def get_or_create_conversation_engine(conv_uri: str) -> Engine:
+    """
+    Return a cached engine for the Agent Platform DB URI.
+
+    Unlike :func:`get_or_create_engine`, this does NOT run Alembic
+    migrations — the AP DB is expected to be a fresh database that
+    gets its tables created via ``ConversationBase.metadata.create_all()``.
+    For the common case where AP DB == Omnigent DB, callers should
+    use :func:`get_or_create_engine` directly and share the engine.
+
+    :param conv_uri: SQLAlchemy database URI for the AP DB.
+    :returns: A :class:`~sqlalchemy.engine.Engine` for the given URI.
+    """
+    if conv_uri not in _engine_cache:
+        with _engine_lock:
+            if conv_uri not in _engine_cache:
+                engine = _create_engine(conv_uri)
+                _ensure_conversation_tables(engine)
+                from omnigent.runtime.telemetry import instrument_sqlalchemy_engine
+
+                instrument_sqlalchemy_engine(engine)
+                _engine_cache[conv_uri] = engine
+    return _engine_cache[conv_uri]
+
+
+def _ensure_conversation_tables(engine: Engine) -> None:
+    """Create AP tables (conversations, conversation_items, conversation_labels) if absent."""
+    from omnigent.db.db_models import ConversationBase
+
+    with query_name_scope("omnigent.database.ensure_conversation_schema"):
+        ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
+        ensure_fts_table(engine)
+
+
+def _set_alembic_database_url(config: Config, db_uri: str) -> None:
+    """Store a database URL safely in Alembic's ConfigParser-backed config."""
+    config.set_main_option("sqlalchemy.url", db_uri.replace("%", "%%"))
 
 
 def _build_alembic_config(db_uri: str) -> Config:
@@ -334,7 +390,7 @@ def _build_alembic_config(db_uri: str) -> Config:
 
     alembic_ini = Path(__file__).parent / "alembic.ini"
     config = Config(str(alembic_ini))
-    config.set_main_option("sqlalchemy.url", db_uri)
+    _set_alembic_database_url(config, db_uri)
     config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
     return config
 
@@ -359,26 +415,112 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     :param db_uri: Database connection string forwarded to
         Alembic's ``sqlalchemy.url`` config option, e.g.
         ``"sqlite:///mydb.db"``.
+    :raises RuntimeError: If the database revision is newer than
+        the revisions known to this build.
     """
     from alembic import command
 
-    from omnigent.db.db_models import Base
+    from omnigent.db.db_models import ConversationBase, OmnigentBase
+
+    current = _get_current_db_revision(engine)
+    head = _get_head_db_revision(db_uri)
+    _verify_db_revision_is_supported(db_uri, current, head)
 
     _logger.info("Running database migrations...")
     config = _build_alembic_config(db_uri)
     # Pass a shared connection so Alembic operates within the same
     # engine (required for SQLite in-memory databases, and avoids
-    # creating a second connection pool).
-    with engine.begin() as connection:
-        config.attributes["connection"] = connection
-        command.upgrade(config, "head")
-    # Belt-and-suspenders: if a future migration is added but a
-    # caller forgets to wire it into the chain, ``create_all`` will
-    # at least create any missing tables from ORM metadata so the
-    # server still boots. Cannot rescue missing COLUMNS on existing
-    # tables — those need a real migration, which is why the
-    # short-circuit above was removed.
-    Base.metadata.create_all(bind=engine, checkfirst=True)
+    # creating a second connection pool). The connection is handed over
+    # outside any transaction so Alembic owns transaction demarcation:
+    # a migration with an autocommit_block (CREATE INDEX CONCURRENTLY)
+    # cannot suspend an externally-begun transaction.
+    with query_name_scope("omnigent.database.run_migrations"):
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
+        # Belt-and-suspenders: if a future migration is added but a
+        # caller forgets to wire it into the chain, ``create_all`` will
+        # at least create any missing tables from ORM metadata so the
+        # server still boots. Cannot rescue missing COLUMNS on existing
+        # tables — those need a real migration, which is why the
+        # short-circuit above was removed. Both bases are created because
+        # in single-DB mode this engine hosts the AP tables too.
+        for base in (OmnigentBase, ConversationBase):
+            base.metadata.create_all(bind=engine, checkfirst=True)
+
+
+def run_migrations_with_retry(
+    db_uri: str,
+    *,
+    max_attempts: int = 8,
+    backoff_seconds: float = 3.0,
+    engine_factory: Callable[[str], Engine] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Connect and run migrations, retrying a cold database with backoff.
+
+    Managed Postgres endpoints (e.g. Databricks Lakebase) suspend after
+    an idle window and take several seconds to resume. A process that
+    boots and migrates once at startup can hit that resume window and
+    fail with a transient :class:`~sqlalchemy.exc.OperationalError`
+    ("the database system is starting up" / connection refused). Callers
+    that treat a startup exception as fatal then crash-loop until the DB
+    happens to be warm. Retrying the connect+migrate with linear backoff
+    lets a cold start self-heal.
+
+    A fresh engine is created per attempt and disposed afterward so a
+    poisoned connection pool from a failed attempt is never reused. Only
+    :class:`~sqlalchemy.exc.OperationalError` is retried; every other
+    exception (including a real migration/schema error) propagates
+    immediately. The final attempt's error is re-raised so a genuinely
+    unreachable database still fails loudly.
+
+    :param db_uri: SQLAlchemy database URL to connect and migrate.
+    :param max_attempts: Total connect+migrate attempts before giving
+        up. Must be >= 1.
+    :param backoff_seconds: Base linear backoff; attempt *n* sleeps
+        ``backoff_seconds * n`` before attempt *n+1*.
+    :param engine_factory: Callable returning an :class:`Engine` for the
+        URI. Defaults to :func:`sqlalchemy.create_engine`. Injectable
+        for tests.
+    :param sleep: Sleep function, injectable for tests. Defaults to
+        :func:`time.sleep`.
+    :raises sqlalchemy.exc.OperationalError: If every attempt fails to
+        connect.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+    if engine_factory is None:
+        import sqlalchemy
+
+        engine_factory = sqlalchemy.create_engine
+
+    from sqlalchemy.exc import OperationalError
+
+    for attempt in range(1, max_attempts + 1):
+        engine = engine_factory(db_uri)
+        try:
+            _run_migrations(engine, db_uri)
+            return
+        except OperationalError as exc:
+            if attempt == max_attempts:
+                _logger.error(
+                    "Database not reachable after %d attempt(s); giving up",
+                    max_attempts,
+                )
+                raise
+            delay = backoff_seconds * attempt
+            _logger.warning(
+                "DB connect/migrate attempt %d/%d failed (%s); retrying in %.0fs "
+                "(a managed endpoint may be resuming from suspend)",
+                attempt,
+                max_attempts,
+                type(exc).__name__,
+                delay,
+            )
+            sleep(delay)
+        finally:
+            engine.dispose()
 
 
 def _get_current_db_revision(engine: Engine) -> str | None:
@@ -396,12 +538,13 @@ def _get_current_db_revision(engine: Engine) -> str | None:
     """
     from alembic.runtime.migration import MigrationContext
 
-    inspector = inspect(engine)
-    if "alembic_version" not in inspector.get_table_names():
-        return None
-    with engine.connect() as connection:
-        ctx = MigrationContext.configure(connection)
-        return ctx.get_current_revision()
+    with query_name_scope("omnigent.database.select_current_revision"):
+        inspector = inspect(engine)
+        if "alembic_version" not in inspector.get_table_names():
+            return None
+        with engine.connect() as connection:
+            ctx = MigrationContext.configure(connection)
+            return ctx.get_current_revision()
 
 
 def _get_head_db_revision(db_uri: str) -> str:
@@ -430,11 +573,34 @@ def _get_head_db_revision(db_uri: str) -> str:
     return head
 
 
+def _verify_db_revision_is_supported(
+    db_uri: str,
+    current: str | None,
+    head: str,
+) -> None:
+    """Reject a database revision that is unknown to this build."""
+    if current is None or current == head:
+        return
+
+    from alembic.script import ScriptDirectory
+    from alembic.util import CommandError
+
+    script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
+    try:
+        script.get_revision(current)
+    except CommandError as exc:
+        raise RuntimeError(
+            "Omnigent database schema is newer than this version of Omnigent "
+            f"(found revision {current!r}, latest supported revision {head!r}). "
+            "Upgrade Omnigent before using this database."
+        ) from exc
+
+
 def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     """
     Bring a fresh or stale database to head before the server starts.
 
-    Three cases:
+    Four cases:
 
     - **Fresh DB** (no ``alembic_version`` table) — run migrations to
       head. This covers brand-new SQLite files and freshly created
@@ -445,6 +611,8 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
       If the migration fails, re-raise with context so the server
       still terminates with an actionable error instead of continuing
       against an incompatible schema.
+    - **Newer than this build** — stop without attempting a migration
+      and tell the operator to upgrade Omnigent.
 
     :param engine: SQLAlchemy engine bound to the target database.
     :param db_uri: Database URL, used both for Alembic config and in
@@ -454,6 +622,7 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     """
     head = _get_head_db_revision(db_uri)
     current = _get_current_db_revision(engine)
+    _verify_db_revision_is_supported(db_uri, current, head)
 
     if current is None:
         _run_migrations(engine, db_uri)
@@ -508,6 +677,54 @@ def clear_engine_cache() -> None:
 # ── Managed session ────────────────────────────────────
 
 
+# Ambient per-engine sessions for a read-only "share one checkout" scope. When
+# active (see :func:`shared_read_scope`), ``managed_session()`` reuses the
+# scope's session for its engine instead of opening a fresh pool checkout,
+# collapsing several back-to-back reads (e.g. the access-control check's
+# permission + conversation lookups) into a single connection round-trip.
+# Keyed by ``id(engine)`` so distinct engines (split-DB) still get independent
+# checkouts. Unset outside a scope, so it is a strict no-op for every ordinary
+# caller.
+_shared_read_sessions: ContextVar[dict[int, Session] | None] = ContextVar(
+    "omnigent_shared_read_sessions", default=None
+)
+
+
+@contextmanager
+def shared_read_scope() -> Iterator[None]:
+    """Collapse back-to-back reads into one pool checkout per engine.
+
+    Within this scope, ``managed_session()`` reuses a single session per
+    engine rather than checking out a fresh pooled connection (plus a
+    ``pool_pre_ping`` round-trip) on every store call. Intended for a short,
+    strictly READ-ONLY burst — an access-control check, a snapshot assembly —
+    where the per-call checkout dominates the actual query time.
+
+    Nesting reuses the outer scope. Write makers (``immediate=True``) never
+    participate, so they keep their own ``BEGIN IMMEDIATE`` isolation even
+    when nested here. Never hold this open across network I/O: it pins a
+    pooled connection for the scope's whole duration.
+    """
+    if _shared_read_sessions.get() is not None:
+        # Already inside a scope — the outer one owns the sessions.
+        yield
+        return
+    sessions: dict[int, Session] = {}
+    token = _shared_read_sessions.set(sessions)
+    try:
+        yield
+        for session in sessions.values():
+            session.commit()
+    except BaseException:
+        for session in sessions.values():
+            session.rollback()
+        raise
+    finally:
+        for session in sessions.values():
+            session.close()
+        _shared_read_sessions.reset(token)
+
+
 def make_managed_session_maker(
     engine: Engine,
     *,
@@ -529,7 +746,14 @@ def make_managed_session_maker(
     :returns: A callable that, when invoked, returns a context
         manager yielding a :class:`~sqlalchemy.orm.Session`.
     """
-    factory = sessionmaker(bind=engine)
+    # expire_on_commit=False keeps column attributes accessible on ORM
+    # instances after the session commits and closes. Without it, SQLAlchemy
+    # expires all attributes on commit, and any access outside the session
+    # context (e.g. after the ``with session:`` block exits) raises
+    # DetachedInstanceError. This is safe here because each managed session
+    # is short-lived and single-writer, so there is no cross-session stale
+    # data concern.
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
     is_sqlite = engine.dialect.name == "sqlite"
 
     @contextmanager
@@ -540,7 +764,27 @@ def make_managed_session_maker(
         Commits on clean exit, rolls back on exception. For SQLite
         backends, enables foreign key enforcement and sets a
         busy timeout before yielding.
+
+        Inside a :func:`shared_read_scope` (and only for read makers), the
+        scope's per-engine session is reused instead of a fresh checkout;
+        the scope — not this block — owns its commit/close.
         """
+        if not immediate:
+            shared = _shared_read_sessions.get()
+            if shared is not None:
+                key = id(engine)
+                session = shared.get(key)
+                if session is None:
+                    session = factory()
+                    # Register before the PRAGMAs: those executes force the pool
+                    # checkout, so if one raises the scope must already track the
+                    # session to close it (otherwise the connection would leak).
+                    shared[key] = session
+                    if is_sqlite:
+                        session.execute(text("PRAGMA foreign_keys = ON"))
+                        session.execute(text("PRAGMA busy_timeout = 20000"))  # 20s
+                yield session
+                return
         with factory() as session:
             try:
                 if is_sqlite:
@@ -562,68 +806,107 @@ def make_managed_session_maker(
     return managed_session
 
 
+def make_named_managed_session_maker(
+    engine: Engine,
+    *,
+    query_name_prefix: str,
+    immediate: bool = False,
+) -> NamedManagedSessionMaker:
+    """Create managed sessions whose database work always has a semantic name.
+
+    The supplied suffix is joined to ``query_name_prefix`` and remains active
+    through the session's implicit flush and commit. A nested
+    :func:`query_name_scope` can provide a more specific name for one statement.
+
+    :param engine: The SQLAlchemy engine to bind sessions to.
+    :param query_name_prefix: Stable namespace shared by the store's queries,
+        e.g. ``"omnigent.file_store"``.
+    :param immediate: Forwarded to :func:`make_managed_session_maker`.
+    :returns: A callable accepting one semantic query-name suffix per session.
+    """
+    prefix = query_name_prefix.rstrip(".")
+    if not prefix.strip():
+        raise ValueError("query_name_prefix must not be empty")
+
+    managed_session = make_managed_session_maker(engine, immediate=immediate)
+
+    @contextmanager
+    def named_managed_session(query_name: str) -> Iterator[Session]:
+        if not query_name.strip():
+            raise ValueError("query_name must not be empty")
+        with query_name_scope(f"{prefix}.{query_name}"), managed_session() as session:
+            yield session
+
+    return named_managed_session
+
+
 # ── ID generation ──────────────────────────────────────
 
-_ITEM_TYPE_PREFIX: dict[str, str] = {
-    "message": "msg_",
-    "function_call": "fc_",
-    "function_call_output": "fco_",
-    "error": "err_",
-    "reasoning": "rs_",
-    "compaction": "cmp_",
-    "native_tool": "nt_",
-    "resource_event": "rse_",
-    "slash_command": "sc_",
-    "terminal_command": "tc_",
-    "routing_decision": "rd_",
-}
+# Recognised conversation-item types, validated at id generation. The item's
+# type lives in the ``conversation_items.type`` column, not in its id. Kept in
+# parity with ``ITEM_TYPE_TO_DATA_CLS`` (see the db util tests).
+_ITEM_TYPES: frozenset[str] = frozenset(
+    {
+        "message",
+        "function_call",
+        "function_call_output",
+        "error",
+        "reasoning",
+        "compaction",
+        "native_tool",
+        "resource_event",
+        "slash_command",
+        "terminal_command",
+        "routing_decision",
+    }
+)
 
 
 def generate_agent_id() -> str:
     """
     Generate a unique agent identifier.
 
-    :returns: A string of the form ``"ag_<32-char hex>"``,
-        e.g. ``"ag_0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c"``.
     """
-    return f"ag_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def builtin_agent_id(name: str) -> str:
     """
     Deterministic agent id for a built-in agent, derived from its name.
 
-    Same shape and length as :func:`generate_agent_id` (``ag_`` + 32 hex), but
+    Same shape and length as :func:`generate_agent_id` (bare 32-char hex), but
     stable across processes: a multi-tenant deployment reseeds the built-ins into
     an ephemeral per-pod store, where a random id would change each boot and
     dangle a persisted ``conversation.agent_id``. Do NOT revert built-in seeding
     to :func:`generate_agent_id` (guarded by the ``builtin_agent_id`` tests).
 
     :param name: The built-in agent's unique name, e.g. ``"polly"``.
-    :returns: A deterministic id of the form ``"ag_<32-char hex>"``.
+    :returns: A deterministic bare 32-char hex id.
     """
     digest = hashlib.sha256(f"builtin:{name}".encode()).hexdigest()
-    return f"ag_{digest[:32]}"
+    return digest[:32]
 
 
 def generate_file_id() -> str:
     """
     Generate a unique file identifier.
 
-    :returns: A string of the form ``"file_<32-char hex>"``,
-        e.g. ``"file_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
     """
-    return f"file_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def generate_conversation_id() -> str:
     """
     Generate a unique conversation identifier.
 
-    :returns: A string of the form ``"conv_<32-char hex>"``,
-        e.g. ``"conv_e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9"``.
     """
-    return f"conv_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def generate_task_id() -> str:
@@ -640,25 +923,16 @@ def generate_item_id(item_type: str) -> str:
     """
     Generate a unique conversation-item identifier.
 
-    The prefix is determined by the item type:
+    *item_type* is validated against :data:`_ITEM_TYPES` but no longer encoded
+    into the id — the type lives in the ``conversation_items.type`` column.
 
-    - ``"message"`` -> ``"msg_"``
-    - ``"function_call"`` -> ``"fc_"``
-    - ``"function_call_output"`` -> ``"fco_"``
-    - ``"error"`` -> ``"err_"``
-    - ``"reasoning"`` -> ``"rs_"``
-    - ``"compaction"`` -> ``"cmp_"``
-    - ``"native_tool"`` -> ``"nt_"``
-    - ``"slash_command"`` -> ``"sc_"``
-
-    :param item_type: One of the keys in :data:`_ITEM_TYPE_PREFIX`.
-    :returns: A prefixed identifier, e.g. ``"msg_a1b2c3d4..."``.
+    :param item_type: One of the members of :data:`_ITEM_TYPES`.
+    :returns: A bare 32-char hex uuid, e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
     :raises ValueError: If *item_type* is not a recognised type.
     """
-    prefix = _ITEM_TYPE_PREFIX.get(item_type)
-    if prefix is None:
+    if item_type not in _ITEM_TYPES:
         raise ValueError(f"unknown item type: {item_type!r}")
-    return f"{prefix}{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 # ── FTS (SQLite FTS5) ─────────────────────────────────
@@ -701,7 +975,7 @@ def ensure_fts_table(engine: Engine) -> None:
         ``conversation_items_fts`` virtual table is created if absent.
     """
     if _supports_fts5(engine.dialect.name):
-        with engine.connect() as conn:
+        with query_name_scope("omnigent.database.ensure_fts_table"), engine.connect() as conn:
             conn.execute(_CREATE_FTS)
             conn.commit()
 
@@ -737,6 +1011,45 @@ def insert_fts(
         )
 
 
+def insert_fts_bulk(
+    session: Session,
+    rows: list[tuple[str, str, str]],
+) -> None:
+    """
+    Dual-write multiple rows into the FTS5 table in a single INSERT.
+
+    On dialects without FTS5 this is a no-op. An empty ``rows`` list is also
+    a no-op.
+
+    :param session: An active SQLAlchemy session.
+    :param rows: Each tuple is ``(item_id, conversation_id, search_text)``.
+    """
+    if not rows:
+        return
+    if not (session.bind and _supports_fts5(session.bind.dialect.name)):
+        return
+    # 3 params per row; keep total < 999 (SQLite's safe SQLITE_MAX_VARIABLE_NUMBER
+    # on pre-3.32 builds). Newer SQLite raised the limit to 32766, but chunking at
+    # 300 is safe on all versions.
+    _CHUNK_SIZE = 300
+    for chunk_start in range(0, len(rows), _CHUNK_SIZE):
+        chunk = rows[chunk_start : chunk_start + _CHUNK_SIZE]
+        placeholders = ", ".join(f"(:item_id_{i}, :cid_{i}, :st_{i})" for i in range(len(chunk)))
+        params: dict[str, str] = {}
+        for i, (item_id, conversation_id, search_text) in enumerate(chunk):
+            params[f"item_id_{i}"] = item_id
+            params[f"cid_{i}"] = conversation_id
+            params[f"st_{i}"] = search_text
+        session.execute(
+            text(
+                f"INSERT INTO {_FTS_TABLE}"
+                f"(item_id, conversation_id, search_text) "
+                f"VALUES {placeholders}"
+            ),
+            params,
+        )
+
+
 def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
     """
     Remove all FTS rows for a conversation (SQLite-family dialects only).
@@ -752,6 +1065,26 @@ def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
         session.execute(
             text(f"DELETE FROM {_FTS_TABLE} WHERE conversation_id = :cid"),
             {"cid": conversation_id},
+        )
+
+
+def delete_fts_by_conversation_ids(session: Session, conv_ids: list[str]) -> None:
+    """
+    Remove all FTS rows for a list of conversations in a single query.
+
+    No-op when ``conv_ids`` is empty or the dialect lacks FTS5.
+
+    :param session: An active SQLAlchemy session.
+    :param conv_ids: Conversation IDs whose FTS rows should be removed.
+    """
+    if not conv_ids:
+        return
+    if session.bind and _supports_fts5(session.bind.dialect.name):
+        placeholders = ", ".join(f":cid{i}" for i in range(len(conv_ids)))
+        params = {f"cid{i}": cid for i, cid in enumerate(conv_ids)}
+        session.execute(
+            text(f"DELETE FROM {_FTS_TABLE} WHERE conversation_id IN ({placeholders})"),
+            params,
         )
 
 

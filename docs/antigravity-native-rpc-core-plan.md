@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Python deps via `uv` only (never pip); JS/TS via `bun`. Latest stable deps.
-- Pre-commit gate (must pass): `uv run ruff check --fix && uv run ruff format && uv run mypy --strict . && uv run pytest`. Never disable a lint/type rule — fix the root cause.
+- Pre-commit gate (must pass): `uv sync --group dev && uv run --no-sync ruff check --fix && uv run --no-sync ruff format && uv run --no-sync pyrefly check && uv run --no-sync pytest`. Never disable a lint/type rule — fix the root cause.
 - agy pinned: `AGY_EXPECTED_VERSION=1.0.10` (Docker build fails on mismatch). All RPC shapes are version-sensitive.
 - connect-RPC: JSON (`Content-Type: application/json`), `verify=False`, every URL passes `_assert_loopback_url`. Reuse `antigravity_native_rpc.py` discovery (`discover_language_server_port` / `_candidate_agy_rpc_ports` / `_conversation_matches`).
 - Identity: `cascadeId == conversationId == brain-dir UUID` (no separate id lookup).
@@ -80,7 +80,7 @@ def test_cancel_cascade_steps_true_on_200(monkeypatch):
     assert rpc.cancel_cascade_steps(52548, "conv-uuid") is True
 ```
 
-- [ ] **Step 2: Run, verify FAIL** — `uv run pytest tests/test_antigravity_native_rpc.py -k "trajectory_steps or cancel_cascade" -v` → fail (undefined).
+- [ ] **Step 2: Run, verify FAIL** — `uv run --group test pytest tests/test_antigravity_native_rpc.py -k "trajectory_steps or cancel_cascade" -v` → fail (undefined).
 - [ ] **Step 3: Implement** `get_trajectory_steps` (POST `{"cascadeId": cascade_id}` to `GetCascadeTrajectorySteps`, parse `.get("steps", [])`) and `cancel_cascade_steps` (POST `{"cascadeId": cascade_id}` to `CancelCascadeSteps`, return `resp.status_code < 400`), both via `_sync_client` + `_assert_loopback_url`, mirroring `_conversation_matches`.
 - [ ] **Step 4: Run, verify PASS.**
 - [ ] **Step 5: Commit** (`feat(antigravity-native): RPC client — trajectory steps + cancel`).
@@ -241,7 +241,7 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 
 - [ ] **Step 1:** Grep for `antigravity_native_forwarder` / `forwarded_steps` / `update_forwarded_steps` references; confirm only the reader path remains.
 - [ ] **Step 2:** Delete the forwarder module + its tests; remove the cursor fields/methods from the bridge; relocate the shared types.
-- [ ] **Step 3:** Run the full gate: `uv run ruff check --fix && uv run ruff format && uv run mypy --strict . && uv run pytest` (targeted antigravity suites + server).
+- [ ] **Step 3:** Run the full gate: `uv sync --group dev && uv run --no-sync ruff check --fix && uv run --no-sync ruff format && uv run --no-sync pyrefly check && uv run --no-sync pytest` (targeted antigravity suites + server).
 - [ ] **Step 4:** Commit (`refactor(antigravity-native): retire transcript forwarder + durable cursor (RPC reader supersedes)`).
 
 ---

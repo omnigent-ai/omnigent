@@ -30,6 +30,19 @@ class NativeNotificationManager(
     // with the reserved badge-summary notification.
     private val nextId = AtomicInteger(BADGE_NOTIFICATION_ID + 1)
 
+    // Last badge state from the web layer, kept so a grant of the API 33+
+    // notification permission can replay a badge that was computed (and
+    // deduped web-side) while the permission dialog was still open.
+    private data class BadgeState(
+        val count: Int,
+        val navigatePath: String?,
+        val title: String?,
+        val body: String?,
+    )
+
+    @Volatile
+    private var lastBadge: BadgeState? = null
+
     init {
         val channel =
             NotificationChannel(
@@ -63,25 +76,59 @@ class NativeNotificationManager(
     }
 
     /**
-     * Android has no universal numeric icon badge. We attach the count to a
-     * lightweight summary notification via `setNumber()` (surfaced by some
-     * launchers; AOSP shows only a dot). A count of 0 is a no-op: we never
-     * cancel notifications just to clear a badge.
+     * Android has no universal numeric icon badge, so the count is surfaced as a
+     * lightweight summary notification (its `setNumber()` is shown by some
+     * launchers; AOSP shows only a dot). Because that notification is often the
+     * ONLY thing the user sees, it must be actionable and descriptive: when the
+     * web layer supplies a [navigatePath] the tap opens the app and routes there
+     * (one waiting session → that session; several → the inbox), and [title] /
+     * [body] describe what's waiting instead of a bare "N pending". Older web
+     * builds omit these, so we fall back to the app name + "N pending" and no
+     * tap intent — the prior behavior.
+     *
+     * A count of 0 withdraws the summary: the badge notification is the count
+     * surface, so once nothing is pending it must not linger as a stale,
+     * still-tappable "N sessions need your attention" routing to resolved work.
      */
-    fun setBadgeCount(count: Int) {
-        if (count <= 0) return
-        val summary =
+    fun setBadgeCount(
+        count: Int,
+        navigatePath: String? = null,
+        title: String? = null,
+        body: String? = null,
+    ) {
+        lastBadge = BadgeState(count, navigatePath, title, body)
+        if (count <= 0) {
+            manager.cancel(BADGE_NOTIFICATION_ID)
+            return
+        }
+        val builder =
             NotificationCompat
                 .Builder(context, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle(context.getString(R.string.app_name))
+                .setContentTitle(title ?: context.getString(R.string.app_name))
                 .setContentText(
-                    context.resources.getQuantityString(R.plurals.badge_text, count, count),
+                    body ?: context.resources.getQuantityString(R.plurals.badge_text, count, count),
                 ).setNumber(count)
                 .setSilent(true)
                 .setOngoing(false)
-                .build()
-        post(BADGE_NOTIFICATION_ID, summary)
+        if (navigatePath != null && navigatePath.startsWith("/")) {
+            // Tap opens the app and routes. Deliberately NOT setAutoCancel: this
+            // is an ambient count, not a one-off event — clearing it on tap would
+            // drop the only Android count surface while sessions are still
+            // pending, and a later poll with the same count won't repost it.
+            builder.setContentIntent(activationIntent(navigatePath, BADGE_NOTIFICATION_ID))
+        }
+        post(BADGE_NOTIFICATION_ID, builder.build())
+    }
+
+    /**
+     * Re-post the last badge the web layer sent. Called when the user grants
+     * the notification permission: a badge posted before the grant was
+     * silently dropped, and the web side won't resend an unchanged state.
+     */
+    fun replayBadge() {
+        val badge = lastBadge ?: return
+        setBadgeCount(badge.count, badge.navigatePath, badge.title, badge.body)
     }
 
     /**

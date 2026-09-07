@@ -8,11 +8,24 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
+    HostDetectCredentialsFrame,
+    HostDetectCredentialsResultFrame,
+    HostFsRequestFrame,
+    HostFsResultFrame,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportedLocalSession,
+    HostImportLocalByIdFrame,
+    HostImportLocalDoneFrame,
+    HostImportLocalFrame,
+    HostImportLocalSessionFrame,
+    HostInstallHarnessFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirEntry,
@@ -20,16 +33,150 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostModelOptionsFrame,
+    HostModelOptionsResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusFrame,
+    HostRunnerStatusResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
     HostStopRunnerResultFrame,
+    HostStoreSecretFrame,
+    HostStoreSecretResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
+
+
+def test_import_local_frames_round_trip() -> None:
+    """Request, per-session, and done frames survive the tunnel (title + source)."""
+    request = decode_host_frame(
+        encode_host_frame(HostImportLocalFrame(request_id="req_imp", source="claude", limit=3))
+    )
+    assert request == HostImportLocalFrame(request_id="req_imp", source="claude", limit=3)
+
+    exact_request = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalByIdFrame(
+                request_id="req_exact",
+                source="codex",
+                session_id="0198d07d-session",
+            )
+        )
+    )
+    assert exact_request == HostImportLocalByIdFrame(
+        request_id="req_exact",
+        source="codex",
+        session_id="0198d07d-session",
+    )
+
+    session = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalSessionFrame(
+                request_id="req_imp",
+                total=2,
+                session=HostImportedLocalSession(
+                    external_session_id="s1",
+                    workspace="/repo",
+                    items=[{"type": "message", "response_id": "r", "data": {}}],
+                    title="My renamed thread",
+                    source="claude",
+                ),
+            )
+        )
+    )
+    assert isinstance(session, HostImportLocalSessionFrame)
+    assert session.total == 2
+    assert session.session.external_session_id == "s1"
+    assert session.session.title == "My renamed thread"
+    assert session.session.source == "claude"
+
+    # A session with no title round-trips as null (not an error).
+    null_title = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalSessionFrame(
+                request_id="req_imp",
+                total=2,
+                session=HostImportedLocalSession(
+                    external_session_id="s2", workspace=None, items=[], title=None, source="codex"
+                ),
+            )
+        )
+    )
+    assert isinstance(null_title, HostImportLocalSessionFrame)
+    assert null_title.session.title is None
+
+    done = decode_host_frame(
+        encode_host_frame(HostImportLocalDoneFrame(request_id="req_imp", status="ok"))
+    )
+    assert isinstance(done, HostImportLocalDoneFrame)
+    assert done.status == "ok" and done.error is None
+    assert done.failed == 0
+
+    # The done frame carries the host-side unreadable count so the server's
+    # tally covers sessions that never produced a frame.
+    done_failed = decode_host_frame(
+        encode_host_frame(HostImportLocalDoneFrame(request_id="req_imp", status="ok", failed=2))
+    )
+    assert isinstance(done_failed, HostImportLocalDoneFrame)
+    assert done_failed.failed == 2
+
+
+def test_model_options_frames_round_trip() -> None:
+    """Pre-launch model catalogs survive both directions of the host tunnel."""
+    request = decode_host_frame(
+        encode_host_frame(
+            HostModelOptionsFrame(request_id="req_models", harness="claude-native"),
+        )
+    )
+    assert request == HostModelOptionsFrame(
+        request_id="req_models",
+        harness="claude-native",
+    )
+
+    result = decode_host_frame(
+        encode_host_frame(
+            HostModelOptionsResultFrame(
+                request_id="req_models",
+                status="ok",
+                models=[
+                    {
+                        "id": "sonnet",
+                        "model": "system.ai.claude-sonnet-4-6[1m]",
+                        "displayName": "Sonnet 4.6",
+                    }
+                ],
+            )
+        )
+    )
+    assert isinstance(result, HostModelOptionsResultFrame)
+    assert result.models == [
+        {
+            "id": "sonnet",
+            "model": "system.ai.claude-sonnet-4-6[1m]",
+            "displayName": "Sonnet 4.6",
+        }
+    ]
+    # Absent from an older host's payload, and present when it reports the
+    # endpoint's wider catalog.
+    assert result.routable_models == []
+    with_routable = decode_host_frame(
+        encode_host_frame(
+            HostModelOptionsResultFrame(
+                request_id="req_models",
+                status="ok",
+                routable_models=["system.ai.claude-opus-5", "system.ai.claude-opus-4-8"],
+            )
+        )
+    )
+    assert isinstance(with_routable, HostModelOptionsResultFrame)
+    assert with_routable.routable_models == [
+        "system.ai.claude-opus-5",
+        "system.ai.claude-opus-4-8",
+    ]
 
 
 def test_encode_injects_traceparent_under_active_span() -> None:
@@ -190,6 +337,133 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
     # Exact map equality: both the True and the False must survive —
     # False is the actionable "warn the user" value.
     assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
+
+
+def test_connection_error_frame_round_trip() -> None:
+    """Connection errors preserve the server stage and exception message."""
+    original = HostConnectionErrorFrame(
+        stage="registration",
+        error="[Errno 13] Permission denied",
+        retryable=False,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert decoded == original
+
+
+def test_harness_readiness_frame_round_trip() -> None:
+    """Verify a live readiness refresh survives encode and decode."""
+    original = HostHarnessReadinessFrame(
+        configured_harnesses={"pi": True, "codex": "needs-auth"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHarnessReadinessFrame)
+    assert decoded.configured_harnesses == {"pi": True, "codex": "needs-auth"}
+
+
+def test_hello_frame_gateway_inference_round_trip() -> None:
+    original = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="corey-laptop",
+        configured_harnesses={"claude-native": True},
+        gateway_inference={"claude-native": True, "codex": False},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.gateway_inference == {"claude-native": True, "codex": False}
+
+
+def test_hello_frame_absent_gateway_inference_decodes_to_none() -> None:
+    encoded = json.dumps(
+        {
+            "kind": "host.hello",
+            "version": "0.1.0",
+            "frame_protocol_version": 1,
+            "name": "corey-laptop",
+        }
+    )
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.gateway_inference is None
+
+
+def test_hello_frame_drops_non_bool_gateway_inference_values() -> None:
+    encoded = json.dumps(
+        {
+            "kind": "host.hello",
+            "version": "0.1.0",
+            "frame_protocol_version": 1,
+            "name": "corey-laptop",
+            "gateway_inference": {"codex": "maybe", "claude-native": True},
+        }
+    )
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.gateway_inference == {"claude-native": True}
+
+
+def test_harness_readiness_frame_gateway_inference_round_trip() -> None:
+    original = HostHarnessReadinessFrame(
+        configured_harnesses={"codex": True},
+        gateway_inference={"codex": True, "native-codex": True},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHarnessReadinessFrame)
+    assert decoded.gateway_inference == {"codex": True, "native-codex": True}
+
+
+def test_harness_readiness_frame_without_gateway_inference_is_none() -> None:
+    encoded = json.dumps(
+        {
+            "kind": "host.harness_readiness",
+            "configured_harnesses": {"codex": True},
+        }
+    )
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostHarnessReadinessFrame)
+    assert decoded.gateway_inference is None
+
+
+def test_harness_readiness_frame_rejects_unknown_availability() -> None:
+    """Unknown readiness states cannot partially replace the live map."""
+    encoded = json.dumps(
+        {
+            "kind": "host.harness_readiness",
+            "configured_harnesses": {
+                "pi": "future-state",
+                "codex": "needs-auth",
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="unsupported availability state"):
+        decode_host_frame(encoded)
+
+
+def test_harness_readiness_frame_requires_object_map() -> None:
+    """A malformed live refresh is rejected instead of clearing known readiness."""
+    encoded = json.dumps(
+        {
+            "kind": "host.harness_readiness",
+            "configured_harnesses": ["pi"],
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires a configured_harnesses object"):
+        decode_host_frame(encoded)
+
+
+def test_harness_readiness_frame_rejects_empty_map() -> None:
+    """An empty refresh cannot erase the host's last complete readiness map."""
+    encoded = json.dumps(
+        {
+            "kind": "host.harness_readiness",
+            "configured_harnesses": {},
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires a non-empty configured_harnesses map"):
+        decode_host_frame(encoded)
 
 
 def test_hello_frame_legacy_payload_decodes_unknown_harnesses() -> None:
@@ -386,6 +660,44 @@ def test_runner_exited_frame_missing_error_raises() -> None:
     """
     with pytest.raises(ValueError, match="missing required string field"):
         decode_host_frame('{"kind": "host.runner_exited", "runner_id": "runner_abc123"}')
+
+
+def test_runner_status_frame_round_trip() -> None:
+    """
+    Verify HostRunnerStatusFrame survives encode → decode.
+
+    A garbled runner_id here would make the host answer about the wrong
+    runner, so the dispatch path could wait for (or relaunch) the wrong
+    one.
+    """
+    original = HostRunnerStatusFrame(
+        request_id="req_rs_1",
+        runner_id="runner_token_abc",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostRunnerStatusFrame)
+    assert decoded.request_id == "req_rs_1"
+    assert decoded.runner_id == "runner_token_abc"
+
+
+def test_runner_status_result_frame_round_trip() -> None:
+    """
+    Verify HostRunnerStatusResultFrame survives encode → decode for each
+    verdict.
+
+    ``status`` is the entire signal the dispatch gate acts on — a lossy
+    round-trip would make the server wait when it should relaunch, or
+    vice versa.
+    """
+    for status in ("alive", "dead", "unknown"):
+        original = HostRunnerStatusResultFrame(
+            request_id="req_rs_1",
+            status=status,
+        )
+        decoded = decode_host_frame(encode_host_frame(original))
+        assert isinstance(decoded, HostRunnerStatusResultFrame)
+        assert decoded.request_id == "req_rs_1"
+        assert decoded.status == status
 
 
 def test_decode_unknown_kind_raises() -> None:
@@ -772,6 +1084,39 @@ def test_create_worktree_frame_optional_base_defaults_none() -> None:
     assert decoded.base_branch is None
 
 
+def test_create_worktree_frame_existing_branch_round_trip() -> None:
+    """Verify existing_branch=True survives encode → decode.
+
+    A dropped flag would make the host try to CREATE the branch (with
+    ``-b``), which fails because it already exists — the deleted-worktree
+    recreate would break.
+    """
+    original = HostCreateWorktreeFrame(
+        request_id="req_wt_3",
+        repo_path="/repo",
+        branch_name="fix-1",
+        existing_branch=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.existing_branch is True
+    assert decoded == original
+
+
+def test_create_worktree_frame_existing_branch_absent_defaults_false() -> None:
+    """A frame from an older server (no existing_branch key) decodes as False."""
+    import json
+
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_4", repo_path="/repo", branch_name="wip")
+    )
+    msg = json.loads(encoded)
+    msg.pop("existing_branch", None)
+    decoded = decode_host_frame(json.dumps(msg))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.existing_branch is False
+
+
 def test_create_worktree_result_frame_round_trip() -> None:
     """Verify HostCreateWorktreeResultFrame survives encode → decode.
 
@@ -986,3 +1331,336 @@ def test_create_dir_result_error_round_trip() -> None:
     assert decoded.status == "ok"
     assert decoded.path is None
     assert decoded.error == "directory already exists"
+
+
+def test_install_harness_frame_round_trip() -> None:
+    """
+    Verify HostInstallHarnessFrame survives encode → decode.
+
+    The host maps ``harness`` to an install-spec key; a garbled value
+    would install (or reject) the wrong harness.
+    """
+    original = HostInstallHarnessFrame(
+        request_id="req_install_1",
+        harness="claude",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostInstallHarnessFrame)
+    assert decoded.request_id == "req_install_1"
+    assert decoded.harness == "claude"
+
+
+def test_install_harness_result_success_round_trip() -> None:
+    """
+    Verify a successful install result round-trips with the refreshed
+    readiness map intact.
+
+    The server flips the UI badge off this map, so a dropped or garbled
+    ``configured_harnesses`` would leave a stale "binary missing" badge
+    after a successful install. The map mixes bool and string values
+    (``"needs-auth"`` for an installed-but-unauthed harness), so both
+    must survive the wire.
+    """
+    original = HostInstallHarnessResultFrame(
+        request_id="req_install_2",
+        status="ok",
+        configured_harnesses={"claude-native": True, "codex-native": "needs-auth"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostInstallHarnessResultFrame)
+    assert decoded.status == "ok"
+    assert decoded.configured_harnesses == {
+        "claude-native": True,
+        "codex-native": "needs-auth",
+    }
+    assert decoded.error is None
+
+
+def test_install_harness_result_failure_round_trip() -> None:
+    """
+    Verify a failed install round-trips the reason and leaves the
+    readiness map ``None``.
+
+    The dialog surfaces ``error`` inline so the user sees why the
+    install failed; when the installer never ran there is no fresh
+    readiness to report, so the server keeps its prior view.
+    """
+    original = HostInstallHarnessResultFrame(
+        request_id="req_install_3",
+        status="failed",
+        error="npm not found",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostInstallHarnessResultFrame)
+    assert decoded.status == "failed"
+    assert decoded.configured_harnesses is None
+    assert decoded.gateway_inference is None
+    assert decoded.error == "npm not found"
+
+
+def test_result_frames_round_trip_gateway_inference() -> None:
+    install = HostInstallHarnessResultFrame(
+        request_id="req_install_4",
+        status="ok",
+        configured_harnesses={"claude-native": True},
+        gateway_inference={"claude-native": False},
+    )
+    decoded_install = decode_host_frame(encode_host_frame(install))
+    assert isinstance(decoded_install, HostInstallHarnessResultFrame)
+    assert decoded_install.gateway_inference == {"claude-native": False}
+
+    secret = HostStoreSecretResultFrame(
+        request_id="req_cred_2",
+        status="ok",
+        configured_harnesses={"codex": True},
+        gateway_inference={"codex": True},
+    )
+    decoded_secret = decode_host_frame(encode_host_frame(secret))
+    assert isinstance(decoded_secret, HostStoreSecretResultFrame)
+    assert decoded_secret.gateway_inference == {"codex": True}
+
+
+def test_store_secret_key_frame_round_trip() -> None:
+    """A key store-secret request survives encode → decode with the secret.
+
+    The ``kind`` field rides on the wire as ``kind_`` to avoid colliding with
+    the frame-type ``kind`` discriminator; a decode that read the wrong key
+    would lose the credential kind. The secret must round-trip so the host can
+    write it.
+    """
+    original = HostStoreSecretFrame(
+        request_id="req_cred_1",
+        harness="claude",
+        kind="key",
+        secret_value="sk-ant-SECRET",
+        default_model="claude-sonnet-4-6",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostStoreSecretFrame)
+    assert decoded.request_id == "req_cred_1"
+    assert decoded.harness == "claude"
+    assert decoded.kind == "key"
+    assert decoded.secret_value == "sk-ant-SECRET"
+    assert decoded.default_model == "claude-sonnet-4-6"
+
+
+def test_store_secret_gateway_and_adopt_round_trip() -> None:
+    """Gateway (base_url + wire_api) and adopt (env_var, no secret) round-trip."""
+    gateway = HostStoreSecretFrame(
+        request_id="req_cred_2",
+        harness="codex",
+        kind="gateway",
+        secret_value="gw-TOKEN",
+        base_url="https://openrouter.ai/api/v1",
+        wire_api="chat",
+    )
+    decoded_gw = decode_host_frame(encode_host_frame(gateway))
+    assert isinstance(decoded_gw, HostStoreSecretFrame)
+    assert decoded_gw.kind == "gateway"
+    assert decoded_gw.base_url == "https://openrouter.ai/api/v1"
+    assert decoded_gw.wire_api == "chat"
+
+    adopt = HostStoreSecretFrame(
+        request_id="req_cred_3",
+        harness="codex",
+        kind="adopt",
+        env_var="OPENAI_API_KEY",
+    )
+    decoded_adopt = decode_host_frame(encode_host_frame(adopt))
+    assert isinstance(decoded_adopt, HostStoreSecretFrame)
+    assert decoded_adopt.kind == "adopt"
+    assert decoded_adopt.env_var == "OPENAI_API_KEY"
+    assert decoded_adopt.secret_value is None
+
+
+def test_store_secret_value_is_redacted_from_telemetry() -> None:
+    """The ``secret_value`` field is masked by the telemetry redactor.
+
+    The frame body is recorded on a span when content capture is on; the field
+    is named so ``_REDACT_KEY_SUBSTRINGS`` masks it. A rename that broke this
+    would leak the credential onto a trace.
+    """
+    from omnigent.runtime import telemetry
+
+    redacted = telemetry._redact_payload(
+        {"secret_value": "sk-ant-SECRET", "harness": "claude", "kind_": "key"}
+    )
+    assert redacted["secret_value"] == "[redacted]"
+    assert redacted["harness"] == "claude"
+
+
+def test_store_secret_result_round_trip() -> None:
+    """The result frame round-trips status + refreshed readiness (never a secret)."""
+    ok = HostStoreSecretResultFrame(
+        request_id="req_cred_1",
+        status="ok",
+        configured_harnesses={"claude-native": True},
+    )
+    decoded = decode_host_frame(encode_host_frame(ok))
+    assert isinstance(decoded, HostStoreSecretResultFrame)
+    assert decoded.status == "ok"
+    assert decoded.configured_harnesses == {"claude-native": True}
+
+    failed = HostStoreSecretResultFrame(
+        request_id="req_cred_1",
+        status="failed",
+        error="a gateway requires a base_url",
+    )
+    decoded_f = decode_host_frame(encode_host_frame(failed))
+    assert isinstance(decoded_f, HostStoreSecretResultFrame)
+    assert decoded_f.status == "failed"
+    assert decoded_f.error == "a gateway requires a base_url"
+    assert decoded_f.configured_harnesses is None
+
+
+def test_detect_credentials_round_trip() -> None:
+    """The detect request + result round-trip; the result carries only descriptors."""
+    req = HostDetectCredentialsFrame(request_id="req_detect_1")
+    decoded_req = decode_host_frame(encode_host_frame(req))
+    assert isinstance(decoded_req, HostDetectCredentialsFrame)
+    assert decoded_req.request_id == "req_detect_1"
+
+    result = HostDetectCredentialsResultFrame(
+        request_id="req_detect_1",
+        credentials=[
+            {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
+        ],
+    )
+    decoded = decode_host_frame(encode_host_frame(result))
+    assert isinstance(decoded, HostDetectCredentialsResultFrame)
+    assert decoded.credentials == [
+        {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
+    ]
+
+
+def test_detect_credentials_result_drops_malformed_entries() -> None:
+    """A garbled credentials payload keeps only well-formed string entries."""
+    encoded = json.dumps(
+        {
+            "kind": "host.detect_credentials_result",
+            "request_id": "r1",
+            "credentials": [
+                {"family": "anthropic", "source": "$X", "env_var": "X"},  # kept
+                {"family": 123, "source": "$Y"},  # dropped (non-str family)
+                "not-a-dict",  # dropped
+                {"source": "$Z"},  # dropped (no family)
+            ],
+        }
+    )
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostDetectCredentialsResultFrame)
+    assert decoded.credentials == [{"family": "anthropic", "source": "$X", "env_var": "X"}]
+
+
+def test_fs_request_round_trip() -> None:
+    """
+    Verify an fs request round-trips with op, workspace, session, and params.
+
+    The host reads a session's workspace from disk to serve the file panel
+    when the runner is offline; a dropped ``params`` would silently read the
+    root / default page instead of what the client asked for.
+    """
+    original = HostFsRequestFrame(
+        request_id="req_fs_1",
+        op="list_or_read",
+        workspace="/Users/corey/project",
+        session_id="conv_abc123",
+        params={"path": "src", "limit": 100, "order": "asc"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostFsRequestFrame)
+    assert decoded == original
+
+
+def test_fs_request_defaults_empty_params() -> None:
+    """
+    Verify an fs request with no ``params`` decodes to an empty dict.
+
+    The ``changes`` op carries no params; it must not fail to decode nor
+    surface ``None`` where the handler expects a dict.
+    """
+    decoded = decode_host_frame(
+        '{"kind": "host.fs_request", "request_id": "r", "op": "changes", '
+        '"workspace": "/w", "session_id": "s"}'
+    )
+    assert isinstance(decoded, HostFsRequestFrame)
+    assert decoded.params == {}
+
+
+def test_fs_request_missing_op_raises() -> None:
+    """
+    Verify decoding an fs request without ``op`` raises ValueError.
+
+    Without an op the host cannot route the read; failing loud beats
+    guessing an operation.
+    """
+    with pytest.raises(ValueError, match="missing required string field"):
+        decode_host_frame(
+            '{"kind": "host.fs_request", "request_id": "r", "workspace": "/w", "session_id": "s"}'
+        )
+
+
+def test_fs_request_non_object_params_raises() -> None:
+    """
+    Verify a non-object ``params`` is rejected rather than silently dropped.
+
+    A malformed peer sending ``params: []`` should fail decode instead of
+    reaching the handler as the wrong type.
+    """
+    with pytest.raises(ValueError, match="must be a JSON object: 'params'"):
+        decode_host_frame(
+            '{"kind": "host.fs_request", "request_id": "r", "op": "changes", '
+            '"workspace": "/w", "session_id": "s", "params": []}'
+        )
+
+
+def test_fs_result_success_round_trip() -> None:
+    """
+    Verify a successful fs result round-trips with the payload intact.
+
+    The payload is the runner-shaped JSON the panel renders; a dropped
+    field would blank the viewer even though the host read succeeded.
+    """
+    original = HostFsResultFrame(
+        request_id="req_fs_2",
+        status="ok",
+        payload={"object": "list", "data": [], "has_more": False},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostFsResultFrame)
+    assert decoded == original
+
+
+def test_fs_result_error_round_trip() -> None:
+    """
+    Verify an fs error result round-trips with the status/code/message.
+
+    The server reproduces the runner's HTTP response from these fields; a
+    404 that arrived as a 500 would mislead the client's error handling.
+    """
+    original = HostFsResultFrame(
+        request_id="req_fs_3",
+        status="error",
+        error_status=404,
+        error_code="not_found",
+        error="Path 'missing.py' not found",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostFsResultFrame)
+    assert decoded == original
+
+
+def test_fs_result_null_payload_round_trip() -> None:
+    """
+    Verify an fs result with a null payload decodes cleanly.
+
+    Error results carry no payload; ``null`` must not be coerced into a
+    dict nor raise during decode.
+    """
+    decoded = decode_host_frame(
+        '{"kind": "host.fs_result", "request_id": "r", "status": "error", '
+        '"payload": null, "error_status": 500, "error_code": "boom", "error": "x"}'
+    )
+    assert isinstance(decoded, HostFsResultFrame)
+    assert decoded.payload is None
+    assert decoded.error_status == 500

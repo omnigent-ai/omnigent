@@ -35,15 +35,21 @@ files plus two secrets.
    | `DATABASE_URL` | variable | `sqlite:////data/artifacts/chat.db` |
    | `OMNIGENT_ACCOUNTS_COOKIE_SECRET` | secret | `openssl rand -hex 32` (pin it: ephemeral disk would otherwise drop sessions on restart) |
 
-4. The Space builds + boots. Admin password is in the Space **Logs** on first
-   boot. The base URL is auto-detected from `SPACE_HOST`, so it needs no manual
-   set.
+4. The Space builds + boots. No admin credential is auto-generated: first boot
+   prints a "No admin yet" line to the Space **Logs**, and the Space serves a
+   web Create-admin form where you pick your own username + password. The base
+   URL is auto-detected from `SPACE_HOST`, so it needs no manual set. To create
+   the admin directly instead, add `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD` as a
+   Space secret before first boot.
 5. **Log in via the direct URL** `https://<user>-<space>.hf.space` in its own
    tab — not HF's embedded preview. The session cookie is `SameSite=Lax`, which
    browsers won't send inside HF's cross-origin iframe, so logging in from the
    embedded view loops back to `/login`. The direct URL is top-level
    (same-site), so login sticks. Make the Space **Public** so the direct URL
-   isn't gated.
+   isn't gated — but note the Create-admin form is unauthenticated until the
+   first admin is claimed, so a public Space can be claimed by the first
+   visitor. Pre-seed `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD` (step 4) or claim
+   the admin immediately after it goes public.
 
 ## Want persistence / multi-user later?
 

@@ -90,8 +90,16 @@ def test_runner_id_backfill_marks_only_unbound_conversations(tmp_path: Path) -> 
                     "VALUES (:id, :ts, :ts, 'default', :runner_id)",
                 ),
                 [
-                    {"id": "conv_bound", "ts": 1700000000, "runner_id": "runner_existing"},
-                    {"id": "conv_unbound", "ts": 1700000001, "runner_id": None},
+                    {
+                        "id": "e6c4a1ce71909cfba7d30a314c5f94ee",
+                        "ts": 1700000000,
+                        "runner_id": "runner_existing",
+                    },
+                    {
+                        "id": "e4ffbe103d61752f313e9b6f9e7d3ede",
+                        "ts": 1700000001,
+                        "runner_id": None,
+                    },
                 ],
             )
 
@@ -99,8 +107,8 @@ def test_runner_id_backfill_marks_only_unbound_conversations(tmp_path: Path) -> 
 
         rows = _conversation_runner_ids(engine)
         assert rows == {
-            "conv_bound": "runner_existing",
-            "conv_unbound": OFFLINE_MIGRATED_RUNNER_ID,
+            "e6c4a1ce71909cfba7d30a314c5f94ee": "runner_existing",
+            "e4ffbe103d61752f313e9b6f9e7d3ede": OFFLINE_MIGRATED_RUNNER_ID,
         }
     finally:
         engine.dispose()
@@ -119,8 +127,16 @@ def test_runner_id_backfill_downgrade_round_trips_sentinel(tmp_path: Path) -> No
                     "VALUES (:id, :ts, :ts, 'default', :runner_id)",
                 ),
                 [
-                    {"id": "conv_bound", "ts": 1700000000, "runner_id": "runner_existing"},
-                    {"id": "conv_unbound", "ts": 1700000001, "runner_id": None},
+                    {
+                        "id": "e6c4a1ce71909cfba7d30a314c5f94ee",
+                        "ts": 1700000000,
+                        "runner_id": "runner_existing",
+                    },
+                    {
+                        "id": "e4ffbe103d61752f313e9b6f9e7d3ede",
+                        "ts": 1700000001,
+                        "runner_id": None,
+                    },
                 ],
             )
         _upgrade(engine, uri, "e9f2a7c4d1b8")
@@ -129,8 +145,8 @@ def test_runner_id_backfill_downgrade_round_trips_sentinel(tmp_path: Path) -> No
 
         rows = _conversation_runner_ids(engine)
         assert rows == {
-            "conv_bound": "runner_existing",
-            "conv_unbound": None,
+            "e6c4a1ce71909cfba7d30a314c5f94ee": "runner_existing",
+            "e4ffbe103d61752f313e9b6f9e7d3ede": None,
         }
     finally:
         engine.dispose()

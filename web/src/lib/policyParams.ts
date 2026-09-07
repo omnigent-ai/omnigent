@@ -19,8 +19,7 @@ export interface PolicyParamProp {
 }
 
 export type PolicyParamsResult =
-  | { ok: true; params: Record<string, unknown> }
-  | { ok: false; error: string };
+  { ok: true; params: Record<string, unknown> } | { ok: false; error: string };
 
 /**
  * Convert string-valued form inputs to typed factory params, driven by each

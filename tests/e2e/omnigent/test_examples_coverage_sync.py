@@ -102,8 +102,16 @@ _ALT_COVERED: frozenset[str] = frozenset(
         "coding_supervisor",
         # Covered by tests/e2e/test_openai_coder_*.py.
         "openai-coder",
+        # Covered by tests/e2e/omnigent/test_deep_research_example.py.
+        # The agent name ``deep-research`` has a hyphen (not a valid
+        # Python test-module name), so it can't use the
+        # ``test_example_<name>.py`` convention — same as ``openai-coder``.
+        "deep-research",
         # Covered by tests/e2e/omnigent/test_repl_overview_terminal_visibility.py.
         "terminal_workers",
+        # Covered by tests/e2e/test_subagent_tool_limit_e2e.py. Hyphenated
+        # name, so it can't use the ``test_example_<name>.py`` convention.
+        "subagent-tool-limit",
         # Pre-existing coverage gaps — ``chat_model`` is exercised
         # by ``web/``'s integration flow (``web/README.md`` leads
         # the dev-server README with it) and ``coding_supervisor_openai``

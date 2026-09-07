@@ -352,6 +352,63 @@ def test_chat_text_response_to_response() -> None:
     assert resp.usage == Usage(input_tokens=10, output_tokens=5, total_tokens=15)
 
 
+def test_chat_list_content_flattened_to_string() -> None:
+    # Claude via Databricks (and Kimi, etc.) return non-streaming
+    # message.content as a list of typed blocks rather than a plain
+    # string. It must be flattened so downstream consumers get a str.
+    chat_dict = {
+        "id": "chatcmpl-list",
+        "model": "databricks-claude-sonnet-4",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": '{"action":"allow"}'}],
+                    "tool_calls": None,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": None,
+    }
+    resp = chat_response_to_response(chat_dict)
+    assert len(resp.output) == 1
+    assert isinstance(resp.output[0], MessageOutput)
+    assert resp.output[0].content[0].text == '{"action":"allow"}'
+
+
+def test_chat_list_content_reasoning_and_text_flattened() -> None:
+    # A mixed reasoning + text block list flattens to just the visible
+    # text; reasoning blocks are not folded into the message text.
+    chat_dict = {
+        "id": "chatcmpl-mixed",
+        "model": "databricks-claude-sonnet-4",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "thinking..."}],
+                        },
+                        {"type": "text", "text": '{"action":"deny"}'},
+                    ],
+                    "tool_calls": None,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": None,
+    }
+    resp = chat_response_to_response(chat_dict)
+    assert len(resp.output) == 1
+    assert isinstance(resp.output[0], MessageOutput)
+    assert resp.output[0].content[0].text == '{"action":"deny"}'
+
+
 def test_chat_tool_calls_to_response() -> None:
     chat_dict = {
         "id": "chatcmpl-456",

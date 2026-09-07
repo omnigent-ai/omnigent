@@ -2,8 +2,8 @@
 
 When a session is bound to a managed host whose sandbox idle-stopped, the
 open-session view must NOT dead-end on the ``host_offline`` reconnect banner:
-the host is resumable, so the composer stays ENABLED and its placeholder tells
-the user the next message will resume the sandbox host. This drives the
+the host is resumable, so the composer stays ENABLED with the normal send
+placeholder (the next message resumes the sandbox host). This drives the
 ``host_asleep`` liveness variant (see ``web/src/hooks/useSessionLiveness.ts``
 row 3) end to end — host-bound + ``host_online=false`` + ``host_resumable=true``
 + the runner offline, and outside the startup grace.
@@ -32,10 +32,9 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
-_ASLEEP_PLACEHOLDER = (
-    "Current session's host is offline. "
-    "Next message will resume the sandbox host which can take minutes"
-)
+from tests.e2e_ui.conftest import fetch_with_retry
+
+_COMPOSER_PLACEHOLDER = "Send a message…"
 _FAKE_HOST_ID = "host_test_managed"
 # Unix seconds well before now so the session is outside the startup grace
 # (STARTING_GRACE_S) — see useSessionLiveness row 2.
@@ -56,7 +55,7 @@ def _force_host_asleep(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         payload["host_id"] = payload.get("host_id") or _FAKE_HOST_ID
         payload["host_resumable"] = True
@@ -75,7 +74,7 @@ def _force_host_asleep(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/v1/sessions":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         rows = payload.get("data") if isinstance(payload, dict) else None
         if isinstance(rows, list):
@@ -93,7 +92,7 @@ def _force_host_asleep(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/health":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         offline = {"runner_online": False, "host_online": False}
         # Plural shape used by the open-session fallback poll:
@@ -118,11 +117,11 @@ def _force_host_asleep(page: Page, session_id: str) -> None:
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
 
 
-def test_host_asleep_keeps_composer_open_with_resume_placeholder(
+def test_host_asleep_keeps_composer_open(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """In ``host_asleep`` the composer stays enabled with the wake placeholder.
+    """In ``host_asleep`` the composer stays enabled with the send placeholder.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -136,9 +135,8 @@ def test_host_asleep_keeps_composer_open_with_resume_placeholder(
 
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=15_000)
-    # The placeholder is the host_asleep tell: composer open, message resumes
-    # the sandbox host. NOT the host_offline "Session offline — reconnect"
-    # dead-end.
-    expect(composer).to_have_attribute("placeholder", _ASLEEP_PLACEHOLDER, timeout=15_000)
-    # Key behavior: a resumable dormant host keeps the composer usable.
+    # Key behavior: a resumable dormant host keeps the composer open and
+    # enabled with the normal send placeholder — NOT the host_offline
+    # "Session offline — reconnect" disabled dead-end.
+    expect(composer).to_have_attribute("placeholder", _COMPOSER_PLACEHOLDER, timeout=15_000)
     expect(composer).not_to_be_disabled()

@@ -47,7 +47,7 @@ vi.mock("@/components/blocks/ApprovalCard", () => ({
 }));
 
 vi.mock("@/hooks/useConversations", async (importActual) => ({
-  ...(await importActual<typeof import("@/hooks/useConversations")>()),
+  ...(await importActual<typeof conversationsHook>()),
   useConversations: vi.fn(),
 }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
@@ -213,7 +213,9 @@ describe("InboxPage approval items", () => {
     renderPage();
 
     const item = await screen.findByTestId("inbox-item");
-    fireEvent.click(within(item).getByRole("button", { name: /My Session/ }));
+    const toggle = within(item).getByRole("button", { name: /My Session/ });
+    expect(toggle).toHaveClass("cursor-pointer");
+    fireEvent.click(toggle);
     await waitFor(() => expect(item).toHaveAttribute("data-expanded", "false"));
     expect(screen.queryByTestId("approval-card")).not.toBeInTheDocument();
   });

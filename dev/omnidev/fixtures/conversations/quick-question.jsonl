@@ -1,0 +1,3 @@
+{"record_type":"session_meta","title":"Example: Quick question","harness":"pi-native"}
+{"record_type":"item","id":"msg_quick_1","type":"message","status":"completed","response_id":"resp_quick_1","role":"user","content":[{"type":"input_text","text":"What command runs one Python test in this repository?"}]}
+{"record_type":"item","id":"msg_quick_2","type":"message","status":"completed","response_id":"resp_quick_1","role":"assistant","content":[{"type":"output_text","text":"Use `uv run pytest path/to/test.py::test_name`. Keeping the node id focused avoids running the full suite locally."}],"model":"pi-native-ui"}

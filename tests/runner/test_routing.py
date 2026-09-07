@@ -55,6 +55,14 @@ class _ConversationStore:
         return self._conversations.get(conversation_id)
 
 
+class _FailOnReadConversationStore:
+    """Conversation store that rejects persistence reads."""
+
+    def get_conversation(self, conversation_id: str) -> Conversation | None:
+        """Fail because the caller should use its preloaded conversation."""
+        raise AssertionError(f"unexpected conversation read for {conversation_id}")
+
+
 def _conversation(
     conversation_id: str = "conv_test",
     *,
@@ -235,6 +243,44 @@ async def test_runner_router_resources_require_existing_runner_binding() -> None
 
         _assert_omnigent_error(excinfo, code=ErrorCode.CONFLICT)
         assert conversation.runner_id is None
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runner_router_resources_reuses_preloaded_conversation() -> None:
+    """Resource routing can reuse the row already loaded for authorization."""
+    registry = TunnelRegistry()
+    registry.register("runner_one", _FakeWebSocket(), _hello(harnesses=["codex"]))
+    conversation = _conversation(runner_id="runner_one")
+    router = RunnerRouter(
+        registry=registry,
+        conversation_store=_FailOnReadConversationStore(),  # type: ignore[arg-type]
+    )
+    try:
+        routed = router.client_for_session_resources(
+            "conv_test",
+            conversation=conversation,
+        )
+
+        assert routed.runner_id == "runner_one"
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runner_router_resources_rejects_mismatched_preloaded_conversation() -> None:
+    """A preloaded row cannot be used to route a different session id."""
+    router = RunnerRouter(
+        registry=TunnelRegistry(),
+        conversation_store=_FailOnReadConversationStore(),  # type: ignore[arg-type]
+    )
+    try:
+        with pytest.raises(ValueError, match="conversation id mismatch"):
+            router.client_for_session_resources(
+                "conv_test",
+                conversation=_conversation("conv_other"),
+            )
     finally:
         await router.aclose()
 

@@ -403,3 +403,63 @@ def test_launch_blocked_notice_skips_without_client(
 
     monkeypatch.setattr(subprocess, "Popen", _boom)
     native_cost_popup.launch_blocked_notice("/tmp/x.sock", "main", message="x")
+
+
+def test_tmux_window_activity_at_tracks_a_live_server() -> None:
+    """
+    A live tmux window reports recent activity; a killed server reports None.
+
+    The pane reaper uses this as primary evidence that a terminal is
+    producing output, so the live reading must be a fresh epoch timestamp
+    and a dead server must read as "no evidence", never as an error.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+
+    if shutil.which("tmux") is None:
+        pytest.skip("tmux not installed")
+    # A short socket dir: pytest's tmp_path exceeds the Unix sun_path limit.
+    tmp_dir = tempfile.mkdtemp(prefix="omni-wa-")
+    socket_path = str(Path(tmp_dir) / "t.sock")
+    try:
+        subprocess.run(
+            ["tmux", "-S", socket_path, "new-session", "-d", "-s", "main", "-x", "20", "-y", "5"],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        try:
+            activity_at = native_cost_popup._tmux_window_activity_at(socket_path, "main")
+            assert activity_at is not None
+            assert abs(time.time() - activity_at) < 120.0
+        finally:
+            subprocess.run(
+                ["tmux", "-S", socket_path, "kill-server"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+        assert native_cost_popup._tmux_window_activity_at(socket_path, "main") is None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_tmux_window_activity_at_none_on_unparseable_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Garbage from tmux is treated as "no evidence", not a crash.
+
+    An old tmux that doesn't know the format variable echoes it back
+    verbatim; the reaper must fall back to its other signals rather than
+    treat that as activity (or blow up mid-scan).
+    """
+    import subprocess
+
+    def _fake_run(*_a: Any, **_k: Any) -> Any:
+        return types.SimpleNamespace(returncode=0, stdout="#{window_activity}\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    assert native_cost_popup._tmux_window_activity_at("/tmp/x.sock", "main") is None

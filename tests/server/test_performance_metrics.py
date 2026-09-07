@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from dataclasses import dataclass, field
 
 import httpx
@@ -14,6 +15,7 @@ from fastapi import FastAPI, Request
 from opentelemetry.util.types import Attributes
 from starlette.types import Scope
 
+from omnigent.process_logging import DEFAULT_LOG_DATEFMT, DEFAULT_LOG_PREFIX_FORMAT
 from omnigent.server.performance_metrics import (
     RequestDurationAccessFormatter,
     ServerMetricsOtelPublisher,
@@ -392,6 +394,28 @@ def test_request_duration_access_formatter_appends_individual_duration() -> None
         )
     finally:
         set_request_duration_for_access_log(None)
+
+
+def test_request_duration_access_formatter_colors_standard_level_name() -> None:
+    """Terminal access logs color the standard display columns."""
+    formatter = RequestDurationAccessFormatter(
+        fmt=DEFAULT_LOG_PREFIX_FORMAT + '"%(request_line)s" %(status_code)s',
+        datefmt=DEFAULT_LOG_DATEFMT,
+        use_colors=True,
+    )
+    record = _make_access_record()
+
+    output = formatter.format(record)
+
+    assert re.match(
+        r"\x1b\[32mINFO \x1b\[0m \d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} "
+        r"\x1b\[34muvicorn\.access\s+\x1b\[0m "
+        r"\x1b\[35m-\s+\x1b\[0m \| "
+        r'"\x1b\[1mGET /v1/sessions/conv_abc/events HTTP/1\.1\x1b\[0m" '
+        r"\x1b\[32m200 OK\x1b\[0m",
+        output,
+    )
+    assert record.levelname == "INFO"
 
 
 def _make_access_record() -> logging.LogRecord:
@@ -864,7 +888,11 @@ async def test_create_app_metrics_middleware_counts_http_requests(
 
     resp = await client.get(
         "/health",
-        params={"session_ids": "conv_one,conv_two"},
+        # Valid bare-hex ids: session_ids bind to Uuid16, so a non-uuid would
+        # now 404 the batch (InvalidUuidError) instead of returning 200-empty.
+        params={
+            "session_ids": "dbb8b733fdfaca2c150b42317d3829f6,f8fb0016d56510e7e6b3ee8618d78415"
+        },
     )
 
     after = app.state.server_metrics.snapshot()

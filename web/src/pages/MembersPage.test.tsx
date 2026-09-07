@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   accountsEnabled: true,
   loginUrl: null as string | null,
   serverVersion: "0.3.0.dev0" as string | null,
+  singleUser: false,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -26,6 +27,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     server_version: mocks.serverVersion,
+    single_user: mocks.singleUser,
   }),
 }));
 vi.mock("@/lib/identity", () => ({
@@ -62,6 +64,7 @@ beforeEach(() => {
   mocks.accountsEnabled = true;
   mocks.loginUrl = null;
   mocks.serverVersion = "0.3.0.dev0";
+  mocks.singleUser = false;
   vi.mocked(identity.resolveIdentity).mockResolvedValue("admin");
   vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
   vi.mocked(accountsApi.listUsers).mockResolvedValue([]);
@@ -195,12 +198,13 @@ describe("MembersPage actions", () => {
 
 describe("MembersPage in plain header/single-user mode", () => {
   beforeEach(() => {
-    // Single-user mode: no accounts, no IdP (login_url is null). The
-    // /auth/users endpoint does not exist, so the page must skip the fetch
-    // and show a "not available" message instead.
+    // Explicit single-user local runtime (single_user marker): no accounts,
+    // no IdP. The /auth/users endpoint does not exist, so the page must skip
+    // the fetch and show a "not available" message instead.
     mocks.accountsEnabled = false;
     mocks.loginUrl = null;
     mocks.serverVersion = "0.3.0.dev0";
+    mocks.singleUser = true;
   });
 
   it("shows a not-available message and never calls listUsers", async () => {

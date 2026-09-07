@@ -3,26 +3,40 @@
 // Covers the Appearance theme picker, the auth-gated Account section, and the
 // Archived sessions list (which moved here out of the sidebar).
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, useLocation } from "react-router-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
   theme: "system" as string,
   archiveMutate: vi.fn(),
   deleteMutate: vi.fn(),
+  bulkArchiveMutate: vi.fn(),
+  bulkDeleteMutate: vi.fn(),
   accountsEnabled: true,
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
-  // header single-user mode. Gates the Account section.
+  // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
+  // single_user: explicit single-user marker; false for accounts/OIDC/
+  // multi-user-header. Gates the settings-route single-user redirect.
+  singleUser: false,
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
   conversations: [] as Conversation[],
+  // Optional multi-page dataset (array of per-page row arrays) for pagination
+  // tests. When unset the mock serves a single page of `conversations`.
+  pages: undefined as Conversation[][] | undefined,
+  // Picker options come from useArchivedProjectNames (a dedicated scan), not
+  // from the loaded rows — so tests set them independently of `conversations`.
+  projectNames: [] as string[],
+  hasNextPage: false,
+  fetchNextPage: vi.fn(),
 }));
 
 vi.mock("next-themes", () => ({
@@ -33,6 +47,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
+    single_user: mocks.singleUser,
   }),
 }));
 vi.mock("@/lib/accountsApi", () => ({
@@ -42,15 +57,110 @@ vi.mock("@/lib/accountsApi", () => ({
 vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
+  getCurrentUserId: () => mocks.me?.id ?? null,
 }));
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: () => ({
-    data: { pages: [{ data: mocks.conversations }] },
-    isLoading: false,
-  }),
-  useArchiveConversation: () => ({ mutate: mocks.archiveMutate, isPending: false }),
-  useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
+  // many pages are "loaded" and reveals the next on fetchNextPage, so a click
+  // on "Load more" re-renders with more rows (as the real hook would).
+  const { useState } = await import("react");
+  return {
+    PROJECT_LABEL_KEY: "omni_project",
+    // The Archived view drives the visible list from this hook; filter on the
+    // fourth (`project`) arg so the mock mirrors the server-side ?project=
+    // scoping.
+    useConversations: (
+      _searchQuery?: string,
+      _includeArchived?: boolean,
+      _options?: unknown,
+      project?: string,
+    ) => {
+      // `mocks.pages` (array of per-page row arrays) drives multi-page tests;
+      // otherwise serve a single page of `mocks.conversations`.
+      const source = mocks.pages ?? [mocks.conversations];
+      const [shown, setShown] = useState(1);
+      const pages = source.slice(0, shown).map((rows) => ({
+        data: project ? rows.filter((c) => c.labels?.["omni_project"] === project) : rows,
+      }));
+      return {
+        data: { pages },
+        isLoading: false,
+        hasNextPage: shown < source.length || mocks.hasNextPage,
+        isFetchingNextPage: false,
+        fetchNextPage: () => {
+          mocks.fetchNextPage();
+          setShown((n) => Math.min(n + 1, source.length));
+        },
+      };
+    },
+    // Picker options are sourced from this dedicated scan, decoupled from the
+    // loaded rows so archived-only projects on later pages still appear.
+    useArchivedProjectNames: () => ({ data: mocks.projectNames }),
+    useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
+    // Mirrors react-query's mutate: per-call `onSuccess` runs once the
+    // mutation settles, which is what drives the post-unarchive navigation.
+    useArchiveConversation: () => ({
+      mutate: (vars: { id: string; archived: boolean }, opts?: { onSuccess?: () => void }) => {
+        mocks.archiveMutate(vars, opts);
+        opts?.onSuccess?.();
+      },
+      isPending: false,
+    }),
+    useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
+    useBulkArchiveConversations: () => ({
+      mutate: mocks.bulkArchiveMutate,
+      isPending: false,
+      isError: false,
+    }),
+    useBulkDeleteConversations: () => ({
+      mutate: mocks.bulkDeleteMutate,
+      isPending: false,
+      isError: false,
+    }),
+  };
+});
+// Radix Select uses a portal + pointer events jsdom can't drive; stub it to a
+// native <select> so tests can drive both the color-theme dropdown and the
+// archived project filter. The real page puts data-testid on SelectTrigger,
+// so the stub lifts it from the trigger child onto the native <select>.
+vi.mock("@/components/ui/select", async () => {
+  const { Children, isValidElement } = await import("react");
+  const SelectTrigger = ({ children }: { children?: ReactNode }) => children;
+  const Select = ({
+    value,
+    onValueChange,
+    children,
+  }: {
+    value: string;
+    onValueChange: (v: string) => void;
+    children: ReactNode;
+  }) => {
+    const kids = Children.toArray(children);
+    const trigger = kids.find((c) => isValidElement(c) && c.type === SelectTrigger);
+    const testId =
+      isValidElement(trigger) && trigger.props && typeof trigger.props === "object"
+        ? (trigger.props as Record<string, unknown>)["data-testid"]
+        : undefined;
+    return (
+      <select
+        data-testid={typeof testId === "string" ? testId : undefined}
+        value={value}
+        onChange={(e) => onValueChange(e.target.value)}
+      >
+        {kids.filter((c) => !(isValidElement(c) && c.type === SelectTrigger))}
+      </select>
+    );
+  };
+  return {
+    Select,
+    SelectTrigger,
+    SelectValue: () => null,
+    SelectContent: ({ children }: { children: ReactNode }) => children,
+    SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
+      <option value={value}>{children}</option>
+    ),
+  };
+});
 // The admin management surfaces are lazy-loaded and own heavy data layers of
 // their own; stub them so these tests only assert SettingsPage's section
 // routing (that /settings/members and /settings/policies render the right one).
@@ -59,33 +169,6 @@ vi.mock("@/pages/MembersPage", () => ({
 }));
 vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
-}));
-// Radix Select uses a portal + pointer events jsdom can't drive, so stub it to
-// a native <select>; lets the color-theme dropdown be exercised via change.
-vi.mock("@/components/ui/select", () => ({
-  Select: ({
-    value,
-    onValueChange,
-    children,
-  }: {
-    value: string;
-    onValueChange: (v: string) => void;
-    children: ReactNode;
-  }) => (
-    <select
-      data-testid="color-theme-select"
-      value={value}
-      onChange={(e) => onValueChange(e.target.value)}
-    >
-      {children}
-    </select>
-  ),
-  SelectTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,
-  SelectValue: () => null,
-  SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
-  SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
-    <option value={value}>{children}</option>
-  ),
 }));
 
 import { SettingsPage } from "./SettingsPage";
@@ -103,11 +186,17 @@ function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
   };
 }
 
+/** Exposes the router location so navigation assertions read the real URL. */
+function LocationProbe() {
+  return <span data-testid="location">{useLocation().pathname}</span>;
+}
+
 function renderPage(path = "/settings") {
   return render(
     <TooltipProvider>
       <MemoryRouter initialEntries={[path]}>
         <SettingsPage />
+        <LocationProbe />
       </MemoryRouter>
     </TooltipProvider>,
   );
@@ -117,24 +206,94 @@ beforeEach(() => {
   mocks.setTheme.mockReset();
   mocks.archiveMutate.mockReset();
   mocks.deleteMutate.mockReset();
+  mocks.bulkArchiveMutate.mockReset();
+  mocks.bulkDeleteMutate.mockReset();
+  mocks.fetchNextPage.mockReset();
   mocks.theme = "system";
   mocks.accountsEnabled = true;
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
+  mocks.pages = undefined;
+  mocks.projectNames = [];
+  mocks.hasNextPage = false;
+  delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
 afterEach(() => {
   cleanup();
-  // Reset the font-size preference + applied scale so the Appearance tests
-  // don't leak persisted state or the --ui-font-scale variable into each other.
+  // Reset the font-size preference + applied desktop size so the Appearance
+  // tests don't leak state into each other.
   localStorage.clear();
-  document.documentElement.style.removeProperty("--ui-font-scale");
+  document.documentElement.style.removeProperty("--desktop-ui-font-size");
   // The palette picker sets data-theme on <html>; clear it so a palette
   // selected in one test doesn't leak into the next.
   document.documentElement.removeAttribute("data-theme");
+  document.documentElement.removeAttribute("data-custom-translucent-sidebar");
+  for (const property of Array.from(document.documentElement.style)) {
+    if (property.startsWith("--custom-")) document.documentElement.style.removeProperty(property);
+  }
+  delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
 
+const DEFAULT_UPDATE_CONFIG: UpdateConfig = {
+  mode: "default",
+  autoInstall: true,
+  skippedVersion: null,
+};
+
+function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
+  let onStatus: Parameters<ElectronUpdateBridge["onStatus"]>[0] | null = null;
+  const unsubscribe = vi.fn();
+  const bridge: ElectronUpdateBridge = {
+    getConfig: vi.fn().mockResolvedValue(config),
+    getStatus: vi.fn().mockResolvedValue({ state: "idle" }),
+    check: vi.fn().mockResolvedValue(undefined),
+    download: vi.fn().mockResolvedValue(undefined),
+    installNow: vi.fn().mockResolvedValue(undefined),
+    setConfig: vi.fn().mockImplementation((patch: Partial<UpdateConfig>) =>
+      Promise.resolve({
+        ...config,
+        ...patch,
+      }),
+    ),
+    onStatus: vi.fn((cb) => {
+      onStatus = cb;
+      return unsubscribe;
+    }),
+  };
+  (window as unknown as Record<string, unknown>).omnigentDesktop = {
+    kind: "electron",
+    setBadgeCount: vi.fn(),
+    notify: vi.fn(),
+    updates: bridge,
+  };
+  return {
+    bridge,
+    emitStatus: (status: UpdateStatus) => onStatus?.(status),
+    unsubscribe,
+  };
+}
+
 describe("SettingsPage", () => {
+  it("renders composer shortcut guidance as two accessible lines", () => {
+    renderPage("/settings/general");
+    const toggle = screen.getByTestId("composer-submit-with-mod-enter-toggle");
+    const descriptionId = toggle.getAttribute("aria-describedby");
+    const description = descriptionId ? document.getElementById(descriptionId) : null;
+
+    expect(description).toBeTruthy();
+    if (description === null) throw new Error("Missing composer shortcut description");
+    expect(Array.from(description.children).map((line) => line.tagName)).toEqual(["P", "P"]);
+    expect(
+      within(description).getByText("Off: Enter submits and Shift+Enter inserts a newline."),
+    ).toBeInTheDocument();
+    expect(
+      within(description).getByText(/On: Enter inserts a newline and (?:⌘|Ctrl)\+Enter submits\./),
+    ).toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-labelledby");
+    expect(toggle).toHaveAccessibleName(/Submit with (?:⌘|Ctrl) \+ Enter on desktop/);
+  });
+
   it("renders the Appearance section and applies a theme on card click", () => {
     renderPage("/settings/appearance");
     expect(screen.getByRole("heading", { name: "Appearance" })).toBeInTheDocument();
@@ -151,6 +310,13 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-light")).toHaveAttribute("aria-checked", "false");
     expect(screen.getByTestId("terminal-theme-dark")).toHaveAttribute("aria-checked", "false");
     expect(localStorage.getItem("omnigent:terminal-theme")).toBeNull();
+  });
+
+  it("renders Terminal theme before Color theme", () => {
+    renderPage("/settings/appearance");
+    const terminal = screen.getByText("Terminal theme");
+    const color = screen.getByText("Color theme");
+    expect(terminal.compareDocumentPosition(color) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("persists dark and light terminal theme choices on card click", () => {
@@ -174,6 +340,24 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
   });
 
+  it("defaults transcripts to Chat and persists a Terminal default", () => {
+    renderPage("/settings/appearance");
+
+    expect(screen.getByRole("radiogroup", { name: "Default transcript view" })).toBeInTheDocument();
+    expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-transcript-view")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
+    expect(screen.getByTestId("transcript-view-default-terminal")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
+  });
+
   it("renders the color theme dropdown, defaults to Omnigent, and applies a palette on change", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
@@ -189,6 +373,92 @@ describe("SettingsPage", () => {
     expect(select.value).toBe("github");
     expect(document.documentElement.getAttribute("data-theme")).toBe("github");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+  });
+
+  it("creates and applies a custom theme when a guided color control changes", () => {
+    renderPage("/settings/appearance");
+    const select = screen.getByTestId("color-theme-select") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "github" } });
+
+    fireEvent.click(screen.getByTestId("custom-theme-accent-trigger"));
+    const accent = screen.getByTestId("custom-theme-accent-input") as HTMLInputElement;
+    expect(accent.value).toBe("#1F883D");
+    fireEvent.change(accent, { target: { value: "#2563eb" } });
+
+    expect(select.value).toBe("custom");
+    expect(document.documentElement.getAttribute("data-theme")).toBe("custom");
+    expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("custom"));
+    expect(JSON.parse(localStorage.getItem("omnigent:custom-theme") ?? "null")).toMatchObject({
+      basePalette: "github",
+      accent: "#2563eb",
+      darkAccent: "#2563eb",
+    });
+    expect(document.documentElement.style.getPropertyValue("--custom-light-primary")).toBe(
+      "#2563eb",
+    );
+  });
+
+  it("keeps the preset primary color when contrast creates a custom theme", () => {
+    renderPage("/settings/appearance");
+    fireEvent.change(screen.getByTestId("color-theme-select"), {
+      target: { value: "github" },
+    });
+
+    fireEvent.change(screen.getByTestId("custom-theme-contrast"), {
+      target: { value: "68" },
+    });
+
+    expect(document.documentElement.getAttribute("data-theme")).toBe("custom");
+    expect(document.documentElement.style.getPropertyValue("--custom-light-primary")).toBe(
+      "#1f883d",
+    );
+    expect(document.documentElement.style.getPropertyValue("--custom-dark-primary")).toBe(
+      "#238636",
+    );
+    expect(document.documentElement.style.getPropertyValue("--custom-dark-background")).toBe(
+      "#0d1117",
+    );
+  });
+
+  it("restores Dracula surfaces when contrast returns to 50", () => {
+    renderPage("/settings/appearance");
+    fireEvent.change(screen.getByTestId("color-theme-select"), {
+      target: { value: "dracula" },
+    });
+
+    const contrast = screen.getByTestId("custom-theme-contrast");
+    fireEvent.change(contrast, { target: { value: "53" } });
+    fireEvent.change(contrast, { target: { value: "50" } });
+
+    const style = document.documentElement.style;
+    expect(style.getPropertyValue("--custom-light-background")).toBe("#f7f5fd");
+    expect(style.getPropertyValue("--custom-light-card")).toBe("#ffffff");
+    expect(style.getPropertyValue("--custom-light-sidebar")).toBe("#f3f0fa");
+    expect(style.getPropertyValue("--custom-light-border")).toBe("#e6e0f2");
+    expect(style.getPropertyValue("--custom-light-brand-accent")).toBe("#d6409f");
+  });
+
+  it("persists the shared contrast and translucent-sidebar controls", () => {
+    renderPage("/settings/appearance");
+
+    fireEvent.change(screen.getByTestId("custom-theme-contrast"), {
+      target: { value: "68" },
+    });
+    fireEvent.click(screen.getByTestId("custom-theme-translucent-sidebar"));
+
+    expect(screen.getByTestId("custom-theme-contrast")).toHaveStyle({
+      "--range-progress": "68%",
+    });
+    expect(screen.getByTestId("color-theme-select")).toHaveValue("custom");
+    expect(screen.getByTestId("custom-theme-contrast-value")).toHaveTextContent("68");
+    expect(JSON.parse(localStorage.getItem("omnigent:custom-theme") ?? "null")).toMatchObject({
+      contrast: 68,
+      translucentSidebar: true,
+    });
+    expect(document.documentElement.style.getPropertyValue("--custom-light-sidebar")).toMatch(
+      /^rgba\(/,
+    );
+    expect(document.documentElement).toHaveAttribute("data-custom-translucent-sidebar");
   });
 
   it("moves the mode selection with arrow keys (radiogroup keyboard nav)", () => {
@@ -208,28 +478,29 @@ describe("SettingsPage", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
     const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
-    // No stored preference → 16px default.
-    expect(input.value).toBe("16");
+    // No stored preference → 13px default.
+    expect(input.value).toBe("13");
+    expect(screen.getByTestId("ui-font-size-inc").querySelector("svg")).toHaveClass("ui-icon");
 
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
-    expect(input.value).toBe("17");
+    expect(input.value).toBe("14");
     // The choice is persisted so it survives a refresh.
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("17");
-    // The scale is applied live to the document root (17 / 16).
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.0625");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("14");
+    // The discrete desktop size is applied live to the document root.
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("14px");
   });
 
   it("disables the steppers at the min and max bounds", () => {
-    localStorage.setItem("omnigent:ui-font-size", "20");
+    localStorage.setItem("omnigent:ui-font-size", "18");
     renderPage("/settings/appearance");
-    // At the 20px max, only the increase button is disabled.
+    // At the 18px max, only the increase button is disabled.
     expect(screen.getByTestId("ui-font-size-inc")).toBeDisabled();
     expect(screen.getByTestId("ui-font-size-dec")).not.toBeDisabled();
 
     cleanup();
-    localStorage.setItem("omnigent:ui-font-size", "12");
+    localStorage.setItem("omnigent:ui-font-size", "11");
     renderPage("/settings/appearance");
-    // At the 12px min, only the decrease button is disabled.
+    // At the 11px min, only the decrease button is disabled.
     expect(screen.getByTestId("ui-font-size-dec")).toBeDisabled();
     expect(screen.getByTestId("ui-font-size-inc")).not.toBeDisabled();
   });
@@ -272,25 +543,96 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-font-family")).toBeNull();
   });
 
+  it("resets every appearance preference back to product defaults", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+
+    // Tweak a representative set of appearance preferences.
+    mocks.theme = "dark";
+    fireEvent.click(screen.getByTestId("theme-dark"));
+    fireEvent.click(screen.getByTestId("terminal-theme-dark"));
+    fireEvent.change(screen.getByTestId("color-theme-select") as HTMLSelectElement, {
+      target: { value: "github" },
+    });
+    fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
+    fireEvent.click(screen.getByTestId("workspace-panel-default-collapsed"));
+    fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
+      target: { value: "Inter" },
+    });
+    fireEvent.click(screen.getByTestId("code-font-size-inc"));
+    fireEvent.click(screen.getByTestId("code-font-size-inc"));
+    fireEvent.change(screen.getByTestId("code-font-family-input") as HTMLInputElement, {
+      target: { value: "Fira Code" },
+    });
+    fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
+
+    // Sanity: the non-default choices were persisted.
+    expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
+    expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
+    expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
+    expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
+    expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
+
+    // Open the confirmation dialog and confirm the reset.
+    fireEvent.click(screen.getByTestId("reset-appearance-button"));
+    fireEvent.click(screen.getByTestId("reset-appearance-confirm"));
+
+    // Mode is restored to "system".
+    expect(mocks.setTheme).toHaveBeenCalledWith("system");
+
+    // Fonts are back to their defaults.
+    expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("13");
+    expect((screen.getByTestId("ui-font-family-input") as HTMLInputElement).value).toBe("");
+    expect((screen.getByTestId("code-font-size-input") as HTMLInputElement).value).toBe("13");
+    expect((screen.getByTestId("code-font-family-input") as HTMLInputElement).value).toBe("");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("13px");
+    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
+    expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
+    expect(localStorage.getItem("omnigent:code-font-weight")).toBeNull();
+
+    // Color theme is back to Omnigent.
+    expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
+    expect(document.documentElement.getAttribute("data-theme")).toBeNull();
+
+    // Terminal theme, transcript view, workspace panel, and harness visibility are restored.
+    expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByTestId("workspace-panel-default-open")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByTestId("hide-unconfigured-harnesses-toggle")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+  });
+
   it("lets you clear and retype the font size without clamping mid-edit", () => {
     localStorage.setItem("omnigent:ui-font-size", "13");
     renderPage("/settings/appearance");
     const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
     expect(input.value).toBe("13");
 
-    // Deleting a digit leaves "1" — below the 12px min. The box must SHOW "1"
-    // (free editing) without snapping to 12 or persisting the transient value.
+    // Deleting a digit leaves "1" — below the 11px min. The box must SHOW "1"
+    // (free editing) without snapping to 11 or persisting the transient value.
     fireEvent.change(input, { target: { value: "1" } });
     expect(input.value).toBe("1");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("13");
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("");
 
     // Finishing the number to a valid size applies it live and persists it.
     fireEvent.change(input, { target: { value: "18" } });
     expect(input.value).toBe("18");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("18");
-    // 18 / 16 base = 1.125.
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.125");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("18px");
   });
 
   it("clamps a below-min entry to the minimum on blur", () => {
@@ -301,8 +643,8 @@ describe("SettingsPage", () => {
     fireEvent.change(input, { target: { value: "1" } });
     fireEvent.blur(input);
     // On blur the draft settles to the clamped minimum.
-    expect(input.value).toBe("12");
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("12");
+    expect(input.value).toBe("11");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("11");
   });
 
   it("reverts an empty entry to the committed size on blur", () => {
@@ -322,15 +664,14 @@ describe("SettingsPage", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
     const input = screen.getByTestId("code-font-size-input") as HTMLInputElement;
-    // No stored preference → 13px default (code widgets read a touch smaller
-    // than the 16px chrome default).
+    // No stored preference → 13px default, matching the interface default.
     expect(input.value).toBe("13");
 
     fireEvent.click(screen.getByTestId("code-font-size-inc"));
     expect(input.value).toBe("14");
     // Persisted under the code-font key (distinct from the chrome font's) so it
-    // survives a refresh. There's no --ui-font-scale here — the pref reaches the
-    // editor/terminal imperatively, not via a CSS variable.
+    // survives a refresh. It doesn't use --desktop-ui-font-size — the pref
+    // reaches the editor/terminal imperatively, not via a CSS variable.
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("14");
   });
 
@@ -403,18 +744,37 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:code-font-family")).toBeNull();
   });
 
-  it("defaults bare /settings to Account when a login session exists, else Appearance", async () => {
-    // Login session (accounts OR OIDC) → Account leads, so /settings lands on it.
-    renderPage("/settings");
-    await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
+  it("shows and persists the code font weight", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    const toggle = screen.getByTestId("heavier-code-text-toggle");
+    expect(toggle).toHaveAttribute("aria-checked", "false");
 
-    // Header single-user (no login_url) → no Account section; falls back to
-    // Appearance.
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
+  });
+
+  it("maps legacy font weights to the supported presets", () => {
+    localStorage.setItem("omnigent:code-font-weight", "900");
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("heavier-code-text-toggle")).toHaveAttribute("aria-checked", "true");
+
+    cleanup();
+    localStorage.setItem("omnigent:code-font-weight", "100");
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("heavier-code-text-toggle")).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("defaults bare /settings to General regardless of login mode", () => {
+    renderPage("/settings");
+    expect(screen.getByRole("heading", { name: "General" })).toBeInTheDocument();
+
     cleanup();
     mocks.accountsEnabled = false;
     mocks.loginUrl = null;
     renderPage("/settings");
-    expect(screen.getByRole("heading", { name: "Appearance" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "General" })).toBeInTheDocument();
   });
 
   it("renders the Account section at /settings/account for any login session", async () => {
@@ -428,6 +788,58 @@ describe("SettingsPage", () => {
     mocks.loginUrl = null;
     renderPage("/settings/account");
     expect(screen.queryByText("alice")).toBeNull();
+  });
+
+  it("persists an Updates mode change through the desktop bridge", async () => {
+    const { bridge } = installUpdateBridge();
+
+    renderPage("/settings/updates");
+    expect(await screen.findByRole("heading", { name: "Updates" })).toBeInTheDocument();
+
+    const select = screen.getByRole("combobox", { name: "Update mode" }) as HTMLSelectElement;
+    expect(select.value).toBe("default");
+    fireEvent.change(select, { target: { value: "manual" } });
+
+    await waitFor(() => {
+      expect(bridge.setConfig).toHaveBeenCalledWith({ mode: "manual" });
+    });
+  });
+
+  it("surfaces manual update-check failures in Settings", async () => {
+    const { bridge, emitStatus } = installUpdateBridge();
+    vi.mocked(bridge.check).mockRejectedValueOnce(new Error("Cannot find latest.yml: 404"));
+
+    renderPage("/settings/updates");
+    expect(await screen.findByRole("heading", { name: "Updates" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Check for updates now" }));
+
+    expect(await screen.findByText("Last check failed")).toBeInTheDocument();
+    expect(screen.getByText("Cannot find latest.yml: 404")).toBeInTheDocument();
+
+    emitStatus({ state: "checking" });
+    await waitFor(() => {
+      expect(screen.queryByText("Cannot find latest.yml: 404")).toBeNull();
+    });
+
+    emitStatus({ state: "idle", lastError: "Feed provider failed" });
+    expect(await screen.findByText("Feed provider failed")).toBeInTheDocument();
+  });
+
+  it("unsubscribes from update status events when Settings unmounts", async () => {
+    const { unsubscribe } = installUpdateBridge();
+
+    const { unmount } = renderPage("/settings/updates");
+    expect(await screen.findByRole("heading", { name: "Updates" })).toBeInTheDocument();
+
+    unmount();
+
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides the Updates section outside the Electron shell", () => {
+    renderPage("/settings/updates");
+    expect(screen.queryByRole("heading", { name: "Updates" })).toBeNull();
   });
 
   it("renders the Account section under OIDC (accounts off, login_url set)", async () => {
@@ -519,7 +931,12 @@ describe("SettingsPage", () => {
     expect(within(rows[0]).getByText("Old chat")).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("unarchive-conversation"));
-    expect(mocks.archiveMutate).toHaveBeenCalledWith({ id: "conv_archived", archived: false });
+    expect(mocks.archiveMutate.mock.calls[0][0]).toEqual({
+      id: "conv_archived",
+      archived: false,
+    });
+    // Unarchiving opens the restored session (the mock mutate runs onSuccess).
+    expect(screen.getByTestId("location").textContent).toBe("/c/conv_archived");
   });
 
   it("deletes an archived session after confirming, with no row-click navigation", () => {
@@ -533,5 +950,260 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("delete-archived"));
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     expect(mocks.deleteMutate).toHaveBeenCalledWith({ id: "conv_archived" });
+  });
+
+  it("scopes the archived list to the project picked in the filter", () => {
+    mocks.projectNames = ["Alpha", "Beta"];
+    mocks.conversations = [
+      conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
+      conv("conv_b", { archived: true, title: "Beta chat", labels: { omni_project: "Beta" } }),
+      conv("conv_active"),
+    ];
+    renderPage("/settings/archived");
+
+    // "All projects" (default) lists every archived session.
+    expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
+    const select = screen.getByTestId("archived-project-filter");
+    expect(within(select).getByRole("option", { name: "All projects" })).toBeInTheDocument();
+    expect(within(select).getByRole("option", { name: "Alpha" })).toBeInTheDocument();
+    expect(within(select).getByRole("option", { name: "Beta" })).toBeInTheDocument();
+
+    // Picking a project narrows the list to that project's archived sessions.
+    // Select values are discriminated (`project:<name>`), never the raw name.
+    fireEvent.change(select, { target: { value: "project:Alpha" } });
+    const rows = screen.getAllByTestId("archived-row");
+    expect(rows).toHaveLength(1);
+    expect(within(rows[0]).getByText("Alpha chat")).toBeInTheDocument();
+
+    // Back to "All projects" restores the full list.
+    fireEvent.change(select, { target: { value: "all" } });
+    expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
+  });
+
+  it("hides the project filter when no archived session belongs to a project", () => {
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
+    renderPage("/settings/archived");
+
+    expect(screen.queryByTestId("archived-project-filter")).toBeNull();
+    expect(screen.getByTestId("archived-row")).toBeInTheDocument();
+  });
+
+  it("shows the empty state (and no filter) when there are no archived sessions", () => {
+    mocks.conversations = [conv("conv_active")];
+    renderPage("/settings/archived");
+
+    expect(screen.getByText("No archived sessions.")).toBeInTheDocument();
+    expect(screen.queryByTestId("archived-project-filter")).toBeNull();
+  });
+
+  it("shows a project-scoped empty state when the picked project has no rows", () => {
+    mocks.projectNames = ["Alpha"];
+    mocks.conversations = [
+      conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
+    ];
+    renderPage("/settings/archived");
+
+    const select = screen.getByTestId("archived-project-filter");
+    // Drop Alpha's only session so the filtered fetch returns nothing, then
+    // pick Alpha (still an option because it's in the scanned name set).
+    mocks.conversations = [];
+    fireEvent.change(select, { target: { value: "project:Alpha" } });
+    expect(screen.getByText("No archived sessions in this project.")).toBeInTheDocument();
+  });
+
+  it("offers archived-only projects whose sessions are beyond the first loaded page", () => {
+    // The visible list's first page has no Gamma row, but the option scan
+    // (useArchivedProjectNames, which pages through everything) found Gamma —
+    // this is the gotcha the feature exists for.
+    mocks.projectNames = ["Gamma"];
+    mocks.conversations = [conv("p1", { archived: true, title: "Page-one chat" })];
+    renderPage("/settings/archived");
+
+    const select = screen.getByTestId("archived-project-filter");
+    // Gamma is offered even though no Gamma row is in the loaded page.
+    expect(within(select).getByRole("option", { name: "Gamma" })).toBeInTheDocument();
+  });
+
+  it("treats a project literally named __all__ as a real project, not the clear-filter sentinel", () => {
+    mocks.projectNames = ["Other", "__all__"];
+    mocks.conversations = [
+      conv("x1", { archived: true, title: "Edge chat", labels: { omni_project: "__all__" } }),
+      conv("o1", { archived: true, title: "Other chat", labels: { omni_project: "Other" } }),
+    ];
+    renderPage("/settings/archived");
+
+    const select = screen.getByTestId("archived-project-filter");
+    // Picking the "__all__" project must FILTER to it (discriminated value
+    // `project:__all__`), not clear the filter.
+    fireEvent.change(select, { target: { value: "project:__all__" } });
+    const rows = screen.getAllByTestId("archived-row");
+    expect(rows).toHaveLength(1);
+    expect(within(rows[0]).getByText("Edge chat")).toBeInTheDocument();
+  });
+
+  it("loads the next page of archived sessions on demand", () => {
+    mocks.conversations = [conv("a1", { archived: true, title: "Old chat" })];
+    mocks.hasNextPage = true;
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-load-more"));
+    expect(mocks.fetchNextPage).toHaveBeenCalled();
+  });
+
+  it("keeps Load more available when page 1 has only active rows, then pages to archived", () => {
+    // The first page holds only active sessions (archived ones sort onto a
+    // later page). This must NOT dead-end on the definitive empty state.
+    mocks.pages = [
+      [conv("act1", { title: "Active chat" })],
+      [conv("arch2", { archived: true, title: "Deep archive" })],
+    ];
+    renderPage("/settings/archived");
+
+    // No archived rows on page 1, but more pages exist → not the definitive
+    // empty state; a pager is offered instead.
+    expect(screen.queryByText("No archived sessions.")).toBeNull();
+    expect(screen.getByText("No archived sessions on this page.")).toBeInTheDocument();
+    expect(screen.getByTestId("archived-load-more")).toBeInTheDocument();
+
+    // Paging forward surfaces the archived row that lived on page 2.
+    fireEvent.click(screen.getByTestId("archived-load-more"));
+    expect(mocks.fetchNextPage).toHaveBeenCalled();
+    expect(screen.getByTestId("archived-row")).toBeInTheDocument();
+    expect(screen.getByText("Deep archive")).toBeInTheDocument();
+  });
+
+  it("groups archived sessions under date headers", () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    // Use local-time construction so bucket boundaries align with the
+    // local-time arithmetic in dateGroupLabel regardless of the test runner's
+    // timezone.
+    vi.setSystemTime(new Date(2026, 6, 15, 12, 0, 0));
+
+    try {
+      const todaySec = new Date(2026, 6, 15, 10, 0, 0).getTime() / 1000;
+      const yesterdaySec = new Date(2026, 6, 14, 8, 0, 0).getTime() / 1000;
+      const fiveDaysAgoSec = new Date(2026, 6, 10, 8, 0, 0).getTime() / 1000;
+      const twentyDaysAgoSec = new Date(2026, 5, 25, 8, 0, 0).getTime() / 1000;
+      const oldDate = new Date(2026, 2, 1, 8, 0, 0);
+      const oldSec = oldDate.getTime() / 1000;
+
+      mocks.conversations = [
+        conv("c_today", { archived: true, title: "Today chat", updated_at: todaySec }),
+        conv("c_yesterday", { archived: true, title: "Yesterday chat", updated_at: yesterdaySec }),
+        conv("c_week", { archived: true, title: "This week chat", updated_at: fiveDaysAgoSec }),
+        conv("c_month", { archived: true, title: "This month chat", updated_at: twentyDaysAgoSec }),
+        conv("c_old", { archived: true, title: "Old chat", updated_at: oldSec }),
+      ];
+      renderPage("/settings/archived");
+
+      expect(screen.getByText("Today")).toBeInTheDocument();
+      expect(screen.getByText("Yesterday")).toBeInTheDocument();
+      expect(screen.getByText("Previous 7 days")).toBeInTheDocument();
+      expect(screen.getByText("Previous 30 days")).toBeInTheDocument();
+      // Derive the expected label the same way the component does so the
+      // assertion is locale-independent.
+      const expectedOldLabel = oldDate.toLocaleDateString(undefined, {
+        month: "long",
+        year: "numeric",
+      });
+      expect(screen.getByText(expectedOldLabel)).toBeInTheDocument();
+
+      expect(screen.getAllByTestId("archived-row")).toHaveLength(5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("enters selection mode and selects rows via click", () => {
+    mocks.conversations = [
+      conv("a1", { archived: true, title: "Chat A" }),
+      conv("a2", { archived: true, title: "Chat B" }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    const rows = screen.getAllByTestId("archived-row");
+    expect(rows).toHaveLength(2);
+
+    // Clicking a row in selection mode toggles its checkbox.
+    fireEvent.click(rows[0]);
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+
+    fireEvent.click(rows[1]);
+    expect(screen.getByText("2 selected")).toBeInTheDocument();
+
+    // Clicking again deselects.
+    fireEvent.click(rows[0]);
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+  });
+
+  it("bulk-deletes selected archived sessions after confirming", () => {
+    mocks.conversations = [
+      conv("a1", { archived: true, title: "Chat A" }),
+      conv("a2", { archived: true, title: "Chat B" }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    const rows = screen.getAllByTestId("archived-row");
+    fireEvent.click(rows[0]);
+    fireEvent.click(rows[1]);
+
+    fireEvent.click(screen.getByTestId("archived-bulk-delete"));
+    fireEvent.click(screen.getByRole("button", { name: /Delete 2 session/ }));
+    expect(mocks.bulkDeleteMutate).toHaveBeenCalledWith({ ids: ["a1", "a2"] }, expect.anything());
+  });
+
+  it("bulk-unarchives selected archived sessions", () => {
+    mocks.conversations = [
+      conv("a1", { archived: true, title: "Chat A" }),
+      conv("a2", { archived: true, title: "Chat B" }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    fireEvent.click(screen.getAllByTestId("archived-row")[0]);
+
+    fireEvent.click(screen.getByTestId("archived-bulk-unarchive"));
+    expect(mocks.bulkArchiveMutate).toHaveBeenCalledWith(
+      { ids: ["a1"], archived: false },
+      expect.anything(),
+    );
+  });
+
+  it("exits selection mode and clears selection", () => {
+    mocks.conversations = [conv("a1", { archived: true, title: "Chat A" })];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    fireEvent.click(screen.getAllByTestId("archived-row")[0]);
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("archived-exit-selection"));
+    expect(screen.queryByText("1 selected")).toBeNull();
+    expect(screen.queryByTestId("archived-bulk-delete")).toBeNull();
+  });
+
+  it("select-all picks every visible archived row", () => {
+    mocks.conversations = [
+      conv("a1", { archived: true, title: "Chat A" }),
+      conv("a2", { archived: true, title: "Chat B" }),
+      conv("a3", { archived: true, title: "Chat C" }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    fireEvent.click(screen.getByRole("button", { name: "Select all" }));
+    expect(screen.getByText("3 selected")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Deselect all" }));
+    expect(screen.getByText("None selected")).toBeInTheDocument();
+  });
+
+  it("hides the Select button when there are no archived sessions", () => {
+    mocks.conversations = [conv("conv_active")];
+    renderPage("/settings/archived");
+
+    expect(screen.queryByTestId("archived-toggle-selection")).toBeNull();
   });
 });

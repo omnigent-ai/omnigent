@@ -50,7 +50,11 @@ def _ctx(root: Path, home: Path, skills_filter: str | list[str] = "all") -> Skil
         ("pi-native", "pi"),
         ("native-pi", "pi"),
         ("openai-agents", None),
+        # Only the agy CLI reads ~/.gemini plugins; the in-process Gemini SDK
+        # harness (bare "antigravity") does not, so it stays unmapped.
         ("antigravity", None),
+        ("antigravity-native", "antigravity"),
+        ("native-antigravity", "antigravity"),
         ("qwen", None),
         (None, None),
         ("", None),
@@ -638,3 +642,204 @@ def test_cursor_provider_tolerates_unreadable_skills_dir(
     # Must not raise.
     out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "cursor-native")
     assert out == []
+
+
+# ---------------------------------------------------------------------------
+# antigravity (agy CLI) provider
+# ---------------------------------------------------------------------------
+#
+# Layout live-verified against agy 1.1.9:
+#   ~/.gemini/config/plugins/<name>/skills/<skill>/SKILL.md   (imported plugins)
+#   ~/.gemini/antigravity-cli/builtin/skills/<skill>/SKILL.md (shipped builtins)
+# A plugin is DISABLED by renaming its manifest to ``plugin.json.disabled``
+# (``agy plugin disable`` performs exactly that rename; the import manifest and
+# config.json are left untouched, and ``agy plugin list`` still lists it).
+
+
+def _write_agy_plugin(home: Path, plugin: str, *skills: str, enabled: bool = True) -> None:
+    """Write an agy plugin with *skills*, enabled or disabled via its manifest name."""
+    root = home / ".gemini" / "config" / "plugins" / plugin
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ("plugin.json" if enabled else "plugin.json.disabled")).write_text('{"name":"x"}')
+    for skill in skills:
+        _write_skill(root / "skills", skill)
+
+
+def test_antigravity_provider_surfaces_plugin_and_builtin_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """agy's own skills — imported plugins plus shipped builtins — reach the menu."""
+    home = tmp_path / "home"
+    _write_agy_plugin(home, "superpowers", "brainstorming", "writing-plans")
+    _write_skill(home / ".gemini" / "antigravity-cli" / "builtin" / "skills", "antigravity-guide")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [
+        s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity-native")
+    ]
+    # Plugin skills are namespaced <plugin>:<skill> (agy's own /skills panel
+    # lists them that way and the TUI only accepts that spelling); builtins are
+    # bare. Live-verified against agy 1.1.9.
+    assert sorted(names) == [
+        "antigravity-guide",
+        "superpowers:brainstorming",
+        "superpowers:writing-plans",
+    ]
+
+
+def test_antigravity_provider_skips_disabled_plugin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plugin disabled via the plugin.json -> plugin.json.disabled rename is hidden.
+
+    The skills stay on disk and the import manifest still lists the plugin, so the
+    manifest is NOT a usable enabled-signal — the manifest name is.
+    """
+    home = tmp_path / "home"
+    _write_agy_plugin(home, "superpowers", "brainstorming", enabled=False)
+    _write_agy_plugin(home, "othertools", "still-on", enabled=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [
+        s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity-native")
+    ]
+    assert "superpowers:brainstorming" not in names
+    assert "othertools:still-on" in names
+
+
+def test_antigravity_session_does_not_inherit_generic_claude_host_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An agy session must not surface ~/.claude/skills (those belong to Claude).
+
+    agy owns an enumerable host-skill mechanism, so it lists exactly what agy has
+    rather than falling through to the generic walk.
+    """
+    home = tmp_path / "home"
+    _write_skill(home / ".claude" / "skills", "claude-only-skill")
+    _write_agy_plugin(home, "superpowers", "brainstorming")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [
+        s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity-native")
+    ]
+    assert "claude-only-skill" not in names
+    assert "superpowers:brainstorming" in names
+
+
+def test_antigravity_sdk_harness_keeps_the_generic_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The in-process Gemini SDK harness is NOT agy and keeps the generic fallback.
+
+    It never launches the agy CLI, so ~/.gemini plugins are not its skills; its
+    skills are the omnigent-injected generic ones.
+    """
+    home = tmp_path / "home"
+    _write_skill(home / ".claude" / "skills", "claude-only-skill")
+    _write_agy_plugin(home, "superpowers", "brainstorming")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity")]
+    assert "claude-only-skill" in names
+    assert "superpowers:brainstorming" not in names
+
+
+def test_antigravity_provider_filters_user_invocable_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user-invocable:false agy skill is dropped (consistent across harnesses)."""
+    home = tmp_path / "home"
+    _write_agy_plugin(home, "superpowers")
+    _write_skill(home / ".gemini" / "config" / "plugins" / "superpowers" / "skills", "shown")
+    _write_skill(
+        home / ".gemini" / "config" / "plugins" / "superpowers" / "skills",
+        "internal",
+        user_invocable=False,
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [
+        s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity-native")
+    ]
+    assert names == ["superpowers:shown"]
+
+
+def test_antigravity_provider_respects_none_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``skills: none`` in the agent spec suppresses agy's host skills."""
+    home = tmp_path / "home"
+    _write_agy_plugin(home, "superpowers", "brainstorming")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home, "none"), "antigravity-native")
+    assert out == []
+
+
+def test_antigravity_provider_tolerates_missing_and_unreadable_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ~/.gemini at all (or an unreadable tree) yields [] rather than raising."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    assert resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity-native") == []
+
+    _write_agy_plugin(home, "superpowers", "brainstorming")
+    real_iterdir = Path.iterdir
+
+    def _boom(self: Path):
+        if self.name == "plugins":
+            raise PermissionError("permission denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr("pathlib.Path.iterdir", _boom)
+    # Must not raise.
+    assert resolve_harness_skills(_ctx(tmp_path / "ws", home), "antigravity-native") == []
+
+
+def test_antigravity_provider_surfaces_all_five_agy_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every source agy's own /skills panel lists is surfaced.
+
+    Live-verified against agy 1.1.9, whose panel names them: Workspace
+    (``<ws>/.agents/skills``), Global (``antigravity-cli/skills``), Shared
+    (``.gemini/skills``), plus imported plugins and shipped builtins.
+    """
+    home = tmp_path / "home"
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".agents" / "skills", "ws-skill")
+    _write_skill(home / ".gemini" / "antigravity-cli" / "skills", "global-skill")
+    _write_skill(home / ".gemini" / "skills", "shared-skill")
+    _write_agy_plugin(home, "superpowers", "brainstorming")
+    _write_skill(home / ".gemini" / "antigravity-cli" / "builtin" / "skills", "antigravity-guide")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = sorted(s.name for s in resolve_harness_skills(_ctx(ws, home), "antigravity-native"))
+    assert names == [
+        "antigravity-guide",
+        "global-skill",
+        "shared-skill",
+        "superpowers:brainstorming",
+        "ws-skill",
+    ]
+
+
+def test_antigravity_provider_reads_agents_skills_not_claude_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``.agents/skills`` in the workspace is agy's; ``.claude/skills`` is not.
+
+    The generic walk scans both, which is why agy previously saw Claude's. agy
+    genuinely reads the vendor-neutral ``.agents/skills``, so that one stays.
+    """
+    home = tmp_path / "home"
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".agents" / "skills", "neutral-skill")
+    _write_skill(ws / ".claude" / "skills", "claude-ws-skill")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(ws, home), "antigravity-native")]
+    assert names == ["neutral-skill"]

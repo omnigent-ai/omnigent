@@ -31,11 +31,13 @@ from __future__ import annotations
 import uuid
 
 import httpx
+import pytest
 from playwright.sync_api import Browser, Page, Request, expect
 
 from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 
+@pytest.mark.compat_smoke
 def test_session_rename_streams_to_open_tabs(
     browser: Browser,
     seeded_session: tuple[str, str],
@@ -127,6 +129,7 @@ def _count_session_list_requests(page: Page) -> list[str]:
     return hits
 
 
+@pytest.mark.compat_smoke
 def test_idle_sidebar_does_not_poll_sessions_list(
     page: Page,
     seeded_session: tuple[str, str],
@@ -172,6 +175,7 @@ def test_idle_sidebar_does_not_poll_sessions_list(
     )
 
 
+@pytest.mark.compat_smoke
 def test_session_created_elsewhere_appears_via_push(
     page: Page,
     seeded_session: tuple[str, str],

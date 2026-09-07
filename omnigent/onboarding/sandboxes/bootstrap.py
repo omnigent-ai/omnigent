@@ -43,6 +43,8 @@ from urllib.parse import parse_qs, urlparse
 import click
 import httpx
 
+from omnigent.cli_invocation import cli_invocation
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -379,7 +381,8 @@ def _workspace_org_id(workspace_host: str) -> str | None:
         response = httpx.get(f"{workspace_host}/login.html", timeout=10.0)
     except httpx.HTTPError:
         return None
-    return response.headers.get("x-databricks-org-id")
+    workspace_id = response.headers.get("x-databricks-org-id")
+    return str(workspace_id) if workspace_id is not None else None
 
 
 def derive_workspace(server_url: str) -> DerivedWorkspace | None:
@@ -496,14 +499,16 @@ def login_app_oauth_in_sandbox(
     # (e.g. Modal) — BEFORE validating flags or touching the sandbox, so
     # the user gets the --no-auth hint instead of a misleading error
     # from a doomed in-sandbox login.
-    if not launcher.supports_local_port_forward:
+    if not launcher.capabilities.local_port_forward:
         raise launcher.forward_capability_error()
     if server_url is None:
         raise click.ClickException(
             "The in-sandbox login needs the server URL — pass --server, or --no-auth to skip."
         )
 
-    click.echo(f"▸ Logging sandbox '{sandbox_id}' in to {server_url}")
+    from omnigent.server_url import display_server_url
+
+    click.echo(f"▸ Logging sandbox '{sandbox_id}' in to {display_server_url(server_url)}")
     if workspace is not None:
         # Reset ~/.databrickscfg to exactly one [DEFAULT] entry shaped
         # like what `databricks auth login` itself writes (host +
@@ -566,7 +571,7 @@ def _complete_browser_login(
         returncode = login.wait()
         if returncode != 0:
             raise click.ClickException(
-                f"`omnigent login` inside sandbox '{sandbox_id}' exited "
+                f"`{cli_invocation()} login` inside sandbox '{sandbox_id}' exited "
                 f"with code {returncode} before printing a verification "
                 "URL. Run it inside the sandbox manually to debug."
             )
@@ -587,7 +592,8 @@ def _complete_browser_login(
         returncode = login.wait()
         if returncode != 0:
             raise click.ClickException(
-                f"`omnigent login` inside sandbox '{sandbox_id}' exited with code {returncode}."
+                f"`{cli_invocation()} login` inside sandbox '{sandbox_id}' "
+                f"exited with code {returncode}."
             )
 
 
@@ -624,7 +630,7 @@ def set_sandbox_host_name(launcher: SandboxLauncher, sandbox_id: str, host_name:
         "cfg=yaml.safe_load(open(p)) if os.path.exists(p) else {}; "
         "cfg=cfg or {}; "
         f"h=cfg.get('host') or {{}}; h['name']='{safe_name}'; "
-        "h.setdefault('host_id', 'host_'+uuid.uuid4().hex); "
+        "h.setdefault('host_id', uuid.uuid4().hex); "
         "cfg['host']=h; "
         "yaml.safe_dump(cfg, open(p,'w'), default_flow_style=False, sort_keys=True)"
     )
@@ -668,14 +674,19 @@ def connect_sandbox_host(
         config.yaml (usually ``socket.gethostname()``).
     :raises click.ClickException: If the remote command exits non-zero.
     """
-    click.echo(f"▸ Registering sandbox '{sandbox_id}' as a host with {server_url}")
+    from omnigent.server_url import display_server_url
+
+    click.echo(
+        f"▸ Registering sandbox '{sandbox_id}' as a host with {display_server_url(server_url)}"
+    )
+    # The executed command keeps the wire URL — it must work verbatim in-sandbox.
     if host_name is not None:
         set_sandbox_host_name(launcher, sandbox_id, host_name)
-    click.echo("  → running `omnigent host` in the sandbox (Ctrl-C to detach)")
+    click.echo(f"  → running `{cli_invocation()} host` in the sandbox (Ctrl-C to detach)")
     returncode = launcher.exec_foreground(sandbox_id, f"omnigent host --server {server_url}")
     if returncode != 0:
         raise click.ClickException(
-            f"`omnigent host` on sandbox '{sandbox_id}' exited with code {returncode}."
+            f"`{cli_invocation()} host` on sandbox '{sandbox_id}' exited with code {returncode}."
         )
 
 
@@ -722,7 +733,7 @@ def bootstrap_sandbox_host(
     # up front so a misconfigured call fails before the wheel build and
     # ship already ran. (The CLI skips auth automatically for providers
     # without the capability; this backstops programmatic callers.)
-    if not skip_auth and not launcher.supports_local_port_forward:
+    if not skip_auth and not launcher.capabilities.local_port_forward:
         raise launcher.forward_capability_error()
     launcher.prepare()
     if sandbox_id is None:

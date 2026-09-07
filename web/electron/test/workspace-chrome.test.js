@@ -22,7 +22,7 @@ describe("applyWorkspaceChromeHideCss", () => {
   it("injects the chrome-hide CSS even when the URL is not under the workspace path", () => {
     const injected = [];
     const webContents = {
-      // A path variant the old guard would have skipped (not /ml/omnigents).
+      // A path variant the old guard would have skipped (not /omnigent).
       getURL: () => "https://dbc-x.cloud.databricks.com/dashboard",
       insertCSS: (css) => {
         injected.push(css);
@@ -37,7 +37,7 @@ describe("applyWorkspaceChromeHideCss", () => {
       [WORKSPACE_CHROME_HIDE_CSS],
       [
         "applyWorkspaceChromeHideCss must inject WORKSPACE_CHROME_HIDE_CSS for ANY loaded",
-        "URL, but it did not fire for a non-/ml/omnigents path. A URL/path guard has likely",
+        "URL, but it did not fire for a non-/omnigent path. A URL/path guard has likely",
         "been reintroduced. That is the original bug: gating injection by path left the",
         "Databricks workspace switcher visible on auth redirects and path variants. Injection",
         "must stay unconditional — the CSS only targets .omnigent-app (workspace-embedded",

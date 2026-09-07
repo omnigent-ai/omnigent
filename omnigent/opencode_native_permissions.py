@@ -17,7 +17,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal, TypeAlias
+
+from omnigent.json_types import JsonObject as _JsonObject
 
 OPENCODE_NATIVE_HARNESS = "opencode-native"
 
@@ -26,6 +28,8 @@ OpenCodeReply = Literal["once", "always", "reject"]
 
 # Omnigent-side normalized decisions used by the forwarder.
 PolicyDecision = Literal["allow_once", "allow_always", "reject", "ask"]
+
+_JsonMapping: TypeAlias = Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -46,13 +50,13 @@ class OpenCodePermissionRequest:
     request_id: str
     session_id: str | None
     action: str | None
-    resources: list[Any] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    resources: list[object] = field(default_factory=list)
+    metadata: _JsonObject = field(default_factory=dict)
     source: str | None = None
-    raw: dict[str, Any] = field(default_factory=dict)
+    raw: _JsonObject = field(default_factory=dict)
 
 
-def parse_permission_request(payload: Mapping[str, Any]) -> OpenCodePermissionRequest | None:
+def parse_permission_request(payload: _JsonMapping) -> OpenCodePermissionRequest | None:
     """
     Parse a raw permission payload into :class:`OpenCodePermissionRequest`.
 
@@ -91,7 +95,9 @@ def parse_permission_request(payload: Mapping[str, Any]) -> OpenCodePermissionRe
         session_id=session_id if isinstance(session_id, str) else None,
         action=action if isinstance(action, str) else None,
         resources=list(resources) if isinstance(resources, list) else [],
-        metadata=dict(metadata) if isinstance(metadata, Mapping) else {},
+        metadata={key: value for key, value in metadata.items() if isinstance(key, str)}
+        if isinstance(metadata, Mapping)
+        else {},
         source=source if isinstance(source, str) else None,
         raw=dict(payload),
     )
@@ -102,7 +108,7 @@ def normalize_for_policy(
     *,
     omnigent_session_id: str,
     workspace: str | None,
-) -> dict[str, Any]:
+) -> _JsonObject:
     """
     Build an Omnigent policy-evaluation input from a permission request.
 
@@ -143,9 +149,7 @@ def _extract_resource_fields(
     command: str | None = None
     path: str | None = None
     url: str | None = None
-    candidates: list[Mapping[str, Any]] = []
-    if isinstance(request.metadata, Mapping):
-        candidates.append(request.metadata)
+    candidates: list[_JsonMapping] = [request.metadata]
     for resource in request.resources:
         if isinstance(resource, Mapping):
             candidates.append(resource)
@@ -162,7 +166,7 @@ def _extract_resource_fields(
     return command, path, url
 
 
-def map_verdict_to_decision(verdict: Mapping[str, Any] | None) -> PolicyDecision:
+def map_verdict_to_decision(verdict: _JsonMapping | None) -> PolicyDecision:
     """
     Map an Omnigent policy verdict onto a normalized decision.
 
@@ -214,7 +218,7 @@ def decision_to_reply(decision: PolicyDecision) -> OpenCodeReply | None:
     return None
 
 
-def reply_body(reply: OpenCodeReply, *, message: str | None = None) -> dict[str, Any]:
+def reply_body(reply: OpenCodeReply, *, message: str | None = None) -> _JsonObject:
     """
     Build the JSON body for ``POST /permission/{requestID}/reply``.
 
@@ -222,7 +226,7 @@ def reply_body(reply: OpenCodeReply, *, message: str | None = None) -> dict[str,
     :param message: Optional human-readable note attached to the reply.
     :returns: The reply request body.
     """
-    body: dict[str, Any] = {"reply": reply}
+    body: _JsonObject = {"reply": reply}
     if message is not None:
         body["message"] = message
     return body

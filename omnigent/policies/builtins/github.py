@@ -75,6 +75,8 @@ from typing import Any
 
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
+    SHELL_TOOLS,
+    is_unresolved_invocation,
     real_invocation_tokens,
     split_command_segments,
     unwrap_shell_command,
@@ -87,8 +89,9 @@ from omnigent.policies.schema import PolicyEvent, PolicyResponse
 # so ``mcp__github__`` wins over a bare ``github__``.
 _DEFAULT_TOOL_PREFIXES: tuple[str, ...] = ("mcp__github__", "github__")
 
-# Shell tools whose command string this policy parses for git / gh invocations.
-_DEFAULT_SHELL_TOOLS: tuple[str, ...] = ("sys_os_shell",)
+# Shell tools whose command string this policy parses for git / gh invocations:
+# every harness's, since most ``git push`` runs on a native harness.
+_DEFAULT_SHELL_TOOLS: frozenset[str] = SHELL_TOOLS
 
 # Pulls ``owner/repo`` out of any GitHub URL (HTTPS, SSH, scp-style). The
 # ``[:/]+`` after the host matches both ``github.com/owner`` and the scp-style
@@ -427,6 +430,16 @@ _MCP_WRITE_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+# MCP write tools that are destructive (irreversible deletes). Gated separately
+# by ``allow_destructive`` — denied by default even on allowed repos.
+_MCP_DESTRUCTIVE_TOOLS: frozenset[str] = frozenset(
+    {
+        "delete_file",
+        "delete_branch",
+        "delete_release",
+    }
+)
+
 # Verb prefixes used to classify GitHub-prefixed tools we don't list explicitly.
 # Only applied when the raw tool name carried a GitHub server prefix (we are
 # certain it is a GitHub tool); never used to claim un-prefixed tools, which
@@ -606,6 +619,24 @@ _GH_WRITE_ACTIONS: dict[str, frozenset[str]] = {
 
 # gh groups that are GitHub-aware but never touch a specific repo's contents —
 # ignore them (auth, local config, etc.).
+# gh groups → destructive action names (a subset of _GH_WRITE_ACTIONS). Gated
+# separately by ``allow_destructive`` — denied by default even on allowed repos.
+_GH_DESTRUCTIVE_ACTIONS: dict[str, frozenset[str]] = {
+    "repo": frozenset({"delete"}),
+    "release": frozenset({"delete"}),
+    "issue": frozenset({"delete"}),
+    "gist": frozenset({"delete"}),
+    "cache": frozenset({"delete"}),
+    "codespace": frozenset({"delete"}),
+    "project": frozenset({"delete", "item-delete"}),
+    "variable": frozenset({"delete"}),
+    "ssh-key": frozenset({"delete"}),
+    "gpg-key": frozenset({"delete"}),
+    "secret": frozenset({"delete"}),
+    "label": frozenset({"delete"}),
+    "run": frozenset({"delete"}),
+}
+
 _GH_IGNORE_GROUPS: frozenset[str] = frozenset(
     {
         "auth",
@@ -640,6 +671,13 @@ class _ShellOp:
         content (``gh issue create``, ``gh pr merge`` …).
     :param detail: Short description for the decision reason, e.g.
         ``"git push"`` or ``"gh pr create"``.
+    :param destructive: Whether the operation is an irreversible delete, gated
+        separately by ``allow_destructive``.
+    :param tag_push: Whether this ``git push`` includes tags (``--tags``,
+        ``--follow-tags``, or ``refs/tags/`` refspecs).
+    :param force_push: Whether this ``git push`` uses a force flag
+        (``--force``, ``-f``, ``--force-with-lease``, ``--force-if-includes``)
+        or a ``+refspec`` force prefix.
     """
 
     kind: str
@@ -647,6 +685,9 @@ class _ShellOp:
     branches: frozenset[str]
     branch_targeted: bool
     detail: str
+    destructive: bool = False
+    tag_push: bool = False
+    force_push: bool = False
 
 
 def _repo_from_tokens(tokens: list[str]) -> str | None:
@@ -711,17 +752,39 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
         positionals = [t for t in args if not t.startswith("-")]
         repo = _repo_from_tokens(args)
         branches: set[str] = set()
+        tag_push = any(t in ("--tags", "--follow-tags") for t in args)
         for refspec in positionals[1:]:
             dest = refspec.split(":", 1)[1] if ":" in refspec else refspec
+            dest = dest.lstrip("+")
+            if dest.startswith("refs/tags/"):
+                tag_push = True
+                continue
             branch = _normalize_branch(dest)
             if branch:
                 branches.add(branch)
+        # Detect delete semantics: ``--delete`` / ``-d`` flag, or a refspec
+        # starting with ``:`` (empty left side = delete the remote branch).
+        is_destructive = any(t in ("--delete", "-d") for t in args) or any(
+            refspec.startswith(":") for refspec in positionals[1:]
+        )
+        # Detect force-push: long flags, ``=``-value forms, bundled short
+        # flags containing ``f`` (e.g. ``-uf``), and ``+refspec`` prefix.
+        _FORCE_LONG = {"--force", "-f", "--force-with-lease", "--force-if-includes"}
+        is_force = any(
+            t in _FORCE_LONG
+            or t.startswith(("--force-with-lease=", "--force-if-includes="))
+            or (t.startswith("-") and not t.startswith("--") and "f" in t)
+            for t in args
+        ) or any(rs.startswith("+") for rs in positionals[1:])
         return _ShellOp(
             kind="write",
             repo=repo,
             branches=frozenset(branches),
             branch_targeted=True,
             detail="git push",
+            destructive=is_destructive,
+            tag_push=tag_push,
+            force_push=is_force,
         )
     return None
 
@@ -757,8 +820,14 @@ def _classify_gh(tokens: list[str]) -> _ShellOp | None:
     if is_write:
         # gh writes are not inherently branch-targeted (they act on PRs/issues/
         # repos by number/name); a branch named via --base is still checked.
+        is_destructive = action in _GH_DESTRUCTIVE_ACTIONS.get(group, frozenset())
         return _ShellOp(
-            kind="write", repo=repo, branches=branches, branch_targeted=False, detail=detail
+            kind="write",
+            repo=repo,
+            branches=frozenset(branches),
+            branch_targeted=False,
+            detail=detail,
+            destructive=is_destructive,
         )
     # Known read group, or an unknown group treated conservatively as a read
     # (reads are the safer default — they are only gated when read_all is off).
@@ -814,18 +883,29 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
         leave it 0.
     :returns: One :class:`_ShellOp` per git/gh remote invocation found. Local
         git commands and non-git/gh segments produce no op. A segment that
-        starts with git/gh but cannot be tokenized yields an ``"unparseable"``
-        op so the caller can ASK rather than silently allow.
+        mentions git/gh but whose real command cannot be resolved — it does not
+        tokenize, or a wrapper's own flags left an option as the head — yields
+        an ``"unparseable"`` op so the caller can ASK rather than silently allow.
     """
     if _depth > MAX_SHELL_NESTING:
         return []
     ops: list[_ShellOp] = []
     for segment in split_command_segments(command):
+        unreadable = False
         try:
             tokens = shlex.split(segment)
         except ValueError:
             # Unbalanced quotes etc. If it looks like a git/gh command we can't
             # read, surface it for approval instead of guessing.
+            unreadable = True
+            tokens = []
+        else:
+            tokens = real_invocation_tokens(tokens)
+            # A leading option means some wrapper's own flags were not modelled,
+            # so the real command was never reached. Same fail-safe as an
+            # un-tokenizable segment rather than a silent abstain.
+            unreadable = is_unresolved_invocation(tokens)
+        if unreadable:
             if re.search(r"\b(git|gh)\b", segment):
                 ops.append(
                     _ShellOp(
@@ -837,7 +917,6 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
                     )
                 )
             continue
-        tokens = real_invocation_tokens(tokens)
         if not tokens:
             continue
         # Unwrap shell-interpreter (``bash -c "<cmd>"``) and ``eval`` wrappers so
@@ -866,6 +945,9 @@ def github_policy(
     read_repos: list[str] | None = None,
     write_repos: list[str] | None = None,
     write_branches: list[str] | None = None,
+    allow_destructive: bool = False,
+    deny_tag_push: bool = True,
+    deny_force_push: bool = True,
     mcp_tool_prefixes: list[str] | None = None,
     shell_tools: list[str] | None = None,
     deny_reason: str = "GitHub operation blocked by policy.",
@@ -883,15 +965,30 @@ def github_policy(
     :param write_branches: Branches writable within an allowed repo, e.g.
         ``["main", "develop"]``. ``None`` / empty means branches are not
         restricted (any branch on an allowed repo is writable).
+    :param allow_destructive: When ``False`` (default), irreversible destructive
+        operations (deletes) are denied even on allowed repos. Set to ``True``
+        to let destructive operations through normal write gating.
+    :param deny_tag_push: When ``True`` (default), pushing tags to remotes via
+        ``git push --tags``, ``git push --follow-tags``, or explicit
+        ``refs/tags/`` refspecs is denied. Tags are immutable references that
+        downstream CI/CD and release tooling depend on; an agent pushing a tag
+        can trigger releases, deployments, or break semver expectations.
+    :param deny_force_push: When ``True`` (default), ``git push`` with force
+        flags (``--force``, ``-f``, ``--force-with-lease``,
+        ``--force-if-includes``), bundled short flags containing ``f``
+        (e.g. ``-uf``), and ``+refspec`` force prefixes are denied regardless
+        of repo/branch allowlists. Set to ``False`` to allow force pushes
+        through normal repo/branch gating.
     :param mcp_tool_prefixes: GitHub MCP server name-prefixes to strip when
         canonicalizing MCP tool names. ``None`` uses the standard
         ``mcp__github__`` / ``github__``.
     :param shell_tools: Names of the shell / terminal tools whose ``command``
-        argument is parsed for ``git`` / ``gh`` invocations. ``None`` uses the
-        built-in OS shell, ``["sys_os_shell"]``. Override this if the agent
-        exposes shell access through a differently-named tool (e.g. a custom
-        terminal); list every such tool, since git/gh run through any tool not
-        listed here are not inspected by this policy.
+        argument is parsed for ``git`` / ``gh`` invocations. ``None`` uses every
+        harness's shell tool (:data:`~omnigent.policies.builtins._shell.SHELL_TOOLS`
+        — Omnigent, Claude/Codex, Cursor, Pi, Hermes, Goose). Override this only
+        if the agent exposes shell access through a differently-named tool (e.g.
+        a custom terminal); list every such tool, since git/gh run through any
+        tool not listed here are not inspected by this policy.
     :param deny_reason: Reason prefix attached to DENY decisions.
     :returns: A one-argument policy callable returning a :class:`PolicyResponse`
         or ``None`` (abstain → ALLOW).
@@ -1008,7 +1105,7 @@ def github_policy(
             )
         # cls == "write"
         branches = _extract_branches_from_args(args)
-        return _gate_write(
+        write_result = _gate_write(
             repos,
             branches,
             branch_targeted=_mcp_base(canonical) in _MCP_BRANCH_WRITE_TOOLS,
@@ -1019,6 +1116,16 @@ def github_policy(
                 f"not be determined."
             ),
         )
+        if write_result is not None:
+            return write_result
+        # Destructive check fires after the repo allowlist so a destructive op
+        # on a non-allowed repo still gets the repo DENY, not this one.
+        if not allow_destructive and _mcp_base(canonical) in _MCP_DESTRUCTIVE_TOOLS:
+            return _deny(
+                f"{deny_reason} Destructive operation {raw_tool!r} is blocked by default. "
+                f"Set allow_destructive=true to permit deletes."
+            )
+        return None
 
     def _evaluate_shell(command: str) -> PolicyResponse | None:
         """
@@ -1057,7 +1164,22 @@ def github_policy(
                     f"of `{op.detail}` could not be determined. Approve?"
                 ),
             )
+        if op.kind == "write" and op.force_push and deny_force_push:
+            return _deny(
+                "Force push is blocked by policy. Remove the force flag "
+                "(--force / -f / --force-with-lease / --force-if-includes / "
+                "+refspec) or set deny_force_push=False."
+            )
         if op.kind == "write":
+            if op.destructive and not allow_destructive:
+                return _deny(
+                    f"{deny_reason} Destructive operation `{op.detail}` is blocked by "
+                    f"default. Set allow_destructive=true to permit deletes."
+                )
+            if deny_tag_push and op.tag_push:
+                return _deny(
+                    f"{deny_reason} Pushing tags is blocked by policy (deny_tag_push is enabled)."
+                )
             return _gate_write(
                 {op.repo} if op.repo else set(),
                 set(op.branches),
@@ -1132,7 +1254,8 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
         "description": (
             "Controls GitHub access across MCP tools (official per-operation server and the "
             "github_read_api_call / github_write_api_call HTTP-proxy wrapper) and git/gh shell "
-            "commands run via sys_os_shell. Restricts reads to read_repos (unless read_all), and "
+            "commands. Supports Omnigent, Claude/Codex, Cursor, Pi, Hermes, and Goose shell "
+            "tools. Restricts reads to read_repos (unless read_all), and "
             "writes to write_repos plus optional write_branches. Shell commands whose target repo "
             "or branch cannot be determined return ASK for human approval."
         ),
@@ -1159,6 +1282,26 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "items": {"type": "string"},
                     "description": "Branches writable within an allowed repo. Empty = any branch.",
                 },
+                "allow_destructive": {
+                    "type": "boolean",
+                    "description": "Allow irreversible destructive operations (deletes). "
+                    "When false (default), deletes are denied even on allowed repos.",
+                    "default": False,
+                },
+                "deny_tag_push": {
+                    "type": "boolean",
+                    "description": "Block pushing tags to remotes (--tags, --follow-tags, "
+                    "refs/tags/ refspecs). Tags are immutable references that downstream "
+                    "CI/CD depends on.",
+                    "default": True,
+                },
+                "deny_force_push": {
+                    "type": "boolean",
+                    "description": "Deny git push with force flags (--force, -f, "
+                    "--force-with-lease, --force-if-includes), bundled short flags "
+                    "(-uf), and +refspec force prefixes. Default true.",
+                    "default": True,
+                },
                 "mcp_tool_prefixes": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -1170,7 +1313,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "items": {"type": "string"},
                     "description": "Shell/terminal tools whose command arg is parsed for "
                     "git/gh; git/gh run through tools not listed here are not "
-                    "inspected (default: sys_os_shell).",
+                    "inspected (default: every harness's shell tool).",
                 },
             },
         },

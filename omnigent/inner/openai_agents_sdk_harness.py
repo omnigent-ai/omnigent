@@ -83,17 +83,24 @@ Env vars read at startup:
   default. An explicit env-var value still wins as the
   highest-priority switch, so bad specs fail loudly at the gateway
   instead of being silently rewritten.
+- ``HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY``: optional Responses
+  replay policy, either ``"preserve"`` or ``"omit"``. Unset uses the
+  OpenAI Agents SDK default.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from typing import cast
 
 from fastapi import FastAPI
 
 from omnigent.inner.executor import Executor
-from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
+from omnigent.inner.openai_agents_sdk_executor import (
+    OpenAIAgentsSDKExecutor,
+    ReasoningItemIdPolicy,
+)
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -107,6 +114,7 @@ _ENV_GATEWAY_HOST = "HARNESS_OPENAI_AGENTS_GATEWAY_HOST"
 _ENV_USE_RESPONSES = "HARNESS_OPENAI_AGENTS_USE_RESPONSES"
 _ENV_GATEWAY_BASE_URL = "HARNESS_OPENAI_AGENTS_GATEWAY_BASE_URL"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND"
+_ENV_REASONING_ITEM_ID_POLICY = "HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY"
 # Direct OpenAI-compatible API key set when the agent spec declares
 # executor.auth: {type: api_key, api_key: …}. Takes precedence over
 # ambient OPENAI_API_KEY in the caller's environment.
@@ -210,6 +218,10 @@ def _build_openai_agents_sdk_executor() -> Executor:
         _ENV_USE_RESPONSES,
         default=default_use_responses,
     )
+    reasoning_item_id_policy = cast(
+        ReasoningItemIdPolicy | None,
+        os.environ.get(_ENV_REASONING_ITEM_ID_POLICY) or None,
+    )
     return OpenAIAgentsSDKExecutor(
         profile=profile,
         api_key=api_key,
@@ -218,6 +230,7 @@ def _build_openai_agents_sdk_executor() -> Executor:
         base_url_override=os.environ.get(_ENV_GATEWAY_BASE_URL) or None,
         gateway_host=os.environ.get(_ENV_GATEWAY_HOST) or None,
         gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
+        reasoning_item_id_policy=reasoning_item_id_policy,
     )
 
 

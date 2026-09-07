@@ -29,7 +29,13 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 
 import pytest
-from omnigent_client._events import ClientTaskCancel, ToolCall, ToolResult
+from omnigent_client._events import (
+    ClientTaskCancel,
+    CompactionCompleted,
+    CompactionFailed,
+    ToolCall,
+    ToolResult,
+)
 from omnigent_client._sse import parse_sse_stream
 
 
@@ -46,6 +52,46 @@ async def _bytes(*frames: bytes) -> AsyncIterator[bytes]:
     """
     for frame in frames:
         yield frame
+
+
+@pytest.mark.asyncio
+async def test_sse_parser_emits_compaction_completed_with_total_tokens() -> None:
+    """
+    ``response.compaction.completed`` must surface as a typed event
+    with the server's optional ``total_tokens`` payload preserved.
+    Otherwise legacy stream consumers that started a compaction
+    spinner never receive the terminal success signal.
+    """
+    frame = (
+        b"event: response.compaction.completed\n"
+        b'data: {"type": "response.compaction.completed", "total_tokens": 8421}\n'
+        b"\n"
+    )
+
+    events = []
+    async for event in parse_sse_stream(_bytes(frame)):
+        events.append(event)
+
+    assert len(events) == 1, f"Expected one compaction event; got {events!r}"
+    assert isinstance(events[0], CompactionCompleted)
+    assert events[0].total_tokens == 8421
+
+
+@pytest.mark.asyncio
+async def test_sse_parser_emits_compaction_failed() -> None:
+    """
+    ``response.compaction.failed`` must surface as a typed event so
+    clients can dismiss in-progress compaction state when the server
+    leaves conversation history unchanged.
+    """
+    frame = b'event: response.compaction.failed\ndata: {"type": "response.compaction.failed"}\n\n'
+
+    events = []
+    async for event in parse_sse_stream(_bytes(frame)):
+        events.append(event)
+
+    assert len(events) == 1, f"Expected one compaction event; got {events!r}"
+    assert isinstance(events[0], CompactionFailed)
 
 
 @pytest.mark.asyncio

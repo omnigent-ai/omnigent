@@ -1,0 +1,133 @@
+name: Issue prioritization v2
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        description: Issue to classify and prioritize
+        required: true
+        type: number
+      reopen_closed:
+        description: Reopen the issue before evaluating an author response
+        required: false
+        default: false
+        type: boolean
+      intake:
+        description: Run one-time labeling, assignment, and duplicate detection
+        required: false
+        default: false
+        type: boolean
+      apply:
+        description: Apply the planned changes instead of producing a dry run
+        required: false
+        default: true
+        type: boolean
+      manual_dispatch:
+        description: Use the caller's explicit duplicate-comment choice
+        required: false
+        default: false
+        type: boolean
+      post_duplicate_comments:
+        description: Post duplicate comments during a manual dispatch
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: issue-prioritization-v2-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  prioritize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Reopen for author follow-up
+        if: inputs.reopen_closed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json state --jq '.state')
+          if [ "$state" = "CLOSED" ]; then
+            gh issue reopen "$ISSUE_NUMBER" --repo "$REPO"
+          else
+            echo "Issue #$ISSUE_NUMBER is already open."
+          fi
+
+      - name: Check out default branch
+        if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Install uv
+        if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+
+      - name: Grade, label, and comment
+        if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+          DATABRICKS_AUTH_TYPE: oauth-m2m
+          GITHUB_TOKEN: ${{ github.token }}
+          MODEL_ENDPOINT: ${{ vars.ISSUE_PRIORITIZATION_V2_MODEL_ENDPOINT }}
+          INTAKE: ${{ inputs.intake }}
+          APPLY: ${{ inputs.apply }}
+          MANUAL_DISPATCH: ${{ inputs.manual_dispatch }}
+          POST_DUPLICATE_COMMENTS: ${{ inputs.post_duplicate_comments }}
+          REPO_POST_DUPLICATE_COMMENTS: ${{ vars.ISSUE_TRIAGE_POST_DUPLICATE_COMMENTS || 'false' }}
+          CLOSE_DUPLICATES: ${{ vars.ISSUE_TRIAGE_CLOSE_DUPLICATES || 'false' }}
+        run: |
+          set -euo pipefail
+          : "${DATABRICKS_HOST:?Set the DATABRICKS_HOST repository secret}"
+          : "${DATABRICKS_CLIENT_ID:?Set the DATABRICKS_CLIENT_ID repository secret}"
+          : "${DATABRICKS_CLIENT_SECRET:?Set the DATABRICKS_CLIENT_SECRET repository secret}"
+          : "${MODEL_ENDPOINT:?Set the ISSUE_PRIORITIZATION_V2_MODEL_ENDPOINT repository variable}"
+          mode=dry_run
+          if [ "$APPLY" = "true" ]; then
+            mode=apply
+          fi
+          args=(
+            --issue-number "${{ inputs.issue_number }}"
+            --github-repo "${{ github.repository }}"
+            --model-endpoint "$MODEL_ENDPOINT"
+            --areas .github/areas.json
+            --label-manifest .github/issue-prioritization-labels.json
+            --output-dir /tmp/issue-priority-v2
+            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}"
+            --source-revision "${{ github.sha }}"
+            --mode "$mode"
+          )
+          if [ "$INTAKE" = "true" ]; then
+            args+=(--intake --maintainers .github/MAINTAINER)
+            if [ "$CLOSE_DUPLICATES" = "true" ]; then
+              args+=(--close-duplicates)
+            fi
+            if { [ "$MANUAL_DISPATCH" = "true" ] && [ "$POST_DUPLICATE_COMMENTS" = "true" ]; } ||
+               { [ "$MANUAL_DISPATCH" != "true" ] && [ "$REPO_POST_DUPLICATE_COMMENTS" = "true" ]; }; then
+              args+=(--post-duplicate-comments)
+            fi
+          fi
+          uv run --frozen --project .github/triage_v2 issue-priority-event "${args[@]}"
+
+      - name: Upload decision artifact
+        if: always() && vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: issue-priority-v2-${{ inputs.issue_number }}-${{ github.run_id }}
+          path: /tmp/issue-priority-v2
+          retention-days: 30
+          if-no-files-found: warn

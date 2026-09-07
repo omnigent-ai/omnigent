@@ -265,7 +265,11 @@ export default defineConfig({
     outDir: path.resolve(__dirname, "./dist-embed"),
     emptyOutDir: true,
     cssCodeSplit: false,
-    sourcemap: false,
+    // Emit source maps so downstream bundlers embedding this build (e.g. the
+    // Databricks monolith's rspack/webpack) can chain through to the original
+    // src/** — without them, host-side error stack frames bottom out at
+    // omnigent-embed.js:<line>. Consumed at the host build via source-map-loader.
+    sourcemap: true,
     lib: {
       entry: path.resolve(__dirname, "./src/embed.tsx"),
       formats: ["es"],

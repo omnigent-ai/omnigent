@@ -79,7 +79,9 @@ function writePanelSizePreferences(prefs: PanelSizePreferences): void {
 export function writePanelSizePreference(key: PanelSizePreferenceKey, width: number | null): void {
   const prefs = readPanelSizePreferences();
   if (width === null) {
-    delete prefs[key];
+    const { [key]: _removedPreference, ...remainingPreferences } = prefs;
+    writePanelSizePreferences(remainingPreferences);
+    return;
   } else if (isValidWidth(width)) {
     prefs[key] = width;
   } else {

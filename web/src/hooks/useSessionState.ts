@@ -16,7 +16,12 @@ import type { Conversation } from "@/hooks/useConversations";
 export type SessionState =
   | { kind: "awaiting"; count: number }
   | { kind: "running" }
-  | { kind: "unseen" };
+  | { kind: "unseen" }
+  // The open session's launch/relaunch window — a send in flight or the PTY
+  // being created before the server confirms `running`. Not derivable from a
+  // conversation row (it reads the chat store), so `getSessionState` never
+  // returns it; the sidebar row folds it in for the bound session only.
+  | { kind: "starting" };
 
 export function getSessionState(
   conversation: Pick<Conversation, "status" | "pending_elicitations_count"> | undefined | null,

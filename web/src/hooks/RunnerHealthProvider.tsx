@@ -51,7 +51,7 @@ type RegisterRunnerHealth = (key: string, sessions: RunnerHealthInput[] | null) 
 const RunnerHealthRegistryContext = createContext<RegisterRunnerHealth>(() => {});
 
 export function RunnerHealthProvider({ children }: { children: ReactNode }) {
-  const { data } = useConversations();
+  const { data } = useConversations("", true);
   const sidebarSessions = useMemo(() => data?.pages.flatMap((page) => page.data) ?? [], [data]);
 
   // The open session is the one liveness actually matters for now (the

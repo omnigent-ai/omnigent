@@ -174,7 +174,7 @@ def render_section(tag: str, date: str, results: list[HarvestResult]) -> str:
 
 
 # Multi-section draft for the GitHub Release body: the Type-of-change tags collapse
-# into the sections the release coordinator curates by hand (see RELEASING.md /
+# into the sections the release coordinator curates by hand (see the maintainer release runbook /
 # the release-notes-drafter agent). This is the deterministic scaffold — the AI
 # drafter refines it, and it is also the fallback when the LLM is unavailable.
 # Values are "Type of change" checkbox labels (see _md.TYPE_TAGS).

@@ -128,7 +128,7 @@ const ROUTING_VERBS = ["weighing", "matching", "tuning", "sizing up"] as const;
  *
  * Three states: while judging (`input-available`) the rows show their
  * worker with a shimmering per-task verb placeholder; on success each row gets
- * its recommended {@link ModelTierPill} plus the judge's rationale; on
+ * its recommended model pill plus the judge's rationale; on
  * failure (error string / unparseable output / no output recorded) the
  * dispatcher's message renders as a muted line — the orchestrator
  * dispatches with its own model choices in that case, so the card must
@@ -171,11 +171,11 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
       data-testid="smart-routing-card"
       data-state-kind={judging ? "judging" : failed ? "failed" : "sized"}
     >
-      <div className="flex items-center gap-1.5 text-xs">
+      <div className="flex items-center gap-1.5 text-sm">
         <BrainIcon className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="font-medium">Intelligent routing</span>
+        <span className="font-medium">Smart routing</span>
         {judging ? (
-          <Shimmer as="span" className="text-xs">
+          <Shimmer as="span" className="text-sm">
             {`Weighing ${tasks.length} ${taskNoun}…`}
           </Shimmer>
         ) : (
@@ -194,7 +194,7 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
         )}
       </div>
       {failed ? (
-        <p className="text-xs text-muted-foreground" data-testid="smart-routing-error">
+        <p className="text-sm text-muted-foreground" data-testid="smart-routing-error">
           {output ?? "No routing decision was recorded for this fan-out."}
         </p>
       ) : (
@@ -202,7 +202,7 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
           const rec = recommendations?.get(task.title) ?? null;
           return (
             <div key={task.title} className="flex flex-col gap-0.5">
-              <div className="flex items-center gap-2 text-xs">
+              <div className="flex items-center gap-2 text-sm">
                 <span className="min-w-0 truncate font-mono text-foreground">{task.title}</span>
                 {(rec?.agent ?? task.agent).length > 0 && (
                   <span className="shrink-0 text-muted-foreground/70">
@@ -215,7 +215,7 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
                       {shortModelName(rec.model)}
                     </span>
                   ) : judging ? (
-                    <Shimmer as="span" className="text-xs">
+                    <Shimmer as="span" className="text-sm">
                       {`${ROUTING_VERBS[i % ROUTING_VERBS.length]}…`}
                     </Shimmer>
                   ) : (
@@ -224,7 +224,7 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
                 </span>
               </div>
               {rec !== null && rec.rationale.length > 0 && (
-                <p className="text-xs leading-snug text-muted-foreground">{rec.rationale}</p>
+                <p className="text-sm leading-snug text-muted-foreground">{rec.rationale}</p>
               )}
             </div>
           );

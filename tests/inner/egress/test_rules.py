@@ -78,6 +78,10 @@ def test_parse_rule_valid(
         ("GET", "must be 'METHODS host/path'"),
         ("INVALID api.github.com/**", "Invalid HTTP method"),
         ("GET,INVALID api.github.com/**", "Invalid HTTP method"),
+        ("FETCH api.github.com/**", "Invalid HTTP method"),
+        ("GET, api.github.com/**", "Empty HTTP method"),
+        ("GET,,POST api.github.com/**", "Empty HTTP method"),
+        ("POST! api.github.com/**", "Invalid HTTP method"),
     ],
 )
 def test_parse_rule_invalid(rule_str: str, expected_fragment: str) -> None:
@@ -134,6 +138,9 @@ def test_matches_wildcard_subdomain() -> None:
     assert rule.matches("GET", "amazonaws.com", "/x") is True
     # Non-matching suffix
     assert rule.matches("GET", "evil.com", "/") is False
+    # Suffix lookalikes must not match: the wildcard requires a dot boundary.
+    assert rule.matches("GET", "evilamazonaws.com", "/") is False
+    assert rule.matches("GET", "amazonaws.com.evil.com", "/") is False
 
 
 def test_matches_wildcard_method() -> None:
@@ -153,6 +160,38 @@ def test_matches_single_segment_wildcard() -> None:
     # Single-segment wildcard matches one segment only
     assert rule.matches("GET", "api.example.com", "/v1/item123/details") is True
     assert rule.matches("GET", "api.example.com", "/v1/a/b/details") is False
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("/repos/issues", True),
+        ("/repos/org/issues", True),
+        ("/repos/org/project/issues", True),
+        ("/repos/org/project/issues/1", False),
+        ("/repos/org/project/pulls", False),
+    ],
+)
+def test_matches_double_star_path_glob_depth(path: str, expected: bool) -> None:
+    """``**`` spans zero or more path segments but still honors the
+    remaining literal suffix.
+    """
+    rule = parse_rule("GET api.example.com/repos/**/issues")
+    assert rule.matches("GET", "api.example.com", path) is expected
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("/files/report.txt", True),
+        ("/files/.txt", True),
+        ("/files/nested/report.txt", False),
+        ("/files/report.md", False),
+    ],
+)
+def test_matches_single_star_path_glob_stays_in_one_segment(path: str, expected: bool) -> None:
+    rule = parse_rule("GET api.example.com/files/*.txt")
+    assert rule.matches("GET", "api.example.com", path) is expected
 
 
 # ------------------------------------------------------------------

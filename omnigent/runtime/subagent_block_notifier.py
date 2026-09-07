@@ -8,9 +8,10 @@ module observes every elicitation at the
 is mirrored into ancestor chats for the human, so for a child session the
 parent *agent* is woken only after an escalation grace passes with the block
 still unanswered (once per block, re-arming when it clears); a delivered wake
-is then paired with a resolution notice when the block clears so the parent is
-never left waiting on a stale notice. Delivery is an injected ``wake_dispatch``
-coroutine (kept free of HTTP/server knowledge) wired up by the Omnigent server
+is then paired with a resolution notice — carrying the human's verdict — when
+the block clears so the parent is never left waiting on a stale notice or
+narrating a guessed verdict into the transcript. Delivery is an injected
+``wake_dispatch`` coroutine (kept free of HTTP/server knowledge) wired up by the Omnigent server
 in ``configure_subagent_block_notifier``. See
 ``designs/SUBAGENT_ELICITATION_VISIBILITY_V2.md``.
 """
@@ -37,6 +38,9 @@ _RESOLVED_TYPE = "response.elicitation_resolved"
 
 # Max length of the elicitation prompt echoed into the parent's notice.
 _REASON_MAX_CHARS = 200
+
+# MCP ElicitResult verdicts a resolution event may carry.
+_VERDICT_ACTIONS = ("accept", "decline", "cancel")
 
 # Bounded in-handler retry for a transient delivery miss (parent runner briefly
 # unroutable during a reconnect/relaunch). Total attempts = 1 + _WAKE_RETRIES.
@@ -129,6 +133,10 @@ class SubagentBlockNotifier:
         # dispatches a wake so a resolve racing the in-flight wake is never
         # missed; observe() sets it on the resolved event.
         self._resolution_signals: dict[str, asyncio.Event] = {}
+        # Verdict captured off the resolved event ("accept"/"decline"/"cancel"),
+        # stored only while a handler waits on the matching signal so entries
+        # never outlive the notice they inform.
+        self._verdicts: dict[str, str] = {}
         # Strong refs so scheduled wake futures aren't GC'd mid-flight; close() cancels them.
         self._inflight: set[concurrent.futures.Future[None]] = set()
 
@@ -157,6 +165,9 @@ class SubagentBlockNotifier:
             with self._lock:
                 self._notified.discard(elicitation_id)
                 signal = self._resolution_signals.get(elicitation_id)
+                action = _resolution_action(event)
+                if signal is not None and action is not None:
+                    self._verdicts[elicitation_id] = action
             if signal is not None:
                 # Event.set is not thread-safe; hop onto the loop. A gone
                 # loop (shutdown) means the waiting handler dies with it.
@@ -293,12 +304,15 @@ class SubagentBlockNotifier:
             if outcome is _WakeOutcome.MOOT:
                 return
             await signal.wait()
+            with self._lock:
+                verdict = self._verdicts.pop(elicitation_id, None)
             await self._deliver_with_retry(
-                parent_id, child, _format_resolution_notice(child), armed_id=None
+                parent_id, child, _format_resolution_notice(child, verdict), armed_id=None
             )
         finally:
             with self._lock:
                 self._resolution_signals.pop(elicitation_id, None)
+                self._verdicts.pop(elicitation_id, None)
 
     async def _deliver_with_retry(
         self,
@@ -392,27 +406,70 @@ def _format_block_notice(child: Conversation, event: dict[str, Any]) -> str:
     )
 
 
-def _format_resolution_notice(child: Conversation) -> str:
+def _format_resolution_notice(child: Conversation, action: str | None) -> str:
     """
     Build the follow-up notice sent after a woken block resolves.
 
     Sent only when a block notice was actually delivered, so the parent
     stops acting on it (offering to relay answers, polling the child)
-    once the human has dealt with the prompt directly.
+    once the human has dealt with the prompt directly. The human's
+    verdict is stated verbatim so the parent agent cannot narrate an
+    approval that did not happen (a decline must never be retold as
+    "approved" into the transcript); when no verdict was recorded
+    (timeout, severed wait, older runner) the notice says so and points
+    at the fail-closed reading.
 
     :param child: The previously blocked child :class:`Conversation`,
         used for its ``<agent>:<title>`` label.
+    :param action: The MCP verdict from the resolution event —
+        ``"accept"``, ``"decline"``, or ``"cancel"`` — or ``None``
+        when the resolution carried no verdict.
     :returns: A one-line ``[System: …]`` notice, e.g. ``"[System:
         sub-agent codex/auth-refactor's pending approval has been
-        resolved and it is continuing. …]"``.
+        resolved (action: decline — NOT approved) and it is
+        continuing. …]"``.
     """
     label = _child_label(child)
     return (
-        f"[System: sub-agent {label}'s pending approval has been resolved and it "
-        "is continuing. No action is needed on the earlier block notice — if you "
-        "are waiting on its output, the result will arrive in your inbox as "
-        "usual.]"
+        f"[System: sub-agent {label}'s pending approval has been resolved "
+        f"{_verdict_clause(action)} and it is continuing. No action is needed "
+        "on the earlier block notice — if you are waiting on its output, the "
+        "result will arrive in your inbox as usual.]"
     )
+
+
+def _verdict_clause(action: str | None) -> str:
+    """
+    Render the human's verdict as an un-misreadable clause.
+
+    Every branch names the gate outcome explicitly so an agent reading
+    the transcript cannot infer "approved" from the bare word
+    "resolved".
+
+    :param action: The MCP verdict, or ``None`` when unrecorded.
+    :returns: A parenthesized clause, e.g. ``"(action: decline — NOT
+        approved)"``.
+    """
+    if action == "accept":
+        return "(action: accept)"
+    if action == "decline" or action == "cancel":
+        return f"(action: {action} — NOT approved)"
+    return "(no human verdict recorded — treat the call as NOT approved)"
+
+
+def _resolution_action(event: dict[str, Any]) -> str | None:
+    """
+    Extract the MCP verdict from a ``response.elicitation_resolved`` event.
+
+    :param event: The resolved event dict; reads ``action``.
+    :returns: ``"accept"``/``"decline"``/``"cancel"``, or ``None``
+        when the event predates verdict carriage or carries a
+        malformed value.
+    """
+    action = event.get("action")
+    if isinstance(action, str) and action in _VERDICT_ACTIONS:
+        return action
+    return None
 
 
 def _child_label(child: Conversation) -> str:

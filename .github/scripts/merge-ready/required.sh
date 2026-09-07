@@ -7,6 +7,7 @@
 # Generated file -- do not hand-edit; it is replaced wholesale on every sync.
 
 REQUIRED=(
+  "DCO"
   "Pre-commit checks"
   "Docker build"
   "Pytest (runtime-harnesses)"
@@ -29,9 +30,11 @@ REQUIRED=(
   "E2E Tests (shard 1/4)"
   "E2E Tests (shard 2/4)"
   "E2E Tests (shard 3/4)"
-  "E2E UI Tests (shard 0/3)"
-  "E2E UI Tests (shard 1/3)"
-  "E2E UI Tests (shard 2/3)"
+  "E2E UI Tests (shard 0/4)"
+  "E2E UI Tests (shard 1/4)"
+  "E2E UI Tests (shard 2/4)"
+  "E2E UI Tests (shard 3/4)"
+  "UI Snapshot (visual baselines)"
   "Integration (claude-sdk)"
   "Integration (openai-agents)"
   "Integration (codex)"
@@ -59,9 +62,11 @@ ALLOW_SKIP=(
   "E2E Tests (shard 1/4)"
   "E2E Tests (shard 2/4)"
   "E2E Tests (shard 3/4)"
-  "E2E UI Tests (shard 0/3)"
-  "E2E UI Tests (shard 1/3)"
-  "E2E UI Tests (shard 2/3)"
+  "E2E UI Tests (shard 0/4)"
+  "E2E UI Tests (shard 1/4)"
+  "E2E UI Tests (shard 2/4)"
+  "E2E UI Tests (shard 3/4)"
+  "UI Snapshot (visual baselines)"
   "Integration (claude-sdk)"
   "Integration (openai-agents)"
   "Integration (codex)"
@@ -79,6 +84,7 @@ workflow_for() {
     "Pytest ("*)             echo "CI" ;;
     "E2E Tests (shard "*)    echo "E2E Tests" ;;
     "E2E UI Tests (shard "*) echo "E2E UI Tests" ;;
+    "UI Snapshot (visual baselines)") echo "UI Snapshot" ;;
     "Integration ("*)        echo "Integration Tests" ;;
     *)                       echo "" ;;
   esac

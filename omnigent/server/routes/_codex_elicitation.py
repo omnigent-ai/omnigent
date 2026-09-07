@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from omnigent.codex_native_elicitation import is_codex_request_id
 from omnigent.errors import ErrorCode, OmnigentError
@@ -81,7 +81,7 @@ def parse_codex_elicitation_request(payload: dict[str, Any]) -> CodexElicitation
     """
     method = payload.get("method")
     params = payload.get("params")
-    request_id = payload.get("id")
+    request_id: object = payload.get("id")
     if not isinstance(method, str) or not method:
         raise OmnigentError(
             "Codex elicitation request must include a non-empty method string.",
@@ -97,6 +97,7 @@ def parse_codex_elicitation_request(payload: dict[str, Any]) -> CodexElicitation
             "Codex elicitation request must include a string or integer id.",
             code=ErrorCode.INVALID_INPUT,
         )
+    typed_request_id = cast(int | str, request_id)
     adapter = _CODEX_ELICITATION_ADAPTERS.get(method)
     if adapter is None:
         raise OmnigentError(
@@ -104,9 +105,9 @@ def parse_codex_elicitation_request(payload: dict[str, Any]) -> CodexElicitation
             code=ErrorCode.INVALID_INPUT,
         )
     return CodexElicitationRequest(
-        params=adapter.build_params(request_id, method, params),
+        params=adapter.build_params(typed_request_id, method, params),
         method=method,
-        request_id=request_id,
+        request_id=typed_request_id,
         codex_params=params,
         response_builder=adapter.build_response,
     )
@@ -236,7 +237,7 @@ def _codex_request_user_input_response(
 def _codex_mcp_elicitation_response(
     result: ElicitationResult,
     _method: str,
-    _params: dict[str, Any],
+    params: dict[str, Any],
 ) -> dict[str, Any]:
     """
     Convert a web approval result into Codex MCP elicitation output.
@@ -244,15 +245,38 @@ def _codex_mcp_elicitation_response(
     :param result: Web-submitted elicitation result.
     :param _method: Codex app-server method, unused because MCP
         elicitation has one response shape.
-    :param _params: Original Codex request params, unused because the
-        response depends only on the web verdict.
+    :param params: Original Codex request params. Its ``_meta.persist``
+        declaration bounds which persistence choices the web verdict
+        may return.
     :returns: Codex ``McpServerElicitationRequestResponse`` payload.
+    :raises OmnigentError: If the verdict asks for a persistence mode
+        the original Codex request did not advertise.
     """
+    response_meta: dict[str, str] | None = None
+    requested_persist = result.meta.get("persist") if result.meta is not None else None
+    if result.action == "accept" and requested_persist is not None:
+        advertised = _codex_mcp_persist_modes(params)
+        if not isinstance(requested_persist, str) or requested_persist not in advertised:
+            raise OmnigentError(
+                "Codex MCP persistence choice was not advertised by the request.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        response_meta = {"persist": requested_persist}
     return {
         "action": result.action,
         "content": result.content if result.action == "accept" else None,
-        "_meta": None,
+        "_meta": response_meta,
     }
+
+
+def _codex_mcp_persist_modes(params: dict[str, Any]) -> set[str]:
+    """Return the supported persistence modes advertised by Codex."""
+    meta = params.get("_meta")
+    if not isinstance(meta, dict) or meta.get("codex_approval_kind") != "mcp_tool_call":
+        return set()
+    persist = meta.get("persist")
+    values = persist if isinstance(persist, list) else [persist]
+    return {value for value in values if isinstance(value, str) and value in {"session", "always"}}
 
 
 def _execpolicy_amendment(value: Any) -> list[str] | None:
@@ -367,6 +391,7 @@ def _codex_command_approval_response(
         decisions, e.g. ``{"availableDecisions": [...]}``.
     :returns: Codex command approval response payload.
     """
+    decision: str | dict[str, dict[str, list[str]]]
     if method == _CODEX_COMMAND_EXECUTION_REQUEST_APPROVAL_METHOD:
         amendment = _result_execpolicy_amendment(result.content)
         if result.action == "accept" and amendment is not None:

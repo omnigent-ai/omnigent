@@ -301,6 +301,29 @@ async def test_schemas_for_rpc_error_body_returns_failure() -> None:
     assert "Method not found" in result.failures["proxy"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rpc_body", "expected_message"),
+    [
+        ({"jsonrpc": "2.0", "id": 1, "error": []}, "non-object RPC error"),
+        ({"jsonrpc": "2.0", "id": 1, "result": []}, "non-object tools/list result"),
+    ],
+)
+async def test_schemas_for_malformed_rpc_objects_return_failure(
+    rpc_body: dict[str, Any],
+    expected_message: str,
+) -> None:
+    """Malformed JSON-RPC objects surface as schema failures rather than empty success."""
+    transport = _StubTransport([_json_resp(rpc_body)])
+    manager = _make_manager(transport)
+
+    result = await manager.schemas_for(_make_spec("github"))
+
+    assert result.schemas == []
+    assert result.tool_names == set()
+    assert expected_message in result.failures["proxy"]
+
+
 # ── call_tool ──────────────────────────────────────────────────────────────
 
 
@@ -411,6 +434,16 @@ async def test_call_tool_non_32000_rpc_error_raises() -> None:
     manager = _make_manager(transport)
 
     with pytest.raises(RuntimeError, match="-32600"):
+        await manager.call_tool(_make_spec("github"), "github__search", {})
+
+
+@pytest.mark.asyncio
+async def test_call_tool_non_object_rpc_error_raises_precise_error() -> None:
+    """A malformed JSON-RPC error remains fail-closed with a precise diagnostic."""
+    transport = _StubTransport([_json_resp({"jsonrpc": "2.0", "id": 1, "error": []})])
+    manager = _make_manager(transport)
+
+    with pytest.raises(RuntimeError, match="non-object RPC error"):
         await manager.call_tool(_make_spec("github"), "github__search", {})
 
 

@@ -40,14 +40,40 @@ function getScrollParent(node: Element): Element | null {
   return null;
 }
 
-function jumpTo(itemId: string, flash: (id: string) => void): void {
+/**
+ * Smooth-scroll a user message into view (centered) and flash it once the
+ * scroll settles. Shared by the Cmd+Alt nav hook and the turn rail so both
+ * land on the message the same way. Anchors on the `data-user-message-id`
+ * DOM attribute stamped by UserBubble.
+ *
+ * @param itemId - The user bubble's itemId (the DOM anchor to scroll to).
+ * @param flash - Optional highlight callback fired when the scroll settles.
+ * @param ensureVisible - Optional hook (from the virtualized transcript) that
+ *     pulls a windowed-out row into the DOM. Called first; when it reports it
+ *     scrolled, the centering scroll is deferred a frame so the freshly mounted
+ *     node exists to center on.
+ */
+export function scrollToUserMessage(
+  itemId: string,
+  flash?: (id: string) => void,
+  ensureVisible?: (id: string) => boolean,
+): void {
+  // The row may be windowed out of the DOM (virtualized transcript). Ask the
+  // transcript to scroll it into the mounted range first; its node then mounts
+  // on the next frame, so retry the DOM lookup + centering scroll there.
+  const scrolledIntoWindow = ensureVisible?.(itemId) ?? false;
   const el = document.querySelector(
     // CSS.escape is defensive — itemIds are alphanumeric today.
     `[data-user-message-id="${CSS.escape(itemId)}"]`,
   );
   if (!el) {
+    if (scrolledIntoWindow) {
+      // Row is being mounted by the virtualizer — center on it next frame.
+      requestAnimationFrame(() => scrollToUserMessage(itemId, flash));
+      return;
+    }
     // Fail loud: id exists in the list but DOM anchor is missing.
-    console.warn(`useUserMessageNav: no element for itemId=${itemId}`);
+    console.warn(`scrollToUserMessage: no element for itemId=${itemId}`);
     return;
   }
 
@@ -56,6 +82,10 @@ function jumpTo(itemId: string, flash: (id: string) => void): void {
   cancelPendingFlash?.();
 
   el.scrollIntoView({ block: "center", behavior: "smooth" });
+
+  // Nothing to defer when there's no flash to fire — the smooth-scroll runs
+  // to completion on its own.
+  if (!flash) return;
 
   // Defer the flash until the smooth-scroll settles. On a long jump the
   // highlight would otherwise burn out before the message is on screen.
@@ -75,7 +105,7 @@ function jumpTo(itemId: string, flash: (id: string) => void): void {
     if (done) return;
     done = true;
     cleanup();
-    flash(itemId);
+    flash?.(itemId);
   }
 
   function onScroll(): void {
@@ -91,7 +121,12 @@ function jumpTo(itemId: string, flash: (id: string) => void): void {
   maxTimer = window.setTimeout(finish, SCROLL_SETTLE_MAX_MS);
 }
 
-export function useUserMessageNav(userMessageIds: readonly string[]): UserMessageNav {
+export function useUserMessageNav(
+  userMessageIds: readonly string[],
+  // From the virtualized transcript: pulls a windowed-out target into the DOM
+  // before the centering scroll. Omitted in tests / non-virtualized callers.
+  ensureItemVisible?: (id: string) => boolean,
+): UserMessageNav {
   const flashUserMessage = useChatStore((s) => s.flashUserMessage);
   const [anchorId, setAnchorId] = useState<string | null>(null);
 
@@ -109,16 +144,16 @@ export function useUserMessageNav(userMessageIds: readonly string[]): UserMessag
       ? userMessageIds[userMessageIds.length - 1]
       : userMessageIds[currentIndex - 1];
     setAnchorId(target);
-    jumpTo(target, flashUserMessage);
-  }, [userMessageIds, currentIndex, outside, flashUserMessage]);
+    scrollToUserMessage(target, flashUserMessage, ensureItemVisible);
+  }, [userMessageIds, currentIndex, outside, flashUserMessage, ensureItemVisible]);
 
   const goNext = useCallback(() => {
     if (outside) return;
     if (currentIndex >= userMessageIds.length - 1) return;
     const target = userMessageIds[currentIndex + 1];
     setAnchorId(target);
-    jumpTo(target, flashUserMessage);
-  }, [userMessageIds, currentIndex, outside, flashUserMessage]);
+    scrollToUserMessage(target, flashUserMessage, ensureItemVisible);
+  }, [userMessageIds, currentIndex, outside, flashUserMessage, ensureItemVisible]);
 
   // Stable identity so consumers can put the return value in an
   // effect dep array without re-registering on every render.

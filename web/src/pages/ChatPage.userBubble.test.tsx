@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { BubbleView } from "./ChatPage";
@@ -13,6 +14,7 @@ afterEach(cleanup);
 
 const FILE_VIEWER_NOOP = {
   openFile: () => {},
+  openGithubTab: () => {},
   isChangedPath: () => false,
   conversationId: undefined,
   workspaceRoot: null,
@@ -99,6 +101,167 @@ describe("UserBubble markdown rendering", () => {
     const cell = await screen.findByText("1", { selector: "td, td *" });
     expect(cell.closest("table")).not.toBeNull();
   });
+
+  it("renders CJK text around explicit inline math", async () => {
+    const { container } = renderBubble(userBubble(String.raw`中文 \(\sqrt{x + 1}\) 文本`));
+
+    await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+    expect(container.textContent).toContain("中文");
+    expect(container.textContent).toContain("文本");
+    const katex = container.querySelector(".katex") as HTMLElement;
+    expect(katex.querySelector(".sqrt")).not.toBeNull();
+    expect(katex.textContent).toContain("x");
+    expect(katex.textContent).toContain("1");
+  });
+});
+
+describe("UserBubble system messages", () => {
+  it("keeps hook order stable when a system message becomes a regular message", () => {
+    const { rerender } = renderBubble(userBubble("[System: timer build fired]"));
+    expect(screen.getByTestId("system-message")).toBeInTheDocument();
+
+    rerender(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BubbleView bubble={userBubble("build finished")} />
+      </FileViewerContext.Provider>,
+    );
+
+    expect(screen.queryByTestId("system-message")).toBeNull();
+    expect(screen.getByText("build finished")).toBeInTheDocument();
+  });
+
+  it("renders a steering interrupt as a muted marker and its uploads as their own bubble", () => {
+    // The two items a mid-tool-use steer produces, once the pending-input
+    // drain stops handing the uploads to the marker: Claude's own interrupt
+    // record (text-only) and the user's attachments-only message.
+    renderBubble(userBubble("[Request interrupted by user for tool use]"));
+    const marker = screen.getByTestId("system-message");
+    expect(marker.getAttribute("data-system-kind")).toBe("interrupted");
+    expect(marker).toHaveTextContent("Interrupted");
+    // The raw record must not survive as user-bubble text.
+    expect(screen.queryByText(/\[Request interrupted by user/)).toBeNull();
+    expect(screen.queryByTestId("message-bubble")).toBeNull();
+
+    cleanup();
+
+    renderBubble(
+      userBubble("[Attached: /tmp/uploads/shot1.png]\n\n[Attached: /tmp/uploads/shot2.png]", {
+        content: [
+          { type: "input_image", file_id: "file_1", filename: "shot1.png" },
+          { type: "input_image", file_id: "file_2", filename: "shot2.png" },
+          {
+            type: "input_text",
+            text: "[Attached: /tmp/uploads/shot1.png]\n\n[Attached: /tmp/uploads/shot2.png]",
+          },
+        ],
+      }),
+    );
+    // A real bubble with both screenshots — not the blank pill the stolen
+    // file blocks used to leave behind.
+    expect(screen.getByTestId("message-bubble")).toBeInTheDocument();
+    expect(screen.getByAltText("shot1.png")).toBeInTheDocument();
+    expect(screen.getByAltText("shot2.png")).toBeInTheDocument();
+    // Upload markers are stripped from the text, and an empty text renders
+    // nothing rather than an empty markdown block.
+    expect(screen.queryByText(/\[Attached:/)).toBeNull();
+    expect(screen.queryByTestId("system-message")).toBeNull();
+  });
+});
+
+describe("UserBubble image attachments", () => {
+  const INLINE_PNG =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+  it("renders an imported inline image that carries no file id", () => {
+    // Codex rollouts inline a pasted image as a `data:` URI with no file_id
+    // (`session_import/local.py` preserves the block verbatim).
+    renderBubble(
+      userBubble("look at this", {
+        content: [
+          { type: "input_text", text: "look at this" },
+          { type: "input_image", image_url: INLINE_PNG, filename: "shot.png" },
+        ],
+      }),
+    );
+
+    expect(screen.getByAltText("shot.png")).toHaveAttribute("src", INLINE_PNG);
+    expect(screen.getByText("look at this")).toBeInTheDocument();
+  });
+
+  it("keeps the rest of the message readable when an image block is malformed", () => {
+    // The non-fatal fallback: one unusable attachment costs its own preview,
+    // never the surrounding transcript.
+    renderBubble(
+      userBubble("still readable", {
+        content: [{ type: "input_image" }, { type: "input_text", text: "still readable" }],
+      }),
+    );
+
+    expect(screen.getByText("still readable")).toBeInTheDocument();
+    expect(screen.getByText("Unavailable image")).toBeInTheDocument();
+  });
+
+  it("still shows a chip while an upload is in flight", () => {
+    renderBubble(
+      userBubble("uploading", {
+        content: [
+          { type: "input_image", file_id: "pending:shot.png" },
+          { type: "input_text", text: "uploading" },
+        ],
+      }),
+    );
+
+    expect(screen.getByText("shot.png")).toBeInTheDocument();
+    expect(screen.queryByAltText("shot.png")).toBeNull();
+  });
+});
+
+describe("UserBubble file attachments", () => {
+  it("labels a non-image attachment with its filename", () => {
+    renderBubble(
+      userBubble("read this", {
+        content: [
+          { type: "input_file", file_id: "file_1", filename: "notes.pdf" },
+          { type: "input_text", text: "read this" },
+        ],
+      }),
+    );
+
+    expect(screen.getByText("notes.pdf")).toBeInTheDocument();
+    expect(screen.getByText("read this")).toBeInTheDocument();
+  });
+
+  // An imported transcript is copied verbatim server-side, so a file block can
+  // carry any type; a non-string label would throw "Objects are not valid as a
+  // React child" and blank the whole transcript.
+  it.each([
+    ["an object filename", { type: "input_file", filename: { name: "notes.pdf" } }],
+    ["a numeric file id", { type: "input_file", file_id: 42 }],
+    ["both fields malformed", { type: "input_file", filename: 7, file_id: ["file_1"] }],
+  ])("renders a generic chip when a file block carries %s", (_case, block) => {
+    renderBubble(
+      userBubble("still readable", {
+        content: [block, { type: "input_text", text: "still readable" }] as MessageContentBlock[],
+      }),
+    );
+
+    expect(screen.getByText("Attachment")).toBeInTheDocument();
+    expect(screen.getByText("still readable")).toBeInTheDocument();
+  });
+
+  it("drops a text block whose text is not a string instead of rendering it", () => {
+    renderBubble(
+      userBubble("real text", {
+        content: [
+          { type: "input_text", text: { parts: ["oops"] } },
+          { type: "input_text", text: "real text" },
+        ] as MessageContentBlock[],
+      }),
+    );
+
+    expect(screen.getByText("real text")).toBeInTheDocument();
+    expect(screen.queryByText(/\[object Object\]/)).toBeNull();
+  });
 });
 
 describe("AssistantBubble lifecycle rendering", () => {
@@ -118,6 +281,13 @@ describe("AssistantBubble lifecycle rendering", () => {
 describe("UserBubble copy button", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("uses a compact action button with an 8px content gap", () => {
+    renderBubble(userBubble("copy me please"));
+
+    expect(screen.getByTestId("message-bubble")).toHaveClass("gap-2");
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
   });
 
   it("copies the message text to the clipboard when clicked", async () => {

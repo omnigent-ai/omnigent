@@ -5,9 +5,9 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 from omnigent.inner.executor import (
+    EnqueuedContent,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -16,7 +16,7 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.inner.native_attachments import materialize_attachment
+from omnigent.inner.native_attachments import attachment_reference_line
 from omnigent.pi_native_bridge import (
     PI_NATIVE_BRIDGE_DIR_ENV_VAR,
     PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
@@ -56,7 +56,7 @@ class PiNativeExecutor(Executor):
         """:returns: ``True`` because messages can be queued for the extension."""
         return True
 
-    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+    async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         """
         Queue a live steering message for the resident Pi extension.
 
@@ -178,7 +178,7 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     return ""
 
 
-def _content_to_text(content: Any, bridge_dir: Path) -> str:
+def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     """
     Normalize executor content into plain text for Pi.
 
@@ -200,9 +200,7 @@ def _content_to_text(content: Any, bridge_dir: Path) -> str:
                 if isinstance(text, str):
                     text_parts.append(text)
             elif block_type in ("input_image", "input_file"):
-                path = materialize_attachment(block, bridge_dir)
-                if path is not None:
-                    attachment_lines.append(f"[Attached: {path}]")
+                attachment_lines.append(attachment_reference_line(block, bridge_dir))
         return "\n\n".join([*attachment_lines, *text_parts])
     if content is None:
         return ""

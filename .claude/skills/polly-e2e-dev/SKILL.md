@@ -118,7 +118,7 @@ right vendor, cross-reviews). That is the live recipe.
 ### Run a live turn
 
 ```bash
-.venv/bin/omni server start && .venv/bin/omni server status   # prints $SERVER, e.g. http://127.0.0.1:6767
+.venv/bin/omni server --background && .venv/bin/omni server status   # prints $SERVER, e.g. http://127.0.0.1:6767
 SERVER=http://127.0.0.1:6767
 timeout 280 .venv/bin/omni run examples/polly \
   -p "Investigate how the runner enforces tool-call policies and report file:line evidence." \
@@ -203,7 +203,7 @@ side effects.
 
 ```bash
 # Existing pytest e2e for polly (mock-LLM) — complementary to this skill:
-uv run --frozen --extra dev python -m pytest \
+uv run --frozen --group test python -m pytest \
   tests/e2e/test_polly_e2e.py \
   tests/e2e/test_polly_cost_advisor_e2e.py \
   tests/e2e/test_polly_subagent_model_e2e.py -q

@@ -1,0 +1,74 @@
+bundle:
+  name: omnigent-issue-prioritization
+
+include:
+  - resources/*.yml
+
+sync:
+  paths:
+    - .
+    - ../areas.json
+    - ../issue-prioritization-labels.json
+
+artifacts:
+  default:
+    type: whl
+    path: .
+    build: uv build --wheel --out-dir dist
+
+variables:
+  catalog:
+    default: main
+  schema:
+    default: team_eng_omnigent
+  source_table:
+    default: github_issues_bronze
+  classifications_table:
+    default: issue_classifications
+  scores_table:
+    default: issue_scores
+  latest_scores_view:
+    default: issue_scores_latest
+  bot_state_table:
+    default: issue_bot_state
+  artifact_volume_name:
+    default: issue_priority_artifacts
+  model_endpoint:
+    description: Model Serving endpoint used for impact classification.
+    default: ""
+  github_repo:
+    default: omnigent-ai/omnigent
+  github_secret_scope:
+    description: Secret scope for legacy ownership reads and apply-mode writes.
+    default: ""
+  github_auth_mode:
+    description: GitHub credential source. Use app after its secrets are configured.
+    default: token
+  github_token_secret_key:
+    default: github-token
+  github_app_client_id_secret_key:
+    default: github-app-client-id
+  github_app_private_key_secret_key:
+    default: github-app-private-key
+  legacy_priority_bot_logins:
+    description: Comma-separated actors whose historical priority labels may be adopted.
+    default: github-actions[bot],omnigent-ci[bot]
+  allow_github_writes:
+    description: Hard gate for GitHub mutations. Keep false until rollout approval.
+    default: "false"
+  schedule_pause_status:
+    description: Keep PAUSED until App authentication is verified manually.
+    default: PAUSED
+  scheduled_mode:
+    description: Default mode for triggered runs. Keep dry_run until rollout approval.
+    default: dry_run
+  scheduled_adopt_legacy_bot_priorities:
+    description: Adopt legacy bot labels during triggered runs while ownership is migrated.
+    default: "false"
+
+targets:
+  dev:
+    default: true
+    mode: development
+  prod:
+    mode: production

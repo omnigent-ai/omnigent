@@ -19,9 +19,6 @@ from omnigent_client import tool
 _TOOL_CLASSES: dict[str, tuple[str, str]] = {
     "download_file": ("omnigent.tools.builtins.download_file", "DownloadFileTool"),
     "export_agent": ("omnigent.tools.builtins.export_agent", "ExportAgentTool"),
-    "hindsight_recall": ("omnigent.tools.builtins.hindsight", "HindsightRecallTool"),
-    "hindsight_reflect": ("omnigent.tools.builtins.hindsight", "HindsightReflectTool"),
-    "hindsight_retain": ("omnigent.tools.builtins.hindsight", "HindsightRetainTool"),
     "list_files": ("omnigent.tools.builtins.list_files", "ListFilesTool"),
     "search_conversations": (
         "omnigent.tools.builtins.search_conversations",
@@ -31,6 +28,51 @@ _TOOL_CLASSES: dict[str, tuple[str, str]] = {
     "web_fetch": ("omnigent.tools.builtins.web_fetch", "WebFetchTool"),
     "web_search": ("omnigent.tools.builtins.web_search", "WebSearchTool"),
 }
+
+
+def _hindsight_available() -> bool:
+    """Return True when the optional ``hindsight-client`` SDK is installed."""
+    import importlib.util
+
+    return importlib.util.find_spec("hindsight_client") is not None
+
+
+def _nimble_available() -> bool:
+    """Return True when the optional ``nimble-python`` SDK is installed."""
+    import importlib.util
+
+    return importlib.util.find_spec("nimble_python") is not None
+
+
+# Both Nimble tools need a Nimble account and API key, so the `nimble` extra
+# is the opt-in signal for the pair: advertised only when it is installed, so
+# the assistant never recommends a tool the author cannot use. Runtime is
+# unaffected: a spec may still enable either by name.
+if _nimble_available():
+    _TOOL_CLASSES.update(
+        {
+            "nimble_extract": (
+                "omnigent.tools.builtins.nimble_extract",
+                "NimbleExtractTool",
+            ),
+            "nimble_research": (
+                "omnigent.tools.builtins.nimble_research",
+                "NimbleResearchTool",
+            ),
+        }
+    )
+
+
+# Hindsight memory tools (optional ``hindsight`` extra). Advertised only when
+# the SDK is installed, so the assistant never recommends unusable tools.
+if _hindsight_available():
+    _TOOL_CLASSES.update(
+        {
+            "hindsight_retain": ("omnigent.tools.builtins.hindsight", "HindsightRetainTool"),
+            "hindsight_recall": ("omnigent.tools.builtins.hindsight", "HindsightRecallTool"),
+            "hindsight_reflect": ("omnigent.tools.builtins.hindsight", "HindsightReflectTool"),
+        }
+    )
 
 
 @tool

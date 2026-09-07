@@ -40,12 +40,12 @@ function mockListing(
 
 describe("splitTypedPath", () => {
   // input -> { dir (directory to list, "" = home), partial (prefix) }
-  const cases: Array<{
+  const cases: {
     name: string;
     input: string;
     dir: string;
     partial: string;
-  }> = [
+  }[] = [
     {
       name: "empty input lists home with no filter",
       input: "",

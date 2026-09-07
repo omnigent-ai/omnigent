@@ -66,6 +66,11 @@ def function_calls(items: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return calls
 
 
+def reasoning_item_count(items: Iterable[Mapping[str, Any]]) -> int:
+    """Return the number of persisted reasoning items."""
+    return sum(1 for item in items if item_type(item) == "reasoning")
+
+
 def tool_output_states(
     items: Iterable[Mapping[str, Any]], *, deny_marker: str
 ) -> tuple[bool, bool]:
@@ -109,5 +114,6 @@ __all__ = [
     "item_data",
     "item_role",
     "item_type",
+    "reasoning_item_count",
     "tool_output_states",
 ]

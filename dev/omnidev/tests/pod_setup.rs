@@ -17,6 +17,9 @@ mod pod;
 #[allow(dead_code)]
 #[path = "../src/ports.rs"]
 mod ports;
+#[allow(dead_code)]
+#[path = "../src/profile.rs"]
+mod profile;
 
 use pod::Pod;
 use ports::Ports;
@@ -30,7 +33,7 @@ fn finds_repo_root_from_subdir() {
     fs::create_dir_all(tmp.join("omnigent/server")).unwrap();
     fs::create_dir_all(tmp.join("web/src")).unwrap();
 
-    let root = paths::find_repo_root(&tmp.join("omnigent/server")).unwrap();
+    let root = paths::find_repo_root(&tmp.join("omnigent/server"), false).unwrap();
     assert_eq!(root, tmp.canonicalize().unwrap());
 }
 
@@ -39,7 +42,19 @@ fn finds_repo_root_from_subdir() {
 fn rejects_non_omnigent_project() {
     let tmp = tempdir();
     fs::create_dir_all(tmp.join(".git")).unwrap();
-    assert!(paths::find_repo_root(&tmp).is_err());
+    assert!(paths::find_repo_root(&tmp, false).is_err());
+}
+
+/// External profiles deliberately relax the OSS checkout layout check.
+#[test]
+fn external_profile_accepts_another_project_layout() {
+    let tmp = tempdir();
+    fs::create_dir_all(tmp.join(".git")).unwrap();
+    fs::create_dir_all(tmp.join("service")).unwrap();
+
+    let root = paths::find_repo_root(&tmp.join("service"), true).unwrap();
+
+    assert_eq!(root, tmp.canonicalize().unwrap());
 }
 
 /// Two different repo paths get distinct pod dirs; the same path is stable.
@@ -52,10 +67,9 @@ fn pod_dir_is_per_repo_and_stable() {
     assert_ne!(a1, b);
 }
 
-/// npm install is needed when node_modules is missing, and when a manifest is
-/// newer than it; not needed when node_modules is up to date.
+/// Dependency preparation is needed when node_modules is missing or stale.
 #[test]
-fn needs_npm_install_tracks_manifests() {
+fn needs_web_prepare_tracks_manifests() {
     let repo = tempdir();
     let web = repo.join("web");
     fs::create_dir_all(&web).unwrap();
@@ -70,20 +84,21 @@ fn needs_npm_install_tracks_manifests() {
         },
         vite_host: "127.0.0.1".into(),
         trusted_origins: Vec::new(),
+        profile: None,
     };
 
     // No node_modules yet → install needed.
-    assert!(pod.needs_npm_install());
+    assert!(pod.needs_web_prepare());
 
     // Fresh node_modules created after the manifest → up to date.
     fs::create_dir_all(web.join("node_modules")).unwrap();
-    assert!(!pod.needs_npm_install());
+    assert!(!pod.needs_web_prepare());
 
     // A manifest touched after node_modules → stale, install needed.
     // (Sleep briefly so the mtime is observably newer on coarse filesystems.)
     std::thread::sleep(std::time::Duration::from_millis(10));
-    fs::write(web.join("package-lock.json"), "{}").unwrap();
-    assert!(pod.needs_npm_install());
+    fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: 1").unwrap();
+    assert!(pod.needs_web_prepare());
 }
 
 /// Ports probe to bindable values and persist/reuse across calls.
@@ -176,6 +191,7 @@ fn pod_with_trusted(trusted: Vec<String>) -> Pod {
         },
         vite_host: "0.0.0.0".into(),
         trusted_origins: trusted,
+        profile: None,
     }
 }
 

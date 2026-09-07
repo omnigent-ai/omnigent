@@ -44,13 +44,13 @@ from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 # Reuse the proven harness/process-manager/client stubs from the sessions-native
 # suite so this repro drives the exact same dispatch path the runner uses.
-from tests.runner.test_app_sessions_native import (
-    NullServerClient,
+from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
     _sse,
 )
+from tests.runner.helpers import NullServerClient
 
 PARENT_AGENT_ID = "ag_polly"
 CHILD_SESSION_ID = "conv_child_claude_code"

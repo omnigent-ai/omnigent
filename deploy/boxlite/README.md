@@ -59,8 +59,23 @@ sandbox:
   server_url: https://omnigent.example.com   # the in-box host dials this back
 ```
 
+A top-level `sandbox.host_config:` (provider-agnostic) holds verbatim
+in-sandbox `~/.omnigent/config.yaml` content — e.g. a `providers:`
+block routing a harness through a self-hosted gateway — installed into
+the sandbox before `omnigent host` starts. The block is server-managed:
+entries injected by a previous launch are replaced or removed on the
+next launch/resume, while config created inside the sandbox survives.
+Keep secrets out via
+`api_key_ref: env:VAR` (resolved in the sandbox against the injected
+env). See the [sandbox-runners config
+table](../kubernetes/overlays/sandbox-runners/README.md#configuration-sandbox-configyaml)
+for the shape.
+
 `provider` + `server_url` is a complete config: the image defaults to
-the official prebaked host image and boxes run locally.
+the official prebaked host image and boxes run locally. To bake extra
+harness CLIs into that image (e.g. `goose`, `jcode`), build it with the
+`EXTRA_HARNESS_CLIS` build-arg and point `boxlite.image:` at your copy —
+see [deploy/docker](../docker/README.md#baking-in-extra-harness-clis).
 
 ### Cloud (remote `boxlite serve` pool)
 
@@ -71,6 +86,7 @@ sandbox:
   boxlite:
     image: docker.io/me/omnigent-host:latest     # optional, shared; default: official
     env: [OPENAI_API_KEY, GIT_TOKEN]             # optional, shared; SERVER env var NAMES
+    disk_size_gb: 100                            # optional, shared; default: SDK default
     cloud:
       endpoint: https://boxlite.example.com:8100 # selects CLOUD mode
 ```

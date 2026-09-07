@@ -11,11 +11,11 @@ import {
   approve,
   bindOnlyOnlineRunner,
   createSession,
-  fetchInitialHistoryWindow,
   fetchSessionItemsPage,
   forkSession,
   getSession,
   getSessionSlim,
+  importLocalSessions,
   interrupt,
   listRunners,
   openSessionStream,
@@ -32,6 +32,24 @@ function mockJsonResponse(body: unknown, init?: { ok?: boolean; status?: number 
     statusText: "OK",
     json: async () => body,
   } as unknown as Response;
+}
+
+// An NDJSON streaming response: each line is emitted as its own chunk so the
+// reader sees them arrive one at a time, matching the `/imports/local` stream.
+function mockNdjsonResponse(lines: string[]): Response {
+  const encoder = new TextEncoder();
+  let i = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (i < lines.length) {
+        controller.enqueue(encoder.encode(lines[i] + "\n"));
+        i += 1;
+      } else {
+        controller.close();
+      }
+    },
+  });
+  return { ok: true, status: 200, statusText: "OK", body } as unknown as Response;
 }
 
 const fetchMock = vi.fn();
@@ -96,6 +114,9 @@ describe("createSession", () => {
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
+      terminalLaunchArgs: null,
+      kind: "default",
+      backgroundTaskCount: undefined,
       todos: [],
       skills: [],
       codexModelOptions: [],
@@ -302,6 +323,47 @@ describe("forkSession", () => {
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ title: "My clone" });
+  });
+
+  it("forwards run-config overrides (model / effort / launch args)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await forkSession("conv_src", undefined, undefined, undefined, {
+      modelOverride: "opus",
+      reasoningEffort: "high",
+      terminalLaunchArgs: ["--permission-mode", "auto"],
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      model_override: "opus",
+      reasoning_effort: "high",
+      terminal_launch_args: ["--permission-mode", "auto"],
+    });
+  });
+
+  it("omits run-config fields left undefined so the fork inherits them", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    // An empty config object (non-native target) sends no run overrides.
+    await forkSession("conv_src", undefined, undefined, undefined, {});
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({});
   });
 
   it("surfaces a non-ok response as a thrown error (e.g. 403 no access)", async () => {
@@ -521,6 +583,45 @@ describe("runner binding", () => {
     // real value for this field — the server's clear signal is the field
     // present with a JSON null. Sending an alias here would 400.
     expect(JSON.parse(init.body as string)).toEqual({ cost_control_mode_override: null });
+  });
+
+  it("PATCHes subagent_routing_override as snake_case and reads it back", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+        subagent_routing_override: "on",
+      }),
+    );
+
+    const session = await updateSession("conv_abc", { subagentRoutingOverride: "on" });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ subagent_routing_override: "on" });
+    expect(session.subagentRoutingOverride).toBe("on");
+  });
+
+  it("PATCHes an explicit null to clear subagentRoutingOverride", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+        subagent_routing_override: null,
+      }),
+    );
+
+    await updateSession("conv_abc", { subagentRoutingOverride: null });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    // "off" is a real value here too, so the clear signal is a JSON null. The
+    // cleared session reads as Default, the same place "off" lands.
+    expect(JSON.parse(init.body as string)).toEqual({ subagent_routing_override: null });
   });
 
   it("forwards silent:true so bind-time auto-apply skips runner forward", async () => {
@@ -773,157 +874,6 @@ describe("fetchSessionItemsPage", () => {
   });
 });
 
-describe("fetchInitialHistoryWindow", () => {
-  // Wire builders. The server returns one page newest-first (order=desc);
-  // the helper reverses each page to chronological and prepends older
-  // pages, so the assertions below track item ids, not raw wire order.
-  function userWire(id: string, opts: { meta?: boolean } = {}) {
-    return {
-      id,
-      response_id: `resp_${id}`,
-      type: "message",
-      role: "user",
-      status: "completed",
-      content: [{ type: "input_text", text: id }],
-      ...(opts.meta ? { is_meta: true } : {}),
-    };
-  }
-  function asstWire(id: string) {
-    // Stands in for any non-user turn item (assistant text, tool call,
-    // tool output) — only real user prompts count toward the boundary.
-    return {
-      id,
-      response_id: `resp_${id}`,
-      type: "message",
-      role: "assistant",
-      status: "completed",
-      model: "agent_xyz",
-      content: [{ type: "output_text", text: id }],
-    };
-  }
-  function pageBody(dataNewestFirst: Array<{ id: string }>, hasMore: boolean): Response {
-    return mockJsonResponse({
-      object: "list",
-      data: dataNewestFirst,
-      first_id: dataNewestFirst[0]?.id ?? null,
-      last_id: dataNewestFirst[dataNewestFirst.length - 1]?.id ?? null,
-      has_more: hasMore,
-    });
-  }
-
-  it("stops after one fetch when the first page already holds 2+ user prompts", async () => {
-    // 20 items (the floor) with two user prompts → the previous user
-    // message is already on screen, so no extra request is needed. This
-    // is the common case and must stay as cheap as fetchSessionItemsPage.
-    const fillers = Array.from({ length: 18 }, (_, i) => asstWire(`a${i}`));
-    fetchMock.mockResolvedValueOnce(
-      pageBody([...fillers, userWire("u_last"), userWire("u_prev")], true),
-    );
-
-    const page = await fetchInitialHistoryWindow("conv_abc");
-
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(page.items).toHaveLength(SESSION_HISTORY_PAGE_SIZE);
-    expect(page.hasMore).toBe(true);
-    // Single descending request, no cursor — same shape as the plain page.
-    expect(String(fetchMock.mock.calls[0]![0])).toBe(
-      `/v1/sessions/conv_abc/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
-    );
-  });
-
-  it("pages backward until the previous user message is included (long single turn)", async () => {
-    // A long turn: one user prompt followed by 19 tool/assistant items, so
-    // the first 20-item page contains only ONE user prompt. The previous
-    // prompt lives in the next page; the helper must fetch it.
-    const turnFillers = Array.from({ length: 19 }, (_, i) => asstWire(`t${i}`));
-    // Page 1 newest-first: fillers then the turn's prompt as the oldest item.
-    fetchMock.mockResolvedValueOnce(pageBody([...turnFillers, userWire("u_last")], true));
-    // Page 2 (older): the previous exchange.
-    fetchMock.mockResolvedValueOnce(pageBody([asstWire("a_prev"), userWire("u_prev")], true));
-
-    const page = await fetchInitialHistoryWindow("conv_abc");
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    // Window now starts at the previous user prompt and runs to the newest item.
-    expect(page.items[0]!.id).toBe("u_prev");
-    expect(page.items).toHaveLength(22);
-    expect(page.hasMore).toBe(true);
-    // Second fetch pages older via the oldest loaded id (u_last) as `after`.
-    expect(String(fetchMock.mock.calls[1]![0])).toBe(
-      `/v1/sessions/conv_abc/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc&after=u_last`,
-    );
-  });
-
-  it("keeps fetching into a last turn longer than one page until its prompt is reached", async () => {
-    // The newest turn itself spans more than SESSION_HISTORY_PAGE_SIZE
-    // items, so the first page is ALL assistant/tool items — zero user
-    // prompts. The helper must page past the full turn to surface the
-    // last user message (the prompt that started it), then one more to
-    // the previous prompt, rather than opening to a response with no
-    // visible prompt above it.
-    const tail = Array.from({ length: 20 }, (_, i) => asstWire(`tail${i}`));
-    fetchMock.mockResolvedValueOnce(pageBody(tail, true)); // page 1: no user prompt
-    // Page 2: the rest of the long turn, then the prompt that started it.
-    const head = Array.from({ length: 5 }, (_, i) => asstWire(`head${i}`));
-    fetchMock.mockResolvedValueOnce(pageBody([...head, userWire("u_last")], true));
-    // Page 3: the previous exchange.
-    fetchMock.mockResolvedValueOnce(pageBody([asstWire("a_prev"), userWire("u_prev")], true));
-
-    const page = await fetchInitialHistoryWindow("conv_abc");
-
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    // The long turn's own prompt is included even though it sat beyond the
-    // first page...
-    expect(page.items.some((i) => i.id === "u_last")).toBe(true);
-    // ...and the window still extends back to the previous prompt.
-    expect(page.items[0]!.id).toBe("u_prev");
-  });
-
-  it("stops at the start of a short conversation without spinning", async () => {
-    // Only one user prompt exists; has_more=false means there is nothing
-    // older to fetch. Must return what it has rather than loop forever
-    // chasing a second prompt that doesn't exist.
-    fetchMock.mockResolvedValueOnce(pageBody([asstWire("a_1"), userWire("u_1")], false));
-
-    const page = await fetchInitialHistoryWindow("conv_abc");
-
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(page.items.map((i) => i.id)).toEqual(["u_1", "a_1"]);
-    expect(page.hasMore).toBe(false);
-  });
-
-  it("does not count meta user items toward the boundary", async () => {
-    // Injected context (is_meta) carries role:"user" but is not a real
-    // prompt. A full page of meta-user items must NOT satisfy the
-    // boundary — the helper keeps paging to find genuine prompts.
-    const metaUsers = Array.from({ length: 20 }, (_, i) => userWire(`m${i}`, { meta: true }));
-    fetchMock.mockResolvedValueOnce(pageBody(metaUsers, true));
-    fetchMock.mockResolvedValueOnce(pageBody([userWire("u_last"), userWire("u_prev")], true));
-
-    const page = await fetchInitialHistoryWindow("conv_abc");
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    // Both real prompts present; the meta page alone would have stopped a
-    // count-only window short of any real prompt.
-    expect(page.items.filter((i) => i.id === "u_prev" || i.id === "u_last")).toHaveLength(2);
-  });
-
-  it("stops at MAX_INITIAL_PAGES, leaving hasMore=true so scroll-up still reaches older items", async () => {
-    // Pathological: a turn so long that 8 pages never reach a second user
-    // prompt. The helper must bound its requests and hand the rest back to
-    // loadMoreHistory (hasMore stays true) rather than fetch unbounded.
-    for (let i = 0; i < 20; i++) {
-      fetchMock.mockResolvedValueOnce(pageBody([asstWire(`p${i}`)], true));
-    }
-
-    const page = await fetchInitialHistoryWindow("conv_abc");
-
-    // MAX_INITIAL_PAGES is 8; never more, even with pages still available.
-    expect(fetchMock).toHaveBeenCalledTimes(8);
-    expect(page.hasMore).toBe(true);
-  });
-});
-
 describe("postEvent", () => {
   it("POSTs the event body verbatim and returns {queued, itemId}", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true, item_id: "ci_123" }));
@@ -1037,5 +987,118 @@ describe("approve", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_abc/elicitations/elic_xyz/resolve");
     expect(JSON.parse(init.body as string)).toEqual({ action: "decline" });
+  });
+});
+
+describe("importLocalSessions", () => {
+  it("streams each session through onSession and returns the final tally", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c1", title: "First" }),
+        JSON.stringify({ event: "session", session_id: "c2", title: null }),
+        JSON.stringify({ event: "done", imported: 2, already_imported: 1, failed: 0 }),
+      ]),
+    );
+
+    const seen: string[] = [];
+    const result = await importLocalSessions("host_1", "all", 25, (s) => seen.push(s.id));
+
+    expect(seen).toEqual(["c1", "c2"]);
+    expect(result).toEqual({
+      imported: 2,
+      alreadyImported: 1,
+      failed: 0,
+      sessions: [
+        { id: "c1", title: "First" },
+        { id: "c2", title: null },
+      ],
+    });
+    // Hits the streaming endpoint with the snake_case body.
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/imports/local/stream");
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_id: "host_1",
+      source: "all",
+      limit: 25,
+    });
+  });
+
+  it("throws the server's message on a mid-stream error, keeping delivered sessions", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c1", title: "First" }),
+        JSON.stringify({ event: "error", message: "host stalled mid-import" }),
+        JSON.stringify({ event: "done", imported: 1, already_imported: 0, failed: 0 }),
+      ]),
+    );
+
+    const seen: string[] = [];
+    await expect(importLocalSessions("h", "claude", 10, (s) => seen.push(s.id))).rejects.toThrow(
+      "host stalled mid-import",
+    );
+    // The session that streamed before the error was still handed to the caller.
+    expect(seen).toEqual(["c1"]);
+  });
+
+  it("sends an exact session ID with its harness", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c1", title: "Exact" }),
+        JSON.stringify({ event: "done", imported: 1, already_imported: 0, failed: 0 }),
+      ]),
+    );
+
+    await importLocalSessions("host_1", "codex", 25, undefined, "session-exact");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_id: "host_1",
+      source: "codex",
+      limit: 25,
+      session_id: "session-exact",
+    });
+  });
+
+  it("does not fall back to a server that cannot distinguish an exact import", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 }));
+
+    await expect(
+      importLocalSessions("host_1", "codex", 25, undefined, "session-exact"),
+    ).rejects.toThrow("Direct session import is not supported");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the buffered endpoint when the stream endpoint 404s", async () => {
+    // Old server: the streaming endpoint is absent, so the client retries the
+    // buffered one and delivers every session through onSession at once.
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 }));
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        imported: 2,
+        already_imported: 1,
+        failed: 0,
+        sessions: [
+          { session_id: "c1", title: "First" },
+          { session_id: "c2", title: null },
+        ],
+      }),
+    );
+
+    const seen: string[] = [];
+    const result = await importLocalSessions("host_1", "all", 25, (s) => seen.push(s.id));
+
+    expect(seen).toEqual(["c1", "c2"]);
+    expect(result).toEqual({
+      imported: 2,
+      alreadyImported: 1,
+      failed: 0,
+      sessions: [
+        { id: "c1", title: "First" },
+        { id: "c2", title: null },
+      ],
+    });
+    // First the stream endpoint (404), then the buffered fallback.
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/imports/local/stream");
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/imports/local");
   });
 });

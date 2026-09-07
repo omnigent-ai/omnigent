@@ -13,8 +13,9 @@ import androidx.activity.ComponentActivity
 
 /**
  * Native server-entry screen, the Android counterpart to the iOS `ConnectView`:
- * a URL field plus a tappable recent-servers list. On connect it persists the
- * server via [ServerStore] and hands off to [MainActivity].
+ * a URL field plus a tappable server list (organization presets, then recents).
+ * On connect it persists the server via [ServerStore] and hands off to
+ * [MainActivity].
  *
  * [MainActivity] routes here on launch when no server has been configured yet.
  */
@@ -58,13 +59,13 @@ class ConnectActivity : ComponentActivity() {
     }
 
     private fun renderRecents() {
-        val recents = store.recentServers()
+        val servers = store.offeredServers()
         val container = findViewById<LinearLayout>(R.id.recents)
         findViewById<TextView>(R.id.recents_label).visibility =
-            if (recents.isEmpty()) View.GONE else View.VISIBLE
+            if (servers.isEmpty()) View.GONE else View.VISIBLE
 
         val inflater = LayoutInflater.from(this)
-        for (url in recents) {
+        for (url in servers) {
             val row = inflater.inflate(R.layout.item_recent, container, false) as TextView
             row.text = url
             row.setOnClickListener { connect(url) }

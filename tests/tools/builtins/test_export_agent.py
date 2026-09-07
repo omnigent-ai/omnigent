@@ -112,6 +112,33 @@ def test_invoke_missing_target(tool_ctx: ToolContext) -> None:
     assert "Error" in result and "target" in result.lower()
 
 
+def test_invoke_rejects_invalid_arguments(tool_ctx: ToolContext) -> None:
+    """Malformed and non-object JSON return tool errors instead of raising."""
+    tool = ExportAgentTool()
+    malformed = tool.invoke("{", tool_ctx)
+    non_object = tool.invoke("[]", tool_ctx)
+    assert "Error" in malformed and "malformed JSON" in malformed
+    assert "Error" in non_object and "JSON object" in non_object
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        ({"source": 123, "target": "/tmp/out"}, "source"),
+        ({"source": "my-agent", "target": True}, "target"),
+    ],
+)
+def test_invoke_rejects_non_string_paths(
+    tool_ctx: ToolContext,
+    payload: dict[str, object],
+    expected: str,
+) -> None:
+    """Non-string source/target values are rejected before filesystem access."""
+    tool = ExportAgentTool()
+    result = tool.invoke(json.dumps(payload), tool_ctx)
+    assert "Error" in result and expected in result.lower()
+
+
 def test_invoke_source_not_found(
     tool_ctx: ToolContext,
     tmp_path: Path,

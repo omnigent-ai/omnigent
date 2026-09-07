@@ -3,7 +3,7 @@ import { cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { useAvailableAgents } from "./useAvailableAgents";
+import { useAvailableAgents, prefetchAvailableAgentDetails } from "./useAvailableAgents";
 
 // The hook unions the built-in agent list from GET /v1/agents with
 // custom agents discovered on the caller's sessions via
@@ -25,7 +25,8 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 const fetchMock = vi.fn();
 
 const BUILTINS_URL = "/v1/agents";
-const SCAN_URL = "/v1/sessions?limit=100&kind=any";
+const SCAN_URL = "/v1/sessions?limit=100&kind=any&include_archived=true";
+const HARNESSES_URL = "/v1/harnesses";
 
 /**
  * Stub the global fetch with per-URL responses. Unrouted URLs reject
@@ -88,6 +89,47 @@ describe("useAvailableAgents", () => {
     const urls = fetchMock.mock.calls.map((c) => c[0] as string);
     expect(urls).toContain(BUILTINS_URL);
     expect(urls).toContain(SCAN_URL);
+  });
+
+  it("labels and flags generic-ACP agents from the server harness catalog", async () => {
+    // A seeded ACP agent's name is a slug, so without the catalog the picker
+    // renders Grok Build as "Grok" and — lacking `acpHarness` — groups it under
+    // "Agents" instead of "Harnesses". Both come from the server so a new
+    // builtin ACP row needs no frontend change.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_grok", name: "grok", harness: "grok", builtin: true },
+          { id: "ag_polly", name: "polly", harness: "claude-sdk", builtin: true },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: EMPTY_SCAN,
+      [HARNESSES_URL]: mockResponse({
+        data: [
+          { id: "grok", label: "Grok Build", capabilities: { integration_mode: "acp-subprocess" } },
+          {
+            id: "claude-sdk",
+            label: "Claude SDK",
+            capabilities: { integration_mode: "sdk-in-process" },
+          },
+        ],
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    // The catalog is a second query, so wait for the enrichment specifically.
+    await waitFor(() =>
+      expect(result.current.data?.find((a) => a.name === "grok")?.acpHarness).toBe(true),
+    );
+    expect(result.current.data?.find((a) => a.name === "grok")?.display_name).toBe("Grok Build");
+
+    // A composed agent on a non-ACP harness keeps its own name: it must not
+    // inherit the harness label ("Claude SDK") nor move into the Harnesses group.
+    const polly = result.current.data?.find((a) => a.name === "polly");
+    expect(polly?.display_name).toBe("Polly");
+    expect(polly?.acpHarness).toBeUndefined();
   });
 
   it("paginates built-ins so defaults pushed past fork rows are still listed", async () => {
@@ -349,34 +391,15 @@ describe("useAvailableAgents", () => {
             agent_id: "ag_clone2",
             agent_name: "claude-native-ui (fork conv_9) (fork conv_10)",
           },
-          // Genuinely custom agent; survives and is enriched below.
+          // Genuinely custom agent; survives with scan-only fields on initial
+          // load (harness/description filled on hover via prefetchAvailableAgentDetails).
           { id: "conv_3", agent_id: "ag_doc", agent_name: "doc-writer" },
-          // Same custom agent on an older session — deduped by id, and
-          // the enrich fetch must use the newest session (conv_3).
+          // Same custom agent on an older session — deduped by id.
           { id: "conv_4", agent_id: "ag_doc", agent_name: "doc-writer" },
           // Orphaned row (agent deleted) — skipped.
           { id: "conv_5", agent_id: "ag_gone", agent_name: null },
         ],
         has_more: false,
-      }),
-      "/v1/sessions/conv_3/agent": mockResponse({
-        id: "ag_doc",
-        object: "agent",
-        name: "doc-writer",
-        description: "Documentation specialist",
-        harness: "claude-sdk",
-        skills: [{ name: "humanizer", description: "Remove AI writing patterns" }],
-      }),
-      // Reached only if the fork-of-fork leaks (i.e. the fix regressed):
-      // its claude-native harness would resolve to "Claude Code", proving
-      // the leak renders as a duplicate built-in. With the fix conv_6 is
-      // dropped before enrichment, so this mock is never hit.
-      "/v1/sessions/conv_6/agent": mockResponse({
-        id: "ag_clone2",
-        object: "agent",
-        name: "claude-native-ui (fork conv_9) (fork conv_10)",
-        harness: "claude-native",
-        skills: [],
       }),
     });
 
@@ -388,6 +411,8 @@ describe("useAvailableAgents", () => {
     // ag_clone2 specifically guards the nested fork-of-fork case that
     // surfaces as a duplicate built-in; ag_doc missing means kind=any
     // discovery broke; two ag_doc rows mean the by-id dedup broke.
+    // description/harness are null on initial load — enriched on hover
+    // via prefetchAvailableAgentDetails.
     expect(result.current.data).toEqual([
       {
         id: "ag_native",
@@ -401,18 +426,17 @@ describe("useAvailableAgents", () => {
         id: "ag_doc",
         name: "doc-writer",
         display_name: "Doc-writer",
-        description: "Documentation specialist",
-        harness: "claude-sdk",
-        skills: [{ name: "humanizer", description: "Remove AI writing patterns" }],
+        description: null,
+        harness: null,
+        sessionId: "conv_3",
+        skills: [],
       },
     ]);
-    // The enrich fetch ran once, against the newest session the agent
-    // was seen on — not the older duplicate (conv_4) and not the
-    // shadowed rows (which must not be enriched at all).
+    // No enrich fetches on initial load — enrichment is deferred to hover.
     const enrichCalls = fetchMock.mock.calls
       .map((c) => c[0] as string)
       .filter((u) => u.endsWith("/agent"));
-    expect(enrichCalls).toEqual(["/v1/sessions/conv_3/agent"]);
+    expect(enrichCalls).toEqual([]);
   });
 
   it("dedupes native built-ins and hides session-discovered native shadows", async () => {
@@ -438,8 +462,10 @@ describe("useAvailableAgents", () => {
       [SCAN_URL]: mockResponse({
         object: "list",
         data: [
-          // This distinct session-bound id used to enrich into a second
-          // Kiro row because it did not shadow the built-in by name/id.
+          // Session-bound id with a non-canonical kiro name (server typo).
+          // On initial load harness is null (lazy enrichment), so it appears
+          // in the list; prefetchAvailableAgentDetails removes it once enriched
+          // to harness: "kiro-native" and a kiro built-in already exists.
           { id: "conv_kiro", agent_id: "ag_session_kiro", agent_name: "kiro-naitive" },
           // Legacy failed Kiro attempts used a plain "kiro" agent name and
           // no harness; that row must not surface as a custom Kiro picker row.
@@ -447,17 +473,15 @@ describe("useAvailableAgents", () => {
         ],
         has_more: false,
       }),
-      "/v1/sessions/conv_kiro/agent": mockResponse({
-        id: "ag_session_kiro",
-        object: "agent",
-        name: "kiro-naitive",
-        harness: "kiro-native",
-      }),
     });
 
     const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
+    // ag_session_kiro appears on initial load with harness: null because
+    // enrichment is deferred. prefetchAvailableAgentDetails (called on picker
+    // open) would later detect harness: "kiro-native" and remove the duplicate.
+    // ag_legacy_kiro is filtered by kiroLegacyNames (name: "kiro").
     expect(result.current.data).toEqual([
       {
         id: "ag_codex",
@@ -481,6 +505,15 @@ describe("useAvailableAgents", () => {
         display_name: "Kiro",
         description: null,
         harness: "kiro-native",
+        skills: [],
+      },
+      {
+        id: "ag_session_kiro",
+        name: "kiro-naitive",
+        display_name: "Kiro-naitive",
+        description: null,
+        harness: null,
+        sessionId: "conv_kiro",
         skills: [],
       },
     ]);
@@ -510,23 +543,6 @@ describe("useAvailableAgents", () => {
         ],
         has_more: false,
       }),
-      // Only the newest session per name may be enriched. An enrich
-      // fetch for conv_mid/conv_old is unrouted and rejects loudly,
-      // failing the test if the by-name collapse regresses.
-      "/v1/sessions/conv_new/agent": mockResponse({
-        id: "ag_run3",
-        object: "agent",
-        name: "elise_working_agent",
-        description: "Elise's agent",
-        harness: "claude-sdk",
-      }),
-      "/v1/sessions/conv_doc/agent": mockResponse({
-        id: "ag_doc",
-        object: "agent",
-        name: "doc-writer",
-        description: null,
-        harness: "codex",
-      }),
     });
 
     const { result } = renderHook(() => useAvailableAgents(), { wrapper });
@@ -535,13 +551,15 @@ describe("useAvailableAgents", () => {
     // Exactly one elise row (the newest mint, ag_run3) plus doc-writer.
     // Three elise rows would mean the by-name collapse regressed to
     // by-id-only dedup; zero would mean customs were over-collapsed.
+    // description/harness are null on initial load (enriched on hover).
     expect(result.current.data).toEqual([
       {
         id: "ag_run3",
         name: "elise_working_agent",
         display_name: "Elise_working_agent",
-        description: "Elise's agent",
-        harness: "claude-sdk",
+        description: null,
+        harness: null,
+        sessionId: "conv_new",
         skills: [],
       },
       {
@@ -549,7 +567,8 @@ describe("useAvailableAgents", () => {
         name: "doc-writer",
         display_name: "Doc-writer",
         description: null,
-        harness: "codex",
+        harness: null,
+        sessionId: "conv_doc",
         skills: [],
       },
     ]);
@@ -589,13 +608,6 @@ describe("useAvailableAgents", () => {
         ],
         has_more: false,
       }),
-      "/v1/sessions/conv_b/agent": mockResponse({
-        id: "ag_upload_v2",
-        object: "agent",
-        name: "agent-a",
-        description: "version 2",
-        harness: "claude-sdk",
-      }),
     });
 
     const { result } = renderHook(() => useAvailableAgents(), { wrapper });
@@ -607,11 +619,11 @@ describe("useAvailableAgents", () => {
     // mean the template and upload both leaked.
     const ids = result.current.data?.map((a) => a.id);
     expect(ids).toEqual(["ag_debby", "ag_upload_v2"]);
-    // The enrich ran against the upload's session, not the template-bound one.
+    // No enrich fetches on initial load — enrichment is deferred to hover.
     const enrichCalls = fetchMock.mock.calls
       .map((c) => c[0] as string)
       .filter((u) => u.endsWith("/agent"));
-    expect(enrichCalls).toEqual(["/v1/sessions/conv_b/agent"]);
+    expect(enrichCalls).toEqual([]);
   });
 
   it("keeps a user-registered template when no newer upload exists", async () => {
@@ -712,15 +724,13 @@ describe("useAvailableAgents", () => {
         data: [{ id: "conv_3", agent_id: "ag_doc", agent_name: "doc-writer" }],
         has_more: false,
       }),
-      // The agent's bundle can't be loaded (or the fetch 500s) — the
-      // agent must still be listed from scan fields, mirroring the
-      // server's own spec-load degradation, just without harness/skills.
-      "/v1/sessions/conv_3/agent": mockResponse({ detail: "boom" }, { ok: false, status: 500 }),
     });
 
     const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
+    // Agent is listed with scan-only fields (no enrich fetch on initial load).
+    // harness/description filled on hover via prefetchAvailableAgentDetails.
     expect(result.current.data).toEqual([
       {
         id: "ag_doc",
@@ -728,8 +738,274 @@ describe("useAvailableAgents", () => {
         display_name: "Doc-writer",
         description: null,
         harness: null,
+        sessionId: "conv_3",
         skills: [],
       },
     ]);
+  });
+});
+
+describe("prefetchAvailableAgentDetails", () => {
+  it("patches harness, description, and skills into the cache on success", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const agent = {
+      id: "ag_doc",
+      name: "doc-writer",
+      display_name: "Doc-writer",
+      description: null,
+      harness: null,
+      skills: [],
+      sessionId: "conv_3",
+    };
+    queryClient.setQueryData(["available-agents"], [agent]);
+
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "ag_doc",
+        object: "agent",
+        name: "doc-writer",
+        description: "Documentation specialist",
+        harness: "claude-sdk",
+        skills: [{ name: "humanizer", description: "Remove AI writing patterns" }],
+      }),
+    );
+
+    await prefetchAvailableAgentDetails(agent, queryClient);
+
+    expect(queryClient.getQueryData(["available-agents"])).toEqual([
+      {
+        id: "ag_doc",
+        name: "doc-writer",
+        display_name: "Doc-writer",
+        description: "Documentation specialist",
+        harness: "claude-sdk",
+        sessionId: "conv_3",
+        skills: [{ name: "humanizer", description: "Remove AI writing patterns" }],
+      },
+    ]);
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_3/agent");
+  });
+
+  it("is a no-op when harness is already populated", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const agent = {
+      id: "ag_doc",
+      name: "doc-writer",
+      display_name: "Doc-writer",
+      description: null,
+      harness: "claude-sdk",
+      skills: [],
+      sessionId: "conv_3",
+    };
+    queryClient.setQueryData(["available-agents"], [agent]);
+
+    await prefetchAvailableAgentDetails(agent, queryClient);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(queryClient.getQueryData(["available-agents"])).toEqual([agent]);
+  });
+
+  it("is a no-op when sessionId is absent (catalog agent)", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const agent = {
+      id: "ag_native",
+      name: "claude-native-ui",
+      display_name: "Claude Code",
+      description: null,
+      harness: null,
+      skills: [],
+    };
+    queryClient.setQueryData(["available-agents"], [agent]);
+
+    await prefetchAvailableAgentDetails(agent, queryClient);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves the agent name-only when the enrich fetch fails", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const agent = {
+      id: "ag_doc",
+      name: "doc-writer",
+      display_name: "Doc-writer",
+      description: null,
+      harness: null,
+      skills: [],
+      sessionId: "conv_3",
+    };
+    queryClient.setQueryData(["available-agents"], [agent]);
+
+    fetchMock.mockResolvedValueOnce(mockResponse({ detail: "boom" }, { ok: false, status: 500 }));
+
+    await prefetchAvailableAgentDetails(agent, queryClient);
+
+    // Cache unchanged — agent stays with scan-only fields.
+    expect(queryClient.getQueryData(["available-agents"])).toEqual([agent]);
+  });
+
+  it("removes a session agent when enrichment reveals it is a native shadow", async () => {
+    // A session bound a kiro agent with a non-canonical name ("kiro-naitive"
+    // typo). On initial load harness is null so it passes the kiro filter.
+    // prefetchAvailableAgentDetails detects harness: "kiro-native" after
+    // enrichment and removes the agent since a seeded kiro built-in exists.
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const kiroBuiltin = {
+      id: "ag_kiro",
+      name: "kiro-native-ui",
+      display_name: "Kiro",
+      description: null,
+      harness: "kiro-native",
+      skills: [],
+    };
+    const kiroShadow = {
+      id: "ag_session_kiro",
+      name: "kiro-naitive",
+      display_name: "Kiro-naitive",
+      description: null,
+      harness: null,
+      skills: [],
+      sessionId: "conv_kiro",
+    };
+    queryClient.setQueryData(["available-agents"], [kiroBuiltin, kiroShadow]);
+
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "ag_session_kiro",
+        object: "agent",
+        name: "kiro-naitive",
+        harness: "kiro-native",
+        skills: [],
+      }),
+    );
+
+    await prefetchAvailableAgentDetails(kiroShadow, queryClient);
+
+    // Shadow removed; only the seeded built-in remains.
+    expect(queryClient.getQueryData(["available-agents"])).toEqual([kiroBuiltin]);
+  });
+});
+
+// Pinned agents (e.g. a project's configured default) must survive discovery:
+// the recency-bounded scan can miss them and the same-name collapse could
+// otherwise drop or id-swap them, silently rebinding the project.
+describe("useAvailableAgents pinned agents", () => {
+  const PINNED_LOOKUP_URL =
+    "/v1/sessions?limit=1&kind=any&include_archived=true&agent_id=ag_pinned";
+
+  it("resolves a pinned agent whose only sessions are archived or paginated out of the scan", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),
+      [SCAN_URL]: EMPTY_SCAN,
+      [PINNED_LOOKUP_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "conv_anchor", agent_id: "ag_pinned", agent_name: "deploy-bot", created_at: 100 },
+        ],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents({ pinnedAgentIds: ["ag_pinned"] }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const pinned = result.current.data?.find((a) => a.id === "ag_pinned");
+    expect(pinned?.name).toBe("deploy-bot");
+    // Anchored to the archived session so hover enrichment still works.
+    expect(pinned?.sessionId).toBe("conv_anchor");
+  });
+
+  it("keeps a pinned agent's id through the same-name newest-wins collapse", async () => {
+    // A newer same-named upload wins the name bucket — without pinning, that
+    // id swap would silently rebind the project to the newer upload.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),
+      [SCAN_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "conv_new", agent_id: "ag_new", agent_name: "deploy-bot", created_at: 200 },
+          { id: "conv_old", agent_id: "ag_pinned", agent_name: "deploy-bot", created_at: 100 },
+        ],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents({ pinnedAgentIds: ["ag_pinned"] }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const ids = (result.current.data ?? []).map((a) => a.id);
+    expect(ids).toContain("ag_pinned");
+    expect(ids).toContain("ag_new");
+  });
+
+  it("restores a pinned session-less catalog template superseded by a newer same-named upload", async () => {
+    // A project pins a user-registered template (builtin: false) that has no
+    // sessions of its own. A newer same-named upload wins the name bucket, so
+    // the template leaves the merged list; the scan can't restore it and the
+    // per-agent session lookup finds nothing. The pin must still resolve from
+    // the catalog instead of surfacing a false "agent unavailable".
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          {
+            id: "ag_pinned",
+            name: "deploy-bot",
+            harness: "claude-sdk",
+            builtin: false,
+            created_at: 100,
+          },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: mockResponse({
+        object: "list",
+        data: [
+          // Newer same-named upload — wins the bucket, evicting the template.
+          { id: "conv_new", agent_id: "ag_upload_v2", agent_name: "deploy-bot", created_at: 200 },
+        ],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents({ pinnedAgentIds: ["ag_pinned"] }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const ids = (result.current.data ?? []).map((a) => a.id);
+    expect(ids).toContain("ag_pinned");
+    expect(ids).toContain("ag_upload_v2");
+    // Restored straight from the catalog — no per-agent session probe fired.
+    const lookupCalls = fetchMock.mock.calls
+      .map((c) => c[0] as string)
+      .filter((u) => u.includes("agent_id=ag_pinned"));
+    expect(lookupCalls).toEqual([]);
+  });
+
+  it("omits an unresolvable pinned id without failing the rest of the list", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [{ id: "ag_polly", name: "polly", builtin: true }],
+        has_more: false,
+      }),
+      [SCAN_URL]: EMPTY_SCAN,
+      "/v1/sessions?limit=1&kind=any&include_archived=true&agent_id=ag_gone": mockResponse({
+        object: "list",
+        data: [],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents({ pinnedAgentIds: ["ag_gone"] }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly"]);
   });
 });

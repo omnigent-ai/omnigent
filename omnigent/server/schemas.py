@@ -12,11 +12,24 @@ delineator further down:
 from __future__ import annotations
 
 import re
-from typing import Annotated, Any, Literal, get_args
+from typing import Annotated, Any, Literal, Self, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    Strict,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
-from omnigent.entities import ConversationItem
+from omnigent.entities import (
+    DEFAULT_GENERATED_TITLE_MAX_CHARS,
+    USER_SESSION_TITLE_MAX_CHARS,
+    ConversationItem,
+)
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -54,10 +67,9 @@ class MCPServerSummary(BaseModel):
     """
     Safe subset of an MCP server's configuration for API exposure.
 
-    Secret-bearing fields (``headers``, ``env``) are intentionally
-    excluded. This model is the wire shape returned inside
-    :class:`AgentObject` so clients can display which MCP servers
-    an agent is connected to without leaking credentials.
+    Header values are redacted (``"[REDACTED]"``) so callers can see
+    which headers are configured without leaking the actual secrets.
+    ``env`` is still fully excluded.
 
     :param name: Server name as declared in the agent spec,
         e.g. ``"github"``.
@@ -67,6 +79,9 @@ class MCPServerSummary(BaseModel):
     :param url: HTTP(S) endpoint URL for ``transport="http"``
         servers, e.g. ``"https://mcp.example.com/sse"``. ``None``
         for stdio servers.
+    :param headers: HTTP headers for ``transport="http"`` servers.
+        Values are always ``"[REDACTED]"``; only the key names are
+        exposed.
     :param command: Executable path for ``transport="stdio"``
         servers, e.g. ``"uvx"``. ``None`` for http servers.
     :param args: Command-line arguments for ``transport="stdio"``
@@ -78,6 +93,7 @@ class MCPServerSummary(BaseModel):
     transport: str
     description: str | None = None
     url: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
     command: str | None = None
     args: list[str] = Field(default_factory=list)
 
@@ -89,15 +105,15 @@ class UpsertMCPServerRequest(BaseModel):
     """
     Request body for creating or updating a session agent MCP server.
 
-    Secret-bearing fields (``headers`` and ``env``) are intentionally
-    not accepted by the UI route. Existing secrets are preserved when a
-    server is edited without changing transport.
+    ``env`` is still excluded. ``headers`` is accepted for HTTP servers;
+    when omitted, existing headers in the bundle are preserved unchanged.
     """
 
     name: str = Field(min_length=1, max_length=128, pattern=_MCP_SERVER_NAME_RE)
     transport: Literal["http", "stdio"]
     description: str | None = Field(default=None, max_length=512)
     url: str | None = None
+    headers: dict[str, str] | None = None
     command: str | None = None
     args: list[str] = Field(default_factory=list, max_length=64)
 
@@ -155,6 +171,30 @@ class SkillSummary(BaseModel):
 
     name: str
     description: str
+
+
+class NativeReasoningEffortOption(BaseModel):
+    """Reasoning-effort metadata advertised by a native model catalog."""
+
+    model_config = ConfigDict(extra="allow")
+
+    reasoningEffort: str
+    description: str | None = None
+
+
+class NativeModelOption(BaseModel):
+    """One runner-owned native model-picker row."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    model: str | None = None
+    # Optional: Codex model/list and OpenCode /api/model rows are
+    # provider-supplied and may omit it; the UI falls back to ``id``.
+    displayName: str | None = None
+    defaultReasoningEffort: str | None = None
+    supportedReasoningEfforts: list[NativeReasoningEffortOption] = Field(default_factory=list)
+    isDefault: bool | None = None
 
 
 class PolicySummary(BaseModel):
@@ -219,7 +259,7 @@ class AgentObject(BaseModel):
         phases. Empty list when the spec declares no policies
         or when the bundle cannot be loaded.
     :param skills: Skills bundled in the agent spec
-        (``skills/<name>/SKILL.md``). Lets the Web UI's
+        (``skills/<dir>/SKILL.md``). Lets the Web UI's
         new-session composer offer a slash-command menu before a
         session (and its runner) exists. Host-discovered skills
         are runner-owned, so they are NOT listed here — the
@@ -765,12 +805,23 @@ class ChildSessionSummary(BaseModel):
         a fanned-out sub-agent that needs attention is visible
         without opening its chat. Mirrors
         :attr:`SessionListItem.pending_elicitations_count`.
+    :param routed_model: Model this sub-agent runs on when one was pinned
+        for it, e.g. ``"databricks-claude-opus-4-8"``. Read from the
+        child's ``model_override`` — the field intelligent routing writes
+        when it picks a model for a spawned child. ``None`` when the child
+        inherits the parent/spec model.
+    :param routing_decision_id: Identifier of the routing decision that
+        produced :attr:`routed_model`, mirroring
+        ``RoutingDecisionData.decision_id``. Read from the child's
+        ``omnigent.routing.decision_id`` label, stamped when routing pins
+        the model. ``None`` when the child was not routed.
     """
 
     id: str
     object: str = "child_session"
     parent_session_id: str
     title: str | None = None
+    task_summary: str | None = None
     tool: str | None = None
     session_name: str | None = None
     kind: str = "sub_agent"
@@ -785,6 +836,8 @@ class ChildSessionSummary(BaseModel):
     last_task_error: dict[str, str] | None = None
     last_message_preview: str | None = None
     pending_elicitations_count: int = 0
+    routed_model: str | None = None
+    routing_decision_id: str | None = None
 
 
 # ── Responses ───────────────────────────────────────────────────
@@ -860,11 +913,23 @@ class ErrorDetail(BaseModel):
 
     :param code: Error code string, e.g. ``"server_error"``,
         ``"invalid_input"``.
-    :param message: Human-readable error description.
+    :param message: Human-readable error description. Always populated; older
+        clients render this verbatim.
+    :param title: Optional short headline naming what went wrong, e.g.
+        ``"Claude Code can't run as root"``. Present when the runner
+        recognized the failure (see ``omnigent.runner.launch_failure``); lets
+        the UI show a clear card title instead of the raw ``code``.
+    :param cause: Optional one/two-sentence explanation of why it failed.
+        Paired with ``title``.
+    :param remediation: Optional concrete next step to fix it, e.g. a command
+        to run. ``None`` when there is no single clear fix.
     """
 
     code: str
     message: str
+    title: str | None = None
+    cause: str | None = None
+    remediation: str | None = None
 
 
 class IncompleteDetails(BaseModel):
@@ -898,8 +963,11 @@ class CreateResponseRequest(BaseModel):
         background and the caller may poll for results.
     :param store: Must be ``True`` (persisted responses). The
         server rejects ``False``.
-    :param instructions: Per-request system instructions that
-        override the agent's default instructions.
+    :param instructions: Per-request system instructions. Composed
+        ADDITIVELY with the agent's own instructions rather than
+        replacing them — appended after the agent's text, matching how
+        ``omnigent/runtime/prompt.py`` assembles the system prompt and
+        what ``docs/AGENT_YAML_SPEC.md`` documents.
     :param previous_response_id: ID of the prior response in the
         conversation thread, e.g. ``"resp_abc123"``. Enables
         multi-turn continuation and steering.
@@ -1028,8 +1096,8 @@ class ResponseObject(BaseModel):
     :param previous_response_id: ID of the prior response in
         the conversation thread, or ``None`` for the first turn.
     :param conversation: Reference to the owning conversation.
-    :param instructions: Per-request system instructions
-        override, or ``None``.
+    :param instructions: Per-request system instructions composed
+        additively with the agent's own, or ``None``.
     :param reasoning: Reasoning configuration,
         e.g. ``{"effort": "medium"}``.
     :param error: Error details if the response failed.
@@ -1045,6 +1113,54 @@ class ResponseObject(BaseModel):
     completed_at: int | None = None
     # Heterogeneous output items (messages, reasoning, function_calls);
     # shape varies by item type.
+    output: list[dict[str, Any]] = Field(default_factory=list)
+    background: bool = False
+    store: bool = True
+    usage: Usage | None = None
+    previous_response_id: str | None = None
+    conversation: ConversationRef | None = None
+    instructions: str | None = None
+    reasoning: dict[str, str] | None = None
+    error: ErrorDetail | None = None
+    incomplete_details: IncompleteDetails | None = None
+
+
+class FailedResponseObject(BaseModel):
+    """Response payload for failures raised before response allocation.
+
+    Transport and setup failures can terminate a turn before the harness has
+    assigned the metadata required by :class:`ResponseObject`. The remaining
+    fields mirror that model so fully allocated failures retain their complete
+    wire representation.
+
+    :param id: Unique response identifier, e.g. ``"resp_abc123"``, or
+        ``None`` when allocation did not complete.
+    :param object: Fixed resource type, always ``"response"``.
+    :param status: Lifecycle status, normally ``"failed"``.
+    :param model: Agent name that produced the response, e.g.
+        ``"research-agent"``, or ``None`` when resolution did not complete.
+    :param created_at: Unix epoch timestamp of creation, or ``None`` when the
+        response failed before creation.
+    :param completed_at: Unix epoch timestamp of completion, or ``None``.
+    :param output: Heterogeneous serialized output items accumulated before
+        failure.
+    :param background: Whether the response was created as a background task.
+    :param store: Whether the response is persisted.
+    :param usage: Token usage statistics, or ``None`` when unavailable.
+    :param previous_response_id: ID of the prior response, or ``None``.
+    :param conversation: Reference to the owning conversation, or ``None``.
+    :param instructions: Per-request instructions override, or ``None``.
+    :param reasoning: Reasoning configuration, or ``None``.
+    :param error: Error details describing the failure, or ``None``.
+    :param incomplete_details: Incomplete-response details, or ``None``.
+    """
+
+    id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    object: str = "response"
+    status: str
+    model: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    created_at: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    completed_at: int | None = None
     output: list[dict[str, Any]] = Field(default_factory=list)
     background: bool = False
     store: bool = True
@@ -1090,6 +1206,9 @@ class ElicitationResult(BaseModel):
         binary approve/reject elicitations and for ``decline`` /
         ``cancel`` actions. Values are restricted to JSON scalars
         and string lists per the MCP spec.
+    :param meta: Optional MCP result metadata. Codex uses
+        ``_meta.persist`` to distinguish one-time, session-scoped,
+        and persistent MCP tool approvals.
     """
 
     action: Literal["accept", "decline", "cancel"]
@@ -1097,6 +1216,21 @@ class ElicitationResult(BaseModel):
     # ElicitResult.content value type — keep them aligned so an MCP
     # client can bridge to our endpoint without translation.
     content: dict[str, str | int | float | bool | list[str] | None] | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+    # ``_meta`` must serialize under its alias so the verdict survives the
+    # resolve route's dump -> re-validate round-trip, but an unset ``_meta``
+    # must not appear at all: hook replies are compared verbatim.
+    model_config = ConfigDict(serialize_by_alias=True)
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_meta(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Drop ``_meta`` when unset, keeping other ``None`` fields intact."""
+        data = handler(self)
+        if self.meta is None:
+            data.pop("_meta", None)
+            data.pop("meta", None)
+        return data
 
 
 # ── Sessions (/v1/sessions) ────────────────────────────────────
@@ -1131,6 +1265,8 @@ class SessionEventInput(BaseModel):
         "description": "...", "parameters": {...}}}]``. Ignored
         when the event steers into an active task: that task's
         tools are fixed at start time.
+    :param created_by: Optional internal attribution actor for runner-
+        originated events that are triggered by a prior human turn.
     """
 
     type: str
@@ -1140,6 +1276,7 @@ class SessionEventInput(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
+    created_by: str | None = None
 
 
 class SessionGitOptions(BaseModel):
@@ -1170,29 +1307,41 @@ class SessionGitOptions(BaseModel):
         invalid with ``existing_worktree``.
     :param existing_worktree: When ``True``, bind to the pre-existing
         worktree at ``workspace`` instead of creating one (see above).
+    :param existing_branch: When ``True``, ``branch_name`` already
+        exists and the host checks it out into a fresh worktree (the
+        deleted-worktree recreate path) instead of creating a new
+        branch. Create mode only; invalid with ``existing_worktree``
+        and with ``base_branch`` (an existing branch has no base to
+        fork).
     """
 
     branch_name: str
     base_branch: str | None = None
     existing_worktree: bool = False
+    existing_branch: bool = False
 
     @model_validator(mode="after")
     def _check_existing_worktree(self) -> SessionGitOptions:
-        """Reject ``base_branch`` in bind mode (422).
+        """Reject incoherent mode combinations (422).
 
         ``base_branch`` selects the ref a *new* branch forks from; it is
-        meaningless when binding to a worktree that already exists.
+        meaningless when binding to a worktree that already exists or
+        when checking out an existing branch. ``existing_worktree`` and
+        ``existing_branch`` are distinct modes and cannot combine.
 
         :returns: The validated instance.
-        :raises ValueError: If ``base_branch`` is set with
-            ``existing_worktree``.
+        :raises ValueError: If the flags combine incoherently.
         """
         if self.existing_worktree and self.base_branch is not None:
             raise ValueError("base_branch cannot be set when existing_worktree is true")
+        if self.existing_branch and self.base_branch is not None:
+            raise ValueError("base_branch cannot be set when existing_branch is true")
+        if self.existing_branch and self.existing_worktree:
+            raise ValueError("existing_branch and existing_worktree cannot both be true")
         return self
 
 
-class SessionCreateRequest(BaseModel):
+class _SessionCreateRequestBase(BaseModel):
     """
     JSON request body for ``POST /v1/sessions``.
 
@@ -1237,6 +1386,10 @@ class SessionCreateRequest(BaseModel):
         host launch flow (generate binding token, write runner_id,
         send launch frame). ``None`` for CLI-initiated sessions.
         Must be ``None`` when ``host_type`` is ``"managed"``.
+    :param sandbox_provider: Which configured sandbox provider to
+        provision on, e.g. ``"modal"`` — one of the names ``GET /v1/info``
+        reports in ``sandbox_providers``. Only valid with
+        ``host_type: "managed"``; ``None`` takes the server's first.
     :param workspace: Where the session works. For external hosts:
         an absolute path on the host where the runner should start,
         e.g. ``"/Users/corey/universe/src/foo"``. Required when
@@ -1292,6 +1445,13 @@ class SessionCreateRequest(BaseModel):
         default) defers to the spec default. Set by the web UI's
         new-session "Cost Optimized" option; read by the cost-control
         advisor pipeline at turn start.
+    :param subagent_routing_override: Optional per-session
+        subagent-routing switch to persist at create time: ``"on"``
+        routes subagent spawns, ``"off"`` leaves them unrouted.
+        ``None`` (the default) lets the create route stamp ``"on"``
+        when the session starts on Smart Routing, and otherwise leaves
+        the session on Default. An explicit value always wins. Mutable
+        mid-session via ``PATCH /v1/sessions/{id}``.
     :param harness_override: Optional per-session brain-harness
         override to persist at create time, e.g. ``"pi"`` or
         ``"openai-agents"``. Set by the web UI's new-chat harness
@@ -1303,26 +1463,41 @@ class SessionCreateRequest(BaseModel):
         the spec's declared harness. Create-time only — there is no
         PATCH path, since the harness process spawns on the first
         turn.
+    :param smart_routing_message: The user's first-message text, used to
+        route the harness at create time. Only read on the top-level
+        Smart Routing path (``harness_override: "auto"`` on a native
+        wrapper agent), where the terminal launches as soon as the
+        session row exists and so the harness must be decided before it.
+        Routing-only: not persisted or dispatched — the client sends the
+        real message after the create returns. ``None`` everywhere else,
+        including the bundle-agent auto path, which routes on the first
+        message event instead.
     """
 
-    agent_id: str
+    # Declared here, in the legacy field position, so validation errors keep
+    # main's ordering. Concrete public models narrow the wire type below.
+    agent_id: Any
+    project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"
     host_id: str | None = None
+    sandbox_provider: str | None = None
     workspace: str | None = None
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
     cost_control_mode_override: str | None = None
+    subagent_routing_override: str | None = None
     harness_override: str | None = None
+    smart_routing_message: str | None = None
 
     @model_validator(mode="after")
-    def _check_git_requires_host(self) -> SessionCreateRequest:
+    def _check_git_requires_host(self) -> Self:
         """
         Reject ``git`` without ``host_id`` at validation time.
 
@@ -1334,12 +1509,12 @@ class SessionCreateRequest(BaseModel):
         :returns: The validated instance.
         :raises ValueError: If ``git`` is set but ``host_id`` is not.
         """
-        if self.git is not None and self.host_id is None:
+        if self.git is not None and self.host_id is None and self.project_id is None:
             raise ValueError("git worktree creation requires host_id")
         return self
 
     @model_validator(mode="after")
-    def _check_managed_host_fields(self) -> SessionCreateRequest:
+    def _check_managed_host_fields(self) -> Self:
         """
         Enforce the per-``host_type`` workspace and host-id contract.
 
@@ -1378,12 +1553,38 @@ class SessionCreateRequest(BaseModel):
                         "host_type 'managed' takes a git repository URL "
                         f"(optionally '#<branch>') as workspace: {exc}"
                     ) from exc
-        elif self.workspace is not None and is_repo_workspace(self.workspace):
+            return self
+        if self.sandbox_provider is not None:
+            raise ValueError(
+                "sandbox_provider only applies to host_type 'managed' — "
+                "external hosts are not server-provisioned"
+            )
+        if self.workspace is not None and is_repo_workspace(self.workspace):
             raise ValueError(
                 "a repository-URL workspace requires host_type 'managed' — "
                 "external hosts take an absolute path on the host"
             )
         return self
+
+
+class SessionCreateRequest(_SessionCreateRequestBase):
+    """Legacy create shape, preserving required-string ``agent_id``."""
+
+    agent_id: str
+
+
+class ProjectSessionCreateRequest(_SessionCreateRequestBase):
+    """Project-opted create shape whose agent may be filled by the server.
+
+    The public legacy :class:`SessionCreateRequest` deliberately keeps
+    ``agent_id`` required so requests without ``project_id`` retain their exact
+    validation and OpenAPI contract.
+    """
+
+    agent_id: str | None = None
+
+
+SessionCreateInput = SessionCreateRequest | ProjectSessionCreateRequest
 
 
 class SessionCreateMetadata(BaseModel):
@@ -1401,7 +1602,7 @@ class SessionCreateMetadata(BaseModel):
     :param reasoning_effort: Optional per-session reasoning-effort
         hint. Accepted metadata values are ``"none"``,
         ``"minimal"``, ``"low"``, ``"medium"``, ``"high"``,
-        ``"xhigh"``, and ``"max"``. Provider-specific support is
+        ``"xhigh"``, ``"max"``, and ``"ultra"``. Provider-specific support is
         validated when a turn executes. ``None`` means use the agent
         default.
     :param host_id: Optional host to launch the runner on, e.g.
@@ -1428,17 +1629,82 @@ class SessionCreateMetadata(BaseModel):
         inherits the parent's runner binding for co-location. The
         caller must have READ access to the parent. ``None``
         creates a top-level session.
+    :param host_type: How the session's host is obtained — ``"external"``
+        (the default: the caller manages the runner, e.g. a local
+        ``omnigent run``) or ``"managed"`` (the server provisions a
+        sandbox host). The uploaded bundle's session-scoped agent runs
+        on the provisioned sandbox; its spec is fetched by the managed
+        runner over its tunnel, same as any session-scoped agent.
+    :param sandbox_provider: Which configured sandbox provider to
+        provision on ``host_type: "managed"`` (one of the server's
+        ``sandbox_providers``); ``None`` takes the server's first. Only
+        valid with ``host_type: "managed"``.
     """
 
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
+    project_id: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     host_id: str | None = None
     workspace: str | None = None
     terminal_launch_args: list[str] | None = None
     parent_session_id: str | None = None
+    host_type: Literal["external", "managed"] = "external"
+    sandbox_provider: str | None = None
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def _check_managed_bundle_fields(self) -> SessionCreateMetadata:
+        """
+        Enforce the multipart per-``host_type`` contract.
+
+        Mirrors :meth:`SessionCreateRequest._check_managed_host_fields`
+        for the bundle-upload path: a managed session's host is
+        server-provisioned, so a caller-supplied ``host_id`` contradicts
+        it, and a managed ``workspace`` (when given) must be a git
+        repository URL (optionally ``#<branch>``) the server clones into
+        the sandbox — a filesystem path points at nothing in a sandbox
+        that doesn't exist yet. ``sandbox_provider`` only applies to a
+        managed host. A repository-URL workspace on an external host is
+        rejected symmetrically.
+
+        :returns: The validated instance.
+        :raises ValueError: On ``"managed"`` + ``host_id``, a managed
+            workspace that isn't a valid repository URL, ``sandbox_provider``
+            without ``"managed"``, or an external repository-URL workspace.
+        """
+        # Lazy import: schemas is imported nearly everywhere, so pulling
+        # the FastAPI/click-importing managed-hosts module in at module
+        # scope would risk import cycles.
+        from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
+
+        if self.host_type == "managed":
+            if self.host_id is not None:
+                raise ValueError(
+                    "host_type 'managed' lets the server provision the host; "
+                    "host_id must not be set"
+                )
+            if self.workspace is not None:
+                try:
+                    parse_repo_workspace(self.workspace)
+                except ValueError as exc:
+                    raise ValueError(
+                        "host_type 'managed' takes a git repository URL "
+                        f"(optionally '#<branch>') as workspace: {exc}"
+                    ) from exc
+            return self
+        if self.sandbox_provider is not None:
+            raise ValueError(
+                "sandbox_provider only applies to host_type 'managed' — "
+                "external hosts are not server-provisioned"
+            )
+        if self.workspace is not None and is_repo_workspace(self.workspace):
+            raise ValueError(
+                "a repository-URL workspace requires host_type 'managed' — "
+                "external hosts take an absolute path on the host"
+            )
+        return self
 
 
 class CreatedSessionResponse(BaseModel):
@@ -1547,6 +1813,30 @@ class ModelUsage(BaseModel):
     total_cost_usd: float | None = None
 
 
+class BackgroundTaskInfo(BaseModel):
+    """
+    One still-running background shell from the claude-native ``Stop`` hook.
+
+    Claude Code leaves finished shells in the hook's ``background_tasks``
+    array, so the list surfaced here is filtered to the non-terminal ones —
+    its length matches the ``background_task_count`` tally. Every field is
+    best-effort: the hook shape is external, so an entry missing one field
+    still yields a usable row (e.g. a ``description`` with no ``command``).
+
+    :param id: Opaque per-shell identifier, e.g. ``"abc123"``.
+    :param type: Task kind, e.g. ``"shell"``.
+    :param status: Per-task status, e.g. ``"running"``.
+    :param description: Human-readable label, e.g. ``"Wait for CI"``.
+    :param command: Command the shell is running, e.g. ``"sleep 120"``.
+    """
+
+    id: str | None = None
+    type: str | None = None
+    status: str | None = None
+    description: str | None = None
+    command: str | None = None
+
+
 class SessionResponse(BaseModel):
     """
     API representation of a session.
@@ -1575,6 +1865,9 @@ class SessionResponse(BaseModel):
         running as of the last status edge, so a reload re-shows "N shells
         still running" even though the session has settled to ``"idle"``.
         ``None`` (the default / omitted) when no shells are tracked.
+    :param background_tasks: Per-shell detail for the running tally above,
+        so a reload can restore each shell's description/command. ``None`` when
+        none are tracked (or when an older runner reported only the count).
     :param created_at: Unix epoch seconds of creation.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
@@ -1636,10 +1929,13 @@ class SessionResponse(BaseModel):
         permission level on this session: ``1`` = read, ``2`` =
         edit, ``3`` = manage. ``None`` when permissions are
         disabled (single-user mode without a permission store).
-    :param llm_model: The LLM model identifier from the bound
-        agent's spec, e.g. ``"anthropic/claude-sonnet-4-6"``.
-        ``None`` when the agent has no explicit ``llm:`` block or
-        the agent cannot be looked up.
+    :param llm_model: The model this session is actually on. When the
+        harness has reported one (``reported_model``, written by
+        ``external_model_change``), that verbatim value serves here
+        and is the only model value clients display; otherwise the
+        bound agent spec's model, e.g.
+        ``"anthropic/claude-sonnet-4-6"``. ``None`` when neither
+        exists.
     :param harness: The bound agent's canonical harness, e.g.
         ``"claude-sdk"`` or ``"openai-agents"``. Lets the client
         render the active credential for the correct provider
@@ -1659,6 +1955,13 @@ class SessionResponse(BaseModel):
         applies). Set at create time or via
         ``PATCH /v1/sessions/{id}`` (the web "Cost Optimized"
         toggle); read by the cost-control advisor pipeline.
+    :param subagent_routing_override: Per-session subagent-routing
+        switch, two-state: ``"on"`` routes subagent spawns, and ``"off"``
+        or ``None`` (unset) both leave them unrouted — the in-session
+        "Subagent routing" row renders either as "Default". ``None`` on
+        a row created before this became explicit inherits nothing.
+        Stamped ``"on"`` at create for Smart Routing sessions; also set
+        via ``PATCH /v1/sessions/{id}``.
     :param context_window: The model's context window size in tokens
         as looked up server-side from litellm's registry (or from the
         ``AP_CONTEXT_WINDOW_OVERRIDE`` env var), e.g. ``200_000``.
@@ -1751,10 +2054,9 @@ class SessionResponse(BaseModel):
         runner at startup. Empty list when the agent spec
         cannot be loaded, or when bundled + host discovery
         yields nothing.
-    :param model_options: Codex app-server ``model/list`` options
-        for codex-native sessions, including each model's supported
-        reasoning efforts. Empty for non-codex-native sessions or while
-        the bound runner / Codex app-server cannot answer yet.
+    :param model_options: Runner-owned model-picker options for native
+        sessions. Claude supplies launch-time gateway aliases; Codex includes
+        each model's supported reasoning efforts. Empty while unavailable.
     :param terminal_pending: ``True`` while the runner is auto-creating
         a terminal-first session's terminal (claude-native /
         codex-native), so the Web UI shows a spinner on the Terminal
@@ -1781,6 +2083,12 @@ class SessionResponse(BaseModel):
         id is not re-sent on reconnect. Today only native-terminal
         forwarders (claude-native) stamp a turn id on their status
         edges; other harnesses leave this ``None``.
+    :param updated_at: Unix epoch timestamp of the last persisted session
+        activity. Advances when conversation items are appended and on session
+        metadata edits (rename, agent switch, archive); a mid-stall rename
+        therefore resets the clock, so an orchestrator treating this as a pure
+        item-append heartbeat should account for that. Can be compared across
+        snapshots independently of lifecycle status.
     """
 
     id: str
@@ -1788,7 +2096,9 @@ class SessionResponse(BaseModel):
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     background_task_count: int | None = None
+    background_tasks: list[BackgroundTaskInfo] | None = None
     created_at: int
+    updated_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
@@ -1800,12 +2110,14 @@ class SessionResponse(BaseModel):
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
     sub_agent_name: str | None = None
+    kind: str = "default"
     parent_session_id: str | None = None
     root_conversation_id: str | None = None
     llm_model: str | None = None
     harness: str | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
+    subagent_routing_override: str | None = None
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
@@ -1827,7 +2139,7 @@ class SessionResponse(BaseModel):
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
-    model_options: list[dict[str, Any]] = Field(default_factory=list)
+    model_options: list[NativeModelOption] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
     # Per-MCP-server startup state for native harness sessions
@@ -1837,6 +2149,11 @@ class SessionResponse(BaseModel):
     # opening the session mid-startup sees the startup band.
     mcp_startup: dict[str, McpServerStartup] | None = None
     active_response_id: str | None = None
+    # First-class project this session is filed under, or ``None`` when
+    # unfiled. Distinct from the legacy ``omni_project`` label (surfaced in
+    # ``labels``); set/cleared via ``PATCH /v1/sessions/{id}`` and filtered on
+    # ``GET /v1/sessions?project=``.
+    project_id: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -1873,6 +2190,25 @@ class UpdateSessionRequest(BaseModel):
         ``"plan"`` enters Plan mode and ``"default"`` returns to Default
         mode for subsequent Codex turns. Only valid for sessions stamped
         with the codex-native wrapper label. Omitted leaves unchanged.
+    :param permission_mode: Claude-native permission mode to switch a
+        running session to, e.g. ``"auto"``. Only the modes Claude Code's
+        shift+tab cycle can reach are accepted (``default``,
+        ``acceptEdits``, ``plan``, ``auto``) — ``dontAsk`` and
+        ``bypassPermissions`` are launch-only. Only valid for sessions
+        stamped with the claude-native wrapper label. Unlike the other
+        fields here the switch is applied by the live TUI, so a failure
+        to reach the mode is surfaced as an error rather than persisted.
+        Omitted leaves unchanged.
+    :param approval_mode: Codex-native approval mode to switch a running
+        session to, one of ``"ask-for-approval"``, ``"approve-for-me"``,
+        ``"full-access"``, ``"read-only"`` — Codex's own ``/permissions``
+        presets (the set is codex-version-dependent, so an older build may not
+        offer every one). Only valid for sessions stamped with the codex-native
+        wrapper label. The runner applies it by driving Codex's ``/permissions``
+        popup and confirms the switch echoed before returning, so a failure to
+        reach the mode surfaces as an error. The confirmed mode is stored on the
+        read-back label only (Codex owns the durable approval state), so it is
+        not written to ``terminal_launch_args``. Omitted leaves unchanged.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session.
@@ -1880,6 +2216,14 @@ class UpdateSessionRequest(BaseModel):
         default; omitting the field leaves it unchanged (``"off"`` is
         a real value here, so the field's *presence* — not a clear
         alias — is the clear signal, unlike ``model_override``).
+    :param subagent_routing_override: Per-session subagent-routing
+        switch: ``"on"`` routes subagent spawns, ``"off"`` leaves them
+        unrouted. Explicit JSON ``null`` clears the override, which lands
+        the session on Default (the same behavior as ``"off"`` — nothing
+        is inherited); omitting the field leaves it unchanged (same
+        presence-is-the-clear-signal rule as
+        ``cost_control_mode_override``). Effective on the next spawn, so
+        it can be changed at any point in a session.
     :param external_session_id: Runtime-native session id captured
         by a wrapper bridge (e.g. Claude Code's session uuid for
         ``omnigent claude`` sessions). Idempotent on same-value
@@ -1906,21 +2250,83 @@ class UpdateSessionRequest(BaseModel):
         session from the default sidebar listing), ``False`` unarchives,
         ``None`` leaves unchanged. Owner-only (unlike ``title``, which
         needs only edit access).
+    :param project_id: File this session into a first-class project (see
+        ``designs/PROJECTS_PRD.md``). A non-empty id moves the session into
+        that project; the empty string ``""`` unfiles it. **Omitting** the
+        field leaves membership unchanged; an explicit ``null`` is rejected
+        (400) so it can't silently unfile. Owner-only: because projects are
+        owner-private, only the session owner may file it, and only into a
+        project they own — the server verifies both. Independent of the
+        legacy ``omni_project`` label, which is set via ``labels``.
     """
 
     runner_id: str | None = None
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None
     model_override: str | None = None
     collaboration_mode: str | None = None
+    permission_mode: str | None = None
+    approval_mode: str | None = None
     cost_control_mode_override: str | None = None
+    subagent_routing_override: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
+    project_id: str | None = None
     silent: bool = False
 
     model_config = ConfigDict(extra="forbid")
+
+
+class AutomaticSessionRenameRequest(BaseModel):
+    """Request body for the current-agent automatic rename endpoint."""
+
+    title: str = Field(min_length=2, max_length=DEFAULT_GENERATED_TITLE_MAX_CHARS)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AutomaticSessionRenameResponse(BaseModel):
+    """Result of a conditional automatic session rename."""
+
+    renamed: bool
+    title: str | None = None
+    reason: Literal["not_top_level", "no_seed", "title_changed"] | None = None
+
+
+class ResetSessionModelOverrideRequest(BaseModel):
+    """Reset a launch-time model selection only while that selection is current."""
+
+    expected_model_override: str = Field(min_length=1)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ResetSessionModelOverrideResponse(BaseModel):
+    """Whether the launch-time selection was still current and was cleared."""
+
+    reset: bool
+
+
+class BackgroundSessionTitleRequest(BaseModel):
+    """Private runner request for isolated background title inference."""
+
+    prompt: str = Field(min_length=1, max_length=20_000)
+    additional_instructions: str | None = Field(default=None, max_length=4_000)
+    agent_id: str | None = None
+    model_override: str | None = None
+    harness_override: str | None = None
+    sub_agent_name: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class BackgroundSessionTitleResponse(BaseModel):
+    """Private runner result for background title inference."""
+
+    status: Literal["generated", "unsupported"]
+    title: str | None = None
 
 
 class CodexGoalObject(BaseModel):
@@ -2039,11 +2445,44 @@ class SessionForkRequest(BaseModel):
         the last item of that response are copied — items after it are
         dropped from the fork. When ``None`` (default), the full history
         is copied.
+    :param model_override: Per-session LLM model override to apply to the
+        fork, e.g. ``"claude-opus-4-7"``. **Omitting** the field inherits
+        the source's model (same as today, within the same provider
+        family); an explicit value overrides it, and a clear alias
+        (``"default"``, ``"off"``, ``"reset"``) resets the fork to the
+        bound agent's default. Validated against a conservative model-id
+        charset. Set by the web fork dialog's model picker.
+    :param reasoning_effort: Per-session reasoning-effort override to apply
+        to the fork, e.g. ``"high"``. **Omitting** the field inherits the
+        source's effort; an explicit value overrides it, and a clear alias
+        (``"default"``, ``"off"``, ``"reset"``) resets it. Validated
+        against the shared effort vocabulary; provider support is enforced
+        at launch. Set by the web fork dialog's effort picker.
+    :param terminal_launch_args: Per-session native-terminal pass-through
+        args to apply to the fork, e.g. ``["--permission-mode", "auto"]``
+        (the fork dialog's permission-/approval-mode selector).
+        **Omitting** the field keeps today's behavior — the source's args
+        are carried on a same-agent fork and dropped on an agent switch. A
+        list (including ``[]``, which clears them) replaces them wholesale.
+        Bounds (count / length) are validated server-side.
+    :param codex_bypass_sandbox: Opt-in for the DANGEROUS codex-native
+        full-bypass (``--dangerously-bypass-approvals-and-sandbox``) on the
+        fork. The source's bypass label is ALWAYS dropped on a fork (a
+        bypass-armed source can never silently re-arm its clone), so this is
+        the only way a fork enables it — an explicit, banner-gated opt-in
+        from the dialog, mirroring the new-session approval selector. ``True``
+        stamps ``omnigent.codex_native.bypass_sandbox`` on the fork; ``False``
+        / omitted leaves the fork in Codex's normal approval/sandbox stance.
+        Only meaningful for a codex-native target; ignored otherwise.
     """
 
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     agent_id: str | None = None
     up_to_response_id: str | None = None
+    model_override: str | None = None
+    reasoning_effort: str | None = None
+    terminal_launch_args: list[str] | None = None
+    codex_bypass_sandbox: bool = False
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2219,6 +2658,11 @@ class SessionListItem(BaseModel):
     viewer_last_seen: int | None = None
     viewer_unread: bool = False
     search_snippet: str | None = None
+    parent_session_id: str | None = None
+    # First-class project this session is filed under, or ``None`` when
+    # unfiled. Lets the sidebar group sessions by project without a follow-up
+    # GET. Distinct from the legacy ``omni_project`` label in ``labels``.
+    project_id: str | None = None
 
 
 class SessionList(BaseModel):
@@ -2239,6 +2683,89 @@ class ChildSessionList(BaseModel):
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
+
+
+class SessionUsage(BaseModel):
+    """
+    One session's rolled-up LLM spend for the ``GET /v1/usage`` report.
+
+    ``cost_usd`` is the subtree total — the session plus every sub-agent it
+    spawned — read from ``session_usage`` via
+    :func:`omnigent.runtime.policies.builder.load_session_usage`. It is the
+    authoritative session figure (the same value the web session sidebar
+    shows as "Session cost" and the daily rollup records).
+
+    ``models`` is the per-model cost breakdown, mirroring the web session
+    sidebar's per-model list. Deliberately **not guaranteed to sum to
+    ``cost_usd``**: native harnesses report a single cumulative session
+    total and the server attributes it to the currently-active model, so on
+    a session that switched models mid-run each model's bucket is a snapshot
+    of the running total rather than that model's own spend. The header
+    ``cost_usd`` stays authoritative; the per-model values are shown
+    faithfully as recorded (same convention as the web UI).
+
+    :param id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param created_at: Unix epoch seconds of creation.
+    :param updated_at: Unix epoch seconds of last activity.
+    :param title: Optional human-readable title.
+    :param cost_usd: Authoritative cumulative USD spend for this session's
+        subtree.
+    :param models: Per-model recorded cost, keyed by the raw harness model
+        id (e.g. ``{"claude-opus-4-8": 14.03}``). Empty when no per-model
+        cost was recorded. May not sum to ``cost_usd`` (see above).
+    """
+
+    id: str
+    created_at: int
+    updated_at: int
+    title: str | None = None
+    cost_usd: float = 0.0
+    models: dict[str, float] = Field(default_factory=dict)
+    harness: str | None = None
+    other_harnesses: list[str] | None = None
+    llm_model: str | None = None
+    agent_name: str | None = None
+
+
+class DailyCost(BaseModel):
+    """One day's LLM spend for the daily timeline chart."""
+
+    day: str
+    cost_usd: float = 0.0
+
+
+class UsageReport(BaseModel):
+    """
+    Aggregated LLM usage for the calling user, powering ``omni usage``.
+
+    The cost summary is sourced from the per-user daily-cost rollup
+    (``user_daily_cost``), which attributes spend to the UTC calendar day it
+    occurred on. Windows are therefore calendar-day buckets summed back from
+    today — ``cost_today`` / ``cost_last_7d`` / ``cost_last_30d`` — not
+    rolling wall-clock hours, so a weeks-old session touched today is not
+    counted wholly in "today".
+
+    The ``sessions`` list is a separate detail view built from each session's
+    cumulative ``session_usage`` (newest activity first), so the summary and
+    the per-session list come from different sources and are not guaranteed
+    to tie out to the cent (the summary counts every priced turn ever
+    recorded for the user; the list only covers the user's currently-listed
+    top-level sessions).
+
+    :param cost_today: Total spend on the current UTC day.
+    :param cost_last_7d: Total spend over the last 7 UTC days (incl. today).
+    :param cost_last_30d: Total spend over the last 30 UTC days (incl. today).
+    :param total_cost_usd: All-time total spend from the daily rollup.
+    :param sessions: Per-session detail, newest activity first.
+    """
+
+    object: Literal["usage_report"] = "usage_report"
+    cost_today: float = 0.0
+    cost_last_7d: float = 0.0
+    cost_last_30d: float = 0.0
+    total_cost_usd: float = 0.0
+    daily_costs: list[DailyCost] = Field(default_factory=list)
+    sessions: list[SessionUsage] = Field(default_factory=list)
 
 
 # ── Permissions ────────────────────────────────────────────────────
@@ -2410,6 +2937,20 @@ class SessionStatusEvent(_SSEEventBase):
         is emitted. ``None`` for every non-failed transition.
         Clients render ``error.message`` as the terminal error
         line; without it a setup failure shows as a silent end.
+    :param background_task_count: Background shells still running at this
+        edge (claude-native ``Stop`` hook). ``None`` when the edge carries no
+        information (leave the sticky tally untouched); ``0`` clears it.
+    :param background_tasks: Per-shell detail backing that tally, so the UI
+        can name each running shell. ``None`` when the edge reports no detail
+        (an older runner may send only the count).
+    :param blocked_on: Short human phrase naming what a still-``running``
+        session is parked on, e.g. ``"permission prompt"`` or
+        ``"dialog open"``. Set by terminal-backed integrations whose agent
+        can block on a dialog the web UI does not mirror, so the client can
+        say *why* nothing is moving instead of showing a bare spinner.
+        ``None`` whenever the session is not parked. Unrelated to the
+        ``waiting`` status above, which means the turn has ended and only
+        background work remains.
 
     Category: **transient** (SSE-only). Status is rederived on
     reconnect from the cached last-relayed turn lifecycle event
@@ -2422,6 +2963,8 @@ class SessionStatusEvent(_SSEEventBase):
     response_id: str | None = None
     error: ErrorDetail | None = None
     background_task_count: int | None = None
+    background_tasks: list[BackgroundTaskInfo] | None = None
+    blocked_on: str | None = None
 
 
 class SessionUsageEvent(_SSEEventBase):
@@ -2471,29 +3014,51 @@ class SessionUsageEvent(_SSEEventBase):
 
 class SessionModelEvent(_SSEEventBase):
     """
-    Active-model update from a terminal-backed integration.
+    Active-model report from a harness integration.
 
-    Emitted after an ``external_model_change`` POST from the
-    ``omnigent claude`` transcript forwarder when the model is
-    switched inside the Claude Code terminal (a ``/model`` command or
-    the in-TUI picker). Lets the web model picker reflect a TUI-side
-    switch without a reload.
+    Emitted after an ``external_model_change`` POST from a native
+    forwarder or when an SDK relay reports its concrete model in terminal
+    response usage. Every surface re-renders its model display from this.
 
     :param type: Always ``"session.model"``.
     :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
-    :param model: Tier alias the session is now on, e.g. ``"opus"`` —
-        Claude Code's version-agnostic alias, matching the picker's
-        vocabulary (not a pinned ``"claude-opus-4-8"`` id).
+    :param model: The model the harness reports the session is on,
+        VERBATIM in the harness's own spelling, e.g.
+        ``"claude-opus-4-8[1m]"`` or ``"gpt-5.6-luna"`` — never
+        collapsed to a picker alias.
 
     Category: **transient** (SSE-only). The server also writes
-    ``model_override`` on the conversation, so on reconnect clients
-    restore the selection from the snapshot's ``model_override`` rather
-    than from a replayed event.
+    ``reported_model`` on the conversation (served on the snapshot's
+    ``llm_model``), so on reconnect clients restore the display from
+    the snapshot rather than from a replayed event.
     """
 
     type: Literal["session.model"]
     conversation_id: str
     model: str
+
+
+class SessionTitleEvent(_SSEEventBase):
+    """
+    Session-title update from a terminal-backed integration.
+
+    Emitted after an ``external_session_title`` POST from the
+    ``omnigent claude`` transcript forwarder when the operator renames
+    the session inside the Claude Code pane (``/rename``). Lets the web
+    session list show the new name without a reload.
+
+    :param type: Always ``"session.title"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param title: Title the session is now on, e.g. ``"auth-refactor"``.
+
+    Category: **transient** (SSE-only). The server also writes ``title``
+    on the conversation, so on reconnect clients restore the name from
+    the session snapshot rather than from a replayed event.
+    """
+
+    type: Literal["session.title"]
+    conversation_id: str
+    title: str
 
 
 class SessionReasoningEffortEvent(_SSEEventBase):
@@ -2542,6 +3107,55 @@ class SessionCollaborationModeEvent(_SSEEventBase):
     type: Literal["session.collaboration_mode"]
     conversation_id: str
     mode: str
+
+
+class SessionPermissionModeEvent(_SSEEventBase):
+    """
+    Active permission-mode update from a claude-native session.
+
+    Emitted after the web UI switches the mode, and after the Claude forwarder
+    observes a different mode in the pane footer — a shift+tab pressed inside
+    the TUI, which Omnigent has no other way to see. Lets the composer's mode
+    picker track the pane without a reload.
+
+    :param type: Always ``"session.permission_mode"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param permission_mode: The active mode, e.g. ``"auto"`` or ``"plan"``.
+
+    Category: **transient** (SSE-only). The server also writes
+    ``omnigent.claude_native.permission_mode`` on the conversation labels, so
+    reconnecting clients restore the same state from the session snapshot.
+    """
+
+    type: Literal["session.permission_mode"]
+    conversation_id: str
+    permission_mode: str
+
+
+class SessionCodexApprovalModeEvent(_SSEEventBase):
+    """
+    Active approval/sandbox-mode update from a codex-native session.
+
+    Emitted after the web UI switches the mode, and after the Codex forwarder
+    observes a ``thread/settings/updated`` notification — an approval change the
+    user made inside Codex's ``/permissions`` popup, which Omnigent has no other
+    way to see. Lets the composer's approval picker track the thread without a
+    reload.
+
+    :param type: Always ``"session.codex_approval_mode"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param approval_mode: The active mode, one of ``"ask-for-approval"``,
+        ``"approve-for-me"``, ``"full-access"``, ``"read-only"``.
+
+    Category: **transient** (SSE-only). The server also writes
+    ``omnigent.codex_native.approval_mode`` on the conversation labels (and
+    ``terminal_launch_args``), so reconnecting clients restore the same state
+    from the session snapshot.
+    """
+
+    type: Literal["session.codex_approval_mode"]
+    conversation_id: str
+    approval_mode: str
 
 
 class SessionAgentChangedEvent(_SSEEventBase):
@@ -2752,14 +3366,12 @@ class SessionSkillsEvent(_SSEEventBase):
 
 class SessionModelOptionsEvent(_SSEEventBase):
     """
-    Signal that a codex-native session's model catalog has resolved.
+    Signal that a native session's model catalog has resolved.
 
-    Model options are fetched from the bound runner's live
-    Codex app-server via ``model/list`` and cached on the session
-    snapshot. The initial snapshot can return an empty list while
-    this background fetch is in flight; this event tells connected
-    clients to re-read the snapshot and apply its now-populated
-    ``model_options``.
+    Model options are fetched from the bound runner and cached on the session
+    snapshot. The initial snapshot can return an empty list while this
+    background fetch is in flight; this event tells connected clients to
+    re-read the snapshot and apply its now-populated ``model_options``.
 
     Carries no payload beyond the conversation id. The snapshot's
     ``model_options`` field remains the source of truth.
@@ -2769,7 +3381,7 @@ class SessionModelOptionsEvent(_SSEEventBase):
         e.g. ``"conv_abc123"``.
 
     Category: **transient** (SSE-only). On reconnect, clients seed
-    Codex model / effort controls from the session snapshot.
+    Native model / effort controls from the session snapshot.
     """
 
     type: Literal["session.model_options"]
@@ -2997,17 +3609,13 @@ class OutputTextDeltaEvent(_SSEEventBase):
     :param type: Always ``"response.output_text.delta"``.
     :param delta: The text fragment for this chunk, e.g.
         ``"Hello"``.
-    :param message_id: For terminal-observed streaming (claude-native),
-        the vendor's stable per-message id, e.g.
-        ``"2ca51d97-2f0f-493a-aed7-85a5b56c5747"``. Lets the web UI scope
-        an in-flight buffer to one assistant message and reconcile it
-        against the final item. ``None`` for ordinary in-process task
-        streaming, where deltas already group by the active response.
+    :param message_id: For native terminal streaming, the provider's stable
+        per-message id, e.g. ``"2ca51d97-2f0f-493a-aed7-85a5b56c5747"``.
+        ``None`` for ordinary in-process task streaming, where deltas group
+        by the active response.
     :param index: 0-based chunk order within the message, e.g. ``3``.
-        ``None`` when not terminal-observed streaming.
-    :param final: ``True`` on the last chunk of a terminal-observed
-        message; ``None`` otherwise. Signals the web UI that no further
-        chunks for ``message_id`` will arrive.
+        Used to suppress repeated chunks; ``None`` for in-process streaming.
+    :param final: Optional provider completion marker for the message.
     """
 
     type: Literal["response.output_text.delta"]
@@ -3015,6 +3623,19 @@ class OutputTextDeltaEvent(_SSEEventBase):
     message_id: str | None = None
     index: int | None = None
     final: bool | None = None
+
+
+class ToolOutputDeltaEvent(_SSEEventBase):
+    """Incremental output from an in-progress function call.
+
+    :param type: Always ``"response.function_call_output.delta"``.
+    :param call_id: Function-call correlation id.
+    :param delta: Command stdout/stderr fragment.
+    """
+
+    type: Literal["response.function_call_output.delta"]
+    call_id: str
+    delta: str
 
 
 class ReasoningStartedEvent(_SSEEventBase):
@@ -3422,10 +4043,17 @@ class ElicitationResolvedEvent(_SSEEventBase):
     :param elicitation_id: Correlation id of the elicitation
         being cleared, e.g. ``"elicit_abc123"``. Must match the
         id of a prior :class:`ElicitationRequestEvent`.
+    :param action: Optional MCP verdict recorded when the
+        resolution carried a human decision (``"accept"`` /
+        ``"decline"`` / ``"cancel"``). ``None`` for resolutions
+        without a verdict — timeout, severed wait, or a runner
+        that predates verdict carriage — so consumers can say "no
+        verdict was recorded" rather than guessing one.
     """
 
     type: Literal["response.elicitation_resolved"]
     elicitation_id: str
+    action: Literal["accept", "decline", "cancel"] | None = None
 
 
 class PolicyDeniedEvent(_SSEEventBase):
@@ -3528,17 +4156,22 @@ class FailedEvent(_SSEEventBase):
     """
     Terminal event for a turn that ended with an error.
 
-    Carries the final
-    :class:`omnigent.server.schemas.ResponseObject` whose
-    ``error`` field describes the failure.
+    Carries a :class:`omnigent.server.schemas.FailedResponseObject`
+    whose ``error`` field describes the failure. Response metadata may
+    be absent when the failure occurs before response allocation.
 
     :param type: Always ``"response.failed"``.
-    :param response: The final response object with
-        ``status="failed"`` and ``error`` populated.
+    :param source: Where the fault originated -- ``"llm"`` for
+        inference/context errors, ``"harness"`` for Claude Code/harness
+        process failures, ``"execution"`` for runner configuration
+        or infrastructure failures.
+    :param response: The failure response object with ``status="failed"``
+        and ``error`` populated.
     """
 
     type: Literal["response.failed"]
-    response: ResponseObject
+    source: Literal["llm", "execution", "tool", "harness"] = "execution"
+    response: ResponseObject | FailedResponseObject
 
 
 class CancelledEvent(_SSEEventBase):
@@ -3638,16 +4271,16 @@ class ErrorEvent(_SSEEventBase):
     (``except Exception``). Wire shape matches those emits.
 
     :param type: Always ``"response.error"``.
-    :param source: Origin of the error — ``"llm"`` for LLM-call
+    :param source: Origin of the error -- ``"llm"`` for LLM-call
         failures, ``"execution"`` for timeouts, ``"tool"`` for
-        tool failures (currently emitted by retry exhaustion paths).
+        tool failures, ``"harness"`` for harness process failures.
     :param tool_name: Tool identifier when ``source == "tool"``;
         ``None`` for the other sources.
     :param error: Classified error description.
     """
 
     type: Literal["response.error"]
-    source: Literal["llm", "execution", "tool"]
+    source: Literal["llm", "execution", "tool", "harness"]
     tool_name: str | None = None
     error: RetryErrorDetail
 
@@ -3660,10 +4293,20 @@ class CompactionInProgressEvent(_SSEEventBase):
     compaction step runs so clients can render a "summarizing
     history…" indicator. Wire shape matches ``compaction.py:765``.
 
+    A long compaction is announced repeatedly (once per status poll), so
+    clients must treat every event carrying the same ``started_at`` as one
+    compaction — refreshing their indicator rather than stacking another.
+
     :param type: Always ``"response.compaction.in_progress"``.
+    :param started_at: Unix epoch timestamp (seconds) when this compaction
+        was first reported in progress. Stable across repeated progress
+        events for the same compaction, so clients can anchor an elapsed
+        counter to the true start — including after a page reload. ``None``
+        when the emitter does not track it.
     """
 
     type: Literal["response.compaction.in_progress"]
+    started_at: int | None = None
 
 
 class CompactionCompletedEvent(_SSEEventBase):
@@ -3926,8 +4569,11 @@ ServerStreamEvent = Annotated[
     SessionStatusEvent
     | SessionUsageEvent
     | SessionModelEvent
+    | SessionTitleEvent
     | SessionReasoningEffortEvent
     | SessionCollaborationModeEvent
+    | SessionPermissionModeEvent
+    | SessionCodexApprovalModeEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent
@@ -3948,6 +4594,7 @@ ServerStreamEvent = Annotated[
     | SessionTerminalActivityEvent
     # ── Transient (SSE-only) — incremental token deltas ────────
     | OutputTextDeltaEvent
+    | ToolOutputDeltaEvent
     | ReasoningStartedEvent
     | ReasoningTextDeltaEvent
     | ReasoningSummaryTextDeltaEvent
@@ -4063,4 +4710,208 @@ class PolicyEvaluationRequestEvent(_SSEEventBase):
     data: dict[str, Any]
 
 
-HarnessStreamEvent = ServerStreamEvent | InjectionConsumedEvent | PolicyEvaluationRequestEvent
+class SubagentStartedEvent(_SSEEventBase):
+    """
+    Runner-internal marker: the harness agent spawned a sub-agent.
+
+    ACP agents that delegate report it in their own dialect (see
+    :mod:`omnigent.inner.acp_subagents`); the executor normalizes that to a
+    :class:`~omnigent.inner.executor.SubAgentStarted`, which the adapter emits as
+    this event. The runner intercepts it in ``proxy_stream`` and POSTs
+    ``external_subagent_start`` to the Omnigent server, minting a child session so
+    the web "Subagents" panel lists one row per child. **Never** relayed to
+    external clients — the client learns of the child via ``session.created``.
+
+    :param type: Always ``"subagent.started"``.
+    :param child_key: Stable, per-turn-unique id for the sub-agent — the
+        idempotency key when the child is minted and the correlation key for the
+        later :class:`SubagentCompletedEvent`.
+    :param title: Short human label for the row, e.g. ``"mathutils"``.
+    :param task: The instruction the sub-agent was given.
+    """
+
+    type: Literal["subagent.started"]
+    child_key: str
+    title: str
+    task: str = ""
+
+
+class SubagentCompletedEvent(_SSEEventBase):
+    """
+    Runner-internal marker: a previously-announced sub-agent finished.
+
+    Emitted by the adapter from a
+    :class:`~omnigent.inner.executor.SubAgentCompleted`. The runner records the
+    outcome on the child session minted for the matching ``child_key`` (status +
+    the summary as its output). **Never** relayed to external clients.
+
+    :param type: Always ``"subagent.completed"``.
+    :param child_key: Matches the :attr:`SubagentStartedEvent.child_key`.
+    :param ok: Whether the sub-agent reported success.
+    :param summary: The sub-agent's closing summary.
+    """
+
+    type: Literal["subagent.completed"]
+    child_key: str
+    ok: bool = True
+    summary: str = ""
+
+
+class SubagentToolCallEvent(_SSEEventBase):
+    """
+    Runner-internal marker: an ACP sub-agent ran a tool call.
+
+    Emitted by the adapter from a
+    :class:`~omnigent.inner.executor.SubAgentToolCall` — a call the sub-agent
+    made inside its delegated work, which belongs in the child's transcript, not
+    the parent stream. The runner appends it as a ``function_call`` conversation
+    item on the child session minted for the matching ``child_key``. **Never**
+    relayed to external clients.
+
+    :param type: Always ``"subagent.tool_call"``.
+    :param child_key: Matches the :attr:`SubagentStartedEvent.child_key`.
+    :param call_id: The tool call's id, used as the child item's ``call_id``.
+    :param name: Human tool label for the card, e.g. ``"Wrote mathutils.py"``.
+    :param arguments: JSON-encoded arguments string (the tool's raw input).
+    """
+
+    type: Literal["subagent.tool_call"]
+    child_key: str
+    call_id: str
+    name: str
+    arguments: str = ""
+
+
+HarnessStreamEvent = (
+    ServerStreamEvent
+    | InjectionConsumedEvent
+    | PolicyEvaluationRequestEvent
+    | SubagentStartedEvent
+    | SubagentCompletedEvent
+    | SubagentToolCallEvent
+)
+
+
+# ── Projects ──────────────────────────────────────────────────────
+
+
+class ProjectObject(BaseModel):
+    """
+    A first-class project (see ``designs/PROJECTS_PRD.md``).
+
+    :param id: Project id (bare 32-char hex).
+    :param object: Discriminator; always ``"project"``.
+    :param name: Human-readable project name, unique per owner.
+    :param created_at: Unix epoch seconds at creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None``.
+    :param config: Default session settings as an opaque JSON object (host,
+        workspace, harness, model, reasoning effort, git base-branch, …). Empty
+        when the project stores no defaults. The key vocabulary is owned by the
+        client; the server persists and returns it whole. Values are hints the
+        new-chat dialog pre-fills, not enforced requirements.
+    """
+
+    id: str
+    object: Literal["project"] = "project"
+    name: str
+    created_at: int
+    updated_at: int | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectList(BaseModel):
+    """Response for ``GET /v1/projects``.
+
+    :param object: Discriminator; always ``"list"``.
+    :param data: The caller's projects.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[ProjectObject]
+
+
+class SessionProjectSummary(BaseModel):
+    """One entry of ``GET /v1/sessions/projects`` — a sidebar project folder.
+
+    Dual-read union of first-class projects and legacy ``omni_project``
+    label-projects, keyed by name.
+
+    :param id: First-class project id when one exists, or ``None`` for a
+        label-only project not yet promoted to the ``projects`` table.
+    :param name: Project name (the folder's display name and union key).
+    :param icon: The project's chosen emoji icon (a unicode grapheme), read
+        from its ``config``; ``None`` when unset or for a label-only folder,
+        so the sidebar falls back to the default folder glyph.
+    """
+
+    id: str | None = None
+    name: str
+    icon: str | None = None
+
+
+class CreateProjectRequest(BaseModel):
+    """
+    Request body for ``POST /v1/projects``.
+
+    :param name: Human-readable project name. Trimmed; must be non-empty and
+        at most 100 characters; unique among the caller's projects.
+    :param config: Optional default session settings (opaque JSON object).
+        Omitted / empty stores no defaults.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    config: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        """Trim and bound the project name.
+
+        :param value: The raw name from the request.
+        :returns: The trimmed name.
+        :raises ValueError: If empty/whitespace-only or over 100 chars.
+        """
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("name must not be empty")
+        if len(trimmed) > 100:
+            raise ValueError("name must be at most 100 characters")
+        return trimmed
+
+
+class UpdateProjectRequest(BaseModel):
+    """
+    Request body for ``PATCH /v1/projects/{project_id}``.
+
+    All fields optional; ``None`` leaves a field unchanged.
+
+    :param name: New project name. ``None`` leaves it unchanged; otherwise
+        trimmed, non-empty, at most 100 characters.
+    :param config: New config object to replace the stored one. ``None`` leaves
+        it unchanged; an empty object ``{}`` clears the stored defaults.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    config: dict[str, Any] | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str | None) -> str | None:
+        """Trim and bound the project name when provided.
+
+        :param value: The raw name from the request, or ``None``.
+        :returns: The trimmed name, or ``None``.
+        :raises ValueError: If provided but empty/whitespace-only or over 100.
+        """
+        if value is None:
+            return None
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("name must not be empty")
+        if len(trimmed) > 100:
+            raise ValueError("name must be at most 100 characters")
+        return trimmed

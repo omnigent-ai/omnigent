@@ -22,6 +22,8 @@ from opentelemetry import metrics as otel_metrics
 from opentelemetry.util.types import Attributes
 from uvicorn.logging import AccessFormatter
 
+from omnigent.process_logging import log_record_display_fields
+
 _DEFAULT_WINDOWS_SECONDS = (1.0, 10.0, 30.0)
 _BYTES_PER_MIB = 1024 * 1024
 _OTEL_METER_NAME = "omnigent.server.performance"
@@ -216,6 +218,16 @@ class RequestDurationAccessFormatter(AccessFormatter):
     """
 
     _MAX_USER_AGENT_LENGTH = 80
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Apply Omnigent's standard source and level display fields."""
+        fmt = getattr(self._style, "_fmt", "")
+        with log_record_display_fields(
+            record,
+            use_colors=self.use_colors,
+            format_level="%(levelprefix)" not in fmt,
+        ):
+            return super().format(record)
 
     def formatMessage(self, record: logging.LogRecord) -> str:
         """
@@ -552,6 +564,7 @@ class ServerPerformanceMetrics:
         self._active_websockets = 0
         self._total_processing_seconds = 0.0
         self._max_processing_seconds = 0.0
+        self._route_counts: dict[str, int] = {}
         self._last_snapshot_wall = clock()
         self._last_snapshot_cpu = process_time_fn()
 
@@ -600,6 +613,33 @@ class ServerPerformanceMetrics:
             )
             self._prune_locked(now)
         return duration_seconds
+
+    def record_route(self, method: str, route: str) -> None:
+        """
+        Increment the per-route request counter for ``"METHOD route"``.
+
+        The route is the low-cardinality FastAPI template (e.g.
+        ``"/v1/sessions/{session_id}"``), so the key space is bounded by the
+        number of registered routes and the map stays small. Used only for
+        offline analysis (the benchmark harness's per-journey request
+        breakdown); the aggregate counters above drive live metrics.
+
+        :param method: HTTP request method, e.g. ``"GET"``.
+        :param route: Matched route template, e.g. ``"/v1/sessions"``.
+        """
+        key = f"{method} {route}"
+        with self._lock:
+            self._route_counts[key] = self._route_counts.get(key, 0) + 1
+
+    def route_counts(self) -> dict[str, int]:
+        """
+        Return a copy of the cumulative per-route request counts.
+
+        :returns: ``"METHOD route"`` mapped to the number of requests handled
+            since process start.
+        """
+        with self._lock:
+            return dict(self._route_counts)
 
     def websocket_connected(self) -> None:
         """
@@ -1121,6 +1161,6 @@ def _current_rss_bytes() -> int:
             return int(usage.ru_maxrss)
         return int(usage.ru_maxrss) * 1024
 
-    import psutil
+    import psutil  # type: ignore[import-untyped]
 
     return int(psutil.Process().memory_info().rss)

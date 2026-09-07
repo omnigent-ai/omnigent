@@ -17,10 +17,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
+from omnigent.json_types import JsonValue
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
@@ -30,6 +31,7 @@ from .async_utils import run_sync_on_thread
 from .credential_proxy import (
     CredentialProxyRuntime,
     CredentialRewriteRule,
+    MaterializedFile,
     prepare_credential_proxy_runtime,
 )
 from .datamodel import CredentialProxySpec, OSEnvSpec
@@ -40,17 +42,20 @@ from .sandbox import (
     cleanup_private_tmpdir,
     create_private_tmpdir,
     get_backend,
+    reachable_roots,
     resolve_sandbox,
     set_temp_env,
     with_additional_write_roots,
 )
+
+if TYPE_CHECKING:
+    import asyncio
+
+    from .egress import EgressProxyHandle
+    from .egress.proxy import EgressProxy
 from .sandbox import (
     run_launcher as _run_launcher,
 )
-
-# Any JSON-shaped leaf — used for the encode/decode serializer helpers that
-# mirror the pattern in ``omnigent/sandbox.py`` and ``omnigent/uc_tools.py``.
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 # Result dict returned by ``read`` / ``write`` / ``edit`` / ``shell`` and the
 # corresponding ``_*_impl`` helpers. Keys vary by op (content/offset/total_lines
@@ -71,6 +76,10 @@ OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 EditEntry: TypeAlias = dict[str, str]
 
 
+class _PopenKwargs(TypedDict, total=False):
+    pass_fds: tuple[int, ...]
+
+
 # Environment variables every helper subprocess inherits unconditionally.
 # Names that any reasonable Python program or POSIX shell expects to find
 # in its environment regardless of who is running it. Adding to this list
@@ -89,8 +98,13 @@ EditEntry: TypeAlias = dict[str, str]
 #   non-interactive startup.
 # - ``PROMPT_COMMAND``: arbitrary command run by bash before each prompt.
 # - ``CDPATH``: changes the resolution of relative paths in shell ``cd``.
-# - ``SSH_AUTH_SOCK``: the user's running ssh-agent socket — a
-#   credential surface masquerading as a path.
+# - ``SSH_AUTH_SOCK``: the user's ssh-agent socket. Allowed through the
+#   weaker host→runner and harness-CLI boundaries (a socket path, like
+#   ``KUBECONFIG``), but an ACTIVE sandbox is where the agent is being
+#   deliberately confined, and signing with the user's keys is exactly
+#   what that confinement is for. Opt in per-spec, and grant the socket
+#   path too: under seatbelt / bwrap the name alone points at something
+#   unreachable.
 # - ``DBUS_SESSION_BUS_ADDRESS``: lets the helper talk to the user's
 #   D-Bus session.
 # - ``XDG_RUNTIME_DIR``: per-session socket directory (Wayland, ssh-
@@ -259,6 +273,33 @@ def _build_credential_proxy_parent_env(
     return resolved
 
 
+def _write_credential_proxy_files(
+    env: dict[str, str],
+    files: Sequence[MaterializedFile],
+    tmpdir: Path,
+) -> None:
+    """
+    Write placeholder-only credential-proxy files into the sandbox scratch dir.
+
+    Each file carries only synthetic ``oa_cred_*`` placeholders (never a
+    real secret), so writing it into the sandbox-visible scratch dir is
+    safe. When a file declares an ``env_var``, that variable is pointed at
+    the written file's absolute path so the tool discovers it (e.g.
+    ``DATABRICKS_CONFIG_FILE``).
+
+    :param env: The helper spawn env; pointer vars are set in place.
+    :param files: The files to materialize.
+    :param tmpdir: The sandbox scratch directory (a write root bound into
+        the sandbox).
+    """
+    for spec in files:
+        path = tmpdir / spec.name
+        path.write_text(spec.content, encoding="utf-8")
+        os.chmod(path, spec.mode)
+        if spec.env_var is not None:
+            env[spec.env_var] = str(path)
+
+
 @dataclass
 class OSEnvironment(ABC):
     """Base OS environment interface."""
@@ -272,6 +313,7 @@ class OSEnvironment(ABC):
         path: str,
         offset: int = 1,
         limit: int | None = None,
+        max_binary_bytes: int | None = None,
     ) -> OpResult:
         raise NotImplementedError
 
@@ -346,15 +388,15 @@ class _HelperProcessClient:
         # ``_stop_locked`` to tear down the helper's process tree.
         self._sandbox_handle: ContainmentHandle | None = None
         self._tmpdir: Path | None = None
-        self._egress_proxy: Any | None = None  # EgressProxy when active
-        self._egress_loop: Any | None = None  # asyncio event loop for proxy
+        self._egress_proxy: EgressProxy | None = None
+        self._egress_loop: asyncio.AbstractEventLoop | None = None
         self._egress_thread: threading.Thread | None = None
         # Controller handle for unified start/stop. The legacy
         # ``_egress_proxy`` / ``_egress_loop`` / ``_egress_thread``
         # mirrors are kept for back-compat with any tooling that
         # introspects them, but the lifecycle is driven through
         # the handle when present.
-        self._egress_handle: Any | None = None  # EgressProxyHandle
+        self._egress_handle: EgressProxyHandle | None = None
         self._lock = threading.Lock()
         self._closed = False
         atexit.register(self.close)
@@ -441,6 +483,11 @@ class _HelperProcessClient:
                     parent_env=credential_parent_env,
                 )
                 env.update(credential_runtime.helper_env_updates)
+                # Materialize placeholder-only config files (e.g. a
+                # ``.databrickscfg`` listing proxied profiles with
+                # ``oa_cred_*`` tokens) into the scratch dir and point the
+                # tool at them. No real secret is written to the sandbox.
+                _write_credential_proxy_files(env, credential_runtime.sandbox_files, self._tmpdir)
 
         # Start L7 egress proxy if rules are configured. The proxy
         # listens on a Unix socket in the scratch tmpdir; the helper
@@ -540,7 +587,7 @@ class _HelperProcessClient:
         # in the child, which is why we can pass it as a plain ``--config-fd``
         # argv arg. On Windows the config came via ``--config-file`` instead,
         # so there is no fd to inherit.
-        popen_kwargs: dict[str, Any] = {}
+        popen_kwargs: _PopenKwargs = {}
         if r_fd is not None:
             popen_kwargs["pass_fds"] = (r_fd,)
         try:
@@ -711,8 +758,9 @@ class _HelperProcessClient:
         # ``require_auth=True`` because we have an inherited config
         # FD to deliver the token out of band — see the in-process
         # token injection in :func:`_run_helper`.
+        rules = list(self._egress_rules or [])
         handle = start_egress_proxy(
-            rules=self._egress_rules or [],
+            rules=rules,
             tmpdir=self._tmpdir,
             allow_private_destinations=self._egress_allow_private_destinations,
             require_auth=True,
@@ -948,8 +996,8 @@ def _handle_helper_request(
             return {"error": "path must be a non-empty string"}
         path = _resolve_path(cwd, raw_path)
         try:
-            _assert_within_cwd(cwd, path)
-            _assert_read_allowed(sandbox, path)
+            _assert_within_reach(cwd, sandbox, path, need_write=False)
+            _assert_read_allowed(sandbox, path, cwd)
         except PermissionError as exc:
             return {"error": str(exc)}
         offset_raw = request.get("offset", 1)
@@ -969,7 +1017,7 @@ def _handle_helper_request(
             return {"error": "path must be a non-empty string"}
         path = _resolve_path(cwd, raw_path)
         try:
-            _assert_within_cwd(cwd, path)
+            _assert_within_reach(cwd, sandbox, path, need_write=True)
             _assert_write_allowed(sandbox, path)
         except PermissionError as exc:
             return {"error": str(exc)}
@@ -990,8 +1038,8 @@ def _handle_helper_request(
             return {"error": "path must be a non-empty string"}
         path = _resolve_path(cwd, raw_path)
         try:
-            _assert_within_cwd(cwd, path)
-            _assert_read_allowed(sandbox, path)
+            _assert_within_reach(cwd, sandbox, path, need_write=True)
+            _assert_read_allowed(sandbox, path, cwd)
             _assert_write_allowed(sandbox, path)
         except PermissionError as exc:
             return {"error": str(exc)}
@@ -1061,11 +1109,89 @@ def _assert_within_cwd(cwd: Path, resolved: Path) -> None:
         ) from exc
 
 
-def _assert_read_allowed(policy: SandboxPolicy, path: Path) -> None:
+def _assert_within_reach(
+    cwd: Path,
+    policy: SandboxPolicy,
+    resolved: Path,
+    *,
+    need_write: bool,
+) -> None:
+    """Confine a file-tool op to *cwd*, extended by declared sandbox grants.
+
+    Replaces the historical cwd-only guard at the read / write / edit sites.
+    The grants come from :func:`omnigent.inner.sandbox.reachable_roots`, which
+    is also what the filesystem APIs advertise as reachable, so what is
+    enforced here and what a caller is told it can reach cannot drift apart.
+    *resolved* is already canonicalised by :func:`_resolve_path` (symlinks
+    followed, ``..`` collapsed) and every grant root is canonicalised at
+    resolve time, so a symlink or ``..`` chain whose real target leaves both
+    *cwd* and every grant is rejected -- the confinement boundary cannot be
+    escaped by traversal.
+
+    Precedence and grant semantics:
+
+    - A path inside *cwd* is always permitted here (the active-sandbox
+      allow-list narrowing in :func:`_assert_read_allowed` /
+      :func:`_assert_write_allowed` still runs afterwards, unchanged).
+    - A path OUTSIDE *cwd* is permitted only when an explicitly declared
+      grant of the right kind covers it. These reuse the SAME grant shapes the
+      active backends already populate -- ``read_paths`` / ``write_paths`` are
+      directory roots (containment match against ``read_roots`` /
+      ``write_roots``) and ``write_files`` is the single-file grant (exact
+      resolved-path match); no new grant vocabulary is introduced. A **write**
+      grant (``write_paths`` / ``write_files``) admits both reads and writes of
+      that subtree (a writable path is readable); a **read** grant
+      (``read_paths``) admits reads only -- so a read grant never confers
+      write. Read grants are directory roots; a single readable file is
+      expressed by rooting a ``read_paths`` entry at that file (an exact-path
+      match still succeeds, but there is no ``read_files`` shape).
+    - With NO grants declared, ``write_roots`` / ``write_files`` are empty and
+      ``read_roots`` is ``None``: nothing outside *cwd* is permitted, byte for
+      byte the previous cwd-confinement behaviour. This default-unchanged
+      property is the security invariant.
+
+    The target is resolved ONCE (by :func:`_resolve_path`) before comparison,
+    so this guard shares the prior cwd-guard's TOCTOU posture: a symlink
+    swapped between this check and the later open could redirect the op. That
+    is unchanged by this diff -- for an ACTIVE sandbox the backend's OS-level
+    mount mask stays the hard boundary, and under ``type: none`` the file tools
+    were never a containment boundary anyway (the co-resident ``sys_os_shell``
+    is unconfined). Widening reach to declared grants does not alter that
+    posture.
+
+    :param cwd: The environment root (resolved inside).
+    :param policy: Resolved sandbox policy carrying the declared grants.
+    :param resolved: Fully-resolved target path (post ``_resolve_path``).
+    :param need_write: ``True`` for write / edit ops (only write grants admit
+        an out-of-cwd path); ``False`` for read ops (read OR write grants
+        admit).
+    :raises PermissionError: If *resolved* is outside *cwd* and no grant of
+        the required kind covers it.
+    """
+    for root in reachable_roots(cwd, policy):
+        # Read grants admit reads only; write grants admit both.
+        if need_write and root.access != "write":
+            continue
+        if root.contains(resolved):
+            return
+    resolved_cwd = cwd.resolve()
+    kind = "write" if need_write else "read"
+    raise PermissionError(
+        f"Access to '{resolved}' is blocked: path is outside the "
+        f"environment root '{resolved_cwd}' and no sandbox {kind} grant "
+        f"covers it"
+    )
+
+
+def _assert_read_allowed(policy: SandboxPolicy, path: Path, cwd: Path) -> None:
     roots = policy.read_roots
     if not policy.active or roots is None:
         return
-    if any(_is_within(path, root) for root in roots):
+    if _is_within(path, cwd):
+        return
+    if any(_is_within(path, root) for root in (*roots, *policy.write_roots)):
+        return
+    if any(path == allowed for allowed in policy.write_files):
         return
     raise PermissionError(f"Read access to '{path}' is blocked by sandbox.")
 
@@ -1333,6 +1459,7 @@ def _shell_impl(
         completed = subprocess.run(
             argv,
             cwd=str(cwd),
+            env=_child_shell_env(),
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -1423,6 +1550,40 @@ def _project_root() -> Path:
     # File lives at omnigent/inner/os_env.py; climb two levels to the
     # repo root that hosts `omnigent/` as a package.
     return Path(__file__).resolve().parents[2]
+
+
+def _same_path(entry: str, root: Path) -> bool:
+    """True when ``entry`` names the same directory as ``root``."""
+    try:
+        return Path(entry).resolve() == root
+    except OSError:
+        return os.path.normpath(entry) == os.path.normpath(str(root))
+
+
+def _child_shell_env() -> dict[str, str]:
+    """
+    Environment for agent shell commands, minus omnigent's own package root.
+
+    The helper prepends its project root to ``PYTHONPATH`` at spawn (see
+    ``_HelperProcessClient._start_locked``) purely so ``python -m
+    omnigent.inner.os_env`` can import omnigent. That entry has no business in
+    the commands the agent runs: under a tool install it points at omnigent's
+    ``site-packages`` and shadows the project venv's own packages on
+    ``sys.path`` (e.g. a 3.12 ``pydantic_core`` failing to load under a 3.13
+    project). Strip only omnigent's entry — any other ``PYTHONPATH`` the caller
+    set is preserved, in order.
+    """
+    env = os.environ.copy()
+    raw = env.get("PYTHONPATH")
+    if not raw:
+        return env
+    root = _project_root()
+    kept = [entry for entry in raw.split(os.pathsep) if not (entry and _same_path(entry, root))]
+    if kept:
+        env["PYTHONPATH"] = os.pathsep.join(kept)
+    else:
+        env.pop("PYTHONPATH", None)
+    return env
 
 
 def _read_config_from_fd(fd: int) -> JsonValue:

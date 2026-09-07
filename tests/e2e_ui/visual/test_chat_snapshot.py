@@ -61,7 +61,7 @@ _AGENTS_BODY = {
             "name": _AGENT_NAME,
             "display_name": "Claude Code",
             "description": "Anthropic's coding agent",
-            "harness": None,
+            "harness": "claude",
             "skills": [],
         }
     ]
@@ -115,6 +115,21 @@ _ITEMS_BODY = {
     "last_id": "msg_user",
     "has_more": False,
 }
+# Claude-native launch catalog, mirroring the model-picker e2e. The
+# ``omnigent.wrapper`` label below is what makes the composer render the config
+# gear (modelPickerKind="claude") + its read-only model/effort label, so the
+# baseline actually captures that surface. ``llm_model`` binds Sonnet 5 as the
+# resolved model so the label reads a friendly name.
+_MODEL_OPTIONS = [
+    {"id": "opus", "model": "system.ai.claude-opus-4-10", "displayName": "Opus 4.10"},
+    {
+        "id": "sonnet",
+        "model": "system.ai.claude-sonnet-5",
+        "displayName": "Sonnet 5",
+        "isDefault": True,
+    },
+    {"id": "haiku", "model": "system.ai.claude-haiku-4-5", "displayName": "Haiku 4.5"},
+]
 _SESSION_BODY = {
     "id": _SESSION_ID,
     "agent_id": _AGENT_ID,
@@ -122,13 +137,18 @@ _SESSION_BODY = {
     "status": "idle",
     "created_at": 1704067200,
     "updated_at": 1704067200,
+    # claude-native wrapper: drives the composer gear + model/effort label.
+    "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+    "harness": "claude",
+    "llm_model": "system.ai.claude-sonnet-5",
+    "model_options": _MODEL_OPTIONS,
 }
 _AGENT_BODY = {
     "id": _AGENT_ID,
     "object": "agent",
     "name": _AGENT_NAME,
     "description": "Anthropic's coding agent",
-    "harness": None,
+    "harness": "claude",
     "mcp_servers": [],
     "policies": [],
     "terminals": [],
@@ -140,6 +160,11 @@ _HEALTH_BODY = {"sessions": {_SESSION_ID: {"runner_online": True, "host_online":
 _DONE_SSE = "data: [DONE]\n\n"
 
 _BUBBLE = '[data-testid="message-bubble"]'
+# Shiki loads lazily, so the fenced block paints raw first and re-renders with
+# per-token spans (colored via the `--sdm-c` custom property) once the import
+# resolves. Span *presence* races the paint — the spans mount a frame before
+# their colors are composited — so the capture waits on the computed colors.
+_TOKEN_SPANS = '[data-streamdown="code-block-body"] span[style*="--sdm-c"]'
 
 
 @pytest.mark.visual
@@ -187,6 +212,41 @@ def test_chat_conversation_matches_baseline(
     expect(page.locator(f'{_BUBBLE}[data-role="assistant"]')).to_be_visible(timeout=30_000)
     # No live turn is in flight, so the working shimmer must be absent.
     expect(page.locator('[data-testid="working-indicator"]')).to_have_count(0)
+    # The claude-native wrapper labels drive the composer config gear + its
+    # read-only model/effort label; wait for both so the capture includes them
+    # (they hydrate from the same session snapshot the bubbles above wait on).
+    expect(page.locator('[data-testid="composer-config-gear"]')).to_be_visible(timeout=30_000)
+    expect(page.locator('[data-testid="composer-model-effort-label"]')).to_be_visible()
+
+    # Shiki loads lazily: the colored token spans mount a frame after the block
+    # first paints raw. Wait until the tokens resolve more than one distinct
+    # color (the raw fallback is uniform `inherit`), then flush two animation
+    # frames so those colors are composited before the screenshot — waiting on
+    # span presence alone races the paint and captured a raw frame.
+    page.wait_for_function(
+        """(selector) => {
+            const spans = Array.from(document.querySelectorAll(selector));
+            if (spans.length < 2) return false;
+            const colors = new Set(spans.map((el) => getComputedStyle(el).color));
+            return colors.size > 1;
+        }""",
+        arg=_TOKEN_SPANS,
+        timeout=30_000,
+    )
+    page.evaluate(
+        "() => new Promise((resolve) => "
+        "requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+    )
+
+    # Hide the "Jump to top" pill for the capture. It's transient, time-dependent
+    # chrome: the initial layout settle (LatestTurnSpacer + StickToBottom pinning
+    # to the bottom) fires a scroll that reveals it for a ~2s window, so whether
+    # it's on screen at capture time is a race the baseline shouldn't encode.
+    # Force it out the same way settle kills the caret, so the resting state is
+    # deterministic regardless of when the scroll settles.
+    page.add_style_tag(
+        content='[aria-label="Jump to the first message"] { display: none !important; }'
+    )
 
     # Settle web fonts + kill the blinking caret (both time-dependent).
     settle_for_snapshot(page)

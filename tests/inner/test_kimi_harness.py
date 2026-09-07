@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -72,6 +73,7 @@ def test_executor_factory_reads_env_vars(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("HARNESS_KIMI_MODEL", "kimi-k2-turbo")
     monkeypatch.setenv("HARNESS_KIMI_CWD", "/tmp/kimi-cwd")
     monkeypatch.setenv("HARNESS_KIMI_PATH", "/custom/bin/kimi")
+    monkeypatch.delenv("OMNIGENT_KIMI_PATH", raising=False)
     monkeypatch.setenv("HARNESS_KIMI_PLAN", "yes")
     monkeypatch.setenv("HARNESS_KIMI_CONTINUE_LAST", "true")
     monkeypatch.setenv("HARNESS_KIMI_SKILLS_DIRS", json.dumps(["/a", "/b"]))
@@ -106,6 +108,8 @@ def test_executor_factory_defaults_when_env_unset(monkeypatch: pytest.MonkeyPatc
         # Cleared too: cwd now falls back to it, so a dev with it exported
         # mustn't flip this default-path assertion.
         "OMNIGENT_RUNNER_WORKSPACE",
+        # Canonical path env var — would shadow the legacy HARNESS_* delenv above.
+        "OMNIGENT_KIMI_PATH",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -202,13 +206,22 @@ def test_parse_truthy(value: str | None, expected: bool) -> None:
 
 
 def test_resolve_kimi_binary_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OMNIGENT_KIMI_PATH", raising=False)
     monkeypatch.delenv("HARNESS_KIMI_PATH", raising=False)
     assert _resolve_kimi_binary() == "kimi"
 
 
 def test_resolve_kimi_binary_explicit_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HARNESS_KIMI_PATH", "/opt/bin/kimi")
+    # Canonical OMNIGENT_KIMI_PATH wins.
+    monkeypatch.setenv("OMNIGENT_KIMI_PATH", "/opt/bin/kimi")
     assert _resolve_kimi_binary() == "/opt/bin/kimi"
+
+
+def test_resolve_kimi_binary_legacy_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Deprecated HARNESS_KIMI_PATH still honored as a fallback.
+    monkeypatch.delenv("OMNIGENT_KIMI_PATH", raising=False)
+    monkeypatch.setenv("HARNESS_KIMI_PATH", "/legacy/bin/kimi")
+    assert _resolve_kimi_binary() == "/legacy/bin/kimi"
 
 
 def test_latest_user_text_string_message() -> None:
@@ -689,14 +702,21 @@ def test_sandbox_launch_path_wraps_when_sandbox_requested(
     class _ActivePolicy:
         active = True
 
+    captured_write_roots: list[Path] = []
+
+    def _capture_write_roots(policy: _ActivePolicy, roots: list[Path]) -> _ActivePolicy:
+        captured_write_roots.extend(roots)
+        return policy
+
     monkeypatch.setattr(sandbox_mod, "resolve_sandbox", lambda *_a, **_k: _ActivePolicy())
     monkeypatch.setattr(sandbox_mod, "with_additional_read_roots", lambda s, _roots: s)
-    monkeypatch.setattr(sandbox_mod, "with_additional_write_roots", lambda s, _roots: s)
+    monkeypatch.setattr(sandbox_mod, "with_additional_write_roots", _capture_write_roots)
     monkeypatch.setattr(sandbox_mod, "with_spawn_env_allowlist", lambda s, _names: s)
     monkeypatch.setattr(
         sandbox_mod, "create_exec_launcher", lambda target, _policy: f"LAUNCHER::{target}"
     )
 
+    monkeypatch.delenv("KIMI_CODE_HOME", raising=False)
     os_env = OSEnvSpec(
         type="caller_process",
         cwd=None,
@@ -707,6 +727,17 @@ def test_sandbox_launch_path_wraps_when_sandbox_requested(
     launch = ex._sandbox_launch_path(("PATH",))
 
     assert launch.startswith("LAUNCHER::")
+    assert Path.home() / ".kimi-code" in captured_write_roots
+    assert Path.home() / ".kimi" not in captured_write_roots
+
+    # A custom $KIMI_CODE_HOME moves kimi's config dir; the jail's write
+    # grant must follow it or the CLI can't persist config when overridden.
+    captured_write_roots.clear()
+    monkeypatch.setenv("KIMI_CODE_HOME", "/srv/custom-kimi-home")
+    launch = ex._sandbox_launch_path(("PATH",))
+    assert launch.startswith("LAUNCHER::")
+    assert Path("/srv/custom-kimi-home") in captured_write_roots
+    assert Path.home() / ".kimi-code" not in captured_write_roots
 
 
 def test_run_turn_emits_error_when_kimi_binary_missing(monkeypatch: pytest.MonkeyPatch) -> None:

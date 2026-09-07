@@ -106,6 +106,7 @@ swap-on-access:
 | `https_basic` | `Authorization: Basic b64(user:<real>)` | swap-on-access (optional `env:`) | Generic Basic auth; `username` defaults to `x-access-token`. |
 | `git_https` | `Authorization: Basic b64(user:<real>)` | swap-on-access | Preset for git-over-HTTPS; nothing in the sandbox. |
 | `gh_basic` | Basic for git host, `token` for api host | swap-on-access for git; `GH_TOKEN`/`GITHUB_TOKEN` env for api | Preset for GitHub CLI + git; defaults to `github.com` + `api.github.com`. |
+| `databricks_cli` | `Authorization: Bearer <real>` per workspace host | placeholder `.databrickscfg` file (one `oa_cred_*` per profile) | Preset for the Databricks CLI; takes `profiles` (+ optional `default`). See below. |
 
 Common fields: `target`/`targets` (host + optional path glob — only the
 host binds the credential; path scoping is delegated to `egress_rules`),
@@ -152,6 +153,54 @@ parser) that rejects unknown keys, enforces exactly one source key, and
 checks POSIX env-var names — then converts to the `CredentialSourceSpec`
 dataclass the runtime consumes.
 
+### `databricks_cli` — profile-keyed, refreshing, file-materialized
+
+The Databricks CLI is a fifth type that differs from the four host-keyed
+primitives above:
+
+- **Profile-keyed, not host-keyed.** It takes `profiles: [name, ...]`
+  (and optional `default`) instead of `target`/`targets`/`source`. The
+  workspace host behind each profile is only known once the parent
+  resolves it, so profiles are carried on `DatabricksProxySpec` rather
+  than in the host-keyed `entries` list. Only the listed profiles are
+  proxied; every other profile is invisible to the sandbox.
+- **File materialization, not env injection.** The CLI gates on a local
+  credential (like `gh`) and `DATABRICKS_HOST`/`DATABRICKS_TOKEN` carry
+  only one workspace, so per-profile selection needs a config file. The
+  parent writes a placeholder-only `.databrickscfg` into the sandbox
+  scratch dir — one `[profile]` section per profile with the real `host`
+  and a synthetic `token = oa_cred_*` — and points `DATABRICKS_CONFIG_FILE`
+  at it (and `DATABRICKS_CONFIG_PROFILE` when `default` is set). The CLI
+  emits `Authorization: Bearer oa_cred_*`, which the proxy swaps per host.
+- **Refreshing secret.** Databricks profiles are usually OAuth
+  (`auth_type = databricks-cli`) with a ~1h token, so the rewrite rule
+  holds a `DatabricksProfileTokenProvider` (via the SDK) instead of a
+  static secret. The proxy calls `rule.resolve_secret()` on each swap; the
+  provider re-mints via `Config.authenticate()` at most once per throttle
+  window (the SDK caches in-memory and only re-shells near expiry), so a
+  long session survives token expiry. The provider requires the
+  `databricks` extra and fails loud if it is missing.
+- **Egress is operator-listed.** Reaching a workspace requires its host in
+  `egress_rules` (`* <host>/**`), the same as every other credential-proxy
+  type. The proxy does not widen egress on its own — an earlier draft
+  auto-added resolved hosts, but that was dropped to keep egress behavior
+  consistent across types (the operator declares every reachable host).
+- **Linux only.** The `databricks` CLI is a Go binary and Go on macOS
+  ignores `SSL_CERT_FILE`, so `databricks_cli` is rejected on
+  `darwin_seatbelt` (same rationale as `gh_basic`); use `linux_bwrap`.
+
+```yaml
+os_env:
+  sandbox:
+    type: linux_bwrap
+    egress_rules:
+      - "* pypi.org/**"
+    credential_proxy:
+      - type: databricks_cli
+        profiles: [dbc-adb7b1a3-9097, oss]
+        default: dbc-adb7b1a3-9097
+```
+
 ## Internal model
 
 `omnigent/inner/datamodel.py`:
@@ -162,8 +211,11 @@ dataclass the runtime consumes.
   type compiles down to: `host`, `scheme` (`basic`/`bearer`/`token`),
   `source`, `username | None`, `inject_env: list[str]` (empty for
   swap-on-access; populated only by the opt-in `env` shim).
-- `CredentialProxySpec` — list of entries; attached to
+- `CredentialProxySpec` — list of entries plus an optional
+  `databricks: DatabricksProxySpec`; attached to
   `OSEnvSandboxSpec.credential_proxy`.
+- `DatabricksProxySpec` / `DatabricksProfileBinding` — the profile list
+  (+ `default`, `config_env`) for the `databricks_cli` type.
 
 The parser (`omnigent/spec/parser.py`, `_parse_credential_proxy`)
 validates each raw entry with a pydantic boundary model
@@ -186,9 +238,13 @@ backend allow-list, and the `gh_basic`-on-macOS guard.
   - `helper_env_updates` — synthetic values for each `inject_env` var
     (empty for swap-on-access entries),
   - `rewrites: list[CredentialRewriteRule]` — `(host, scheme,
-    real_secret, synthetic | None, username)` for the proxy. `synthetic`
-    is `None` for swap-on-access entries; it is minted (and the matching
-    placeholder injected) only when the entry sets `env`.
+    real_secret | secret_provider, synthetic | None, username)` for the
+    proxy. `synthetic` is `None` for swap-on-access entries; it is minted
+    (and the matching placeholder injected) only when the entry sets `env`
+    (or, for `databricks_cli`, per proxied profile). A rule carries either
+    a static `real_secret` or a refreshing `secret_provider` — the proxy
+    calls `rule.resolve_secret()` — plus, for `databricks_cli`,
+    `sandbox_files` (the placeholder `.databrickscfg`).
 
 The real secret lives **only** in the parent process and the proxy's
 in-memory rewrite table. It is never serialized into the

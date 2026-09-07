@@ -1,32 +1,37 @@
-"""E2E: Cmd/Ctrl+↑/↓ switches sessions even while the composer is focused.
+"""E2E: Cmd/Ctrl+bracket switches sessions, composer focus included.
 
-Covers the composer fix in ``web/src/pages/ChatPage.tsx``: the composer's
-ArrowUp/ArrowDown draft-recall handler used to intercept *any* arrow keydown,
-so the global session-switch hotkey (``useSessionSwitchHotkey``, Cmd/Ctrl+↑/↓)
-appeared dead while typing — recall swallowed the keystroke and replaced the
-draft instead of switching sessions. The fix gates recall to UNmodified arrows
-(``!metaKey && !ctrlKey && !altKey``), letting the modified chord bubble to the
-window-level hotkey.
+``useSessionSwitchHotkey`` (window keydown) steps the sidebar's ordered
+sessions on Cmd/Ctrl+[ and Cmd/Ctrl+]. Brackets carry no composer caret
+behavior, so the global shortcut can work while a draft is focused. Terminals
+and Monaco remain excluded because they own these chords.
 
-The regression is specifically "composer has focus". So this test puts focus
-in the composer (types a draft), then presses Ctrl+ArrowDown (the Win/Linux
-chord; CI runs Linux chromium — the hook also accepts Cmd via metaKey on
-macOS) and asserts the route navigates to a different session. Pre-fix, recall
-ate the chord and the route never changed.
+This exercises the contract through the real chain the unit tests mock out:
+live session list -> sidebar render order -> window keydown handler ->
+client-side navigation to ``/c/{id}``.
 
-No LLM turn is needed — this exercises pure client-side keyboard + routing —
-so it skips the nightly/real-agent markers the approval suites carry. Two
-runner-bound sessions come from the ``seeded_session_pair`` fixture; both
-render under the sidebar's "Sessions" group, so both are in the hotkey's ordered
-list.
+- ``test_command_bracket_switches_session_from_focused_composer``: focus the
+  composer, leave a draft, press Command/Ctrl+], and assert the route moved, the
+  inactive row gains its draft indicator, and the draft survives the round
+  trip. A regression that restored the editable-field guard would stay put
+  here.
+- ``test_command_bracket_still_switches_session_from_body_focus``: blur the
+  composer so the keydown targets the body, press Command/Ctrl+], and assert the
+  route leaves the current session.
+
+No LLM turn is needed — pure client-side keyboard + routing — so this skips the
+nightly/real-agent markers the approval suites carry. Two runner-bound
+sessions come from the ``seeded_session_pair`` fixture; both render under the
+sidebar's "Sessions" group, so both are in the hotkey's ordered list.
 """
 
 from __future__ import annotations
 
+import sys
+
 import httpx
 from playwright.sync_api import Page, expect
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
@@ -39,38 +44,93 @@ def _set_title(base_url: str, session_id: str, title: str) -> None:
     resp.raise_for_status()
 
 
-def test_ctrl_arrow_switches_session_from_focused_composer(
+def test_command_bracket_switches_session_from_focused_composer(
     page: Page,
     seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """Typing in the composer, then Ctrl+↓, navigates off the current session."""
+    """Typing in the composer, then Command/Ctrl+], moves to another session."""
     base_url, session_a, session_b = seeded_session_pair
     _set_title(base_url, session_a, "e2e-switch-a")
     _set_title(base_url, session_b, "e2e-switch-b")
 
     page.goto(f"{base_url}/c/{session_a}")
 
-    # Both sessions must be present in the sidebar for the hotkey to step
-    # between them.
-    expect(page.locator(f'a[href="/c/{session_a}"]')).to_be_visible(timeout=30_000)
+    session_a_link = page.locator(f'a[href="/c/{session_a}"]')
+    expect(session_a_link).to_be_visible(timeout=30_000)
     expect(page.locator(f'a[href="/c/{session_b}"]')).to_be_visible()
+    session_a_row = page.locator("li").filter(has=session_a_link)
+    draft_indicator = session_a_row.get_by_test_id("conversation-draft-indicator")
 
-    # Put focus in the composer and leave an unsent draft — this is the exact
-    # condition under which the recall handler used to swallow the chord.
+    # Focus the composer and leave an unsent draft — the exact condition the
+    # editable-field guard used to suppress.
     composer = page.get_by_placeholder(_COMPOSER)
     expect(composer).to_be_visible()
     composer.click()
-    composer.fill("an unsent draft that recall must not intercept")
+    composer.fill("an unsent draft that must survive the switch")
+    # The open composer already exposes its own content, so its active sidebar
+    # row does not need a redundant draft marker.
+    expect(draft_indicator).to_have_count(0)
 
-    # Cmd/Ctrl+↓ steps to the adjacent sidebar session. With the bug, recall
-    # consumes ArrowDown and the route stays put; with the fix, the chord
-    # bubbles to the window hotkey and we navigate away from session_a.
-    page.keyboard.press("Control+ArrowDown")
+    # The non-platform modifier must not navigate (Control on macOS, Meta
+    # elsewhere), and holding both modifiers must not bypass that exclusivity.
+    wrong_modifier = "Control" if sys.platform == "darwin" else "Meta"
+    page.keyboard.press(f"{wrong_modifier}+BracketRight")
+    assert page.url == f"{base_url}/c/{session_a}"
+    page.keyboard.press("Meta+Control+BracketRight")
+    assert page.url == f"{base_url}/c/{session_a}"
 
-    # Assert we left the composing session for another /c/ route. We check
-    # "switched away" rather than a hard-coded target id: the suite shares one
-    # server across tests, so the sidebar may hold sessions beyond this pair —
-    # but navigating at all from a focused composer is precisely the regression.
+    # ControlOrMeta maps to the real platform modifier (Cmd on macOS, Ctrl
+    # elsewhere); CI runs Linux chromium, so this is Ctrl+].
+    page.keyboard.press("ControlOrMeta+BracketRight")
+
+    # Assert "switched away" rather than a hard-coded target: the suite shares
+    # one server, so the sidebar may hold sessions beyond this pair.
+    expect(page).not_to_have_url(f"{base_url}/c/{session_a}", timeout=10_000)
+    assert "/c/" in page.url and session_a not in page.url, (
+        f"expected to switch to another session, still at {page.url}"
+    )
+    expect(draft_indicator).to_be_visible()
+    expect(draft_indicator).to_have_accessible_name("Draft")
+
+    # Drafts are per-session, so the composer we landed on is a different one;
+    # stepping back restores the draft, proving the chord navigated rather than
+    # clobbering composer state.
+    page.keyboard.press("ControlOrMeta+BracketLeft")
+    expect(page).to_have_url(f"{base_url}/c/{session_a}", timeout=10_000)
+    expect(page.get_by_placeholder(_COMPOSER)).to_have_value(
+        "an unsent draft that must survive the switch"
+    )
+    expect(draft_indicator).to_have_count(0)
+
+
+def test_command_bracket_still_switches_session_from_body_focus(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """With focus outside the composer, Command/Ctrl+] steps to a neighbor."""
+    base_url, session_a, session_b = seeded_session_pair
+    _set_title(base_url, session_a, "e2e-switch-a")
+    _set_title(base_url, session_b, "e2e-switch-b")
+
+    page.goto(f"{base_url}/c/{session_a}")
+
+    expect(page.locator(f'a[href="/c/{session_a}"]')).to_be_visible(timeout=30_000)
+    expect(page.locator(f'a[href="/c/{session_b}"]')).to_be_visible()
+
+    # Move focus off the composer (the session page autofocuses it on load) so
+    # the keydown targets the body rather than a text field.
+    page.evaluate(
+        "() => { const el = document.activeElement; "
+        "if (el && typeof el.blur === 'function') el.blur(); }"
+    )
+
+    # Dispatch the chord at the body; the keydown bubbles to the window hook
+    # and we navigate to a neighbor.
+    page.locator("body").press("ControlOrMeta+BracketRight")
+
+    # Assert we left session_a for another /c/ route. We check "switched away"
+    # rather than a hard-coded target id: the suite shares one server across
+    # tests, so the sidebar may hold sessions beyond this pair.
     expect(page).not_to_have_url(f"{base_url}/c/{session_a}", timeout=10_000)
     assert "/c/" in page.url and session_a not in page.url, (
         f"expected to switch to another session, still at {page.url}"

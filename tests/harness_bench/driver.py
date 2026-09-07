@@ -33,6 +33,12 @@ _CONV_ID = "conv_bench"
 _STREAM_PROMPT = (
     "Count from 1 to 30 in words, one number per line, and add a short note after each."
 )
+REASONING_PROMPT = (
+    "Solve this constraint problem carefully: five tasks A, B, C, D, and E must be "
+    "ordered so that A is before C, D is immediately before B, E is not first or last, "
+    "and C is after E. Give one valid ordering and briefly explain how it satisfies every "
+    "constraint."
+)
 _LONG_PROMPT = (
     "Write a very detailed 600-word essay about the history of computing, in full paragraphs."
 )
@@ -86,11 +92,13 @@ def _error_text(error: object) -> str:
     return str(error or "")
 
 
-def infra_failure_reason(result: TurnResult) -> str | None:
+def infra_failure_reason(result: TurnResult | ForkResult) -> str | None:
     """Return a skip reason when failure reflects infrastructure, not capability."""
-    if not result.failed:
-        return None
     text = _error_text(result.error)
+    if isinstance(result, TurnResult) and result.text:
+        text = f"{text} {result.text}"
+    if not result.failed and not any(marker in text for marker in _INFRA_ERROR_MARKERS):
+        return None
     if not any(marker in text for marker in _INFRA_ERROR_MARKERS):
         return None
     for code in ("403", "401"):
@@ -136,6 +144,7 @@ class TurnResult:
     text: str = ""
     text_delta_count: int = 0
     reasoning_delta_count: int = 0
+    reasoning_item_count: int = 0
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     policy_actions: list[tuple[str, str]] = field(default_factory=list)
     tool_call_denied: bool = False
@@ -156,6 +165,19 @@ class TurnResult:
     @property
     def event_types(self) -> list[str]:
         return [e.get("type", "") for e in self.events]
+
+
+@dataclass
+class ForkResult:
+    """Probe-observable state from cloning a session and replaying its history."""
+
+    created: bool = False
+    history_copied: bool = False
+    recalled: bool = False
+    text: str = ""
+    failed: bool = False
+    error: Any = None
+    timed_out: bool = False
 
 
 def fill_snapshot_cost(result: TurnResult, snapshot: dict[str, Any]) -> None:
@@ -228,6 +250,7 @@ class SdkInprocDriver:
         policy_reason: str | None = None,
         auto_tool_output: str | None = None,
         interrupt_on_first_delta: bool = False,
+        reasoning_effort: str | None = None,
         timeout: float = 120.0,
     ) -> TurnResult:
         """Start one turn and drain its event stream."""
@@ -240,6 +263,8 @@ class SdkInprocDriver:
         }
         if tools is not None:
             body["tools"] = tools
+        if reasoning_effort is not None:
+            body["reasoning"] = {"effort": reasoning_effort}
 
         result = TurnResult()
         try:
@@ -266,6 +291,9 @@ class SdkInprocDriver:
     async def run_streaming_turn(self) -> TurnResult:
         return await self.run_turn(_STREAM_PROMPT)
 
+    async def run_reasoning_turn(self) -> TurnResult:
+        return await self.run_turn(REASONING_PROMPT, reasoning_effort="high")
+
     async def run_tool_turn(self, *, deny: bool) -> TurnResult:
         """Provoke a tool call and optionally deny its policy evaluation."""
         if deny:
@@ -283,6 +311,12 @@ class SdkInprocDriver:
             auto_tool_output="bench-tool-ok",
             timeout=150.0,
         )
+
+    async def run_mcp_tool_turn(self) -> TurnResult:
+        return TurnResult(error="Omnigent MCP relay is not observable on sdk-inproc")
+
+    async def run_fork_turn(self, marker: str) -> ForkResult:
+        return ForkResult(error="session fork is not observable on sdk-inproc")
 
     async def run_policy_turn(self, *, action: str) -> TurnResult:
         """Return unmeasured because wrap-direct cannot observe ALLOW or ASK."""
@@ -384,7 +418,11 @@ class SdkInprocDriver:
 
 # Harness wraps use both reasoning-delta spellings.
 _REASONING_DELTA_TYPES: frozenset[str] = frozenset(
-    {"response.reasoning.delta", "response.reasoning_summary_text.delta"}
+    {
+        "response.reasoning.delta",
+        "response.reasoning_text.delta",
+        "response.reasoning_summary_text.delta",
+    }
 )
 
 

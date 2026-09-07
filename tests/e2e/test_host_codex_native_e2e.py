@@ -30,11 +30,15 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.codex_native_bridge import (
+    bridge_dir_for_bridge_id,
+    read_bridge_state,
+    update_active_turn_id,
+)
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
-
-_CODEX_NATIVE_AGENT_NAME = "codex-native-ui"
 
 # Marker file the cwd-resolution tests ask Codex to read back. It is placed
 # only in the session's intended cwd (worktree / picked workspace) and never
@@ -114,10 +118,10 @@ def _codex_native_agent_id(client: httpx.Client) -> str:
     resp = client.get("/v1/agents")
     resp.raise_for_status()
     for agent in resp.json()["data"]:
-        if agent["name"] == _CODEX_NATIVE_AGENT_NAME:
+        if agent["name"] == CODEX_NATIVE_AGENT_NAME:
             return str(agent["id"])
     raise AssertionError(
-        f"{_CODEX_NATIVE_AGENT_NAME!r} not registered on the server "
+        f"{CODEX_NATIVE_AGENT_NAME!r} not registered on the server "
         "(expected from _ensure_default_agents at startup)"
     )
 
@@ -264,6 +268,101 @@ def _poll_for_assistant_marker(
         f"No assistant message containing {marker!r} within {timeout}s — "
         "the codex-native message was not answered."
     )
+
+
+def _poll_for_active_codex_turn(bridge_dir: Path, *, timeout: float) -> str:
+    """Return the active Codex turn id once the native bridge publishes it."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = read_bridge_state(bridge_dir)
+        if state is not None and state.active_turn_id is not None:
+            return state.active_turn_id
+        time.sleep(0.05)
+    raise AssertionError(f"Codex bridge {bridge_dir} published no active turn within {timeout}s")
+
+
+def _wait_for_codex_turn_idle(
+    client: httpx.Client,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    timeout: float,
+) -> None:
+    """Wait until both Omnigent and the native bridge agree the turn ended."""
+    deadline = time.monotonic() + timeout
+    last_status: object = None
+    last_active_turn: str | None = None
+    while time.monotonic() < deadline:
+        response = client.get(f"/v1/sessions/{session_id}")
+        response.raise_for_status()
+        last_status = response.json().get("status")
+        state = read_bridge_state(bridge_dir)
+        last_active_turn = state.active_turn_id if state is not None else None
+        if last_status == "idle" and state is not None and last_active_turn is None:
+            return
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(
+        f"Codex turn did not settle within {timeout}s "
+        f"(session status={last_status!r}, active turn={last_active_turn!r})"
+    )
+
+
+def _poll_for_marker_without_new_error(
+    client: httpx.Client,
+    *,
+    session_id: str,
+    marker: str,
+    prior_error_ids: set[object],
+    timeout: float,
+) -> str:
+    """Return a marker reply, failing early if the turn persists an error."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = client.get(
+            f"/v1/sessions/{session_id}/items",
+            params={"limit": 50, "order": "asc"},
+        )
+        response.raise_for_status()
+        items = response.json().get("data", [])
+        for item in items:
+            text = _assistant_text(item)
+            if marker in text:
+                return text
+        new_errors = [
+            item
+            for item in items
+            if item.get("type") == "error" and item.get("id") not in prior_error_ids
+        ]
+        if new_errors:
+            raise AssertionError(
+                f"Codex persisted an error instead of replying with {marker!r}: {new_errors!r}"
+            )
+        snapshot = client.get(f"/v1/sessions/{session_id}")
+        snapshot.raise_for_status()
+        if snapshot.json().get("status") == "failed":
+            raise AssertionError(
+                f"Codex turn failed instead of replying with {marker!r}: {snapshot.json()!r}"
+            )
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"No assistant message containing {marker!r} within {timeout}s")
+
+
+def _poll_for_child_session(
+    client: httpx.Client,
+    *,
+    parent_session_id: str,
+    timeout: float,
+) -> dict[str, object]:
+    """Poll until a Codex-native child appears under its parent."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = client.get(f"/v1/sessions/{parent_session_id}/child_sessions")
+        if resp.status_code == 200:
+            children = resp.json().get("data", [])
+            if children:
+                return children[0]
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"No child session appeared within {timeout}s")
 
 
 def _poll_for_assistant_reply(
@@ -486,16 +585,16 @@ def test_codex_native_builtin_registered_at_startup(
     """
     The server auto-registers ``codex-native-ui`` as a built-in agent.
 
-    ``_ensure_default_codex_agent`` runs during lifespan startup and
+    ``_ensure_default_native_agents`` runs during lifespan startup and
     inserts the agent into the store. ``GET /v1/agents`` must list it
     so the Web UI new-session picker can offer Codex alongside Claude.
     """
     resp = http_client.get("/v1/agents")
     resp.raise_for_status()
     agent_names = {a["name"] for a in resp.json()["data"]}
-    assert _CODEX_NATIVE_AGENT_NAME in agent_names, (
-        f"Expected {_CODEX_NATIVE_AGENT_NAME!r} in built-in agents "
-        f"{agent_names}. _ensure_default_codex_agent did not run or "
+    assert CODEX_NATIVE_AGENT_NAME in agent_names, (
+        f"Expected {CODEX_NATIVE_AGENT_NAME!r} in built-in agents "
+        f"{agent_names}. _ensure_default_native_agents did not run or "
         f"used a different name."
     )
 
@@ -511,7 +610,7 @@ def test_codex_native_builtin_session_can_be_created(
     resp.raise_for_status()
     agent_id = None
     for agent in resp.json()["data"]:
-        if agent["name"] == _CODEX_NATIVE_AGENT_NAME:
+        if agent["name"] == CODEX_NATIVE_AGENT_NAME:
             agent_id = agent["id"]
             break
     assert agent_id is not None
@@ -644,6 +743,73 @@ def test_codex_native_builtin_session_round_trip(
         assert marker in _user_text(messages[first_user]), (
             f"user message text missing the prompt marker {marker!r}; "
             f"got {_user_text(messages[first_user])!r}"
+        )
+    finally:
+        daemon.send_signal(signal.SIGTERM)
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            daemon.wait()
+
+
+@pytest.mark.skipif(
+    os.environ.get("OMNIGENT_E2E_CODEX_NATIVE") != "1" or shutil.which("codex") is None,
+    reason=(
+        "codex-native subagent e2e needs `codex` on PATH and OMNIGENT_E2E_CODEX_NATIVE=1 to run"
+    ),
+)
+def test_codex_native_spawn_creates_child_session(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """A real Codex native spawn appears as an Omnigent child session."""
+    workspace = tmp_path / "codex_subagent_ws"
+    workspace.mkdir()
+    child_marker = f"CHILD_{uuid.uuid4().hex[:6].upper()}"
+    parent_marker = f"PARENT_{uuid.uuid4().hex[:6].upper()}"
+
+    daemon = _spawn_host_daemon(tmp_path=tmp_path, live_server=live_server)
+    try:
+        host_id = _online_host_id(http_client, timeout=30.0)
+        agent_id = _codex_native_agent_id(http_client)
+        session_id = _create_codex_host_session(
+            http_client,
+            agent_id=agent_id,
+            host_id=host_id,
+            workspace=str(workspace),
+        )
+        _send_user_text(
+            http_client,
+            session_id=session_id,
+            text=(
+                "Use your native multi-agent tool to spawn exactly one subagent. "
+                f"Ask it to reply with exactly {child_marker}. Wait for it, then reply "
+                f"with exactly {parent_marker}."
+            ),
+        )
+
+        child = _poll_for_child_session(
+            http_client,
+            parent_session_id=session_id,
+            timeout=180.0,
+        )
+        child_id = str(child["id"])
+        labels = child.get("labels", {})
+        assert isinstance(labels, dict)
+        assert labels.get("omnigent.codex_native.subagent_thread_id")
+        _poll_for_assistant_marker(
+            http_client,
+            session_id=child_id,
+            marker=child_marker,
+            timeout=180.0,
+        )
+        _poll_for_assistant_marker(
+            http_client,
+            session_id=session_id,
+            marker=parent_marker,
+            timeout=180.0,
         )
     finally:
         daemon.send_signal(signal.SIGTERM)
@@ -1358,6 +1524,112 @@ def test_codex_native_web_model_effort_override_survives_turn(
             "model_override did not persist after the override turn; got "
             f"{after.json().get('model_override')!r}, expected {target_model!r}"
         )
+    finally:
+        daemon.send_signal(signal.SIGTERM)
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            daemon.wait()
+
+
+@pytest.mark.skipif(
+    os.environ.get("OMNIGENT_E2E_CODEX_NATIVE") != "1" or shutil.which("codex") is None,
+    reason=(
+        "codex-native stale-steer recovery e2e needs `codex` on PATH and "
+        "OMNIGENT_E2E_CODEX_NATIVE=1 to run"
+    ),
+)
+def test_codex_native_stale_completed_turn_recovers_with_new_turn(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """A stale completed turn id is reconciled before the next web message."""
+    workspace = tmp_path / "codex_ws"
+    workspace.mkdir()
+    first_marker = f"FIRST_{uuid.uuid4().hex[:6].upper()}"
+    second_marker = f"SECOND_{uuid.uuid4().hex[:6].upper()}"
+
+    daemon = _spawn_host_daemon(tmp_path=tmp_path, live_server=live_server)
+    try:
+        host_id = _online_host_id(http_client, timeout=30.0)
+        agent_id = _codex_native_agent_id(http_client)
+        session_id = _create_codex_host_session(
+            http_client,
+            agent_id=agent_id,
+            host_id=host_id,
+            workspace=str(workspace),
+        )
+        bridge_dir = bridge_dir_for_bridge_id(session_id)
+
+        # Complete a real first Codex turn and retain its id. The forwarder
+        # normally clears this id when it processes turn/completed.
+        _send_user_text(
+            http_client,
+            session_id=session_id,
+            text=f"Reply with exactly one word: {first_marker}",
+        )
+        completed_turn_id = _poll_for_active_codex_turn(bridge_dir, timeout=30.0)
+        _poll_for_assistant_marker(
+            http_client,
+            session_id=session_id,
+            marker=first_marker,
+            timeout=180.0,
+        )
+        _wait_for_codex_turn_idle(
+            http_client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            timeout=60.0,
+        )
+
+        before = http_client.get(
+            f"/v1/sessions/{session_id}/items",
+            params={"limit": 50, "order": "asc"},
+        )
+        before.raise_for_status()
+        prior_error_ids = {
+            item.get("id") for item in before.json().get("data", []) if item.get("type") == "error"
+        }
+
+        # Recreate the production race: Omnigent still believes completed
+        # turn A is active while Codex already considers the thread idle.
+        update_active_turn_id(bridge_dir, completed_turn_id)
+        stale_state = read_bridge_state(bridge_dir)
+        assert stale_state is not None
+        assert stale_state.active_turn_id == completed_turn_id
+
+        _send_user_text(
+            http_client,
+            session_id=session_id,
+            text=f"Reply with exactly one word: {second_marker}",
+        )
+        text = _poll_for_marker_without_new_error(
+            http_client,
+            session_id=session_id,
+            marker=second_marker,
+            prior_error_ids=prior_error_ids,
+            timeout=180.0,
+        )
+        assert second_marker in text
+        _wait_for_codex_turn_idle(
+            http_client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            timeout=60.0,
+        )
+        after = http_client.get(
+            f"/v1/sessions/{session_id}/items",
+            params={"limit": 50, "order": "asc"},
+        )
+        after.raise_for_status()
+        new_errors = [
+            item
+            for item in after.json().get("data", [])
+            if item.get("type") == "error" and item.get("id") not in prior_error_ids
+        ]
+        assert new_errors == [], f"stale-turn recovery persisted errors: {new_errors!r}"
     finally:
         daemon.send_signal(signal.SIGTERM)
         try:

@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import os
 import shutil
 import tracemalloc
 from pathlib import Path
 
-from omnigent.inner.os_env import _read_impl, _shell_impl, build_helper_env
+import pytest
+
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.os_env import (
+    _child_shell_env,
+    _project_root,
+    _read_impl,
+    _shell_impl,
+    build_helper_env,
+    create_os_environment,
+)
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VALUE,
@@ -294,3 +306,98 @@ def test_read_impl_nul_byte_file_classified_binary(tmp_path: Path) -> None:
 
     assert result["encoding"] == "base64"
     assert result["total_bytes"] == 10
+
+
+# ---------------------------------------------------------------------------
+# _child_shell_env — omnigent's own package root must not leak onto the
+# PYTHONPATH of agent shell commands (it would shadow the project's packages).
+# ---------------------------------------------------------------------------
+
+
+def test_child_shell_env_strips_project_root_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """omnigent's project root is removed; a project entry is preserved.
+
+    The helper prepends its project root to ``PYTHONPATH`` so it can import
+    omnigent at startup. Commands the agent runs must not inherit that entry,
+    or omnigent's ``site-packages`` shadows the project venv's own packages.
+
+    :returns: None.
+    """
+    project_entry = "/opt/venvs/proj/lib/python3.13/site-packages"
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(_project_root()), project_entry]))
+
+    env = _child_shell_env()
+
+    assert env["PYTHONPATH"] == project_entry
+
+
+def test_child_shell_env_drops_var_when_only_project_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the sole entry is omnigent's root, ``PYTHONPATH`` is unset.
+
+    Leaving an empty ``PYTHONPATH`` would put the shell command's cwd on
+    ``sys.path``; dropping the var entirely avoids that surprise.
+
+    :returns: None.
+    """
+    monkeypatch.setenv("PYTHONPATH", str(_project_root()))
+
+    env = _child_shell_env()
+
+    assert "PYTHONPATH" not in env
+
+
+def test_child_shell_env_noop_without_pythonpath(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``PYTHONPATH`` in the parent env means nothing to strip.
+
+    :returns: None.
+    """
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    env = _child_shell_env()
+
+    assert "PYTHONPATH" not in env
+    assert env["PATH"] == "/usr/bin"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: the real helper must not leak omnigent's package root into a
+# sys_os_shell command's PYTHONPATH. Guards the wiring in _shell_impl, not
+# just _child_shell_env in isolation.
+# ---------------------------------------------------------------------------
+
+
+def test_shell_command_does_not_see_omnigent_project_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shell command's ``PYTHONPATH`` drops omnigent's root, keeps the rest.
+
+    Spawns a real ``caller_process`` helper (``sandbox: none`` so it runs on
+    every platform) with omnigent's root pre-seeded on ``PYTHONPATH`` — the
+    same shape the helper spawn produces — and asserts the agent's command
+    sees the sibling project entry but not omnigent's, so project subprocesses
+    resolve their own packages.
+
+    :returns: None.
+    """
+    project_entry = "/opt/venvs/proj/site-packages"
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(_project_root()), project_entry]))
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    try:
+        result = asyncio.run(os_env.shell("echo PP=$PYTHONPATH"))
+    finally:
+        os_env.close()
+
+    out = result.get("stdout", "")
+    assert project_entry in out
+    assert str(_project_root()) not in out

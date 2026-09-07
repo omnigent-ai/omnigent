@@ -30,7 +30,6 @@ from omnigent.inner.hermes_executor import (
     _build_hermes_args,
     _extract_last_user_message,
     _parse_session_id,
-    _populate_hermes_home,
     _strip_hermes_metadata,
 )
 
@@ -146,55 +145,83 @@ class TestUtils:
 # ---------------------------------------------------------------------------
 
 
-class TestPopulateHermesHome:
-    """Tests for the per-session HERMES_HOME setup."""
+class TestSetupHermesHome:
+    """The headless executor's HERMES_HOME setup (option B: private-tempdir home,
+    shared bridge dir for the runner<->serve-mcp rendezvous only)."""
 
-    def test_creates_config_with_hook(self, tmp_path: pathlib.Path) -> None:
-        """config.yaml contains the pre_tool_call hook registration."""
-        _populate_hermes_home(
-            tmp_path,
-            "/path/to/hook.py",
-            "http://127.0.0.1:6767",
-            "conv_test123",
+    @pytest.fixture
+    def setup(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+        """Build an executor with a fake bridge root + session id.
+
+        Returns (home, bridge_dir): the credential-bearing HERMES_HOME (a private
+        tempdir) and the deterministic bridge dir (runner rendezvous)."""
+        import omnigent.hermes_native_bridge as hnb
+
+        monkeypatch.setattr(hnb, "_BRIDGE_ROOT", tmp_path)
+        monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
+        monkeypatch.setattr(
+            "omnigent.inner.hermes_executor._get_conversation_id",
+            lambda: "conv_test123",
         )
-        config_path = tmp_path / "config.yaml"
-        assert config_path.exists()
-        config = json.loads(config_path.read_text())
+        monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path / "nohome"))
+        executor = HermesExecutor(hermes_path="/usr/bin/hermes-fake", cwd="/tmp")
+        assert executor._hermes_home is not None
+        bridge_dir = hnb.bridge_dir_for_session_id("conv_test123")
+        return executor._hermes_home, bridge_dir
+
+    def test_config_registers_policy_hook(self, setup) -> None:
+        """config.yaml carries the pre_tool_call hook registration."""
+        home, _ = setup
+        config = json.loads((home / "config.yaml").read_text())
         assert config["hooks_auto_accept"] is True
         hooks = config["hooks"]["pre_tool_call"]
         assert len(hooks) == 1
         assert "omnigent-policy-hook.sh" in hooks[0]["command"]
 
-    def test_creates_wrapper_script(self, tmp_path: pathlib.Path) -> None:
-        """Wrapper script exports env vars and execs the Python hook."""
-        _populate_hermes_home(
-            tmp_path,
-            "/path/to/hook.py",
-            "http://127.0.0.1:6767",
-            "conv_test123",
-        )
-        wrapper = tmp_path / "omnigent-policy-hook.sh"
-        assert wrapper.exists()
-        content = wrapper.read_text()
-        assert "http://127.0.0.1:6767" in content
-        assert "conv_test123" in content
-        assert "/path/to/hook.py" in content
+    def test_config_registers_omnigent_mcp_server(self, setup) -> None:
+        """config.yaml carries mcp_servers.omnigent (serve-mcp) pointed at the bridge
+        dir — the parity gap. Fails on the previous setup, which wrote no mcp_servers
+        key: a headless Hermes agent had zero Omnigent tools."""
+        home, bridge_dir = setup
+        omnigent_mcp = json.loads((home / "config.yaml").read_text())["mcp_servers"]["omnigent"]
+        assert omnigent_mcp["args"][:4] == [
+            "-I",
+            "-m",
+            "omnigent.claude_native_bridge",
+            "serve-mcp",
+        ]
+        assert "serve-mcp" in omnigent_mcp["args"]
+        assert str(bridge_dir) in omnigent_mcp["args"]  # serve-mcp --bridge-dir <bridge_dir>
 
-    def test_creates_allowlist(self, tmp_path: pathlib.Path) -> None:
-        """shell-hooks-allowlist.json is pre-populated with correct format."""
-        _populate_hermes_home(
-            tmp_path,
-            "/path/to/hook.py",
-            "http://127.0.0.1:6767",
-            "conv_test123",
-        )
-        allowlist_path = tmp_path / "shell-hooks-allowlist.json"
-        assert allowlist_path.exists()
-        allowlist = json.loads(allowlist_path.read_text())
+    def test_credentials_stay_off_the_predictable_bridge_path(self, setup, tmp_path) -> None:
+        """The HERMES_HOME holding .env/auth.json/the token-bearing wrapper is a
+        private tempdir, NOT under the deterministic bridge dir — so credentials never
+        land on a predictable path another local user could pre-create."""
+        home, bridge_dir = setup
+        assert not home.is_relative_to(tmp_path)  # bridge root is tmp_path; home is elsewhere
+        assert (home / "omnigent-policy-hook.sh").is_file()
+        assert not (bridge_dir / "hermes_home").exists()  # no creds under the bridge dir
+
+    def test_home_is_owner_only(self, setup) -> None:
+        """The private HERMES_HOME is 0700 (mkdtemp default) — it holds credentials."""
+        import stat
+
+        home, _ = setup
+        assert stat.S_IMODE(home.stat().st_mode) & 0o077 == 0
+
+    def test_bridge_json_written_for_serve_mcp(self, setup) -> None:
+        """bridge.json (serve-mcp control token) lands in the deterministic bridge
+        dir — the runner<->serve-mcp rendezvous, same as the hermes-native path."""
+        _, bridge_dir = setup
+        assert (bridge_dir / "bridge.json").is_file()
+
+    def test_creates_allowlist(self, setup) -> None:
+        """shell-hooks-allowlist.json is pre-populated so Hermes never prompts."""
+        home, _ = setup
+        allowlist = json.loads((home / "shell-hooks-allowlist.json").read_text())
         approvals = allowlist["approvals"]
         assert len(approvals) == 1
         assert approvals[0]["event"] == "pre_tool_call"
-        assert "omnigent-policy-hook.sh" in approvals[0]["command"]
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +434,163 @@ async def test_run_turn_resumes_existing_session(
         assert list(call_args)[resume_idx + 1] == "20260620_existing_sid"
 
 
+def _sent_message(call_args: tuple) -> str:
+    """Return the ``-q <message>`` argument value from captured argv."""
+    args = list(call_args)
+    return args[args.index("-q") + 1]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_first_call_prefixes_composed_instructions_once(
+    executor: HermesExecutor,
+) -> None:
+    """A genuinely fresh session (no captured hermes_sid) prefixes exactly once."""
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.communicate = AsyncMock(
+        return_value=(b"session_id: 20260620_fresh_sid\nHi there!", b"")
+    )
+
+    with patch.object(
+        asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ) as mock_create:
+        events = []
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "Hello", "session_id": "fresh-key"}],
+            tools=[],
+            system_prompt="Be a concise assistant.",
+        ):
+            events.append(event)
+
+    call_args, _ = mock_create.call_args
+    assert _sent_message(call_args) == "Be a concise assistant.\n\nHello"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_framework_only_sends_framework_text_without_fallback(
+    executor: HermesExecutor,
+) -> None:
+    """Framework-only instructions prefix alone — never fused with the fallback."""
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.communicate = AsyncMock(
+        return_value=(b"session_id: 20260620_fw_sid\nHi there!", b"")
+    )
+
+    with patch.object(
+        asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ) as mock_create:
+        events = []
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "Hello", "session_id": "fw-key"}],
+            tools=[],
+            system_prompt="Framework note only.",
+        ):
+            events.append(event)
+
+    call_args, _ = mock_create.call_args
+    sent = _sent_message(call_args)
+    assert sent == "Framework note only.\n\nHello"
+    assert "You are a helpful assistant." not in sent
+
+
+@pytest.mark.asyncio
+async def test_run_turn_neither_case_sends_no_prefix(
+    executor: HermesExecutor,
+) -> None:
+    """Genuinely nothing to compose → the user text goes through unprefixed."""
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.communicate = AsyncMock(
+        return_value=(b"session_id: 20260620_none_sid\nHi there!", b"")
+    )
+
+    with patch.object(
+        asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ) as mock_create:
+        events = []
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "Hello", "session_id": "none-key"}],
+            tools=[],
+            system_prompt="",
+        ):
+            events.append(event)
+
+    call_args, _ = mock_create.call_args
+    assert _sent_message(call_args) == "Hello"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_resume_does_not_reprefix(
+    executor: HermesExecutor,
+) -> None:
+    """A captured session id suppresses re-prefixing, even with instructions."""
+    executor._session_map["resume-key"] = "20260620_existing_sid"
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.communicate = AsyncMock(
+        return_value=(b"session_id: 20260620_existing_sid\nFollow-up", b"")
+    )
+
+    with patch.object(
+        asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ) as mock_create:
+        events = []
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "Follow up", "session_id": "resume-key"}],
+            tools=[],
+            system_prompt="Be a concise assistant.",
+        ):
+            events.append(event)
+
+    call_args, _ = mock_create.call_args
+    assert _sent_message(call_args) == "Follow up"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_simulated_restart_reprefixes(
+    executor: HermesExecutor,
+) -> None:
+    """A harness-subprocess restart (empty _session_map) re-prefixes on the next turn.
+
+    ``_session_map`` is in-memory only; if the harness process restarts
+    mid-conversation, the map is empty and Hermes genuinely starts a new
+    vendor session — re-prefixing on that restart is correct, not a bug.
+    """
+    # Simulate a captured session id that was lost on restart.
+    assert executor._hermes_session_id("restart-key") is None
+
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.communicate = AsyncMock(
+        return_value=(b"session_id: 20260620_restarted_sid\nHi again!", b"")
+    )
+
+    with patch.object(
+        asyncio,
+        "create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ) as mock_create:
+        events = []
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "Hello again", "session_id": "restart-key"}],
+            tools=[],
+            system_prompt="Be a concise assistant.",
+        ):
+            events.append(event)
+
+    call_args, _ = mock_create.call_args
+    assert _sent_message(call_args) == "Be a concise assistant.\n\nHello again"
+
+
 @pytest.mark.asyncio
 async def test_run_turn_passes_model_from_config(
     executor: HermesExecutor,
@@ -493,3 +677,54 @@ async def test_run_turn_passes_hermes_home_env(
         _, call_kwargs = mock_create.call_args
         assert "env" in call_kwargs
         assert call_kwargs["env"]["HERMES_HOME"] == str(executor._hermes_home)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_terminates_live_process(tmp_path: pathlib.Path) -> None:
+    """A live subprocess (returncode None) is terminated and True returned."""
+    executor = HermesExecutor(hermes_path="/usr/bin/hermes-fake", cwd=str(tmp_path))
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+    mock_proc.wait = AsyncMock(return_value=0)
+    executor._proc = mock_proc
+
+    assert await executor.interrupt_session("some-key") is True
+    mock_proc.terminate.assert_called_once()
+    mock_proc.kill.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_escalates_to_kill_when_sigterm_ignored(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A subprocess that ignores SIGTERM is SIGKILLed after the grace wait."""
+    executor = HermesExecutor(hermes_path="/usr/bin/hermes-fake", cwd=str(tmp_path))
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+
+    async def _never_exits() -> int:
+        # Cancelled by interrupt_session's real grace-period wait_for.
+        await asyncio.sleep(3600)
+        return 0
+
+    mock_proc.wait = _never_exits
+    executor._proc = mock_proc
+
+    assert await executor.interrupt_session("some-key") is True
+    mock_proc.terminate.assert_called_once()
+    mock_proc.kill.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_returns_false_when_finished_or_absent(
+    tmp_path: pathlib.Path,
+) -> None:
+    """No process, or an already-exited one, yields False with no terminate."""
+    executor = HermesExecutor(hermes_path="/usr/bin/hermes-fake", cwd=str(tmp_path))
+    assert await executor.interrupt_session("some-key") is False
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    executor._proc = mock_proc
+    assert await executor.interrupt_session("some-key") is False
+    mock_proc.terminate.assert_not_called()

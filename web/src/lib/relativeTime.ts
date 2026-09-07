@@ -7,6 +7,10 @@ const YEAR_MS = 365 * DAY_MS;
 
 // "mo" (not "m") for months disambiguates from minutes.
 export function relativeTime(timestampMs: number, nowMs: number = Date.now()): string {
+  // A non-finite timestamp (missing/malformed updated_at) would make every
+  // threshold comparison false and fall through to the years branch as "NaNy".
+  // Render nothing instead of garbage.
+  if (!Number.isFinite(timestampMs)) return "";
   const diff = Math.max(0, nowMs - timestampMs);
   if (diff < MIN_MS) return "now";
   if (diff < HOUR_MS) return `${Math.floor(diff / MIN_MS)}m`;
@@ -18,5 +22,8 @@ export function relativeTime(timestampMs: number, nowMs: number = Date.now()): s
 }
 
 export function absoluteTime(timestampMs: number): string {
+  // Guard the same non-finite case as relativeTime — `new Date(NaN)` renders
+  // "Invalid Date" in the row's tooltip.
+  if (!Number.isFinite(timestampMs)) return "";
   return new Date(timestampMs).toLocaleString();
 }

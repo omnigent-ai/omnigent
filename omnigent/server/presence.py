@@ -311,7 +311,9 @@ def _expire_leave(root_id: str, user_id: str) -> None:
     with _lock:
         _pending_leaves.pop((root_id, user_id), None)
         users = _viewers.get(root_id)
-        entry = users.get(user_id) if users is not None else None
+        if users is None:
+            return
+        entry = users.get(user_id)
         if entry is None or entry.connections:
             return
         del users[user_id]

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseAskUserQuestionPreview } from "./askUserQuestion";
+import { parseAskUserQuestionPreview, userInputElicitationKey } from "./askUserQuestion";
 
 describe("parseAskUserQuestionPreview", () => {
   it("parses a single-question single-select payload", () => {
@@ -103,5 +103,42 @@ describe("parseAskUserQuestionPreview", () => {
         'AskUserQuestion({"questions": [{"question": "Q", "options": [], "multiSelect": false}]})',
       ),
     ).toBeNull();
+  });
+});
+
+describe("userInputElicitationKey", () => {
+  const questions = {
+    questions: [
+      { question: "Which library?", options: [{ label: "date-fns" }], multiSelect: false },
+    ],
+  };
+
+  it("pairs the live card with the one history rebuilds from the same call", () => {
+    // The two copies differ in every transport field — the live
+    // elicitation id is minted per prompt and never persisted — so the
+    // questions are what identifies them as the same exchange.
+    const live = { askUserQuestion: questions, contentPreview: "" };
+    const rebuilt = { askUserQuestion: { ...questions, extra: 1 }, contentPreview: "" };
+    expect(userInputElicitationKey(live)).toBe(userInputElicitationKey(rebuilt));
+  });
+
+  it("separates different questions, and plans from questions", () => {
+    const other = {
+      askUserQuestion: {
+        questions: [{ question: "Which db?", options: [{ label: "pg" }], multiSelect: false }],
+      },
+      contentPreview: "",
+    };
+    const plan = { exitPlanMode: { plan: "## Steps" }, contentPreview: "" };
+    const keys = [
+      userInputElicitationKey({ askUserQuestion: questions, contentPreview: "" }),
+      userInputElicitationKey(other),
+      userInputElicitationKey(plan),
+    ];
+    expect(new Set(keys).size).toBe(3);
+  });
+
+  it("returns null for an approval card so plain gates are never paired", () => {
+    expect(userInputElicitationKey({ contentPreview: 'Bash({"command": "ls"})' })).toBeNull();
   });
 });

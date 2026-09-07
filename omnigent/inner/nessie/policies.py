@@ -10,7 +10,13 @@ from omnigent.policies.builtins.orchestration import POLICY_REGISTRY as _new_reg
 # bundles that were deployed before the module was renamed.
 _OLD = "omnigent.inner.nessie.policies."
 _NEW = "omnigent.policies.builtins.orchestration."
-POLICY_REGISTRY = [
-    {**entry, "handler": entry["handler"].replace(_NEW, _OLD), "internal_only": True}
-    for entry in _new_registry
-]
+
+
+def _legacy_entry(entry: dict[str, object]) -> dict[str, object]:
+    handler = entry.get("handler")
+    if not isinstance(handler, str):
+        raise TypeError("policy registry handler must be a string")
+    return {**entry, "handler": handler.replace(_NEW, _OLD), "internal_only": True}
+
+
+POLICY_REGISTRY = [_legacy_entry(entry) for entry in _new_registry]

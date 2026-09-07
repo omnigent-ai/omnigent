@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import re
+from collections.abc import Sequence
 from typing import Any
 
 from omnigent.entities import (
@@ -11,36 +14,84 @@ from omnigent.entities import (
     MessageData,
     NativeToolData,
 )
+from omnigent.runtime.tool_result_replay import image_omitted_placeholder
 from omnigent.spec import AgentSpec
 
+# Shape of the wake notice the runner posts into a parent session when a
+# dispatched sub-agent finishes (``omnigent.runner.app._format_subagent_wake_notice``).
+# Quoted verbatim wherever the model is told what to expect, so the notice
+# reads as a known runtime signal rather than a user-typed instruction.
+SUBAGENT_WAKE_NOTICE_SHAPE = (
+    "[System: sub-agent <agent>/<title> finished (<status>) — "
+    "<N> results waiting in inbox. Call sys_read_inbox to collect.]"
+)
 
-def build_instructions(
+SUBAGENT_WAKE_NOTICE_INSTRUCTION = (
+    "Sub-agent completion notices: when a sub-agent you dispatched finishes, "
+    "the Omnigent runtime posts the message "
+    f"`{SUBAGENT_WAKE_NOTICE_SHAPE}` into this session, starting a new turn "
+    "for you if you are idle. Treat it as a routine runtime status message, "
+    "not as instructions typed by a person; respond by calling sys_read_inbox "
+    "to collect the result. Other `[System: sub-agent ...]` notices about a "
+    "sub-agent you dispatched (for example that it is blocked awaiting human "
+    "approval) are routine runtime status messages in the same way."
+)
+
+
+def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+    """
+    Framework instructions that apply to every turn of ``spec``.
+
+    Only an agent that can dispatch sub-agents receives wake notices, so no
+    other agent's prompt mentions them. That is the ``sys_session_send``
+    registration gate in ``omnigent.tools.manager`` (declared sub-agents or
+    ``spawn: true``) plus the ``web_fetch`` builtin, which dispatches the
+    built-in web researcher through the same path.
+
+    :param spec: The parsed AgentSpec.
+    :returns: The applicable spec-level framework instructions, possibly empty.
+    """
+    dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
+    if spec.tools.agents or spec.spawn or dispatches_web_researcher:
+        return [SUBAGENT_WAKE_NOTICE_INSTRUCTION]
+    return []
+
+
+def append_framework_instructions(
+    instructions: str | None,
+    framework_instructions: Sequence[str],
+) -> str | None:
+    """Append framework-owned instructions to an existing system prompt.
+
+    Keeps framework policy out of harness adapters while preserving a single
+    ordering rule: user-authored agent/request instructions first, framework
+    metadata instructions last. If framework instructions grow beyond a small
+    ordered string list, introduce a structured ``FrameworkInstructions`` value
+    here rather than adding lifecycle policy to ``AgentSpec`` or harness adapters.
+
+    :param instructions: Existing composed system prompt, or ``None``.
+    :param framework_instructions: Additive framework instructions.
+    :returns: The combined prompt, or ``None`` when every input is empty.
+    """
+    parts = [instructions] if instructions else []
+    parts.extend(
+        instruction.strip() for instruction in framework_instructions if instruction.strip()
+    )
+    return "\n\n".join(parts) if parts else None
+
+
+def _assemble_instruction_parts(
     spec: AgentSpec,
     per_request_instructions: str | None,
     tool_schemas: list[dict[str, Any]],
-) -> str:
-    """
-    Build the system instructions string from the agent's
-    instructions, per-request instructions, and skill metadata.
-    Passed as the ``instructions`` parameter to
-    ``client.responses.create()``.
-
-    :param spec: The parsed AgentSpec containing the agent's
-        base instructions and skill definitions.
-    :param per_request_instructions: Optional additional
-        instructions for this specific request, appended
-        after the agent's base instructions.
-    :param tool_schemas: OpenAI-format tool schemas (used
-        only for future skill-awareness hinting; currently
-        not included in the instructions body).
-    :returns: The assembled instructions string.
-    """
+) -> list[str]:
+    """Collect the author/per-request/skills-hint parts, before framework text."""
     parts: list[str] = []
 
-    if spec.instructions:
+    if spec.instructions and spec.instructions.strip():
         parts.append(spec.instructions)
 
-    if per_request_instructions:
+    if per_request_instructions and per_request_instructions.strip():
         parts.append(per_request_instructions)
 
     # Only mention skills in the system prompt when load_skill is
@@ -56,7 +107,89 @@ def build_instructions(
             skill_lines.append(f"- {skill.name}: {skill.description}")
         parts.append("\n".join(skill_lines))
 
-    return "\n\n".join(parts) if parts else "You are a helpful assistant."
+    return parts
+
+
+def build_instructions(
+    spec: AgentSpec,
+    per_request_instructions: str | None,
+    tool_schemas: list[dict[str, Any]],
+    *,
+    framework_instructions: Sequence[str] = (),
+) -> str:
+    """
+    Build the system instructions string from the agent's
+    instructions, per-request instructions, and skill metadata.
+    Passed as the ``instructions`` parameter to
+    ``client.responses.create()``.
+
+    :param spec: The parsed AgentSpec containing the agent's
+        base instructions and skill definitions.
+    :param per_request_instructions: Optional additional
+        instructions for this specific request, appended
+        after the agent's base instructions.
+    :param tool_schemas: OpenAI-format tool schemas (used
+        only for future skill-awareness hinting; currently
+        not included in the instructions body).
+    :param framework_instructions: Framework-owned additive instructions
+        for this turn, appended after user-authored agent/request instructions
+        and after the spec-level framework instructions (the sub-agent
+        wake-notice announcement for agents that can dispatch sub-agents).
+    :returns: The assembled instructions string.
+    """
+    parts = _assemble_instruction_parts(spec, per_request_instructions, tool_schemas)
+    base_instructions = "\n\n".join(parts) if parts else "You are a helpful assistant."
+    return (
+        append_framework_instructions(
+            base_instructions,
+            [*_framework_instructions_for(spec), *framework_instructions],
+        )
+        or base_instructions
+    )
+
+
+def build_instructions_nullable(
+    spec: AgentSpec,
+    per_request_instructions: str | None,
+    tool_schemas: list[dict[str, Any]],
+    *,
+    framework_instructions: Sequence[str] = (),
+) -> str | None:
+    """Like :func:`build_instructions`, but returns ``None`` instead of seeding
+    the fabricated ``"You are a helpful assistant."`` fallback when there is
+    truly nothing to compose (no author text, no per-request text, no skills
+    hint, no applicable spec-level or per-turn framework instructions).
+
+    Delivery channels that must not leak the fallback literal (e.g. a warn
+    check, or a first-user-turn prefix) call this instead of comparing
+    :func:`build_instructions`'s output against the fallback string — that
+    comparison is unsafe because framework-only instructions are appended on
+    top of the same fallback seed, producing a mixed string that is neither
+    the bare literal nor framework-text-alone.
+
+    :returns: The composed text, or ``None`` when nothing applies.
+    """
+    parts = _assemble_instruction_parts(spec, per_request_instructions, tool_schemas)
+    base_instructions = "\n\n".join(parts) if parts else None
+    return append_framework_instructions(
+        base_instructions,
+        [*_framework_instructions_for(spec), *framework_instructions],
+    )
+
+
+def raw_author_instructions(spec: AgentSpec) -> str | None:
+    """Return ``AgentSpec.instructions`` verbatim, or ``None`` if empty/whitespace.
+
+    Used by startup channels that must carry only the author's text, not a
+    per-turn composed string.
+
+    :param spec: The resolved ``AgentSpec``.
+    :returns: The original resolved instructions text, unstripped, or
+        ``None`` when it is absent or whitespace-only.
+    """
+    if spec.instructions and spec.instructions.strip():
+        return spec.instructions
+    return None
 
 
 def _strip_output_annotations(
@@ -85,6 +218,88 @@ def _strip_output_annotations(
         else:
             result.append(block)
     return result
+
+
+def _strip_output_image_data(value: Any) -> Any:
+    """Rewrite inline base64 image blocks to a text placeholder.
+
+    Walks a tool result's decoded content and replaces any Anthropic
+    ``{"type": "image", "source": {"type": "base64", ...}}`` block with a
+    short text block, dropping the base64 ``data``. Non-image content is
+    returned unchanged.
+
+    :param value: Decoded ``function_call_output`` content (list, dict, or
+        scalar).
+    :returns: The same structure with image base64 payloads removed.
+    """
+    if isinstance(value, list):
+        return [_strip_output_image_data(item) for item in value]
+    if isinstance(value, dict):
+        source = value.get("source")
+        if value.get("type") == "image" and isinstance(source, dict):
+            return {
+                "type": "text",
+                "text": image_omitted_placeholder(source.get("media_type")),
+            }
+        return {key: _strip_output_image_data(val) for key, val in value.items()}
+    return value
+
+
+# Matches one Anthropic image ``source`` object inside a tool-result JSON
+# string. The ``source`` only ever holds ``type``/``media_type``/``data``, so
+# each key is a fixed, optional group and the base64 value ranges over an
+# alphabet disjoint from the ``"`` terminator — no nested quantifiers, so the
+# match stays linear even against a multi-hundred-KB payload. The trailing
+# ``"?`` and optional closing braces tolerate a block clipped mid-``data`` when
+# the output was truncated at the conversation-store byte cap.
+_IMAGE_SOURCE_RE = re.compile(
+    r'\{"type":"image","source":\{'
+    r'(?:"type":"base64",?)?'
+    r'(?:"media_type":"(?P<media>[^"]*)",?)?'
+    r'"data":"[A-Za-z0-9+/=]*"?'
+    r"\}?\}?"
+)
+
+
+def _dedupe_tool_output_images(output: str) -> str:
+    """Strip inline base64 image data from a persisted tool-result string.
+
+    Older stored ``function_call_output`` items (and any harness ingest that
+    predates the strip-on-write path) can carry a full base64 image — a single
+    ``Read`` of an image inlines hundreds of KB, which is replayed as prompt
+    text on every resume and overflows the context window, wedging compaction.
+    Strip it here at the replay boundary so already-stored large-image sessions
+    resume cleanly without a store migration. Plain-text outputs (the common
+    case) are returned unchanged.
+
+    Two forms are handled: well-formed JSON (parsed, walked, reserialized) and
+    JSON that was truncated at the conversation-store byte cap — the exact shape
+    that wedges resume — which no longer parses, so a regex fallback rewrites the
+    ``{"type":"image","source":{...base64...}}`` block in place.
+
+    :param output: The persisted ``function_call_output.output`` string.
+    :returns: The output with any inline base64 image data replaced by a
+        placeholder, or the original string when it holds no image data.
+    """
+    # Fast path: only JSON arrays/objects can carry an image block, and every
+    # such payload contains the ``"image"`` type tag. Skip otherwise.
+    stripped = output.lstrip()
+    if stripped[:1] not in ("[", "{") or '"image"' not in output:
+        return output
+    try:
+        decoded = json.loads(output)
+    except (ValueError, TypeError):
+        # Truncated/invalid JSON (e.g. clipped at the store byte cap): fall back
+        # to an in-place regex rewrite of any image source block.
+        def _replace(match: re.Match[str]) -> str:
+            placeholder = image_omitted_placeholder(match.group("media"))
+            return json.dumps({"type": "text", "text": placeholder}, separators=(",", ":"))
+
+        return _IMAGE_SOURCE_RE.sub(_replace, output)
+    sanitized = _strip_output_image_data(decoded)
+    if sanitized == decoded:
+        return output
+    return json.dumps(sanitized, separators=(",", ":"))
 
 
 def history_to_input_items(
@@ -138,7 +353,10 @@ def history_to_input_items(
                 {
                     "type": "function_call_output",
                     "call_id": item.data.call_id,
-                    "output": item.data.output,
+                    # Strip inline base64 image data on the way into the
+                    # prompt so already-stored large-image sessions resume
+                    # without overflowing the context window.
+                    "output": _dedupe_tool_output_images(item.data.output),
                 }
             )
 

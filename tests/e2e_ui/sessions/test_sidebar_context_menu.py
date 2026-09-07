@@ -50,11 +50,14 @@ def test_right_click_opens_session_actions_menu(
     # The context menu carries the full set of kebab actions — same testids,
     # proving it renders from the shared ConversationMenuItems body. (The kebab
     # DropdownMenu is closed, so these are the context menu's own items.)
-    expect(page.get_by_test_id("share-conversation")).to_be_visible()
+    # Share is the exception: the shared e2e server is single-user
+    # (OMNIGENT_LOCAL_SINGLE_USER=1), which has no other users to share with,
+    # so the Share item is omitted here (asserted absent below).
     expect(page.get_by_test_id("rename-conversation")).to_be_visible()
     expect(page.get_by_test_id("move-to-project")).to_be_visible()
     expect(page.get_by_test_id("archive-conversation")).to_be_visible()
     expect(page.get_by_test_id("delete-conversation")).to_be_visible()
+    expect(page.get_by_test_id("share-conversation")).to_have_count(0)
 
     # Selecting Rename runs the same path as the kebab / double-click: the row
     # swaps for the inline edit field. Right-click did not navigate away.

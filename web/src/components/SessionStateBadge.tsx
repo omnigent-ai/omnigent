@@ -30,7 +30,9 @@ function describe(state: SessionState): Visual {
         ariaLabel: tooltip,
         tooltip,
         render: () => (
-          <Badge className="border-transparent bg-warning/25 text-warning">Needs response</Badge>
+          <Badge className="border-transparent bg-brand-accent/15 text-brand-accent">
+            Needs response
+          </Badge>
         ),
       };
     }
@@ -39,7 +41,15 @@ function describe(state: SessionState): Visual {
         kind: state.kind,
         ariaLabel: "Session running",
         tooltip: "Session running",
-        render: () => <RunningDot />,
+        render: () => <RunningDot className="size-3" />,
+      };
+    case "starting":
+      // Same spinner as running — the session is coming up, not yet working.
+      return {
+        kind: state.kind,
+        ariaLabel: "Session starting up",
+        tooltip: "Session starting up",
+        render: () => <RunningDot className="size-3" />,
       };
     case "unseen":
       // Solid brand-pink dot — distinguished from the running indicator,
@@ -54,7 +64,7 @@ function describe(state: SessionState): Visual {
 }
 
 function Dot({ tone }: { tone: string }) {
-  return <span aria-hidden className={cn("size-2 shrink-0 rounded-full", tone)} />;
+  return <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", tone)} />;
 }
 
 export function SessionStateBadge({ state }: SessionStateBadgeProps) {

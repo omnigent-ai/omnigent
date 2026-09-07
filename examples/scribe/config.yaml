@@ -44,7 +44,7 @@ prompt: |
   even across several files; any change to source code or tests, and any deep
   code investigation, goes to a sub-agent.
 
-  You have exactly TWO sub-agents (see agents/<name>/):
+  You have exactly TWO sub-agents (see agents/<dir>/):
   - `researcher` — a read-only repo explorer (claude-sdk). Ask it how something
     actually works, what a diff changed, or to trace behavior across files; it
     returns a findings report and edits nothing.
@@ -107,7 +107,7 @@ prompt: |
   - api-docs — document a module or public API surface.
 
   Skills are prose, so you author new ones yourself into Scribe's OWN skills
-  directory (`examples/scribe/skills/<name>/SKILL.md`), never the host
+  directory (`examples/scribe/skills/<dir>/SKILL.md`), never the host
   `~/.claude/skills/` directory.
 
 async: true
@@ -139,7 +139,7 @@ guardrails:
           gate_pushes: false
 
 tools:
-  # The two sub-agents — see agents/<name>/. `researcher` explores read-only on
+  # The two sub-agents — see agents/<dir>/. `researcher` explores read-only on
   # claude-sdk; `reviewer` fact-checks on codex (a different vendor) so the
   # cross-model check is meaningful.
   agents:

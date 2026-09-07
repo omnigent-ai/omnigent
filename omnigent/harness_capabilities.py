@@ -44,6 +44,7 @@ class Elicitation(str, Enum):
 class Resume(str, Enum):
     """Whether a prior conversation is reattached or rebuilt."""
 
+    NONE = "none"  # prior conversations cannot be resumed
     WARM_REATTACH = "warm-reattach"  # reattach to a live vendor session / terminal
     COLD_ONLY = "cold-only"  # rebuild from Omnigent transcript / history replay
 
@@ -56,6 +57,7 @@ class EffortFamily(str, Enum):
     OPENAI = "openai"
     GEMINI = "gemini"
     COPILOT = "copilot"
+    PI = "pi"
 
 
 class ModelFamily(str, Enum):
@@ -75,6 +77,29 @@ class AuthModel(str, Enum):
     SESSION_SCOPED_CONFIG = "session-scoped-config"  # per-session synthesized vendor config
 
 
+class ForkHistory(str, Enum):
+    """How a fork (or in-place agent switch) carries prior history into the harness."""
+
+    NONE = "none"  # fork launches fresh; no prior turns are carried
+    REBUILD = "rebuild"  # rebuild the vendor's resumable session file from copied items
+    PREAMBLE = "preamble"  # replay prior turns as a text preamble (server-backed vendors)
+
+
+class InstructionDelivery(str, Enum):
+    """Whether and how ``AgentSpec.instructions`` reach the vendor agent.
+
+    See ``docs/AGENT_YAML_SPEC.md`` for the full per-harness matrix and the
+    lifecycle meaning of each value.
+    """
+
+    COMPOSED_PER_TURN = "composed-per-turn"
+    COMPOSED_SESSION_SNAPSHOT = "composed-session-snapshot"
+    AGENT_STARTUP_ADDITIVE = "agent-startup-additive"
+    FIRST_USER_PREFIX = "first-user-prefix"
+    NOT_DELIVERED = "not-delivered"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class HarnessCapabilities:
     """The declared feature set one harness supports.
@@ -92,6 +117,27 @@ class HarnessCapabilities:
     :param streaming: Whether the harness forwards token-level deltas (vs a
         single complete blob). Declared claim; verified by the bench's
         streaming probe.
+    :param steering: Whether input can be added to an active turn.
+    :param live_queue: Whether follow-up input can be queued during an active
+        turn.
+    :param images: Whether the harness accepts image input.
+    :param compaction: Whether the harness can compact conversation history.
+        Optional capability fields use ``None`` when the harness makes no claim;
+        the bench reports those declarations as ``UNKNOWN`` rather than assuming
+        the capability is unsupported.
+    :param fork_history: How a fork / in-place agent switch carries prior history
+        into the harness — ``none`` (fresh), ``rebuild`` (rebuild the vendor's
+        resumable session file from copied items), or ``preamble`` (replay prior
+        turns as a text preamble). Drives the server's fork-history gating.
+    :param shell_tool_name: The harness's shell/exec tool name the harness bench
+        provokes to verify tool-calling (e.g. ``"Bash"``, ``"shell"``). ``None``
+        skips the bench's tool/policy probe for this harness.
+    :param shell_tool_prompt: The prompt the bench sends to provoke that tool.
+        Must contain the ``omnigent-bench-ok`` placeholder the probe token-swaps.
+        ``None`` skips the probe.
+    :param instruction_delivery: Whether and how ``AgentSpec.instructions``
+        reach the vendor agent. Defaults to ``UNKNOWN`` for undeclared/
+        third-party harnesses.
     """
 
     integration_mode: IntegrationMode
@@ -103,8 +149,16 @@ class HarnessCapabilities:
     subagents: bool
     interrupt: bool
     streaming: bool
+    steering: bool | None = None
+    live_queue: bool | None = None
+    images: bool | None = None
+    compaction: bool | None = None
+    fork_history: ForkHistory = ForkHistory.NONE
+    shell_tool_name: str | None = None
+    shell_tool_prompt: str | None = None
+    instruction_delivery: InstructionDelivery = InstructionDelivery.UNKNOWN
 
-    def as_dict(self) -> dict[str, str | bool]:
+    def as_dict(self) -> dict[str, str | bool | None]:
         """Return a JSON-serializable view for the ``/v1/harnesses`` catalog."""
         return {
             "integration_mode": self.integration_mode.value,
@@ -116,4 +170,12 @@ class HarnessCapabilities:
             "subagents": self.subagents,
             "interrupt": self.interrupt,
             "streaming": self.streaming,
+            "steering": self.steering,
+            "live_queue": self.live_queue,
+            "images": self.images,
+            "compaction": self.compaction,
+            "fork_history": self.fork_history.value,
+            "shell_tool_name": self.shell_tool_name,
+            "shell_tool_prompt": self.shell_tool_prompt,
+            "instruction_delivery": self.instruction_delivery.value,
         }

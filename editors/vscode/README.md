@@ -39,11 +39,11 @@ buttons and `navigator.clipboard` paths still work.)
 ## Build / test / package
 
 ```bash
-npm ci
-npm run type-check   # tsc --noEmit
-npm run test         # vitest run
-npm run build        # esbuild -> dist/extension.js
-npm run package      # @vscode/vsce package -> omnigent-vscode-<version>.vsix
+pnpm install --frozen-lockfile
+pnpm run type-check   # tsc --noEmit
+pnpm run test         # vitest run
+pnpm run build        # esbuild -> dist/extension.js
+pnpm run package      # @vscode/vsce package -> omnigent-vscode-<version>.vsix
 ```
 
 Install the resulting `.vsix` via the Extensions view → "Install from VSIX…". The

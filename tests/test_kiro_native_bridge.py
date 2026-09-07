@@ -577,3 +577,63 @@ def test_inject_model_command_raises_when_switch_not_confirmed(
 
     with pytest.raises(RuntimeError, match="did not confirm the model switch"):
         bridge.inject_model_command(bridge_dir, model="bogus-model", timeout_s=0.1)
+
+
+_BOOTING_PANE = "old output\n────────────────\n\n Initializing · type to queue a message"
+
+
+def test_inject_user_message_waits_out_a_slow_kiro_tui_boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A TUI still showing "Initializing" past ``timeout_s`` is waited out, not failed."""
+    monkeypatch.setattr(bridge, "_TYPE_COMMIT_TIMEOUT_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    # Still booting when the caller's short deadline expires, ready just after.
+    _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_BOOTING_PANE, _BOOTING_PANE, _BOOTING_PANE, _READY_PANE],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    inject_user_message(bridge_dir, content="hello", timeout_s=0.1)
+
+
+def test_inject_user_message_fails_fast_when_pane_is_not_booting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pane that is neither ready nor booting still fails at ``timeout_s``."""
+    monkeypatch.setattr(bridge, "_KIRO_BOOT_READY_TIMEOUT_S", 600.0)
+    bridge_dir = tmp_path / "bridge"
+    _install_fake_tmux(monkeypatch, pane_outputs=["idle pane, no kiro prompt\n$ \n"])
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    with pytest.raises(RuntimeError, match="was not ready before injection"):
+        inject_user_message(bridge_dir, content="hello", timeout_s=0.1)
+
+
+def test_inject_user_message_surfaces_kiro_cli_argv_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A kiro-cli that refused its argv never renders a prompt; quote its error."""
+    error_pane = "error: Conflicting options: --tui cannot be used with --agent-engine=v1.\n$ \n"
+    bridge_dir = tmp_path / "bridge"
+    _install_fake_tmux(monkeypatch, pane_outputs=[error_pane])
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    with pytest.raises(RuntimeError, match="Conflicting options"):
+        inject_user_message(bridge_dir, content="hello", timeout_s=0.1)

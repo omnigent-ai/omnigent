@@ -163,6 +163,10 @@ class OIDCConfig:
         ``id_token`` email claim without requiring
         ``email_verified``. Only affects the generic-OIDC path;
         GitHub always requires a verified primary email.
+    :param email_claim: Name of the ``id_token`` claim that carries
+        the user's email identity, e.g. ``"preferred_username"`` for
+        IdPs that omit ``email`` (Microsoft Entra ID). Defaults to
+        ``"email"``. Only affects the generic-OIDC path.
     """
 
     issuer: str
@@ -181,6 +185,7 @@ class OIDCConfig:
     userinfo_endpoint: str | None
     allow_invites: bool
     skip_email_verification: bool = False
+    email_claim: str = "email"
 
     @property
     def base_url(self) -> str:
@@ -306,6 +311,25 @@ class OIDCConfig:
                 issuer,
             )
 
+        # Some IdPs carry the email identity in a claim other than
+        # ``email`` (Microsoft Entra ID commonly issues only
+        # ``preferred_username``, the UPN).
+        email_claim = (os.environ.get("OMNIGENT_OIDC_EMAIL_CLAIM") or "email").strip()
+        if email_claim != "email":
+            _logger.warning(
+                "OMNIGENT_OIDC_EMAIL_CLAIM is set: the user identity "
+                "will be read from the %r claim of id_tokens issued by "
+                "%s instead of ``email``.",
+                email_claim,
+                issuer,
+            )
+            if not skip_email_verification:
+                _logger.warning(
+                    "A custom email claim carries no email_verified "
+                    "marker, so logins will be rejected unless "
+                    "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is also set."
+                )
+
         # Determine provider type and resolve endpoints.
         is_github = issuer.rstrip("/") == _GITHUB_ISSUER
 
@@ -371,4 +395,5 @@ class OIDCConfig:
             userinfo_endpoint=doc.get("userinfo_endpoint"),
             allow_invites=allow_invites,
             skip_email_verification=skip_email_verification,
+            email_claim=email_claim,
         )

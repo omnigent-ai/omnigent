@@ -63,4 +63,14 @@ describe("UserMessageNav", () => {
     expect(props.goPrev).toHaveBeenCalledOnce();
     expect(props.goNext).toHaveBeenCalledOnce();
   });
+
+  it("forwards className to the control container", () => {
+    // The connected wrapper passes responsive classes (e.g. `md:hidden`, so
+    // the TurnRail minimap replaces these buttons on desktop) via className.
+    // If the component dropped it, that mobile-only gating would silently
+    // stop working. Assert the class reaches the rendered container.
+    renderNav({ className: "md:hidden" });
+    const container = screen.getByLabelText("Previous user message").closest("div");
+    expect(container).toHaveClass("md:hidden");
+  });
 });

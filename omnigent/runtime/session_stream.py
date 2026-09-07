@@ -1,13 +1,14 @@
 """Pure pub-sub in-process live stream for real-time SSE delivery.
 
 This module is a fan-out broadcaster keyed by ``conversation_id``.
-Every active call to :func:`subscribe` owns its own ephemeral
-``asyncio.Queue``; :func:`publish` fans the event out to all
-queues currently subscribed to that conversation_id. Events emitted
-before any subscriber is connected are LOST — there is no buffer
-and no replay. Clients that need to recover state across a
-disconnect fetch ``GET /v1/sessions/{id}`` for the persisted
-history and dedupe by item id.
+Every active call to :func:`subscribe` owns its own bounded ephemeral
+``asyncio.Queue``; :func:`publish` fans the event out to all queues
+currently subscribed to that conversation_id. A subscriber that falls
+behind past the bound is disconnected so it can recover through the
+snapshot + live-tail reconnect contract. Events emitted before any
+subscriber is connected are LOST — there is no buffer and no replay.
+Clients that need to recover state across a disconnect fetch
+``GET /v1/sessions/{id}`` for the persisted history and dedupe by item id.
 
 This module owns no per-conversation lifecycle. There is no
 ``register`` / ``unregister`` step: the first ``subscribe`` call
@@ -26,17 +27,33 @@ Consumer (SSE endpoint, async):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any
 
+from omnigent.debug_logging import (
+    audit_event_logger,
+    debug_event,
+    debug_sink_enabled,
+    sse_event_logger,
+)
 from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
 
-# Sentinel object that signals end-of-stream to every subscriber.
+# A generous burst allowance that still bounds one stalled subscriber's memory.
+_SUBSCRIBER_QUEUE_MAX_EVENTS = 1024
+
+# Sentinel objects that signal terminal subscriber states.
 _DONE = object()
+_OVERFLOW = object()
+
+
+class SubscriberOverflowError(RuntimeError):
+    """Raised when a subscriber falls behind the bounded live-event queue."""
+
 
 # Subscriber registry: conversation_id -> set of
 # (queue, event_loop) pairs. The event_loop reference is needed
@@ -49,7 +66,145 @@ _subscribers: dict[
 _lock = threading.Lock()
 
 
-def publish(conversation_id: str, event: dict[str, Any]) -> None:
+def _enqueue_or_overflow(
+    queue: asyncio.Queue[dict[str, Any] | object],
+    item: dict[str, Any] | object,
+) -> None:
+    """Enqueue *item*, replacing a full backlog with an overflow signal."""
+    try:
+        queue.put_nowait(item)
+        return
+    except asyncio.QueueFull:
+        pass
+
+    while True:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+    queue.put_nowait(_OVERFLOW)
+
+
+# ── SSE-event debug logging (table-only; see omnigent.debug_logging) ──────────
+# Frequent, low-signal events not worth a debug-log row.
+_SSE_SKIP_TYPES = frozenset(
+    {"session.terminal.activity", "session.heartbeat", "response.heartbeat"}
+)
+# Failure events logged at WARNING so the table's level column flags them.
+_SSE_WARN_TYPES = frozenset(
+    {"response.failed", "response.error", "turn.failed", "response.policy_denied"}
+)
+# Terminal SSE events → the turn's outcome. Emitted once per turn as a
+# first-class ``turn_finished`` audit row (session-scoped), so turn success /
+# failure is queryable without inferring it from the raw SSE stream.
+_TURN_OUTCOME_BY_EVENT_TYPE = {
+    "response.completed": "completed",
+    "response.failed": "failed",
+    "response.cancelled": "cancelled",
+    "response.incomplete": "incomplete",
+}
+# Top-level event fields safe to log — stable identifiers, closed enums, and
+# pure numerics only. Deliberately excludes human/LLM-authored free text
+# (``reason`` — PolicyDeniedEvent's deny reason is LLM-generated and can quote
+# the content it evaluated — and ``blocked_on``, a free-form "human phrase") and
+# ``tool_name`` (author-defined for custom/MCP tools; ``call_id`` still
+# correlates a call to its result without naming the tool), alongside the
+# content fields dropped in _sse_safe_attributes.
+_SSE_SAFE_KEYS = (
+    "status",
+    "call_id",
+    "message_id",
+    "phase",
+    "attempt",
+    "max_attempts",
+    "sequence_number",
+    "index",
+    "final",
+    "model",
+    "context_tokens",
+    "context_window",
+    "total_cost_usd",
+)
+
+
+def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
+    """Extract only safe identifiers/dimensions from an SSE event.
+
+    A strict whitelist: content and free-text fields (``delta`` text, tool
+    ``arguments`` / outputs, message/reasoning ``data``, ``error.message``,
+    human/LLM-authored ``reason`` / ``blocked_on``, and ``tool_name``) are never
+    read, so no model response or user content reaches the debug table.
+    """
+    attrs: dict[str, object] = {}
+    for key in _SSE_SAFE_KEYS:
+        value = event.get(key)
+        if value is not None and not isinstance(value, (dict, list)):
+            attrs[key] = value
+    response = event.get("response")
+    if isinstance(response, dict) and isinstance(response.get("id"), str):
+        attrs["response_id"] = response["id"]
+    elif isinstance(event.get("response_id"), str):
+        attrs["response_id"] = event["response_id"]
+    item = event.get("item")
+    if isinstance(item, dict):
+        if isinstance(item.get("id"), str):
+            attrs["item_id"] = item["id"]
+        if isinstance(item.get("type"), str):
+            attrs["item_type"] = item["type"]
+    error = event.get("error")
+    if isinstance(error, dict):
+        if error.get("code") is not None:
+            attrs["error_code"] = error["code"]
+        if error.get("source") is not None:
+            attrs["error_source"] = error["source"]
+    return attrs
+
+
+def _log_sse_event(conversation_id: str, event: dict[str, Any]) -> None:
+    """Mirror one emitted SSE event to the debug-log table (best-effort).
+
+    No-op unless the debug-log sink is enabled. Logs the event name and safe
+    ids only (never content); heartbeats / terminal-activity are skipped, and
+    failure events go at WARNING. Never raises into :func:`publish`.
+    """
+    with contextlib.suppress(Exception):
+        if not debug_sink_enabled():
+            return
+        event_type = event.get("type")
+        if not isinstance(event_type, str) or event_type in _SSE_SKIP_TYPES:
+            return
+        level = logging.WARNING if event_type in _SSE_WARN_TYPES else logging.INFO
+        extra = debug_event(event_type, session_id=conversation_id)
+        extra["attributes"] = _sse_safe_attributes(event)
+        sse_event_logger().log(level, "sse %s", event_type, extra=extra)
+        _log_turn_outcome(conversation_id, event_type, event)
+
+
+def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, Any]) -> None:
+    """Emit a first-class ``turn_finished`` audit row on a terminal SSE event.
+
+    One row per turn (terminal events fire once), carrying the outcome plus safe
+    ids, so turn success/failure rate is a direct query rather than an inference
+    over the raw stream. Table-only via the audit logger; caller already gated on
+    :func:`debug_sink_enabled` and wrapped in ``suppress``.
+    """
+    outcome = _TURN_OUTCOME_BY_EVENT_TYPE.get(event_type)
+    if outcome is None:
+        return
+    extra = debug_event("turn_finished", session_id=conversation_id, outcome=outcome)
+    attributes = extra["attributes"]
+    if isinstance(attributes, dict):
+        response = event.get("response")
+        if isinstance(response, dict) and isinstance(response.get("id"), str):
+            attributes["response_id"] = response["id"]
+        error = event.get("error")
+        if isinstance(error, dict) and error.get("code") is not None:
+            attributes["error_code"] = str(error["code"])
+    level = logging.WARNING if outcome in ("failed", "incomplete") else logging.INFO
+    audit_event_logger().log(level, "turn %s", outcome, extra=extra)
+
+
+def publish(conversation_id: str, event: dict[str, Any]) -> int:
     """
     Broadcast an event to every active subscriber of the given
     conversation (called from sync workflow thread). The event
@@ -72,40 +227,53 @@ def publish(conversation_id: str, event: dict[str, Any]) -> None:
         the Omnigent route layer validates each emitted dict against
         the union before serializing, so an unmodelled event
         fails loud at the SSE boundary.
+    :returns: The number of subscriber slots the event was dispatched
+        toward (``0`` when nothing was listening or the event was
+        suppressed). A slow subscriber's queue may still overflow after
+        dispatch, so a positive count is presence, not delivery. Callers
+        that need a live listener — e.g. the browser action bridge — use
+        this to fail fast instead of awaiting a response that can never
+        arrive; most callers ignore it.
     """
-    # Track the current turn's streamed assistant text so a client
-    # (re)connecting mid-turn can replay it, AND get the verdict
-    # on whether this event must be WITHHELD from the live fan-out. The
-    # only suppressed events are claude-native ``output_text.delta`` chunks
-    # whose message has already committed (a duplicate trailing chunk): the
-    # forwarder tails the deltas file separately from the transcript, so a
-    # message's last chunk can be POSTed just AFTER its committed item.
-    # Computed BEFORE fan-out so we can actually drop it — the old order
-    # (fan-out first, record after) could only scrub the reconnect-replay
-    # snapshot, never un-send a delta already on a live subscriber's queue.
-    # Safe to reorder: ``record_publish`` and the fan-out below run with no
-    # ``await`` between them, so within a single ``publish`` call nothing
-    # interleaves — the verdict and the enqueue are one atomic step. (This
-    # holds for both callers: native deltas, the only suppressible events,
-    # arrive on the AP loop via the ``POST /events`` handler; the in-process
-    # relay calls ``publish`` from a workflow thread, where ``record_publish``
-    # never returns a suppress verdict so the reorder is a no-op there.) The
-    # snapshot/live-tail partition is unaffected: a
-    # reconnecting client's prefix is still captured by ``subscribe``'s
-    # ``pre_ready_snapshot`` at slot registration, independent of this order.
-    suppress_live = inflight_text.record_publish(conversation_id, event)
+    # Mirror the emitted event to the debug-log table (best-effort, table-only,
+    # no-op unless the sink is enabled). Done first so it captures every event
+    # the server produces — including ones with no live subscriber.
+    _log_sse_event(conversation_id, event)
+    # Track reconnect state and centrally suppress or rewrite native deltas
+    # before they reach subscribers.
+    live_event = inflight_text.record_publish(conversation_id, event)
     # Side-channel: keep the cross-session pending-elicitations
     # index in step with the SSE stream. Only acts on
     # ``response.elicitation_request`` events; every other event
     # type is a single dict lookup and a return. A suppressed event is
     # always a text delta, never an elicitation, so this still runs.
     pending_elicitations.record_publish(conversation_id, event)
-    if suppress_live:
-        return
+    if live_event is None:
+        return 0
     with _lock:
         subs = list(_subscribers.get(conversation_id, ()))
     for queue, loop in subs:
-        loop.call_soon_threadsafe(queue.put_nowait, event)
+        loop.call_soon_threadsafe(_enqueue_or_overflow, queue, live_event)
+    return len(subs)
+
+
+def has_subscribers(conversation_id: str) -> bool:
+    """
+    Return whether any live subscriber is currently registered for
+    the given conversation.
+
+    Because this stream has no buffer and no replay, an event
+    published while this returns ``False`` is lost — callers can use
+    that to fail fast instead of awaiting a response that can never
+    arrive (e.g. a browser action dispatched to a session no renderer
+    is watching).
+
+    :param conversation_id: The conversation to check,
+        e.g. ``"conv_abc123"``.
+    :returns: ``True`` when at least one subscriber slot is registered.
+    """
+    with _lock:
+        return bool(_subscribers.get(conversation_id))
 
 
 def close(conversation_id: str) -> None:
@@ -122,7 +290,7 @@ def close(conversation_id: str) -> None:
     with _lock:
         subs = list(_subscribers.get(conversation_id, ()))
     for queue, loop in subs:
-        loop.call_soon_threadsafe(queue.put_nowait, _DONE)
+        loop.call_soon_threadsafe(_enqueue_or_overflow, queue, _DONE)
 
 
 def shutdown_all() -> None:
@@ -139,7 +307,7 @@ def shutdown_all() -> None:
     with _lock:
         all_subs = [entry for subs in _subscribers.values() for entry in subs]
     for queue, _ in all_subs:
-        queue.put_nowait(_DONE)
+        _enqueue_or_overflow(queue, _DONE)
 
 
 async def subscribe(
@@ -153,13 +321,20 @@ async def subscribe(
     """
     Subscribe to live events for a conversation.
 
-    Creates a fresh ephemeral queue for this subscriber, registers
+    Creates a fresh bounded ephemeral queue for this subscriber, registers
     it under ``conversation_id``, and yields events as they arrive
     from :func:`publish`. Ends when :func:`close` broadcasts the
     end-of-stream sentinel or when the caller stops iterating
     (e.g. client disconnect cancels the generator). The
     ``finally`` block always unregisters this subscriber slot so
     a stale queue cannot keep accumulating events.
+
+    If the subscriber falls more than
+    :data:`_SUBSCRIBER_QUEUE_MAX_EVENTS` events behind, its queued backlog
+    is replaced with an overflow signal and this iterator raises
+    :class:`SubscriberOverflowError`. HTTP/SSE callers treat that as a
+    dropped transport and reconnect through the persisted snapshot rather
+    than retaining an unbounded in-memory backlog.
 
     Live-tail only: events emitted before this call are NOT
     replayed. Multiple concurrent subscribers to the same
@@ -208,8 +383,12 @@ async def subscribe(
         yielded verbatim as it was passed to :func:`publish`,
         plus synthetic heartbeat dicts when *heartbeat_interval_s*
         is set.
+    :raises SubscriberOverflowError: If this subscriber falls behind the
+        bounded event queue.
     """
-    queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue(
+        maxsize=_SUBSCRIBER_QUEUE_MAX_EVENTS
+    )
     loop = asyncio.get_running_loop()
     entry = (queue, loop)
     with _lock:
@@ -271,6 +450,11 @@ async def subscribe(
                     continue
             if item is _DONE:
                 return
+            if item is _OVERFLOW:
+                raise SubscriberOverflowError(
+                    f"session stream subscriber for {conversation_id!r} "
+                    f"exceeded {_SUBSCRIBER_QUEUE_MAX_EVENTS} queued events"
+                )
             assert isinstance(item, dict)
             yield item
     finally:

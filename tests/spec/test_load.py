@@ -338,12 +338,10 @@ def test_load_omnigent_yaml_preserves_use_responses_bool(tmp_path: Path) -> None
     ``HARNESS_OPENAI_AGENTS_USE_RESPONSES=true``, causing silent API failures for
     models that require ``use_responses=False`` (e.g. Kimi K2 via Databricks).
 
-    Root cause guarded: ``_omnigent_compat.load_omnigent_yaml`` previously used
-    ``yaml.safe_load`` to read the raw YAML, but importing ``load_agent_def`` mutates
-    ``yaml.SafeLoader``'s implicit resolvers as a side effect, causing ``safe_load`` to
-    return string ``"false"`` for unquoted ``false`` values.  The fix is to use
-    ``_OmnigentYamlLoader`` directly (which owns its resolvers and is unaffected by
-    the mutation).
+    How it's guarded: ``_omnigent_compat.load_omnigent_yaml`` reads the raw YAML
+    with ``_OmnigentYamlLoader`` (not ``yaml.safe_load``) so this raw read resolves
+    booleans the same way ``load_agent_def``'s own parsing does — both loaders keep
+    ``on``/``off`` as plain strings and parse unquoted ``false`` as bool ``False``.
     """
     yaml_text = textwrap.dedent("""\
         name: kimi-test
@@ -357,6 +355,21 @@ def test_load_omnigent_yaml_preserves_use_responses_bool(tmp_path: Path) -> None
     (tmp_path / "kimi-test.yaml").write_text(yaml_text)
     spec = load_omnigent_yaml(tmp_path / "kimi-test.yaml")
     assert spec.executor.config.get("use_responses") is False
+
+
+def test_load_omnigent_yaml_preserves_reasoning_item_id_policy(tmp_path: Path) -> None:
+    yaml_text = textwrap.dedent("""\
+        name: reasoning-replay-test
+        prompt: You are a helpful assistant.
+
+        executor:
+          harness: openai-agents
+          model: databricks-gpt-5-4-mini
+          reasoning_item_id_policy: preserve
+    """)
+    (tmp_path / "reasoning-replay-test.yaml").write_text(yaml_text)
+    spec = load_omnigent_yaml(tmp_path / "reasoning-replay-test.yaml")
+    assert spec.executor.config["reasoning_item_id_policy"] == "preserve"
 
 
 def test_load_omnigent_yaml_threads_executor_extra_max_tokens_to_llm_extra(
@@ -460,13 +473,13 @@ def _write_parent_with_sub_agents(
     parent_agents: list[str],
     sub_agents: dict[str, dict],
 ) -> None:
-    """Write a ``config.yaml`` parent bundle with ``agents/<name>/`` children.
+    """Write a ``config.yaml`` parent bundle with ``agents/<dir>/`` children.
 
     :param root: Bundle root to populate.
     :param parent_agents: Names placed under the parent's
         ``tools.agents`` delegation list.
     :param sub_agents: Map of sub-agent name → its ``config.yaml`` dict,
-        each written to ``agents/<name>/config.yaml``.
+        each written to ``agents/<dir>/config.yaml``.
     """
     parent = {
         "spec_version": 1,

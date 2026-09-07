@@ -82,6 +82,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
                 transport=srv.transport,
                 description=srv.description,
                 url=srv.url,
+                headers=dict.fromkeys(srv.headers, "[REDACTED]") if srv.headers else {},
                 command=srv.command,
                 args=srv.args,
             )

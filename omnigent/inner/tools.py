@@ -31,9 +31,9 @@ ToolArgs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ToolResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 # User-supplied Python callables bound via YAML (``callable: mod.func``) —
-# the framework has no way to know their real signatures. ``Callable[..., X]``
-# is treated as ``Any`` by mypy's explicit-any check, so the ignore is needed
-# at the alias site.
+# the framework has no way to know their real signatures. The variadic callable
+# boundary is intentionally unconstrained, so keep the explicit-any ignore at
+# the alias site.
 DynamicCallable: TypeAlias = Callable[..., object]  # type: ignore[explicit-any]
 
 

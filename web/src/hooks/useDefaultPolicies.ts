@@ -3,14 +3,16 @@ import { authenticatedFetch } from "@/lib/identity";
 
 /** A server-wide default policy returned by the admin CRUD API. */
 export interface DefaultPolicy {
-  id: string;
+  id: string | null;
   object: "default_policy";
+  /** Config-file policies have ``source: "config"`` and are read-only. */
+  source?: "config";
   name: string;
   type: string;
   handler: string;
   factory_params?: Record<string, unknown> | null;
   enabled: boolean;
-  created_at: number;
+  created_at: number | null;
   updated_at: number | null;
   created_by: string | null;
 }

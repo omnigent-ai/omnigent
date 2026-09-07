@@ -466,6 +466,34 @@ def test_policy_denied_format_sse_uses_response_prefixed_wire_name() -> None:
     assert sse.startswith("event: response.policy_denied\ndata: {")
 
 
+@pytest.mark.asyncio
+async def test_stream_overflow_closes_without_done_for_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Subscriber overflow ends as a reconnectable drop, not a clean close."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes.sessions import _stream_live_events
+
+    async def overflowing_subscribe(*_args: Any, **_kwargs: Any):
+        yield {"type": "session.heartbeat"}
+        raise session_stream.SubscriberOverflowError("conv_slow overflowed")
+
+    class ConnectedRequest:
+        """Request stub that keeps the stream connected through its first event."""
+
+        async def is_disconnected(self) -> bool:
+            """Return ``False`` so overflow, not disconnect, ends the stream."""
+            return False
+
+    monkeypatch.setattr(session_stream, "subscribe", overflowing_subscribe)
+    request: Any = ConnectedRequest()
+    frames = [frame async for frame in _stream_live_events(request, "conv_slow")]
+
+    assert len(frames) == 1
+    assert frames[0].startswith("event: session.heartbeat\n")
+    assert all("[DONE]" not in frame for frame in frames)
+
+
 def test_publish_session_status_helper_uses_waiting_literal() -> None:
     """``workflow._publish_session_status`` publishes a typed waiting event.
 

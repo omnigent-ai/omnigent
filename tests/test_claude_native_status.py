@@ -187,3 +187,70 @@ def test_status_wrapper_chain_swallows_subprocess_errors(
     assert rc == 0
     _out, err = capsys.readouterr()
     assert "chain failed" in err
+
+
+def test_normalize_status_payload_extracts_record() -> None:
+    """The normalizer extracts window/usage/cost/model; None without a window."""
+    from omnigent.claude_native_status import normalize_status_payload
+
+    record = normalize_status_payload(
+        {
+            "context_window": {
+                "context_window_size": 200_000,
+                "current_usage": {"input_tokens": 5},
+                "used_percentage": 2.5,
+            },
+            "cost": {"total_cost_usd": 0.42},
+            "model": {"id": "claude-opus-4-8", "display_name": "Opus"},
+        }
+    )
+    assert record == {
+        "context_window_size": 200_000,
+        "current_usage": {"input_tokens": 5},
+        "used_percentage": 2.5,
+        "total_cost_usd": 0.42,
+        "model": "claude-opus-4-8",
+    }
+    assert normalize_status_payload({"model": "claude-opus-4-8"}) is None
+
+
+def test_sync_raw_status_context_normalizes_and_retries(tmp_path: Path) -> None:
+    """The forwarder-side sync normalizes raw captures and tolerates junk.
+
+    Unchanged signatures are no-ops, a malformed raw file leaves the
+    signature untouched so the next poll retries, and a rewritten raw
+    file re-normalizes.
+    """
+    import json as _json
+
+    from omnigent.claude_native_status import (
+        CONTEXT_RAW_FILE,
+        sync_raw_status_context,
+    )
+
+    raw_path = tmp_path / CONTEXT_RAW_FILE
+    payload = {
+        "context_window": {"context_window_size": 1000},
+        "model": {"id": "claude-opus-4-8"},
+    }
+    raw_path.write_text(_json.dumps(payload, indent=2), encoding="utf-8")
+
+    sig = sync_raw_status_context(tmp_path, None)
+    assert sig is not None
+    written = _json.loads((tmp_path / "context.json").read_text("utf-8"))
+    assert written == {"context_window_size": 1000, "model": "claude-opus-4-8"}
+
+    # Unchanged raw file: same signature back, nothing rewritten.
+    assert sync_raw_status_context(tmp_path, sig) == sig
+
+    # Malformed raw file: signature unchanged so the next poll retries.
+    raw_path.write_text("{not json", encoding="utf-8")
+    assert sync_raw_status_context(tmp_path, sig) == sig
+
+    # Rewritten raw file: re-normalized under a fresh signature.
+    payload["model"] = {"id": "claude-sonnet-4-6"}
+    raw_path.write_text(_json.dumps(payload), encoding="utf-8")
+    new_sig = sync_raw_status_context(tmp_path, sig)
+    assert new_sig != sig
+    written = _json.loads((tmp_path / "context.json").read_text("utf-8"))
+    assert written["model"] == "claude-sonnet-4-6"

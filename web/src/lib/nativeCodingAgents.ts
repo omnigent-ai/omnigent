@@ -16,17 +16,31 @@ export type NativeCodingAgentIconKind =
   | "antigravity"
   | "kimi"
   | "hermes";
-export type NativeCodingAgentCapability = "permissionMode" | "approvalMode" | "cursorMode";
+export type NativeCodingAgentCapability =
+  "permissionMode" | "approvalMode" | "cursorMode" | "skipPermissions" | "modelPicker";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
   agentName: string;
   harness: string;
   wrapperLabel: string;
+  /**
+   * `omnigent.wrapper` value stamped on the children this vendor spawns
+   * inside its own CLI (Claude's Task tool, Codex collab threads). Mirrors
+   * `NativeCodingAgent.subagent_wrapper_label` on the server. Absent for
+   * vendors that don't register sub-agent children.
+   */
+  subagentWrapperLabel?: string;
   displayName: string;
   iconKind: NativeCodingAgentIconKind;
   sortRank: number;
   capabilities?: readonly NativeCodingAgentCapability[];
+  /**
+   * A fully supported harness — the integration we maintain and test end to
+   * end. Only these lead the picker's primary list; every other harness folds
+   * into the "More" group regardless of whether it is configured on the host.
+   */
+  fullySupported?: boolean;
 }
 
 export const NATIVE_CODING_AGENTS = [
@@ -35,26 +49,31 @@ export const NATIVE_CODING_AGENTS = [
     agentName: "claude-native-ui",
     harness: "claude-native",
     wrapperLabel: "claude-code-native-ui",
+    subagentWrapperLabel: "claude-code-native-ui-subagent",
     displayName: "Claude Code",
     iconKind: "claude",
     sortRank: 10,
-    capabilities: ["permissionMode"],
+    capabilities: ["permissionMode", "modelPicker"],
+    fullySupported: true,
   },
   {
     key: "codex",
     agentName: "codex-native-ui",
     harness: "codex-native",
     wrapperLabel: "codex-native-ui",
+    subagentWrapperLabel: "codex-native-ui-subagent",
     displayName: "Codex",
     iconKind: "codex",
     sortRank: 20,
     capabilities: ["approvalMode"],
+    fullySupported: true,
   },
   {
     key: "opencode",
     agentName: "opencode-native-ui",
     harness: "opencode-native",
     wrapperLabel: "opencode-native-ui",
+    subagentWrapperLabel: "opencode-native-ui-subagent",
     displayName: "OpenCode",
     iconKind: "opencode",
     sortRank: 25,
@@ -87,6 +106,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Pi",
     iconKind: "pi",
     sortRank: 40,
+    capabilities: ["modelPicker"],
   },
   {
     key: "kiro",
@@ -107,9 +127,14 @@ export const NATIVE_CODING_AGENTS = [
     agentName: "antigravity-native-ui",
     harness: "antigravity-native",
     wrapperLabel: "antigravity-native-ui",
+    subagentWrapperLabel: "antigravity-native-ui-subagent",
     displayName: "Antigravity",
     iconKind: "antigravity",
     sortRank: 45,
+    // agy's only pre-emptive control is the all-or-nothing
+    // `--dangerously-skip-permissions`, so it gets a two-value toggle rather
+    // than Claude's graded permissionMode selector.
+    capabilities: ["skipPermissions"],
   },
   {
     key: "goose",
@@ -157,14 +182,22 @@ export const NATIVE_CODING_AGENTS = [
   },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
-const BY_AGENT_NAME: Map<string, NativeCodingAgentSpec> = new Map(
+const BY_AGENT_NAME = new Map<string, NativeCodingAgentSpec>(
   NATIVE_CODING_AGENTS.map((agent) => [agent.agentName, agent]),
 );
-const BY_HARNESS: Map<string, NativeCodingAgentSpec> = new Map(
+const BY_HARNESS = new Map<string, NativeCodingAgentSpec>(
   NATIVE_CODING_AGENTS.map((agent) => [agent.harness, agent]),
 );
-const BY_WRAPPER: Map<string, NativeCodingAgentSpec> = new Map(
+const BY_WRAPPER = new Map<string, NativeCodingAgentSpec>(
   NATIVE_CODING_AGENTS.map((agent) => [agent.wrapperLabel, agent]),
+);
+// Kept out of BY_WRAPPER: a sub-agent child is NOT a native-terminal session
+// (it owns no PTY and takes no input), so `isNativeWrapper` must keep
+// returning false for these labels.
+const BY_SUBAGENT_WRAPPER = new Map<string, NativeCodingAgentSpec>(
+  NATIVE_CODING_AGENTS.flatMap((agent) =>
+    "subagentWrapperLabel" in agent ? [[agent.subagentWrapperLabel, agent] as const] : [],
+  ),
 );
 
 // Reversed harness spellings that fold to a canonical native `harness`.
@@ -176,6 +209,8 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-cursor": "cursor-native",
   "native-kiro": "kiro-native",
   "native-antigravity": "antigravity-native",
+  "agy-native": "antigravity-native",
+  "native-agy": "antigravity-native",
   "native-goose": "goose-native",
   "native-qwen": "qwen-native",
   "native-kimi": "kimi-native",
@@ -183,10 +218,83 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-opencode": "opencode-native",
 };
 
+// Vendors whose elicitation wire prefix differs from their registry `key`:
+// Antigravity's bridge stamps `agy_native_*`.
+const POLICY_NAME_VENDORS: Record<string, string> = { antigravity: "agy" };
+
+// Stamped by the generic native-permission hook when the posting bridge sends
+// no name of its own — native provenance with no vendor attached.
+const VENDORLESS_NATIVE_POLICY_NAME = "native_permission";
+
+// `<vendor>_native_` → spec, derived from the registry so a new vendor row is
+// covered without editing a second list. Mirrors the ids the server bridges
+// stamp: `omnigent/server/routes/sessions/routes_hooks.py` (Claude, Cursor,
+// generic), `routes/_codex_elicitation.py`, `routes/_antigravity_elicitation.py`,
+// and the per-vendor `omnigent/<vendor>_native_permissions.py` hooks.
+// `<vendor>_native_` is reserved for those bridges: a user-authored policy in
+// that shape reads as provenance and loses its own name in the UI.
+const NATIVE_POLICY_PREFIXES: readonly (readonly [string, NativeCodingAgentSpec])[] =
+  NATIVE_CODING_AGENTS.map((agent) => [
+    `${POLICY_NAME_VENDORS[agent.key] ?? agent.key}_native_`,
+    agent,
+  ]);
+
+/**
+ * Resolve the vendor behind an elicitation's synthetic ``policy_name``.
+ *
+ * Native permission bridges stamp provenance ids — ``claude_native_permission``,
+ * ``codex_native_command_approval``, ``kiro_native_permission`` — rather than a
+ * policy anyone wrote, so approval surfaces can name the product that asked
+ * instead of leaking the id.
+ *
+ * @param policyName - ``policy_name`` from the elicitation params.
+ * @returns The vendor spec, or undefined for user-authored policy names and for
+ *   native stamps whose vendor this build doesn't know.
+ */
+export function nativeCodingAgentForPolicyName(
+  policyName: string,
+): NativeCodingAgentSpec | undefined {
+  return NATIVE_POLICY_PREFIXES.find(([prefix]) => policyName.startsWith(prefix))?.[1];
+}
+
+/**
+ * Whether a ``policy_name`` is native provenance rather than a policy someone
+ * wrote. True for every ``<vendor>_native_*`` stamp and for the vendor-less
+ * ``native_permission`` fallback, so callers can hide both the id and the
+ * constant ``phase`` that rides along with it.
+ *
+ * @param policyName - ``policy_name`` from the elicitation params.
+ * @returns True when the name came from a harness-native bridge.
+ */
+export function isNativePolicyName(policyName: string): boolean {
+  return (
+    policyName === VENDORLESS_NATIVE_POLICY_NAME ||
+    nativeCodingAgentForPolicyName(policyName) !== undefined
+  );
+}
+
 export function nativeCodingAgentForAgentName(
   name: string | null | undefined,
 ): NativeCodingAgentSpec | undefined {
   return name == null ? undefined : BY_AGENT_NAME.get(name);
+}
+
+/**
+ * The synthetic ``policy_name`` a native agent's permission prompts carry.
+ *
+ * History hydration rebuilds answered question / plan cards from persisted
+ * tool calls, which name the agent rather than the elicitation provenance
+ * the live card came with. Minting the id from the same prefix table
+ * :func:`nativeCodingAgentForPolicyName` reads keeps both directions on
+ * one source of truth, so the rebuilt card names the same vendor.
+ *
+ * @param name - Agent name from the item, e.g. ``"claude-native-ui"``.
+ * @returns The provenance id, or ``""`` for a non-native agent.
+ */
+export function nativePolicyNameForAgentName(name: string | null | undefined): string {
+  const spec = nativeCodingAgentForAgentName(name);
+  if (spec === undefined) return "";
+  return `${POLICY_NAME_VENDORS[spec.key] ?? spec.key}_native_permission`;
 }
 
 export function nativeCodingAgentForHarness(
@@ -202,6 +310,20 @@ export function nativeCodingAgentForWrapper(
   return wrapper == null ? undefined : BY_WRAPPER.get(wrapper);
 }
 
+/**
+ * Resolve the vendor that spawned a native sub-agent child from its
+ * `omnigent.wrapper` label (e.g. `"claude-code-native-ui-subagent"` →
+ * the Claude Code spec). These children reuse the parent's agent row and
+ * carry the VENDOR-side agent type as their `sub_agent_name` (Claude's
+ * `subagent_type`, e.g. `"general-purpose"`), so the wrapper label is the
+ * only signal for which product is running them.
+ */
+export function nativeCodingAgentForSubagentWrapper(
+  wrapper: string | null | undefined,
+): NativeCodingAgentSpec | undefined {
+  return wrapper == null ? undefined : BY_SUBAGENT_WRAPPER.get(wrapper);
+}
+
 export function nativeCodingAgentForAvailableAgent(
   agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
 ): NativeCodingAgentSpec | undefined {
@@ -215,8 +337,68 @@ export function isNativeCodingAgent(
   return nativeCodingAgentForAvailableAgent(agent) !== undefined;
 }
 
+/**
+ * Whether a harness is fully supported — the maintained, end-to-end tested
+ * integrations that lead the picker. Everything else (including non-native
+ * agents) belongs in the "More" group regardless of host readiness.
+ */
+export function isFullySupportedNativeCodingAgent(
+  agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
+): boolean {
+  return nativeCodingAgentForAvailableAgent(agent)?.fullySupported === true;
+}
+
+/**
+ * Whether ``agent``'s harness is one of ``recentHarnesses``. Compares resolved
+ * specs rather than raw strings so a stored reversed alias (``native-pi``) still
+ * matches the canonical spelling (``pi-native``).
+ */
+export function isRecentHarness(
+  agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
+  recentHarnesses: readonly string[],
+): boolean {
+  const spec = nativeCodingAgentForAvailableAgent(agent);
+  if (spec === undefined) return false;
+  return recentHarnesses.some((h) => nativeCodingAgentForHarness(h)?.key === spec.key);
+}
+
 export function isNativeWrapper(wrapper: string | null | undefined): boolean {
   return nativeCodingAgentForWrapper(wrapper) !== undefined;
+}
+
+/**
+ * Whether a session runs a native terminal harness — by its `omnigent.wrapper`
+ * label OR its resolved harness. Mirrors the server's
+ * `_native_coding_agent_for_session`: a session is native-terminal if either
+ * signal matches (a built-in wrapper agent sets the label; a custom agent bound
+ * to a native harness has no label but still runs the native CLI). Native CLIs
+ * bake the model at launch and can't per-turn route, so callers use this to hide
+ * per-turn Smart Routing from these sessions.
+ */
+export function isNativeTerminalSession(
+  session: { harness?: string | null; labels?: Record<string, string> } | null | undefined,
+): boolean {
+  if (session == null) return false;
+  const wrapper = session.labels?.[WRAPPER_LABEL_KEY];
+  if (isNativeWrapper(wrapper)) return true;
+  return nativeCodingAgentForHarness(session.harness) !== undefined;
+}
+
+/**
+ * Resolve the native coding agent a session runs, from its wrapper label
+ * (authoritative) or its harness field.
+ *
+ * @param session - Session-shaped object with `harness` and `labels`.
+ * @returns The agent spec, or undefined for non-native sessions.
+ */
+export function nativeCodingAgentForSession(
+  session: { harness?: string | null; labels?: Record<string, string> } | null | undefined,
+): NativeCodingAgentSpec | undefined {
+  if (session == null) return undefined;
+  return (
+    nativeCodingAgentForWrapper(session.labels?.[WRAPPER_LABEL_KEY]) ??
+    nativeCodingAgentForHarness(session.harness)
+  );
 }
 
 export function nativeWrapperLabelsForAgent(

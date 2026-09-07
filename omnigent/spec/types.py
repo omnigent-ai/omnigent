@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
@@ -517,6 +518,16 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         the literal string ``"inherit"`` on inline-AgentTool
         sub-specs. Empty dict for other executor types.
 
+        Native-harness autonomy pass-through: for server-spawned
+        sub-agents the session-create path reads ``"yolo"`` (bool or a
+        ``"true"``/``"false"`` string matched case-insensitively, with
+        no whitespace tolerance on the enabling value; enables
+        codex/cursor/kimi bypass flags, opt-out for codex/cursor and
+        opt-in for kimi) and ``"permission_mode"`` (exact-match string;
+        ``bypassPermissions`` maps to the claude-native /
+        antigravity-native skip flags) into the session's
+        ``terminal_launch_args``.
+
         🚨 **TECH DEBT — REMOVE WHEN OMNIGENT COMPAT ENDS.**
         This field exists *solely* to carry harness / profile /
         os_env data for the Omnigent integration (see
@@ -543,6 +554,17 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         key. Used by harness spawn-env builders, context-window
         auto-detection, telemetry, and tool-provider inference.
         ``None`` only when no model is declared anywhere in the spec.
+    :param reasoning_effort: Default reasoning level for this agent,
+        e.g. ``"high"``. Populated by the parser from either the
+        ``executor.reasoning_effort`` YAML key or (for backward
+        compatibility) ``llm.reasoning_effort``. Applies when nothing more
+        specific asks for one: a per-dispatch
+        ``sys_session_send``/``sys_session_create`` argument wins over
+        it, and it in turn wins over whatever default the harness CLI
+        carries on the host. Validated against the harness's effort
+        family where it is applied, so a value the harness cannot
+        accept is reported rather than silently dropped. ``None`` =
+        no spec-level default.
     :param connection: Per-provider connection overrides (credentials,
         endpoint URLs), e.g.
         ``{"api_key": "sk-...", "base_url": "https://..."}``.
@@ -585,6 +607,10 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
     # Primary model identifier for all executor types. Populated by
     # the parser from executor.model or (backward compat) llm.model.
     model: str | None = None
+    # Spec-level default reasoning effort, applied when no per-dispatch
+    # value asks for one. Populated from executor.reasoning_effort or
+    # (backward compat) llm.reasoning_effort.
+    reasoning_effort: str | None = None
     # Per-provider connection overrides (api_key, base_url, etc.).
     # Populated from executor.connection or (backward compat) llm.connection.
     # None means rely on environment variable / profile defaults.
@@ -627,9 +653,8 @@ class CompactionConfig:
     truncation as emergency fallback.
 
     :param trigger_threshold: Fraction of the model's context window
-        at which proactive compaction fires (after the first overflow
-        has been observed and the window size is known), e.g. ``0.8``
-        means fire at 80% of the window.
+        at which proactive compaction fires, e.g. ``0.8`` means fire
+        at 80% of the window.
     :param recent_window: Number of recent LLM iterations to protect
         from compaction. Items within this window are never cleared or
         summarized — the agent always has verbatim access to its most
@@ -674,6 +699,19 @@ class LLMConfig:  # type: ignore[explicit-any]  # extra: dict[str, Any] field (s
         ``request_timeout`` to distinguish from the task-level
         ``executor.timeout``.
     :param retry: Retry policy for transient LLM failures.
+    :param fallback_models: Ordered backup models tried, in order,
+        when a call to ``model`` fails. Same provider-prefixed
+        format as ``model``, e.g.
+        ``["databricks/claude-3-5-haiku", "databricks/gpt-4o-mini"]``.
+        Consumed today by the policy LLM client
+        (:class:`~omnigent.policies.types.PolicyLLMClient`): a call
+        advances to the next model on any failure and only surfaces
+        an error once every candidate is exhausted. Empty (the
+        default) preserves single-model behaviour. The resolved
+        ``connection`` (or ``profile``) is shared across the primary
+        and every fallback, so prefer same-provider fallbacks; a
+        fallback on a different provider only works when credentials
+        come from environment defaults (no ``connection``/``profile``).
     """
 
     model: str
@@ -690,6 +728,9 @@ class LLMConfig:  # type: ignore[explicit-any]  # extra: dict[str, Any] field (s
     profile: str | None = None
     request_timeout: int = 300
     retry: RetryPolicy = field(default_factory=RetryPolicy)
+    # Ordered backup models tried when a call to ``model`` fails.
+    # Empty preserves single-model behaviour.
+    fallback_models: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -757,19 +798,25 @@ class SandboxConfig:
     :param docker_image: Deprecated alias for ``container_image``.
         If both are set, ``container_image`` takes precedence.
     :param container_runtime: The container CLI to use, either
-        ``"docker"`` (default) or ``"podman"``.
+        ``"docker"`` (default) or ``"podman"``.  Can also be set
+        via the ``OMNIGENT_CONTAINER_RUNTIME`` environment variable;
+        the constructor argument takes precedence.
     """
+
+    _ENV_VAR = "OMNIGENT_CONTAINER_RUNTIME"
+    ALLOWED_RUNTIMES = frozenset({"docker", "podman"})
+    _DEFAULT_RUNTIME: ClassVar[str] = "docker"
 
     container_image: str | None = None
     docker_image: str | None = None
-    container_runtime: Literal["docker", "podman"] = "docker"
-
-    _ALLOWED_RUNTIMES = frozenset({"docker", "podman"})
+    container_runtime: Literal["docker", "podman"] | None = None
 
     def __post_init__(self) -> None:
-        if self.container_runtime not in self._ALLOWED_RUNTIMES:
+        if self.container_runtime is None:
+            self.container_runtime = os.environ.get(self._ENV_VAR, self._DEFAULT_RUNTIME)  # type: ignore[assignment]
+        if self.container_runtime not in self.ALLOWED_RUNTIMES:
             raise ValueError(
-                f"container_runtime must be one of {sorted(self._ALLOWED_RUNTIMES)}, "
+                f"container_runtime must be one of {sorted(self.ALLOWED_RUNTIMES)}, "
                 f"got {self.container_runtime!r}"
             )
         # Resolve the deprecated docker_image alias: if only
@@ -787,8 +834,10 @@ class ToolsConfig:
     Declared tool references from config.yaml.
 
     :param agents: Names of sub-agents this agent can delegate to,
-        e.g. ``["summarizer", "code-reviewer"]``. Each name must
-        match a directory under ``agents/``.
+        e.g. ``["summarizer", "code-reviewer"]``. Each name must be
+        the declared ``name`` of a sub-agent under ``agents/``; the
+        directory it was parsed from may differ (see
+        :attr:`AgentSpec.source_rel_dir`).
     :param builtins: Built-in tools to enable, e.g.
         ``[BuiltinToolConfig(name="web_search")]``. Each
         entry carries the tool name and optional config fields
@@ -815,10 +864,14 @@ class ToolsConfig:
 @dataclass
 class SkillSpec:
     """
-    A parsed skill from ``skills/<name>/SKILL.md``.
+    A parsed skill from ``skills/<dir>/SKILL.md``.
+
+    The directory name is provenance only — it is recorded in
+    :attr:`skill_dir` and need not equal :attr:`name`.
 
     :param name: Lowercase kebab-case skill identifier, e.g.
-        ``"code-review"``. Must match ``[a-z0-9-]+``.
+        ``"code-review"``. Must match ``[a-z0-9-]+``. Taken from the
+        frontmatter, not from the directory name.
     :param description: Human-readable summary of what the skill
         does (max 1024 characters).
     :param content: The body of the SKILL.md file after the YAML
@@ -1384,13 +1437,19 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``{"max_retries": 3, "style": "concise"}``.
     :param instructions: Agent system prompt, typically from
         ``AGENTS.md``. ``None`` if no instructions file is present.
-    :param skills: Parsed skills from ``skills/<name>/SKILL.md``.
+    :param skills: Parsed skills from ``skills/<dir>/SKILL.md``.
     :param mcp_servers: MCP server declarations from
         ``tools/mcp/<name>.yaml``.
     :param local_tools: Discovered local tool files from
         ``tools/python/`` and ``tools/typescript/``.
     :param sub_agents: Recursively parsed child agents from
-        ``agents/<name>/``.
+        ``agents/<dir>/``.
+    :param pass_history: Whether a parent session passes its current
+        history when launching this agent as a sub-agent tool.
+    :param pass_histories: Named parent histories passed when launching
+        this agent as a sub-agent tool.
+    :param max_sessions: Maximum concurrent sessions when this agent is
+        exposed as a sub-agent tool. ``None`` means unlimited.
     :param executor: Executor configuration (type, task timeout,
         max iterations). ``executor.type`` is the
         discriminator for the entire spec's validity.
@@ -1518,6 +1577,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
     local_tools: list[LocalToolInfo] = field(default_factory=list)
     sub_agents: list[AgentSpec] = field(default_factory=list)
+    pass_history: bool = False
+    pass_histories: list[str] | None = None
+    max_sessions: int | None = None
     executor: ExecutorSpec = field(default_factory=ExecutorSpec)
     compaction: CompactionConfig | None = None
     guardrails: GuardrailsSpec | None = None
@@ -1527,3 +1589,4 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     timers: bool = False
     spawn: bool = False
     agent_session_sharing: SharePolicy = SharePolicy.NONE
+    source_rel_dir: str | None = field(default=None, compare=False)

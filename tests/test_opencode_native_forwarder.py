@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from typing import Any
 
 import httpx
@@ -17,24 +19,38 @@ class _RecordingServerClient:
 
     def __init__(self) -> None:
         self.posts: list[tuple[str, dict[str, Any]]] = []
+        self.hook_response: dict[str, Any] | None = None
 
     async def post(self, url: str, *, json: dict[str, Any]) -> httpx.Response:
         self.posts.append((url, json))
-        return httpx.Response(200, request=httpx.Request("POST", url))
+        request = httpx.Request("POST", url)
+        if url.endswith("/hooks/native-permission-request") and self.hook_response is not None:
+            return httpx.Response(200, json=self.hook_response, request=request)
+        return httpx.Response(200, request=request)
 
 
 class _FakeOpenCodeClient:
-    """Fake OpenCode client recording permission replies + history."""
+    """Fake OpenCode client recording permission and question replies + history."""
 
     def __init__(self) -> None:
         self.replies: list[tuple[str, dict[str, Any]]] = []
         self.messages: list[dict[str, Any]] = []
+        self.question_replies: list[tuple[str, list[Any]]] = []
+        self.question_rejects: list[str] = []
 
     async def list_messages(self, session_id: str) -> list[dict[str, Any]]:
         return self.messages
 
     async def reply_permission(self, request_id: str, reply: dict[str, Any]) -> bool:
         self.replies.append((request_id, reply))
+        return True
+
+    async def reply_question(self, request_id: str, answers: list[Any]) -> bool:
+        self.question_replies.append((request_id, answers))
+        return True
+
+    async def reject_question(self, request_id: str) -> bool:
+        self.question_rejects.append(request_id)
         return True
 
 
@@ -290,6 +306,140 @@ async def test_session_error_message_aborted_takes_idle_path() -> None:
     assert status["status"] == "idle"
     assert "reauth_required" not in status
     assert "output" not in status
+
+
+def _status_edges(posts: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
+    return [b["data"] for _u, b in posts if b["type"] == "external_session_status"]
+
+
+async def test_running_and_idle_carry_assistant_response_id() -> None:
+    """running/idle edges carry the turn's assistant messageID as ``response_id``.
+
+    The web chat renders in-flight tool calls live only when the ``running`` edge
+    and the mirrored ``function_call`` items share the SAME ``response_id``. Here
+    the tool call and both status edges must all group under ``msg_1``.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(
+        _event(
+            "message.part.updated",
+            part={
+                "id": "prt_t",
+                "messageID": "msg_1",
+                "type": "tool",
+                "callID": "call_1",
+                "tool": "bash",
+                "state": {"status": "completed", "input": {"command": "ls"}, "output": "ok"},
+            },
+        )
+    )
+    await fwd.handle_event(_event("session.idle"))
+
+    edges = _status_edges(server.posts)
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_1"),
+        ("idle", "msg_1"),
+    ]
+    call = next(b for _u, b in server.posts if b["data"].get("item_type") == "function_call")
+    # The live-card contract: same id on the running edge and the tool call.
+    assert call["data"]["response_id"] == edges[0]["response_id"]
+
+
+async def test_running_edge_fires_once_per_turn() -> None:
+    """A turn's many parts still produce exactly one ``running`` edge."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    for part in (
+        {"id": "s", "messageID": "msg_1", "type": "step-start"},
+        {"id": "prt_x", "messageID": "msg_1", "type": "text", "text": "hi"},
+        {
+            "id": "prt_t",
+            "messageID": "msg_1",
+            "type": "tool",
+            "callID": "c1",
+            "tool": "bash",
+            "state": {"status": "running", "input": {"command": "ls"}},
+        },
+    ):
+        await fwd.handle_event(_event("message.part.updated", part=part))
+    running = [e for e in _status_edges(server.posts) if e["status"] == "running"]
+    assert len(running) == 1
+    assert running[0]["response_id"] == "msg_1"
+
+
+async def test_running_edge_deferred_until_message_id_known() -> None:
+    """A bare ``session.status`` busy before ``message.updated`` still yields the id.
+
+    opencode can open a turn with ``session.status`` busy (no messageID) before
+    the assistant ``message.updated`` arrives. The ``running`` edge must defer
+    until the id is known and carry ``msg_1`` — not an id-less/session-id edge
+    that would never match the tool-call items — and still fire exactly once.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.status", status={"type": "busy"}))
+    # No running edge yet: the id is unknown.
+    assert _status_edges(server.posts) == []
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    running = [e for e in _status_edges(server.posts) if e["status"] == "running"]
+    assert len(running) == 1
+    assert running[0]["response_id"] == "msg_1"
+
+
+async def test_second_turn_gets_its_own_running_response_id() -> None:
+    """Each turn's running/idle edges carry that turn's own assistant id."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    for msg in ("msg_a", "msg_b"):
+        await fwd.handle_event(_event("message.updated", info={"id": msg, "role": "assistant"}))
+        await fwd.handle_event(_event("session.idle"))
+    edges = _status_edges(server.posts)
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_a"),
+        ("idle", "msg_a"),
+        ("running", "msg_b"),
+        ("idle", "msg_b"),
+    ]
+
+
+async def test_multi_assistant_message_turn_retires_with_the_live_id() -> None:
+    """Two assistant messages in ONE turn: idle carries the id that went live.
+
+    If opencode emits more than one assistant ``message.updated`` before
+    ``session.idle`` (no idle between them), the ``running`` edge locks to the
+    first id (``msg_1``) while ``_active_message_id`` advances to ``msg_2``. The
+    terminal ``idle`` edge must still carry ``msg_1`` — the id the running edge
+    used — so the web retires the tool cards that were actually rendered live.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_2", "role": "assistant"}))
+    await fwd.handle_event(_event("session.idle"))
+    edges = _status_edges(server.posts)
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_1"),
+        ("idle", "msg_1"),
+    ]
+
+
+async def test_turn_without_assistant_message_idles_with_session_fallback() -> None:
+    """A turn that opens (busy) and idles with no assistant ``message.updated``.
+
+    No ``running`` edge fires (there was never an id to carry) and the terminal
+    ``idle`` edge falls back to the session id. Benign — there are no live tool
+    cards to retire — but the fallback id is deliberate, not a mismatch bug.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.status", status={"type": "busy"}))
+    await fwd.handle_event(_event("session.idle"))
+    edges = _status_edges(server.posts)
+    assert [e["status"] for e in edges] == ["idle"]
+    assert edges[0]["response_id"] == _SESSION
 
 
 async def test_permission_asked_rejects_when_no_policy_wired() -> None:
@@ -744,3 +894,258 @@ async def test_file_part_dedupes_across_snapshots() -> None:
     await fwd.handle_event(_event("message.part.updated", part=dict(part)))
     items = [b for _u, b in server.posts if b["type"] == "external_conversation_item"]
     assert len(items) == 1
+
+
+# --- question tool (blocking ``question`` → web elicitation) --------------
+
+
+def _hook_post(server: _RecordingServerClient) -> dict[str, Any] | None:
+    """Return the body of the native-permission-request hook POST, if any."""
+    for url, body in server.posts:
+        if url.endswith("/hooks/native-permission-request"):
+            return body
+    return None
+
+
+async def test_question_asked_accept_single_select_replies() -> None:
+    """A single-select web verdict → reply_question with the chosen label list.
+
+    The asked event carries the request id under ``id``; the question is parked
+    on the native-permission-request hook (NOT inline — a background task), and
+    the accept verdict's per-question content is keyed by the ORIGINAL index.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "accept", "content": {"0": "Tabs"}}
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "question.asked",
+            id="que_1",
+            tool="question",
+            questions=[
+                {
+                    "question": "Indent style?",
+                    "header": "Formatting",
+                    "options": [{"label": "Tabs"}, {"label": "Spaces"}],
+                }
+            ],
+        )
+    )
+    # The handler spawns a task and returns immediately (never blocks the loop);
+    # capture it before awaiting (the done-callback evicts it on completion).
+    task = fwd._question_tasks["que_1"]
+    await task
+    assert opencode.question_replies == [("que_1", [["Tabs"]])]
+    assert opencode.question_rejects == []
+    hook = _hook_post(server)
+    assert hook is not None
+    assert hook["operation_type"] == "question"
+    assert hook["agent"] == "OpenCode"
+    assert hook["policy_name"] == "opencode_native_question"
+    # Header drives the card message; the structured payload is authoritative.
+    assert hook["message"] == "Formatting"
+    assert hook["content_preview"] == "Indent style?"
+    web_questions = hook["ask_user_question"]["questions"]
+    assert web_questions[0]["id"] == "0"
+    assert web_questions[0]["multiSelect"] is False
+    assert web_questions[0]["options"] == [{"label": "Tabs"}, {"label": "Spaces"}]
+
+
+async def test_question_asked_accept_multi_question_multi_select_replies() -> None:
+    """Two questions (one multi-select) → one answer list per question, in order."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "accept", "content": {"0": ["A", "B"], "1": "X"}}
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "question.asked",
+            id="que_1",
+            questions=[
+                {
+                    "question": "Pick letters",
+                    "multiple": True,
+                    "options": [{"label": "A"}, {"label": "B"}, {"label": "C"}],
+                },
+                {"question": "Pick one", "options": [{"label": "X"}, {"label": "Y"}]},
+            ],
+        )
+    )
+    task = fwd._question_tasks["que_1"]
+    await task
+    assert opencode.question_replies == [("que_1", [["A", "B"], ["X"]])]
+    assert opencode.question_rejects == []
+    web_questions = _hook_post(server)["ask_user_question"]["questions"]
+    assert web_questions[0]["multiSelect"] is True
+    assert [q["id"] for q in web_questions] == ["0", "1"]
+
+
+async def test_question_asked_decline_rejects_without_reply() -> None:
+    """A ``decline`` web verdict → reject_question, never reply_question."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "decline"}
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "question.asked",
+            id="que_1",
+            questions=[{"question": "Q?", "options": [{"label": "A"}]}],
+        )
+    )
+    task = fwd._question_tasks["que_1"]
+    await task
+    assert opencode.question_rejects == ["que_1"]
+    assert opencode.question_replies == []
+
+
+async def test_question_asked_empty_verdict_rejects() -> None:
+    """An empty 200 (TUI answered / timeout, no scripted verdict) → reject_question."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    # hook_response stays None → the hook returns an empty 200 body.
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "question.asked",
+            id="que_1",
+            questions=[{"question": "Q?", "options": [{"label": "A"}]}],
+        )
+    )
+    task = fwd._question_tasks["que_1"]
+    await task
+    assert opencode.question_rejects == ["que_1"]
+    assert opencode.question_replies == []
+    # The card WAS parked (the hook was POSTed); it just resolved with no verdict.
+    assert _hook_post(server) is not None
+
+
+async def test_question_replied_cancels_pending_task_and_clears_card() -> None:
+    """``question.replied`` (TUI answered) cancels the park and withdraws the card.
+
+    ``replied`` keys the id as ``requestID`` (not ``id``). It must cancel the
+    still-parked POST (so the forwarder doesn't also reply) and post
+    ``external_elicitation_resolved`` so the web card disappears.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+
+    async def _never() -> None:
+        await asyncio.sleep(3600)
+
+    pending: asyncio.Task[None] = asyncio.create_task(_never())
+    fwd._question_tasks["que_1"] = pending
+    await fwd.handle_event(_event("question.replied", requestID="que_1", answers=[["A"]]))
+    # The parked task was cancelled and removed from the registry.
+    assert "que_1" not in fwd._question_tasks
+    with contextlib.suppress(asyncio.CancelledError):
+        await pending
+    assert pending.cancelled()
+    resolved = next(
+        b["data"] for _u, b in server.posts if b["type"] == "external_elicitation_resolved"
+    )
+    assert resolved == {"elicitation_id": "que_1"}
+    # No reply/reject was sent for a TUI-resolved question.
+    assert opencode.question_replies == []
+    assert opencode.question_rejects == []
+
+
+async def test_question_rejected_clears_card() -> None:
+    """``question.rejected`` (TUI declined) withdraws the web card."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("question.rejected", requestID="que_9"))
+    resolved = next(
+        b["data"] for _u, b in server.posts if b["type"] == "external_elicitation_resolved"
+    )
+    assert resolved == {"elicitation_id": "que_9"}
+
+
+async def test_run_awaits_cancelled_question_tasks() -> None:
+    """Forwarder shutdown waits for question-task cancellation cleanup."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    cleanup_finished = asyncio.Event()
+
+    async def _pending_question() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            await asyncio.sleep(0)
+            cleanup_finished.set()
+
+    pending = asyncio.create_task(_pending_question())
+    fwd._question_tasks["que_1"] = pending
+    await asyncio.sleep(0)
+    await fwd.run(max_reconnects=0)
+
+    assert cleanup_finished.is_set()
+    assert pending.cancelled()
+    assert fwd._question_tasks == {}
+
+
+async def test_question_asked_no_valid_options_rejects_without_hook() -> None:
+    """A question with no renderable options → reject_question, no card parked."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "question.asked",
+            id="que_1",
+            # Options present but none carry a usable string label.
+            questions=[{"question": "Q?", "options": [{}, {"label": ""}]}],
+        )
+    )
+    task = fwd._question_tasks["que_1"]
+    await task
+    assert opencode.question_rejects == ["que_1"]
+    assert opencode.question_replies == []
+    assert _hook_post(server) is None
+
+
+async def test_question_asked_empty_questions_rejects_without_hook() -> None:
+    """An empty questions list → reject_question, no card parked."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("question.asked", id="que_1", questions=[]))
+    task = fwd._question_tasks["que_1"]
+    await task
+    assert opencode.question_rejects == ["que_1"]
+    assert _hook_post(server) is None
+
+
+async def test_question_asked_mixed_valid_and_malformed_rejects_whole_request() -> None:
+    """One malformed question rejects the request instead of sending empty answers."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "question.asked",
+            id="que_1",
+            questions=[
+                {"question": "Valid?", "options": [{"label": "Yes"}]},
+                {"question": "Malformed", "options": [{"label": ""}]},
+            ],
+        )
+    )
+    task = fwd._question_tasks["que_1"]
+    await task
+    assert opencode.question_rejects == ["que_1"]
+    assert opencode.question_replies == []
+    assert _hook_post(server) is None
+
+
+async def test_question_asked_dedupes_concurrent_same_request() -> None:
+    """A duplicate ``question.asked`` for the same id spawns only one park task."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "accept", "content": {"0": "A"}}
+    fwd = _forwarder(server, opencode)
+    ev = _event(
+        "question.asked",
+        id="que_1",
+        questions=[{"question": "Q?", "options": [{"label": "A"}]}],
+    )
+    await fwd.handle_event(ev)
+    task = fwd._question_tasks["que_1"]
+    # A second asked event before the first resolves must NOT spawn a 2nd task.
+    await fwd.handle_event(ev)
+    assert fwd._question_tasks["que_1"] is task
+    await task
+    assert opencode.question_replies == [("que_1", [["A"]])]

@@ -5,8 +5,7 @@ import { resetSidebarWidthStoreForTesting, useResizableSidebar } from "./useResi
 
 // useResizableSidebar keeps its width in a module-level store shared across all
 // callers. resetSidebarWidthStoreForTesting resets it between tests so cases
-// are independent. A 2000px viewport gives a ceiling of min(480, 2000*0.5) =
-// 480, so the 480px hard cap is the binding limit at this width.
+// are independent. A 2000px viewport gives a 1000px ceiling (50vw).
 
 const originalInnerWidth = window.innerWidth;
 
@@ -73,12 +72,12 @@ describe("useResizableSidebar", () => {
     expect(readPanelSizePreference("sidebarWidthPx")).toBe(320);
   });
 
-  it("clamps to the [220, 480] band", () => {
+  it("clamps between 220px and half the viewport", () => {
     const { result } = renderHook(() => useResizableSidebar());
 
-    // Drag far past the right edge — capped at the 480 hard max, not 1500.
+    // Drag far past the right edge — capped at half of the 2000px viewport.
     dragTo(result, 1500);
-    expect(result.current.width).toBe(480);
+    expect(result.current.width).toBe(1000);
 
     // Drag below the floor — held at 220, not 50.
     dragTo(result, 50);
@@ -102,21 +101,21 @@ describe("useResizableSidebar", () => {
   it("clamps down on viewport shrink and springs back to the saved width on widen", () => {
     const { result } = renderHook(() => useResizableSidebar());
 
-    // Establish a 460px preference (under the 480 ceiling at 2000px).
-    dragTo(result, 460);
-    expect(result.current.width).toBe(460);
-    expect(readPanelSizePreference("sidebarWidthPx")).toBe(460);
+    // Establish a 900px preference (under the 1000px ceiling at 2000px).
+    dragTo(result, 900);
+    expect(result.current.width).toBe(900);
+    expect(readPanelSizePreference("sidebarWidthPx")).toBe(900);
 
-    // Shrink the viewport: ceiling = min(480, 700*0.5) = 350. Live width clamps
-    // down to 350 but the saved 460 preference is untouched.
+    // Shrink the viewport: ceiling = 700*0.5 = 350. Live width clamps down to
+    // 350 but the saved 900 preference is untouched.
     setInnerWidth(700);
     act(() => window.dispatchEvent(new Event("resize")));
     expect(result.current.width).toBe(350);
-    expect(readPanelSizePreference("sidebarWidthPx")).toBe(460);
+    expect(readPanelSizePreference("sidebarWidthPx")).toBe(900);
 
-    // Widen again: re-derives from the preference, restoring 460 in-session.
+    // Widen again: re-derives from the preference, restoring 900 in-session.
     setInnerWidth(2000);
     act(() => window.dispatchEvent(new Event("resize")));
-    expect(result.current.width).toBe(460);
+    expect(result.current.width).toBe(900);
   });
 });

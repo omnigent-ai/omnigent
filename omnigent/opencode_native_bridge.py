@@ -33,6 +33,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from omnigent import native_bridge_common
+
 # Env var the runner stamps on the harness process so the executor can
 # locate its bridge directory. Mirrors ``HARNESS_CODEX_NATIVE_BRIDGE_DIR``.
 OPENCODE_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_OPENCODE_NATIVE_BRIDGE_DIR"
@@ -82,9 +84,8 @@ _OPENCODE_POLICY_PLUGIN_JS = r"""
 // phases the reactive permission.asked path cannot reach.
 const BASE = (process.env.OMNIGENT_POLICY_URL || "").replace(/\/+$/, "");
 const SESSION = process.env.OMNIGENT_SESSION_ID || "";
-// Full routing header map (Authorization + workspace / deployment routing
-// selectors) baked by the runner so this out-of-process plugin's POSTs reach the
-// SAME server instance as the runner.
+const RELAY_FILE = process.env.OMNIGENT_RELAY_FILE || "";
+// Full routing header map baked by the runner for the direct-server fallback.
 let POLICY_HEADERS = {};
 try {
   POLICY_HEADERS = JSON.parse(process.env.OMNIGENT_POLICY_HEADERS || "{}") || {};
@@ -93,11 +94,31 @@ try {
 }
 const TIMEOUT_MS = 600000;
 
+const fs = require("fs");
+
+// Re-read tool_relay.json on each call so the plugin picks up the relay as
+// soon as it starts (the file is written after opencode serve launches).
+function relayCredentials() {
+  if (!RELAY_FILE) return null;
+  try {
+    const d = JSON.parse(fs.readFileSync(RELAY_FILE, "utf8"));
+    if (d && typeof d.url === "string" && typeof d.token === "string") {
+      return { url: d.url, token: d.token };
+    }
+  } catch (_e) {}
+  return null;
+}
+
 async function evaluate(type, target, data) {
   // Returns {result, reason}. Not wired (no server/session) -> no-op allow.
   if (!BASE || !SESSION) return { result: "ALLOW" };
-  const url = BASE + "/v1/sessions/" + encodeURIComponent(SESSION) + "/policies/evaluate";
-  const headers = { "content-type": "application/json", ...POLICY_HEADERS };
+  const relay = relayCredentials();
+  const url = relay
+    ? relay.url.replace(/\/+$/, "") + "/policies/evaluate"
+    : BASE + "/v1/sessions/" + encodeURIComponent(SESSION) + "/policies/evaluate";
+  const headers = relay
+    ? { "content-type": "application/json", authorization: "Bearer " + relay.token }
+    : { "content-type": "application/json", ...POLICY_HEADERS };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
@@ -314,7 +335,24 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
     os.chmod(bridge_dir, 0o700)
     xdg_data_home_for_bridge_dir(bridge_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
     xdg_config_home_for_bridge_dir(bridge_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Owner-pid marker for the periodic dead-owner prune; refreshed every
+    # turn so it always names the current runner. See native_bridge_common.
+    native_bridge_common.write_owner_pid_marker(bridge_dir)
     return bridge_dir
+
+
+def prune_orphaned_bridge_dirs() -> int:
+    """
+    Remove opencode-native bridge dirs whose owner process is provably dead.
+
+    Delegates to the shared sweep against this harness's bridge root; the
+    runner calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
+    at startup to reclaim dirs leaked by a prior runner that died without
+    running the explicit delete path.
+
+    :returns: The number of orphaned bridge dirs removed.
+    """
+    return native_bridge_common.prune_orphaned_dirs(bridge_root())
 
 
 def write_relay_bridge_config(bridge_dir: Path) -> None:
@@ -605,8 +643,11 @@ def read_bridge_state(bridge_dir: Path) -> OpenCodeNativeBridgeState | None:
     session_id = raw.get("session_id")
     server_base_url = raw.get("server_base_url")
     opencode_session_id = raw.get("opencode_session_id")
-    required = (session_id, server_base_url, opencode_session_id)
-    if not all(isinstance(value, str) and value for value in required):
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if not isinstance(server_base_url, str) or not server_base_url:
+        return None
+    if not isinstance(opencode_session_id, str) or not opencode_session_id:
         return None
 
     def _opt_str(key: str) -> str | None:

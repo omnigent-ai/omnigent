@@ -135,9 +135,9 @@ async def test_get_host_detail_includes_runners_field(
     access.
     """
     app, _hr, host_store, *_ = management_app
-    host_store.upsert_on_connect("host_detail", "detail-laptop", "local")
+    host_store.upsert_on_connect("93de036146aa8e2618c0c24ab8f8f4cc", "detail-laptop", "local")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.get("/v1/hosts/host_detail")
+        resp = await client.get("/v1/hosts/93de036146aa8e2618c0c24ab8f8f4cc")
     assert resp.status_code == 200
     body = resp.json()
     assert "runners" in body, "response must contain a 'runners' key"
@@ -160,10 +160,10 @@ async def test_launch_runner_missing_session_id_returns_422(
     a 500.
     """
     app, _hr, host_store, *_ = management_app
-    host_store.upsert_on_connect("host_validate", "laptop", "local")
+    host_store.upsert_on_connect("4a4ec6c71dc0085128719ef31db86c45", "laptop", "local")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
-            "/v1/hosts/host_validate/runners",
+            "/v1/hosts/4a4ec6c71dc0085128719ef31db86c45/runners",
             json={"workspace": "/tmp/test"},
         )
     assert resp.status_code == 422, f"Expected 422 for missing session_id, got {resp.status_code}"
@@ -179,11 +179,11 @@ async def test_launch_runner_missing_workspace_returns_422(
     Both ``session_id`` and ``workspace`` are required fields.
     """
     app, _hr, host_store, *_ = management_app
-    host_store.upsert_on_connect("host_validate2", "laptop", "local")
+    host_store.upsert_on_connect("9fd95280b78ff59e9c3664b00ffca9bf", "laptop", "local")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
-            "/v1/hosts/host_validate2/runners",
-            json={"session_id": "conv_fake"},
+            "/v1/hosts/9fd95280b78ff59e9c3664b00ffca9bf/runners",
+            json={"session_id": "5ab79713d8c7904f4f4bf10b2da5df62"},
         )
     assert resp.status_code == 422, f"Expected 422 for missing workspace, got {resp.status_code}"
 
@@ -206,7 +206,7 @@ async def test_list_hosts_stale_host_reported_offline(
     """
     app, _hr, host_store, *_ = management_app
     # Register the host so it has status="online" in the DB.
-    host_store.upsert_on_connect("host_stale", "stale-laptop", "local")
+    host_store.upsert_on_connect("f5422856c5f2a0d1189fdd49de0c469c", "stale-laptop", "local")
 
     # Verify it initially shows as online. Other tests sharing this
     # xdist worker's host store leave rows behind (host rows are not
@@ -216,8 +216,10 @@ async def test_list_hosts_stale_host_reported_offline(
         resp = await client.get("/v1/hosts")
     assert resp.status_code == 200, resp.text
     hosts = resp.json()["hosts"]
-    stale = next((h for h in hosts if h["host_id"] == "host_stale"), None)
-    assert stale is not None, f"host_stale missing from {[h['host_id'] for h in hosts]}"
+    stale = next((h for h in hosts if h["host_id"] == "f5422856c5f2a0d1189fdd49de0c469c"), None)
+    assert stale is not None, (
+        f"f5422856c5f2a0d1189fdd49de0c469c missing from {[h['host_id'] for h in hosts]}"
+    )
     assert stale["status"] == "online"
 
     # Manually backdate updated_at to simulate a crashed host.
@@ -231,7 +233,9 @@ async def test_list_hosts_stale_host_reported_offline(
     stale_time = int(time.time()) - 600
     with Session(host_store._engine) as session:
         session.execute(
-            update(SqlHost).where(SqlHost.host_id == "host_stale").values(updated_at=stale_time)
+            update(SqlHost)
+            .where(SqlHost.host_id == "f5422856c5f2a0d1189fdd49de0c469c")
+            .values(updated_at=stale_time)
         )
         session.commit()
 
@@ -239,8 +243,10 @@ async def test_list_hosts_stale_host_reported_offline(
         resp = await client.get("/v1/hosts")
     assert resp.status_code == 200, resp.text
     hosts = resp.json()["hosts"]
-    stale = next((h for h in hosts if h["host_id"] == "host_stale"), None)
-    assert stale is not None, f"host_stale missing from {[h['host_id'] for h in hosts]}"
+    stale = next((h for h in hosts if h["host_id"] == "f5422856c5f2a0d1189fdd49de0c469c"), None)
+    assert stale is not None, (
+        f"f5422856c5f2a0d1189fdd49de0c469c missing from {[h['host_id'] for h in hosts]}"
+    )
     assert stale["status"] == "offline", (
         "A host with a stale last_seen_at should be reported as offline. "
         "The liveness check (host_is_live) is missing from the list route."
@@ -262,11 +268,11 @@ async def test_get_host_detail_offline_status(
     list shows offline but the detail view shows online.
     """
     app, _hr, host_store, *_ = management_app
-    host_store.upsert_on_connect("host_off", "off-laptop", "local")
-    host_store.set_offline("host_off")
+    host_store.upsert_on_connect("ba0a675ffb72378982f8ef434478adc8", "off-laptop", "local")
+    host_store.set_offline("ba0a675ffb72378982f8ef434478adc8")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.get("/v1/hosts/host_off")
+        resp = await client.get("/v1/hosts/ba0a675ffb72378982f8ef434478adc8")
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "offline"
-    assert body["host_id"] == "host_off"
+    assert body["host_id"] == "ba0a675ffb72378982f8ef434478adc8"

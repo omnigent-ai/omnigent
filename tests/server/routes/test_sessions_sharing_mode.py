@@ -705,3 +705,102 @@ async def test_admin_put_is_atomic_across_mixed_writability(db_uri: str, tmp_pat
         assert resp.status_code == 403, resp.text
         # The writable half must NOT have been persisted (no partial apply).
         assert read_sharing_mode_override() is None
+
+
+# ── Read-only collaborators may pin a shared session ─────────────────
+
+
+async def test_read_only_grantee_can_pin_shared_session(db_uri: str, tmp_path: Path) -> None:
+    """Pinning is a personal, per-viewer preference, not an edit to the session.
+    A ``LEVEL_READ`` collaborator on a session shared with them must be able to
+    pin it — a pin-only PATCH needs only read access, and the pin is stored under
+    the caller's own per-user key (not visible to other viewers)."""
+    from omnigent.db.utils import generate_agent_id
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    permission_store = SqlAlchemyPermissionStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="pin-agent", bundle_location="test:///bundle")
+    conv = conversation_store.create_conversation(agent_id=agent_id)
+    permission_store.ensure_user(_OWNER)
+    permission_store.grant(_OWNER, conv.id, LEVEL_OWNER)
+    # Share it read-only with the grantee.
+    permission_store.ensure_user(_GRANTEE)
+    permission_store.grant(_GRANTEE, conv.id, LEVEL_READ)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        permission_store=permission_store,
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+
+    async with _client(app, _GRANTEE) as c:
+        resp = await c.patch(
+            f"/v1/sessions/{conv.id}",
+            json={"labels": {"omnigent.pinned": "1721760000000"}},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["labels"].get("omnigent.pinned") == "1721760000000"
+
+    # Stored under the grantee's per-user key, and it surfaces on their
+    # ``?pinned=true`` list.
+    conv = conversation_store.get_conversation(conv.id)
+    assert conv is not None
+    assert conv.labels.get(pinned_label_key(_GRANTEE)) == "1721760000000"
+
+    async with _client(app, _GRANTEE) as c:
+        listed = await c.get("/v1/sessions?pinned=true")
+        assert listed.status_code == 200, listed.text
+        assert conv.id in [s["id"] for s in listed.json()["data"]]
+
+        # Unpin takes the other branch (the ``delete_label`` clear loop) but is
+        # still pin-only, so it also needs just read access: an empty value
+        # clears the grantee's own per-user key.
+        resp = await c.patch(
+            f"/v1/sessions/{conv.id}",
+            json={"labels": {"omnigent.pinned": ""}},
+        )
+        assert resp.status_code == 200, resp.text
+
+    conv = conversation_store.get_conversation(conv.id)
+    assert conv is not None
+    assert pinned_label_key(_GRANTEE) not in conv.labels
+
+
+async def test_read_only_grantee_cannot_edit_other_labels(db_uri: str, tmp_path: Path) -> None:
+    """The pin-only downgrade is narrow: a read-only collaborator PATCHing any
+    non-pin field (or bundling one alongside the pin) still hits the edit gate."""
+    from omnigent.db.utils import generate_agent_id
+
+    permission_store = SqlAlchemyPermissionStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="pin-agent", bundle_location="test:///bundle")
+    conv = conversation_store.create_conversation(agent_id=agent_id)
+    permission_store.ensure_user(_OWNER)
+    permission_store.grant(_OWNER, conv.id, LEVEL_OWNER)
+    permission_store.ensure_user(_GRANTEE)
+    permission_store.grant(_GRANTEE, conv.id, LEVEL_READ)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        permission_store=permission_store,
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+
+    async with _client(app, _GRANTEE) as c:
+        # A non-pin label alone → edit required → 403.
+        resp = await c.patch(
+            f"/v1/sessions/{conv.id}",
+            json={"labels": {"omni_project": "Moonshot"}},
+        )
+        assert resp.status_code == 403, resp.text
+        # Pin bundled with another label → not pin-only → edit required → 403.
+        resp = await c.patch(
+            f"/v1/sessions/{conv.id}",
+            json={"labels": {"omnigent.pinned": "1721760000000", "omni_project": "Moonshot"}},
+        )
+        assert resp.status_code == 403, resp.text

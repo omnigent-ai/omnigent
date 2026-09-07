@@ -39,44 +39,72 @@ Reset everything (drops the DB and the artifact store):
 docker compose down -v
 ```
 
+## Release features
+
+Release features are deployment-wide and off by default. Enable one or more
+with the comma-separated `OMNIGENT_FEATURES` variable in `.env`, then recreate
+the server container:
+
+```dotenv
+OMNIGENT_FEATURES=usage_page
+```
+
+```bash
+docker compose up -d
+curl -s http://localhost:8000/v1/info | jq '.features'
+```
+
+Known keys and their lifecycle are documented in
+[`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md). Unknown keys fail
+server startup so a typo cannot silently produce the wrong rollout. To roll
+back, remove the key (or empty the variable), run `docker compose up -d` again,
+and reload the web app.
+
 ## Multi-user mode (accounts — default)
 
 Built-in accounts auth: no IdP to register, no proxy to host.
 This is the default — `docker compose up -d` brings it up with no
-extra env wiring. First boot creates an admin user (named after the
-operator's OS user, falling back to `admin` in headless containers)
-with a random password that lands in the container logs and on the
-persistent volume at `/data/admin-credentials`.
+extra env wiring. No credentials are auto-generated. On first boot,
+when no admin exists yet and none was pre-seeded, the server creates
+nothing and prints:
+
+```
+→ No admin yet. Open <base_url> to create the first admin account (choose a username + password).
+```
+
+You then open the web UI's **Create admin** form (it appears while no
+admin exists) and pick your own username + password.
 
 For any deploy reachable through a public domain, also set the
-external URL so invite links resolve correctly:
+external URL so the printed link and invite links resolve correctly:
 
 ```bash
 # Add to .env (bootstrap.sh already minted the cookie secret for you):
 OMNIGENT_ACCOUNTS_BASE_URL=https://omnigent.example.com
 
 docker compose up -d
-docker compose logs omnigent | grep -A4 "Created initial admin"
+docker compose logs omnigent      # shows the "No admin yet" line with your base URL
 ```
 
-Copy the random `password` from the log line into the web UI's
-login form, then:
+Once you've created the admin and signed in:
 
 - Click your username in the top-right → **Members** → **Invite member**.
 - Share the single-use URL with the teammate; they pick their own
   username and password when they redeem it.
 - Sign-out lives in the same account menu.
 
-Headless deploy (CI, Cloud Run, etc.) where you can't read the
-logs? Pre-seed the password:
+Headless deploy (CI, Cloud Run, etc.) where you can't reach the
+Create-admin form? Pre-seed the admin password so first boot creates
+the admin directly:
 
 ```bash
 OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD=<your-strong-password>
 ```
 
-The persistent password file is at `/data/admin-credentials` on
-the `artifact-data` volume — survives `docker compose restart`,
-deleted by `docker compose down -v`.
+`OMNIGENT_ADMIN_CREDENTIALS_PATH` (set to `/data/admin-credentials`
+in `docker-compose.yaml`) anchors the persistent state directory on
+the `artifact-data` volume — it survives `docker compose restart` and
+is deleted by `docker compose down -v`.
 
 ## Multi-user mode (OIDC)
 
@@ -260,6 +288,34 @@ Build it locally from the repo root:
 docker build -t omnigent-host:latest --target host \
              -f deploy/docker/Dockerfile .
 ```
+
+### Baking in extra harness CLIs
+
+A harness whose CLI isn't in the image fails closed with
+`harness_not_configured` when a managed-sandbox session tries to launch
+it. To bake in additional harness CLIs without forking the Dockerfile,
+pass `EXTRA_HARNESS_CLIS` at build time — space-separated harness names
+with an optional `@version` pin, whether the CLI ships on npm or via a
+vendor installer:
+
+```bash
+docker build -t omnigent-host:latest --target host \
+             -f deploy/docker/Dockerfile \
+             --build-arg EXTRA_HARNESS_CLIS="goose jcode opencode" .
+```
+
+Supported names (`opencode`, `qwen`, `goose`, `agy`, `jcode`, `cursor`,
+`kimi`), the install method behind each, and the `npm:<pkg-spec>` escape
+hatch live in [`install-harness-cli.sh`](./install-harness-cli.sh). Empty by
+default — the shipped CLI set is unchanged.
+
+Supply-chain note: the `agy` row is pinned to an immutable per-arch release
+asset with a sha256 check (the same control kiro-cli gets in the default
+image); the other vendor-installer rows run the harness's own `curl | bash`
+off mutable refs and are verified only with a `--version` check (cursor's
+installer cannot be pinned at all). `npm:<pkg-spec>` entries get no binary
+smoke check — confirm the binary yourself. UBI has no baked `agy`; use
+`EXTRA_HARNESS_CLIS=agy` there.
 
 ### Using it with the Modal sandbox provider
 

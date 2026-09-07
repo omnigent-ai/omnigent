@@ -15,12 +15,30 @@ import click
 import httpx
 import pytest
 
+from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.host import daemon_launch
 from omnigent.host.daemon_launch import (
+    open_daemon_client,
     runner_is_online,
     wait_for_host_online,
     wait_for_runner_online,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate the machine's own host identity and runner slice-key env.
+
+    ``databricks_request_headers`` (reached via ``open_daemon_client`` with no
+    explicit host) falls back to the CLI's own host_id, so on a machine that IS
+    a host (a persisted ``~/.omnigent/config.yaml`` ``host:`` section) the
+    "no slice key" assertions would pick up that ambient identity.
+    """
+    monkeypatch.setattr(
+        "omnigent.host.identity.load_host_identity_if_present",
+        lambda *a, **k: None,
+    )
+    monkeypatch.delenv("OMNIGENT_RUNNER_SLICE_KEY", raising=False)
 
 
 class _FlakyThenOnline:
@@ -128,12 +146,15 @@ class _AlwaysHtml:
 
 @pytest.fixture
 def fast_poll(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Shrink the poll interval so the wait loops iterate in milliseconds.
+    """Shrink the poll intervals so the wait loops iterate in milliseconds.
 
-    Patches the module's own constant (read at call time inside the
-    loops), keeping each test well under 100ms instead of multiples
-    of the real 0.5s cadence.
+    Patches the module's own constants (read at call time by
+    ``daemon_poll_intervals``), keeping each test well under 100ms
+    instead of multiples of the real cadence. Both the opening interval
+    and the steady-state cap are shrunk — leaving the opening one at its
+    real value would dominate these short loops.
     """
+    monkeypatch.setattr(daemon_launch, "DAEMON_POLL_INITIAL_INTERVAL_S", 0.01)
     monkeypatch.setattr(daemon_launch, "DAEMON_POLL_INTERVAL_S", 0.01)
 
 
@@ -344,3 +365,56 @@ async def test_wait_for_host_online_tolerates_html_fallback_then_online(
         await wait_for_host_online(client, "host_abc123", timeout_s=5.0)
     # 3 = 2 HTML-fallback polls + the one that observed JSON "online".
     assert handler.requests_seen == 3
+
+
+async def test_open_daemon_client_pins_slice_key_on_workspace_mount() -> None:
+    """On the workspace mount the client is pinned to the host's replica.
+
+    The host_id routing header is baked into the client's default headers, so
+    every request it makes — the launch, runner-status polls, and the
+    session/terminal ops (including a resume reattach check that runs before
+    the launch) — reaches the replica holding the host's tunnels. Base headers
+    are preserved.
+    """
+    async with open_daemon_client(
+        "https://ws.example.com/api/2.0/omnigent",
+        {"Authorization": "Bearer t"},
+        "host_abc123",
+    ) as client:
+        assert client.headers.get(OMNIGENT_SLICE_KEY_HEADER) == "host_abc123"
+        assert client.headers.get("Authorization") == "Bearer t"
+
+
+async def test_open_daemon_client_no_slice_key_off_workspace() -> None:
+    """An unsharded server has no sharding layer, so no key is baked."""
+    async with open_daemon_client("http://test", {}, "host_abc123") as client:
+        assert OMNIGENT_SLICE_KEY_HEADER not in client.headers
+
+
+async def test_open_daemon_client_no_slice_key_without_host() -> None:
+    """A hostless (local) session leaves routing to the default fallback."""
+    async with open_daemon_client("https://ws.example.com/api/2.0/omnigent", {}, None) as client:
+        assert OMNIGENT_SLICE_KEY_HEADER not in client.headers
+
+
+def test_daemon_poll_intervals_open_tight_then_hold_at_the_cadence() -> None:
+    """
+    Readiness probes start tight and ease off to the steady cadence.
+
+    These waits gate every native-harness launch and usually resolve in
+    the first probe or two, so the opening interval must be well under
+    the steady cadence — otherwise a resource that became ready
+    immediately still costs a full interval of dead time. The sequence
+    must also be monotonic and never exceed the cadence, so a long wait
+    does not hammer the server.
+    """
+    intervals = daemon_launch.daemon_poll_intervals()
+    first_ten = [next(intervals) for _ in range(10)]
+
+    assert first_ten[0] == daemon_launch.DAEMON_POLL_INITIAL_INTERVAL_S
+    assert first_ten[0] < daemon_launch.DAEMON_POLL_INTERVAL_S
+    assert first_ten == sorted(first_ten)
+    assert max(first_ten) == daemon_launch.DAEMON_POLL_INTERVAL_S
+    # Reaching "ready" on the third probe must cost less than the old flat
+    # cadence would have spent getting there.
+    assert sum(first_ten[:2]) < 2 * daemon_launch.DAEMON_POLL_INTERVAL_S
