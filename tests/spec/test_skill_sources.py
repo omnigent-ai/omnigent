@@ -843,3 +843,140 @@ def test_antigravity_provider_reads_agents_skills_not_claude_skills(
 
     names = [s.name for s in resolve_harness_skills(_ctx(ws, home), "antigravity-native")]
     assert names == ["neutral-skill"]
+
+
+def _write_plugin_command(commands_dir: Path, name: str, text: str) -> None:
+    """Write a ``<commands_dir>/<name>.md`` plugin command file."""
+    commands_dir.mkdir(parents=True, exist_ok=True)
+    (commands_dir / f"{name}.md").write_text(text)
+
+
+def _claude_home_with_plugin_command(
+    home: Path, *, plugin: str = "knowledge-base", marketplace: str = "mkt"
+) -> Path:
+    """Seed a fake ~/.claude with one enabled plugin carrying a command + a skill."""
+    install = home / ".claude" / "plugins" / "cache" / marketplace / plugin / "1.0.0"
+    _write_skill(install / "skills", "kb-search")
+    _write_plugin_command(
+        install / "commands",
+        "kb-review",
+        "---\n"
+        "description: Review a knowledge-base PR\n"
+        "argument-hint: --pr <number>\n"
+        "---\n"
+        "Review the KB pull request given as $ARGUMENTS.\n",
+    )
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    (home / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {f"{plugin}@{marketplace}": True}})
+    )
+    (home / ".claude" / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {"version": 2, "plugins": {f"{plugin}@{marketplace}": [{"installPath": str(install)}]}}
+        )
+    )
+    return home
+
+
+def test_claude_provider_surfaces_plugin_commands_namespaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plugin's ``commands/<name>.md`` shows up next to its skills."""
+    home = _claude_home_with_plugin_command(tmp_path / "home")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    by_name = {s.name: s for s in out}
+    assert "knowledge-base:kb-search" in by_name
+    command = by_name.get("knowledge-base:kb-review")
+    assert command is not None
+    assert command.description == "Review a knowledge-base PR"
+    # Sibling files under commands/ are other commands, not skill resources.
+    assert command.skill_dir is None
+
+
+def test_plugin_command_without_frontmatter_uses_first_body_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Frontmatter is optional on plugin commands; the body's first line labels it."""
+    home = tmp_path / "home"
+    install = home / ".claude" / "plugins" / "cache" / "mkt" / "tools" / "1.0.0"
+    _write_plugin_command(install / "commands", "deploy", "Deploy the current branch.\n")
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    (home / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"tools@mkt": True}})
+    )
+    (home / ".claude" / "plugins" / "installed_plugins.json").write_text(
+        json.dumps({"version": 2, "plugins": {"tools@mkt": [{"installPath": str(install)}]}})
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    by_name = {s.name: s for s in out}
+    command = by_name.get("tools:deploy")
+    assert command is not None
+    assert command.description == "Deploy the current branch."
+    assert command.content == "Deploy the current branch."
+
+
+def test_plugin_commands_respect_none_and_list_filters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plugin commands obey ``skills_filter`` like every other host skill."""
+    home = _claude_home_with_plugin_command(tmp_path / "home")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    hermetic = SkillSourceContext(
+        roots=(tmp_path / "ws",), home=home, skills_filter="none", bundle_dir=None
+    )
+    assert resolve_harness_skills(hermetic, "claude-native") == []
+
+    selected = SkillSourceContext(
+        roots=(tmp_path / "ws",), home=home, skills_filter=["kb-review"], bundle_dir=None
+    )
+    names = [s.name for s in resolve_harness_skills(selected, "claude-native")]
+    assert names == ["knowledge-base:kb-review"]
+
+
+def test_plugin_commands_skip_non_md_and_nested_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only top-level ``*.md`` files are commands; dirs and other files are not."""
+    home = _claude_home_with_plugin_command(tmp_path / "home")
+    install = home / ".claude" / "plugins" / "cache" / "mkt" / "knowledge-base" / "1.0.0"
+    (install / "commands" / "notes.txt").write_text("not a command")
+    nested = install / "commands" / "group"
+    nested.mkdir()
+    (nested / "inner.md").write_text("nested command spelling not surfaced yet")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert "knowledge-base:kb-review" in names
+    assert "knowledge-base:notes" not in names
+    assert "knowledge-base:inner" not in names
+    assert "knowledge-base:group" not in names
+
+
+def test_plugin_skill_wins_name_collision_with_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a plugin ships skills/x and commands/x.md, the skill entry wins."""
+    home = tmp_path / "home"
+    install = home / ".claude" / "plugins" / "cache" / "mkt" / "dup" / "1.0.0"
+    _write_skill(install / "skills", "review")
+    _write_plugin_command(
+        install / "commands", "review", "---\ndescription: command flavor\n---\nbody\n"
+    )
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    (home / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"dup@mkt": True}})
+    )
+    (home / ".claude" / "plugins" / "installed_plugins.json").write_text(
+        json.dumps({"version": 2, "plugins": {"dup@mkt": [{"installPath": str(install)}]}})
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    matches = [s for s in out if s.name == "dup:review"]
+    assert len(matches) == 1
+    assert matches[0].description == "review desc"  # the skill's, not the command's
