@@ -1900,6 +1900,22 @@ describe("Composer file-attachment focus", () => {
     expect(document.activeElement).toBe(ta);
   });
 
+  it("marks the textarea with data-has-draft for an attachment-only draft", () => {
+    // The approve hotkey's drafting guard only sees the focused element, so
+    // the composer must advertise non-text drafts (attachments, mentions) on
+    // the textarea itself — with an empty value, an attached file is still a
+    // sendable draft, and Cmd/Ctrl+Enter must read as send intent there.
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    expect(ta.getAttribute("data-has-draft")).toBeNull();
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.change(fileInput(), { target: { files: [file] } });
+
+    expect(ta.value).toBe("");
+    expect(ta.getAttribute("data-has-draft")).toBe("true");
+  });
+
   it("does not focus the textarea when the attachment is rejected", () => {
     // An unsupported type is dropped by validateAttachments, so no file is
     // added — and with nothing attached there's no reason to yank focus back.

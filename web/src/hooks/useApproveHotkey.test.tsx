@@ -152,6 +152,30 @@ describe("useApproveHotkey", () => {
     }
   });
 
+  it("does not accept from an empty field marked as holding a draft (attachments/mentions)", () => {
+    // A draft isn't only text: pending attachments or @-mentions make the
+    // composer sendable with an empty value, and it advertises that via
+    // data-has-draft. The chord is still a send intent there, not a verdict.
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(false));
+    const ta = document.createElement("textarea");
+    ta.dataset.hasDraft = "true";
+    document.body.appendChild(ta);
+    try {
+      ta.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          ctrlKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      expect(submitApproval).not.toHaveBeenCalled();
+    } finally {
+      ta.remove();
+    }
+  });
+
   it("still accepts from an empty text field (no draft, no send intent)", () => {
     // Post-send, focus can legitimately sit in the cleared composer; an
     // empty field carries no draft, so the chord keeps meaning "approve".

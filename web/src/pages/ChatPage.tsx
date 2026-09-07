@@ -3596,6 +3596,9 @@ function ComposerImpl({
             // the disabled Send button) until the prompt is answered.
             disabled={disabled || isReadOnly || unreachable}
             data-slash-command={composerIsCommand ? "true" : undefined}
+            // Full send intent (text OR attachments OR mentions) for the
+            // approve hotkey's drafting guard, which only sees this element.
+            data-has-draft={hasDraft ? "true" : undefined}
             className={cn(
               "relative w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 [&::-webkit-scrollbar]:hidden",
               // Hand glyph painting to the overlay while a command is drafted;

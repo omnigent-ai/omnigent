@@ -31,12 +31,18 @@ import { useChatStore } from "@/store/chatStore";
 /**
  * Whether the keystroke landed in a text field that holds a draft — the
  * signature of a user mid-composition, for whom Cmd/Ctrl+Enter means "send
- * what I typed", never "approve the prompt that just appeared". An EMPTY
- * field carries no send intent, so the chord still accepts from there (the
- * common post-send state, where focus may remain in the cleared composer).
+ * what I typed", never "approve the prompt that just appeared". A field can
+ * hold a sendable draft its text can't show (pending attachments or
+ * @-mentions with an empty value), so the composer marks itself with
+ * `data-has-draft` and that marker counts too. An EMPTY, unmarked field
+ * carries no send intent, so the chord still accepts from there (the common
+ * post-send state, where focus may remain in the cleared composer).
  */
 export function isDraftingTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
+  // Complete send intent (text OR attachments OR mentions), as declared by
+  // the field itself — a bare value check can't see non-text drafts.
+  if (target.dataset.hasDraft === "true") return true;
   if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
     return target.value.length > 0;
   }
