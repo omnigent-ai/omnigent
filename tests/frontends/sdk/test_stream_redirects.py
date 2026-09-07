@@ -1,13 +1,16 @@
-"""Redirects on stream opens: followed transparently, or failed loud.
+"""Redirects on stream opens: followed on-origin, refused off it, never silent.
 
 ``OmnigentClient`` builds its ``httpx.AsyncClient`` with
-``follow_redirects=True``, so a proxy or gateway 3xx on a stream request is
-chased to the final endpoint and the SSE stream flows from there. The
-stream-open guards cover the remaining hole: a 3xx that *cannot* be followed
-(no ``Location`` header, a ``304``, or a caller-supplied client with
-redirects disabled) must raise ``OmnigentError`` instead of handing the SSE
-parser a non-SSE body that completes as a silent, error-free, zero-event
-stream.
+``follow_redirects=True`` plus a response hook that restricts following to
+the request's own origin (same scheme/host/port, or an http→https upgrade on
+the same host). An on-origin proxy or gateway 3xx on a stream request is
+chased to the final endpoint and the SSE stream flows from there; a
+cross-origin or https→http hop raises ``OmnigentError`` before any header or
+body is forwarded. The stream-open guards cover the remaining hole: a 3xx
+that *cannot* be followed (no ``Location`` header, a ``304``, or a
+caller-supplied client with redirects disabled) must raise ``OmnigentError``
+instead of handing the SSE parser a non-SSE body that completes as a silent,
+error-free, zero-event stream.
 
 ``_stream_session_events`` documents ``:raises OmnigentError:`` for a non-2xx
 stream open, including an unfollowed redirect; these tests pin both halves of
@@ -114,6 +117,52 @@ async def test_responses_stream_follows_307_replaying_the_post_body() -> None:
     assert [event.delta for event in events if isinstance(event, TextDelta)] == ["hi"]
     assert relocated[0].method == "POST"
     assert b'"model"' in relocated[0].content and b"agent" in relocated[0].content
+
+
+@pytest.mark.asyncio
+async def test_cross_origin_redirect_is_refused_and_nothing_is_forwarded() -> None:
+    """A redirect off the configured origin raises; no second request is sent.
+
+    A redirecting gateway must not be able to point caller headers or bodies
+    at a foreign host: the response hook refuses the hop before the client
+    issues any request to the redirect target.
+    """
+    seen_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(request.url.host)
+        return httpx.Response(
+            302,
+            headers={"location": "https://elsewhere.invalid/v1/sessions/conv_1/stream"},
+        )
+
+    async with OmnigentClient(base_url=_BASE) as client:
+        client._http._transport = httpx.MockTransport(handler)
+        with pytest.raises(OmnigentError) as excinfo:
+            async for _event in client.sessions.stream("conv_1"):
+                pass
+
+    assert excinfo.value.status_code == 302
+    assert seen_hosts == ["127.0.0.1"]
+
+
+@pytest.mark.asyncio
+async def test_https_downgrade_redirect_is_refused() -> None:
+    """An https→http redirect on the same host is a downgrade and is refused."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            301,
+            headers={"location": "http://127.0.0.1:9/v1/sessions/conv_1/stream"},
+        )
+
+    async with OmnigentClient(base_url="https://127.0.0.1:9") as client:
+        client._http._transport = httpx.MockTransport(handler)
+        with pytest.raises(OmnigentError) as excinfo:
+            async for _event in client.sessions.stream("conv_1"):
+                pass
+
+    assert excinfo.value.status_code == 301
 
 
 @pytest.mark.asyncio

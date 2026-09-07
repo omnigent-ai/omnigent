@@ -9,6 +9,7 @@ import httpx
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
+from ._errors import OmnigentError
 from ._files import FilesNamespace
 from ._http import is_loopback_url
 from ._query import QueryResult, QueryStream
@@ -17,6 +18,42 @@ from ._session import Session
 from ._sessions import SessionsNamespace
 from ._sessions_chat import SessionsChat, ToolCallable
 from ._tool_handler import StreamHooks, ToolHandler
+
+
+def _redirect_stays_on_origin(request_url: httpx.URL, location: str) -> bool:
+    """True when a redirect target keeps the request's origin.
+
+    Same scheme/host/port, or an http→https upgrade on the same host — the
+    same rule httpx uses to keep auth headers across a redirect.
+    """
+    try:
+        target = request_url.join(location)
+    except httpx.InvalidURL:
+        return False
+    if target.host != request_url.host:
+        return False
+    if target.scheme == request_url.scheme and target.port == request_url.port:
+        return True
+    return request_url.scheme == "http" and target.scheme == "https"
+
+
+async def _refuse_cross_origin_redirects(response: httpx.Response) -> None:
+    """Response hook: only follow redirects on the request's own origin.
+
+    Keeps caller-supplied auth headers and request bodies from being
+    forwarded to a foreign host by a redirecting gateway, and blocks
+    https→http downgrades. Cross-origin hops fail loud instead.
+    """
+    if not response.has_redirect_location:
+        return
+    location = response.headers["location"]
+    if _redirect_stays_on_origin(response.request.url, location):
+        return
+    raise OmnigentError(
+        f"refusing to follow a cross-origin redirect (status {response.status_code}) "
+        f"to {location}",
+        response.status_code,
+    )
 
 
 class OmnigentClient:
@@ -55,6 +92,11 @@ class OmnigentClient:
     :param timeout: Default timeout for non-streaming HTTP requests in
         seconds. SSE streams use a 600-second read timeout so server-side
         tool execution can pause the stream for several minutes.
+
+    The client follows 3xx redirects on the configured origin (including
+    http→https upgrades on the same host) and refuses cross-origin hops
+    with :class:`OmnigentError`, so headers and bodies never leave the
+    host the caller configured.
     """
 
     def __init__(
@@ -80,9 +122,12 @@ class OmnigentClient:
             auth=auth,
             timeout=httpx.Timeout(timeout),
             # Follow proxy/gateway redirects (3xx) transparently, streams
-            # included. httpx strips Authorization on cross-origin hops and
-            # raises TooManyRedirects on loops.
+            # included, but only on the configured origin: the response hook
+            # refuses cross-origin hops so headers and bodies never leave
+            # the host the caller configured. httpx raises TooManyRedirects
+            # on loops.
             follow_redirects=True,
+            event_hooks={"response": [_refuse_cross_origin_redirects]},
             # A proxy cannot reach our loopback server, so bypass the
             # environment for local targets. Loopback is plain HTTP with
             # explicit headers, so losing netrc/CA env with it costs nothing.
