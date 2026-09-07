@@ -119,7 +119,92 @@ def test_send_kiro_permission_verdict_accepts_default_option(
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
     bridge_dir = tmp_path / "bridge"
-    calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE, _READY_PANE],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    send_kiro_permission_verdict(
+        bridge_dir, action="accept", expected_title="Running: pwd", timeout_s=0.1
+    )
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Enter"]
+
+
+def test_send_kiro_permission_verdict_retries_ignored_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rendered prompt must disappear before web delivery counts as successful."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _PERMISSION_PANE,
+            _PERMISSION_PANE,
+            _PERMISSION_PANE,
+            _READY_PANE,
+        ],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    send_kiro_permission_verdict(
+        bridge_dir, action="accept", expected_title="Running: pwd", timeout_s=0.1
+    )
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Enter", "Enter"]
+
+
+def test_send_kiro_permission_verdict_fails_if_prompt_never_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    with pytest.raises(RuntimeError, match="did not resolve after verdict delivery"):
+        send_kiro_permission_verdict(
+            bridge_dir, action="accept", expected_title="Running: pwd", timeout_s=0.01
+        )
+
+
+def test_send_kiro_permission_verdict_does_not_retry_a_changed_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE, _PERMISSION_PANE_DATE],
+    )
     write_tmux_target(
         bridge_dir,
         socket_path=Path("/tmp/tmux.sock"),
@@ -174,6 +259,7 @@ def test_send_kiro_permission_verdict_declines_with_slow_navigation(
         pane_outputs=[
             _PERMISSION_PANE,
             _PERMISSION_PANE_REJECT_FOCUSED,
+            _READY_PANE,
         ],
     )
     write_tmux_target(

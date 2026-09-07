@@ -57,6 +57,8 @@ _SUBMIT_VERIFY_TIMEOUT_S = 5.0
 _SUBMIT_RETRY_INTERVAL_S = 0.5
 _PERMISSION_KEY_INTERVAL_S = 0.3
 _PERMISSION_ENTER_SETTLE_S = 0.5
+_PERMISSION_VERDICT_VERIFY_TIMEOUT_S = 5.0
+_PERMISSION_VERDICT_RETRY_INTERVAL_S = 0.5
 _KIRO_SEPARATOR = "────"
 _KIRO_INPUT_READY_MARKERS = (
     "ask a question or describe a task",
@@ -518,6 +520,40 @@ def _wait_for_kiro_permission_prompt(
     )
 
 
+def _wait_for_kiro_permission_verdict_applied(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    action: str,
+    expected_title: str | None,
+    timeout_s: float,
+) -> None:
+    """Verify Kiro consumed a verdict, retrying only on the same safe prompt."""
+    deadline = time.monotonic() + min(timeout_s, _PERMISSION_VERDICT_VERIFY_TIMEOUT_S)
+    last_enter = time.monotonic()
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        if not _kiro_permission_prompt_active(pane):
+            return
+        if not _kiro_permission_prompt_matches_title(pane, expected_title):
+            return
+        focus_is_safe = (
+            _kiro_permission_focus_on_one_time_allow(pane)
+            if action == "accept"
+            else _kiro_permission_focus_on_reject(pane)
+        )
+        if not focus_is_safe:
+            raise RuntimeError(
+                "kiro-native permission focus changed before verdict delivery completed"
+            )
+        now = time.monotonic()
+        if now - last_enter >= _PERMISSION_VERDICT_RETRY_INTERVAL_S:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            last_enter = now
+        time.sleep(_POLL_INTERVAL_S)
+    raise RuntimeError("kiro-native permission prompt did not resolve after verdict delivery")
+
+
 def _wait_for_kiro_input_ready(
     socket_path: str,
     tmux_target: str,
@@ -733,6 +769,13 @@ def send_kiro_permission_verdict(
             raise RuntimeError("kiro-native allow option was not safely focused before delivery")
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
         time.sleep(_PERMISSION_KEY_INTERVAL_S)
+        _wait_for_kiro_permission_verdict_applied(
+            socket_path,
+            tmux_target,
+            action=action,
+            expected_title=expected_title,
+            timeout_s=timeout_s,
+        )
         return
     for key in ("Down", "Down"):
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
@@ -747,6 +790,13 @@ def send_kiro_permission_verdict(
     time.sleep(_PERMISSION_ENTER_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    _wait_for_kiro_permission_verdict_applied(
+        socket_path,
+        tmux_target,
+        action=action,
+        expected_title=expected_title,
+        timeout_s=timeout_s,
+    )
 
 
 # kiro prints "Model changed to <id> (saved as default)" after a successful
