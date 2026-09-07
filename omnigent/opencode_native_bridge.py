@@ -96,6 +96,13 @@ const TIMEOUT_MS = 600000;
 
 const fs = require("fs");
 
+const KNOWN_VERDICTS = [
+  "POLICY_ACTION_ALLOW",
+  "POLICY_ACTION_DENY",
+  "POLICY_ACTION_ASK",
+  "POLICY_ACTION_UNSPECIFIED",
+];
+
 // Re-read tool_relay.json on each call so the plugin picks up the relay as
 // soon as it starts (the file is written after opencode serve launches).
 function relayCredentials() {
@@ -109,9 +116,15 @@ function relayCredentials() {
   return null;
 }
 
-async function evaluate(type, target, data) {
+async function evaluate(type, target, data, failClosed) {
   // Returns {result, reason}. Not wired (no server/session) -> no-op allow.
   if (!BASE || !SESSION) return { result: "ALLOW" };
+  // ``failClosed`` mirrors ``FAIL_CLOSED_PHASES`` in omnigent/policies/types.py
+  // client-side: for a phase whose in-band verdict is the ONLY enforcement
+  // point, an unreachable engine must not wave the call through.
+  const unavailable = failClosed
+    ? { result: "POLICY_ACTION_DENY", reason: "policy engine unavailable" }
+    : { result: "ALLOW" };
   const relay = relayCredentials();
   const url = relay
     ? relay.url.replace(/\/+$/, "") + "/policies/evaluate"
@@ -128,13 +141,20 @@ async function evaluate(type, target, data) {
       body: JSON.stringify({ event: { type: type, target: target || "", data: data } }),
       signal: controller.signal,
     });
-    if (!resp.ok) return { result: "ALLOW" };
+    if (!resp.ok) return unavailable;
     const body = await resp.json();
-    return body && typeof body === "object" ? body : { result: "ALLOW" };
+    // A 2xx that isn't a verdict (proxy envelope, {"detail": ...}, a renamed
+    // field) must not read as ALLOW on a fail-closed phase. Allowlist the
+    // verdicts, mirroring omnigent/native_policy_hook.py.
+    if (!body || typeof body !== "object" || KNOWN_VERDICTS.indexOf(body.result) < 0) {
+      return unavailable;
+    }
+    return body;
   } catch (e) {
-    // Server unreachable / timeout: fail OPEN so a transient blip can't lock
-    // the session. The web approval card (if any) stays parked server-side.
-    return { result: "ALLOW" };
+    // Server unreachable / timeout: advisory phases fail OPEN so a transient
+    // blip can't lock the session. The web approval card (if any) stays parked
+    // server-side. TOOL_CALL passes failClosed and denies instead.
+    return unavailable;
   } finally {
     clearTimeout(timer);
   }
@@ -168,6 +188,33 @@ export const OmnigentPolicyPlugin = async () => ({
       // written to opencode's session log, so carry the policy reason there.
       throw new Error(
         "Omnigent policy blocked this prompt: " + (verdict.reason || "request denied"),
+      );
+    }
+  },
+  // TOOL_CALL phase: gate the call BEFORE the tool runs. opencode fires this
+  // hook ahead of dispatch, so a throw is a true block rather than an
+  // after-the-fact redaction. Without it the TOOL_RESULT hook below is the
+  // only tool-facing lever, and by then the write has already happened.
+  "tool.execute.before": async (input, output) => {
+    const verdict = await evaluate(
+      "PHASE_TOOL_CALL",
+      input && input.tool,
+      { name: (input && input.tool) || "", arguments: (output && output.args) || {} },
+      true,
+    );
+    if (verdict.result === "POLICY_ACTION_DENY") {
+      throw new Error(
+        "Omnigent policy blocked this tool call: " + (verdict.reason || "tool call denied"),
+      );
+    }
+    // An ASK that reaches the plugin was not resolved server-side, and this is
+    // the only pre-execution gate — treating it as ALLOW would run the tool the
+    // user was being asked about. omnigent/native_policy_hook.py maps
+    // POLICY_ACTION_ASK to deny for the same reason.
+    if (verdict.result === "POLICY_ACTION_ASK") {
+      throw new Error(
+        "Omnigent policy requires approval for this tool call, and none was "
+          + "recorded: " + (verdict.reason || "approval required"),
       );
     }
   },
