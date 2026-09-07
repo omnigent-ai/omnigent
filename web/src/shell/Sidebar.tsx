@@ -15,6 +15,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
@@ -157,9 +158,8 @@ import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
-  isExplicitlyUnread,
   markConversationUnread,
-  useUnseenTick,
+  useConversationReadState,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -196,6 +196,7 @@ import {
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
+import { getEmbedRoot } from "../lib/host";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // right-1 edge in every viewport: on desktop it fades on hover so the pin +
@@ -235,6 +236,10 @@ const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 // ``useProjects()`` subscription. Keeps row renders O(1) and avoids spinning up
 // a query observer per row (which would also re-run on every project mutation).
 const ProjectNamesContext = createContext<Map<string, string>>(new Map());
+// Maps a first-class project id → its chosen emoji icon (only projects that
+// have one), sharing the same list-level lookup as the names map so a row can
+// surface the real project glyph in the pinned flyout without its own query.
+const ProjectIconsContext = createContext<Map<string, string>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 // Row-invariant values resolved once at the list owner and shared, so a row
 // doesn't run `useIsMobileViewport` (a matchMedia-on-every-render store) or
@@ -242,6 +247,9 @@ const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 const IsMobileContext = createContext<boolean>(false);
 const ViewerIdContext = createContext<string | null>(null);
 const ServerInfoContext = createContext<ReturnType<typeof useServerInfo>>("loading");
+const RowActivationContext = createContext<
+  (id: string, event: MouseEvent<HTMLAnchorElement>) => void
+>(() => {});
 // Rows report an in-progress inline-rename edit here so ConversationList can
 // hold the sort order for the edit's whole duration — the pointer often
 // leaves the list while typing, and a reorder then would shuffle rows around
@@ -259,28 +267,38 @@ function useStableCallback<A extends unknown[], R>(fn: (...args: A) => R): (...a
 
 function SidebarRowDataProvider({
   projectNamesById,
+  projectIconsById,
   hostsById,
   isMobile,
   viewerId,
   serverInfo,
+  onActivate,
   children,
 }: {
   projectNamesById: Map<string, string>;
+  projectIconsById: Map<string, string>;
   hostsById: ReadonlyMap<string, Host>;
   isMobile: boolean;
   viewerId: string | null;
   serverInfo: ReturnType<typeof useServerInfo>;
+  onActivate: (id: string, event: MouseEvent<HTMLAnchorElement>) => void;
   children: ReactNode;
 }) {
   return (
     <ProjectNamesContext.Provider value={projectNamesById}>
-      <HostsByIdContext.Provider value={hostsById}>
-        <IsMobileContext.Provider value={isMobile}>
-          <ViewerIdContext.Provider value={viewerId}>
-            <ServerInfoContext.Provider value={serverInfo}>{children}</ServerInfoContext.Provider>
-          </ViewerIdContext.Provider>
-        </IsMobileContext.Provider>
-      </HostsByIdContext.Provider>
+      <ProjectIconsContext.Provider value={projectIconsById}>
+        <HostsByIdContext.Provider value={hostsById}>
+          <IsMobileContext.Provider value={isMobile}>
+            <ViewerIdContext.Provider value={viewerId}>
+              <ServerInfoContext.Provider value={serverInfo}>
+                <RowActivationContext.Provider value={onActivate}>
+                  {children}
+                </RowActivationContext.Provider>
+              </ServerInfoContext.Provider>
+            </ViewerIdContext.Provider>
+          </IsMobileContext.Provider>
+        </HostsByIdContext.Provider>
+      </ProjectIconsContext.Provider>
     </ProjectNamesContext.Provider>
   );
 }
@@ -820,6 +838,26 @@ function SidebarImpl({
   const dragging = dragProgress != null;
   const effectiveOpen = open || dragging || peek;
 
+  // While the peek card's entry animation is still fading it in, the card is
+  // (nearly) invisible yet already covers the toggle whose hover armed it —
+  // taking pointer events then would swallow a click aimed at that toggle,
+  // landing it on whatever sidebar content sits under the pointer instead.
+  // Stay click-through until the composed entry animation completes.
+  // Children's animations bubble too, so only the card's own end unlocks it.
+  const [peekInteractive, setPeekInteractive] = useState(false);
+  useEffect(() => {
+    if (!peek) {
+      setPeekInteractive(false);
+      return;
+    }
+    // Do not leave the card click-through if animationend is suppressed or missed.
+    const fallback = setTimeout(() => setPeekInteractive(true), 200);
+    return () => clearTimeout(fallback);
+  }, [peek]);
+  const prefersReducedMotion =
+    typeof window !== "undefined" &&
+    window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
   // While peeking, leaving the card closes it after a short grace period;
   // re-entering before that fires cancels the close so a wobble doesn't
   // dismiss it.
@@ -869,6 +907,9 @@ function SidebarImpl({
       )}
       <aside
         aria-label="Conversations"
+        onAnimationEnd={(event) => {
+          if (event.target === event.currentTarget) setPeekInteractive(true);
+        }}
         onPointerEnter={cancelPeekClose}
         onPointerLeave={() => {
           if (!peek) return;
@@ -931,6 +972,10 @@ function SidebarImpl({
           // overlay rather than a push.
           peek &&
             "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
+          // Click-through while fading in (see peekInteractive above): the
+          // click falls through to the header toggle underneath, which pins
+          // the sidebar open — what the user aimed for.
+          peek && !prefersReducedMotion && !peekInteractive && "pointer-events-none",
         )}
         style={
           {
@@ -1608,6 +1653,16 @@ function ConversationList({
     return map;
   }, [projects]);
 
+  // id → emoji icon for rows that want to show the real project glyph (e.g. the
+  // pinned flyout); built alongside the names map and shared the same way.
+  const projectIconsById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const p of projects) {
+      if (p.id !== null && p.icon) map.set(p.id, p.icon);
+    }
+    return map;
+  }, [projects]);
+
   // Freeze the active chat's sort key while you're inside it so an
   // updated_at bump from sending a message doesn't reorder the row
   // out from under you. Snapshot is dropped on navigate-away so the
@@ -1618,6 +1673,14 @@ function ConversationList({
   // parent walk loads — a top-level session resolves to itself.
   const activeRootSessionId = useActiveRootSessionId(activeId ?? null);
   const resolvedActiveId = activeRootSessionId ?? activeId ?? null;
+  const [optimisticActiveId, setOptimisticActiveId] = useState<string | null>(null);
+  useEffect(() => setOptimisticActiveId(null), [activeId]);
+  const activateRow = useCallback((id: string, event: MouseEvent<HTMLAnchorElement>) => {
+    if (event.defaultPrevented || event.button !== 0) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    setOptimisticActiveId(id);
+  }, []);
+  const displayedActiveId = optimisticActiveId ?? resolvedActiveId;
   const [activeOverride, setActiveOverride] = useState<ActiveChatOverride | null>(null);
   useEffect(() => {
     setActiveOverride((prev) => computeNextActiveOverride(activeId, allConversations, prev));
@@ -2090,10 +2153,12 @@ function ConversationList({
   return (
     <SidebarRowDataProvider
       projectNamesById={projectNamesById}
+      projectIconsById={projectIconsById}
       hostsById={hostsById}
       isMobile={isMobile}
       viewerId={viewerId}
       serverInfo={serverInfo}
+      onActivate={activateRow}
     >
       <DndContext
         sensors={sensors}
@@ -2150,7 +2215,7 @@ function ConversationList({
                     <ConversationSection
                       title="Pinned"
                       conversations={sections.pinned}
-                      activeConversationId={resolvedActiveId}
+                      activeConversationId={displayedActiveId}
                       pinnedConversationIds={pinnedConversationIds}
                       collapsed={effectiveCollapsedSections.includes("Pinned")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
@@ -2209,7 +2274,7 @@ function ConversationList({
                       projectId={group.id}
                       icon={group.icon}
                       windowConversations={group.conversations}
-                      activeConversationId={resolvedActiveId}
+                      activeConversationId={displayedActiveId}
                       expanded={expandedProjects.includes(group.name)}
                       active={newSessionProjectName === group.name}
                       // Best-effort marker from the globally-loaded window: a
@@ -2250,7 +2315,7 @@ function ConversationList({
                     <ConversationSection
                       title="Sessions"
                       conversations={sections.sessions}
-                      activeConversationId={resolvedActiveId}
+                      activeConversationId={displayedActiveId}
                       emptyMessage={SIDEBAR_FILTER_EMPTY[activeTab]}
                       pinnedConversationIds={pinnedConversationIds}
                       collapsed={effectiveCollapsedSections.includes("Chats")}
@@ -2328,15 +2393,22 @@ function ConversationList({
             )}
           </div>
         </RowEditHoldContext.Provider>
-        {/* The dragged row's preview follows the pointer (rendered in a portal),
-          a compact card showing the session's title. */}
-        <DragOverlay dropAnimation={null}>
-          {activeDrag ? (
-            <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip">
-              {activeDrag.label}
-            </div>
-          ) : null}
-        </DragOverlay>
+        {/* The dragged row's preview follows the pointer: a compact card showing
+          the session's title. Portaled to <body>: the aside always carries a CSS
+          translate (the mobile slide-in), which makes it the containing block for
+          fixed descendants, so an inline overlay would resolve its viewport
+          coordinates against the aside's box and drift off the cursor whenever
+          the aside sits away from (0,0) — e.g. the floating peek card. */}
+        {createPortal(
+          <DragOverlay dropAnimation={null}>
+            {activeDrag ? (
+              <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip">
+                {activeDrag.label}
+              </div>
+            ) : null}
+          </DragOverlay>,
+          getEmbedRoot() ?? document.body,
+        )}
       </DndContext>
     </SidebarRowDataProvider>
   );
@@ -3498,6 +3570,7 @@ function ConversationRowImpl({
   // portal), and a passive effect would leave a post-paint frame where churn
   // could reorder — and blur — the just-mounted input before the hold lands.
   const reportRowEditing = useContext(RowEditHoldContext);
+  const activateRow = useContext(RowActivationContext);
   useLayoutEffect(() => {
     if (!isEditing) return;
     reportRowEditing(conversation.id, true);
@@ -3560,6 +3633,13 @@ function ConversationRowImpl({
   // routes the row through the plain ContextMenu/link path and restores the
   // native `title` tooltip.
   const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
+  // First-class projects can carry a chosen emoji; label-only projects have
+  // none, so the flyout falls back to the folder glyph for those.
+  const projectIconsById = useContext(ProjectIconsContext);
+  const projectFlyoutIcon =
+    conversation.project_id != null
+      ? (projectIconsById.get(conversation.project_id) ?? null)
+      : null;
 
   // The title the user just committed. The rename's cache write reaches this
   // row as a prop from the list above, which re-renders a tick after the row's
@@ -3582,10 +3662,13 @@ function ConversationRowImpl({
   const isProvisionalLabel =
     pendingTitle === null && conversation.title == null && optimisticTitle !== undefined;
   const hasDraft = useHasSessionDraft(conversation.id);
-  // Recompute unseen state the moment the last-seen map changes (e.g. the
-  // user picks "Mark as unread" on this row) rather than waiting for the
-  // next conversations poll.
-  useUnseenTick();
+  // A write for another conversation leaves this primitive snapshot unchanged,
+  // so useSyncExternalStore skips the heavy row render.
+  const readState = useConversationReadState(
+    conversation.id,
+    conversation.updated_at,
+    conversation.status,
+  );
   // The dot shows when the conversation is content-unseen AND either the
   // row isn't the one you're viewing OR you explicitly marked it unread.
   // `isConversationUnseen` still gates on status, so a *running* turn never
@@ -3593,9 +3676,7 @@ function ConversationRowImpl({
   // invisible until the turn finishes (then the dot lights like any unseen
   // row). The explicit override only lifts the active-row suppression, so
   // flagging the thread you're currently viewing surfaces the dot at once.
-  const hasUnseenMessages =
-    isConversationUnseen(conversation.id, conversation.updated_at, conversation.status) &&
-    (!isActive || isExplicitlyUnread(conversation.id));
+  const hasUnseenMessages = readState.unseen && (!isActive || readState.explicitlyUnread);
   // "Mark as unread" is offered on any row not already showing the dot.
   const canMarkUnread = !hasUnseenMessages;
   // Badge precedence: a pending approval ("Needs response") outranks the
@@ -3831,6 +3912,7 @@ function ConversationRowImpl({
           onToggleSelected(conversation.id, e.shiftKey);
           return;
         }
+        activateRow(conversation.id, e);
         onClick(e);
       }}
       onDoubleClick={(e) => {
@@ -3893,6 +3975,7 @@ function ConversationRowImpl({
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
+              projectIcon={projectFlyoutIcon}
               gitBranch={gitBranch}
             />
           </HoverCard>
@@ -3921,6 +4004,7 @@ function ConversationRowImpl({
           <PinnedProjectFlyoutContent
             title={conversation.title ?? conversation.id}
             projectName={projectFlyoutName}
+            projectIcon={projectFlyoutIcon}
             gitBranch={gitBranch}
           />
         </HoverCard>
@@ -4346,10 +4430,12 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
 function PinnedProjectFlyoutContent({
   title,
   projectName,
+  projectIcon,
   gitBranch,
 }: {
   title: string;
   projectName: string;
+  projectIcon: string | null;
   gitBranch: string | null;
 }) {
   return (
@@ -4365,7 +4451,7 @@ function PinnedProjectFlyoutContent({
           the DOM. */}
       <p className="sidebar-compact-text line-clamp-3 font-medium">{title}</p>
       <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
-        <FolderIcon className="size-3.5 shrink-0" />
+        <ProjectRowIcon icon={projectIcon} />
         <span className="truncate">{projectName}</span>
       </p>
       {gitBranch && (

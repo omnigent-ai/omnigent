@@ -787,17 +787,24 @@ describe("LatestTurnSpacer", () => {
     });
     stickContext.scrollRef.current = scrollRoot;
 
-    if (opts.anchor !== "none") {
+    if (opts.anchor === "user") {
       const anchor = document.createElement("div");
-      if (opts.anchor === "user") {
-        anchor.dataset.role = "user";
-        anchor.dataset.userMessageId = "initial-user";
-        useChatStore.setState({ blocks: [userBlock("initial-user")] });
-      } else {
-        anchor.dataset.testid = "assistant-text-section";
-      }
+      anchor.dataset.role = "user";
+      anchor.dataset.userMessageId = "initial-user";
+      useChatStore.setState({ blocks: [userBlock("initial-user")] });
       vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(opts.anchorTop));
       scrollRoot.append(anchor);
+    } else if (opts.anchor === "text") {
+      // The assistant text section is nested inside its bubble, which carries
+      // the stable id the spacer captures and re-resolves by.
+      const bubble = document.createElement("div");
+      bubble.dataset.role = "assistant";
+      bubble.dataset.responseStableId = "resp-1";
+      const anchor = document.createElement("div");
+      anchor.dataset.testid = "assistant-text-section";
+      vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(opts.anchorTop));
+      bubble.append(anchor);
+      scrollRoot.append(bubble);
     }
 
     const { container } = render(<LatestTurnSpacer />);
@@ -993,6 +1000,203 @@ describe("LatestTurnSpacer", () => {
     });
     expect(spacer.style.display).toBe("none");
     expect(spacer.style.height || "0px").toBe("0px");
+  });
+
+  it("holds its height while the anchor is windowed out, then re-resolves the remounted node", () => {
+    // WHY: the transcript is virtualized, so the anchor's DOM node is destroyed
+    // when it scrolls out of the window and a *fresh* node with the same id
+    // mounts when it returns. The spacer must resolve the anchor by id, not by a
+    // captured node reference — a held reference would stay detached forever and
+    // freeze the reservation.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const makeAnchor = (top: number) => {
+      const el = document.createElement("div");
+      el.dataset.role = "user";
+      el.dataset.userMessageId = "initial-user";
+      vi.spyOn(el, "getBoundingClientRect").mockReturnValue(rect(top));
+      return el;
+    };
+    const first = makeAnchor(0);
+    scrollRoot.append(first);
+    useChatStore.setState({ blocks: [userBlock("initial-user")] });
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("104px"); // 600 − 400 − 96
+
+    // Windowed out: the row unmounts. The captured height must hold.
+    first.remove();
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("104px");
+
+    // Windowed back in as a *new* node with the same id, at a different offset
+    // (anchor at 50 → 600 − (400 − 50) − 96 = 154). A stale node reference would
+    // still read the removed node; id re-resolution picks up the fresh node.
+    const remounted = makeAnchor(50);
+    scrollRoot.append(remounted);
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("154px");
+  });
+
+  it("does not retarget the assistant-text anchor to a different mounted turn", () => {
+    // WHY: with no committed user anchor the spacer pins the LAST assistant
+    // response by its stable id. Once that response is windowed out while an
+    // EARLIER assistant text is still mounted, a "last mounted text" resolution
+    // would silently re-anchor to the wrong turn and change the reservation.
+    // Binding to the stable id holds the last good height instead.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const makeAssistant = (stableId: string, top: number) => {
+      const bubble = document.createElement("div");
+      bubble.dataset.role = "assistant";
+      bubble.dataset.responseStableId = stableId;
+      const text = document.createElement("div");
+      text.dataset.testid = "assistant-text-section";
+      vi.spyOn(text, "getBoundingClientRect").mockReturnValue(rect(top));
+      bubble.append(text);
+      return bubble;
+    };
+    // Two assistant turns mounted; the LAST (resp-2, at 150) is the anchor.
+    const earlier = makeAssistant("resp-1", 50);
+    const last = makeAssistant("resp-2", 150);
+    scrollRoot.append(earlier, last);
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(500));
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("154px"); // 600 − (500 − 150) − 96, anchored to resp-2
+
+    // resp-2 windows out; only the earlier turn (resp-1) stays mounted. A
+    // "last mounted text" resolution would retarget to resp-1 (→ 600 − (500 −
+    // 50) − 96 = 4); binding to the stable id holds the last good height.
+    last.remove();
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("154px");
+  });
+
+  it("retries capture across frames until the windowed anchor row mounts", () => {
+    // WHY: the anchor row can be absent for the first frame(s) on a cold load of
+    // a windowed transcript (the scroll element is published before the
+    // virtualizer fills its window). Capture must retry rather than depend on a
+    // resize that need not fire — the wrapper height is estimate-fixed.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    // Drive requestAnimationFrame callbacks manually.
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      frames.push(cb);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+    // Committed anchor exists in the store, but its row hasn't mounted yet.
+    useChatStore.setState({ blocks: [userBlock("initial-user")] });
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
+    // Mount + manual measure both find no anchor node → a retry is scheduled and
+    // no height is set yet.
+    act(() => holder.cb?.());
+    expect(spacer.style.height || "0px").toBe("0px");
+    expect(frames.length).toBeGreaterThan(0);
+
+    // Synchronous layout/observer measurements can fire repeatedly before the
+    // browser advances a frame. They must not consume the frame retry budget.
+    for (let i = 0; i < 12; i += 1) {
+      act(() => holder.cb?.());
+    }
+
+    // The row mounts; the next scheduled frame fires and capture succeeds.
+    const anchor = document.createElement("div");
+    anchor.dataset.role = "user";
+    anchor.dataset.userMessageId = "initial-user";
+    vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(0));
+    scrollRoot.append(anchor);
+    act(() => frames.shift()?.(0));
+    expect(spacer.style.height).toBe("104px"); // 600 − 400 − 96
+  });
+
+  it("settles a never-anchoring turn to display:none after the retry budget", () => {
+    // WHY: a tool-only trailing turn (committed non-user block, no user anchor
+    // and no assistant-text section) must not retry forever — capture settles to
+    // no-anchor (display:none) once the budget is spent, matching the pre-
+    // windowing behaviour.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      frames.push(cb);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+    // A committed block that is NOT a user message and never renders an anchor.
+    useChatStore.setState({
+      blocks: [{ type: "reasoning", ctx: { itemId: "r1" }, text: "…" }] as never,
+    });
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
+
+    // Drain the retry budget; the anchor never mounts. Bounded, so it stops.
+    act(() => holder.cb?.());
+    let guard = 0;
+    while (frames.length > 0 && guard < 50) {
+      guard += 1;
+      act(() => frames.shift()?.(0));
+    }
+    expect(guard).toBeLessThan(50); // did not retry forever
+    expect(spacer.style.display).toBe("none");
   });
 });
 

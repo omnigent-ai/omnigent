@@ -1205,6 +1205,9 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
         "terminal_command",
         "terminal_command",
     ]
+    # Every item carries its server-side idempotency key: a retried or
+    # concurrently re-posted record must dedupe on the server.
+    assert all(isinstance(item.get("source_id"), str) and item["source_id"] for item in posted)
     assert posted[0]["item_data"] == {
         "role": "user",
         "content": [{"type": "input_text", "text": "read TODO"}],

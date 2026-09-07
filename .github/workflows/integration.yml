@@ -34,8 +34,8 @@ env:
   CLAUDE_CODE: ""
 
 concurrency:
-  # Key by PR number so re-syncs cancel; push/dispatch key by SHA/branch.
-  group: integration-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}
+  # Key by PR number so re-syncs cancel, dispatch by ref, and schedule by SHA.
+  group: integration-${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && github.ref) || github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -92,8 +92,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
 
       # Shared verbatim with server-compat.yml's backcompat-integration job via
       # the composite action, so the two never drift. server_version is omitted

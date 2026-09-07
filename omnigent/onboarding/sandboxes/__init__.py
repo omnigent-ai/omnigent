@@ -85,7 +85,12 @@ __all__ = [
 ]
 
 
-def get_launcher(provider: str, *, workspace_host: str | None = None) -> SandboxHostLauncher:
+def get_launcher(
+    provider: str,
+    *,
+    workspace_host: str | None = None,
+    server_url: str | None = None,
+) -> SandboxHostLauncher:
     """
     Resolve a provider name to a launcher instance.
 
@@ -100,6 +105,9 @@ def get_launcher(provider: str, *, workspace_host: str | None = None) -> Sandbox
         Databricks workspace, so the value is meaningless for them and
         deliberately not forwarded — the CLI derives it from --server
         for every provider, so rejecting it here would break them.
+    :param server_url: Normalized CLI target URL. Microsandbox uses it to
+        scope guest-to-host access to a local server's port; other providers
+        ignore it.
     :returns: A fresh launcher for the provider.
     :raises click.ClickException: If the provider is unknown or its
         launcher module is not present in this build.
@@ -110,6 +118,6 @@ def get_launcher(provider: str, *, workspace_host: str | None = None) -> Sandbox
             f"Unknown or unavailable sandbox provider '{provider}'. Available: {offered}."
         )
     try:
-        return instantiate(provider, workspace_host=workspace_host)
+        return instantiate(provider, workspace_host=workspace_host, server_url=server_url)
     except SandboxRegistryError as exc:
         raise click.ClickException(str(exc)) from exc

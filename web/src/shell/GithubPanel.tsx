@@ -50,11 +50,14 @@ import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { MessageResponse } from "@/components/ai-elements/message";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import {
   fetchGithubFileContents,
   useGithubChangedFiles,
@@ -62,6 +65,8 @@ import {
   useGithubPrDiff,
   type GithubChangedFile,
   type GithubCheckRun,
+  type GithubChecks,
+  type GithubComment,
   type GithubInfo,
 } from "@/hooks/useGithub";
 
@@ -383,6 +388,127 @@ function CheckPill({
   );
 }
 
+// ── Summary tab ──────────────────────────────────────────────────────────
+// The PR's description and its conversation comments (from `gh pr view`), both
+// rendered as GitHub-flavored markdown via the shared MessageResponse.
+
+/** One comment card: an author + relative-time header over the markdown body. */
+function GithubCommentCard({ comment }: { comment: GithubComment }) {
+  const ts = comment.created_at ? Date.parse(comment.created_at) : NaN;
+  const rel = relativeTime(ts);
+  const initial = comment.author?.[0]?.toUpperCase() ?? "?";
+  return (
+    <li className="rounded-lg border border-border bg-muted/20 p-3">
+      <div className="mb-1.5 flex items-center gap-2 text-xs">
+        <span
+          aria-hidden
+          className="inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] font-semibold text-muted-foreground"
+        >
+          {initial}
+        </span>
+        <span className="min-w-0 truncate font-medium text-foreground">
+          {comment.author ?? "unknown"}
+        </span>
+        {rel && (
+          <span className="shrink-0 text-muted-foreground/70" title={absoluteTime(ts)}>
+            {rel}
+          </span>
+        )}
+        {comment.url && (
+          <a
+            href={comment.url}
+            target="_blank"
+            rel="noreferrer"
+            aria-label="Open comment on GitHub"
+            className="ml-auto shrink-0 text-muted-foreground hover:text-foreground"
+          >
+            <ExternalLinkIcon className="size-3" />
+          </a>
+        )}
+      </div>
+      <div className="text-ui break-words">
+        <MessageResponse>{comment.body}</MessageResponse>
+      </div>
+    </li>
+  );
+}
+
+/** The Summary tab body: CI checks, the PR description, then its comments. */
+function GithubSummaryTab({
+  checks,
+  body,
+  comments,
+}: {
+  checks: GithubChecks;
+  body: string | null | undefined;
+  comments: GithubComment[];
+}) {
+  return (
+    // Extra bottom padding so the last comment can scroll clear of the very
+    // bottom edge, where it's awkward to read.
+    <div className="space-y-4 p-3 pb-16">
+      {/* CI status checks (from the PR's statusCheckRollup) as pills; hover a
+          pill to see the job names in that bucket. */}
+      {checks.total > 0 && (
+        <section className="space-y-1.5">
+          <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+            Checks
+          </h3>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <CheckPill
+              label="passed"
+              count={checks.passing}
+              runs={checks.runs.filter((r) => r.bucket === "passing")}
+              icon={<CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />}
+              className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
+            />
+            <CheckPill
+              label="pending"
+              count={checks.pending}
+              runs={checks.runs.filter((r) => r.bucket === "pending")}
+              icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
+              className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+            />
+            <CheckPill
+              label="failed"
+              count={checks.failing}
+              runs={checks.runs.filter((r) => r.bucket === "failing")}
+              icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
+              className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
+            />
+          </div>
+        </section>
+      )}
+      <section className="space-y-1.5">
+        <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+          Description
+        </h3>
+        {body ? (
+          <div className="text-ui break-words">
+            <MessageResponse>{body}</MessageResponse>
+          </div>
+        ) : (
+          <p className="text-ui text-muted-foreground italic">No description provided.</p>
+        )}
+      </section>
+      <section className="space-y-2">
+        <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+          {comments.length > 0 ? `Comments (${comments.length})` : "Comments"}
+        </h3>
+        {comments.length === 0 ? (
+          <p className="text-ui text-muted-foreground">No comments yet.</p>
+        ) : (
+          <ul className="space-y-2">
+            {comments.map((c, i) => (
+              <GithubCommentCard key={c.url ?? `${c.author}-${i}`} comment={c} />
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
 // ── Sidebar file tree ────────────────────────────────────────────────────
 // The changed files group into a folder tree. A single-child directory chain
 // collapses into one row (VS Code "compact folders"): a lone change under
@@ -550,6 +676,10 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   const hasPr = !!info.data?.pr;
   const changes = useGithubChangedFiles(conversationId, hasPr);
   const prDiff = useGithubPrDiff(conversationId, hasPr);
+
+  // Summary (PR body + comments) vs Changes (the stacked diff). Summary is the
+  // landing tab — like GitHub's PR page opening on the Conversation view.
+  const [activeTab, setActiveTab] = useState<"summary" | "changes">("summary");
 
   const themeType = useResolvedThemeMode();
   // Diff layout is the app-global FileViewer preference (unified/split); seed
@@ -787,68 +917,69 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   const data = info.data!;
   const pr = data.pr!;
   const checks = pr.checks;
+  const comments = pr.comments ?? [];
 
   return (
     <TooltipProvider delayDuration={0}>
-      <div className="flex h-full min-h-0 flex-col">
-        {/* Header: repo + PR metadata. Refreshes on its own — via the
-            git-activity SSE signal and the panel's own CI poll — so there's no
-            manual Refresh control. */}
-        <div className="shrink-0 border-b border-border p-2">
-          <span className="block min-w-0 truncate text-xs text-muted-foreground">
-            {data.repo?.name_with_owner ?? "GitHub"}
-            {data.branch && (
-              <>
-                {" · "}
-                <span className="font-mono">{data.branch}</span>
-                {baseRef && <span className="text-muted-foreground"> → {baseRef}</span>}
-              </>
-            )}
-          </span>
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <a
-              href={pr.url}
-              target="_blank"
-              rel="noreferrer"
-              className="group inline-flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
-            >
-              <span className="truncate">{pr.title}</span>
-              <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
-              <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
-            </a>
-          </div>
-          {/* CI status checks (from the PR's statusCheckRollup), on their own
-            line as pills; hover a pill to see the job names in that bucket. */}
-          {checks.total > 0 && (
-            <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-muted-foreground">
-              <span className="text-ui font-medium">Checks</span>
-              <CheckPill
-                label="passed"
-                count={checks.passing}
-                runs={checks.runs.filter((r) => r.bucket === "passing")}
-                icon={<CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />}
-                className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
-              />
-              <CheckPill
-                label="pending"
-                count={checks.pending}
-                runs={checks.runs.filter((r) => r.bucket === "pending")}
-                icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
-                className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-              />
-              <CheckPill
-                label="failed"
-                count={checks.failing}
-                runs={checks.runs.filter((r) => r.bucket === "failing")}
-                icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
-                className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
-              />
+      <Tabs
+        value={activeTab}
+        onValueChange={(v) => setActiveTab(v === "changes" ? "changes" : "summary")}
+        componentId="github.panel.tabs"
+        className="flex h-full min-h-0 flex-col gap-0"
+      >
+        {/* Header: repo + PR metadata + the Summary/Changes tabs. Refreshes on
+            its own — via the git-activity SSE signal and the panel's CI poll.
+            Padding lives on the title block (not the outer container) so the
+            tabs align to the gutter and the underline row spans full width. */}
+        <div className="shrink-0 border-b border-border pb-0.5">
+          <div className="px-3 pt-2">
+            <span className="block min-w-0 truncate text-xs text-muted-foreground">
+              {data.repo?.name_with_owner ?? "GitHub"}
+              {data.branch && (
+                <>
+                  {" · "}
+                  <span className="font-mono">{data.branch}</span>
+                  {baseRef && <span className="text-muted-foreground"> → {baseRef}</span>}
+                </>
+              )}
+            </span>
+            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+              <a
+                href={pr.url}
+                target="_blank"
+                rel="noreferrer"
+                className="group inline-flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
+              >
+                <span className="truncate">{pr.title}</span>
+                <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
+                <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
+              </a>
             </div>
-          )}
-          {/* Controls bar: hide the file list (left); toggle layout + expand/
-            collapse every diff (right). */}
+          </div>
+          {/* Tab bar (Summary | Changes); the diff controls live inside the
+            Changes tab on their own line, so they don't crowd the tabs. gap-0 +
+            flex-none keep the two labels close and content-sized (the default
+            flex-1 equalizes and spreads them). */}
+          <TabsList variant="line" aria-label="Pull request" className="h-auto gap-0 p-0">
+            <TabsTrigger value="summary" className="flex-none border-0 px-3 leading-none">
+              Summary
+            </TabsTrigger>
+            <TabsTrigger value="changes" className="flex-none border-0 px-3 leading-none">
+              Changes
+            </TabsTrigger>
+          </TabsList>
+        </div>
+
+        {/* Summary: CI checks + the PR description + its conversation comments. */}
+        <TabsContent value="summary" className="min-h-0 flex-1 overflow-y-auto">
+          <GithubSummaryTab checks={checks} body={pr.body} comments={comments} />
+        </TabsContent>
+
+        {/* Changes: a controls row, then the sidebar (jump-to-file) + one scroll
+            of all files' diffs. */}
+        <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col">
           {files.length > 0 && (
-            <div className="mt-1.5 flex w-full items-center justify-between">
+            <div className="flex w-full shrink-0 items-center justify-between gap-2 border-b border-border px-2 py-1">
               <IconButton
                 label={sidebarCollapsed ? "Show file list" : "Hide file list"}
                 onClick={() => setSidebarCollapsed((v) => !v)}
@@ -886,76 +1017,74 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               </div>
             </div>
           )}
-        </div>
-
-        {/* Body: sidebar (jump-to-file) + one scroll of all files' diffs. */}
-        <div ref={bodyRef as React.RefObject<HTMLDivElement>} className="flex min-h-0 flex-1">
-          {!sidebarCollapsed && (
-            <div
-              style={{ width: `${sidebarWidth}px` }}
-              className="relative shrink-0 overflow-y-auto border-r border-border pb-1"
-            >
-              {/* Drag the right edge to resize the file list. */}
+          <div ref={bodyRef as React.RefObject<HTMLDivElement>} className="flex min-h-0 flex-1">
+            {!sidebarCollapsed && (
               <div
-                {...sidebarHandleProps}
-                aria-label="Resize file list"
-                className="absolute inset-y-0 right-0 z-10 w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
-              />
-              {changes.isLoading ? (
-                <div className="flex items-center justify-center p-4 text-muted-foreground">
-                  <Loader2Icon className="size-4 animate-spin" />
-                </div>
-              ) : changes.error ? (
-                <p className="px-2 py-1 text-ui text-muted-foreground">
-                  {changes.error instanceof RunnerOfflineError
-                    ? "Runner offline."
-                    : (changes.error as Error).message}
-                </p>
-              ) : files.length === 0 ? (
-                <p className="px-2 py-1 text-ui text-muted-foreground">No changes vs base.</p>
+                style={{ width: `${sidebarWidth}px` }}
+                className="relative shrink-0 overflow-y-auto border-r border-border pb-1"
+              >
+                {/* Drag the right edge to resize the file list. */}
+                <div
+                  {...sidebarHandleProps}
+                  aria-label="Resize file list"
+                  className="absolute inset-y-0 right-0 z-10 w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
+                />
+                {changes.isLoading ? (
+                  <div className="flex items-center justify-center p-4 text-muted-foreground">
+                    <Loader2Icon className="size-4 animate-spin" />
+                  </div>
+                ) : changes.error ? (
+                  <p className="px-2 py-1 text-ui text-muted-foreground">
+                    {changes.error instanceof RunnerOfflineError
+                      ? "Runner offline."
+                      : (changes.error as Error).message}
+                  </p>
+                ) : files.length === 0 ? (
+                  <p className="px-2 py-1 text-ui text-muted-foreground">No changes vs base.</p>
+                ) : (
+                  fileTree.map((node) => (
+                    <SidebarNode
+                      key={node.type === "file" ? node.file.path : node.path}
+                      node={node}
+                      depth={0}
+                      activePath={activePath}
+                      onSelectFile={jumpTo}
+                      collapsedDirs={collapsedDirs}
+                      onToggleDir={toggleDir}
+                    />
+                  ))
+                )}
+              </div>
+            )}
+            <div ref={scrollRef} onScroll={onScroll} className="min-w-0 flex-1 overflow-y-auto">
+              {files.length === 0 || prDiff.isLoading ? (
+                <PanelMessage>
+                  {changes.isLoading || prDiff.isLoading ? (
+                    <>
+                      <Loader2Icon className="size-5 animate-spin" />
+                      Loading changes…
+                    </>
+                  ) : (
+                    "No changes vs base."
+                  )}
+                </PanelMessage>
               ) : (
-                fileTree.map((node) => (
-                  <SidebarNode
-                    key={node.type === "file" ? node.file.path : node.path}
-                    node={node}
-                    depth={0}
-                    activePath={activePath}
-                    onSelectFile={jumpTo}
-                    collapsedDirs={collapsedDirs}
-                    onToggleDir={toggleDir}
+                files.map((file) => (
+                  <GithubFileSection
+                    key={file.path}
+                    file={file}
+                    fileDiff={filesByPath.get(file.path)}
+                    options={diffOptions}
+                    registerRef={registerRef}
+                    collapsed={collapsedPaths.has(file.path)}
+                    onToggleCollapsed={() => toggleOne(file.path)}
                   />
                 ))
               )}
             </div>
-          )}
-          <div ref={scrollRef} onScroll={onScroll} className="min-w-0 flex-1 overflow-y-auto">
-            {files.length === 0 || prDiff.isLoading ? (
-              <PanelMessage>
-                {changes.isLoading || prDiff.isLoading ? (
-                  <>
-                    <Loader2Icon className="size-5 animate-spin" />
-                    Loading changes…
-                  </>
-                ) : (
-                  "No changes vs base."
-                )}
-              </PanelMessage>
-            ) : (
-              files.map((file) => (
-                <GithubFileSection
-                  key={file.path}
-                  file={file}
-                  fileDiff={filesByPath.get(file.path)}
-                  options={diffOptions}
-                  registerRef={registerRef}
-                  collapsed={collapsedPaths.has(file.path)}
-                  onToggleCollapsed={() => toggleOne(file.path)}
-                />
-              ))
-            )}
           </div>
-        </div>
-      </div>
+        </TabsContent>
+      </Tabs>
     </TooltipProvider>
   );
 }

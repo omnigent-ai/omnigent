@@ -403,9 +403,10 @@ _MAX_CONSECUTIVE_AUTH_ERRORS = 3
 # process listens on the port — the local server is gone, not unreachable.
 _LOOPBACK_REFUSED_FATAL_ATTEMPTS = 100
 
-# Consecutive post-connect 401/403 rejections (~5 min at the backoff cap)
-# before the retry loop escalates from "check your VPN" to a re-auth prompt.
-# Operator-facing only — the host keeps retrying and never exits.
+# Consecutive post-connect 401/403 (or 404) rejections (~90 s at the backoff
+# cap) before the retry loop escalates its operator message from a transient
+# hint to a "this may not self-heal" prompt. Operator-facing only — the host
+# keeps retrying and never exits.
 _AUTH_REJECT_ESCALATE_ATTEMPTS = 30
 
 # Consecutive accepted-then-silent connections (upgrade completed, then the
@@ -1028,6 +1029,10 @@ class HostProcess:
         # upgrade or any non-refused error. Fatal past a bounded streak only
         # when the server URL is loopback (the local server is gone).
         self._refused_streak = 0
+        # Consecutive post-connect 404s (a proxy answering for a restarting
+        # backend); reset by an accepted upgrade or any non-404 error. Never
+        # fatal — bounds only how loudly the retry loop escalates.
+        self._transient_404_streak = 0
         # Consecutive connections that were accepted but died without a single
         # inbound frame; reset by any received frame or a rejected upgrade.
         # Past a bound the reconnect loop escalates instead of fast-recycling.
@@ -1466,11 +1471,15 @@ class HostProcess:
             without their own client-actionable guidance.
         :returns: A :class:`HostConnectError` for a permanent 4xx, or
             ``None`` for a transient status (retryable 4xx in
-            :data:`_RETRYABLE_UPGRADE_STATUSES`, or any non-4xx such as a
-            5xx server bounce) that the reconnect loop should retry.
+            :data:`_RETRYABLE_UPGRADE_STATUSES`, a 404 on a host that has
+            already connected per :meth:`_classify_transient_404`, or any
+            non-4xx such as a 5xx server bounce) that the reconnect loop
+            should retry.
         """
         if status in _RETRYABLE_UPGRADE_STATUSES or not (400 <= status < 500):
             return None
+        if status == 404:
+            return self._classify_transient_404()
         if status in (401, 403):
             # Fresh hosts can race OAuth refresh; connected hosts preserve active sessions.
             self._auth_retry_streak += 1
@@ -1566,6 +1575,67 @@ class HostProcess:
             f"Connection refused (HTTP {status}): the server rejected the host "
             "tunnel request. This is a permanent error; retrying will not help. "
             "Check the server URL and your access."
+        )
+
+    def _classify_transient_404(self) -> HostConnectError | None:
+        """Treat a 404 on the tunnel upgrade as a transient restart blip.
+
+        A reverse proxy in front of the server answers 404 for the tunnel
+        route while the backend container restarts (upgrade, config change,
+        agent re-seed bounce). A host that has already completed an upgrade
+        in this process rides that window out indefinitely, so a routine
+        server bounce never tears down its live runner sessions.
+
+        A host that has NEVER connected keeps the pre-existing behaviour: a
+        404 is a permanent client error and fails loud on the first attempt,
+        so a genuinely wrong server URL -- or a server too old to expose the
+        tunnel route -- surfaces immediately instead of hanging.
+
+        :returns: ``None`` while an already-connected host should retry the
+            404, or a :class:`HostConnectError` for a never-connected host.
+
+        Note: a future "host is gone" signal must use a distinct status
+        (e.g. 410), never 404, or it would be retried forever here.
+        """
+        if self._ever_connected:
+            self._transient_404_streak += 1
+            cause = (
+                "Connection refused (HTTP 404): the host tunnel route is not "
+                "answering — the server is likely restarting behind its proxy."
+            )
+            if (
+                self._transient_404_streak >= _AUTH_REJECT_ESCALATE_ATTEMPTS
+                and self._transient_404_streak % _AUTH_REJECT_ESCALATE_ATTEMPTS == 0
+            ):
+                # A sustained streak is no longer a restart blip: the route may
+                # be genuinely gone (rollback, URL change). Escalate the
+                # operator signal but keep retrying to preserve live sessions.
+                escalated = (
+                    f"{cause} It has answered 404 "
+                    f"{self._transient_404_streak} times in a row — this is no "
+                    "longer a brief restart window. Check the server URL and "
+                    "deployment. Still retrying."
+                )
+                _logger.warning("%s", escalated)
+                print(f"⚠ {escalated}", file=sys.stderr, flush=True)
+            else:
+                _logger.warning("%s Retrying.", cause)
+                if self._transient_404_streak == 1:
+                    # The warning lands in the CLI log file — print once per
+                    # restart window so a foreground `omnigent host` isn't
+                    # silent while it rides the 404s out.
+                    print(
+                        f"⚠ {cause} Retrying — it will reconnect automatically "
+                        "once the server is back.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            return None
+        return HostConnectError(
+            "Connection refused (HTTP 404): the server did not expose the "
+            "host tunnel route. The server URL may be wrong, or the server "
+            "may predate the host API (the /v1/hosts tunnel route). Check the "
+            "URL and that the server is up to date, then retry."
         )
 
     async def _handle_launch(
@@ -3259,6 +3329,10 @@ class HostProcess:
                     ):
                         # Keep the refresh window limited to consecutive auth rejections.
                         self._auth_retry_streak = 0
+                    if not (isinstance(exc, InvalidStatus) and exc.response.status_code == 404):
+                        # The 404 streak counts CONSECUTIVE restart-window
+                        # rejections only, so escalation reflects one outage.
+                        self._transient_404_streak = 0
                     # Refused on loopback is decisive: nothing listens on the
                     # port and no network path can heal it, so bound the
                     # retries. Remote refusals retry forever (outages recover).
@@ -3536,6 +3610,7 @@ class HostProcess:
         self._login_redirect_streak = 0
         self._auth_retry_streak = 0
         self._refused_streak = 0
+        self._transient_404_streak = 0
         self._conn_upgrade_accepted = True
         # A completed upgrade proves the endpoint healthy — the next drop's
         # prompt reconnect is wanted again.

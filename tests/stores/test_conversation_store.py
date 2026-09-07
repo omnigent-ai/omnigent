@@ -3484,6 +3484,44 @@ def test_update_conversation_terminal_launch_args_empty_list_distinct_from_none(
     assert updated.terminal_launch_args == []
 
 
+def test_update_conversation_share_workspace_files_round_trips(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The share-workspace-files opt-in persists as a two-state flag.
+
+    ``True`` stores the share, ``False`` clears it back to the edit-only
+    default, and ``None`` (the default arg) leaves whatever was stored
+    untouched — the same "None = unchanged" contract as the other
+    per-session overrides. A fresh session starts unshared.
+    """
+    created = conversation_store.create_session_with_agent(
+        agent_id="c0ffee00c0ffee00c0ffee00c0ffee00",
+        agent_name="share-agent",
+        agent_bundle_location="c0ffee00c0ffee00c0ffee00c0ffee00/bundle1",
+        agent_description=None,
+    )
+    conv_id = created.conversation.id
+    # Default: unshared.
+    assert created.conversation.share_workspace_files is False
+
+    shared = conversation_store.update_conversation(conv_id, share_workspace_files=True)
+    assert shared is not None
+    assert shared.share_workspace_files is True
+    # Survives a reload (decoded from the persisted override blob).
+    assert conversation_store.get_conversation(conv_id).share_workspace_files is True
+
+    # None leaves it on.
+    untouched = conversation_store.update_conversation(conv_id, title="renamed")
+    assert untouched is not None
+    assert untouched.share_workspace_files is True
+
+    # False clears it back to edit-only.
+    cleared = conversation_store.update_conversation(conv_id, share_workspace_files=False)
+    assert cleared is not None
+    assert cleared.share_workspace_files is False
+    assert conversation_store.get_conversation(conv_id).share_workspace_files is False
+
+
 def test_set_host_id_no_workspace_fails_when_row_has_none(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -6107,6 +6145,157 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
             ).scalars()
         )
     assert stored == ["custom-search-text"]
+
+
+# ── Idempotent append (stable_id) ─────────────────────
+
+
+def test_append_with_stable_id_is_idempotent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A re-append under the same stable id returns the stored item once.
+
+    The retry contract for at-least-once producers (transcript
+    forwarders): a timed-out POST's disposition is unknown, so the same
+    item may arrive again — and concurrent forwarders tailing one
+    transcript derive the same stable id for the same record.
+    """
+    conv = conversation_store.create_conversation()
+    stable = "ab" * 16
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id=stable,
+    )
+    [first] = conversation_store.append(conv.id, [item])
+    assert first.id == stable
+    assert first.deduplicated is False
+
+    [second] = conversation_store.append(conv.id, [item])
+    assert second.id == stable
+    assert second.deduplicated is True
+
+    page = conversation_store.list_items(conv.id)
+    assert [i.id for i in page.data if i.id == stable] == [stable]
+
+
+def test_append_without_stable_id_still_duplicates(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """No stable id keeps the legacy contract: every append inserts."""
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+    )
+    [a] = conversation_store.append(conv.id, [item])
+    [b] = conversation_store.append(conv.id, [item])
+    assert a.id != b.id
+    assert b.deduplicated is False
+
+
+def test_append_dedupe_does_not_burn_a_position(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A dedupe hit allocates no position: later items stay contiguous."""
+    conv = conversation_store.create_conversation()
+    stable = "cd" * 16
+    dup = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "one"}]),
+        stable_id=stable,
+    )
+    conversation_store.append(conv.id, [dup])
+    # duplicate + a genuinely new item in one batch
+    fresh = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(
+            role="assistant",
+            content=[{"type": "output_text", "text": "two"}],
+            agent="worker",
+        ),
+    )
+    [got_dup, got_fresh] = conversation_store.append(conv.id, [dup, fresh])
+    assert got_dup.deduplicated is True
+    assert got_fresh.deduplicated is False
+    page = conversation_store.list_items(conv.id)
+    assert len(page.data) == 2
+
+
+def test_pure_dedupe_append_leaves_conversation_metadata_alone(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A duplicate-only re-post must not make the conversation look active."""
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="ef" * 16,
+    )
+    conversation_store.append(conv.id, [item])
+    before = conversation_store.get_conversation(conv.id)
+    assert before is not None
+
+    conversation_store.append(conv.id, [item])
+    after = conversation_store.get_conversation(conv.id)
+    assert after is not None
+    assert after.updated_at == before.updated_at
+
+
+def test_same_stable_id_twice_in_one_batch_inserts_once(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """In-batch twins collapse instead of colliding on the primary key."""
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="0a" * 16,
+    )
+    [a, b] = conversation_store.append(conv.id, [item, item])
+    assert a.id == b.id
+    assert a.deduplicated is False
+    assert b.deduplicated is True
+    assert len(conversation_store.list_items(conv.id).data) == 1
+
+
+def test_repeated_persisted_twin_batch_leaves_conversation_metadata_alone(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry batch repeating one already-persisted stable id is a pure duplicate.
+
+    Concurrent forwarders can deliver the same record twice in one batch
+    after it already persisted: every item resolves to the stored row, so
+    nothing inserts and the conversation must not look active.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="1b" * 16,
+    )
+    conversation_store.append(conv.id, [item])
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    [a, b] = conversation_store.append(conv.id, [item, item])
+    assert a.deduplicated is True
+    assert b.deduplicated is True
+    assert a.id == b.id
+    after = conversation_store.get_conversation(conv.id)
+    assert after is not None
+    assert after.updated_at == 1000
+    assert len(conversation_store.list_items(conv.id).data) == 1
 
 
 # ── Connection-checkout budget ─────────────────────────

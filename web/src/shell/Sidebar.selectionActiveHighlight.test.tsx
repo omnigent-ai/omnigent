@@ -8,10 +8,12 @@ import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { forwardRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
+import { type OmnigentLinkProps, reactRouterRouting, RoutingProvider } from "@/lib/routing";
 
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
@@ -102,16 +104,38 @@ function snapshot(id: string, parentSessionId: string | null): Session {
   } as unknown as Session;
 }
 
-function renderAt(initialEntry: string) {
+function renderAt(initialEntry: string, holdRoute = false) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const StaticLink = forwardRef<HTMLAnchorElement, OmnigentLinkProps>(
+    ({ componentId: _componentId, onClick, to, ...props }, ref) => (
+      <a
+        ref={ref}
+        href={String(to)}
+        {...props}
+        onClick={(event) => {
+          onClick?.(event);
+          event.preventDefault();
+        }}
+      />
+    ),
+  );
+  const routes = (
+    <Routes>
+      <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
+      <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+    </Routes>
+  );
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[initialEntry]}>
-          <Routes>
-            <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
-            <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
-          </Routes>
+          {holdRoute ? (
+            <RoutingProvider value={{ ...reactRouterRouting, Link: StaticLink }}>
+              {routes}
+            </RoutingProvider>
+          ) : (
+            routes
+          )}
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
@@ -131,6 +155,19 @@ function rowFor(id: string): HTMLElement {
 }
 
 describe("sidebar active highlight in selection mode", () => {
+  it("highlights a clicked session before route state catches up", async () => {
+    mockConversations([topLevelConv("conv_active"), topLevelConv("conv_other")]);
+    getSessionSlimMock.mockImplementation((id: string) => Promise.resolve(snapshot(id, null)));
+
+    renderAt("/c/conv_active", true);
+    await waitFor(() => expect(rowFor("conv_active")).toHaveClass("bg-[var(--sidebar-active)]"));
+
+    fireEvent.click(rowFor("conv_other"));
+
+    expect(rowFor("conv_other")).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(rowFor("conv_active")).not.toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
   it("drops the active-session highlight once selection mode is on", async () => {
     mockConversations([topLevelConv("conv_active"), topLevelConv("conv_other")]);
     getSessionSlimMock.mockImplementation((id: string) => Promise.resolve(snapshot(id, null)));

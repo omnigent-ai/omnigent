@@ -22,6 +22,7 @@ HTTP response and asserting the correct server behaviour.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import httpx
@@ -358,6 +359,80 @@ async def test_external_compaction_status_publishes_compaction_sse(
         assert "total_tokens" not in published[0][1], (
             f"completed from the hook path must omit total_tokens; got {published[0][1]!r}."
         )
+
+
+async def test_external_compaction_status_anchors_started_at_to_first_report(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Repeated in_progress reports carry one stable compaction start.
+
+    A long compaction posts external_compaction_status("in_progress") on
+    every status poll. Every republished SSE must carry the started_at of
+    the FIRST report — that anchor is what lets the web UI fold repeats
+    into one spinner and keep the elapsed counter truthful across a page
+    reload. completed/failed must clear the anchor so the next compaction
+    starts a fresh clock.
+    """
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def capture_publish(session_id: str, event: dict[str, Any]) -> None:
+        """Capture session-stream events emitted by the route."""
+        published.append((session_id, event))
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        capture_publish,
+    )
+    agent = await create_test_agent(client)
+    sid = await _create_session(client, agent["id"])
+
+    async def post(status: str) -> None:
+        """Post one compaction edge and require the server to accept it."""
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "external_compaction_status", "data": {"status": status}},
+        )
+        assert resp.status_code == 202, resp.text
+
+    def last_started_at() -> object:
+        """Return started_at from the newest published in_progress SSE."""
+        events = [e for _, e in published if e["type"] == "response.compaction.in_progress"]
+        assert events, f"no in_progress SSE published; got {published!r}."
+        return events[-1].get("started_at")
+
+    now = int(time.time())
+    await post("in_progress")
+    first_start = last_started_at()
+    assert isinstance(first_start, int) and now <= first_start <= now + 30, (
+        f"in_progress must carry a wall-clock started_at; got {first_start!r}."
+    )
+
+    # A repeated poll of the SAME compaction reuses the recorded anchor. Pin
+    # it to a sentinel so the reuse is observable without sleeping a second.
+    sessions_helpers._compaction_started_at[sid] = 123
+    await post("in_progress")
+    assert last_started_at() == 123, (
+        "a repeated in_progress must reuse the recorded compaction start, "
+        "not re-anchor to the current clock."
+    )
+
+    # completed clears the anchor: the next compaction starts a fresh clock.
+    await post("completed")
+    assert sid not in sessions_helpers._compaction_started_at
+    await post("in_progress")
+    fresh_start = last_started_at()
+    assert isinstance(fresh_start, int) and fresh_start >= now, (
+        f"after completed, in_progress must record a fresh start; got {fresh_start!r}."
+    )
+
+    # failed clears it too — a retried compaction must not inherit the
+    # failed attempt's clock.
+    await post("failed")
+    assert sid not in sessions_helpers._compaction_started_at
 
 
 async def test_external_compaction_status_rejects_unknown_status(

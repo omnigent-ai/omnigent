@@ -405,6 +405,123 @@ def test_summarize_checks_empty() -> None:
     }
 
 
+def test_github_info_includes_body_and_comments(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The PR carries its description and its shaped conversation comments.
+
+    ``body`` feeds the Summary tab's description; ``comments`` its list. A
+    minimized/collapsed comment is dropped (as GitHub hides it), and each entry
+    is flattened to ``{author, body, created_at, url}``.
+    """
+    view = {
+        "number": 8,
+        "title": "t",
+        "state": "OPEN",
+        "url": "u",
+        "isDraft": False,
+        "author": {"login": "a"},
+        "baseRefName": "main",
+        "headRefName": "feature",
+        "statusCheckRollup": [],
+        "body": "## Summary\nDoes things.",
+        "comments": [
+            {
+                "author": {"login": "reviewer"},
+                "body": "nice",
+                "createdAt": "2026-09-05T07:32:02Z",
+                "url": "https://example.com/c/1",
+                "isMinimized": False,
+            },
+            {
+                "author": {"login": "spammer"},
+                "body": "hidden",
+                "createdAt": "2026-09-05T08:00:00Z",
+                "url": "https://example.com/c/2",
+                "isMinimized": True,
+            },
+        ],
+    }
+
+    def fake_gh(argv: Sequence[str], *, cwd: str) -> tuple[int, str, str]:
+        head = tuple(argv[:2])
+        if head == ("auth", "status"):
+            return (0, "", "")
+        if head == ("repo", "view"):
+            return (0, json.dumps({"nameWithOwner": "o/r"}), "")
+        if head == ("pr", "view"):
+            return (0, json.dumps(view), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    info = github_info(str(repo))
+    assert info["pr"]["body"] == "## Summary\nDoes things."
+    # The minimized comment is dropped; the survivor is flattened to snake_case.
+    assert info["pr"]["comments"] == [
+        {
+            "author": "reviewer",
+            "body": "nice",
+            "created_at": "2026-09-05T07:32:02Z",
+            "url": "https://example.com/c/1",
+        }
+    ]
+
+
+def test_github_info_empty_body_is_null(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A blank PR body becomes null so the UI shows its 'no description' state."""
+    view = {
+        "number": 8,
+        "title": "t",
+        "state": "OPEN",
+        "url": "u",
+        "isDraft": False,
+        "author": {"login": "a"},
+        "baseRefName": "main",
+        "headRefName": "feature",
+        "statusCheckRollup": [],
+        "body": "   ",
+        "comments": [],
+    }
+
+    def fake_gh(argv: Sequence[str], *, cwd: str) -> tuple[int, str, str]:
+        head = tuple(argv[:2])
+        if head == ("auth", "status"):
+            return (0, "", "")
+        if head == ("repo", "view"):
+            return (0, json.dumps({"nameWithOwner": "o/r"}), "")
+        if head == ("pr", "view"):
+            return (0, json.dumps(view), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    info = github_info(str(repo))
+    assert info["pr"]["body"] is None
+    assert info["pr"]["comments"] == []
+
+
+def test_shape_comments_filters_minimized_and_caps() -> None:
+    """Minimized comments drop out and the list caps at ``_MAX_COMMENTS``."""
+    raw: list[dict[str, object]] = [
+        {"author": {"login": "min"}, "body": "x", "isMinimized": True},
+    ]
+    raw += [
+        {"author": {"login": f"u{i}"}, "body": f"c{i}", "createdAt": "t", "url": None}
+        for i in range(github_resource._MAX_COMMENTS + 5)
+    ]
+    shaped = github_resource._shape_comments(raw)
+    assert len(shaped) == github_resource._MAX_COMMENTS
+    assert all(c["author"] != "min" for c in shaped)
+    # A missing author flattens to None; a non-list input is an empty list.
+    assert github_resource._shape_comments([{"body": "hi"}]) == [
+        {"author": None, "body": "hi", "created_at": None, "url": None}
+    ]
+    assert github_resource._shape_comments(None) == []
+
+
 def test_gh_scrubs_env_tokens_in_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
     # In a sandbox the panel's gh must authenticate as the connected owner via
     # hosts.yml, never an ambient GH_TOKEN/GITHUB_TOKEN (gh ranks those above

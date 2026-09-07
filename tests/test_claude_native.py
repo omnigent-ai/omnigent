@@ -8451,6 +8451,89 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
     assert boundaries[0]["compactMetadata"]["postTokens"] == 4321
 
 
+def test_transcript_records_drop_adjacent_store_duplicates() -> None:
+    """Adjacent items identical apart from id/created_at collapse to one record.
+
+    A forwarder retry re-post persists as an adjacent row that differs only
+    in the store envelope (id, created_at). The resume-transcript builder
+    must emit one record for the run so store duplicates don't become
+    duplicated model context on every cold resume.
+    """
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "created_at": 100,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "same payload"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "msg_2",
+            "created_at": 105,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "same payload"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "msg_3",
+            "created_at": 110,
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "reply"}],
+            "response_id": "resp_1",
+        },
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+    user_records = [r for r in records if r.get("type") == "user"]
+    assert len(user_records) == 1, f"Expected 1 user record, got {user_records}"
+    assert len(records) == 2
+    # Parent chain stays intact across the dropped duplicate.
+    assert records[1]["parentUuid"] == records[0]["uuid"]
+
+
+def test_transcript_records_keep_genuine_repeats_across_turns() -> None:
+    """A user genuinely repeating a message in a later turn is NOT collapsed.
+
+    Genuine repeats differ in ``response_id`` (a new turn), so the
+    envelope-ignoring comparison keeps both. Only retry re-posts — same
+    payload AND same response_id — collapse.
+    """
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "created_at": 100,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "try again"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "msg_2",
+            "created_at": 200,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "try again"}],
+            "response_id": "resp_2",
+        },
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+    assert len(records) == 2, f"Genuine repeats must both survive: {records}"
+
+
 def test_claude_transcript_records_handles_native_compaction_messages() -> None:
     """Claude-native compacted messages survive cold-resume reconstruction."""
     items: list[dict[str, Any]] = [
@@ -10376,6 +10459,53 @@ def test_claude_catalog_serves_model(
     )
 
 
+def _gateway_catalog() -> list[dict[str, object]]:
+    """A gateway-probed catalog: alias rows onto bare wire models."""
+    return [
+        {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
+        {"id": "opus[1m]", "model": "claude-opus-4-8[1m]", "displayName": "Opus 4.8 (1M)"},
+        {"id": "haiku", "model": "claude-haiku-4-5", "displayName": "Haiku 4.5"},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        # A gateway/catalog-namespace pin folds onto the row's wire model.
+        ("system.ai.claude-sonnet-5", "claude-sonnet-5"),
+        ("databricks-claude-sonnet-5", "claude-sonnet-5"),
+        ("system.ai.claude-opus-4-8[1m]", "claude-opus-4-8[1m]"),
+        # Case is mechanical too.
+        ("SYSTEM.AI.Claude-Sonnet-5", "claude-sonnet-5"),
+        # An exact row keeps the caller's spelling untouched.
+        ("claude-sonnet-5", "claude-sonnet-5"),
+        ("opus[1m]", "opus[1m]"),
+        # The 1M marker distinguishes requests: a bare pin never folds onto a
+        # [1m]-only row, and vice versa.
+        ("system.ai.claude-opus-4-8", None),
+        ("system.ai.claude-haiku-4-5[1m]", None),
+        # A model no row denotes stays refused.
+        ("system.ai.claude-mythos-9", None),
+        ("databricks-gpt-5-5", None),
+        ("", None),
+    ],
+)
+def test_claude_catalog_launch_spelling_folds_gateway_namespaces(
+    model: str, expected: str | None
+) -> None:
+    """A served model pinned in the gateway spelling folds onto the catalog's."""
+    assert claude_native.claude_catalog_launch_spelling(_gateway_catalog(), model) == expected
+
+
+def test_claude_catalog_launch_spelling_refuses_an_ambiguous_fold() -> None:
+    """Two rows spelling different launch ids for one fold cannot pick either."""
+    rows = [
+        {"id": "sonnet", "model": "claude-sonnet-5"},
+        {"id": "sonnet-gw", "model": "system.ai.claude-sonnet-5"},
+    ]
+    assert claude_native.claude_catalog_launch_spelling(rows, "databricks-claude-sonnet-5") is None
+
+
 @pytest.mark.parametrize(
     ("config", "label"),
     [
@@ -10622,3 +10752,133 @@ def test_catalog_fingerprint_survives_a_missing_binary(
     _point_claude_at(monkeypatch, tmp_path / "absent")
 
     assert isinstance(claude_native.claude_catalog_fingerprint(None), str)
+
+
+# ── ambient gateway detection ─────────────────────────────
+
+
+def test_ambient_env_is_non_anthropic_gateway_detects_databricks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient ANTHROPIC_BASE_URL pointing to Databricks is a gateway."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example.databricks.com/serving/v1")
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is True
+
+
+def test_ambient_env_is_non_anthropic_gateway_allows_anthropic_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient ANTHROPIC_BASE_URL pointing to Anthropic is NOT a gateway."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is False
+
+
+def test_ambient_env_is_non_anthropic_gateway_allows_anthropic_subdomain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient ANTHROPIC_BASE_URL on an Anthropic subdomain is NOT a gateway."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://test.anthropic.com")
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is False
+
+
+def test_ambient_env_is_non_anthropic_gateway_returns_false_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ambient ANTHROPIC_BASE_URL means not a gateway."""
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is False
+
+
+def test_catalog_fingerprint_includes_ambient_gateway_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fingerprint changes when ANTHROPIC_BASE_URL changes in ambient env.
+
+    When claude_config is None (managed settings), the ambient gateway URL
+    must be part of the fingerprint so gateway and non-gateway environments
+    don't share a catalog cache entry.
+    """
+    _point_claude_at(monkeypatch, tmp_path / "claude")
+    (tmp_path / "claude").write_text("binary")
+
+    # No gateway set
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    fp_no_gateway = claude_native.claude_catalog_fingerprint(None)
+
+    # Gateway set
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example.com/anthropic")
+    fp_with_gateway = claude_native.claude_catalog_fingerprint(None)
+
+    # Different gateway
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.databricks.com/anthropic")
+    fp_different_gateway = claude_native.claude_catalog_fingerprint(None)
+
+    # All three should be different
+    assert fp_no_gateway != fp_with_gateway
+    assert fp_no_gateway != fp_different_gateway
+    assert fp_with_gateway != fp_different_gateway
+
+
+async def test_claude_model_catalog_filters_canonical_ids_for_ambient_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When claude_config is None but ANTHROPIC_BASE_URL is a gateway, filter canonical IDs.
+
+    Managed settings (e.g. Isaac) may set ANTHROPIC_BASE_URL to a Databricks
+    gateway. The catalog must filter canonical claude-* IDs even when
+    claude_config is None.
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-4-6", "displayName": "Sonnet 4.6"},
+                {
+                    "id": "sonnet-gateway",
+                    "model": "system.ai.claude-sonnet-4-6[1m]",
+                    "displayName": "Sonnet 4.6 (Gateway)",
+                },
+                {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+            ],
+            default_model="system.ai.claude-sonnet-4-6[1m]",
+            default_label="Sonnet 4.6 (Gateway)",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example.com/anthropic")
+
+    rows = await claude_native.claude_model_catalog(None)
+
+    assert rows is not None
+    # Only the gateway-namespaced model should remain
+    assert [row["id"] for row in rows] == ["sonnet-gateway"]
+    # No canonical claude-* models
+    assert all(not str(row.get("model", "")).startswith("claude-") for row in rows)
+
+
+async def test_claude_model_catalog_keeps_canonical_ids_without_ambient_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When claude_config is None and no gateway URL is set, keep canonical IDs."""
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-4-6", "displayName": "Sonnet 4.6"},
+                {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+            ],
+            default_model="claude-opus-5",
+            default_label="Opus 5",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+
+    rows = await claude_native.claude_model_catalog(None)
+
+    assert rows is not None
+    # Both canonical models should be present
+    assert [row["id"] for row in rows] == ["sonnet", "opus"]
+    assert rows[1]["isDefault"] is True

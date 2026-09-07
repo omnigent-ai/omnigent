@@ -3,7 +3,6 @@ import {
   type KeyboardEvent,
   memo,
   useCallback,
-  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -364,10 +363,6 @@ function truncateTitle(raw: string, max = 60): string {
  */
 export function ChatPage() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
-  // Defer only the transcript key so the <Conversation> subtree remounts at
-  // transition priority. switchTo, routing, and the composer all stay on the
-  // immediate urlConvId — sends always target the conversation the URL shows.
-  const deferredConvId = useDeferredValue(urlConvId);
   const navigate = useNavigate();
   const appName = useAppName();
   // Optional first message handed off by the landing composer through the
@@ -1017,7 +1012,6 @@ export function ChatPage() {
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
-      conversationKey={deferredConvId}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -1242,9 +1236,6 @@ interface MainAgentSurfaceProps {
    * session in terminal-first mode.
    */
   conversationId: string | null;
-  /** Deferred conversation id passed as the transcript key so <Conversation>
-   *  remounts at transition priority instead of blocking the interaction frame. */
-  conversationKey: string | null | undefined;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. Gates the
    *  composer's Stop/Interrupt button — the parent's OWN turn only. */
@@ -1413,7 +1404,6 @@ export function updateWarmTerminalSurfaces(
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
-  conversationKey,
   status,
   isWorking,
   showsWorking,
@@ -1710,7 +1700,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
           <Transcript
-            conversationKey={conversationKey}
             setConversationEl={setConversationEl}
             containerEl={containerEl}
             scroller={scroller}
@@ -2911,10 +2900,16 @@ function ComposerImpl({
     // conversation's draft and wrongly conclude the user is mid-sentence,
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
-    useChatStore.setState({ failedSendDraft: null });
+    useChatStore.setState({
+      failedSendDraft: null,
+      pendingRetryStableId: failedSendDraft.stableId ?? null,
+    });
     // The user started something new while the send was in flight — their
     // in-progress text wins over a clobbering restore.
-    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) return;
+    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
+      useChatStore.setState({ pendingRetryStableId: null });
+      return;
+    }
     setValue(failedSendDraft.text);
     dirtyRef.current = true;
     if (failedSendDraft.files.length > 0) {
@@ -3787,6 +3782,22 @@ function ComposerImpl({
                   codexModelOptions={codexModelOptions}
                   costRoutingEligible={costRoutingEligible}
                   harnessLabel={harnessLabel}
+                  // The pill-wide hover highlight advertises one clickable
+                  // control, so the label half opens the same config modal as
+                  // the gear whenever the gear renders beside it.
+                  onOpenConfig={
+                    hasSessionConfig({
+                      showModels,
+                      showEffort,
+                      costRoutingEligible,
+                      subagentRoutingEligible,
+                      showClaudePermissionMode,
+                      showCodexApprovalMode,
+                    })
+                      ? () => setPickerOpenNonce((n) => n + 1)
+                      : null
+                  }
+                  configDisabled={isReadOnly || unreachable}
                 />
               </ComposerModelSource>
               <ComposerConfigGear
@@ -4749,14 +4760,44 @@ function SessionConfigModal({
 }
 
 /**
+ * Whether the session surfaces any run-config the gear modal can edit. Shared
+ * render guard for the config gear and click-to-open gate for the model/effort
+ * label half of the composer's split pill, so both halves stay in lockstep.
+ */
+function hasSessionConfig({
+  showModels,
+  showEffort,
+  costRoutingEligible,
+  subagentRoutingEligible,
+  showClaudePermissionMode,
+  showCodexApprovalMode,
+}: {
+  showModels: boolean;
+  showEffort: boolean;
+  costRoutingEligible: boolean;
+  subagentRoutingEligible: boolean;
+  showClaudePermissionMode: boolean;
+  showCodexApprovalMode: boolean;
+}): boolean {
+  return (
+    showModels ||
+    showEffort ||
+    costRoutingEligible ||
+    subagentRoutingEligible ||
+    showClaudePermissionMode ||
+    showCodexApprovalMode
+  );
+}
+
+/**
  * Composer gear affordance: a ghost `SettingsIcon` that shows the session's
  * live run-config on hover and opens `SessionConfigModal` on click. Rendered
  * only when the session has at least one switchable knob (model, effort, or
  * smart routing) — otherwise there's nothing to configure.
  *
  * @param openNonce External "open the modal" signal, nonce-keyed so repeat
- *   requests re-open (bare ``/model`` submits route here now that the composer
- *   trigger is a read-only label). ``0`` / omitted means never requested.
+ *   requests re-open (bare ``/model`` submits and clicks on the pill's
+ *   model/effort label half route here). ``0`` / omitted means never requested.
  */
 function ComposerConfigGear({
   harnessLabel,
@@ -4806,12 +4847,14 @@ function ComposerConfigGear({
   });
 
   if (
-    !showModels &&
-    !showEffort &&
-    !costRoutingEligible &&
-    !subagentRoutingEligible &&
-    !showClaudePermissionMode &&
-    !showCodexApprovalMode
+    !hasSessionConfig({
+      showModels,
+      showEffort,
+      costRoutingEligible,
+      subagentRoutingEligible,
+      showClaudePermissionMode,
+      showCodexApprovalMode,
+    })
   )
     return null;
 
@@ -5092,11 +5135,13 @@ function ComposerModelSource({
 }
 
 /**
- * Read-only ``<Model> <Effort>`` label in the composer, left of the config
- * gear. Model switching / effort control now live in the gear modal, so this
- * is a glanceable status label rather than a dropdown trigger — model in the
- * foreground, effort muted. Renders nothing when neither is known/switchable
- * (the harness identity and full config live in the gear tooltip/modal).
+ * ``<Model> <Effort>`` label in the composer, left of the config gear — model
+ * in the foreground, effort muted. Renders nothing when neither is
+ * known/switchable (the harness identity and full config live in the gear
+ * tooltip/modal). The pill's hover highlight spans both halves, so when the
+ * gear renders the label is a button opening the same session-config modal —
+ * the click target matches the hover affordance; without a gear it stays a
+ * plain read-only span.
  *
  * @param showModels Whether the session exposes a model to surface.
  * @param showEffort Whether the session exposes a reasoning-effort level.
@@ -5105,6 +5150,10 @@ function ComposerModelSource({
  * @param costRoutingEligible Whether Smart Routing is offered for this session.
  * @param harnessLabel Harness identity (e.g. "Polly (Pi)"), used as the label
  *   fallback for SDK/bundle agents that surface no model/effort.
+ * @param onOpenConfig Opens the session-config modal; ``null`` when the gear
+ *   isn't rendered, which keeps the label non-interactive.
+ * @param configDisabled Mirrors the gear's inert state (read-only viewer /
+ *   unreachable session): soft-disables the click without dimming the label.
  */
 function ComposerModelEffortLabel({
   showModels,
@@ -5113,6 +5162,8 @@ function ComposerModelEffortLabel({
   codexModelOptions,
   costRoutingEligible,
   harnessLabel,
+  onOpenConfig = null,
+  configDisabled = false,
 }: {
   showModels: boolean;
   showEffort: boolean;
@@ -5120,6 +5171,8 @@ function ComposerModelEffortLabel({
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
   harnessLabel: string | null;
+  onOpenConfig?: (() => void) | null;
+  configDisabled?: boolean;
 }) {
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
@@ -5137,18 +5190,6 @@ function ComposerModelEffortLabel({
         className="ml-1 inline size-3 shrink-0 animate-spin text-muted-foreground"
       />
     ) : null;
-  // Routing picks the model + effort per turn, so the label reads
-  // "Smart Routing" with no pinned model/effort — matching the tooltip.
-  if (routingOn) {
-    return (
-      <span
-        data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
-      >
-        <span className="text-foreground">{SMART_ROUTING_LABEL}</span>
-      </span>
-    );
-  }
   const effortLabel =
     showEffort && selectedEffort
       ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
@@ -5157,32 +5198,61 @@ function ComposerModelEffortLabel({
   // in the label even though the gear modal has no Model dropdown for them —
   // showModels gates only the modal control, not this read-out.
   const model = showModels || modelPickerKind === null ? modelLabel : null;
-  // SDK/bundle agents (e.g. Polly) that resolve no model/effort fall back to
-  // the harness identity ("Polly (Pi)") so the slot isn't empty. Scoped to
-  // SDK/bundle (modelPickerKind === null): native wrappers keep an empty label
-  // when their model is unresolved rather than surfacing the bare vendor name,
-  // which the gear tooltip already shows.
-  if (!model && !effortLabel) {
+
+  let content: ReactNode;
+  if (routingOn) {
+    // Routing picks the model + effort per turn, so the label reads
+    // "Smart Routing" with no pinned model/effort — matching the tooltip.
+    content = <span className="text-foreground">{SMART_ROUTING_LABEL}</span>;
+  } else if (!model && !effortLabel) {
+    // SDK/bundle agents (e.g. Polly) that resolve no model/effort fall back to
+    // the harness identity ("Polly (Pi)") so the slot isn't empty. Scoped to
+    // SDK/bundle (modelPickerKind === null): native wrappers keep an empty label
+    // when their model is unresolved rather than surfacing the bare vendor name,
+    // which the gear tooltip already shows.
     if (modelPickerKind !== null || !harnessLabel) return null;
-    return (
-      <span
-        data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
-      >
-        <span className="text-foreground">{harnessLabel}</span>
-      </span>
+    content = <span className="text-foreground">{harnessLabel}</span>;
+  } else {
+    content = (
+      <>
+        {model && <span className="text-foreground">{model}</span>}
+        {model && effortLabel && " "}
+        {effortLabel && <span className="text-muted-foreground">{effortLabel}</span>}
+        {modelPending}
+      </>
     );
   }
 
+  const labelClass =
+    "min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground";
+  if (!onOpenConfig) {
+    return (
+      <span data-testid="composer-model-effort-label" className={labelClass}>
+        {content}
+      </span>
+    );
+  }
+  // The pill highlights as one control when hovered anywhere, so the label
+  // half must act like the gear beside it: clicking opens the same config
+  // modal. Soft-disable (aria-disabled) mirrors the gear so the pill's hover
+  // highlight drops with it, while the label text stays fully readable.
   return (
-    <span
+    <button
+      type="button"
       data-testid="composer-model-effort-label"
-      className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
+      aria-haspopup="dialog"
+      aria-disabled={configDisabled}
+      onClick={() => {
+        if (configDisabled) return;
+        onOpenConfig();
+      }}
+      className={cn(
+        labelClass,
+        "h-9 rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring md:h-8",
+        configDisabled ? "cursor-default" : "cursor-pointer",
+      )}
     >
-      {model && <span className="text-foreground">{model}</span>}
-      {model && effortLabel && " "}
-      {effortLabel && <span className="text-muted-foreground">{effortLabel}</span>}
-      {modelPending}
-    </span>
+      {content}
+    </button>
   );
 }

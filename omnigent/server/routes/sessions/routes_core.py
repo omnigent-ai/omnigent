@@ -69,6 +69,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
@@ -1849,11 +1850,18 @@ def register_core_routes(
         #   owner-gated stop (an editor must not hide/stop a session they can't
         #   issue that stop for). Presence is the signal for project (``""``
         #   unfiles), so gate on model_fields_set, not a non-None value.
+        # * MANAGE — exposing the workspace to view-level collaborators
+        #   (``share_workspace_files``). It is a sharing decision, so it sits
+        #   with the same tier that already controls who is granted access
+        #   (grant/revoke, public toggle) — the share dialog is manage-gated.
+        #   Presence is the signal (the flag's own True/False is the value).
         # * EDIT — every other field.
         #
-        # Owner implies edit, so a single check at the resolved level gates all
-        # three with no redundant second permission-store read.
+        # A higher tier implies the lower ones, so a single check at the
+        # resolved (strictest requested) level gates them all with no redundant
+        # second permission-store read.
         set_project = "project_id" in body.model_fields_set
+        set_share_workspace = "share_workspace_files" in body.model_fields_set
         pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
             PINNED_LABEL_KEY
         }
@@ -1861,6 +1869,8 @@ def register_core_routes(
             required_level = LEVEL_READ
         elif body.archived is not None or set_project:
             required_level = LEVEL_OWNER
+        elif set_share_workspace:
+            required_level = LEVEL_MANAGE
         else:
             required_level = LEVEL_EDIT
         await _require_access(
@@ -2165,6 +2175,9 @@ def register_core_routes(
                 None if clear_subagent_routing else subagent_routing_override
             ),
             _unset_subagent_routing_override=clear_subagent_routing,
+            # Owner opt-in for workspace-file browsing. Presence is the signal:
+            # an omitted field leaves it unchanged; True/False set or clear it.
+            share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
         )

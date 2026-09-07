@@ -42,7 +42,7 @@ import click
 import httpx
 from fastapi.responses import JSONResponse, Response
 
-from omnigent._platform import IS_WINDOWS
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
@@ -6059,18 +6059,27 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         e.g. ``ImportError("Native Codex requires the 'codex' CLI on PATH.")``.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :returns: ``{"code": ..., "message": ...}`` payload for SSE and
-        JSON error responses. The message is a client-safe string naming
-        the runner's log file; the raw cause is logged there for operators,
-        not surfaced to the caller.
+        JSON error responses. Known actionable configuration errors surface
+        their safe message directly; other causes point to the runner log.
     """
+    error_id = f"err_{uuid.uuid4().hex}"
     _logger.warning(
-        "Native %s terminal start failed: %s",
+        "Native %s terminal start failed; error_id=%s: %s",
         runtime_name,
+        error_id,
         exc,
         exc_info=exc,
-        extra={"session_id": runner_primary_session_id()},
+        extra={"session_id": runner_primary_session_id(), "error_id": error_id},
     )
-    if IS_WINDOWS:
+    from omnigent.claude_native_bridge import ClaudeNativeHookInterpreterMismatchError
+
+    if isinstance(exc, ClaudeNativeHookInterpreterMismatchError):
+        message = (
+            "Claude Code is Windows-native, but Omnigent is running under WSL. "
+            "Install @anthropic-ai/claude-code from WSL so a WSL-native `claude` "
+            "binary wins PATH resolution, then retry."
+        )
+    elif IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
         # Give the client an actionable message instead of a log pointer.
         message = (
@@ -6084,7 +6093,11 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
             f"Native {runtime_name} terminal failed to start; "
             f"see the runner log for details: {log_reference}"
         )
-    return {"code": _NATIVE_TERMINAL_START_FAILED_CODE, "message": message}
+    return {
+        "code": _NATIVE_TERMINAL_START_FAILED_CODE,
+        "error_id": error_id,
+        "message": f"{message} Error ID: {error_id}.",
+    }
 
 
 def _publish_native_terminal_start_error(
@@ -6532,6 +6545,7 @@ async def _auto_create_claude_terminal(
         augment_claude_args,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
+        validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.claude_native_forwarder import reset_transcript_forward_state
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -6616,9 +6630,8 @@ async def _auto_create_claude_terminal(
     await _cancel_auto_forwarder_task(session_id)
     reset_transcript_forward_state(bridge_dir)
     _logger.info(
-        "Claude terminal bridge prepared: session=%s bridge_dir=%s",
+        "Claude terminal bridge prepared: session=%s",
         session_id,
-        bridge_dir,
         extra={"session_id": session_id},
     )
     # Pre-accept Claude's first-run trust + onboarding TUI prompts for this
@@ -6917,6 +6930,7 @@ async def _auto_create_claude_terminal(
     # and leave the model to invisible CLI-private state.
     if session_model_override or launch_model is None:
         from omnigent.claude_native import (
+            claude_catalog_launch_spelling,
             claude_catalog_serves_model,
             claude_launch_catalog,
             claude_launch_catalog_is_stale,
@@ -6954,42 +6968,79 @@ async def _auto_create_claude_terminal(
                     rows, pick, claude_config
                 ) or claude_catalog_serves_model(rows, resolved_request, claude_config)
 
+            # A spec pin or routing pick can spell a served model in the
+            # gateway/catalog namespace ("system.ai.claude-opus-4-8[1m]")
+            # while the launch catalog lists the same model bare; folding the
+            # mechanical prefix away keeps the pick launchable on the
+            # catalog's own spelling instead of falling back to the default.
+            def _fold_pick(rows: list[dict[str, object]]) -> str | None:
+                """
+                The rows' launch spelling for the pick's persisted or resolved id.
+                """
+                # The custom picker slot resolves to a provider-configured id
+                # (e.g. "system.ai.claude-sonnet-5"), so like _serves_pick the
+                # fold must consult both spellings.
+                return claude_catalog_launch_spelling(
+                    rows, pick
+                ) or claude_catalog_launch_spelling(rows, resolved_request)
+
+            folded_spelling = _fold_pick(launch_catalog)
             # Only rows that are fresh may retire the pick: a stale entry may
             # predate a provider change, so it is re-probed first, and a
-            # failed probe leaves no fresh rows at all.
+            # failed probe leaves no fresh rows at all. A foldable pin counts
+            # as an exact serve for staleness: it launches on the stale rows'
+            # spelling without a re-probe, like the exact-serve stale path.
             fresh_rows: list[dict[str, object]] | None = launch_catalog
-            if launch_catalog_was_stale and not _serves_pick(launch_catalog):
+            if (
+                launch_catalog_was_stale
+                and not _serves_pick(launch_catalog)
+                and folded_spelling is None
+            ):
                 fresh_rows = await claude_reprobed_launch_catalog(claude_config)
                 if fresh_rows:
                     launch_catalog = fresh_rows
                     launch_catalog_was_stale = False
+                    folded_spelling = _fold_pick(launch_catalog)
             if not _serves_pick(launch_catalog):
-                # The pick outlives the provider it was made under (a later
-                # ``omnigent setup`` can re-point the default). Launch on what
-                # this provider serves; reset the pick to Default only on fresh
-                # evidence, so the picker shows what the session now runs.
-                offered = ", ".join(
-                    str(row.get("id") or row.get("model") or "") for row in launch_catalog
-                )
-                if fresh_rows:
-                    reset_pick_after_launch = True
-                    outcome = "launching on the provider default and resetting the pick to Default"
-                else:
-                    outcome = (
-                        "the re-probe failed, so launching on the provider default and "
-                        "keeping the pick for the next relaunch"
+                if folded_spelling is not None:
+                    _logger.info(
+                        "claude launch gate folded the pinned model %r onto the catalog "
+                        "spelling %r for session=%s",
+                        pick,
+                        folded_spelling,
+                        session_id,
+                        extra={"session_id": session_id},
                     )
-                _logger.warning(
-                    "claude-native: model pick %r for session %s is not served by %s "
-                    "(it offers: %s); %s",
-                    pick,
-                    session_id,
-                    claude_launch_endpoint_label(claude_config),
-                    offered,
-                    outcome,
-                    extra={"session_id": session_id},
-                )
-                launch_model = unpinned_launch_model
+                    launch_model = folded_spelling
+                else:
+                    # The pick outlives the provider it was made under (a later
+                    # ``omnigent setup`` can re-point the default). Launch on what
+                    # this provider serves; reset the pick to Default only on fresh
+                    # evidence, so the picker shows what the session now runs.
+                    offered = ", ".join(
+                        str(row.get("id") or row.get("model") or "") for row in launch_catalog
+                    )
+                    if fresh_rows:
+                        reset_pick_after_launch = True
+                        outcome = (
+                            "launching on the provider default and resetting the pick to Default"
+                        )
+                    else:
+                        outcome = (
+                            "the re-probe failed, so launching on the provider default and "
+                            "keeping the pick for the next relaunch"
+                        )
+                    _logger.warning(
+                        "claude-native: model pick %r for session %s is not served by %s "
+                        "(it offers: %s); %s",
+                        pick,
+                        session_id,
+                        claude_launch_endpoint_label(claude_config),
+                        offered,
+                        outcome,
+                        extra={"session_id": session_id},
+                    )
+                    launch_model = unpinned_launch_model
         if launch_model is None and launch_catalog:
             # A stale entry's default is yesterday's answer: pinning it as
             # ``--model`` turns a provider-side retirement or entitlement
@@ -7138,6 +7189,14 @@ async def _auto_create_claude_terminal(
     _harness_cfg = load_effective_config()
     launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
+    # Validate the binary this terminal will actually spawn: ``launch_command``
+    # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
+    # name resolves against this process's inherited PATH (same lookup tmux's
+    # pane shell and omnigent.inner.terminal perform). Mirrors
+    # ``_preflight_local_tools`` on the local-CLI path.
+    resolved_claude = resolve_cli_binary(launch_command)
+    if resolved_claude is not None:
+        validate_claude_hook_interpreter_compatibility(resolved_claude)
 
     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
 

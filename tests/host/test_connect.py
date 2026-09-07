@@ -3633,10 +3633,195 @@ async def test_fresh_host_retries_auth_rejection_before_failing_loud(
     assert spy.call_count == 3
 
 
+async def test_connected_host_rides_out_404_restart_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that already connected retries 404s indefinitely.
+
+    A reverse proxy in front of the server answers 404 for the tunnel
+    route while the backend container restarts (deploy, config change,
+    nightly backup window). A host that has already completed an upgrade
+    is watching a routine restart — killing it would drop its live
+    runners — so it must ride the 404 window out and reconnect when the
+    backend returns, rather than exiting 1 and tearing down its sessions.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    not_found = _invalid_status(404)
+    # Accepted upgrade first (None), then a burst of 404s (the restart
+    # window), then another accepted upgrade, then a cancel to end.
+    spy = _ConnectSpy([None, not_found, not_found, not_found, None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    # Returns normally: if the post-connect 404s were misclassified as
+    # fatal this would raise HostConnectError after the first 404 instead
+    # of reconnecting.
+    await host.run()
+
+    # 6 = accepted connect + 3 ridden-out 404s + reconnect + ending
+    # cancel. Fewer means the host died mid-restart (the transient-404 bug).
+    assert spy.call_count == 6
+
+
+async def test_never_connected_host_fails_loud_on_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that has NEVER connected fails loud on 404, first attempt.
+
+    The narrow transient-404 fix rescues only already-connected hosts. A host
+    that never authenticated treats a 404 as a permanent client error — a
+    wrong server URL, or a server too old to expose the tunnel route — and
+    must fail loud immediately (no grace window, no silent looping) so the
+    operator gets instant feedback, exactly as before the fix.
+    """
+    spy = _ConnectSpy([_invalid_status(404)])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with pytest.raises(HostConnectError) as excinfo:
+        await host.run()
+
+    message = str(excinfo.value)
+    assert "HTTP 404" in message
+    assert "host tunnel route" in message
+    # A 404 is not an auth failure, so no `omnigent login` remedy.
+    assert "omnigent login" not in message
+    # Exactly one attempt — fails loud immediately, unlike the
+    # already-connected ride-out path above.
+    assert spy.call_count == 1
+
+
+async def test_connected_host_404_rideout_prints_notice_once(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The first 404 of a restart window warns on stderr, exactly once.
+
+    ``_logger.warning`` goes to the CLI log file, so a foreground
+    ``omnigent host`` would sit silent while riding out a proxy's 404
+    window. The terminal notice must name the cause and print only once
+    per window (not on every retry) so it doesn't spam stderr while the
+    server restarts.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    not_found = _invalid_status(404)
+    spy = _ConnectSpy([None, not_found, not_found, not_found, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    err = capsys.readouterr().err
+    # The cause reached the terminal, framed as a restart, not an error.
+    assert "HTTP 404" in err
+    assert "restarting" in err
+    # Printed once for the whole window, not once per retry — three
+    # consecutive 404s must yield a single notice line.
+    assert err.count("HTTP 404") == 1
+
+
+def test_connected_host_404_streak_escalates_without_going_fatal(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A sustained 404 streak escalates the operator message, never fatally.
+
+    A brief restart window stays quiet after the one-time notice, but a
+    route that answers 404 for minutes is likely not a restart (rollback,
+    changed URL). The classifier escalates the terminal message so the
+    operator learns the retry may not self-heal — while still returning
+    ``None`` so live runner sessions are never torn down.
+    """
+    from omnigent.host.connect import _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+    host = _make_host_process()
+    host._ever_connected = True
+
+    # First 404: retryable (None), framed as a server restart.
+    assert host._classify_http_status(404) is None
+    first = capsys.readouterr().err
+    assert "restarting" in first
+    assert "no longer" not in first
+
+    # Streak climbs toward — but not to — the escalation threshold: stays
+    # quiet so a routine restart never raises a false alarm.
+    for _ in range(2, _AUTH_REJECT_ESCALATE_ATTEMPTS):
+        assert host._classify_http_status(404) is None
+    assert "no longer" not in capsys.readouterr().err
+
+    # Crossing the threshold escalates — and is STILL retryable (no fatal
+    # error, so a host with live sessions is never killed by a long outage).
+    assert host._classify_http_status(404) is None
+    escalated = capsys.readouterr().err
+    assert "no longer a brief restart window" in escalated
+    assert host._transient_404_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+
+async def test_404_streak_resets_on_other_error_between_windows(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A non-404 failure between 404s starts a NEW restart window.
+
+    The 404 streak counts CONSECUTIVE rejections of one outage. A 5xx in
+    between means the previous window ended, so the next 404 is the first
+    of a fresh window: the streak restarts at 1 and the one-time stderr
+    notice prints again rather than being swallowed as a continuation.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    spy = _ConnectSpy(
+        [
+            None,
+            _invalid_status(404),
+            _invalid_status(503),
+            _invalid_status(404),
+            asyncio.CancelledError(),
+        ]
+    )
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    err = capsys.readouterr().err
+    # Two distinct windows => the once-per-window notice printed twice.
+    assert err.count("HTTP 404") == 2
+
+
+async def test_404_streak_resets_on_accepted_upgrade_between_windows(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A successful reconnect between 404 bursts resets the streak.
+
+    Riding out a restart, reconnecting, then hitting a second restart is
+    two separate outages: the accepted upgrade must clear the streak so
+    the second window re-prints the notice and escalation counts only the
+    new outage's consecutive 404s.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    spy = _ConnectSpy(
+        [
+            None,
+            _invalid_status(404),
+            None,
+            _invalid_status(404),
+            asyncio.CancelledError(),
+        ]
+    )
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    err = capsys.readouterr().err
+    # Each window's first 404 printed its own notice.
+    assert err.count("HTTP 404") == 2
+
+
 @pytest.mark.parametrize(
     "status,expected",
     [
-        (404, "permanent"),
+        (404, "HTTP 404"),
     ],
 )
 async def test_run_fails_loud_on_permanent_4xx(
@@ -3644,8 +3829,12 @@ async def test_run_fails_loud_on_permanent_4xx(
 ) -> None:
     """A non-auth permanent 4xx upgrade rejection fails loud immediately.
 
-    A wrong or old server cannot recover through reconnecting, so run()
-    must raise HostConnectError rather than backing off.
+    A 404 on a host that has never connected is permanent (wrong URL /
+    route missing) — reconnecting can never succeed, so run() must raise
+    HostConnectError immediately rather than backing off. Its message
+    names the tunnel route rather than the word "permanent", so this
+    asserts on "HTTP 404". An *already-connected* host instead rides a
+    404 out, covered separately above.
     """
     spy = _ConnectSpy([_invalid_status(status)])
     _patch_connect(monkeypatch, spy)

@@ -14,8 +14,8 @@
 // gracefully when the runner has no OS environment for the session
 // (e.g. cloud-only agents).
 
-import { useEffect, useRef } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useRef } from "react";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { authenticatedFetch } from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
@@ -423,7 +423,14 @@ export function useWorkspaceAllFiles(
     // the session's `failed` status downstream, not by retries.
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
-    staleTime: 5_000,
+    // Keep the tree warm on revisits: within staleTime a return to a
+    // previously-loaded conversation/location paints its cached tree with no
+    // loading flash. Freshness on turn-completion is still handled by
+    // useTrailingInvalidate above. No cross-key placeholderData — carrying the
+    // previous conversation's tree under a new conversation's key fed stale
+    // files into the folder tree's default-expansion cache; virtualization
+    // already keeps the per-switch render cheap, so the warm-carry isn't needed.
+    staleTime: 30_000,
   });
 }
 
@@ -870,5 +877,61 @@ export function useWorkspaceDirectory(
     queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath!, location),
     enabled: !!conversationId && !!dirPath && serveable !== false,
     staleTime: 5_000,
+  });
+}
+
+/** One expanded lazy directory's fetched children + load/error state. */
+export interface DirectoryResult {
+  data: WorkspaceFile[] | undefined;
+  isLoading: boolean;
+  isError: boolean;
+}
+
+/**
+ * Batched form of {@link useWorkspaceDirectory}: subscribe to the listings of
+ * many expanded lazy directories at once, keyed by path.
+ *
+ * The virtualized tree flattens the visible node list from a central place, so
+ * it can't call one hook per rendered row (rows come and go with scrolling, and
+ * a scrolled-off row unmounting would drop its fetch). Fetching here — once,
+ * for every currently-expanded lazy dir — keeps the queries alive regardless of
+ * which rows are windowed in, and shares the same cache entries as the singular
+ * hook (identical query keys).
+ */
+export function useWorkspaceDirectories(
+  conversationId: string | undefined,
+  dirPaths: string[],
+  location = "",
+): Map<string, DirectoryResult> {
+  const serveable = useWorkspaceServeable(conversationId);
+  const enabled = !!conversationId && serveable !== false;
+  // `combine` lets TanStack memoize the assembled Map. Its recompute gate is a
+  // reference check on the combine fn (`combine !== lastCombine`), so the
+  // callback must be stable — an inline closure is a fresh fn every render and
+  // defeats the gate, rebuilding the Map (and re-running the tree's flatten
+  // memo + widening effect) on every render, including every scroll frame.
+  // Keyed on `dirPaths`, which the caller holds stable at its widening fixpoint.
+  const combine = useCallback(
+    (results: { data?: WorkspaceFile[]; isLoading: boolean; isError: boolean }[]) => {
+      const map = new Map<string, DirectoryResult>();
+      dirPaths.forEach((dirPath, i) => {
+        map.set(dirPath, {
+          data: results[i]?.data,
+          isLoading: results[i]?.isLoading ?? false,
+          isError: results[i]?.isError ?? false,
+        });
+      });
+      return map;
+    },
+    [dirPaths],
+  );
+  return useQueries({
+    queries: dirPaths.map((dirPath) => ({
+      queryKey: ["workspace-dir", conversationId, dirPath, location],
+      queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath, location),
+      enabled,
+      staleTime: 5_000,
+    })),
+    combine,
   });
 }

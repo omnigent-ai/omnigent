@@ -54,7 +54,7 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import { userInputElicitationKey } from "@/lib/askUserQuestion";
-import { LIVE_ITEM_PREFIX, structuredErrorFields } from "@/lib/blocks";
+import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
@@ -79,6 +79,7 @@ import type {
   StreamEvent,
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
+import { randomUUID } from "@/lib/randomUUID";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
@@ -138,6 +139,12 @@ export interface SendOptions {
    * `send` already set `conversationId` before the callback.
    */
   onConversationCreated?: (conversationId: string) => void;
+  /**
+   * Stable id to reuse for this send instead of generating a fresh one.
+   * Set by ChatPage when retrying a `failedSendDraft` so the server-side
+   * dedup recognises the retry and does not re-dispatch to the runner.
+   */
+  stableId?: string;
 }
 
 /**
@@ -204,6 +211,14 @@ export interface QueuedMessage {
    * Falls back to the current `boundAgentId` when absent.
    */
   agentId?: string;
+  /**
+   * Stable 32-char hex id for this logical message submit. Generated once at
+   * enqueue time and kept across retries so the server-side append is
+   * idempotent — a re-post of the same message after a network failure does
+   * not insert a duplicate conversation item. Optional for backward
+   * compatibility with serialized queue state that predates this field.
+   */
+  stableId?: string;
 }
 
 /**
@@ -428,7 +443,18 @@ export interface ConversationState {
    * into — but the landing path binds a session first, so the reported flow
    * is covered.
    */
-  failedSendDraft: { conversationId: string; text: string; files: File[] } | null;
+  failedSendDraft: {
+    conversationId: string;
+    text: string;
+    files: File[];
+    stableId?: string;
+  } | null;
+  /**
+   * Stable id set by the failedSendDraft restore path so the next send()
+   * call can reuse it instead of generating a fresh UUID, preventing a
+   * duplicate dispatch on retry.
+   */
+  pendingRetryStableId: string | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -1347,6 +1373,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   streamBudgetExceeded: false,
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
+  pendingRetryStableId: null,
   sendLatchedAt: null,
   llmModel: null,
   pendingModelChange: null,
@@ -1373,12 +1400,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (conversationId === null) return;
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
+    const stableId = randomUUID().replace(/-/g, "");
     setActive((s) => ({
       queuedMessages: [
         ...s.queuedMessages,
         {
           queueId,
           text,
+          stableId,
           conversationId,
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
           ...(files && files.length > 0 ? { files } : {}),
@@ -1562,7 +1591,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ];
         await postEvent(conversationId, {
           type: "message",
-          data: { role: "user", content },
+          data: { role: "user", content, stable_id: head.stableId },
         });
       })()
         .catch(() => {
@@ -1595,6 +1624,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!agentId) {
       throw new Error("chatStore.send: no agentId");
     }
+    const retryId = get().pendingRetryStableId;
+    if (retryId !== null) setActive({ pendingRetryStableId: null });
+    const stableId = opts?.stableId ?? retryId ?? randomUUID().replace(/-/g, "");
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
     // into the running task's inbox. Keep `activeResponse` untouched in
@@ -1623,7 +1655,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // id would collide across attachments and strand a ghost chip (React
       // dedupes on the shared key) until a refresh replaces it with the
       // server's unique file_id.
-      const fileId = `pending:${attachmentKey(file)}`;
+      const fileId = `${PENDING_FILE_PREFIX}${attachmentKey(file)}`;
       return file.type.startsWith("image/")
         ? { type: "input_image" as const, file_id: fileId, filename }
         : { type: "input_file" as const, file_id: fileId, filename };
@@ -1710,6 +1742,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         data: {
           role: "user",
           content: serverContent,
+          stable_id: stableId,
         },
       });
       // Policy denied the input — the server returned immediately
@@ -1768,7 +1801,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const draftSessionId = postedSessionId ?? submitConversationId;
       if (draftSessionId !== null && (text.trim() !== "" || (files?.length ?? 0) > 0)) {
         setterFor(draftSessionId)({
-          failedSendDraft: { conversationId: draftSessionId, text, files: files ?? [] },
+          failedSendDraft: { conversationId: draftSessionId, text, files: files ?? [], stableId },
         });
       }
       // Settle the conversation this send targeted, wherever the user is now:
@@ -2046,7 +2079,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Paint whatever the entry already holds. For a live entry that is the
     // current transcript; for a fresh one it is the initial state.
     mirrorActiveEntry();
-    if (wasLive) return;
+    if (wasLive) {
+      // An open stream is not proof the entry is current: a session stream
+      // routed to the wrong replica stays open and heartbeats while delivering
+      // no events, and a reconnect loop that never re-opens holds the
+      // controller too. Verify the instantly-painted transcript against the
+      // committed snapshot in the background; item-id dedupe makes this a
+      // no-op when the entry really is current.
+      void reconcileOnReconnect(conversationId, entrySetter(entry), entryGetter(entry));
+      return;
+    }
 
     // Cold entry: bind its stream and hydrate history. `hydratePending` replays
     // the snapshot's un-consumed native messages — correct here because a fresh
@@ -5460,13 +5502,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       }
       return;
     case "compaction_failed":
-      // Compaction failed — history is unchanged. Remove the compaction_loading
-      // block so the "Compacting…" shimmer disappears without leaving a marker.
+      // Compaction failed — history is unchanged. Remove every
+      // compaction_loading block so the "Compacting…" shimmer disappears
+      // without leaving a marker: a long compaction re-announces progress,
+      // so more than one loading block may be present.
       applyToConversation((s) => {
-        const idx = [...s.blocks].reverse().findIndex((b) => b.type === "compaction_loading");
-        if (idx === -1) return {};
-        const realIdx = s.blocks.length - 1 - idx;
-        return { blocks: [...s.blocks.slice(0, realIdx), ...s.blocks.slice(realIdx + 1)] };
+        const blocks = s.blocks.filter((b) => b.type !== "compaction_loading");
+        return blocks.length === s.blocks.length ? {} : { blocks };
       });
       return;
     case "policy_denied":

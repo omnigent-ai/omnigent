@@ -1375,6 +1375,23 @@ describe("BlockStream — status events", () => {
     expect(blockTypes(blocks)).not.toContain("compaction");
   });
 
+  it("compaction_in_progress threads the server start time onto the block", () => {
+    // The server anchors started_at to the FIRST progress report of a
+    // compaction, so the spinner's elapsed counter can survive
+    // re-announcements and page reloads.
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      { type: "compaction_in_progress", startedAtS: 1_700_000_000 },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+
+    const loading = blocks.find((b) => b.type === "compaction_loading");
+    expect(loading).toBeDefined();
+    if (loading && loading.type === "compaction_loading") {
+      expect(loading.startedAtS).toBe(1_700_000_000);
+    }
+  });
+
   it("compaction_completed event → CompactionBlock (done marker)", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse() },

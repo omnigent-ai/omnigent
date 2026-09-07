@@ -108,6 +108,7 @@ describe("createSession", () => {
       harness: null,
       modelOverride: undefined,
       costControlModeOverride: undefined,
+      shareWorkspaceFiles: false,
       reasoningEffort: undefined,
       pendingElicitations: [],
       pendingInputs: [],
