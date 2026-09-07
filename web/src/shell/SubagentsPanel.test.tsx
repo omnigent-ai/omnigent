@@ -1514,16 +1514,24 @@ describe("SubagentsPanel", () => {
     expect(useChildSessionsMock).not.toHaveBeenCalledWith("c3");
   });
 
-  it("shows the router's model on a routed sub-agent row, and nothing when unrouted", () => {
-    // Per-subagent routing visibility: the row carries the short model name
-    // the router picked. An unrouted sibling must stay unchanged — the pill
-    // would otherwise imply a decision that never happened.
+  it("shows model and effort in one cue, including directly pinned children", () => {
+    // A routed child carries both the legacy routed field and the explicit
+    // override. A directly pinned child exercises the path the old summary
+    // could not expose to the rail.
     mockChildTree({
       conv_root: [
         childInfo({
           id: "conv_routed",
           tool: "researcher",
           routed_model: "databricks-claude-sonnet-5",
+          model_override: "databricks-claude-sonnet-5",
+          reasoning_effort: "high",
+        }),
+        childInfo({
+          id: "conv_pinned",
+          tool: "researcher",
+          model_override: "gpt-5-6-luna",
+          reasoning_effort: "low",
         }),
         childInfo({ id: "conv_plain", tool: "researcher" }),
       ],
@@ -1532,10 +1540,43 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
     const routed = childRow(container, "conv_routed");
-    expect(within(routed).getByTestId("subagent-routed-model").textContent).toBe("sonnet");
-    expect(
-      within(childRow(container, "conv_plain")).queryByTestId("subagent-routed-model"),
-    ).toBeNull();
+    const routedCue = within(routed).getByTestId("subagent-model-effort");
+    expect(routedCue).toHaveTextContent("sonnet | high");
+    expect(routedCue.querySelector(".text-muted-foreground")).toHaveTextContent("| high");
+    expect(routedCue.querySelector(".ml-1")).toHaveTextContent("| high");
+    const pinned = childRow(container, "conv_pinned");
+    expect(within(pinned).getByTestId("subagent-model-effort")).toHaveTextContent(
+      "gpt-5.6-luna | low",
+    );
+    const plainCue = within(childRow(container, "conv_plain")).getByTestId("subagent-model-effort");
+    expect(plainCue).toHaveTextContent("Default");
+    expect(plainCue).toHaveAttribute("title", "Reasoning effort: Default");
+  });
+
+  it("falls back to the spec model for children without an override or routing pin", () => {
+    // Native opencode sub-agents run the parent profile's spec model with no
+    // model_override and no routing decision — the rail must still label the
+    // model from the summary's llm_model field, not just the effort.
+    mockChildTree({
+      conv_root: [
+        childInfo({
+          id: "conv_spec_model",
+          tool: "researcher",
+          llm_model: "opencode-go/deepseek-v4-flash",
+          reasoning_effort: "max",
+        }),
+      ],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    const row = childRow(container, "conv_spec_model");
+    const cue = within(row).getByTestId("subagent-model-effort");
+    expect(cue).toHaveTextContent("deepseek-v4-flash | max");
+    expect(row.querySelector('[data-testid="subagent-model-effort"]')).toHaveAttribute(
+      "title",
+      "Spec model: opencode-go/deepseek-v4-flash · Reasoning effort: max",
+    );
   });
 
   it("highlights the active grandchild row", () => {

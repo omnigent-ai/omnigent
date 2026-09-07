@@ -57,6 +57,7 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   // Both the native (`antigravity-native`) and SDK (`antigravity`) harnesses
   // share the Antigravity glyph.
   if (agent.harness?.includes("antigravity")) return AntigravityIcon;
+  // Headless OpenCode has no dedicated glyph yet; it falls through to BotIcon.
   return BotIcon;
 }
 

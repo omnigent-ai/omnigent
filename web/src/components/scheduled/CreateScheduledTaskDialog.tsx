@@ -100,11 +100,10 @@ export function CreateScheduledTaskDialog({
     () => sortAgentsForDisplay((agents ?? []).filter((a) => !HIDDEN_PICKER_AGENTS.has(a.name))),
     [agents],
   );
-  const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a)),
-    [agentList],
-  );
-  const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
+  const isNativeHarnessRow = (a: AvailableAgent): boolean =>
+    isNativeCodingAgent(a) && a.builtin !== false;
+  const harnessEntries = useMemo(() => agentList.filter(isNativeHarnessRow), [agentList]);
+  const agentEntries = useMemo(() => agentList.filter((a) => !isNativeHarnessRow(a)), [agentList]);
   // Resolve the effective selection: the explicit pick if it's still in the
   // list, else the edited task's own agent (which may be hidden from the picker
   // — never silently retarget it), else the first agent (so a fresh picker

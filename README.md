@@ -265,9 +265,11 @@ omnigent claude                      # Claude Code, in a session your team can j
 omnigent codex                       # Codex
 omnigent cursor                      # Cursor
 omnigent agy                         # Antigravity
-omnigent opencode                    # OpenCode
+omnigent opencode                    # OpenCode native TUI
 omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
+omnigent run --harness opencode      # OpenCode headless runtime
+omnigent run path/to/agent.yaml      # your own agent (see "Write your own agent")
 ```
 
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
@@ -566,7 +568,7 @@ prompt: You are a helpful data analyst.
 executor:
   harness: claude-sdk          # or: claude-native, codex, codex-native, cursor,
                                # cursor-native, hermes, hermes-native, opencode,
-                               # pi, pi-native, openai-agents
+                               # opencode-native, pi, pi-native, openai-agents
 
 tools:
   # A local Python function (schema auto-generated from the signature)

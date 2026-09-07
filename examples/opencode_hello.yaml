@@ -1,0 +1,56 @@
+name: opencode-hello
+description: >-
+  Smallest possible OpenCode agent — single-file launcher YAML that hands
+  every turn to the OpenCode CLI (https://opencode.ai) running headlessly
+  behind the standard Omnigent REPL. Useful as a sanity check that the
+  harness wires up end-to-end on a fresh machine, and as a starting
+  point for a real OpenCode-backed agent.
+
+# Single-file launcher shape — matches what ``omnigent run --harness
+# opencode`` generates internally (see ``_materialize_harness_launcher_file``
+# in omnigent/cli.py). For multi-agent bundles, prefer the directory
+# layout under ``examples/polly/`` / ``examples/debby/``.
+executor:
+  harness: opencode
+  # ``opencode`` is the headless CLI executor. Use ``opencode-native``
+  # explicitly when the OpenCode TUI/server bridge is intended.
+  # Override per-invocation via ``-m openai/gpt-5`` or ``/model`` in
+  # the REPL. With no model pinned, OpenCode picks its configured
+  # default for the chosen provider.
+
+prompt: |
+  You are OpenCode, running headlessly inside Omnigent. Help the user
+  with software engineering tasks — read files, edit code, run tests,
+  and explain your reasoning. Keep responses concise and prefer
+  showing the user diffs / commands over describing them in prose.
+
+# OpenCode is a multi-provider coding agent. Credentials come from
+# OpenCode's own ``opencode auth login`` flow and are copied into the
+# headless executor's private XDG data root — so this spec declares
+# no ``executor.auth`` block.
+#
+# To route through a gateway (Databricks AI gateway / vendor-neutral
+# proxy) instead, either set the wrapper-only
+# ``HARNESS_OPENCODE_GATEWAY_BASE_URL`` +
+# ``HARNESS_OPENCODE_GATEWAY_API_KEY`` in the shell, or declare a
+# ``executor.auth: {type: databricks, profile: …}`` block and let
+# Omnigent resolve the workspace. The resulting provider/MCP override
+# is written to a private mode-0600 ``opencode.json``; it is not passed
+# as ``OPENCODE_CONFIG_CONTENT`` or as a gateway key to the child.
+#
+# OpenCode owns its own file/shell tools (bash, edit, read, …) and
+# runs them inside its own loop. The harness therefore advertises
+# ``handles_tools_internally=True`` and does NOT need an ``os_env``
+# block to inject the ``sys_os_*`` tools — adding one would just
+# duplicate every operation against Omnigent's dispatch path.
+
+# Try it:
+#   omnigent run examples/opencode_hello.yaml
+#   omnigent run examples/opencode_hello.yaml -p "summarise the README"
+#   omnigent run examples/opencode_hello.yaml -m openai/gpt-5
+#
+# For a direct headless invocation without this YAML:
+#   omnigent run --harness opencode -p "list the files in the current directory"
+#
+# The terminal-owned native TUI/server bridge is a separate entry point:
+#   omnigent opencode

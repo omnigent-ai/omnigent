@@ -48,7 +48,7 @@ import { OttoIcon } from "@/components/icons/OttoIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
 import { Button } from "@/components/ui/button";
 import { RunningDot } from "@/components/RunningDot";
-import { shortModelName } from "@/components/CostRoutingControl";
+import { formatModelDisplayName, shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import type { SessionItem } from "@/lib/types";
@@ -599,6 +599,23 @@ function SubagentRow({
   const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
   const primary = childPrimaryLabel(child);
   const isActive = conversationId === child.id;
+  const effectiveModel = child.model_override ?? child.routed_model ?? child.llm_model;
+  const modelLabel = effectiveModel ? shortModelName(formatModelDisplayName(effectiveModel)) : null;
+  // ``null`` means the child uses its harness/model default. Keep that
+  // visible so every child row answers which reasoning mode it uses.
+  const effortLabel = child.reasoning_effort ?? "Default";
+  const modelEffortTitle = [
+    effectiveModel
+      ? child.model_override
+        ? `Model: ${effectiveModel}`
+        : child.routed_model
+          ? `Smart routing picked ${effectiveModel}`
+          : `Spec model: ${effectiveModel}`
+      : null,
+    `Reasoning effort: ${effortLabel}`,
+  ]
+    .filter((part): part is string => part !== null)
+    .join(" · ");
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
   // — but never the row the user is currently viewing.
   const dim = !isActive && SETTLED_STATE[status.activity];
@@ -657,16 +674,22 @@ function SubagentRow({
             )}
             <Icon className="size-3.5 shrink-0 text-muted-foreground" />
             <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
-            {child.routed_model ? (
-              // Model the intelligent router picked for this sub-agent — the
-              // per-subagent half of routing visibility.
-              <span
-                data-testid="subagent-routed-model"
-                title={`Smart routing picked ${child.routed_model}`}
-                className="shrink-0 truncate font-mono text-[10px] text-muted-foreground"
+            {modelLabel || effortLabel ? (
+              // Keep model and effort in one cue, matching the composer's
+              // foreground model plus muted effort treatment.
+              <Badge
+                data-testid="subagent-model-effort"
+                title={modelEffortTitle}
+                variant="outline"
+                className="h-4 max-w-44 shrink-0 truncate gap-0 px-1 text-[10px] font-normal text-muted-foreground"
               >
-                {shortModelName(child.routed_model)}
-              </span>
+                {modelLabel && <span className="font-mono text-foreground">{modelLabel}</span>}
+                {effortLabel && (
+                  <span className={cn("text-muted-foreground", modelLabel && "ml-1")}>
+                    {modelLabel ? ` | ${effortLabel}` : effortLabel}
+                  </span>
+                )}
+              </Badge>
             ) : null}
             <span className="flex-1" />
             <StatusIndicator {...status} />
