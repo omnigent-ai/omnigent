@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast, get_args
 
 from fastapi import APIRouter, Depends, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from omnigent.db.utils import builtin_agent_id
@@ -48,6 +48,17 @@ _MAX_IMPORT_ITEMS = 100_000
 _LOCAL_IMPORT_STREAM_ERROR_MESSAGE = (
     "The local session import stopped unexpectedly. Retry the import or contact an administrator."
 )
+
+
+def _record_local_import_failure() -> tuple[str, str]:
+    """Log the active import exception and return its safe client correlation data."""
+    error_id = f"err_{secrets.token_hex(16)}"
+    _logger.exception(
+        "Local session import failed; error_id=%s",
+        error_id,
+        extra={"error_id": error_id},
+    )
+    return error_id, f"{_LOCAL_IMPORT_STREAM_ERROR_MESSAGE} Error ID: {error_id}."
 
 
 class ImportItemInput(BaseModel):
@@ -565,7 +576,7 @@ def create_imports_router(
     async def import_local_sessions(
         body: LocalImportRequest,
         request: Request,
-    ) -> LocalImportResponse:
+    ) -> LocalImportResponse | JSONResponse:
         """Import local transcripts from a chosen host.
 
         The transcripts live on the caller's machine, so the read happens on
@@ -582,8 +593,21 @@ def create_imports_router(
         user_id, host_conn = _resolve_import_target(request, body)
         counts: dict[str, int] = {}
         sessions: list[ImportedSessionRef] = []
-        async for ref in _import_local_core(body, user_id, host_conn, counts):
-            sessions.append(ref)
+        try:
+            async for ref in _import_local_core(body, user_id, host_conn, counts):
+                sessions.append(ref)
+        except OmnigentError:
+            error_id, message = _record_local_import_failure()
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "code": ErrorCode.INTERNAL_ERROR,
+                        "error_id": error_id,
+                        "message": message,
+                    }
+                },
+            )
         return LocalImportResponse(
             imported=counts.get("imported", 0),
             already_imported=counts.get("already_imported", 0),
@@ -617,7 +641,7 @@ def create_imports_router(
 
         async def _events() -> AsyncIterator[bytes]:
             counts: dict[str, int] = {}
-            error_id: str | None = None
+            error: tuple[str, str] | None = None
             try:
                 async for ref in _import_local_core(body, user_id, host_conn, counts):
                     yield _import_event_line(
@@ -626,18 +650,14 @@ def create_imports_router(
             except OmnigentError:
                 # The read dropped/stalled mid-stream. The 200 + partial body is
                 # already sent, so report the failure inline rather than raising.
-                error_id = f"err_{secrets.token_hex(16)}"
-                _logger.exception(
-                    "Local session import stream failed; error_id=%s",
-                    error_id,
-                    extra={"error_id": error_id},
-                )
-            if error_id is not None:
+                error = _record_local_import_failure()
+            if error is not None:
+                error_id, message = error
                 yield _import_event_line(
                     {
                         "event": "error",
                         "error_id": error_id,
-                        "message": f"{_LOCAL_IMPORT_STREAM_ERROR_MESSAGE} Error ID: {error_id}.",
+                        "message": message,
                     }
                 )
             yield _import_event_line(

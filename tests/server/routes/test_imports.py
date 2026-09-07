@@ -555,12 +555,14 @@ async def test_local_import_stream_emits_ndjson_session_then_done(
         assert conversation_store.get_conversation(e["session_id"]) is not None
 
 
-async def test_local_import_stream_redacts_host_error(
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "stream"])
+async def test_local_import_endpoints_redact_host_error(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    stream: bool,
 ) -> None:
-    """A mid-stream host failure keeps exception details out of the NDJSON body."""
+    """Host failures retain diagnostics in logs but not either API response."""
     from omnigent.server.routes import imports as imports_module
 
     sensitive_detail = "host read failed at /private/transcripts/session.json\nTraceback: secret"
@@ -591,7 +593,7 @@ async def test_local_import_stream_redacts_host_error(
     with caplog.at_level(logging.ERROR, logger=imports_module.__name__):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
-                "/v1/imports/local/stream",
+                f"/v1/imports/local{'/stream' if stream else ''}",
                 json={
                     "host_id": "host_0123456789abcdef0123456789abcdef",
                     "source": "claude",
@@ -599,20 +601,23 @@ async def test_local_import_stream_redacts_host_error(
                 },
             )
 
-    events = [json.loads(line) for line in response.text.splitlines() if line.strip()]
-    error_event = events[0]
-    error_id = error_event["error_id"]
+    if stream:
+        events = [json.loads(line) for line in response.text.splitlines() if line.strip()]
+        error_payload = events[0]
+        assert error_payload["event"] == "error"
+    else:
+        assert response.status_code == 500
+        error_payload = response.json()["error"]
+        assert error_payload["code"] == ErrorCode.INTERNAL_ERROR
+
+    error_id = error_payload["error_id"]
     assert error_id.startswith("err_")
     assert len(error_id) == 36
     int(error_id.removeprefix("err_"), 16)
-    assert error_event == {
-        "event": "error",
-        "error_id": error_id,
-        "message": (
-            "The local session import stopped unexpectedly. "
-            f"Retry the import or contact an administrator. Error ID: {error_id}."
-        ),
-    }
+    assert error_payload["message"] == (
+        "The local session import stopped unexpectedly. "
+        f"Retry the import or contact an administrator. Error ID: {error_id}."
+    )
     assert sensitive_detail not in response.text
     assert sensitive_detail in caplog.text
     assert error_id in caplog.text
