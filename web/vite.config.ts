@@ -5,6 +5,7 @@ import react from "@vitejs/plugin-react";
 import type { Plugin, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
 import { shikiManualChunk } from "./vite.shiki";
+import { streamdownManualChunk } from "./vite.streamdown";
 
 // Databricks workspace-hosted omnigent is mounted behind the api-proxy at this
 // path; a local / self-hosted server mounts at the root. Mirrors the Python
@@ -272,7 +273,7 @@ export default defineConfig({
     emptyOutDir: true,
     rollupOptions: {
       output: {
-        manualChunks: shikiManualChunk,
+        manualChunks: (id: string) => streamdownManualChunk(id) ?? shikiManualChunk(id),
       },
     },
   },
