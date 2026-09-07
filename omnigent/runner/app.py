@@ -11420,6 +11420,13 @@ def create_runner_app(
             )
 
     async def _catch_up_scan() -> None:
+        replayed_approvals = pending_approvals.notify_server_reconnect()
+        if replayed_approvals:
+            _logger.info(
+                "Replaying %d server-issued approval request(s) after reconnect",
+                replayed_approvals,
+                extra={"session_id": runner_primary_session_id()},
+            )
         # The tunnel just reconnected, which usually means the SERVER restarted
         # (deploy, crash, replica failover) and lost its in-memory session-status
         # cache. This runner did not restart, so every status source still

@@ -14,6 +14,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +22,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.spec.types import AgentSpec, MCPServerConfig
@@ -361,6 +363,87 @@ async def test_call_tool_happy_path_returns_text() -> None:
     assert call.body["method"] == "tools/call"
     assert call.body["params"]["name"] == "github__search"
     assert call.body["params"]["arguments"] == {"query": "asyncio"}
+
+
+@pytest.mark.asyncio
+async def test_call_tool_recreates_approval_after_server_reconnect() -> None:
+    """A reconnect discards stale requestState and repeats the original call."""
+    old_elicitation = "elicit_old_server"
+    new_elicitation = "elicit_new_server"
+
+    def _input_required(elicitation_id: str, request_state: str, rpc_id: int) -> httpx.Response:
+        return _json_resp(
+            {
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "result": {
+                    "resultType": "input_required",
+                    "inputRequests": {
+                        elicitation_id: {
+                            "method": "elicitation/create",
+                            "params": {
+                                "message": "Approve shell command?",
+                                "requestedSchema": {
+                                    "type": "object",
+                                    "properties": {"approved": {"type": "boolean"}},
+                                    "required": ["approved"],
+                                },
+                            },
+                        }
+                    },
+                    "requestState": request_state,
+                },
+            }
+        )
+
+    transport = _StubTransport(
+        [
+            _input_required(old_elicitation, "old-state", 1),
+            _input_required(new_elicitation, "new-state", 2),
+            _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "result": {
+                        "content": [{"type": "text", "text": "approval-resumed"}],
+                        "isError": False,
+                    },
+                }
+            ),
+        ]
+    )
+    manager = _make_manager(transport)
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(
+        manager.call_tool(_make_spec("github"), "sys_os_shell", {"command": "printf ok"})
+    )
+
+    async def _wait_until_registered(elicitation_id: str) -> None:
+        for _ in range(1000):
+            if elicitation_id in pending_approvals._pending:
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError(f"approval {elicitation_id} was never registered")
+
+    try:
+        await _wait_until_registered(old_elicitation)
+        assert pending_approvals.notify_server_reconnect() == 1
+        await _wait_until_registered(new_elicitation)
+        assert pending_approvals.resolve(new_elicitation, approved=True)
+
+        assert await task == "approval-resumed"
+    finally:
+        if not task.done():
+            task.cancel()
+        pending_approvals.reset_for_tests()
+
+    assert [call.body["id"] for call in transport.calls] == [1, 2, 3]
+    first_params, replay_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert replay_params == first_params
+    assert "requestState" not in replay_params
+    assert retry_params["requestState"] == "new-state"
+    assert new_elicitation in retry_params["inputResponses"]
+    assert old_elicitation not in retry_params["inputResponses"]
 
 
 @pytest.mark.asyncio

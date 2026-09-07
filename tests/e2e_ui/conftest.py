@@ -139,7 +139,7 @@ def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> No
 # Populated by ``live_server`` so test-scoped fixtures can access the
 # server PID and runner id without changing ``live_server``'s return
 # type (which other tests depend on).
-_server_state: dict[str, int | str] = {}
+_server_state: dict[str, object] = {}
 _WEB_DIR = _REPO_ROOT / "web"
 _BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
 
@@ -1004,40 +1004,46 @@ def live_server(
     # instead of being shadowed by the worktree.
     apply_server_env(env, _REPO_ROOT)
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
-    proc = subprocess.Popen(
-        [
-            server_executable(),
-            # Equivalent of the unit tests' ``monkeypatch.setattr(presence,
-            # "_LEAVE_GRACE_S", ...)``, but applied INSIDE this spawned
-            # interpreter — a monkeypatch in the test process can't reach a
-            # subprocess. ``-c`` patches the module global before the CLI
-            # runs; the presence route reads it live at call time, so the
-            # presence-leave assertion in test_collab_realtime clears in ~1s
-            # instead of the prod 15s dwell (which only exists to absorb the
-            # ingress' ~5-min stream recycle a test server never hits).
-            # Mirrors ``python -m omnigent`` (omnigent/__main__.py).
-            "-c",
-            "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
-            + "from omnigent.cli import main; main()",
-            "server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{db_path}",
-            "--artifact-location",
-            str(artifact_dir),
-            "--agent",
-            str(agent_yaml_path),
-        ],
-        env=env,
-        # Compat mode: neutral CWD so the worktree doesn't shadow the pinned
-        # old server install via sys.path[0]. None (inherit) in normal runs.
-        cwd=compat_server_cwd(),
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
+    server_argv = [
+        server_executable(),
+        # Equivalent of the unit tests' ``monkeypatch.setattr(presence,
+        # "_LEAVE_GRACE_S", ...)``, but applied INSIDE this spawned
+        # interpreter — a monkeypatch in the test process can't reach a
+        # subprocess. ``-c`` patches the module global before the CLI
+        # runs; the presence route reads it live at call time, so the
+        # presence-leave assertion in test_collab_realtime clears in ~1s
+        # instead of the prod 15s dwell (which only exists to absorb the
+        # ingress' ~5-min stream recycle a test server never hits).
+        # Mirrors ``python -m omnigent`` (omnigent/__main__.py).
+        "-c",
+        "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+        + "from omnigent.cli import main; main()",
+        "server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--database-uri",
+        f"sqlite:///{db_path}",
+        "--artifact-location",
+        str(artifact_dir),
+        "--agent",
+        str(agent_yaml_path),
+    ]
+    server_cwd = compat_server_cwd()
+
+    def _spawn_server() -> subprocess.Popen[bytes]:
+        return subprocess.Popen(
+            server_argv,
+            env=env,
+            # Compat mode: neutral CWD so the worktree doesn't shadow the pinned
+            # old server install via sys.path[0]. None (inherit) in normal runs.
+            cwd=server_cwd,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+
+    proc = _spawn_server()
     base_url = f"http://127.0.0.1:{port}"
 
     # Spawn the runner as a sibling subprocess (the server no longer
@@ -1065,36 +1071,39 @@ def live_server(
         stderr=subprocess.STDOUT,
     )
 
-    # Poll /health and the runner status until the server can
-    # actually route a turn. Time-based polling mirrors
-    # tests/_helpers/live_server.py:start_live_server — the
-    # alternative (asyncio.Event signalling) doesn't apply because
-    # the subprocess is opaque to this process.
-    deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-    ready = False
-    last_error = "not polled yet"
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            last_error = f"process exited early with code {proc.returncode}"
-            break
-        try:
-            resp = httpx.get(f"{base_url}/health", timeout=2)
-            if resp.status_code == 200:
-                status_resp = httpx.get(
-                    f"{base_url}/v1/runners/{runner_id}/status",
-                    timeout=2,
-                )
-                if status_resp.status_code == 200 and status_resp.json()["online"] is True:
-                    ready = True
-                    break
-                last_error = (
-                    f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
-                )
-            else:
-                last_error = f"health HTTP {resp.status_code}: {resp.text[:200]}"
-        except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-        time.sleep(_HEALTH_POLL_INTERVAL_S)
+    def _wait_until_ready(
+        server_process: subprocess.Popen[bytes],
+        *,
+        timeout_s: float = _HEALTH_TIMEOUT_S,
+    ) -> tuple[bool, str]:
+        """Wait until this server generation can route through the runner."""
+        deadline = time.monotonic() + timeout_s
+        last_error = "not polled yet"
+        while time.monotonic() < deadline:
+            if server_process.poll() is not None:
+                return False, f"process exited early with code {server_process.returncode}"
+            try:
+                resp = httpx.get(f"{base_url}/health", timeout=2)
+                if resp.status_code == 200:
+                    status_resp = httpx.get(
+                        f"{base_url}/v1/runners/{runner_id}/status",
+                        timeout=2,
+                    )
+                    if status_resp.status_code == 200 and status_resp.json()["online"] is True:
+                        return True, "ready"
+                    last_error = (
+                        f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
+                    )
+                else:
+                    last_error = f"health HTTP {resp.status_code}: {resp.text[:200]}"
+            except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            time.sleep(_HEALTH_POLL_INTERVAL_S)
+        return False, last_error
+
+    # Poll /health and the runner status until the server can actually route a
+    # turn. The same readiness gate is reused after a server-only restart.
+    ready, last_error = _wait_until_ready(proc)
 
     if not ready:
         if runner_proc.poll() is None:
@@ -1123,6 +1132,7 @@ def live_server(
 
     _server_state["pid"] = proc.pid
     _server_state["runner_id"] = runner_id
+    _server_state["runner_pid"] = runner_proc.pid
     # Exposed so a test whose predecessor killed the shared runner (e.g.
     # test_stale_stream) can respawn one via :func:`_ensure_runner_online`.
     _server_state["binding_token"] = binding_token
@@ -1131,6 +1141,28 @@ def live_server(
     # Exposed so a test can seed a committed transcript straight into the
     # store (see :func:`seed_committed_turn`) instead of driving the LLM.
     _server_state["database_uri"] = f"sqlite:///{db_path}"
+
+    def _restart_server() -> None:
+        """Replace only the server process, preserving its runner and database."""
+        nonlocal proc
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        proc = _spawn_server()
+        ready, restart_error = _wait_until_ready(proc, timeout_s=120.0)
+        if not ready:
+            log_text = log_path.read_text() if log_path.exists() else ""
+            raise RuntimeError(
+                f"restarted server did not become ready on {base_url} "
+                f"(last_error={restart_error}).\n{log_text[-3000:]}"
+            )
+        _server_state["pid"] = proc.pid
+
+    _server_state["restart_server"] = _restart_server
 
     # Set a non-resettable fallback for the policy-classifier LLM queue so
     # every per-test reset leaves the server's guardrails path functional.
@@ -1332,6 +1364,7 @@ def _ensure_runner_online(
                 f"log:\n{log_path.read_text()[-3000:]}"
             )
         if _online():
+            _server_state["runner_pid"] = proc.pid
             return proc
         time.sleep(_HEALTH_POLL_INTERVAL_S)
 

@@ -47,6 +47,10 @@ _DEFAULT_WAIT_SECONDS: float = 86400.0
 ElicitContent = dict[str, str | int | float | bool | list[str] | None]
 
 
+class ServerReconnected(Exception):
+    """The caller should recreate server-owned approval state and wait again."""
+
+
 @dataclass(frozen=True)
 class Verdict:
     """What the user decided, and whatever their form carried.
@@ -71,6 +75,11 @@ class Verdict:
 # Future is owned by the caller that registered it — this module is just
 # the routing table the session-event handler reads to set the result.
 _pending: dict[str, asyncio.Future[Verdict]] = {}
+
+# Only server-issued policy approvals are safe to replay from their original
+# tool call. Inline external MCP elicitations may already have performed work,
+# so reconnects must leave those parked on their original Future.
+_retry_on_server_reconnect: set[str] = set()
 
 # Per-session count of outstanding ASK verdicts (a session may have more
 # than one parked at once — e.g. parallel tool calls that each tripped a
@@ -105,7 +114,11 @@ def has_any_pending() -> bool:
     return any(not fut.done() for fut in _pending.values())
 
 
-def register(elicitation_id: str) -> asyncio.Future[Verdict]:
+def register(
+    elicitation_id: str,
+    *,
+    retry_on_server_reconnect: bool = False,
+) -> asyncio.Future[Verdict]:
     """
     Create and store a Future for an outstanding ASK verdict.
 
@@ -115,11 +128,17 @@ def register(elicitation_id: str) -> asyncio.Future[Verdict]:
     silently overwrites the prior entry.
 
     :param elicitation_id: Correlation id, e.g. ``"elicit_abc123"``.
+    :param retry_on_server_reconnect: Whether a tunnel reconnect should wake
+        this waiter so its caller can recreate server-owned approval state.
     :returns: The newly created Future. Caller awaits with
         :func:`asyncio.wait_for` to bound the wait.
     """
     fut: asyncio.Future[Verdict] = asyncio.get_running_loop().create_future()
     _pending[elicitation_id] = fut
+    if retry_on_server_reconnect:
+        _retry_on_server_reconnect.add(elicitation_id)
+    else:
+        _retry_on_server_reconnect.discard(elicitation_id)
     return fut
 
 
@@ -134,6 +153,28 @@ def cleanup(elicitation_id: str) -> None:
     :param elicitation_id: Correlation id to drop.
     """
     _pending.pop(elicitation_id, None)
+    _retry_on_server_reconnect.discard(elicitation_id)
+
+
+def notify_server_reconnect() -> int:
+    """Wake approval waits whose server-owned state must be recreated.
+
+    The surviving runner receives this signal after its tunnel connects to a
+    new server generation. Opted-in callers retry the operation that produced
+    the approval, causing the server to evaluate policy and publish a fresh,
+    answerable prompt. Other waits are intentionally untouched because an
+    external MCP elicitation is not generally safe to replay.
+
+    :returns: Number of pending waits notified.
+    """
+    notified = 0
+    for elicitation_id in tuple(_retry_on_server_reconnect):
+        fut = _pending.get(elicitation_id)
+        if fut is None or fut.done():
+            continue
+        fut.set_exception(ServerReconnected())
+        notified += 1
+    return notified
 
 
 def resolve(
@@ -174,6 +215,7 @@ async def wait_for_user_verdict(
     conversation_id: str,
     publish_event: Callable[[str, dict[str, object]], None],
     timeout_seconds: float | None = None,
+    retry_on_server_reconnect: bool = False,
 ) -> Verdict:
     """
     Park on a registered Future until the user delivers a verdict.
@@ -202,11 +244,17 @@ async def wait_for_user_verdict(
         treating the prompt as refused, e.g. the spec-resolved
         ``ask_timeout`` from the server's pending verdict. ``None``
         falls back to :data:`_DEFAULT_WAIT_SECONDS`.
+    :param retry_on_server_reconnect: Wake with :class:`ServerReconnected`
+        after a tunnel reconnect so the caller can recreate server-owned
+        approval state.
     :returns: The user's :class:`Verdict`. Declines and timeouts
         carry ``approved=False`` and no content.
     """
     effective_timeout = _DEFAULT_WAIT_SECONDS if timeout_seconds is None else timeout_seconds
-    fut = register(elicitation_id)
+    fut = register(
+        elicitation_id,
+        retry_on_server_reconnect=retry_on_server_reconnect,
+    )
     # Mark the session as awaiting approval for the lifetime of this park
     # so ``has_pending`` reports it. Decremented in ``finally`` on every
     # exit path (verdict, timeout, cancellation) so the flag never leaks.
@@ -271,4 +319,5 @@ def reset_for_tests() -> None:
     from one test silently change the behavior of the next.
     """
     _pending.clear()
+    _retry_on_server_reconnect.clear()
     _session_pending.clear()

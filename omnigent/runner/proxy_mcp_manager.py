@@ -313,15 +313,20 @@ class ProxyMcpManager:
         """
         del spec  # Omnigent server resolves spec from session context
 
-        payload: _JsonObject = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": tool_name, "arguments": arguments},
-        }
+        request_id = 1
 
-        # At most two iterations: initial call + one approval retry.
-        for _attempt in range(2):
+        def _initial_payload() -> _JsonObject:
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            }
+
+        payload = _initial_payload()
+        approval_retries = 0
+
+        while True:
             try:
                 resp = await self._omnigent_client.post(
                     self._mcp_url,
@@ -372,7 +377,7 @@ class ProxyMcpManager:
             # Park for user approval and retry with inputResponses per the
             # MCP Multi Round-Trip Requests spec.
             if result.get("resultType") == "input_required":
-                if _attempt >= 1:
+                if approval_retries >= 1:
                     # Guard against unexpected re-elicitation after one retry.
                     return json.dumps({"error": "Approval loop exceeded"})
 
@@ -395,15 +400,25 @@ class ProxyMcpManager:
                     if self._publish_event is not None
                     else (lambda _s, _e: None)
                 )
-                verdict = await pending_approvals.wait_for_user_verdict(
-                    elicitation_id=elicitation_id,
-                    conversation_id=self._session_id,
-                    publish_event=publisher,
-                )
+                try:
+                    verdict = await pending_approvals.wait_for_user_verdict(
+                        elicitation_id=elicitation_id,
+                        conversation_id=self._session_id,
+                        publish_event=publisher,
+                        retry_on_server_reconnect=True,
+                    )
+                except pending_approvals.ServerReconnected:
+                    # requestState and its elicitation id belong to the server
+                    # generation that issued them. Re-run the original call so
+                    # the connected generation can create an answerable gate.
+                    request_id += 1
+                    payload = _initial_payload()
+                    continue
 
+                request_id += 1
                 payload = {
                     "jsonrpc": "2.0",
-                    "id": 2,  # MRTR spec: retry MUST use a different id
+                    "id": request_id,  # MRTR retry MUST use a different id
                     "method": "tools/call",
                     "params": {
                         "name": tool_name,
@@ -416,6 +431,7 @@ class ProxyMcpManager:
                         },
                     },
                 }
+                approval_retries += 1
                 continue
 
             # ── Normal result (ALLOW or post-approval execution) ──────────
@@ -435,8 +451,6 @@ class ProxyMcpManager:
                     return json.dumps({"error": text})
                 return text if text else json.dumps(result)
             return json.dumps(result)
-
-        return json.dumps({"error": "Approval retry loop exhausted"})
 
     async def prewarm(self, spec: AgentSpec) -> None:
         """No-op — the Omnigent server warms connections lazily via ServerMcpPool.
