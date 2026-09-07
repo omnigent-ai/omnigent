@@ -43,8 +43,12 @@ export function isDraftingTarget(target: EventTarget | null): boolean {
   // Complete send intent (text OR attachments OR mentions), as declared by
   // the field itself — a bare value check can't see non-text drafts.
   if (target.dataset.hasDraft === "true") return true;
-  if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
-    return target.value.length > 0;
+  if (target instanceof HTMLTextAreaElement) return target.value.length > 0;
+  if (target instanceof HTMLInputElement) {
+    // Only text-like inputs carry a typed draft; a checkbox/radio value is a
+    // constant ("on"), not something the user composed.
+    const textLike = /^(?:text|search|url|tel|email|password|number)$/;
+    return textLike.test(target.type) && target.value.length > 0;
   }
   return target.isContentEditable && (target.textContent ?? "").trim().length > 0;
 }

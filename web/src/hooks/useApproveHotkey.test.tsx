@@ -176,6 +176,30 @@ describe("useApproveHotkey", () => {
     }
   });
 
+  it("still accepts from a focused checkbox (its constant value is not a draft)", () => {
+    // A checkbox's value defaults to "on" without any user composition; a
+    // chord from there is a verdict, not a send intent, and must not be
+    // suppressed by the drafting guard.
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(false));
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    document.body.appendChild(box);
+    try {
+      box.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          ctrlKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
+    } finally {
+      box.remove();
+    }
+  });
+
   it("still accepts from an empty text field (no draft, no send intent)", () => {
     // Post-send, focus can legitimately sit in the cleared composer; an
     // empty field carries no draft, so the chord keeps meaning "approve".
