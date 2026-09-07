@@ -222,7 +222,9 @@ def reset_host_id(path: Path = CONFIG_PATH) -> tuple[str | None, str]:
     # Atomic write: reset-id is a recovery command run when things are already
     # broken, so a crash mid-write must not truncate the whole config. Write a
     # sibling temp file and rename it over the target (rename is atomic on the
-    # same filesystem).
+    # same filesystem). The rename adopts mkstemp's 0600 mode intentionally —
+    # config.yaml holds only host identity, and 0600 is the right posture for a
+    # per-user file; do not "restore" a wider umask mode here.
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
