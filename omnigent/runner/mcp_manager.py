@@ -10,16 +10,23 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
-from mcp.types import ElicitRequestParams, ElicitResult
-from mcp.types import Tool as McpToolDef
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.spec.types import AgentSpec, MCPServerConfig, RetryPolicy
 from omnigent.tools.base import is_valid_tool_name
-from omnigent.tools.mcp import McpServerConnection
+
+if TYPE_CHECKING:
+    # Type-only: the MCP SDK graph costs ~300ms to import and is only needed
+    # once a spec actually connects to an MCP server, so every runtime use
+    # below imports it locally instead.
+    from mcp.types import ElicitRequestParams, ElicitResult
+    from mcp.types import Tool as McpToolDef
+
+    from omnigent.tools.mcp import McpServerConnection
 
 _logger = logging.getLogger(__name__)
 
@@ -305,6 +312,8 @@ class RunnerMcpManager:
             :param params: MCP elicitation params from the gateway.
             :returns: User verdict as an :class:`ElicitResult`.
             """
+            from mcp.types import ElicitResult
+
             if server_client is None:
                 _logger.warning(
                     "MCP elicitation callback: no Omnigent server client available — declining",
@@ -797,6 +806,8 @@ class RunnerMcpManager:
 
     async def _connect_server(self, server: _SharedServerEntry, spec_hash: str) -> None:
         """Connect one shared MCP server if needed."""
+        from omnigent.tools.mcp import McpServerConnection
+
         close_after_connect: McpServerConnection | None = None
         current_task = asyncio.current_task()
         try:
