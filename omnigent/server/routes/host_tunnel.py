@@ -41,6 +41,7 @@ from omnigent.host.frames import (
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
+    HostManagedSessionReleasedFrame,
     HostModelOptionsResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -82,6 +83,7 @@ def create_host_tunnel_router(
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
+    on_managed_session_released: Callable[[str, str], Awaitable[None]] | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
 ) -> APIRouter:
@@ -329,6 +331,7 @@ def create_host_tunnel_router(
                     host_registry,
                     runner_exit_reports,
                     on_runner_exited,
+                    on_managed_session_released,
                     on_host_update,
                 ),
                 name=f"host-receive:{host_id}",
@@ -491,6 +494,7 @@ async def _receive_loop(
     host_registry: HostRegistry,
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
+    on_managed_session_released: Callable[[str, str], Awaitable[None]] | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
 ) -> None:
     """Receive host frames and route results to pending futures.
@@ -587,6 +591,8 @@ async def _receive_loop(
                         "runner_id": frame.runner_id,
                         "error": frame.error,
                         "error_code": frame.error_code,
+                        "workspace": frame.workspace,
+                        "git_branch": frame.git_branch,
                     }
                 )
             continue
@@ -616,6 +622,11 @@ async def _receive_loop(
                 # connecting its tunnel has no runner-tunnel disconnect
                 # event, so this report is the only failure signal.
                 await on_runner_exited(frame.runner_id, frame.error)
+            continue
+
+        if isinstance(frame, HostManagedSessionReleasedFrame):
+            if on_managed_session_released is not None:
+                await on_managed_session_released(host_id, frame.session_id)
             continue
 
         if isinstance(frame, HostRunnerStatusResultFrame):

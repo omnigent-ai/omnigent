@@ -2913,6 +2913,13 @@ def create_app(
             fail_idle_top_level=True,
         )
 
+    async def _on_managed_session_released(host_id: str, session_id: str) -> None:
+        """Clear the runner after its host releases the physical worktree."""
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or conv.host_id != host_id:
+            return
+        await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.
 
@@ -3087,6 +3094,7 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
+                on_managed_session_released=_on_managed_session_released,
                 on_host_connect=_on_hosts_changed,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,

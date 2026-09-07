@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import errno
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -68,6 +69,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostManagedSessionReleasedFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
     HostRemoveWorktreeFrame,
@@ -92,7 +94,14 @@ from omnigent.host.git_worktree import (
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.host.worktree_pool import (
+    ManagedWorktreeConfig,
+    WorktreePoolError,
+    WorktreePoolManager,
+    load_managed_worktree_config,
+)
 from omnigent.inner import _proc
+from omnigent.managed_workspace import parse_managed_workspace
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
     detect_adoptable_credentials,
@@ -123,6 +132,7 @@ from omnigent.process_logging import (
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
+    RUNNER_GIT_BRANCH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_LAUNCH_HARNESS_ENV_VAR,
@@ -378,6 +388,16 @@ def _connection_refused(exc: BaseException) -> bool:
 _RECONNECT_BASE_S = 0.5
 _RECONNECT_CAP_S = 3.0
 _RECONNECT_JITTER = 0.5
+_MANAGED_BASE_REFRESH_INTERVAL_S = 60 * 60
+_MANAGED_BASE_REFRESH_MAX_JITTER_S = 5 * 60
+
+
+def _stable_managed_base_refresh_jitter_s(host_id: str) -> int:
+    """Spread hourly managed-base refreshes consistently across hosts."""
+    digest = hashlib.sha256(host_id.encode()).digest()
+    return int.from_bytes(digest[:8], byteorder="big") % _MANAGED_BASE_REFRESH_MAX_JITTER_S
+
+
 # How often the lifecycle monitor re-checks that this daemon still owns its
 # registry record. Cheap local-file read; a stale daemon retiring within a
 # minute is prompt enough, and 60s keeps polling churn negligible.
@@ -749,6 +769,7 @@ def _build_runner_env(
     workspace: str,
     parent_pid: int,
     initial_auth_token: str | None = None,
+    git_branch: str | None = None,
     host_id: str | None = None,
     harness: str | None = None,
 ) -> dict[str, str]:
@@ -777,6 +798,7 @@ def _build_runner_env(
     :param initial_auth_token: Current host bearer for the runner's initial
         server connection. The runner consumes and removes it before spawning
         any children. ``None`` leaves the legacy auth path unchanged.
+    :param git_branch: Branch checked out in ``workspace``, when known.
     :param harness: Canonical harness of the launching session, e.g.
         ``"claude-native"``; lets the runner start harness-specific prewarms
         at boot. ``None`` (unknown / older server) omits the stamp.
@@ -819,6 +841,8 @@ def _build_runner_env(
     if initial_auth_token:
         env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] = initial_auth_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
+    if git_branch is not None:
+        env[RUNNER_GIT_BRANCH_ENV_VAR] = git_branch
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
     # Bound glibc allocator RSS in the runner (no-op off Linux). Injected
     # explicitly because the allowlist above would otherwise drop an inherited
@@ -970,6 +994,7 @@ class HostProcess:
         self,
         identity: HostIdentity,
         server_url: str,
+        managed_worktrees: ManagedWorktreeConfig | None = None,
         lifecycle_lock: DaemonLifecycleLock | None = None,
     ) -> None:
         """Initialize the host process.
@@ -1050,6 +1075,16 @@ class HostProcess:
         # Strong refs to per-runner watcher tasks; asyncio only keeps
         # weak refs, so an unreferenced task can be GC'd mid-flight.
         self._watcher_tasks: set[asyncio.Task[None]] = set()
+        self._worktree_pool = WorktreePoolManager()
+        self._managed_worktrees_enabled = managed_worktrees is not None
+        if managed_worktrees is not None:
+            self._worktree_pool.adopt_managed_config(managed_worktrees)
+        self._managed_lease_by_runner: dict[str, str] = {}
+        self._managed_eviction_task: asyncio.Task[None] | None = None
+        self._managed_base_refresh_task: asyncio.Task[None] | None = None
+        self._managed_base_refresh_jitter_s = _stable_managed_base_refresh_jitter_s(
+            identity.host_id
+        )
         # Strong refs to detached superseded-runner stops (see
         # _spawn_superseded_stop), for the same GC reason.
         self._supersede_stop_tasks: set[asyncio.Task[None]] = set()
@@ -1676,7 +1711,39 @@ class HostProcess:
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )
 
-        workspace = Path(frame.workspace).expanduser()
+        runner_id = token_bound_runner_id(frame.binding_token)
+        managed_lease = None
+        if frame.managed_repo is not None:
+            if frame.session_id is None or frame.git_branch is None:
+                return HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="managed worktree launch requires session_id and git_branch",
+                )
+            try:
+                managed_lease = await asyncio.to_thread(
+                    self._worktree_pool.acquire_managed,
+                    repo_id=frame.managed_repo,
+                    branch_name=frame.git_branch,
+                    session_id=frame.session_id,
+                    runner_id=runner_id,
+                )
+            except (WorktreePoolError, WorktreeError) as exc:
+                if "no available slots" in str(exc):
+                    error_code = "managed_worktree_capacity"
+                elif "already bound to session" in str(exc):
+                    error_code = "managed_worktree_branch_conflict"
+                else:
+                    error_code = "managed_worktree_prepare_failed"
+                return HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error=str(exc),
+                    error_code=error_code,
+                )
+            workspace = Path(managed_lease.worktree_path)
+        else:
+            workspace = Path(frame.workspace).expanduser()
         if not workspace.is_dir():
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
@@ -1685,7 +1752,6 @@ class HostProcess:
                 error_code=WORKSPACE_MISSING_ERROR_CODE,
             )
 
-        runner_id = token_bound_runner_id(frame.binding_token)
         initial_auth_token = await asyncio.to_thread(
             self._current_auth_token,
             initialize=False,
@@ -1698,6 +1764,7 @@ class HostProcess:
             workspace=str(workspace),
             parent_pid=os.getpid(),
             initial_auth_token=initial_auth_token,
+            git_branch=managed_lease.branch if managed_lease is not None else frame.git_branch,
             host_id=self._identity.host_id,
             harness=frame.harness,
         )
@@ -1741,6 +1808,11 @@ class HostProcess:
             spawn.add_done_callback(self._discard_abandoned_spawn)
             raise
         except OSError as exc:
+            if managed_lease is not None and frame.session_id is not None:
+                await asyncio.to_thread(
+                    self._worktree_pool.release_failed_launch,
+                    frame.session_id,
+                )
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
@@ -1748,6 +1820,11 @@ class HostProcess:
             )
 
         if proc.poll() is not None:
+            if managed_lease is not None and frame.session_id is not None:
+                await asyncio.to_thread(
+                    self._worktree_pool.release_failed_launch,
+                    frame.session_id,
+                )
             # The runner died before Popen returned — its actual error
             # is in the captured log, so ship the tail with the result
             # instead of making the user go find the file on the host.
@@ -1780,6 +1857,8 @@ class HostProcess:
         self._runners[runner_id] = _RunnerHandle(
             proc=proc, log_path=log_path, session_id=frame.session_id or None
         )
+        if managed_lease is not None:
+            self._managed_lease_by_runner[runner_id] = managed_lease.lease_id
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
         watcher.add_done_callback(self._watcher_tasks.discard)
@@ -1803,6 +1882,8 @@ class HostProcess:
             request_id=frame.request_id,
             status="launched",
             runner_id=runner_id,
+            workspace=str(workspace),
+            git_branch=managed_lease.branch if managed_lease is not None else frame.git_branch,
         )
 
     def _ensure_zygote_started(self) -> ZygoteManager | None:
@@ -1970,6 +2051,8 @@ class HostProcess:
         :returns: Result frame with status.
         """
         handle = self._runners.pop(frame.runner_id, None)
+        self._worktree_pool.mark_runner_idle(frame.runner_id)
+        self._managed_lease_by_runner.pop(frame.runner_id, None)
         if handle is None:
             return HostStopRunnerResultFrame(
                 request_id=frame.request_id,
@@ -2120,6 +2203,8 @@ class HostProcess:
             # an intentional termination, not a crash to report.
             return
         if handle.proc.returncode == 0:
+            self._worktree_pool.mark_runner_idle(runner_id)
+            self._managed_lease_by_runner.pop(runner_id, None)
             # A clean exit (code 0) is a graceful shutdown, not a crash — the
             # idle reaper shutting an inactive runner down, or any orderly
             # self-exit. Reporting it as host.runner_exited would attach a
@@ -2129,6 +2214,8 @@ class HostProcess:
             _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+        self._worktree_pool.mark_runner_idle(runner_id)
+        self._managed_lease_by_runner.pop(runner_id, None)
         _logger.warning("Runner %s died unexpectedly: %s", runner_id, error)
         await self._report_runner_exit(runner_id, error)
 
@@ -2702,7 +2789,19 @@ class HostProcess:
         from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
         try:
-            expanded = os.path.expanduser(frame.workspace)
+            managed_repo = parse_managed_workspace(frame.workspace)
+            if managed_repo is not None:
+                expanded = self._worktree_pool.workspace_for_session(frame.session_id)
+                if expanded is None:
+                    return HostFsResultFrame(
+                        request_id=frame.request_id,
+                        status="error",
+                        error_status=404,
+                        error_code="not_found",
+                        error="managed session has no active worktree lease",
+                    )
+            else:
+                expanded = os.path.expanduser(frame.workspace)
         except (TypeError, ValueError) as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -3256,6 +3355,15 @@ class HostProcess:
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
         )
+        self._managed_eviction_task = asyncio.create_task(
+            self._managed_worktree_eviction_loop(),
+            name="host-managed-worktree-eviction",
+        )
+        if self._managed_worktrees_enabled:
+            self._managed_base_refresh_task = asyncio.create_task(
+                self._managed_worktree_base_refresh_loop(),
+                name="host-managed-worktree-base-refresh",
+            )
         # Reap per-session native-harness bridge dirs orphaned by a runner
         # that died uncleanly (crash / SIGKILL / host restart mid-run). The
         # runner performs the same sweep at its own startup, but after a
@@ -3469,6 +3577,12 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._reaper_task
                 self._reaper_task = None
+            if self._managed_eviction_task is not None:
+                self._managed_eviction_task.cancel()
+                self._managed_eviction_task = None
+            if self._managed_base_refresh_task is not None:
+                self._managed_base_refresh_task.cancel()
+                self._managed_base_refresh_task = None
             if self._suspend_task is not None:
                 self._suspend_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -3542,12 +3656,51 @@ class HostProcess:
             with contextlib.suppress(Exception):
                 transport.abort()
 
+    async def _managed_worktree_eviction_loop(self) -> None:
+        """Finalize and reset managed worktrees after their idle timeout."""
+        while True:
+            await asyncio.sleep(15)
+            try:
+                released = await asyncio.to_thread(self._worktree_pool.evict_idle_managed)
+                ws = self._ws
+                if ws is not None:
+                    for session_id in released:
+                        await ws.send(
+                            encode_host_frame(
+                                HostManagedSessionReleasedFrame(session_id=session_id)
+                            )
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.exception("managed worktree eviction sweep failed")
+
+    async def _managed_worktree_base_refresh_loop(self) -> None:
+        """Keep configured remote-tracking base refs fresh in the background."""
+        while True:
+            try:
+                refreshed = await asyncio.to_thread(self._worktree_pool.refresh_managed_bases)
+                for repo_id, base_branch in refreshed.items():
+                    _logger.info(
+                        "Refreshed managed worktree base %s for repository %s",
+                        base_branch,
+                        repo_id,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.exception("managed worktree base refresh failed")
+            await asyncio.sleep(
+                _MANAGED_BASE_REFRESH_INTERVAL_S + self._managed_base_refresh_jitter_s
+            )
+
     def _cleanup_runners(self) -> None:
         """Terminate all live runners on shutdown.
 
         :returns: None.
         """
         for runner_id, handle in self._runners.items():
+            self._worktree_pool.mark_runner_idle(runner_id)
             if handle.proc.poll() is None:
                 _logger.info("Terminating runner %s on shutdown", runner_id)
                 handle.proc.terminate()
@@ -4130,6 +4283,13 @@ def run_host_process(
     if _cli_log is not None and _cli_log != host_log_path:
         print(f"CLI diagnostics: {display_log_path(_cli_log)}")
 
+    managed_worktrees = load_managed_worktree_config(path)
+    if managed_worktrees is not None:
+        repo_summary = ", ".join(
+            f"{repo.repo_id}={len(repo.worktrees)}" for repo in managed_worktrees.repos
+        )
+        print(f"Managed worktree mode: {repo_summary}")
+
     # Executor-agnostic GitHub setup: point git at the server's credential
     # broker and attribute commits to the owner. Best-effort; the host runs in
     # every executor and holds the launch token, so no launcher needs to inject
@@ -4153,7 +4313,12 @@ def run_host_process(
 
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
-    host = HostProcess(identity, server_url, lifecycle_lock=lifecycle_lock)
+    host = HostProcess(
+        identity,
+        server_url,
+        managed_worktrees=managed_worktrees,
+        lifecycle_lock=lifecycle_lock,
+    )
     try:
         asyncio.run(host.run())
     except HostConnectError as exc:

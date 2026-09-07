@@ -7,7 +7,7 @@ Covers 8 gaps not exercised by test_hosts_api.py or test_hosts_filesystem.py:
 - ``GET /v1/runners/{id}/status`` omits error field for unconnected runners.
 - ``GET /v1/hosts/{id}`` response shape includes the ``runners`` field.
 - ``POST /v1/hosts/{id}/runners`` with missing ``session_id`` returns 422.
-- ``POST /v1/hosts/{id}/runners`` with missing ``workspace`` returns 422.
+- ``POST /v1/hosts/{id}/runners`` with no execution target returns 422.
 - ``GET /v1/hosts`` returns offline after the host's ``updated_at``
   exceeds the liveness window (stale host detection).
 - ``GET /v1/hosts/{id}`` returns offline status for an offline host.
@@ -23,7 +23,7 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
-from omnigent.server.routes.hosts import create_hosts_router
+from omnigent.server.routes.hosts import LaunchRunnerRequest, create_hosts_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -174,9 +174,10 @@ async def test_launch_runner_missing_workspace_returns_422(
         FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore, TunnelRegistry
     ],
 ) -> None:
-    """POST /v1/hosts/{id}/runners with missing workspace returns 422.
+    """POST /v1/hosts/{id}/runners with no execution target returns 422.
 
-    Both ``session_id`` and ``workspace`` are required fields.
+    A physical ``workspace`` is required unless ``managed_repo`` selects a
+    host-managed worktree pool.
     """
     app, _hr, host_store, *_ = management_app
     host_store.upsert_on_connect("9fd95280b78ff59e9c3664b00ffca9bf", "laptop", "local")
@@ -186,6 +187,29 @@ async def test_launch_runner_missing_workspace_returns_422(
             json={"session_id": "5ab79713d8c7904f4f4bf10b2da5df62"},
         )
     assert resp.status_code == 422, f"Expected 422 for missing workspace, got {resp.status_code}"
+
+
+async def test_launch_runner_managed_repo_allows_missing_workspace() -> None:
+    request = LaunchRunnerRequest.model_validate(
+        {
+            "session_id": "5ab79713d8c7904f4f4bf10b2da5df62",
+            "managed_repo": "universe",
+            "git": {"branch_name": "feature/managed"},
+        }
+    )
+
+    assert request.workspace == ""
+    assert request.managed_repo == "universe"
+
+
+async def test_launch_runner_schema_requires_one_execution_target() -> None:
+    schema = LaunchRunnerRequest.model_json_schema()
+
+    assert schema["anyOf"] == [
+        {"required": ["workspace"]},
+        {"required": ["managed_repo"]},
+    ]
+    assert schema["properties"]["workspace"]["minLength"] == 1
 
 
 # ── Stale host liveness ─────────────────────────────────
