@@ -187,6 +187,12 @@ class EvaluationContext:
         (codex-native is terminal-only). Surfaced as
         ``event["context"]["harness"]``. ``None`` on web / API / unstamped
         paths.
+    :param permission_mode: The harness's own approval mode, e.g.
+        ``"bypassPermissions"`` or ``"default"``, stamped by a native tool
+        hook. Lets a policy gate a session whose harness was launched with
+        approvals disabled. Surfaced as
+        ``event["context"]["permission_mode"]``. ``None`` on web / API /
+        unstamped paths.
     :param labels: Read-only snapshot of the conversation's guardrails
         labels, e.g. ``{"cost_control.plan": "{...}"}``. Injected by the
         engine from its label hot cache (the same source ``condition:``
@@ -214,6 +220,7 @@ class EvaluationContext:
     user_daily_cost: dict[str, float | str] | None = None
     model: str | None = None
     harness: str | None = None
+    permission_mode: str | None = None
     labels: dict[str, str] | None = None
     llm_client: PolicyLLMClient | None = None
 
