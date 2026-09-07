@@ -79,6 +79,14 @@ SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
 # normal approval/sandbox stance.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
+# Codex collaboration mode for a codex-native session (``"plan"`` /
+# ``"default"``). Kept current in-session by the PATCH route and the pane
+# forwarder; seeded at create by the web UI's pre-launch Plan-mode control so
+# the runner can start the fresh Codex thread already in Plan mode (see
+# ``omnigent.runner.native.orchestration._codex_native_launch_config``). A
+# plain conversation label like the bypass directive above.
+CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
+
 # Reserved label key that stores a session's sidebar "project" membership
 # (implicit collections — a project exists while ≥1 session carries this key).
 # Namespaced so it never collides with the user-facing "project" term or other

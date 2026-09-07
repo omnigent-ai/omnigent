@@ -165,3 +165,46 @@ async def test_bypass_sandbox_defaults_off_unless_label_is_one(
         snapshot["labels"] = labels
     cfg = await _run(_Client(_Resp(200, snapshot)))
     assert cfg.bypass_sandbox is False
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_parses_from_collaboration_mode_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-launch Plan-mode pick rides the collaboration-mode label.
+
+    The web new-session control seeds ``omnigent.codex_native.
+    collaboration_mode: "plan"`` at create; the launch config must surface it
+    so the runner switches the fresh thread into Plan mode before the first
+    turn.
+    """
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    snapshot = {
+        "workspace": "/tmp/repo",
+        "labels": {"omnigent.codex_native.collaboration_mode": "plan"},
+    }
+    cfg = await _run(_Client(_Resp(200, snapshot)))
+    assert cfg.plan_mode is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "labels",
+    [
+        None,  # no labels at all
+        {},  # labels present but no collaboration-mode key
+        {"omnigent.codex_native.collaboration_mode": "default"},  # explicit default
+        {"omnigent.codex_native.collaboration_mode": ""},  # empty string
+        {"omnigent.codex_native.collaboration_mode": "PLAN"},  # exact-match only
+    ],
+)
+async def test_plan_mode_defaults_off_unless_label_is_plan(
+    monkeypatch: pytest.MonkeyPatch, labels: Any
+) -> None:
+    """``plan_mode`` is False unless the label is exactly ``"plan"``."""
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    snapshot: dict[str, Any] = {"workspace": "/tmp/repo"}
+    if labels is not None:
+        snapshot["labels"] = labels
+    cfg = await _run(_Client(_Resp(200, snapshot)))
+    assert cfg.plan_mode is False

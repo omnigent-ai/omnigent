@@ -2022,6 +2022,79 @@ describe("NewChatLandingScreen", () => {
     expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
   });
 
+  it("offers a pre-launch Plan-mode toggle in the Codex gear modal only", () => {
+    renderLanding();
+    // Claude Code (a1) has no Codex collaboration mode — no toggle.
+    openAgentConfig("a1");
+    expect(screen.queryByTestId("new-chat-landing-config-plan-mode")).toBeNull();
+    saveConfig();
+    // Codex (a2) carries the toggle, off by default (matching the TUI).
+    openAgentConfig("a2");
+    const toggle = screen.getByTestId("new-chat-landing-config-plan-mode");
+    expect(toggle.getAttribute("aria-label")).toBe("Enter Plan mode");
+    expect(toggle.getAttribute("data-active")).toBeNull();
+    // Engaging it reports the armed state the e2e journey asserts on.
+    fireEvent.click(toggle);
+    expect(
+      screen.getByTestId("new-chat-landing-config-plan-mode").getAttribute("data-active"),
+    ).toBe("true");
+  });
+
+  it("seeds the collaboration-mode label in the create body when Plan mode is picked", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    openAgentConfig("a2");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-plan-mode"));
+    saveConfig();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "plan the auth refactor" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    const labels = body.labels as Record<string, string>;
+    // The label is what the runner reads to start the fresh thread in Plan mode.
+    expect(labels["omnigent.codex_native.collaboration_mode"]).toBe("plan");
+    expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
+  });
+
+  it("omits the collaboration-mode label when Plan mode is left off", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    const labels = body.labels as Record<string, string>;
+    expect(labels["omnigent.codex_native.collaboration_mode"]).toBeUndefined();
+  });
+
+  it("drops the Plan-mode pick when the agent changes (per-session pick)", () => {
+    renderLanding();
+    // Arm Plan mode on Codex (a2), switch away to Claude (a1), come back:
+    // the toggle is off again — Plan mode is a per-session pick, like the
+    // TUI where every session starts in Default mode.
+    openAgentConfig("a2");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-plan-mode"));
+    saveConfig();
+    selectAgent("a1");
+    openAgentConfig("a2");
+    expect(
+      screen.getByTestId("new-chat-landing-config-plan-mode").getAttribute("data-active"),
+    ).toBeNull();
+  });
+
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
     // A live session in the seeded workspace ("/Users/corey/repo") on the
     // auto-selected host occupies the directory the picker opens at.

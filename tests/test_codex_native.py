@@ -4662,15 +4662,7 @@ def test_forwarder_starts_default_turn_from_plan_implementation_prompt(
         ),
     )
     fake_client = _FakeCodexAppServerClient()
-    forwarder_state = codex_native_forwarder._CodexForwarderState(
-        model="mock-model",
-        # A confirmed (config-read or live-notification) ABSENT read, the
-        # way a real forwarder session would have it by the time a plan
-        # prompt is answered — distinct from the never-yet-confirmed default,
-        # which now makes _default_collaboration_mode refuse to build a
-        # payload at all.
-        developer_instructions_known=True,
-    )
+    forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
 
     async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
@@ -4780,12 +4772,7 @@ def test_forwarder_starts_fresh_thread_from_clear_context_plan_prompt(
         ),
     )
     fake_client = _FakeCodexAppServerClient()
-    forwarder_state = codex_native_forwarder._CodexForwarderState(
-        model="mock-model",
-        # See the sibling default-turn test above: a confirmed read is a
-        # precondition for _default_collaboration_mode to build a payload.
-        developer_instructions_known=True,
-    )
+    forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
 
     async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
@@ -4877,26 +4864,20 @@ def test_forwarder_starts_fresh_thread_from_clear_context_plan_prompt(
     assert state.active_turn_id == "turn_fresh"
 
 
-def test_clear_context_plan_implementation_refuses_before_creating_thread_when_unconfirmed(
+def test_clear_context_plan_implementation_refuses_before_creating_thread_when_no_model(
     tmp_path: Path,
 ) -> None:
     """
-    The clear-context plan-implementation flow must validate the
-    model/developer_instructions gate BEFORE creating (and switching to) a
-    new Codex thread — not after.
+    The clear-context plan-implementation flow must validate the model gate
+    BEFORE creating (and switching to) a new Codex thread — not after.
 
-    Regression: the old code only checked ``forwarder_state.model`` up
-    front, then unconditionally created a fresh thread and recorded it as
-    the bridge's active thread, and only THEN (inside
-    ``_start_plan_implementation_turn``) checked
-    ``developer_instructions_known`` and bailed. With never-confirmed
-    developer_instructions (``developer_instructions_known=False``, e.g.
-    every config.toml read so far has been UNREADABLE), that ordering let
-    a bare ``thread/start`` through, switched the bridge to the new (now
-    orphaned) empty thread, and silently never started the implementation
-    turn — the user's "clear context and implement" choice would appear
-    accepted but do nothing. Asserts NO ``thread/start`` (or any
-    other) request reaches Codex, and the bridge state's thread_id is
+    Regression: checking the gate only inside
+    ``_start_plan_implementation_turn`` (after ``thread/start``) let a bare
+    ``thread/start`` through, switched the bridge to the new (now orphaned)
+    empty thread, and silently never started the implementation turn — the
+    user's "clear context and implement" choice would appear accepted but
+    do nothing. With no confirmed model, asserts NO ``thread/start`` (or
+    any other) request reaches Codex, and the bridge state's thread_id is
     unchanged.
     """
     write_bridge_state(
@@ -4910,8 +4891,8 @@ def test_clear_context_plan_implementation_refuses_before_creating_thread_when_u
         ),
     )
     fake_client = _FakeCodexAppServerClient()
-    # developer_instructions_known defaults to False — never confirmed.
-    forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
+    # No confirmed model — the gate must refuse before thread/start.
+    forwarder_state = codex_native_forwarder._CodexForwarderState()
 
     async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         fake_client.requests.append((method, params))
@@ -4968,7 +4949,7 @@ def test_clear_context_plan_implementation_refuses_before_creating_thread_when_u
 
     assert fake_client.requests == [], (
         f"No Codex app-server request should have been issued when "
-        f"developer_instructions_known is False; got {fake_client.requests!r}."
+        f"no model is confirmed; got {fake_client.requests!r}."
     )
     state = read_bridge_state(tmp_path)
     assert state is not None

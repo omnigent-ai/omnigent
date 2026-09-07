@@ -4228,19 +4228,23 @@ def _default_collaboration_mode(
     """
     Build Codex's Default collaboration mode for ``turn/start``.
 
+    ``settings.developer_instructions`` REPLACES the mode's built-in prompt
+    rather than composing with it, so any non-null value here substitutes
+    for Codex's own mode instructions. Authored agent instructions already
+    reach every turn via the additive top-level ``developer_instructions``
+    config key, which this field does not affect — keep it null.
+
     :returns: Codex ``CollaborationMode`` JSON object, or ``None`` when the
-        model or developer-instructions state is not yet confirmed.
+        model is not yet confirmed.
     """
     if not forwarder_state.model:
-        return None
-    if not forwarder_state.developer_instructions_known:
         return None
     return {
         "mode": "default",
         "settings": {
             "model": forwarder_state.model,
             "reasoning_effort": None,
-            "developer_instructions": forwarder_state.developer_instructions,
+            "developer_instructions": None,
         },
     }
 

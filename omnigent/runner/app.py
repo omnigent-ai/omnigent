@@ -5174,30 +5174,12 @@ def create_runner_app(
                     "detail": "Codex-native plan-mode update requires a current model.",
                 },
             )
-        from omnigent.codex_native_bridge import (
-            DeveloperInstructionsReadState,
-            read_codex_config_developer_instructions_state_from_home,
-        )
-
-        _di_read = read_codex_config_developer_instructions_state_from_home(Path(state.codex_home))
-        if _di_read.state is DeveloperInstructionsReadState.UNREADABLE:
-            _logger.warning(
-                "Codex-native plan-mode update skipped for %s: developer_instructions "
-                "config unreadable — refusing to guess and risk wiping live state.",
-                conv_id,
-                extra={"session_id": conv_id},
-            )
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "codex_native_settings_update_failed",
-                    "detail": (
-                        "Codex-native plan-mode update requires reading the current "
-                        "developer_instructions config; it could not be read."
-                    ),
-                },
-            )
-        developer_instructions = _di_read.value
+        # ``collaborationMode.settings.developer_instructions`` REPLACES the
+        # mode's built-in prompt (it is not additive): a non-null value here
+        # is delivered INSTEAD of Codex's Plan Mode instructions, so the
+        # model is never told to plan. The wrapper's authored instructions
+        # already reach every turn via the top-level ``developer_instructions``
+        # config key, which this field does not affect — keep it null.
         return await _handle_codex_native_settings_update(
             conv_id,
             {
@@ -5206,7 +5188,7 @@ def create_runner_app(
                     "settings": {
                         "model": model,
                         "reasoning_effort": effort,
-                        "developer_instructions": developer_instructions,
+                        "developer_instructions": None,
                     },
                 },
             },

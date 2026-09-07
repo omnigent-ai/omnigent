@@ -2886,51 +2886,25 @@ async def test_delta_coalescer_survives_a_cancelled_flush_caller() -> None:
     assert len(client.posts) > posts_before
 
 
-def test_default_collaboration_mode_refuses_when_developer_instructions_never_confirmed() -> None:
-    """No confirmed developer_instructions read yet → refuse to build a
-    payload at all, rather than risk sending an unconfirmed ``null``.
-
-    Regression for the destructive-wipe class: if every config.toml read so
-    far has been UNREADABLE, ``developer_instructions`` stays at its ``None``
-    default but ``developer_instructions_known`` stays ``False`` — this must
-    not be conflated with a confirmed ABSENT read (see the sibling test
-    above), or a Default-mode turn would serialize a literal ``null`` over a
-    value that genuinely exists but just hasn't been read successfully yet.
-    """
+def test_default_collaboration_mode_requires_model() -> None:
+    """No confirmed model yet → refuse to build a payload at all."""
     state = fwd._CodexForwarderState()
-    state.model = "gpt-5.4"
 
     mode = fwd._default_collaboration_mode(state)
 
     assert mode is None
 
 
-def test_default_collaboration_mode_sends_none_when_confirmed_absent() -> None:
-    """A CONFIRMED absent read → explicit ``None``, letting Codex fill in its
-    own built-in Default-mode instructions.
+def test_default_collaboration_mode_never_forwards_developer_instructions() -> None:
+    """The collaboration-mode settings must always carry ``null`` instructions.
 
-    Distinct from the never-confirmed case below: here
-    ``developer_instructions_known`` is ``True`` (a real ABSENT read
-    happened), so the explicit ``null`` is deliberate, not a guess.
-    """
-    state = fwd._CodexForwarderState()
-    state.model = "gpt-5.4"
-    state.developer_instructions_known = True
-
-    mode = fwd._default_collaboration_mode(state)
-
-    assert mode is not None
-    assert mode["settings"]["developer_instructions"] is None
-
-
-def test_default_collaboration_mode_reuses_current_developer_instructions() -> None:
-    """A Default-mode ``turn/start`` must not silently wipe developer_instructions.
-
-    Guards a self-inflicted overwrite: a ``_default_collaboration_mode`` that
-    always sends ``developer_instructions: null`` has that null applied
-    literally by Codex's app-server, clearing whatever
-    ``build_codex_native_server`` persisted, the instant the user (or the
-    plan-implementation flow) triggers a Default-mode turn.
+    ``collaborationMode.settings.developer_instructions`` REPLACES the mode's
+    built-in prompt rather than composing with it, so forwarding the current
+    config value here substitutes the wrapper's blurb for the mode's own
+    instructions (e.g. Plan Mode's planning prompt) — the model is then never
+    told to plan. The authored instructions already reach every turn via the
+    additive top-level ``developer_instructions`` config key, which this
+    field does not affect, so ``null`` loses nothing.
     """
     state = fwd._CodexForwarderState()
     state.model = "gpt-5.4"
@@ -2940,7 +2914,24 @@ def test_default_collaboration_mode_reuses_current_developer_instructions() -> N
     mode = fwd._default_collaboration_mode(state)
 
     assert mode is not None
-    assert mode["settings"]["developer_instructions"] == "Be a concise coding assistant."
+    assert mode["settings"]["developer_instructions"] is None
+
+
+def test_default_collaboration_mode_builds_before_any_config_read() -> None:
+    """An unconfirmed developer-instructions read must not block a turn.
+
+    The field is always ``null`` now (see the sibling test), so there is no
+    unconfirmed value to guess at — a Default-mode turn (e.g. the
+    plan-implementation flow) proceeds on the model alone.
+    """
+    state = fwd._CodexForwarderState()
+    state.model = "gpt-5.4"
+    assert state.developer_instructions_known is False
+
+    mode = fwd._default_collaboration_mode(state)
+
+    assert mode is not None
+    assert mode["settings"]["developer_instructions"] is None
 
 
 def test_note_thread_settings_updated_whitespace_nested_value_not_confirmed() -> None:

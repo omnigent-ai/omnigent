@@ -250,20 +250,23 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
 
 
 @pytest.mark.asyncio
-async def test_events_codex_native_plan_mode_change_preserves_developer_instructions(
+async def test_events_codex_native_plan_mode_change_never_forwards_developer_instructions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    A plan-mode toggle must not silently wipe ``developer_instructions``.
+    A plan-mode toggle must send ``developer_instructions: null`` — always.
 
-    Without the current-value read, the plan-mode collaboration-mode
-    settings send always carried
-    ``developer_instructions: null``, clearing whatever
-    ``build_codex_native_server`` had persisted into the bridge's private
-    ``config.toml`` the moment a user toggled Plan mode. This drives the
-    real HTTP path end-to-end and asserts the current value is read back
-    and threaded through to ``thread/settings/update``.
+    ``collaborationMode.settings.developer_instructions`` REPLACES the
+    mode's built-in prompt (it is not additive): forwarding the config's
+    current value delivers the wrapper's authored blurb INSTEAD of Codex's
+    Plan Mode instructions, so the model is never told to plan and edits
+    away. The authored instructions already reach every turn via the
+    additive top-level ``developer_instructions`` config key, which the
+    collaboration-mode field does not touch — a live probe confirms the
+    config key survives a ``null`` settings send. This drives the real
+    HTTP path end-to-end with a populated config.toml and asserts the
+    field stays ``null``.
     """
     from omnigent import codex_native_app_server
     from omnigent.codex_native_bridge import codex_home_for_bridge_dir
@@ -356,7 +359,7 @@ async def test_events_codex_native_plan_mode_change_preserves_developer_instruct
                     "settings": {
                         "model": "gpt-5.4",
                         "reasoning_effort": None,
-                        "developer_instructions": "Be a concise coding assistant.",
+                        "developer_instructions": None,
                     },
                 },
             },
@@ -365,20 +368,20 @@ async def test_events_codex_native_plan_mode_change_preserves_developer_instruct
 
 
 @pytest.mark.asyncio
-async def test_events_codex_native_plan_mode_change_503s_when_config_unreadable(
+async def test_events_codex_native_plan_mode_change_ignores_unreadable_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    A plan-mode toggle must fail loudly (503), not guess, when the private
-    ``config.toml`` holding ``developer_instructions`` can't be read.
+    A plan-mode toggle succeeds even when the private ``config.toml`` is
+    unreadable.
 
-    Regression guard: collapsing "unreadable" into "genuinely absent" would
-    send ``developer_instructions: null`` on a transient read glitch,
-    silently wiping live state — the same class of bug this whole codex
-    plan-mode preservation feature exists to prevent. The tri-state read
-    must refuse to guess instead.
+    The collaboration-mode settings send always carries
+    ``developer_instructions: null`` (a non-null value would REPLACE the
+    mode's built-in prompt), so the toggle no longer reads the config at
+    all — a corrupt or unreadable file must not block entering Plan mode.
     """
+    from omnigent import codex_native_app_server
     from omnigent.codex_native_bridge import codex_home_for_bridge_dir
 
     conv_id = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d"
@@ -396,6 +399,22 @@ async def test_events_codex_native_plan_mode_change_503s_when_config_unreadable(
             codex_home=str(codex_home),
             active_turn_id=None,
         ),
+    )
+
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43210",
+        client_name="omnigent-codex-native-runner",
+    )
+
+    def _fake_client_for_transport(
+        transport: str, *, client_name: str = "omnigent"
+    ) -> _RecordingCodexAppServerClient:
+        assert transport == fake_client.transport
+        assert client_name == fake_client.client_name
+        return fake_client
+
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", _fake_client_for_transport
     )
 
     codex_native_spec = AgentSpec(
@@ -437,8 +456,23 @@ async def test_events_codex_native_plan_mode_change_503s_when_config_unreadable(
             json={"type": "plan_mode_change", "enabled": True},
         )
 
-    assert resp.status_code == 503, resp.text
-    assert resp.json()["error"] == "codex_native_settings_update_failed"
+    assert resp.status_code == 204, resp.text
+    assert fake_client.requests == [
+        (
+            "thread/settings/update",
+            {
+                "threadId": "thread_codex",
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-5.4",
+                        "reasoning_effort": None,
+                        "developer_instructions": None,
+                    },
+                },
+            },
+        ),
+    ], fake_client.requests
 
 
 @pytest.mark.asyncio

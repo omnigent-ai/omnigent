@@ -1,5 +1,8 @@
 const CODEX_NATIVE_WRAPPER = "codex-native-ui";
-const CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode";
+// Mirrors the server's collaboration-mode label. Seeded at create by the
+// new-session Plan-mode control so the runner launches the fresh Codex
+// thread already in Plan mode; kept current in-session by the PATCH path.
+export const CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode";
 
 export type CodexPlanModeLabelSource =
   { labels?: Record<string, string | null> | null } | null | undefined;

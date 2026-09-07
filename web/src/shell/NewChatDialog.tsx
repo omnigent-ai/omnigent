@@ -131,6 +131,8 @@ import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { readLastSandboxRepo, writeLastSandboxRepo } from "@/lib/repoPreferences";
 import { readHarnessOptions, writeHarnessOption, type HarnessOptions } from "@/lib/modePreferences";
+import { Switch } from "@/components/ui/switch";
+import { CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY } from "@/lib/codexPlanMode";
 import {
   AUTO_HARNESS_DESCRIPTION,
   AUTO_HARNESS_ID,
@@ -1600,6 +1602,7 @@ function HarnessConfigModal({
   cursorExecMode,
   agySkipMode,
   bypassSandbox,
+  planMode,
   pickedModel,
   claudeModelOptions,
   claudeModelsLoading,
@@ -1617,6 +1620,7 @@ function HarnessConfigModal({
   setCursorExecMode,
   setAgySkipMode,
   setBypassSandbox,
+  setPlanMode,
   setPickedModel,
   setPickedEffort,
   setPickedHarness,
@@ -1634,6 +1638,7 @@ function HarnessConfigModal({
   cursorExecMode: string;
   agySkipMode: string;
   bypassSandbox: boolean;
+  planMode: boolean;
   pickedModel: string;
   claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   claudeModelsLoading: boolean;
@@ -1653,6 +1658,7 @@ function HarnessConfigModal({
   setCursorExecMode: (mode: string) => void;
   setAgySkipMode: (mode: string) => void;
   setBypassSandbox: (enabled: boolean) => void;
+  setPlanMode: (enabled: boolean) => void;
   setPickedModel: (model: string) => void;
   setPickedEffort: (effort: string) => void;
   setPickedHarness: (harness: string | null, agentId?: string) => void;
@@ -1680,6 +1686,7 @@ function HarnessConfigModal({
   const [draftCursor, setDraftCursor] = useState(cursorExecMode);
   const [draftAgySkip, setDraftAgySkip] = useState(agySkipMode);
   const [draftBypass, setDraftBypass] = useState(bypassSandbox);
+  const [draftPlanMode, setDraftPlanMode] = useState(planMode);
   const [draftHarness, setDraftHarness] = useState<string | null>(pickedHarness);
   const [draftRouting, setDraftRouting] = useState<CostControlMode>(costControlMode);
 
@@ -1692,6 +1699,7 @@ function HarnessConfigModal({
     setDraftCursor(cursorExecMode);
     setDraftAgySkip(agySkipMode);
     setDraftBypass(bypassSandbox);
+    setDraftPlanMode(planMode);
     setDraftHarness(pickedHarness);
     setDraftRouting(costControlMode);
     // Seed once per open from the current live values.
@@ -1821,6 +1829,9 @@ function HarnessConfigModal({
       }
       setApprovalMode(draftApproval);
       setBypassSandbox(draftBypass);
+      // Plan mode is a per-session pick (like the TUI, every session starts
+      // in Default mode), so it is deliberately NOT remembered per harness.
+      if (isCodex) setPlanMode(draftPlanMode);
       if (entryHarness) {
         writeHarnessOption(entryHarness, {
           mode: isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval,
@@ -2085,6 +2096,26 @@ function HarnessConfigModal({
                   componentId="new_chat.config.approval"
                 />
               </ConfigRow>
+              {/* Pre-launch Plan mode — the pick a plan-first Codex user makes
+              before typing anything (the TUI habit is shift+tab before the
+              first message). Mirrors the in-session composer toggle; the
+              create seeds the collaboration-mode label so the fresh Codex
+              thread starts in Plan mode. */}
+              {isCodex && (
+                <ConfigRow label="Plan mode" description="Plan before making changes">
+                  <div className="flex h-9 items-center sm:justify-end">
+                    <Switch
+                      checked={draftPlanMode}
+                      onCheckedChange={setDraftPlanMode}
+                      aria-pressed={draftPlanMode}
+                      aria-label={draftPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
+                      data-testid="new-chat-landing-config-plan-mode"
+                      data-active={draftPlanMode ? "true" : undefined}
+                      componentId="new_chat.config.plan_mode"
+                    />
+                  </div>
+                </ConfigRow>
+              )}
             </>
           )}
 
@@ -2258,6 +2289,7 @@ interface LandingDraft {
   permissionMode: string;
   approvalMode: string;
   bypassSandbox: boolean;
+  planMode: boolean;
   cursorExecMode: string;
   agySkipMode: string;
   pickedHarness: string | null;
@@ -2697,6 +2729,13 @@ export function NewChatLandingScreen() {
   const [bypassSandbox, setBypassSandbox] = useState<boolean>(
     () => restoredDraft?.bypassSandbox ?? false,
   );
+  // Pre-launch Codex Plan mode (codex-native only). A plan-first user picks
+  // it before typing anything — the TUI habit is shift+tab before the first
+  // message. Seeded onto the create as the collaboration-mode label so the
+  // runner starts the fresh Codex thread already in Plan mode; OFF by
+  // default each visit (matching the TUI, which starts every session in
+  // Default mode).
+  const [planMode, setPlanMode] = useState<boolean>(() => restoredDraft?.planMode ?? false);
   // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
   // for the cursor-native wrapper; ignored otherwise.
   const [cursorExecMode, setCursorExecMode] = useState<string>(
@@ -2784,6 +2823,7 @@ export function NewChatLandingScreen() {
     permissionMode,
     approvalMode,
     bypassSandbox,
+    planMode,
     cursorExecMode,
     agySkipMode,
     pickedHarness,
@@ -3314,10 +3354,14 @@ export function NewChatLandingScreen() {
               value: routingOn ? EFFORT_UNAVAILABLE_PLACEHOLDER : pickedEffort || "Default",
             },
           ];
+      // Plan mode reads as a row only while armed — the default (off) matches
+      // the TUI's default and would just be noise on every hover.
+      const planRow = isCodex && planMode ? [{ label: "Plan mode", value: "On" }] : [];
       return [
         ...modelRows,
         ...effortRows,
         { label: "Approval", value: approvalValue },
+        ...planRow,
         ...(isCodex ? sourceRows(codexModelOptions) : []),
       ];
     }
@@ -3357,6 +3401,7 @@ export function NewChatLandingScreen() {
     permissionMode,
     approvalMode,
     bypassSandbox,
+    planMode,
     cursorExecMode,
     agySkipMode,
     pickedHarness,
@@ -3386,6 +3431,7 @@ export function NewChatLandingScreen() {
     if (!suppressBypassSeedRef.current) return;
     userPickedModelRef.current = false;
     setBypassSandbox(false);
+    setPlanMode(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
   // A project-configured default model (Project settings) outranks the user's
@@ -4427,9 +4473,21 @@ export function NewChatLandingScreen() {
       // when the toggle is armed for a codex-native agent) so the runner
       // launches with --dangerously-bypass-approvals-and-sandbox and the choice
       // survives reload.
+      const isCodexNativeAgent = nativeAgent?.harness === "codex-native";
+      const codexCreateLabels = {
+        ...(agentSupportsApprovalMode && bypassSandbox
+          ? { [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+          : {}),
+        // Pre-launch Plan-mode pick: seed the collaboration-mode label so the
+        // runner switches the fresh Codex thread into Plan mode before the
+        // first turn (see _codex_native_launch_config).
+        ...(isCodexNativeAgent && planMode
+          ? { [CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY]: "plan" }
+          : {}),
+      };
       const baseLabels =
-        agentSupportsApprovalMode && bypassSandbox
-          ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+        Object.keys(codexCreateLabels).length > 0
+          ? { ...(nativeLabels ?? {}), ...codexCreateLabels }
           : nativeLabels;
       // First-class project filing: a project-driven visit whose `?project=`
       // name resolved to a real project id sends `project_id` so the server
@@ -5261,6 +5319,7 @@ export function NewChatLandingScreen() {
                     cursorExecMode={cursorExecMode}
                     agySkipMode={agySkipMode}
                     bypassSandbox={bypassSandbox}
+                    planMode={planMode}
                     pickedModel={pickedModel}
                     claudeModelOptions={claudeModelOptions}
                     claudeModelsLoading={
@@ -5288,6 +5347,7 @@ export function NewChatLandingScreen() {
                     setCursorExecMode={setCursorExecMode}
                     setAgySkipMode={setAgySkipMode}
                     setBypassSandbox={setBypassSandbox}
+                    setPlanMode={setPlanMode}
                     setPickedModel={(m) => {
                       // A commit from the config modal is the user's explicit
                       // choice for this visit — later async project-config
