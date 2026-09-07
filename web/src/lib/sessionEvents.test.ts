@@ -67,6 +67,30 @@ describe("session.status (FLAT envelope)", () => {
     expect(ev.responseId).toBe("codex_turn_123");
   });
 
+  it("carries validated quota-wait telemetry", () => {
+    const out = parse("session.status", {
+      type: "session.status",
+      conversation_id: "conv_abc",
+      status: "running",
+      blocked_on: "quota availability",
+      quota_wait: {
+        admission_delay_seconds: 12.5,
+        current_rate_ppm_per_second: 2.25,
+        burst_multiplier: 1.5,
+        linear_schedule_delta_ppm: -420,
+      },
+    });
+    expect(out[0]).toMatchObject({
+      blockedOn: "quota availability",
+      quotaWait: {
+        admissionDelaySeconds: 12.5,
+        currentRatePpmPerSecond: 2.25,
+        burstMultiplier: 1.5,
+        linearScheduleDeltaPpm: -420,
+      },
+    });
+  });
+
   it("accepts waiting (live-only, not on snapshot)", () => {
     const out = parse("session.status", {
       type: "session.status",

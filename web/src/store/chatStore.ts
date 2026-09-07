@@ -75,6 +75,7 @@ import {
 import type {
   McpServerStartup,
   SessionInputConsumedEvent,
+  SessionStatusEvent,
   SessionViewer,
   StreamEvent,
 } from "@/lib/events";
@@ -293,6 +294,8 @@ export interface ConversationState {
    * no explanation. `null` whenever the session is not parked.
    */
   blockedOn: string | null;
+  /** Quota admission telemetry for the current delay; absent on every other edge. */
+  quotaWait: SessionStatusEvent["quotaWait"] | null;
   /**
    * Whether the active session is a native-terminal wrapper
    * (claude-native / codex-native), derived from the `omnigent.wrapper`
@@ -1304,6 +1307,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   backgroundTaskCount: 0,
   backgroundTasks: [],
   blockedOn: null,
+  quotaWait: null,
   isNativeTerminalSession: false,
   nativeVendorOwnsModel: false,
   boundAgentId: null,
@@ -1624,6 +1628,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // authoritatively. Only the parked-dialog reason clears — a fresh send is
       // not parked on a dialog.
       blockedOn: null,
+      quotaWait: null,
     }));
 
     // Pin the destination before joining the send chain: a stalled prior
@@ -1927,6 +1932,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         backgroundTaskCount: 0,
         backgroundTasks: [],
         blockedOn: null,
+        quotaWait: null,
       };
       if (s.activeResponse?.state === "streaming") {
         patch.activeResponse = {
@@ -3352,6 +3358,7 @@ async function bindStream(
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         backgroundTasks: session.backgroundTasks ?? [],
         blockedOn: null,
+        quotaWait: null,
         // `selectedEffort` / `selectedModel` are app-global sticky picks, not
         // conversation state, so they are applied below — and only while this
         // conversation is still on screen. A cold bind that finishes after the
@@ -5430,6 +5437,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // current reason (the runner re-attaches it to its own pane edges),
           // so an absent one means "no longer parked".
           blockedOn: event.blockedOn ?? null,
+          quotaWait: event.quotaWait ?? null,
         };
         // The background-shell tally is STICKY. Only the Stop-hook-derived
         // status carries an authoritative count (the forwarder relabels its

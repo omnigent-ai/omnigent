@@ -7,6 +7,7 @@
 // holds a non-default value.
 
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
+import { QUOTA_BURST_CONFIG_STORAGE_KEY } from "./quotaBurstConfig";
 
 /** localStorage keys that constitute exportable user preferences. */
 const EXPORTABLE_KEYS = [
@@ -24,6 +25,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
   COMPOSER_SEND_SHORTCUT_STORAGE_KEY,
+  QUOTA_BURST_CONFIG_STORAGE_KEY,
   "web-theme",
 ] as const;
 

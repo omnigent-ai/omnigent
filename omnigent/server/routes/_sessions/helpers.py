@@ -239,6 +239,7 @@ from omnigent.server.schemas import (
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
     PolicyDeniedEvent,
+    QuotaWaitInfo,
     ReasoningStartedEvent,
     ReasoningTextDeltaEvent,
     ResponseObject,
@@ -4101,6 +4102,7 @@ def _publish_status(
     background_task_count: int | None = None,
     background_tasks: list[BackgroundTaskInfo] | None = None,
     blocked_on: str | None = None,
+    quota_wait: QuotaWaitInfo | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4225,6 +4227,7 @@ def _publish_status(
         background_task_count=background_task_count,
         background_tasks=background_tasks,
         blocked_on=blocked_on,
+        quota_wait=quota_wait,
     )
     payload = event.model_dump()
     if response_id is None:
@@ -4238,6 +4241,8 @@ def _publish_status(
         payload.pop("background_tasks", None)
     if blocked_on is None:
         payload.pop("blocked_on", None)
+    if quota_wait is None:
+        payload.pop("quota_wait", None)
     session_stream.publish(session_id, payload)
 
 

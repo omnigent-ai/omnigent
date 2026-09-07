@@ -204,6 +204,7 @@ from omnigent.server.schemas import (
     ElicitationRequestParams,
     ErrorDetail,
     McpServerStartup,
+    QuotaWaitInfo,
     SessionEventInput,
 )
 from omnigent.session_lifecycle import (
@@ -1193,6 +1194,15 @@ def register_events_routes(
             blocked_on = (
                 raw_blocked_on if isinstance(raw_blocked_on, str) and raw_blocked_on else None
             )
+            raw_quota_wait = body.data.get("quota_wait")
+            try:
+                quota_wait = (
+                    QuotaWaitInfo.model_validate(raw_quota_wait)
+                    if isinstance(raw_quota_wait, dict)
+                    else None
+                )
+            except ValueError:
+                quota_wait = None
             # A background-task ``waiting`` marks an ended turn, so deliver it
             # as ``idle``: the session takes a new message now, and for a
             # sub-agent the terminal-delivery branch below must fire (otherwise
@@ -1244,6 +1254,7 @@ def register_events_routes(
                 background_task_count=bg_count,
                 background_tasks=bg_tasks,
                 blocked_on=blocked_on,
+                quota_wait=quota_wait,
             )
             # Emit a turn-end telemetry event for native harnesses. "idle"
             # means the turn completed normally; "failed" means it errored.

@@ -2483,6 +2483,36 @@ def create_runner_app(
     _desync_terminalized: dict[str, int] = {}
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
+    _quota_wait_watcher: asyncio.Task[None] | None = None
+
+    @app.on_event("startup")
+    async def _start_quota_wait_watcher() -> None:
+        nonlocal _quota_wait_watcher
+        data_dir = os.environ.get("OMNIGENT_DATA_DIR")
+        runner_id = os.environ.get("OMNIGENT_RUNNER_ID")
+        if not data_dir or not runner_id:
+            return
+        from omnigent.runner.quota_wait import watch_quota_waits
+
+        _quota_wait_watcher = asyncio.create_task(
+            watch_quota_waits(
+                server_client,
+                Path(data_dir).expanduser().resolve() / "quota-waits",
+                runner_id=runner_id,
+            ),
+            name="quota-wait-status",
+        )
+        _background_tasks.add(_quota_wait_watcher)
+        _quota_wait_watcher.add_done_callback(_background_tasks.discard)
+
+    @app.on_event("shutdown")
+    async def _stop_quota_wait_watcher() -> None:
+        if _quota_wait_watcher is None:
+            return
+        _quota_wait_watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _quota_wait_watcher
+
     _subagent_wake_pending: set[str] = set()
     _last_rewake_notice: dict[str, str] = {}
     # Parents whose wake POST exhausted its bounded retries while their inbox

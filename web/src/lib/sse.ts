@@ -569,6 +569,31 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       // blank reason never renders as a dangling parenthetical.
       const rawBlockedOn = data.blocked_on;
       const blockedOn = typeof rawBlockedOn === "string" && rawBlockedOn ? rawBlockedOn : undefined;
+      const rawQuotaWait = data.quota_wait;
+      let quotaWait: SessionStatusEvent["quotaWait"];
+      if (rawQuotaWait != null && typeof rawQuotaWait === "object") {
+        const quota = rawQuotaWait as Record<string, unknown>;
+        const optionalNonnegative = (value: unknown): number | undefined =>
+          typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+        const admissionDelaySeconds = optionalNonnegative(quota.admission_delay_seconds);
+        const currentRatePpmPerSecond = optionalNonnegative(quota.current_rate_ppm_per_second);
+        const candidateBurstMultiplier = optionalNonnegative(quota.burst_multiplier);
+        const burstMultiplier =
+          candidateBurstMultiplier !== undefined && candidateBurstMultiplier >= 1
+            ? candidateBurstMultiplier
+            : undefined;
+        const linearScheduleDeltaPpm =
+          typeof quota.linear_schedule_delta_ppm === "number" &&
+          Number.isSafeInteger(quota.linear_schedule_delta_ppm)
+            ? quota.linear_schedule_delta_ppm
+            : undefined;
+        quotaWait = {
+          ...(admissionDelaySeconds !== undefined ? { admissionDelaySeconds } : {}),
+          ...(currentRatePpmPerSecond !== undefined ? { currentRatePpmPerSecond } : {}),
+          ...(burstMultiplier !== undefined ? { burstMultiplier } : {}),
+          ...(linearScheduleDeltaPpm !== undefined ? { linearScheduleDeltaPpm } : {}),
+        };
+      }
       return {
         type: "session_status",
         conversationId,
@@ -577,6 +602,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         backgroundTaskCount,
         ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
         ...(blockedOn !== undefined ? { blockedOn } : {}),
+        ...(quotaWait !== undefined ? { quotaWait } : {}),
         ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
     }

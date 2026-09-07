@@ -484,12 +484,22 @@ export interface SessionStatusEvent {
    * the session is not parked.
    */
   blockedOn?: string;
+  /** Numeric-only quota telemetry attached while admission is delayed. */
+  quotaWait?: QuotaWaitInfo;
   /**
    * Structured failure detail; only present when `status === "failed"`.
    * Carries the optional `title` / `cause` / `remediation` fields when the
    * runner classified the failure (see `ErrorInfo`).
    */
   error?: ErrorInfo;
+}
+
+export interface QuotaWaitInfo {
+  admissionDelaySeconds?: number;
+  currentRatePpmPerSecond?: number;
+  burstMultiplier?: number;
+  /** Positive is above/ahead of the linear allowance; negative is below/behind. */
+  linearScheduleDeltaPpm?: number;
 }
 
 /**

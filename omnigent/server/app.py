@@ -70,6 +70,7 @@ from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.projects import create_projects_router
+from omnigent.server.routes.quota_config import create_quota_config_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
@@ -2423,6 +2424,14 @@ def create_app(
         ),
         prefix="/v1",
         tags=["sharing"],
+    )
+    app.include_router(
+        create_quota_config_router(
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["quota"],
     )
 
     # First-class projects (owner-private session containers). Mounted only

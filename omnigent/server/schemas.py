@@ -2868,6 +2868,15 @@ class _SSEEventBase(BaseModel):
 # ── Session-scoped events (session.*) ──────────────────────────────
 
 
+class QuotaWaitInfo(BaseModel):
+    """Safe numeric telemetry for a quota-delayed turn."""
+
+    admission_delay_seconds: float | None = Field(default=None, ge=0)
+    current_rate_ppm_per_second: float | None = Field(default=None, ge=0)
+    burst_multiplier: float | None = Field(default=None, ge=1)
+    linear_schedule_delta_ppm: int | None = None
+
+
 class SessionStatusEvent(_SSEEventBase):
     """
     Session lifecycle status transition.
@@ -2940,6 +2949,7 @@ class SessionStatusEvent(_SSEEventBase):
     background_task_count: int | None = None
     background_tasks: list[BackgroundTaskInfo] | None = None
     blocked_on: str | None = None
+    quota_wait: QuotaWaitInfo | None = None
 
 
 class SessionUsageEvent(_SSEEventBase):
