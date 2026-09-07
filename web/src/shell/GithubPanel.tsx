@@ -941,7 +941,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
                 </>
               )}
             </span>
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
               <a
                 href={pr.url}
                 target="_blank"
