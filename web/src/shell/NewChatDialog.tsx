@@ -69,6 +69,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { randomUUID } from "@/lib/randomUUID";
 import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
@@ -2932,11 +2933,11 @@ export function NewChatLandingScreen() {
   );
 
   // Fill the branch field with a unique auto-generated name so the user can
-  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
-  // available in every browser the app targets; the short prefix keeps the
-  // dir/branch readable (worktree-1a2b3c4d).
+  // spin up a throwaway worktree without inventing one. Uses the secure-context-
+  // safe UUID helper (a plain-http self-hosted origin has no `crypto.randomUUID`);
+  // the short prefix keeps the dir/branch readable (worktree-1a2b3c4d).
   const generateBranchName = useCallback(() => {
-    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+    const suffix = randomUUID().replace(/-/g, "").slice(0, 8);
     const name = `worktree-${suffix}`;
     setBranchName(name);
     return name;
