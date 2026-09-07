@@ -235,6 +235,10 @@ const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 // ``useProjects()`` subscription. Keeps row renders O(1) and avoids spinning up
 // a query observer per row (which would also re-run on every project mutation).
 const ProjectNamesContext = createContext<Map<string, string>>(new Map());
+// Maps a first-class project id → its chosen emoji icon (only projects that
+// have one), sharing the same list-level lookup as the names map so a row can
+// surface the real project glyph in the pinned flyout without its own query.
+const ProjectIconsContext = createContext<Map<string, string>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 // Row-invariant values resolved once at the list owner and shared, so a row
 // doesn't run `useIsMobileViewport` (a matchMedia-on-every-render store) or
@@ -259,6 +263,7 @@ function useStableCallback<A extends unknown[], R>(fn: (...args: A) => R): (...a
 
 function SidebarRowDataProvider({
   projectNamesById,
+  projectIconsById,
   hostsById,
   isMobile,
   viewerId,
@@ -266,6 +271,7 @@ function SidebarRowDataProvider({
   children,
 }: {
   projectNamesById: Map<string, string>;
+  projectIconsById: Map<string, string>;
   hostsById: ReadonlyMap<string, Host>;
   isMobile: boolean;
   viewerId: string | null;
@@ -274,13 +280,15 @@ function SidebarRowDataProvider({
 }) {
   return (
     <ProjectNamesContext.Provider value={projectNamesById}>
-      <HostsByIdContext.Provider value={hostsById}>
-        <IsMobileContext.Provider value={isMobile}>
-          <ViewerIdContext.Provider value={viewerId}>
-            <ServerInfoContext.Provider value={serverInfo}>{children}</ServerInfoContext.Provider>
-          </ViewerIdContext.Provider>
-        </IsMobileContext.Provider>
-      </HostsByIdContext.Provider>
+      <ProjectIconsContext.Provider value={projectIconsById}>
+        <HostsByIdContext.Provider value={hostsById}>
+          <IsMobileContext.Provider value={isMobile}>
+            <ViewerIdContext.Provider value={viewerId}>
+              <ServerInfoContext.Provider value={serverInfo}>{children}</ServerInfoContext.Provider>
+            </ViewerIdContext.Provider>
+          </IsMobileContext.Provider>
+        </HostsByIdContext.Provider>
+      </ProjectIconsContext.Provider>
     </ProjectNamesContext.Provider>
   );
 }
@@ -1608,6 +1616,16 @@ function ConversationList({
     return map;
   }, [projects]);
 
+  // id → emoji icon for rows that want to show the real project glyph (e.g. the
+  // pinned flyout); built alongside the names map and shared the same way.
+  const projectIconsById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const p of projects) {
+      if (p.id !== null && p.icon) map.set(p.id, p.icon);
+    }
+    return map;
+  }, [projects]);
+
   // Freeze the active chat's sort key while you're inside it so an
   // updated_at bump from sending a message doesn't reorder the row
   // out from under you. Snapshot is dropped on navigate-away so the
@@ -2090,6 +2108,7 @@ function ConversationList({
   return (
     <SidebarRowDataProvider
       projectNamesById={projectNamesById}
+      projectIconsById={projectIconsById}
       hostsById={hostsById}
       isMobile={isMobile}
       viewerId={viewerId}
@@ -3560,6 +3579,13 @@ function ConversationRowImpl({
   // routes the row through the plain ContextMenu/link path and restores the
   // native `title` tooltip.
   const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
+  // First-class projects can carry a chosen emoji; label-only projects have
+  // none, so the flyout falls back to the folder glyph for those.
+  const projectIconsById = useContext(ProjectIconsContext);
+  const projectFlyoutIcon =
+    conversation.project_id != null
+      ? (projectIconsById.get(conversation.project_id) ?? null)
+      : null;
 
   // The title the user just committed. The rename's cache write reaches this
   // row as a prop from the list above, which re-renders a tick after the row's
@@ -3893,6 +3919,7 @@ function ConversationRowImpl({
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
+              projectIcon={projectFlyoutIcon}
               gitBranch={gitBranch}
             />
           </HoverCard>
@@ -3921,6 +3948,7 @@ function ConversationRowImpl({
           <PinnedProjectFlyoutContent
             title={conversation.title ?? conversation.id}
             projectName={projectFlyoutName}
+            projectIcon={projectFlyoutIcon}
             gitBranch={gitBranch}
           />
         </HoverCard>
@@ -4346,10 +4374,12 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
 function PinnedProjectFlyoutContent({
   title,
   projectName,
+  projectIcon,
   gitBranch,
 }: {
   title: string;
   projectName: string;
+  projectIcon: string | null;
   gitBranch: string | null;
 }) {
   return (
@@ -4365,7 +4395,7 @@ function PinnedProjectFlyoutContent({
           the DOM. */}
       <p className="sidebar-compact-text line-clamp-3 font-medium">{title}</p>
       <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
-        <FolderIcon className="size-3.5 shrink-0" />
+        <ProjectRowIcon icon={projectIcon} />
         <span className="truncate">{projectName}</span>
       </p>
       {gitBranch && (
