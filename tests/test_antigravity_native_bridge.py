@@ -888,6 +888,202 @@ def test_inject_user_message_via_tui_mid_turn_sends_one_enter(
     assert enters["n"] == 1, "mid-turn submit must send exactly one Enter (no re-send)"
 
 
+def test_inject_user_message_via_tui_dismisses_occupying_overlay_panel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    A marker-less full-screen panel is dismissed with Escape, then delivery lands.
+
+    Models a ``/usage`` overlay left open from the Terminal view: the panel
+    renders NEITHER footer marker and swallows every keystroke, so without a
+    reclaim the readiness gate burns its budget, the paste is swallowed, and
+    the web message is lost. The gate must send a bare Escape (the panel
+    documents Escape as its way out) once the marker-less screen is confirmed
+    on a second poll, then deliver the message into the restored composer.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "Reply with exactly WORKING"
+    escapes = {"n": 0}
+    tui = {"pane": "Usage Statistics\n\nPlan: Pro\n\npress esc or q to close"}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Overlay swallows everything until Escape restores the idle composer."""
+        del kwargs
+        overlay_up = "Usage Statistics" in tui["pane"]
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if cmd[-1] == "Escape":
+            escapes["n"] += 1
+            tui["pane"] = "> \n? for shortcuts"
+        if "paste-buffer" in cmd and not overlay_up:
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter" and not overlay_up:
+            tui["pane"] = "> \nesc to cancel"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+    assert escapes["n"] == 1, "expected exactly one Escape to dismiss the overlay panel"
+
+
+def test_inject_user_message_via_tui_resends_escape_while_panel_remains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    An Escape the panel swallowed is re-sent while the panel is still on screen.
+
+    A key folded into a redraw can be lost; the reclaim must not give up after
+    one Escape while the pane verifiably still shows the marker-less panel.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    monkeypatch.setattr(_mod, "_PANEL_DISMISS_RETRY_INTERVAL_S", 0.0)
+    content = "hello there"
+    escapes = {"n": 0}
+    tui = {"pane": "Usage Statistics\npress esc or q to close"}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Swallow the first Escape; the second restores the composer."""
+        del kwargs
+        overlay_up = "Usage Statistics" in tui["pane"]
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if cmd[-1] == "Escape":
+            escapes["n"] += 1
+            if escapes["n"] >= 2:
+                tui["pane"] = "> \n? for shortcuts"
+        if "paste-buffer" in cmd and not overlay_up:
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter" and not overlay_up:
+            tui["pane"] = "> \nesc to cancel"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+    assert escapes["n"] == 2, "expected the swallowed Escape to be re-sent once"
+
+
+def test_inject_user_message_via_tui_no_escape_while_a_turn_is_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    A visible footer marker never earns an Escape — mid-turn it would cancel
+    the running turn.
+
+    The active footer (``esc to cancel``) satisfies readiness immediately, so
+    the reclaim must not fire; a stray Escape here is user-visible damage.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    escapes = {"n": 0}
+    tui = {"pane": "> \nesc to cancel"}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """agy stays mid-turn; the draft clears after the steer's Enter."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if cmd[-1] == "Escape":
+            escapes["n"] += 1
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> steer me\nesc to cancel"
+        if cmd[-1] == "Enter":
+            tui["pane"] = "> \nesc to cancel"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content="steer me", timeout_s=0.5)
+    assert escapes["n"] == 0, "a running turn's footer must never draw an Escape"
+
+
+def test_inject_user_message_via_tui_single_markerless_frame_gets_no_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    One marker-less frame (a repaint artifact) is not proof of a panel.
+
+    A capture torn mid-redraw can miss the footer for a single poll; spending
+    an Escape on it could hit the bare composer that is back a moment later.
+    The reclaim must re-confirm the panel on a later poll before escaping.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "hello there"
+    escapes = {"n": 0}
+    state = {"first_capture": True}
+    tui = {"pane": "> \n? for shortcuts"}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Serve one footer-less frame, then the normal idle composer."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            if state["first_capture"]:
+                state["first_capture"] = False
+                return SimpleNamespace(returncode=0, stdout="redrawing…", stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if cmd[-1] == "Escape":
+            escapes["n"] += 1
+        if "paste-buffer" in cmd:
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            tui["pane"] = "> \nesc to cancel"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+    assert escapes["n"] == 0, "a single marker-less frame must not draw an Escape"
+
+
+def test_inject_user_message_via_tui_torn_captures_get_no_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    Empty captures are "unknown", never a panel: no Escape is ever spent.
+
+    A pane that only ever captures empty (torn reads / a wedged tmux) must
+    fall through the readiness gate unchanged and fail loudly at the render
+    check — not accumulate Escapes against a screen nobody has seen.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    escapes = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Every capture is empty; everything else succeeds."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[-1] == "Escape":
+            escapes["n"] += 1
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="did not render the pasted message"):
+        inject_user_message_via_tui(bridge_dir, content="hello there", timeout_s=0.1)
+    assert escapes["n"] == 0, "torn (empty) captures must never draw an Escape"
+
+
 def test_inject_user_message_via_tui_ignores_transcript_echo_after_submit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
