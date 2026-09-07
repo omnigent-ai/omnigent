@@ -147,6 +147,60 @@ async def test_cross_origin_redirect_is_refused_and_nothing_is_forwarded() -> No
     assert seen_hosts == ["127.0.0.1"]
 
 
+@pytest.mark.asyncio
+async def test_session_stream_follows_relative_location_redirect() -> None:
+    """A relative ``Location`` resolves onto the origin and is followed.
+
+    Gateways often send path-only redirects (e.g. trailing-slash fixes);
+    those stay on-origin by construction and must stream normally.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not request.url.path.startswith(_RELOCATED_PREFIX):
+            return httpx.Response(
+                307,
+                headers={"location": f"{_RELOCATED_PREFIX}{request.url.path}"},
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_SSE_BODY.encode(),
+        )
+
+    async with OmnigentClient(base_url=_BASE) as client:
+        client._http._transport = httpx.MockTransport(handler)
+        events = [event async for event in client.sessions.stream("conv_1")]
+
+    assert [event.delta for event in events] == ["hi"]  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_cross_origin_redirect_forwards_nothing() -> None:
+    """The POST path refuses a cross-origin hop before replaying the body.
+
+    A 307/308 replays the request body, so the no-forward guarantee matters
+    most here: the transport must never see a request to the foreign host.
+    """
+    seen_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(request.url.host)
+        return httpx.Response(
+            307,
+            headers={"location": "https://elsewhere.invalid/v1/responses"},
+        )
+
+    async with OmnigentClient(base_url=_BASE) as client:
+        client._http._transport = httpx.MockTransport(handler)
+        with pytest.warns(DeprecationWarning):
+            with pytest.raises(OmnigentError) as excinfo:
+                async for _event in client.responses.stream(model="agent", input="hi"):
+                    pass
+
+    assert excinfo.value.status_code == 307
+    assert seen_hosts == ["127.0.0.1"]
+
+
 @pytest.mark.parametrize(
     ("base", "location", "allowed"),
     [
