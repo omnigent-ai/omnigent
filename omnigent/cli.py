@@ -2053,6 +2053,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "lakebox",
         "login",
         "opencode",
+        "open",
         "pane-picker",
         "pane-split",
         "pi",
@@ -2484,6 +2485,46 @@ class _HostHttpResult:
 
 
 @dataclass(frozen=True)
+class _OpenSessionBinding:
+    """Session placement read before recovery.
+
+    :param host_id: Current host binding, or ``None`` for a hostless session.
+    :param wrapper_label: Native-TUI wrapper label, or ``None`` for an Omnigent REPL.
+    """
+
+    host_id: str | None
+    wrapper_label: str | None
+
+
+@dataclass(frozen=True)
+class _OpenRecoveryAttempt:
+    """Result of one recovery-aware ``open`` attempt.
+
+    :param ready: Whether the runner and native terminal are ready to attach.
+    :param detail: Server explanation when the session is not currently recoverable.
+    :param host_id: Current host binding, used to tailor reconnect guidance.
+    :param wrapper_label: Native-TUI wrapper label used to select the attach surface.
+    """
+
+    ready: bool
+    detail: str
+    host_id: str | None
+    wrapper_label: str | None
+
+
+@dataclass(frozen=True)
+class _OpenLocalReconnect:
+    """Outcome of trying to reconnect this machine's matching host daemon."""
+
+    attempted: bool
+    restarted_server_url: str | None = None
+
+
+class _OpenTransientError(click.ClickException):
+    """A temporary server failure that a durable open pane may retry."""
+
+
+@dataclass(frozen=True)
 class _HostSessionsTableWidths:
     """
     Column widths for one host status sessions table.
@@ -2878,18 +2919,24 @@ def _daemon_host_identity_changed(record: _HostDaemonRecord) -> bool:
     return record.host_id != current_host_id
 
 
-def _terminate_host_unit(record: _HostDaemonRecord, *, reason: str) -> None:
+def _terminate_host_unit(
+    record: _HostDaemonRecord,
+    *,
+    reason: str,
+    keep_local_server: bool = False,
+) -> None:
     """
     Tear down a daemon and, in local mode, the Omnigent server it owns.
 
-    The ``--local`` daemon spawns its Omnigent server once and never respawns
-    it, so a stale daemon and its server must be replaced as a unit:
-    killing only the daemon would strand the server (and vice versa). This
-    stops both so the caller can spawn a fresh, correctly-configured pair.
+    The ``--local`` daemon normally owns its Omnigent server, so config changes
+    replace both processes. A tunnel-only heal keeps the healthy server alive;
+    the replacement local daemon adopts it at the same URL.
 
     :param record: Daemon record to tear down.
     :param reason: Human-readable reason surfaced to the user, e.g.
         ``"config changed (auth)"`` or ``"host tunnel is offline"``.
+    :param keep_local_server: Preserve a healthy local server while replacing
+        only its host tunnel.
     :returns: None.
     """
     click.echo(
@@ -2899,7 +2946,7 @@ def _terminate_host_unit(record: _HostDaemonRecord, *, reason: str) -> None:
     # run — the fresh daemon's record overwrites this one regardless.
     with contextlib.suppress(click.ClickException):
         _terminate_daemon(record, force=True)
-    if record.mode == "local":
+    if record.mode == "local" and not keep_local_server:
         stop_local_omnigent_server()
 
 
@@ -3004,7 +3051,11 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     # is a transparent heal, NOT a config change — the caller continues.
     age_s = time.time() - existing.started_at
     if age_s >= _DAEMON_REUSE_MIN_AGE_S and not _daemon_tunnel_recovers(existing):
-        _terminate_host_unit(existing, reason="host tunnel is offline")
+        _terminate_host_unit(
+            existing,
+            reason="host tunnel is offline",
+            keep_local_server=True,
+        )
         return _DaemonReuseDecision(reuse=False, config_changed=False)
     return _DaemonReuseDecision(reuse=True, config_changed=False)
 
@@ -3235,11 +3286,16 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         plain reuse, a transparent tunnel-health heal, or a first spawn.
     """
     target = _normalize_daemon_target(server_url)
+    if server_url and _local_daemon_serves_target(target, server_url):
+        # A caller may hand back the concrete URL discovered from local mode.
+        # Re-enter through its ``local`` record so tunnel health is checked.
+        return _ensure_host_daemon(None)
     decision = _reuse_existing_daemon_record(target)
     if decision.reuse:
         return False
     if not decision.config_changed and _local_daemon_serves_target(target, server_url):
-        return False
+        # Cover a local daemon claiming this URL after the first check.
+        return _ensure_host_daemon(None)
 
     _HOST_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     mode_args = ["--local"] if not server_url else ["--server", server_url]
@@ -3525,7 +3581,11 @@ def _ensure_backend(server: str | None) -> str:
     return local_url
 
 
-def _exit_for_auth_mode_change(base_url: str) -> None:
+def _exit_for_auth_mode_change(
+    base_url: str,
+    *,
+    rerun_command: str | None = None,
+) -> None:
     """Tell the user the server was restarted in a new mode, then exit clean.
 
     The local Omnigent server bakes its auth posture (header vs accounts, cookie
@@ -3539,10 +3599,13 @@ def _exit_for_auth_mode_change(base_url: str) -> None:
 
     :param base_url: The freshly-restarted Omnigent server URL, e.g.
         ``"http://127.0.0.1:6767"``.
+    :param rerun_command: Command to suggest after the restart. Defaults to
+        ``omnigent run`` (or the configured wrapper spelling).
     :returns: Never returns — raises ``SystemExit(0)``.
     :raises SystemExit: Always, with code 0 (a clean, expected stop).
     """
     needs_admin_setup = False
+    command = rerun_command or f"{cli_invocation()} run"
     result = _host_http_json(base_url=base_url, method="GET", path="/v1/info")
     if result.status_code == 200 and isinstance(result.body, dict):
         needs_admin_setup = bool(
@@ -3557,9 +3620,9 @@ def _exit_for_auth_mode_change(base_url: str) -> None:
             "(it may have opened automatically),",
             err=True,
         )
-        click.echo(f"  then re-run `{cli_invocation()} run` to start.", err=True)
+        click.echo(f"  then re-run `{command}` to start.", err=True)
     else:
-        click.echo(f"  Re-run `{cli_invocation()} run` to start.", err=True)
+        click.echo(f"  Re-run `{command}` to start.", err=True)
     click.echo("", err=True)
     raise SystemExit(0)
 
@@ -7862,6 +7925,573 @@ def _require_live_conversation(
         )
 
 
+_OPEN_READY_RECOVERIES = frozenset(
+    {"already_connected", "native_terminal_ready", "runner_relaunched"}
+)
+_OPEN_RETRY_INTERVAL_S = 5.0
+
+
+def _host_error_code(body: _HostJsonObject | str) -> str | None:
+    """Extract a machine-readable Omnigent error code, if present."""
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    return code if isinstance(code, str) else None
+
+
+def _read_open_session_binding(
+    *,
+    base_url: str,
+    conversation_id: str,
+) -> _OpenSessionBinding:
+    """Read the placement and wrapper used to recover a session."""
+    from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
+    from omnigent.claude_native_bridge import url_component
+    from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.server_url import display_server_url
+
+    result = _host_http_json(
+        base_url=base_url,
+        method="GET",
+        path=f"/v1/sessions/{url_component(conversation_id)}",
+        params={"include_items": "false", "include_liveness": "false"},
+    )
+    if result.status_code == 0:
+        raise _OpenTransientError(
+            f"Couldn't reach a server at {display_server_url(base_url)}: "
+            f"{_host_error_text(result.body)}."
+        )
+    if result.status_code == 404:
+        raise click.ClickException(
+            f"Session {conversation_id!r} was not found on {display_server_url(base_url)}."
+        )
+    if result.status_code >= 500:
+        raise _OpenTransientError(
+            f"Couldn't read session {conversation_id!r} on {display_server_url(base_url)} "
+            f"({result.status_code}): {_host_error_text(result.body)}"
+        )
+    if result.status_code != 200 or not isinstance(result.body, dict):
+        raise click.ClickException(
+            f"Couldn't read session {conversation_id!r} on {display_server_url(base_url)} "
+            f"({result.status_code}): {_host_error_text(result.body)}"
+        )
+
+    host_value = result.body.get("host_id")
+    labels = result.body.get("labels")
+    wrapper_value = labels.get(WRAPPER_LABEL_KEY) if isinstance(labels, dict) else None
+    permission_level = result.body.get("permission_level")
+    if (
+        native_coding_agent_for_wrapper_label(
+            wrapper_value if isinstance(wrapper_value, str) else None
+        )
+        is not None
+        and isinstance(permission_level, int)
+        and permission_level < LEVEL_OWNER
+    ):
+        import shlex
+
+        attach_command = (
+            f"{cli_invocation()} attach {shlex.quote(conversation_id)} "
+            f"--server {shlex.quote(base_url)}"
+        )
+        raise click.ClickException(
+            "Only the session owner can open its native TUI because raw terminal input "
+            "cannot be attributed to a collaborator. Use "
+            f"`{attach_command}` for attributed transcript collaboration."
+        )
+    return _OpenSessionBinding(
+        host_id=host_value if isinstance(host_value, str) and host_value else None,
+        wrapper_label=(
+            wrapper_value if isinstance(wrapper_value, str) and wrapper_value else None
+        ),
+    )
+
+
+def _recover_open_session_once(
+    *,
+    base_url: str,
+    conversation_id: str,
+) -> _OpenRecoveryAttempt:
+    """Ask the server to ensure the session's runner and terminal are ready."""
+    from omnigent.claude_native_bridge import url_component
+
+    binding = _read_open_session_binding(
+        base_url=base_url,
+        conversation_id=conversation_id,
+    )
+    result = _host_http_json(
+        base_url=base_url,
+        method="POST",
+        path=f"/v1/sessions/{url_component(conversation_id)}/events",
+        json_body={"type": "retry_session", "data": {}},
+        timeout_s=120.0,
+        host_id=binding.host_id,
+    )
+    if 200 <= result.status_code < 300:
+        recovery = result.body.get("recovery") if isinstance(result.body, dict) else None
+        if recovery in _OPEN_READY_RECOVERIES:
+            return _OpenRecoveryAttempt(
+                ready=True,
+                detail="",
+                host_id=binding.host_id,
+                wrapper_label=binding.wrapper_label,
+            )
+        raise click.ClickException(
+            f"Server returned an unknown recovery result for session {conversation_id!r}: "
+            f"{recovery!r}."
+        )
+    if result.status_code == 503 and _host_error_code(result.body) == "runner_unavailable":
+        return _OpenRecoveryAttempt(
+            ready=False,
+            detail=_host_error_text(result.body),
+            host_id=binding.host_id,
+            wrapper_label=binding.wrapper_label,
+        )
+    if result.status_code == 0:
+        raise _OpenTransientError(
+            f"Couldn't recover session {conversation_id!r}: {_host_error_text(result.body)}"
+        )
+    if result.status_code >= 500:
+        raise _OpenTransientError(
+            f"Couldn't recover session {conversation_id!r} ({result.status_code}): "
+            f"{_host_error_text(result.body)}"
+        )
+    raise click.ClickException(
+        f"Couldn't recover session {conversation_id!r} ({result.status_code}): "
+        f"{_host_error_text(result.body)}"
+    )
+
+
+def _maybe_reconnect_open_session_local_host(
+    *,
+    base_url: str,
+    host_id: str | None,
+) -> _OpenLocalReconnect:
+    """Start this machine's host daemon only when the stored binding belongs here."""
+    if host_id is None:
+        return _OpenLocalReconnect(attempted=False)
+    from omnigent.host.identity import load_host_identity_if_present
+
+    try:
+        identity = load_host_identity_if_present()
+        if identity is None or identity.host_id != host_id:
+            return _OpenLocalReconnect(attempted=False)
+        click.echo("The session belongs to this machine; reconnecting its host in the background.")
+        config_changed = _ensure_host_daemon(base_url)
+    except (OSError, ValueError, click.ClickException):
+        return _OpenLocalReconnect(attempted=False)
+    if not config_changed:
+        return _OpenLocalReconnect(attempted=True)
+
+    restarted_server_url = _discover_local_server_url()
+    _update_daemon_resolved_server_url(_LOCAL_DAEMON_MARKER, restarted_server_url)
+    return _OpenLocalReconnect(
+        attempted=True,
+        restarted_server_url=restarted_server_url,
+    )
+
+
+def _open_rerun_command(*, base_url: str, conversation_id: str) -> str:
+    """Build the exact recovery command for a restarted local server."""
+    import shlex
+
+    return (
+        f"{cli_invocation()} open {shlex.quote(conversation_id)} --server {shlex.quote(base_url)}"
+    )
+
+
+def _open_unavailable_message(
+    *,
+    base_url: str,
+    conversation_id: str,
+    attempt: _OpenRecoveryAttempt,
+    waiting: bool,
+) -> str:
+    """Build the one-time recovery instructions shown in a durable pane."""
+    import shlex
+
+    invocation = cli_invocation()
+    quoted_server = shlex.quote(base_url)
+    lines = [f"Session {conversation_id!r} is offline: {attempt.detail}"]
+    if attempt.host_id is not None:
+        lines.extend(
+            [
+                "Reconnect its original machine:",
+                f"  {invocation} host --background --server {quoted_server}",
+            ]
+        )
+    else:
+        lines.append("The session is not currently bound to a reconnectable host.")
+    if waiting:
+        lines.append(
+            f"Waiting for it to reconnect; retrying every {_OPEN_RETRY_INTERVAL_S:g}s. "
+            "Press Ctrl-C to stop."
+        )
+    return "\n".join(lines)
+
+
+def _recover_open_session_while_waiting(
+    *,
+    base_url: str,
+    conversation_id: str,
+    previous: _OpenRecoveryAttempt,
+) -> _OpenRecoveryAttempt:
+    """Retry recovery while retaining placement across a temporary outage."""
+    try:
+        return _recover_open_session_once(
+            base_url=base_url,
+            conversation_id=conversation_id,
+        )
+    except _OpenTransientError as exc:
+        logging.getLogger(__name__).debug(
+            "open recovery for %s is temporarily unavailable: %s",
+            conversation_id,
+            exc,
+        )
+        return previous
+
+
+async def _run_open_blocking(call: Callable[[], Any]) -> Any:
+    """Run blocking recovery without making asyncio shutdown wait on it."""
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Any] = loop.create_future()
+
+    def run() -> None:
+        try:
+            result = call()
+        except Exception as exc:  # noqa: BLE001 - propagate the callable's failure
+
+            def deliver_error(error: Exception = exc) -> None:
+                if not future.done():
+                    future.set_exception(error)
+
+            deliver = deliver_error
+        else:
+
+            def deliver_result(value: Any = result) -> None:
+                if not future.done():
+                    future.set_result(value)
+
+            deliver = deliver_result
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(deliver)
+
+    threading.Thread(target=run, name="omnigent-open-recovery", daemon=True).start()
+    return await future
+
+
+async def _recover_open_session_once_async(
+    *,
+    base_url: str,
+    conversation_id: str,
+) -> _OpenRecoveryAttempt:
+    """Run one recovery attempt without tying cancellation to its HTTP timeout."""
+    result = await _run_open_blocking(
+        lambda: _recover_open_session_once(
+            base_url=base_url,
+            conversation_id=conversation_id,
+        )
+    )
+    return cast(_OpenRecoveryAttempt, result)
+
+
+async def _recover_open_session_while_waiting_async(
+    *,
+    base_url: str,
+    conversation_id: str,
+    previous: _OpenRecoveryAttempt,
+) -> _OpenRecoveryAttempt:
+    """Async cancellation-aware form of the durable recovery retry."""
+    result = await _run_open_blocking(
+        lambda: _recover_open_session_while_waiting(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            previous=previous,
+        )
+    )
+    return cast(_OpenRecoveryAttempt, result)
+
+
+def _wait_for_open_session(
+    *,
+    base_url: str,
+    conversation_id: str,
+    attempt: _OpenRecoveryAttempt,
+    no_wait: bool,
+) -> _OpenRecoveryAttempt:
+    """Wait until one recovery attempt becomes attachable."""
+    if not attempt.ready:
+        local_reconnect = _maybe_reconnect_open_session_local_host(
+            base_url=base_url,
+            host_id=attempt.host_id,
+        )
+        if local_reconnect.restarted_server_url is not None:
+            restarted_url = local_reconnect.restarted_server_url
+            _exit_for_auth_mode_change(
+                restarted_url,
+                rerun_command=_open_rerun_command(
+                    base_url=restarted_url,
+                    conversation_id=conversation_id,
+                ),
+            )
+        if local_reconnect.attempted:
+            attempt = _recover_open_session_while_waiting(
+                base_url=base_url,
+                conversation_id=conversation_id,
+                previous=attempt,
+            )
+    if attempt.ready:
+        return attempt
+    if no_wait:
+        raise click.ClickException(
+            _open_unavailable_message(
+                base_url=base_url,
+                conversation_id=conversation_id,
+                attempt=attempt,
+                waiting=False,
+            )
+        )
+    click.echo(
+        _open_unavailable_message(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            attempt=attempt,
+            waiting=True,
+        )
+    )
+    while not attempt.ready:
+        time.sleep(_OPEN_RETRY_INTERVAL_S)
+        attempt = _recover_open_session_while_waiting(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            previous=attempt,
+        )
+    click.echo("Session is ready; attaching.")
+    return attempt
+
+
+async def _wait_for_open_session_async(
+    *,
+    base_url: str,
+    conversation_id: str,
+    attempt: _OpenRecoveryAttempt,
+) -> _OpenRecoveryAttempt:
+    """Cancellation-aware wait used by a native terminal reconnect."""
+    import asyncio
+
+    local_reconnect = _OpenLocalReconnect(attempted=False)
+    if not attempt.ready:
+        local_reconnect = cast(
+            _OpenLocalReconnect,
+            await _run_open_blocking(
+                lambda: _maybe_reconnect_open_session_local_host(
+                    base_url=base_url,
+                    host_id=attempt.host_id,
+                )
+            ),
+        )
+    if local_reconnect.restarted_server_url is not None:
+        restarted_url = local_reconnect.restarted_server_url
+        _exit_for_auth_mode_change(
+            restarted_url,
+            rerun_command=_open_rerun_command(
+                base_url=restarted_url,
+                conversation_id=conversation_id,
+            ),
+        )
+    if local_reconnect.attempted:
+        attempt = await _recover_open_session_while_waiting_async(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            previous=attempt,
+        )
+    if attempt.ready:
+        return attempt
+    click.echo(
+        _open_unavailable_message(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            attempt=attempt,
+            waiting=True,
+        )
+    )
+    while not attempt.ready:
+        await asyncio.sleep(_OPEN_RETRY_INTERVAL_S)
+        attempt = await _recover_open_session_while_waiting_async(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            previous=attempt,
+        )
+    click.echo("Session is ready; attaching.")
+    return attempt
+
+
+def _attach_recovered_open_session(
+    *,
+    base_url: str,
+    conversation_id: str,
+    attempt: _OpenRecoveryAttempt,
+    client_tools: str | None,
+    debug_events: bool,
+    auto_open_conversation: bool,
+    no_wait: bool,
+) -> None:
+    """Attach the recovered session without changing its runner placement."""
+    from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+
+    native_agent = native_coding_agent_for_wrapper_label(attempt.wrapper_label)
+    if native_agent is not None:
+        import asyncio
+
+        from omnigent.claude_native import _attach_with_reconnect, attach_local_terminal
+        from omnigent.conversation_browser import open_conversation_link_if_enabled
+        from omnigent.entities.session_resources import terminal_resource_id
+        from omnigent.native_terminal import terminal_attach_url
+
+        open_conversation_link_if_enabled(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            enabled=auto_open_conversation,
+            warn=lambda message: click.echo(message, err=True),
+        )
+        terminal_id = terminal_resource_id(native_agent.terminal_name, "main")
+        headers = _host_request_headers(base_url=base_url, host_id=attempt.host_id)
+
+        async def _recover_native_attach() -> None:
+            """Recover placement and refresh routing/auth before a reconnect."""
+            nonlocal attempt
+            next_attempt = await _recover_open_session_once_async(
+                base_url=base_url,
+                conversation_id=conversation_id,
+            )
+            attempt = await _wait_for_open_session_async(
+                base_url=base_url,
+                conversation_id=conversation_id,
+                attempt=next_attempt,
+            )
+            headers.clear()
+            headers.update(_host_request_headers(base_url=base_url, host_id=attempt.host_id))
+
+        asyncio.run(
+            _attach_with_reconnect(
+                attach=attach_local_terminal,
+                attach_url=terminal_attach_url(base_url, conversation_id, terminal_id),
+                headers=headers,
+                recover=None if no_wait else _recover_native_attach,
+                base_url=base_url,
+                session_id=conversation_id,
+                terminal_id=terminal_id,
+                close_attach_on_terminal_gone=True,
+            )
+        )
+        return
+
+    from omnigent.chat import run_attach
+
+    suppress_slice_key_for_host = None
+    if attempt.host_id is not None:
+        with _host_http_headers_lock:
+            if (base_url, attempt.host_id) in _host_http_keyless_demotions:
+                suppress_slice_key_for_host = attempt.host_id
+    run_attach(
+        base_url=base_url,
+        conversation_id=conversation_id,
+        client_tools=client_tools,
+        debug_events=debug_events,
+        auto_open_conversation=auto_open_conversation,
+        suppress_slice_key_for_host=suppress_slice_key_for_host,
+    )
+
+
+@cli.command("open")
+@click.argument("conversation", required=False, metavar="[CONVERSATION_ID]")
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "AP server storing the session. Defaults to the configured server, "
+        "or a local server already running in the background."
+    ),
+)
+@click.option(
+    "--no-wait",
+    is_flag=True,
+    default=False,
+    help="Exit when recovery needs user action instead of waiting for a host.",
+)
+@click.option(
+    "--tools",
+    default=None,
+    help="Client-side tool set name (e.g. 'coding') for shell access.",
+)
+@click.option(
+    "--debug-events",
+    "debug_events",
+    is_flag=True,
+    default=False,
+    help=(
+        "Enable the SSE-to-UI debug pipeline: Ctrl+E event tape "
+        "overlay, JSONL event log (~/.omnigent/debug/), and "
+        "pipeline stage counters in the toolbar."
+    ),
+)
+def open_session(
+    conversation: str | None,
+    server: str | None,
+    no_wait: bool,
+    tools: str | None,
+    debug_events: bool,
+) -> None:
+    """Recover a stored session and attach its REPL or native TUI.
+
+    ``open`` first ensures the stored runner and native terminal are ready. If
+    the original host is offline, it keeps the terminal pane open and retries
+    until that host reconnects. Use ``--no-wait`` for scripts.
+
+    \b
+    Examples:
+      omnigent open conv_abc123
+      omnigent open conv_abc123 --no-wait
+    """
+    cfg = _load_effective_config()
+    base_url = _resolve_attach_server(server, cfg.get("server"))
+    if base_url is None:
+        raise click.ClickException(
+            "No server to open the session from. Start one with "
+            f"`{cli_invocation()} start`, or point at one with `--server <url>`."
+        )
+    if conversation is None:
+        raise click.ClickException(
+            "Nothing to open: provide a stored session id. Run "
+            f"`{cli_invocation()} host status` to list sessions."
+        )
+    attempt = _wait_for_open_session(
+        base_url=base_url,
+        conversation_id=conversation,
+        attempt=_recover_open_session_once(
+            base_url=base_url,
+            conversation_id=conversation,
+        ),
+        no_wait=no_wait,
+    )
+
+    _attach_recovered_open_session(
+        base_url=base_url,
+        conversation_id=conversation,
+        attempt=attempt,
+        client_tools=tools,
+        debug_events=debug_events,
+        auto_open_conversation=_resolve_auto_open_conversation_from_config(cfg),
+        no_wait=no_wait,
+    )
+
+
 @cli.command()
 @click.argument("conversation", required=False, metavar="[CONVERSATION_ID]")
 @click.option(
@@ -7900,8 +8530,8 @@ def attach(
     on a server and streams its I/O. It never spawns a server, runner, or
     harness, applies no model/harness defaults, and errors loudly when
     there is nothing live to attach to. To START a session use
-    ``omnigent run``; to reopen/restart a stored one use
-    ``omnigent resume``.
+    ``omnigent run``; to recover and attach a stored one use
+    ``omnigent open``.
 
     \b
     Examples:
@@ -8783,13 +9413,67 @@ def _selected_daemon_records(
     return [] if record is None else [record]
 
 
-# Per-process header cache keyed on base_url. _remote_headers() resolves
+# Per-process header cache keyed on (base_url, host_id). _remote_headers() resolves
 # Databricks SDK credentials which can take ~3 s (SDK shelling out to the
-# Databricks CLI). Within a single CLI invocation the token is valid, so
-# resolving once and reusing it is safe. The lock serialises concurrent
-# resolution for the same URL (two threads must not both pay the cost).
+# Databricks CLI). Reuse the result until the server rejects its bearer;
+# long-lived commands then replace that one cache entry and replay once.
+# The lock serialises concurrent resolution for the same URL (two threads
+# must not both pay the cost).
 _host_http_headers_cache: dict[tuple[str, str | None], dict[str, str]] = {}
 _host_http_headers_lock = threading.Lock()
+_host_http_keyless_demotions: set[tuple[str, str]] = set()
+
+
+def _resolve_host_request_headers(
+    *,
+    base_url: str,
+    host_id: str | None,
+    rejected_headers: dict[str, str] | None = None,
+) -> tuple[dict[str, str], bool]:
+    """Resolve cached headers and snapshot whether this request was demoted."""
+    from omnigent.chat import _refreshable_stored_token, _remote_headers
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+
+    cache_key = (base_url, host_id)
+    with _host_http_headers_lock:
+        cached = _host_http_headers_cache.get(cache_key)
+        # Replace only the bearer this caller actually saw rejected. Another
+        # thread may already have refreshed this cache entry while the request
+        # was in flight; preserve that newer value instead of resolving again.
+        rejected_authorization = (
+            rejected_headers.get("Authorization") if rejected_headers is not None else None
+        )
+        if cached is None or (
+            rejected_headers is not None and cached.get("Authorization") == rejected_authorization
+        ):
+            if rejected_authorization and rejected_authorization.startswith("Bearer "):
+                _refreshable_stored_token(
+                    base_url,
+                    force_refresh=True,
+                    rejected_token=rejected_authorization.removeprefix("Bearer "),
+                )
+            cached = _remote_headers(server_url=base_url, host_id=host_id)
+            _host_http_headers_cache[cache_key] = cached
+        headers = dict(cached)
+        keyless = host_id is not None and (base_url, host_id) in _host_http_keyless_demotions
+    if keyless:
+        headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
+    return headers, keyless
+
+
+def _host_request_headers(
+    *,
+    base_url: str,
+    host_id: str | None,
+    rejected_headers: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Resolve cached auth/routing headers, honoring proven keyless hosts."""
+    headers, _keyless = _resolve_host_request_headers(
+        base_url=base_url,
+        host_id=host_id,
+        rejected_headers=rejected_headers,
+    )
+    return headers
 
 
 def _trust_env_for(base_url: str) -> bool:
@@ -8838,20 +9522,9 @@ def _host_http_json(
     """
     import httpx
 
-    from omnigent.chat import _remote_headers
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 
-    try:
-        # Cache the resolved headers per (base_url, host_id): the auth resolution
-        # is the expensive part (token mint / CLI shell-out), and the slice-key
-        # varies by the host a call is scoped to, so both belong in the key.
-        cache_key = (base_url, host_id)
-        if cache_key not in _host_http_headers_cache:
-            with _host_http_headers_lock:
-                if cache_key not in _host_http_headers_cache:
-                    _host_http_headers_cache[cache_key] = _remote_headers(
-                        server_url=base_url, host_id=host_id
-                    )
-        headers = _host_http_headers_cache[cache_key]
+    def _send(headers: dict[str, str]) -> tuple[_HostHttpResult, bool]:
         with httpx.Client(
             base_url=base_url,
             headers=headers,
@@ -8859,6 +9532,83 @@ def _host_http_json(
             trust_env=_trust_env_for(base_url),
         ) as client:
             resp = client.request(method, path, params=params, json=json_body)
+        body: _HostJsonObject | str
+        try:
+            decoded = resp.json()
+        except ValueError:
+            body = resp.text
+        else:
+            body = cast(_HostJsonObject, decoded) if isinstance(decoded, dict) else str(decoded)
+        location = resp.headers.get("location", "")
+        auth_rejected = resp.status_code in (401, 403) or (
+            300 <= resp.status_code < 400 and ("/oidc/" in location or "/.auth/" in location)
+        )
+        return _HostHttpResult(status_code=resp.status_code, body=body), auth_rejected
+
+    try:
+        demotion_key = (base_url, host_id) if host_id is not None else None
+
+        def _send_with_routing_fallback(
+            headers: dict[str, str],
+            *,
+            was_demoted: bool,
+        ) -> tuple[_HostHttpResult, bool]:
+            result, auth_rejected = _send(headers)
+            keyed = OMNIGENT_SLICE_KEY_HEADER in headers
+            if (
+                keyed
+                and result.status_code == 400
+                and _host_error_code(result.body) == "wrong_replica"
+            ):
+                retry_headers = dict(headers)
+                retry_headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
+                result, auth_rejected = _send(retry_headers)
+                if (
+                    demotion_key is not None
+                    and result.status_code != 0
+                    and _host_error_code(result.body) != "wrong_replica"
+                ):
+                    with _host_http_headers_lock:
+                        _host_http_keyless_demotions.add(demotion_key)
+            elif (
+                demotion_key is not None
+                and was_demoted
+                and not keyed
+                and result.status_code == 400
+                and _host_error_code(result.body) == "wrong_replica"
+            ):
+                retry_headers = dict(headers)
+                assert host_id is not None
+                retry_headers[OMNIGENT_SLICE_KEY_HEADER] = host_id
+                result, auth_rejected = _send(retry_headers)
+                if result.status_code != 0 and _host_error_code(result.body) != "wrong_replica":
+                    with _host_http_headers_lock:
+                        _host_http_keyless_demotions.discard(demotion_key)
+            return result, auth_rejected
+
+        headers, was_demoted = _resolve_host_request_headers(
+            base_url=base_url,
+            host_id=host_id,
+        )
+        result, auth_rejected = _send_with_routing_fallback(
+            headers,
+            was_demoted=was_demoted,
+        )
+        if auth_rejected:
+            # A long-lived ``open`` wait or native reconnect can outlive its
+            # initial OAuth bearer. Re-resolve only after a definitive auth
+            # signal and replay this request at most once.
+            refreshed_headers, refreshed_was_demoted = _resolve_host_request_headers(
+                base_url=base_url,
+                host_id=host_id,
+                rejected_headers=headers,
+            )
+            if refreshed_headers.get("Authorization") != headers.get("Authorization"):
+                result, _auth_rejected = _send_with_routing_fallback(
+                    refreshed_headers,
+                    was_demoted=refreshed_was_demoted,
+                )
+        return result
     except (httpx.HTTPError, OSError, ImportError) as exc:
         # httpx raises ImportError while building the client when the ambient
         # environment selects a proxy whose optional extra is missing (e.g. an
@@ -8867,14 +9617,6 @@ def _host_http_json(
             status_code=0,
             body=f"{type(exc).__name__}: {exc}",
         )
-    body: _HostJsonObject | str
-    try:
-        decoded = resp.json()
-    except ValueError:
-        body = resp.text
-    else:
-        body = cast(_HostJsonObject, decoded) if isinstance(decoded, dict) else str(decoded)
-    return _HostHttpResult(status_code=resp.status_code, body=body)
 
 
 def _host_error_text(body: _HostJsonObject | str) -> str:
