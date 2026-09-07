@@ -15,6 +15,7 @@ ALLOWED_PROJECT_ENUMS = frozenset({"chatgpt-playground", "planar-jacobian", "pla
 PERSONAL_QUOTA_ROUTE = "personal-llmq"
 WORK_QUOTA_ROUTE = "work-vertex"
 ALLOWED_QUOTA_ROUTES = frozenset({PERSONAL_QUOTA_ROUTE, WORK_QUOTA_ROUTE})
+LEGACY_PERSONAL_PROJECT_ENUM = "planar-jacobian"
 
 
 class LaunchProjectStore(Protocol):
@@ -54,7 +55,13 @@ def resolve_launch_attribution(
     """Resolve routing from an authoritative project row for every harness."""
     del harness  # Classification is project-owned, never harness- or env-inferred.
     if conversation.project_id is None:
-        raise ProjectAttributionError("Omnigent host launch requires a project")
+        # Pre-project sessions are personal by construction.  Preserve their
+        # availability with the conservative agent-infra default; explicitly
+        # projected work remains the only path to the Vertex route below.
+        return LaunchAttribution(
+            quota_route=PERSONAL_QUOTA_ROUTE,
+            project_enum=LEGACY_PERSONAL_PROJECT_ENUM,
+        )
     if project_store is None:
         raise ProjectAttributionError("Omnigent host launch requires the project store")
     project = project_store.get_for_session_launch(conversation.project_id)

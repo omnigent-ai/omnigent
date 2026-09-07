@@ -57,13 +57,16 @@ def test_personal_native_launch_uses_project_store_name() -> None:
 
 
 @pytest.mark.parametrize("harness", ["codex-native", "claude-native"])
-def test_personal_native_launch_fails_closed_without_project(harness: str) -> None:
-    with pytest.raises(ProjectAttributionError, match="project"):
-        resolve_launch_project_enum(
-            _conversation(project_id=None),
-            harness=harness,
-            project_store=_store(),
-        )
+def test_legacy_unprojected_native_launch_defaults_to_personal_agent_infra(
+    harness: str,
+) -> None:
+    attribution = resolve_launch_attribution(
+        _conversation(project_id=None),
+        harness=harness,
+        project_store=_store(),
+    )
+    assert attribution.quota_route == "personal-llmq"
+    assert attribution.project_enum == "planar-jacobian"
 
 
 def test_personal_native_launch_rejects_unknown_project_name() -> None:
@@ -88,10 +91,12 @@ def test_legacy_label_cannot_override_project_store() -> None:
 
 
 def test_non_personal_harness_preserves_legacy_behavior_without_project_store() -> None:
-    with pytest.raises(ProjectAttributionError, match="project"):
+    assert (
         resolve_launch_project_enum(
             _conversation(project_id=None), harness="claude-sdk", project_store=None
         )
+        == "planar-jacobian"
+    )
 
 
 def test_every_harness_carries_personal_route_and_project() -> None:
