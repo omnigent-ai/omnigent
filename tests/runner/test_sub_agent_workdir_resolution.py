@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.native.orchestration import (
     ResolvedSpec,
     _resolve_sub_agent_spec_entry,
@@ -89,11 +90,16 @@ def test_resolution_always_wraps_never_substitutes_the_parent(bundle: Path) -> N
     assert resolved.spec is not parent_entry.spec
 
 
-def test_unknown_sub_agent_name_returns_none(bundle: Path) -> None:
-    """A lookup miss yields ``None`` so callers can decline to swap."""
+def test_unknown_sub_agent_name_fails_loud(bundle: Path) -> None:
+    """A lookup miss cannot leave callers running with the parent spec."""
     entry = ResolvedSpec(spec=parse(bundle), workdir=bundle)
 
-    assert _resolve_sub_agent_spec_entry(entry, "nope") is None
+    with pytest.raises(OmnigentError) as exc_info:
+        _resolve_sub_agent_spec_entry(entry, "nope")
+
+    assert exc_info.value.code == ErrorCode.SUB_AGENT_UNRESOLVED
+    assert "nope" in exc_info.value.message
+    assert "manager" in exc_info.value.message
 
 
 def test_synthetic_web_researcher_gets_no_workdir(bundle: Path) -> None:

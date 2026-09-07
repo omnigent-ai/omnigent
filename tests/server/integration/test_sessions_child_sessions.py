@@ -1445,8 +1445,10 @@ async def test_subagent_create_rejects_undeclared_name(
     )
     assert resp.status_code == 404, resp.text
     error = resp.json()["error"]
-    assert error["code"] == "not_found"
+    assert error["code"] == "sub_agent_unresolved"
     assert "does-not-exist" in error["message"]
+    assert "orch-undeclared-subagent" in error["message"]
+    assert "impl" in error["message"]
 
 
 @pytest.mark.parametrize(
