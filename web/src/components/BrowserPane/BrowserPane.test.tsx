@@ -80,7 +80,9 @@ describe("BrowserPane cold-start (no view yet)", () => {
       ),
     );
     expect(screen.getByRole("button", { name: "Go back" })).toBeEnabled();
-    expect(bridge.browserSetActive).toHaveBeenCalledWith("browser-tab:conv_a:two");
+    await waitFor(() =>
+      expect(bridge.browserSetActive).toHaveBeenCalledWith("browser-tab:conv_a:two"),
+    );
     cleanup();
     expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null);
   });

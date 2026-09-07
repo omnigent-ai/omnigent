@@ -130,6 +130,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
   // Design-mode toggle: on, the main process injects the in-page picker; submit
   // routing lives in AppShell. This flag only drives the button + enable/disable IPC.
   const [designMode, setDesignMode] = useState(false);
+  const designModeRef = useRef(false);
 
   // Feed `viewActive` from three signals so the placeholder mounts exactly when
   // a view exists: (1) browser-view-created — first navigate (often detached,
@@ -251,9 +252,11 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
     const bridge = getBridge();
     if (!bridge) return;
     if (designMode) {
+      designModeRef.current = false;
       void bridge.browserDisableDesignMode?.(conversationId);
       setDesignMode(false);
     } else {
+      designModeRef.current = true;
       void bridge.browserEnableDesignMode?.(conversationId);
       setDesignMode(true);
     }
@@ -262,7 +265,10 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
   // If the view goes away (closed) while design mode is on, drop the pressed
   // state so the button doesn't lie — the injected picker died with the view.
   useEffect(() => {
-    if (!viewActive && designMode) setDesignMode(false);
+    if (!viewActive && designMode) {
+      designModeRef.current = false;
+      setDesignMode(false);
+    }
   }, [viewActive, designMode]);
 
   // Measure the placeholder and push bounds to the main process. These are
@@ -323,7 +329,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
     return () => {
       cancelled = true;
       lastBoundsRef.current = null;
-      if (designMode) void getBridge()?.browserDisableDesignMode?.(conversationId);
+      if (designModeRef.current) void getBridge()?.browserDisableDesignMode?.(conversationId);
       // Detach whatever is currently active (this pane owned it). The view
       // survives in the registry; only an explicit close destroys it.
       try {
@@ -332,7 +338,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
         /* swallow — window may be tearing down */
       }
     };
-  }, [conversationId, browserSupported, designMode, viewActive, syncBounds]);
+  }, [conversationId, browserSupported, viewActive, syncBounds]);
 
   // Reconcile bounds every frame while shown (cheap: same-rect setBounds is a
   // no-op + we dedupe via lastBoundsRef). Catches position-only shifts that

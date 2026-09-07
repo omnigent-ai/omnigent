@@ -2052,7 +2052,6 @@ export function AppShell() {
               push panels below sit outside the group. */}
                 {conversationId && workspacePanelVisible && (
                   <WorkspacePanel
-                    key={conversationId}
                     conversationId={conversationId}
                     width={inlinePanelWidth}
                     inert={inlinePanelWidth === 0}
