@@ -76,10 +76,16 @@ class Verdict:
 # the routing table the session-event handler reads to set the result.
 _pending: dict[str, asyncio.Future[Verdict]] = {}
 
-# Only server-issued policy approvals are safe to replay from their original
-# tool call. Inline external MCP elicitations may already have performed work,
-# so reconnects must leave those parked on their original Future.
+# Waits whose presentation state belongs to the disconnected server. Their
+# callers decide whether to recreate a policy gate or re-publish a suspended
+# external MCP prompt; this registry only supplies the reconnect signal.
 _retry_on_server_reconnect: set[str] = set()
+
+# Monotonic runner-local server generation plus callers waiting for the next
+# successful tunnel hello. Proxy calls use this to avoid retrying until the
+# replacement server can route back to the retained runner operation.
+_server_generation = 0
+_server_reconnect_waiters: set[asyncio.Future[int]] = set()
 
 # Per-session count of outstanding ASK verdicts (a session may have more
 # than one parked at once — e.g. parallel tool calls that each tripped a
@@ -156,17 +162,45 @@ def cleanup(elicitation_id: str) -> None:
     _retry_on_server_reconnect.discard(elicitation_id)
 
 
+def current_server_generation() -> int:
+    """Return the number of successful server reconnections observed."""
+    return _server_generation
+
+
+async def wait_for_server_reconnect(
+    after_generation: int,
+    *,
+    timeout_seconds: float,
+) -> int:
+    """Wait until a successful tunnel hello advances the server generation."""
+    if _server_generation > after_generation:
+        return _server_generation
+    future: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+    _server_reconnect_waiters.add(future)
+    if _server_generation > after_generation and not future.done():
+        future.set_result(_server_generation)
+    try:
+        return await asyncio.wait_for(future, timeout=timeout_seconds)
+    finally:
+        _server_reconnect_waiters.discard(future)
+
+
 def notify_server_reconnect() -> int:
-    """Wake approval waits whose server-owned state must be recreated.
+    """Wake waits whose server-owned state must be recreated.
 
     The surviving runner receives this signal after its tunnel connects to a
-    new server generation. Opted-in callers retry the operation that produced
-    the approval, causing the server to evaluate policy and publish a fresh,
-    answerable prompt. Other waits are intentionally untouched because an
-    external MCP elicitation is not generally safe to replay.
+    new server generation. Opted-in callers either repeat a not-yet-executed
+    policy check or re-publish an external prompt whose original execution is
+    retained separately. Other waits are intentionally untouched.
 
     :returns: Number of pending waits notified.
     """
+    global _server_generation
+    _server_generation += 1
+    for waiter in tuple(_server_reconnect_waiters):
+        if not waiter.done():
+            waiter.set_result(_server_generation)
+
     notified = 0
     for elicitation_id in tuple(_retry_on_server_reconnect):
         fut = _pending.get(elicitation_id)
@@ -318,6 +352,11 @@ def reset_for_tests() -> None:
     Clear the registry. For test isolation only — leaked Futures
     from one test silently change the behavior of the next.
     """
+    global _server_generation
     _pending.clear()
     _retry_on_server_reconnect.clear()
     _session_pending.clear()
+    for waiter in tuple(_server_reconnect_waiters):
+        waiter.cancel()
+    _server_reconnect_waiters.clear()
+    _server_generation = 0

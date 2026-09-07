@@ -68,6 +68,11 @@ from omnigent.policies.types import (
     EvaluationContext,
     PolicyResult,
 )
+from omnigent.runner.mcp_execution_registry import (
+    MCP_OPERATION_ID_PARAM,
+    RUNNER_MCP_EXECUTION_DETACHED_CODE,
+    RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
+)
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
@@ -9193,7 +9198,23 @@ async def _handle_mcp_tools_call(
     arguments: dict[str, Any] = params.get("arguments") or {}
     request_state_str: str | None = params.get("requestState")
     input_responses: dict[str, Any] = params.get("inputResponses") or {}
+    operation_id_value = params.get(MCP_OPERATION_ID_PARAM)
+    if operation_id_value is not None and not (
+        isinstance(operation_id_value, str) and 1 <= len(operation_id_value) <= 128
+    ):
+        return _mcp_error_response(rpc_id, -32000, "Invalid runner MCP operation id")
+    operation_id = cast("str | None", operation_id_value)
     is_retry = request_state_str is not None
+
+    def _runner_execute_body(
+        execute_params: dict[str, Any],
+        *,
+        step: str,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"method": "tools/call", "params": execute_params}
+        if operation_id is not None:
+            body["_omnigent_operation"] = {"id": operation_id, "step": step}
+        return body
 
     _logger.debug(
         "MCP tools/call: session=%r tool=%r is_retry=%r",
@@ -9424,16 +9445,25 @@ async def _handle_mcp_tools_call(
 
         exec_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/mcp/execute",
-            json={
-                "method": "tools/call",
-                "params": {"name": namespaced_name, "arguments": arguments},
-            },
+            json=_runner_execute_body(
+                {"name": namespaced_name, "arguments": arguments},
+                step="initial",
+            ),
             # ``sys_session_send`` returns a launch handle immediately; this
             # timeout now protects ordinary runner proxy hangs.
             timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
         )
         exec_resp.raise_for_status()
         exec_data = exec_resp.json()
+    except ConnectionError as exc:
+        _logger.warning("Runner MCP execute detached: %s", exc, exc_info=True)
+        if operation_id is not None:
+            return _mcp_error_response(
+                rpc_id,
+                RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
+            )
+        return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
     except Exception as exc:  # noqa: BLE001
         _logger.warning("Runner MCP execute failed: %s", exc, exc_info=True)
         return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
@@ -9489,19 +9519,28 @@ async def _handle_mcp_tools_call(
         try:
             retry_resp = await runner_client.post(
                 f"/v1/sessions/{session_id}/mcp/execute",
-                json={
-                    "method": "tools/call",
-                    "params": {
+                json=_runner_execute_body(
+                    {
                         "name": namespaced_name,
                         "arguments": arguments,
                         "inputResponses": elicitation_responses,
                         "requestState": mcp_request_state,
                     },
-                },
+                    step="elicitation-response",
+                ),
                 timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
             )
             retry_resp.raise_for_status()
             exec_data = retry_resp.json()
+        except ConnectionError as exc:
+            _logger.warning("Runner MCP retry detached: %s", exc, exc_info=True)
+            if operation_id is not None:
+                return _mcp_error_response(
+                    rpc_id,
+                    RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                    RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
+                )
+            return _mcp_error_response(rpc_id, -32000, "Runner MCP retry failed.")
         except Exception as exc:  # noqa: BLE001
             _logger.warning("Runner MCP retry failed: %s", exc, exc_info=True)
             return _mcp_error_response(rpc_id, -32000, "Runner MCP retry failed.")

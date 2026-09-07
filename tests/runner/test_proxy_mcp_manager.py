@@ -23,6 +23,12 @@ import httpx
 import pytest
 
 from omnigent.runner import pending_approvals
+from omnigent.runner.mcp_execution_registry import (
+    MCP_OPERATION_ID_PARAM,
+    RUNNER_MCP_EXECUTION_DETACHED_CODE,
+    McpExecutionRegistry,
+    McpExecutionResult,
+)
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.spec.types import AgentSpec, MCPServerConfig
@@ -444,6 +450,87 @@ async def test_call_tool_recreates_approval_after_server_reconnect() -> None:
     assert retry_params["requestState"] == "new-state"
     assert new_elicitation in retry_params["inputResponses"]
     assert old_elicitation not in retry_params["inputResponses"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_reattaches_retained_execution_after_server_disconnect() -> None:
+    """A replacement server attaches to the original runner-owned operation."""
+    registry = McpExecutionRegistry()
+
+    class _DetachThenSucceedTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.calls: list[_Call] = []
+            self.external_invocations = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(_Call(url=str(request.url), body=body))
+            operation_id = body["params"][MCP_OPERATION_ID_PARAM]
+            if len(self.calls) == 1:
+
+                async def _retained_work() -> McpExecutionResult:
+                    self.external_invocations += 1
+                    return McpExecutionResult(
+                        status_code=200,
+                        content={"result": {"output": "retained"}},
+                    )
+
+                await registry.execute(
+                    session_id="conv_test",
+                    operation_id=operation_id,
+                    step="initial",
+                    params={"name": "github__deploy", "arguments": {}},
+                    run=_retained_work,
+                )
+                return _json_resp(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "error": {
+                            "code": RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                            "message": "Runner MCP execution detached.",
+                        },
+                    }
+                )
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "reattached"}],
+                        "isError": False,
+                    },
+                }
+            )
+
+    transport = _DetachThenSucceedTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(manager.call_tool(None, "github__deploy", {}))
+    try:
+        for _ in range(1000):
+            if transport.calls:
+                break
+            await asyncio.sleep(0.001)
+        pending_approvals.notify_server_reconnect()
+
+        assert await task == "reattached"
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert transport.external_invocations == 1
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    first_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert retry_params == first_params
+    assert first_params[MCP_OPERATION_ID_PARAM].startswith("mcpop_")
 
 
 @pytest.mark.asyncio

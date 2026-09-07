@@ -24,8 +24,10 @@ When to use each implementation:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import uuid
 from collections.abc import Callable
 from typing import cast
 
@@ -33,6 +35,11 @@ import httpx
 
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.runner import pending_approvals
+from omnigent.runner.mcp_execution_registry import (
+    MCP_OPERATION_ID_PARAM,
+    RUNNER_MCP_EXECUTION_DETACHED_CODE,
+    McpExecutionRegistry,
+)
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
 from omnigent.spec.types import AgentSpec
@@ -40,6 +47,7 @@ from omnigent.spec.types import AgentSpec
 _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
+_SERVER_RECONNECT_WAIT_S = 120.0
 
 
 def _json_object(value: object) -> _JsonObject | None:
@@ -151,6 +159,7 @@ class ProxyMcpManager:
         session_id: str,
         ap_client: httpx.AsyncClient,
         publish_event: _EventPublisher | None = None,
+        execution_registry: McpExecutionRegistry | None = None,
     ) -> None:
         """Create a proxy manager bound to one session.
 
@@ -162,10 +171,13 @@ class ProxyMcpManager:
             when the user decides (keeps the approval-badge counter in
             sync).  Pass ``None`` only in test contexts where the badge
             is irrelevant.
+        :param execution_registry: Runner-owned MCP operations that a new
+            server generation can reattach to after a tunnel replacement.
         """
         self._session_id = session_id
         self._omnigent_client = ap_client
         self._publish_event = publish_event
+        self._execution_registry = execution_registry
 
     @property
     def _mcp_url(self) -> str:
@@ -314,19 +326,48 @@ class ProxyMcpManager:
         del spec  # Omnigent server resolves spec from session context
 
         request_id = 1
+        operation_id = f"mcpop_{uuid.uuid4().hex}"
 
         def _initial_payload() -> _JsonObject:
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": "tools/call",
-                "params": {"name": tool_name, "arguments": arguments},
+                "params": {
+                    "name": tool_name,
+                    "arguments": arguments,
+                    MCP_OPERATION_ID_PARAM: operation_id,
+                },
             }
+
+        async def _wait_to_reattach(
+            request_generation: int,
+            cause: BaseException | None = None,
+        ) -> None:
+            registry = self._execution_registry
+            if registry is None or not registry.has_operation(self._session_id, operation_id):
+                raise RuntimeError(
+                    f"MCP proxy call for tool {tool_name!r} in session "
+                    f"{self._session_id!r} lost its server without a retained "
+                    "runner operation"
+                ) from cause
+            try:
+                await pending_approvals.wait_for_server_reconnect(
+                    request_generation,
+                    timeout_seconds=_SERVER_RECONNECT_WAIT_S,
+                )
+            except asyncio.TimeoutError as reconnect_exc:
+                raise RuntimeError(
+                    f"MCP proxy call for tool {tool_name!r} in session "
+                    f"{self._session_id!r} lost its server and no replacement "
+                    f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s"
+                ) from reconnect_exc
 
         payload = _initial_payload()
         approval_retries = 0
 
         while True:
+            request_generation = pending_approvals.current_server_generation()
             try:
                 resp = await self._omnigent_client.post(
                     self._mcp_url,
@@ -344,6 +385,14 @@ class ProxyMcpManager:
                 )
                 resp.raise_for_status()
                 data = _response_json_object(resp)
+            except httpx.TransportError as exc:
+                await _wait_to_reattach(request_generation, exc)
+                # Reattach the new server generation to the same runner-owned
+                # operation. A fresh JSON-RPC id distinguishes this transport
+                # attempt; the operation id prevents external work from replaying.
+                request_id += 1
+                payload = cast("_JsonObject", {**payload, "id": request_id})
+                continue
             except Exception as exc:
                 raise RuntimeError(
                     f"MCP proxy call failed for tool {tool_name!r} in session "
@@ -358,6 +407,11 @@ class ProxyMcpManager:
                     )
                 code = err.get("code")
                 msg = err.get("message", "")
+                if code == RUNNER_MCP_EXECUTION_DETACHED_CODE:
+                    await _wait_to_reattach(request_generation)
+                    request_id += 1
+                    payload = cast("_JsonObject", {**payload, "id": request_id})
+                    continue
                 # -32000 is the MCP convention for server-defined errors (tool
                 # denials, tool errors).  Return as a JSON error string so the
                 # harness feeds the refusal back to the LLM rather than raising.
@@ -423,6 +477,7 @@ class ProxyMcpManager:
                     "params": {
                         "name": tool_name,
                         "arguments": arguments,
+                        MCP_OPERATION_ID_PARAM: operation_id,
                         "requestState": request_state,
                         "inputResponses": {
                             elicitation_id: _input_response(
