@@ -2058,6 +2058,36 @@ describe("touch swipe actions", () => {
     expect(mocks.del.mutate).not.toHaveBeenCalled();
   });
 
+  it("keeps the reveal and committed action aligned through repeated swipe reversals", () => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    const frames: FrameRequestCallback[] = [];
+    const requestFrame = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback) => (frames.push(callback), frames.length));
+    renderSidebar();
+    const li = conversationRow();
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+
+    for (const dx of [-40, 40, -40, 40, -40]) {
+      pointerEventAt("pointerMove", li, { clientX: 100 + dx, clientY: 100 }, 1_100);
+      act(() => frames.splice(0).forEach((frame) => frame(1_116)));
+      expectRevealIcons(li, {
+        shows: dx < 0 ? ".lucide-archive" : ".lucide-trash-2",
+        hides: dx < 0 ? ".lucide-trash-2" : ".lucide-archive",
+      });
+      expect(within(li).getByTestId("conversation-swipe-surface")).toHaveStyle({
+        transform: `translateX(${dx}px)`,
+      });
+      expectNothingCommitted();
+    }
+
+    pointerEventAt("pointerUp", li, { clientX: 10, clientY: 100 }, 1_500);
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+    expect(within(li).queryByTestId("conversation-swipe-reveal")).toBeNull();
+    requestFrame.mockRestore();
+  });
+
   it("opens the delete confirm dialog (no immediate delete) when swiping the delete direction", () => {
     // Default: a leftward finger reveals Delete on the row's right side.
     renderSidebar();
