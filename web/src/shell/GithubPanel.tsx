@@ -927,10 +927,9 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
       >
         {/* Header: repo + PR metadata + the Summary/Changes tabs. Refreshes on
             its own — via the git-activity SSE signal and the panel's CI poll.
-            Padding lives on the title block (not the outer container) so the tabs
-            align to the gutter; pb-2 leaves room for the active tab's underline
-            (anchored 5px below the trigger) to sit just above the border. */}
-        <div className="shrink-0 border-b border-border pb-2">
+            Padding lives on the title block (not the outer container) so the
+            tabs align to the gutter and the underline row spans full width. */}
+        <div className="shrink-0 border-b border-border pb-0.5">
           <div className="px-2 pt-2">
             <span className="block min-w-0 truncate text-xs text-muted-foreground">
               {data.repo?.name_with_owner ?? "GitHub"}
@@ -956,15 +955,10 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
             </div>
           </div>
           {/* Tab bar (Summary | Changes); the diff controls live inside the
-            Changes tab on their own line, so they don't crowd the tabs. Each
-            trigger owns its px-1.5, so pl-0.5 nudges the list right to align
-            "Summary" with the title gutter; gap-0 + flex-none keep the two
-            labels close and content-sized (the default flex-1 equalizes them). */}
-          <TabsList
-            variant="line"
-            aria-label="Pull request"
-            className="mt-1.5 h-auto gap-0 p-0 pl-0.5"
-          >
+            Changes tab on their own line, so they don't crowd the tabs. gap-0 +
+            flex-none keep the two labels close and content-sized (the default
+            flex-1 equalizes and spreads them). */}
+          <TabsList variant="line" aria-label="Pull request" className="mt-1.5 h-auto gap-0 p-0">
             <TabsTrigger value="summary" className="flex-none">
               Summary
             </TabsTrigger>
