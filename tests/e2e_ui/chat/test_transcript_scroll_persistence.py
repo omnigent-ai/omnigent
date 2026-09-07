@@ -93,7 +93,7 @@ _CAPTURE_ANCHOR = f"""
   {_FIND_SCROLLER}
   if (!el) return null;
   const top = el.getBoundingClientRect().top;
-  const rows = [...el.querySelectorAll('[data-bubble-key]')]
+  const rows = [...el.querySelectorAll('[data-bubble-key^="user:"]')]
     .map((node) => {{
       const rect = node.getBoundingClientRect();
       return {{
