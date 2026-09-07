@@ -40,6 +40,8 @@ _TMUX_FILE = "tmux.json"
 _BRIDGE_CONFIG_FILE = "bridge.json"
 _MCP_CONFIG_FILE = "mcp.json"
 _HOOKS_CONFIG_FILE = "hooks.json"
+# Module the usage ``stop`` hook runs; also identifies our entry in hooks.json.
+_USAGE_RECORDER_MODULE = "omnigent.cursor_native_usage"
 _MCP_SERVER_NAME = "omnigent"
 _CURSOR_AUTO_APPROVE_TOOLS = [
     "list_comments",
@@ -388,7 +390,7 @@ def build_hooks_config(bridge_dir: Path, *, python_executable: str | None = None
             python,
             "-I",
             "-m",
-            "omnigent.cursor_native_usage",
+            _USAGE_RECORDER_MODULE,
             "record-usage",
             "--bridge-dir",
             str(bridge_dir),
@@ -397,23 +399,59 @@ def build_hooks_config(bridge_dir: Path, *, python_executable: str | None = None
     return {"version": 1, "hooks": {"stop": [{"command": command}]}}
 
 
+def _is_usage_recorder_hook(entry: object) -> bool:
+    """True when *entry* is an Omnigent usage-recorder ``stop`` hook."""
+    if not isinstance(entry, dict):
+        return False
+    command = entry.get("command")
+    return isinstance(command, str) and _USAGE_RECORDER_MODULE in command
+
+
 def write_hooks_config(
     workspace: Path,
     bridge_dir: Path,
     *,
     python_executable: str | None = None,
 ) -> Path:
-    """Write the workspace-scoped Cursor ``hooks.json`` capturing per-turn usage.
+    """Merge the usage ``stop`` hook into the workspace Cursor ``hooks.json``.
 
     Sibling of :func:`write_mcp_config`: project-scoped Cursor config the TUI
-    loads on launch in a trusted workspace. Returns the written path.
+    loads on launch in a trusted workspace. User-configured hooks are
+    preserved; any stale recorder entry (a previous session's bridge dir) is
+    replaced so exactly one recorder remains. Returns the written path.
     """
     cursor_dir = workspace / ".cursor"
     cursor_dir.mkdir(parents=True, exist_ok=True)
     path = cursor_dir / _HOOKS_CONFIG_FILE
-    payload = build_hooks_config(bridge_dir, python_executable=python_executable)
+
+    loaded: object = None
+    if path.exists():
+        with contextlib.suppress(json.JSONDecodeError, OSError):
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+
+    # A hand-edited hooks.json can hold any JSON shape; discard non-dicts so a
+    # malformed file can't crash the session launch.
+    existing: _JsonObject = loaded if isinstance(loaded, dict) else {}
+    generated = build_hooks_config(bridge_dir, python_executable=python_executable)
+    generated_hooks = generated["hooks"]
+    if not isinstance(generated_hooks, dict):  # pragma: no cover - build_hooks_config invariant
+        raise ValueError("Omnigent hooks config is missing hooks")
+    generated_stop = generated_hooks["stop"]
+    if not isinstance(generated_stop, list):  # pragma: no cover - build_hooks_config invariant
+        raise ValueError("Omnigent hooks config is missing the stop hook")
+
+    existing.setdefault("version", generated["version"])
+    hooks = existing.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+        existing["hooks"] = hooks
+    stop_hooks = hooks.get("stop")
+    if not isinstance(stop_hooks, list):
+        stop_hooks = []
+    hooks["stop"] = [h for h in stop_hooks if not _is_usage_recorder_hook(h)] + generated_stop
+
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return path
 

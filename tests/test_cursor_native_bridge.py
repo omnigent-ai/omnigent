@@ -362,6 +362,62 @@ class TestHooksConfig:
         # No leftover temp file from the atomic write.
         assert not (workspace / ".cursor" / "hooks.json.tmp").exists()
 
+    def test_write_hooks_config_preserves_user_hooks(self, tmp_path: Path) -> None:
+        import json
+
+        workspace = tmp_path / "ws"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        user_hooks = {
+            "version": 1,
+            "hooks": {
+                "stop": [{"command": "/usr/local/bin/notify-done"}],
+                "beforeShellExecution": [{"command": "/usr/local/bin/audit-shell"}],
+            },
+        }
+        (cursor_dir / "hooks.json").write_text(json.dumps(user_hooks))
+        path = cursor_native_bridge.write_hooks_config(workspace, tmp_path / "bridge")
+        payload = json.loads(path.read_text())
+        stop_commands = [hook["command"] for hook in payload["hooks"]["stop"]]
+        # The user's own hooks survive alongside the appended usage recorder.
+        assert "/usr/local/bin/notify-done" in stop_commands
+        assert payload["hooks"]["beforeShellExecution"] == [
+            {"command": "/usr/local/bin/audit-shell"}
+        ]
+        recorders = [c for c in stop_commands if "omnigent.cursor_native_usage" in c]
+        assert len(recorders) == 1
+
+    def test_write_hooks_config_replaces_stale_recorder_entry(self, tmp_path: Path) -> None:
+        import json
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        cursor_native_bridge.write_hooks_config(workspace, tmp_path / "old-bridge")
+        # A user hook added between sessions must survive the next launch.
+        path = workspace / ".cursor" / "hooks.json"
+        payload = json.loads(path.read_text())
+        payload["hooks"]["stop"].append({"command": "/usr/local/bin/notify-done"})
+        path.write_text(json.dumps(payload))
+        cursor_native_bridge.write_hooks_config(workspace, tmp_path / "new-bridge")
+        payload = json.loads(path.read_text())
+        stop_commands = [hook["command"] for hook in payload["hooks"]["stop"]]
+        recorders = [c for c in stop_commands if "omnigent.cursor_native_usage" in c]
+        # Exactly one recorder entry remains, re-pointed at the new bridge dir.
+        assert len(recorders) == 1
+        assert recorders[0].endswith(str(tmp_path / "new-bridge"))
+        assert "/usr/local/bin/notify-done" in stop_commands
+
+    def test_write_hooks_config_tolerates_malformed_existing_file(self, tmp_path: Path) -> None:
+        import json
+
+        workspace = tmp_path / "ws"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        (cursor_dir / "hooks.json").write_text("not json{")
+        path = cursor_native_bridge.write_hooks_config(workspace, tmp_path / "bridge")
+        payload = json.loads(path.read_text())
+        assert len(payload["hooks"]["stop"]) == 1
+
 
 class TestMcpBridgeConfigSecureDir:
     """``bridge.json`` holds a relay bearer token, so its tree must be owner-only."""
