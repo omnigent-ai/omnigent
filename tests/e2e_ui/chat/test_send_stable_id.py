@@ -75,9 +75,7 @@ def test_message_post_carries_stable_id(
     assert captured, "No POST to /events was intercepted — send did not fire"
     body = json.loads(captured[0])
     stable_id = body.get("data", {}).get("stable_id")
-    assert stable_id is not None, (
-        f"stable_id missing from POST body: {body}"
-    )
+    assert stable_id is not None, f"stable_id missing from POST body: {body}"
     assert _STABLE_ID_RE.match(stable_id), (
         f"stable_id {stable_id!r} is not a 32-char lowercase hex string"
     )
