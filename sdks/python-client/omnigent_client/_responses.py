@@ -256,8 +256,7 @@ class ResponsesNamespace:
                     # would yield a silent, error-free, empty stream — fail
                     # loud instead.
                     raise OmnigentError(
-                        f"stream open ended on an unfollowed redirect "
-                        f"(status {resp.status_code})",
+                        f"stream open ended on an unfollowed redirect (status {resp.status_code})",
                         resp.status_code,
                     )
 
