@@ -165,6 +165,14 @@ interface ToolCardProps {
   startedAt?: number | null;
   /** Completed runtime in seconds. Undefined when historical data lacks timing. */
   duration?: number;
+  /**
+   * Mount the expandable panel open. `BlockRenderer` sets this from its
+   * record of cards the user expanded, so a card remounted by a streaming
+   * re-layout comes back open instead of silently collapsing mid-read.
+   */
+  defaultOpen?: boolean;
+  /** Reports the user toggling the expandable panel. */
+  onOpenChange?: (open: boolean) => void;
 }
 
 export function ToolCard({
@@ -176,6 +184,8 @@ export function ToolCard({
   state,
   startedAt,
   duration,
+  defaultOpen = false,
+  onOpenChange,
 }: ToolCardProps) {
   const title = useMemo(() => formatToolTitle(name, args, argsSummary), [name, args, argsSummary]);
   const inputJson = useMemo(() => JSON.stringify(args, null, 2), [args]);
@@ -199,7 +209,11 @@ export function ToolCard({
   const onBodyClick = openFile && rawPath ? () => openFile(rawPath) : undefined;
 
   return (
-    <Collapsible defaultOpen={false} className="group not-prose w-full">
+    <Collapsible
+      defaultOpen={defaultOpen}
+      onOpenChange={onOpenChange}
+      className="group not-prose w-full"
+    >
       <ToolTriggerRow
         title={title}
         name={name}
