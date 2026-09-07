@@ -11,8 +11,15 @@ Data source: kimi persists each session to an append-only JSONL "wire" log at
 ``$KIMI_CODE_HOME/sessions/<wd_…>/<session_…>/agents/main/wire.jsonl``. The
 native harness points ``KIMI_CODE_HOME`` at ``<bridge_dir>/kimi-code-home`` whose
 ``sessions/`` is symlinked to the user's global store, so several workspaces'
-sessions share the tree; we disambiguate by ``workDir`` (via ``session_index.jsonl``)
-and recency. Relevant wire events:
+sessions — and every concurrent Omnigent kimi session's — share the tree. A
+kimi-native launch always creates a brand-new kimi session (there is no native
+resume-by-id), so the forwarder must adopt only a session born of THIS launch:
+session dirs that existed at launch are never adoptable
+(:func:`snapshot_kimi_session_dirs`), ``workDir`` (via ``session_index.jsonl``)
+must match the session's workspace, and among not-yet-indexed candidates the
+forwarder binds only when exactly one qualifies — guessing by recency would
+cross-wire the conversation (and a sub-agent's completion signal) to a stale or
+foreign session's transcript. Relevant wire events:
 
 - ``{"type": "turn.prompt", "input": [{"type":"text","text":…}], "origin": {"kind":"user"}}``
   → a user message.
@@ -75,6 +82,48 @@ class KimiWireItem:
 
 
 _MirrorItem = KimiWireItem
+
+
+def snapshot_kimi_session_dirs(kimi_home: Path) -> frozenset[str]:
+    """Return the kimi session dirs that already exist under *kimi_home*.
+
+    Taken at terminal launch, before the kimi TUI starts. A kimi-native launch
+    always creates a brand-new kimi session, so every dir in the snapshot
+    belongs to some other session — a prior terminal, a concurrent worker, or
+    the user's own kimi use — and must never be adopted, no matter how recently
+    its wire log was written.
+    """
+    sessions_root = kimi_home / "sessions"
+    if not sessions_root.is_dir():
+        return frozenset()
+    return frozenset(str(path) for path in sessions_root.glob("*/session_*") if path.is_dir())
+
+
+def kimi_session_dir_for_wire(wire_path: Path) -> str:
+    """Return the session dir (``…/<wd_…>/<session_…>``) owning a wire log."""
+    return str(wire_path.parent.parent.parent)
+
+
+def verify_wire_adoption(
+    kimi_home: Path,
+    wire_path: Path,
+    workspace: str,
+    preexisting_session_dirs: frozenset[str],
+) -> bool | None:
+    """Judge whether an adopted wire log belongs to this launch.
+
+    :returns: ``True`` when the session index confirms it (``workDir`` matches
+        *workspace*), ``False`` when it provably belongs to another session
+        (existed before launch, or indexed under a different ``workDir``), and
+        ``None`` while the session is not indexed yet (keep tailing, re-check).
+    """
+    session_dir = kimi_session_dir_for_wire(wire_path)
+    if session_dir in preexisting_session_dirs:
+        return False
+    work_dir = workdirs_for_kimi_sessions(kimi_home).get(session_dir)
+    if work_dir is None:
+        return None
+    return work_dir == workspace
 
 
 def clear_kimi_bridge_state(bridge_dir: Path) -> None:
@@ -145,28 +194,37 @@ def workdirs_for_kimi_sessions(kimi_home: Path) -> dict[str, str]:
 _workdirs_for_sessions = workdirs_for_kimi_sessions
 
 
-def _discover_wire(kimi_home: Path, workspace: str, launch_epoch_ms: int) -> Path | None:
-    """Locate the wire log for *workspace*'s newest session created at/after launch.
+def _discover_wire(
+    kimi_home: Path,
+    workspace: str,
+    launch_epoch_ms: int,
+    preexisting_session_dirs: frozenset[str] = frozenset(),
+) -> Path | None:
+    """Locate the wire log of the kimi session THIS launch created.
 
-    Globs ``sessions/*/session_*/agents/main/wire.jsonl`` under *kimi_home*,
-    keeps only sessions whose ``session_index`` ``workDir`` matches *workspace*
-    (when the index lists them), and returns the most-recently-modified wire log
-    whose mtime is at/after ``launch_epoch_ms`` (minus skew). Returns ``None``
-    until kimi has created the session.
+    Globs ``sessions/*/session_*/agents/main/wire.jsonl`` under *kimi_home* and
+    considers only sessions that did not exist at launch (see
+    :func:`snapshot_kimi_session_dirs`) and whose wire mtime is at/after
+    ``launch_epoch_ms`` (minus skew) — a still-active older session keeps a
+    fresh mtime, so the snapshot (not recency) is what excludes it. Sessions the
+    ``session_index`` maps to a different ``workDir`` are foreign and skipped.
+    Among indexed matches the newest wins; a not-yet-indexed session (kimi
+    indexes on the first turn) is adopted only when it is the sole unindexed
+    candidate — with several there is no telling which belongs to this launch,
+    so return ``None`` and retry once the index catches up rather than guess
+    (silently mirroring a foreign session is worse than a brief delay).
     """
     sessions_root = kimi_home / "sessions"
     if not sessions_root.exists():
         return None
     workdirs = workdirs_for_kimi_sessions(kimi_home)
     floor_s = (launch_epoch_ms - _DISCOVER_SKEW_MS) / 1000.0
-    best: tuple[float, Path] | None = None
+    best_indexed: tuple[float, Path] | None = None
+    unindexed: list[Path] = []
     for wire in sessions_root.glob("*/session_*/agents/main/wire.jsonl"):
         # session_index keys on the session dir (…/<wd_…>/<session_…>).
         session_dir = str(wire.parent.parent.parent)
-        work_dir = workdirs.get(session_dir)
-        # When the index doesn't list it yet, fall back to recency alone — a
-        # freshly created session may not be indexed until its first turn.
-        if work_dir is not None and work_dir != workspace:
+        if session_dir in preexisting_session_dirs:
             continue
         try:
             mtime = wire.stat().st_mtime
@@ -174,9 +232,19 @@ def _discover_wire(kimi_home: Path, workspace: str, launch_epoch_ms: int) -> Pat
             continue
         if mtime < floor_s:
             continue
-        if best is None or mtime > best[0]:
-            best = (mtime, wire)
-    return best[1] if best is not None else None
+        work_dir = workdirs.get(session_dir)
+        if work_dir is None:
+            unindexed.append(wire)
+            continue
+        if work_dir != workspace:
+            continue
+        if best_indexed is None or mtime > best_indexed[0]:
+            best_indexed = (mtime, wire)
+    if best_indexed is not None:
+        return best_indexed[1]
+    if len(unindexed) == 1:
+        return unindexed[0]
+    return None
 
 
 def _input_text(blocks: object) -> str:
@@ -384,12 +452,17 @@ async def forward_kimi_wire_to_session(
     workspace: str,
     launch_epoch_ms: int,
     agent_name: str = "kimi-native-ui",
+    preexisting_session_dirs: frozenset[str] = frozenset(),
 ) -> None:
     """Poll the kimi session wire log and mirror new turns into the chat.
 
     Runs until cancelled. Discovers the wire log lazily (kimi writes it after the
     first turn), then tails it, POSTing each new user/assistant turn and
-    persisting the line offset after every post.
+    persisting the line offset after every post. The adopted wire log is
+    re-verified against the session index until confirmed for this workspace
+    (:func:`verify_wire_adoption`); a session that proves stale or foreign is
+    dropped loudly and discovery restarts, so a mis-adoption cannot silently
+    keep mirroring another session's work.
     """
     # Route the transcript mirror to the replica holding this session's runner
     # tunnel: the POST /events is published to that pod's in-process session
@@ -407,18 +480,43 @@ async def forward_kimi_wire_to_session(
     state = _read_state(bridge_dir)
     wire_path = Path(state.wire_path) if state is not None else None
     last_line = state.last_line if state is not None else 0
+    # The adopted wire log is trusted only once the session index maps it to
+    # this workspace; kimi indexes on the first turn, so re-check every poll
+    # until then — a late index row must evict a mis-adopted foreign session.
+    adoption_confirmed = False
     # Final assistant text of the turn in flight, forwarded on the ``end_turn``
     # edge so the parent's inbox gets the real result instead of an empty one.
     last_assistant_text = ""
     async with httpx.AsyncClient(timeout=15.0) as client:
         while True:
+            if wire_path is not None and not adoption_confirmed:
+                verdict = await asyncio.to_thread(
+                    verify_wire_adoption,
+                    kimi_home,
+                    wire_path,
+                    workspace,
+                    preexisting_session_dirs,
+                )
+                if verdict is False:
+                    _logger.error(
+                        "kimi forwarder: dropping wire log %s for session %s — it "
+                        "belongs to a stale or foreign kimi session; rediscovering",
+                        wire_path,
+                        session_id,
+                    )
+                    wire_path = None
+                    last_line = 0
+                    clear_kimi_bridge_state(bridge_dir)
+                else:
+                    adoption_confirmed = verdict is True
             if wire_path is None or not wire_path.exists():
                 discovered = await asyncio.to_thread(
-                    _discover_wire, kimi_home, workspace, launch_epoch_ms
+                    _discover_wire, kimi_home, workspace, launch_epoch_ms, preexisting_session_dirs
                 )
                 if discovered is not None and discovered != wire_path:
                     wire_path = discovered
                     last_line = 0
+                    adoption_confirmed = False
                     _write_state(bridge_dir, _ForwardState(str(wire_path), last_line))
             if wire_path is not None and wire_path.exists():
                 items = await asyncio.to_thread(read_kimi_wire_items, wire_path, last_line)
@@ -471,6 +569,7 @@ async def supervise_kimi_forwarder(
     workspace: str,
     launch_epoch_ms: int,
     agent_name: str = "kimi-native-ui",
+    preexisting_session_dirs: frozenset[str] = frozenset(),
 ) -> None:
     """Run :func:`forward_kimi_wire_to_session` with restart-on-crash backoff.
 
@@ -490,6 +589,7 @@ async def supervise_kimi_forwarder(
                 workspace=workspace,
                 launch_epoch_ms=launch_epoch_ms,
                 agent_name=agent_name,
+                preexisting_session_dirs=preexisting_session_dirs,
             )
         except asyncio.CancelledError:
             raise

@@ -3671,7 +3671,11 @@ async def _auto_create_kimi_terminal(
         write_tmux_target,
     )
     from omnigent.kimi_native_credentials import build_kimi_session_home
-    from omnigent.kimi_native_forwarder import clear_kimi_bridge_state, supervise_kimi_forwarder
+    from omnigent.kimi_native_forwarder import (
+        clear_kimi_bridge_state,
+        snapshot_kimi_session_dirs,
+        supervise_kimi_forwarder,
+    )
     from omnigent.runner._entry import _make_auth_token_factory
 
     bridge_dir = bridge_dir_for_session_id(session_id)
@@ -3723,6 +3727,13 @@ async def _auto_create_kimi_terminal(
         bridge_dir / "kimi-code-home",
         bridge_dir=bridge_dir,
     )
+    # A kimi-native launch always creates a brand-new kimi session, and the
+    # session home's ``sessions/`` tree is shared (symlinked to the global
+    # store). Snapshot what exists before the TUI starts so the forwarder can
+    # never adopt a stale or foreign session's wire log — mirroring one would
+    # cross-wire this conversation (and a sub-agent's completion) to another
+    # session's work.
+    preexisting_kimi_sessions = snapshot_kimi_session_dirs(bridge_dir / "kimi-code-home")
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
         terminal_name="kimi",
@@ -3770,6 +3781,7 @@ async def _auto_create_kimi_terminal(
             kimi_home=bridge_dir / "kimi-code-home",
             workspace=workspace,
             launch_epoch_ms=launch_epoch_ms,
+            preexisting_session_dirs=preexisting_kimi_sessions,
         ),
         name=f"kimi-forwarder-{session_id}",
     )

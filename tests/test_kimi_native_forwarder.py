@@ -18,7 +18,10 @@ from omnigent.kimi_native_forwarder import (
     _row_to_item,
     _write_state,
     clear_kimi_bridge_state,
+    kimi_session_dir_for_wire,
     read_kimi_wire_items,
+    snapshot_kimi_session_dirs,
+    verify_wire_adoption,
 )
 
 
@@ -170,7 +173,13 @@ class TestState:
 
 class TestDiscoverWire:
     def _make_session(
-        self, home: Path, session_dir_name: str, work_dir: str, *, mtime: float
+        self,
+        home: Path,
+        session_dir_name: str,
+        work_dir: str,
+        *,
+        mtime: float,
+        indexed: bool = True,
     ) -> Path:
         wire = home / "sessions" / "wd_x" / session_dir_name / "agents" / "main" / "wire.jsonl"
         wire.parent.mkdir(parents=True, exist_ok=True)
@@ -178,11 +187,12 @@ class TestDiscoverWire:
         import os
 
         os.utime(wire, (mtime, mtime))
-        # session_index keys on the session dir (…/<wd_…>/<session_…>).
-        idx = home / "session_index.jsonl"
-        index_row = {"sessionDir": str(wire.parent.parent.parent), "workDir": work_dir}
-        with idx.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(index_row) + "\n")
+        if indexed:
+            # session_index keys on the session dir (…/<wd_…>/<session_…>).
+            idx = home / "session_index.jsonl"
+            index_row = {"sessionDir": str(wire.parent.parent.parent), "workDir": work_dir}
+            with idx.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(index_row) + "\n")
         return wire
 
     def test_picks_newest_matching_workspace(self, tmp_path: Path) -> None:
@@ -205,3 +215,108 @@ class TestDiscoverWire:
         self._make_session(home, "session_stale", "/ws", mtime=1000.0)
         # launch far in the future (ms) → the 1000s-mtime session is below the floor.
         assert _discover_wire(home, "/ws", launch_epoch_ms=9_000_000_000_000) is None
+
+    def test_sole_unindexed_candidate_adopted(self, tmp_path: Path) -> None:
+        """A brand-new session may not be indexed until its first turn."""
+        home = tmp_path / "kimi-code-home"
+        home.mkdir()
+        fresh = self._make_session(home, "session_fresh", "/ws", mtime=2000.0, indexed=False)
+        assert _discover_wire(home, "/ws", launch_epoch_ms=0) == fresh
+
+    def test_multiple_unindexed_candidates_are_never_guessed(self, tmp_path: Path) -> None:
+        """Two concurrent launches' unindexed sessions are indistinguishable.
+
+        Guessing by recency here is how a dispatch cross-wires to a foreign
+        session; discovery must wait for the index to disambiguate instead.
+        """
+        home = tmp_path / "kimi-code-home"
+        home.mkdir()
+        self._make_session(home, "session_mine", "/ws", mtime=2000.0, indexed=False)
+        self._make_session(home, "session_theirs", "/elsewhere", mtime=3000.0, indexed=False)
+        assert _discover_wire(home, "/ws", launch_epoch_ms=0) is None
+
+    def test_unindexed_session_does_not_shadow_indexed_workspace_match(
+        self, tmp_path: Path
+    ) -> None:
+        """A newer unindexed foreign session must not beat this workspace's own."""
+        home = tmp_path / "kimi-code-home"
+        home.mkdir()
+        mine = self._make_session(home, "session_mine", "/ws", mtime=2000.0)
+        self._make_session(home, "session_foreign", "/elsewhere", mtime=3000.0, indexed=False)
+        assert _discover_wire(home, "/ws", launch_epoch_ms=0) == mine
+
+    def test_still_active_preexisting_session_never_adopted(self, tmp_path: Path) -> None:
+        """A stale session writing after launch stays excluded by the snapshot.
+
+        Its wire mtime passes the launch floor (it is still active), so only
+        the launch-time snapshot keeps the new conversation off its transcript.
+        """
+        home = tmp_path / "kimi-code-home"
+        home.mkdir()
+        stale = self._make_session(home, "session_stale", "/ws", mtime=5000.0)
+        preexisting = frozenset({kimi_session_dir_for_wire(stale)})
+        assert (
+            _discover_wire(
+                home, "/ws", launch_epoch_ms=2_000_000, preexisting_session_dirs=preexisting
+            )
+            is None
+        )
+
+    def test_post_launch_session_adopted_despite_stale_sibling(self, tmp_path: Path) -> None:
+        """The snapshot excludes only what existed at launch, not the new session."""
+        home = tmp_path / "kimi-code-home"
+        home.mkdir()
+        stale = self._make_session(home, "session_stale", "/ws", mtime=5000.0)
+        preexisting = frozenset({kimi_session_dir_for_wire(stale)})
+        fresh = self._make_session(home, "session_fresh", "/ws", mtime=4000.0)
+        assert (
+            _discover_wire(
+                home, "/ws", launch_epoch_ms=2_000_000, preexisting_session_dirs=preexisting
+            )
+            == fresh
+        )
+
+
+class TestSnapshotSessionDirs:
+    def test_lists_existing_session_dirs(self, tmp_path: Path) -> None:
+        home = tmp_path / "kimi-code-home"
+        one = home / "sessions" / "wd_a" / "session_one"
+        two = home / "sessions" / "wd_b" / "session_two"
+        for d in (one, two):
+            d.mkdir(parents=True)
+        assert snapshot_kimi_session_dirs(home) == frozenset({str(one), str(two)})
+
+    def test_empty_when_no_sessions_root(self, tmp_path: Path) -> None:
+        assert snapshot_kimi_session_dirs(tmp_path / "kimi-code-home") == frozenset()
+
+
+class TestVerifyWireAdoption:
+    def _wire(self, home: Path, session_dir_name: str) -> Path:
+        wire = home / "sessions" / "wd_x" / session_dir_name / "agents" / "main" / "wire.jsonl"
+        wire.parent.mkdir(parents=True, exist_ok=True)
+        wire.write_text("{}\n", encoding="utf-8")
+        return wire
+
+    def _index(self, home: Path, wire: Path, work_dir: str) -> None:
+        row = {"sessionDir": kimi_session_dir_for_wire(wire), "workDir": work_dir}
+        with (home / "session_index.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+    def test_preexisting_session_is_rejected(self, tmp_path: Path) -> None:
+        wire = self._wire(tmp_path, "session_old")
+        preexisting = frozenset({kimi_session_dir_for_wire(wire)})
+        assert verify_wire_adoption(tmp_path, wire, "/ws", preexisting) is False
+
+    def test_unindexed_session_is_undecided(self, tmp_path: Path) -> None:
+        wire = self._wire(tmp_path, "session_new")
+        assert verify_wire_adoption(tmp_path, wire, "/ws", frozenset()) is None
+
+    def test_foreign_workdir_is_rejected(self, tmp_path: Path) -> None:
+        wire = self._wire(tmp_path, "session_new")
+        self._index(tmp_path, wire, "/elsewhere")
+        assert verify_wire_adoption(tmp_path, wire, "/ws", frozenset()) is False
+
+    def test_matching_workdir_is_confirmed(self, tmp_path: Path) -> None:
+        wire = self._wire(tmp_path, "session_new")
+        self._index(tmp_path, wire, "/ws")
+        assert verify_wire_adoption(tmp_path, wire, "/ws", frozenset()) is True
