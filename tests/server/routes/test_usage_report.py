@@ -8,6 +8,7 @@ from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.routes.usage import (
     _build_usage_report,
     _day_offset,
+    _forecast_cost,
     _session_cost,
     _session_models,
 )
@@ -260,3 +261,211 @@ def test_sum_daily_cost_range(db_uri: str) -> None:
     assert store.sum_daily_cost("alice", "0000-00-00") == 7.0  # all-time
     assert store.sum_daily_cost("alice", "2026-08-01") == 0.0  # nothing in range
     assert store.sum_daily_cost("nobody", "0000-00-00") == 0.0
+
+
+# ── Server-side date range filtering ─────────────────────────────
+
+
+def test_sum_daily_cost_with_until(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    store.add_daily_cost("alice", "2026-07-01", 1.0)
+    store.add_daily_cost("alice", "2026-07-10", 2.0)
+    store.add_daily_cost("alice", "2026-07-20", 4.0)
+
+    assert store.sum_daily_cost("alice", "2026-07-01", "2026-07-10") == 3.0
+    assert store.sum_daily_cost("alice", "2026-07-01", "2026-07-01") == 1.0
+    assert store.sum_daily_cost("alice", "0000-00-00", "2026-07-15") == 3.0
+
+
+def test_list_daily_costs_with_until(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    store.add_daily_cost("alice", "2026-07-01", 1.0)
+    store.add_daily_cost("alice", "2026-07-10", 2.0)
+    store.add_daily_cost("alice", "2026-07-20", 4.0)
+
+    result = store.list_daily_costs("alice", "2026-07-01", "2026-07-15")
+    assert result == [("2026-07-01", 1.0), ("2026-07-10", 2.0)]
+
+    result_all = store.list_daily_costs("alice", "0000-00-00")
+    assert len(result_all) == 3
+
+
+def test_build_usage_report_with_date_filter(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    now = 1_784_678_400  # 2026-07-22
+
+    # Old session (2026-07-01)
+    _add_session(
+        store,
+        monkeypatch,
+        ts=1_782_950_400,  # ~2026-07-02
+        cost=5.0,
+        by_model={},
+        title="old session",
+    )
+    # Recent session (2026-07-20)
+    _add_session(
+        store,
+        monkeypatch,
+        ts=now - _DAY * 2,
+        cost=2.0,
+        by_model={},
+        title="recent session",
+    )
+
+    monkeypatch.setattr("omnigent.db.utils.now_epoch", lambda: now)
+
+    # Filter to only recent days — should exclude the old session
+    report = _build_usage_report(
+        store,
+        None,
+        since="2026-07-19",
+        until="2026-07-22",
+    )
+    assert all(s.title != "old session" for s in report.sessions)
+    # Summary rollups remain unfiltered
+    assert report.cost_today >= 0
+
+
+# ── Cost alerts ──────────────────────────────────────────────────
+
+
+_ALERT_ID = "abcdef0123456789abcdef0123456789"
+_ALERT_ID_2 = "abcdef0123456789abcdef01234567aa"
+
+
+def test_cost_alert_crud(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    user = "alice@example.com"
+
+    # Create
+    alert = store.create_cost_alert(_ALERT_ID, user, 5.0, "daily")
+    assert alert["threshold_usd"] == 5.0
+    assert alert["period"] == "daily"
+    assert alert["enabled"] is True
+
+    # List
+    alerts = store.list_cost_alerts(user)
+    assert len(alerts) == 1
+    assert alerts[0]["id"] == _ALERT_ID
+
+    # Update
+    updated = store.update_cost_alert(_ALERT_ID, user, enabled=False)
+    assert updated is not None
+    assert updated["enabled"] is False
+
+    updated2 = store.update_cost_alert(_ALERT_ID, user, threshold_usd=10.0)
+    assert updated2 is not None
+    assert updated2["threshold_usd"] == 10.0
+
+    # Delete
+    assert store.delete_cost_alert(_ALERT_ID, user) is True
+    assert store.delete_cost_alert(_ALERT_ID, user) is False
+    assert store.list_cost_alerts(user) == []
+
+
+def test_cost_alert_update_not_found(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.update_cost_alert(_ALERT_ID_2, "alice", enabled=True) is None
+
+
+def test_build_usage_report_alert_triggered(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    now = 1_784_678_400  # 2026-07-22
+    monkeypatch.setattr("omnigent.db.utils.now_epoch", lambda: now)
+
+    store.add_daily_cost(RESERVED_USER_LOCAL, "2026-07-22", 10.0)
+    store.create_cost_alert(_ALERT_ID, RESERVED_USER_LOCAL, 5.0, "daily")
+
+    report = _build_usage_report(store, None)
+    assert report.alert_triggered is True
+    assert len(report.alerts) == 1
+
+
+def test_build_usage_report_alert_not_triggered(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    now = 1_784_678_400
+    monkeypatch.setattr("omnigent.db.utils.now_epoch", lambda: now)
+
+    store.add_daily_cost(RESERVED_USER_LOCAL, "2026-07-22", 1.0)
+    store.create_cost_alert(_ALERT_ID, RESERVED_USER_LOCAL, 50.0, "daily")
+
+    report = _build_usage_report(store, None)
+    assert report.alert_triggered is False
+
+
+# ── Forecasting ──────────────────────────────────────────────────
+
+
+def test_forecast_cost_insufficient_data() -> None:
+    assert _forecast_cost([]) is None
+    assert _forecast_cost([("2026-07-01", 1.0)]) is None
+    assert _forecast_cost([("2026-07-01", 1.0), ("2026-07-02", 2.0)]) is None
+
+
+def test_forecast_cost_stable() -> None:
+    data = [(f"2026-07-{i:02d}", 5.0) for i in range(1, 15)]
+    result = _forecast_cost(data, days_ahead=10)
+    assert result is not None
+    assert result.trend == "stable"
+    assert len(result.projected_daily) == 10
+    assert result.projected_cost_30d > 0
+
+
+def test_forecast_cost_increasing() -> None:
+    data = [(f"2026-07-{i:02d}", float(i)) for i in range(1, 15)]
+    result = _forecast_cost(data, days_ahead=30)
+    assert result is not None
+    assert result.trend == "increasing"
+
+
+def test_forecast_cost_decreasing() -> None:
+    data = [(f"2026-07-{i:02d}", float(15 - i)) for i in range(1, 15)]
+    result = _forecast_cost(data, days_ahead=30)
+    assert result is not None
+    assert result.trend == "decreasing"
+
+
+# ── Project breakdown ────────────────────────────────────────────
+
+
+def test_build_usage_report_includes_projects_when_page_details(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    now = 1_700_000_000
+
+    _add_session(
+        store,
+        monkeypatch,
+        ts=now,
+        cost=3.0,
+        by_model={},
+        title="project-session",
+    )
+    monkeypatch.setattr("omnigent.db.utils.now_epoch", lambda: now)
+    monkeypatch.setattr(
+        "omnigent.server.routes.usage._resolve_session_harness",
+        lambda _conv: "test-harness",
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.usage._resolve_llm_model",
+        lambda _conv: "test-model",
+    )
+
+    report = _build_usage_report(store, None, include_page_details=True)
+    # Sessions without a project_id get grouped under None
+    assert len(report.projects) >= 1
+    unfiled = next((p for p in report.projects if p.project_id is None), None)
+    assert unfiled is not None
+    assert unfiled.session_count >= 1
