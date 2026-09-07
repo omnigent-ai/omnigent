@@ -174,6 +174,9 @@ _HARNESS_FAMILY: dict[str, str] = {
     "codex": OPENAI_FAMILY,
     "codex-native": OPENAI_FAMILY,
     "native-codex": OPENAI_FAMILY,
+    # Genie is Databricks' codex fork; it consumes GPT models over the
+    # openai-compatible Codex Responses gateway.
+    "genie": OPENAI_FAMILY,
     "openai-agents": OPENAI_FAMILY,
     # The workflow's AgentHarnessType spells this "openai-agents-sdk" and
     # normally maps it down via _provider_harness_name; accept both spellings

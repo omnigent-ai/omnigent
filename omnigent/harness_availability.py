@@ -19,7 +19,7 @@ HarnessAvailability = Literal[
 
 # Readiness and model-family checks must agree on every Codex spelling.
 CODEX_CANONICAL_HARNESSES: Final[frozenset[str]] = frozenset(
-    {"codex", "codex-native", "native-codex"}
+    {"codex", "codex-native", "native-codex", "genie"}
 )
 
 
