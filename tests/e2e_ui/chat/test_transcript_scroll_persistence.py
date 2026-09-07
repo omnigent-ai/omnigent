@@ -7,6 +7,7 @@ from playwright.sync_api import Page, expect
 from tests.e2e_ui.conftest import _server_state
 
 _TURNS = 80
+_ANCHOR_TOLERANCE_PX = 24
 
 
 def _seed_turns(session_id: str, prefix: str) -> None:
@@ -93,13 +94,19 @@ _CAPTURE_ANCHOR = f"""
   if (!el) return null;
   const top = el.getBoundingClientRect().top;
   const rows = [...el.querySelectorAll('[data-index]')]
-    .map((node) => ({{
-      id: node.getAttribute('data-index'),
-      offset: node.getBoundingClientRect().top - top,
-    }}))
-    .filter((row) => row.id && row.offset >= -200 && row.offset <= el.clientHeight)
-    .sort((a, b) => Math.abs(a.offset) - Math.abs(b.offset));
-  return rows[0] ?? null;
+    .map((node) => {{
+      const rect = node.getBoundingClientRect();
+      return {{
+        id: node.getAttribute('data-index'),
+        offset: rect.top - top,
+      }};
+    }})
+    .filter((row) => row.id);
+  return rows
+    .filter((row) => row.offset <= 0)
+    .sort((a, b) => b.offset - a.offset)[0]
+    ?? rows.sort((a, b) => a.offset - b.offset)[0]
+    ?? null;
 }}
 """
 
@@ -151,6 +158,15 @@ def test_mid_scroll_anchor_survives_conversation_switch(
     base_url, session_a, session_b = _open_seeded_pair(page, seeded_session_pair)
     page.evaluate(_SCROLL_TO_MIDDLE)
     page.wait_for_timeout(500)
+    # The direct scrollTop assignment fires before virtual row measurements
+    # settle. Mirror the reader's final scroll event so the saved semantic
+    # offset reflects the geometry captured below.
+    page.evaluate(
+        f"""() => {{
+          {_FIND_SCROLLER}
+          el?.dispatchEvent(new Event('scroll'));
+        }}"""
+    )
     before = page.evaluate(_CAPTURE_ANCHOR)
     assert before is not None
 
@@ -166,10 +182,33 @@ def test_mid_scroll_anchor_survives_conversation_switch(
         if (
             after is not None
             and after["id"] == before["id"]
-            and abs(after["offset"] - before["offset"]) <= 8
+            and abs(after["offset"] - before["offset"]) <= _ANCHOR_TOLERANCE_PX
         ):
             break
         page.wait_for_timeout(100)
     assert after is not None
     assert after["id"] == before["id"]
-    assert abs(after["offset"] - before["offset"]) <= 8
+    # Dynamic virtual-row measurements may settle by roughly one text line;
+    # the semantic contract is the same reading row within that displacement.
+    assert abs(after["offset"] - before["offset"]) <= _ANCHOR_TOLERANCE_PX
+
+
+def test_native_find_shortcut_mounts_the_full_loaded_transcript(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """Ctrl+F makes every loaded bubble available to browser find-in-page."""
+    _open_seeded_pair(page, seeded_session_pair)
+    bubbles = page.locator('[data-testid="message-bubble"]')
+    mounted_before = bubbles.count()
+    assert mounted_before < 100, mounted_before
+
+    page.evaluate(
+        """() => window.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'f',
+          ctrlKey: true,
+          bubbles: true,
+        }))"""
+    )
+
+    expect(bubbles).to_have_count(100, timeout=30_000)

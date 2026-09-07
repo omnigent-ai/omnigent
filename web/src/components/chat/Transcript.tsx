@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { flushSync } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
@@ -86,6 +87,20 @@ export interface TranscriptProps {
   terminalFirst: { isTerminalFirst: boolean; terminalStartingUp?: boolean } | null | undefined;
   /** Pub/sub ref for the LatestTurnSpacer's synchronous re-measure handle. */
   spacerMeasureRef: React.RefObject<(() => void) | null>;
+}
+
+export function isNativeFindShortcut(
+  event: Pick<
+    globalThis.KeyboardEvent,
+    "altKey" | "ctrlKey" | "defaultPrevented" | "key" | "metaKey"
+  >,
+): boolean {
+  return (
+    !event.defaultPrevented &&
+    !event.altKey &&
+    event.key.toLowerCase() === "f" &&
+    (event.metaKey || event.ctrlKey)
+  );
 }
 
 /**
@@ -206,6 +221,19 @@ function TranscriptImpl({
   );
   const display = useDeferredValue(nextDisplaySnapshot);
   const isSwitchPending = display.conversationId !== conversationId;
+  const [nativeFindConversationId, setNativeFindConversationId] = useState<string | null>(null);
+  useEffect(() => setNativeFindConversationId(null), [conversationId]);
+  useEffect(() => {
+    const handleFind = (event: globalThis.KeyboardEvent) => {
+      if (!display.conversationId || !isNativeFindShortcut(event)) return;
+      // Native find runs after keydown dispatch. Commit every row before the
+      // browser scans the DOM so off-screen messages participate.
+      flushSync(() => setNativeFindConversationId(display.conversationId));
+    };
+    window.addEventListener("keydown", handleFind);
+    return () => window.removeEventListener("keydown", handleFind);
+  }, [display.conversationId]);
+  const disableVirtualization = nativeFindConversationId === display.conversationId;
 
   // Virtualizer-derived geometry (scroll handle, active turn, range nonce),
   // published by VirtualBubbleList. The rail reads the active turn and the
@@ -350,6 +378,7 @@ function TranscriptImpl({
                   showsWorking={display.showsWorking}
                   conversationId={display.conversationId}
                   hasTasks={display.hasTasks}
+                  disableVirtualization={disableVirtualization}
                   onGeometryChange={onGeometryChange}
                 />
                 {/* Pending elicitation cards, floated to the bottom of the chat
@@ -535,6 +564,7 @@ export function VirtualBubbleList({
   showsWorking,
   conversationId,
   hasTasks,
+  disableVirtualization,
   onGeometryChange,
 }: {
   bubbles: Bubble[];
@@ -543,6 +573,7 @@ export function VirtualBubbleList({
   showsWorking: boolean;
   conversationId: string | null | undefined;
   hasTasks: boolean;
+  disableVirtualization: boolean;
   /** Publishes virtualizer-derived geometry up to the rail/spacer. */
   onGeometryChange: (geometry: TranscriptGeometry) => void;
 }) {
@@ -584,6 +615,7 @@ export function VirtualBubbleList({
   }, [scrollEl, bubbles.length, hasTasks]);
 
   const virtualizer = useVirtualizer({
+    enabled: !disableVirtualization,
     count: bubbles.length,
     getScrollElement: () => scrollEl,
     // Corrected per row by measureElement; a middling bubble keeps the initial
@@ -787,6 +819,21 @@ export function VirtualBubbleList({
   useEffect(() => {
     onGeometryChange({ scrollToItem, activeTurnId, rangeNonce });
   }, [onGeometryChange, scrollToItem, activeTurnId, rangeNonce]);
+
+  if (disableVirtualization) {
+    return (
+      <div className="flex w-full flex-col gap-4">
+        {bubbles.map((bubble, index) => (
+          <BubbleView
+            key={bubbleKey(bubble)}
+            bubble={bubble}
+            isLastAssistant={index === lastAssistantIndex}
+            showsWorking={showsWorking && index === lastAssistantIndex}
+          />
+        ))}
+      </div>
+    );
+  }
 
   return (
     <div ref={wrapperRef} className="relative w-full" style={{ height: `${totalSize}px` }}>
