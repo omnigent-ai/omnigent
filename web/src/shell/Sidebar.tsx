@@ -824,25 +824,21 @@ function SidebarImpl({
   // (nearly) invisible yet already covers the toggle whose hover armed it —
   // taking pointer events then would swallow a click aimed at that toggle,
   // landing it on whatever sidebar content sits under the pointer instead.
-  // Stay click-through until the entry animation completes. A native listener
-  // (not React's onAnimationEnd) so the reduced-motion near-zero duration and
-  // every browser's event name are honored alike; children's animations
-  // bubble here too, so only the card's own end flips it interactive.
-  const asideRef = useRef<HTMLElement | null>(null);
+  // Stay click-through until the composed entry animation completes.
+  // Children's animations bubble too, so only the card's own end unlocks it.
   const [peekInteractive, setPeekInteractive] = useState(false);
   useEffect(() => {
     if (!peek) {
       setPeekInteractive(false);
       return;
     }
-    const el = asideRef.current;
-    if (!el) return;
-    const onAnimationEnd = (e: AnimationEvent) => {
-      if (e.target === el) setPeekInteractive(true);
-    };
-    el.addEventListener("animationend", onAnimationEnd);
-    return () => el.removeEventListener("animationend", onAnimationEnd);
+    // Do not leave the card click-through if animationend is suppressed or missed.
+    const fallback = setTimeout(() => setPeekInteractive(true), 200);
+    return () => clearTimeout(fallback);
   }, [peek]);
+  const prefersReducedMotion =
+    typeof window !== "undefined" &&
+    window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
   // While peeking, leaving the card closes it after a short grace period;
   // re-entering before that fires cancels the close so a wobble doesn't
@@ -892,8 +888,10 @@ function SidebarImpl({
         />
       )}
       <aside
-        ref={asideRef}
         aria-label="Conversations"
+        onAnimationEnd={(event) => {
+          if (event.target === event.currentTarget) setPeekInteractive(true);
+        }}
         onPointerEnter={cancelPeekClose}
         onPointerLeave={() => {
           if (!peek) return;
@@ -959,7 +957,7 @@ function SidebarImpl({
           // Click-through while fading in (see peekInteractive above): the
           // click falls through to the header toggle underneath, which pins
           // the sidebar open — what the user aimed for.
-          peek && !peekInteractive && "pointer-events-none",
+          peek && !prefersReducedMotion && !peekInteractive && "pointer-events-none",
         )}
         style={
           {

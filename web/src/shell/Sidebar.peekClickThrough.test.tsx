@@ -6,7 +6,7 @@
 // its entry animation completes.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -131,12 +131,19 @@ function card() {
   return screen.getByRole("complementary", { name: "Conversations" });
 }
 
+function endAnimation(element: Element = card()) {
+  // jsdom lacks AnimationEvent, so React 18 listens for its WebKit fallback.
+  fireEvent(element, new Event("webkitAnimationEnd", { bubbles: true }));
+}
+
 beforeEach(() => {
   mockConversations([conv("conv_a")]);
 });
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.clearAllMocks();
 });
 
@@ -148,11 +155,30 @@ describe("peek card entry window", () => {
   });
 
   it("takes the pointer over once its own entry animation completes", () => {
-    // A native animationend (what browsers dispatch; jsdom has no
-    // AnimationEvent constructor, so a plain Event stands in for it).
     renderSidebar({ open: false, peek: true });
 
-    fireEvent(card(), new Event("animationend", { bubbles: true }));
+    endAnimation();
+
+    expect(card()).not.toHaveClass("pointer-events-none");
+  });
+
+  it("takes the pointer over if the entry animation end never fires", () => {
+    vi.useFakeTimers();
+    renderSidebar({ open: false, peek: true });
+
+    act(() => vi.advanceTimersByTime(200));
+
+    expect(card()).not.toHaveClass("pointer-events-none");
+  });
+
+  it("is immediately interactive when reduced motion is preferred", () => {
+    const defaultMatchMedia = window.matchMedia;
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...defaultMatchMedia(query),
+      matches: query === "(prefers-reduced-motion: reduce)",
+    }));
+
+    renderSidebar({ open: false, peek: true });
 
     expect(card()).not.toHaveClass("pointer-events-none");
   });
@@ -164,14 +190,14 @@ describe("peek card entry window", () => {
 
     const child = card().querySelector("div");
     expect(child).not.toBeNull();
-    fireEvent(child as Element, new Event("animationend", { bubbles: true }));
+    endAnimation(child as Element);
 
     expect(card()).toHaveClass("pointer-events-none");
   });
 
   it("is click-through again on the next peek", () => {
     const view = renderSidebar({ open: false, peek: true });
-    fireEvent(card(), new Event("animationend", { bubbles: true }));
+    endAnimation();
     expect(card()).not.toHaveClass("pointer-events-none");
 
     view.rerenderSidebar({ open: false, peek: false });
