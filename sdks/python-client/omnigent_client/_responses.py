@@ -249,14 +249,14 @@ class ResponsesNamespace:
                     await resp.aread()
                     raise_for_status(resp.status_code, response_body(resp))
                 elif 300 <= resp.status_code < 400:
-                    # An unfollowed redirect: OmnigentClient follows
-                    # redirects, so a 3xx here means the hop could not be
-                    # chased (no Location header, or a caller-supplied client
-                    # with redirects disabled). Parsing its non-SSE body
-                    # would yield a silent, error-free, empty stream — fail
-                    # loud instead.
+                    # OmnigentClient follows redirects, so a 3xx here was not
+                    # followable (no Location header, a 304, or a
+                    # caller-supplied client with redirects disabled).
+                    # Parsing its non-SSE body would yield a silent,
+                    # error-free, empty stream — fail loud instead.
                     raise OmnigentError(
-                        f"stream open ended on an unfollowed redirect (status {resp.status_code})",
+                        f"stream open returned a 3xx response (status {resp.status_code}) "
+                        "instead of an event stream",
                         resp.status_code,
                     )
 
