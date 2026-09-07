@@ -177,6 +177,31 @@ def test_managed_picker_prefix_is_not_part_of_provider_model() -> None:
     assert provider.model == "claude-opus-4-7"
 
 
+def test_unmanaged_pi_model_reference_classification() -> None:
+    """Only ``provider/model`` values outside the managed set are references.
+
+    The picker persists live Pi model references; a reference naming one of
+    Pi's OWN providers (an OAuth login like ``openai-codex``) must be
+    recognized so the launch passes it through instead of funneling it into
+    the generated ``omnigent`` namespace. Managed-qualified values, bare model
+    ids, and degenerate strings keep provider routing.
+    """
+    assert creds.is_unmanaged_pi_model_reference("openai-codex/gpt-5.6-sol")
+    assert creds.is_unmanaged_pi_model_reference("anthropic/claude-opus-5")
+    # Managed picker values (any managed provider id) are not references.
+    assert not creds.is_unmanaged_pi_model_reference("omnigent/claude-opus-4-7")
+    assert not creds.is_unmanaged_pi_model_reference("omnigent/openai/gpt-4o-mini")
+    assert not creds.is_unmanaged_pi_model_reference("omnigent-openai/databricks-gpt-5-5")
+    assert not creds.is_unmanaged_pi_model_reference("omnigent-completions/glm-5-2")
+    assert not creds.is_unmanaged_pi_model_reference("omnigent-mlflow/system.ai.qwen3")
+    # Bare ids and degenerate values are not provider references.
+    assert not creds.is_unmanaged_pi_model_reference("claude-sonnet-4-6")
+    assert not creds.is_unmanaged_pi_model_reference(None)
+    assert not creds.is_unmanaged_pi_model_reference("")
+    assert not creds.is_unmanaged_pi_model_reference("/gpt-5.6-sol")
+    assert not creds.is_unmanaged_pi_model_reference("openai-codex/")
+
+
 def test_subscription_default_returns_none() -> None:
     """A subscription (CLI-login) default isn't reusable by Pi → None."""
     config = {"providers": {"claude": {"kind": "subscription", "default": True, "cli": "claude"}}}

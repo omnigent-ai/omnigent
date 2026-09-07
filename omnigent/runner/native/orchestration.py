@@ -498,7 +498,9 @@ class _PiNativeLaunchConfig:
         the first message.
     :param model_override: Persisted per-session ``/model`` override, e.g.
         ``"claude-4.6-sonnet-medium"``; ``None`` when unset. Consumed by the
-        cursor-native launch (``--model``), ignored by pi-native.
+        cursor-native launch (``--model``) and by pi-native, which routes a
+        managed picker value through the configured provider and passes a
+        reference to one of Pi's own providers through verbatim.
     :param reasoning_effort: Persisted per-session effort, e.g. ``"high"``.
         Consumed by the pi-native launch as ``--thinking``; ``None`` leaves
         Pi's model default in place.
@@ -2189,15 +2191,23 @@ async def _auto_create_pi_terminal(
     credential_warning: str | None = None
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
         from omnigent.pi_native_credentials import (
+            is_unmanaged_pi_model_reference,
             pi_native_provider_launch,
             resolve_pi_native_provider,
         )
 
         # Provider-qualified picker values select one of the models rendered
         # from the provider configured through ``omni setup``.
-        spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
-        provider = resolve_pi_native_provider(model=spec_model)
-        if provider is not None:
+        model_override = launch_config.model_override
+        spec_model = model_override or _pi_native_model_from_spec(agent_spec)
+        if model_override is not None and is_unmanaged_pi_model_reference(model_override):
+            # The picker persisted a reference to one of Pi's OWN providers
+            # (e.g. an openai-codex OAuth login). Routing it through the
+            # configured default provider would rewrite it into the generated
+            # ``omnigent`` namespace — an id no endpoint serves. Launch Pi on
+            # its own login with the selection passed through verbatim.
+            pi_args.extend(["--model", model_override])
+        elif (provider := resolve_pi_native_provider(model=spec_model)) is not None:
             launch = pi_native_provider_launch(
                 bridge_dir / "pi-agent",
                 provider,
