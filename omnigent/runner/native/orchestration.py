@@ -6062,12 +6062,14 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         JSON error responses. Known actionable configuration errors surface
         their safe message directly; other causes point to the runner log.
     """
+    error_id = f"err_{uuid.uuid4().hex}"
     _logger.warning(
-        "Native %s terminal start failed: %s",
+        "Native %s terminal start failed; error_id=%s: %s",
         runtime_name,
+        error_id,
         exc,
         exc_info=exc,
-        extra={"session_id": runner_primary_session_id()},
+        extra={"session_id": runner_primary_session_id(), "error_id": error_id},
     )
     from omnigent.claude_native_bridge import ClaudeNativeHookInterpreterMismatchError
 
@@ -6091,7 +6093,11 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
             f"Native {runtime_name} terminal failed to start; "
             f"see the runner log for details: {log_reference}"
         )
-    return {"code": _NATIVE_TERMINAL_START_FAILED_CODE, "message": message}
+    return {
+        "code": _NATIVE_TERMINAL_START_FAILED_CODE,
+        "error_id": error_id,
+        "message": f"{message} Error ID: {error_id}.",
+    }
 
 
 def _publish_native_terminal_start_error(

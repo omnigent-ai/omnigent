@@ -617,7 +617,7 @@ def create_imports_router(
 
         async def _events() -> AsyncIterator[bytes]:
             counts: dict[str, int] = {}
-            error_message: str | None = None
+            error_id: str | None = None
             try:
                 async for ref in _import_local_core(body, user_id, host_conn, counts):
                     yield _import_event_line(
@@ -626,10 +626,20 @@ def create_imports_router(
             except OmnigentError:
                 # The read dropped/stalled mid-stream. The 200 + partial body is
                 # already sent, so report the failure inline rather than raising.
-                _logger.exception("Local session import stream failed")
-                error_message = _LOCAL_IMPORT_STREAM_ERROR_MESSAGE
-            if error_message is not None:
-                yield _import_event_line({"event": "error", "message": error_message})
+                error_id = f"err_{secrets.token_hex(16)}"
+                _logger.exception(
+                    "Local session import stream failed; error_id=%s",
+                    error_id,
+                    extra={"error_id": error_id},
+                )
+            if error_id is not None:
+                yield _import_event_line(
+                    {
+                        "event": "error",
+                        "error_id": error_id,
+                        "message": f"{_LOCAL_IMPORT_STREAM_ERROR_MESSAGE} Error ID: {error_id}.",
+                    }
+                )
             yield _import_event_line(
                 {
                     "event": "done",

@@ -600,15 +600,22 @@ async def test_local_import_stream_redacts_host_error(
             )
 
     events = [json.loads(line) for line in response.text.splitlines() if line.strip()]
-    assert events[0] == {
+    error_event = events[0]
+    error_id = error_event["error_id"]
+    assert error_id.startswith("err_")
+    assert len(error_id) == 36
+    int(error_id.removeprefix("err_"), 16)
+    assert error_event == {
         "event": "error",
+        "error_id": error_id,
         "message": (
             "The local session import stopped unexpectedly. "
-            "Retry the import or contact an administrator."
+            f"Retry the import or contact an administrator. Error ID: {error_id}."
         ),
     }
     assert sensitive_detail not in response.text
     assert sensitive_detail in caplog.text
+    assert error_id in caplog.text
 
 
 def _host_import_client(db_uri: str, host_registry: HostRegistry) -> httpx.AsyncClient:

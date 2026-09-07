@@ -2163,11 +2163,17 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
         )
 
     # Client-safe payload pointing at the runner log — no raw exception text.
+    error_id = error["error_id"]
+    assert error_id.startswith("err_")
+    assert len(error_id) == 36
+    int(error_id.removeprefix("err_"), 16)
     assert error == {
         "code": "native_terminal_start_failed",
+        "error_id": error_id,
         "message": (
             "Native Codex terminal failed to start; "
-            f"see the runner log for details: {pinned_runner_log}"
+            f"see the runner log for details: {pinned_runner_log} "
+            f"Error ID: {error_id}."
         ),
     }
     # The raw cause must NOT leak into the surfaced message, but MUST be
@@ -2175,6 +2181,7 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
     # text back in the payload) or the server-side log was dropped.
     assert "requires the 'codex' CLI" not in error["message"]
     assert "requires the 'codex' CLI on PATH." in caplog.text
+    assert error_id in caplog.text
     assert [p.event for p in published] == [
         {
             "type": "session.status",
@@ -2205,16 +2212,22 @@ def test_publish_native_terminal_start_error_redacts_mismatch_path(
             ),
         )
 
+    error_id = error["error_id"]
+    assert error_id.startswith("err_")
+    assert len(error_id) == 36
+    int(error_id.removeprefix("err_"), 16)
     assert error == {
         "code": "native_terminal_start_failed",
+        "error_id": error_id,
         "message": (
             "Claude Code is Windows-native, but Omnigent is running under WSL. "
             "Install @anthropic-ai/claude-code from WSL so a WSL-native `claude` "
-            "binary wins PATH resolution, then retry."
+            f"binary wins PATH resolution, then retry. Error ID: {error_id}."
         ),
     }
     assert sensitive_path not in error["message"]
     assert sensitive_path in caplog.text
+    assert error_id in caplog.text
     assert published[0].event["error"] == error
 
 
