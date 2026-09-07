@@ -14,8 +14,9 @@
   https://github.com/electron-userland/electron-builder/issues/9254.
 - `icon.ico` / `icon.png` — Windows installer icon, and the PNG used at
   runtime for Electron windows/dialogs.
-- Linux launcher icon — `../platform-assets/logos/omnigents-logo.svg`
-  (`linux.icon` in `package.json`). electron-builder installs it as
+- `icon.svg` — Linux launcher icon (`linux.icon` in `package.json`), a
+  copy of the square `docs/images/omnigent-logo.svg`. electron-builder
+  installs it as
   `/usr/share/icons/hicolor/scalable/apps/<executableName>.svg` so
   desktop environments that ignore a lone 1024×1024 PNG still resolve
   `Icon=<executableName>` from the `.desktop` file.

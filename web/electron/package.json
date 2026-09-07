@@ -120,7 +120,7 @@
       ]
     },
     "linux": {
-      "icon": "../platform-assets/logos/omnigents-logo.svg",
+      "icon": "icons/icon.svg",
       "category": "Development",
       "maintainer": "Databricks, Inc. <support@omnigent.ai>",
       "target": [
