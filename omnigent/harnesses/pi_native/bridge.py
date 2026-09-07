@@ -10,6 +10,7 @@ import os
 import tempfile
 import time
 import uuid
+from collections.abc import Mapping
 from importlib.resources import files
 from pathlib import Path
 
@@ -25,6 +26,31 @@ _ENQUEUE_SEQUENCE = itertools.count()
 PI_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_PI_NATIVE_BRIDGE_DIR"
 PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_PI_NATIVE_REQUEST_SESSION_ID"
 PI_NATIVE_CONFIG_ENV_VAR = "OMNIGENT_PI_NATIVE_CONFIG"
+
+#: Env var naming credential variables to strip from the Pi terminal
+#: (comma-separated). Pi activates a built-in provider's whole catalog on the
+#: mere presence of its credential (any value); managed deployments that export
+#: dummy tokens for other harnesses (e.g. ``ANTHROPIC_AUTH_TOKEN`` for
+#: claude-code against a gateway) would otherwise see Pi's picker flooded with
+#: built-in entries that bypass the managed provider. Pi's own auth rides the
+#: managed models.json ``apiKey``, so it needs no credential env. Operator-
+#: declared (not a code constant) because the deployment knows which credential
+#: vars it projects; unset means no scrubbing.
+PI_NATIVE_ENV_UNSET_ENV_VAR = "OMNIGENT_PI_ENV_UNSET"
+
+
+def pi_native_env_unset(environ: Mapping[str, str]) -> list[str]:
+    """Parse the Pi terminal credential-env denylist.
+
+    :param environ: The environment mapping to read
+        :data:`PI_NATIVE_ENV_UNSET_ENV_VAR` from (``os.environ`` at call sites,
+        a dict in tests).
+    :returns: Sorted, deduplicated variable names to pop from the Pi terminal
+        env; empty when the var is unset or blank.
+    """
+    raw = environ.get(PI_NATIVE_ENV_UNSET_ENV_VAR, "")
+    return sorted({name.strip() for name in raw.split(",") if name.strip()})
+
 
 _BRIDGE_ROOT = Path.home() / ".omnigent" / "pi-native"
 _CONFIG_FILE = "config.json"
