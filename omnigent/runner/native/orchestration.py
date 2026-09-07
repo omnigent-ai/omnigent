@@ -6072,7 +6072,11 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
     from omnigent.claude_native_bridge import ClaudeNativeHookInterpreterMismatchError
 
     if isinstance(exc, ClaudeNativeHookInterpreterMismatchError):
-        message = str(exc)
+        message = (
+            "Claude Code is Windows-native, but Omnigent is running under WSL. "
+            "Install @anthropic-ai/claude-code from WSL so a WSL-native `claude` "
+            "binary wins PATH resolution, then retry."
+        )
     elif IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
         # Give the client an actionable message instead of a log pointer.

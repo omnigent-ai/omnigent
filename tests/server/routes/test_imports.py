@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
 import httpx
@@ -552,6 +553,62 @@ async def test_local_import_stream_emits_ndjson_session_then_done(
     # Each streamed session was actually persisted.
     for e in session_events:
         assert conversation_store.get_conversation(e["session_id"]) is not None
+
+
+async def test_local_import_stream_redacts_host_error(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A mid-stream host failure keeps exception details out of the NDJSON body."""
+    from omnigent.server.routes import imports as imports_module
+
+    sensitive_detail = "host read failed at /private/transcripts/session.json\nTraceback: secret"
+
+    async def _fake_stream(**_kwargs: object):
+        yield {}
+        raise OmnigentError(sensitive_detail, code=ErrorCode.INTERNAL_ERROR)
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            SqlAlchemyConversationStore(db_uri),
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=SimpleNamespace(get=lambda _host_id: host_conn),  # type: ignore[arg-type]
+            host_store=SimpleNamespace(  # type: ignore[arg-type]
+                get_host=lambda _host_id: SimpleNamespace(user_id=None)
+            ),
+        ),
+        prefix="/v1",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    with caplog.at_level(logging.ERROR, logger=imports_module.__name__):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/v1/imports/local/stream",
+                json={
+                    "host_id": "host_0123456789abcdef0123456789abcdef",
+                    "source": "claude",
+                    "limit": 5,
+                },
+            )
+
+    events = [json.loads(line) for line in response.text.splitlines() if line.strip()]
+    assert events[0] == {
+        "event": "error",
+        "message": (
+            "The local session import stopped unexpectedly. "
+            "Retry the import or contact an administrator."
+        ),
+    }
+    assert sensitive_detail not in response.text
+    assert sensitive_detail in caplog.text
 
 
 def _host_import_client(db_uri: str, host_registry: HostRegistry) -> httpx.AsyncClient:

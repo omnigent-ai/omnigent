@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import secrets
 import threading
 from collections.abc import AsyncIterator
@@ -39,9 +40,14 @@ from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 
+_logger = logging.getLogger(__name__)
+
 # Upper bound on items in one imported session, shared by the CLI-normalized
 # ``/imports`` body and the host-streamed ``/imports/local`` path.
 _MAX_IMPORT_ITEMS = 100_000
+_LOCAL_IMPORT_STREAM_ERROR_MESSAGE = (
+    "The local session import stopped unexpectedly. Retry the import or contact an administrator."
+)
 
 
 class ImportItemInput(BaseModel):
@@ -617,10 +623,11 @@ def create_imports_router(
                     yield _import_event_line(
                         {"event": "session", "session_id": ref.session_id, "title": ref.title}
                     )
-            except OmnigentError as exc:
+            except OmnigentError:
                 # The read dropped/stalled mid-stream. The 200 + partial body is
                 # already sent, so report the failure inline rather than raising.
-                error_message = str(exc)
+                _logger.exception("Local session import stream failed")
+                error_message = _LOCAL_IMPORT_STREAM_ERROR_MESSAGE
             if error_message is not None:
                 yield _import_event_line({"event": "error", "message": error_message})
             yield _import_event_line(

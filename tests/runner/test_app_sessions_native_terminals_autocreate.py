@@ -2185,6 +2185,39 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
     assert all(p.session_id == "415c9954e2fe4b9276083a4d2c66f689" for p in published)
 
 
+def test_publish_native_terminal_start_error_redacts_mismatch_path(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The actionable WSL mismatch response omits the rejected executable path."""
+    published: list[_PublishedEvent] = []
+    sensitive_path = "/mnt/c/Users/private/AppData/Roaming/npm/claude.cmd"
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(_PublishedEvent(session_id=session_id, event=event))
+
+    with caplog.at_level(logging.WARNING):
+        error = _publish_native_terminal_start_error(
+            _capture,
+            "415c9954e2fe4b9276083a4d2c66f690",
+            "Claude",
+            ClaudeNativeHookInterpreterMismatchError(
+                f"Claude Code executable {sensitive_path!r} is Windows-native"
+            ),
+        )
+
+    assert error == {
+        "code": "native_terminal_start_failed",
+        "message": (
+            "Claude Code is Windows-native, but Omnigent is running under WSL. "
+            "Install @anthropic-ai/claude-code from WSL so a WSL-native `claude` "
+            "binary wins PATH resolution, then retry."
+        ),
+    }
+    assert sensitive_path not in error["message"]
+    assert sensitive_path in caplog.text
+    assert published[0].event["error"] == error
+
+
 def test_terminal_lookup_miss_log_explains_stopped_registered_terminal(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
