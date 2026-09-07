@@ -11,6 +11,10 @@ on:
         description: "versionCode (must be higher than the last uploaded to Play; starts at 3)"
         required: true
         type: string
+      version-name:
+        description: "versionName shown to users (e.g. 0.2.0). Blank keeps the default in app/build.gradle.kts"
+        required: false
+        default: ""
       version-note:
         description: "Optional note appended to the artifact filename (e.g. rc1)"
         required: false
@@ -47,7 +51,10 @@ jobs:
           cache-read-only: false
 
       - name: Build release AAB
-        run: ./gradlew bundleRelease --no-daemon --console=plain -PversionCode=${{ github.event.inputs.version-code }}
+        run: |
+          ./gradlew bundleRelease --no-daemon --console=plain \
+            "-PversionCode=${{ inputs.version-code }}" \
+            "-PversionName=${{ inputs.version-name }}"
 
       - name: Verify artifact
         run: |

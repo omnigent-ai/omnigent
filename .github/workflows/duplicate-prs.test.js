@@ -153,4 +153,19 @@ function assert(name, cond, detail) {
     pr({ number: 2, createdAt: "2026-06-02T00:00:00Z", issues: [] }),
   ]);
   assert("PR with no issue reference is ignored", r.closed.length === 0, JSON.stringify(r));
+
+  // 8. Resolve-agent replacement PRs are exempt. The contributor PR remains
+  //    open until a separate post-merge workflow closes it after replacement.
+  r = await run([
+    pr({ number: 1, createdAt: "2026-06-01T00:00:00Z", issues: [9] }),
+    pr({
+      number: 2,
+      createdAt: "2026-06-02T00:00:00Z",
+      author: "omni-resolve-agent[bot]",
+      issues: [9],
+    }),
+  ]);
+  assert("trusted replacement PR is exempt while contributor PR stays open",
+    r.closed.length === 0 && r.labeled.length === 0 && r.commented.length === 0,
+    JSON.stringify(r));
 })();

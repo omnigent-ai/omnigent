@@ -1,0 +1,51 @@
+name: Reopen notice on PR close
+
+# When a PR is closed without merging, comment telling the author how to get it
+# back (`/reopen`, handled by reopen-pr.yml). Logic + safety notes live in
+# reopen-notice.js (offline unit test: reopen-notice.test.js).
+#
+# `pull_request_target`, because a fork PR's `pull_request` token is read-only no
+# matter what `permissions:` asks for -- commenting would 403 on exactly the fork
+# PRs this notice exists for. `_target` runs in the base-repo context with a
+# grantable token; safe here since the job reads only event metadata and the
+# comment list, checks out the default branch's `.github`, and runs no PR code.
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reopen-notice-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  notice:
+    if: github.repository == 'omnigent-ai/omnigent' && !github.event.pull_request.merged
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # Job-level permissions REPLACE the workflow-level block, so restate read.
+      contents: read
+      # Commenting on a PR needs BOTH: the endpoint is /issues/{n}/comments, but
+      # GitHub gates it on `pull-requests` when the target is a pull request.
+      # `issues: write` alone returns "Resource not accessible by integration".
+      issues: write
+      pull-requests: write
+    steps:
+      # Trusted default branch, .github only (the script). Never PR head.
+      - name: Check out .github
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github
+          persist-credentials: false
+      - name: Comment with the reopen instructions
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          retries: 3
+          script: |
+            const script = require('./.github/workflows/reopen-notice.js');
+            await script({ github, context, core });
