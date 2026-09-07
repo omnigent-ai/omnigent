@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-import omnigent.host.identity as identity_mod
 from omnigent.host.identity import (
     host_identity_env_override_active,
     load_host_identity_if_present,
@@ -376,7 +375,7 @@ def test_reset_host_id_write_is_atomic_and_preserves_config_on_dump_failure(
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(identity_mod.yaml, "safe_dump", _boom)
+    monkeypatch.setattr("omnigent.host.identity.yaml.safe_dump", _boom)
 
     with pytest.raises(RuntimeError, match="disk full"):
         reset_host_id(config_path)
