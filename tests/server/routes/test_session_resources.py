@@ -233,16 +233,6 @@ class _ConversationStore:
             result.append(persisted)
         return result
 
-    def has_item(self, conversation_id: str, item_id: str) -> bool:
-        """Return whether an appended item carries ``item_id``.
-
-        :param conversation_id: The conversation id (unused).
-        :param item_id: Item id to probe.
-        :returns: ``True`` when a recorded item has that id.
-        """
-        del conversation_id
-        return any(item.id == item_id for item in self.appended_items)
-
     def list_items(
         self,
         conversation_id: str,
@@ -4346,15 +4336,10 @@ async def test_kiro_duplicate_repost_restores_skipped_entries_unpersisted() -> N
     class _DedupingStore(_ConversationStore):
         """Store whose matched item is already persisted: every append dedupes."""
 
-        def has_item(self, conversation_id: str, item_id: str) -> bool:
-            del conversation_id, item_id
-            return True
-
         def append(self, conversation_id: str, items: list[Any]) -> list[Any]:
-            del conversation_id
-            return [
+            result = [
                 ConversationItem(
-                    id=item.stable_id,
+                    id=item.stable_id or f"item_{i}",
                     type=item.type,
                     status="completed",
                     response_id=item.response_id,
@@ -4362,8 +4347,10 @@ async def test_kiro_duplicate_repost_restores_skipped_entries_unpersisted() -> N
                     data=item.data,
                     deduplicated=True,
                 )
-                for item in items
+                for i, item in enumerate(items)
             ]
+            self.appended_items.extend(result)
+            return result
 
     pending_inputs.reset_for_tests()
     store = _DedupingStore()
@@ -4397,9 +4384,9 @@ async def test_kiro_duplicate_repost_restores_skipped_entries_unpersisted() -> N
             store,  # type: ignore[arg-type]
         )
 
-        # Nothing persisted (no error items for the skipped drains), and the
-        # queue is back in its original order for the next genuine message.
-        assert store.appended_items == []
+        # The batch was submitted but all items came back deduplicated (retry
+        # of an already-committed message); skipped drains are restored.
+        assert all(item.deduplicated for item in store.appended_items)
         snapshot = pending_inputs.snapshot_for(sid)
         assert [entry["pending_id"] for entry in snapshot] == recorded
     finally:

@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import math
+import re
 import secrets
 import time
 import uuid
@@ -2297,55 +2298,50 @@ async def _persist_external_conversation_item(
             # bubble then disappear once the committed item arrived.
             if drained.created_by is not None and item.created_by is None:
                 item = item.model_copy(update={"created_by": drained.created_by})
+            # A web client that sends stable_id gets store-level idempotency:
+            # use it directly as the item id so the append is a no-op on retry.
+            # source_id from the forwarder takes precedence when both are set.
+            if drained.stable_id is not None and item.stable_id is None:
+                item = item.model_copy(update={"stable_id": drained.stable_id})
         elif item.created_by is None and created_by is not None:
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
-    # Skipped Kiro entries persist BEFORE the matched item so their stored
-    # positions precede it, matching the live broadcast order — unless the
-    # matched item is a duplicate re-post, in which case the skipped drains
-    # belong to LATER messages and are restored (below), not persisted.
-    skipped_persisted = False
-    if skipped_kiro_pending:
-        matched_already_persisted = item.stable_id is not None and await asyncio.to_thread(
-            conversation_store.has_item, session_id, item.stable_id
-        )
-        if not matched_already_persisted:
-            for skipped in skipped_kiro_pending:
-                await _persist_skipped_kiro_pending_input(
-                    session_id,
-                    skipped,
-                    conversation_store,
-                )
-            skipped_persisted = True
+    # Build the batch: skipped Kiro entries first (their positions must
+    # precede the matched item to match broadcast order), then the anchor.
+    # Each skipped entry gets a pair of items (user message + error) with
+    # stable IDs derived from pending_id, so the whole batch is idempotent
+    # under the append lock — no separate has_item probe needed. When the
+    # anchor is already persisted (a forwarder retry), append returns every
+    # item as deduplicated and the queue entries are restored below.
+    skipped_new_items = _build_skipped_kiro_items(session_id, skipped_kiro_pending)
+    batch = [*skipped_new_items, item]
     pending_background_title = prepare_background_session_title(
         coordinator=background_title_coordinator,
         conversation=conv,
         event=SessionEventInput(type=item.type, data=item.data.model_dump()),
     )
-    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
-    persisted = persisted_items[0]
+    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
+    persisted = persisted_items[-1]
     if persisted.deduplicated:
         # A re-post of an already-committed item: nothing new to render or
-        # title, and every pending entry the drain above consumed belongs
-        # to a LATER user message — put them back at the front in their
-        # original queue order (skipped entries preceded the match; restore
-        # prepends, so restore in reverse). Skipped entries persisted above
-        # (the probe raced a concurrent retry) stay persisted.
-        restorable = [drained] if skipped_persisted else [*skipped_kiro_pending, drained]
-        for entry in reversed(restorable):
+        # title. Every pending entry consumed above belongs to a LATER user
+        # message — restore in original queue order (skipped entries preceded
+        # the match; restore prepends, so reverse).
+        for entry in reversed([*skipped_kiro_pending, drained]):
             if entry is not None:
                 pending_inputs.restore(session_id, entry)
         return persisted.id
-    if not skipped_persisted:
-        # Probe said duplicate but the append inserted anyway (row vanished
-        # in between): persist the skipped drains late rather than lose them.
-        for skipped in skipped_kiro_pending:
-            await _persist_skipped_kiro_pending_input(
-                session_id,
-                skipped,
-                conversation_store,
+    # Not a duplicate: publish side effects for each skipped Kiro pair.
+    # Items are [user0, error0, user1, error1, ...]; 2 per skipped entry.
+    for i, skipped in enumerate(skipped_kiro_pending):
+        persisted_user = persisted_items[i * 2]
+        persisted_error = persisted_items[i * 2 + 1]
+        if not persisted_user.deduplicated:
+            _publish_input_consumed(
+                session_id, persisted_user, cleared_pending_id=skipped.pending_id
             )
+            _publish_external_conversation_item(session_id, persisted_error)
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule()
@@ -2356,41 +2352,53 @@ async def _persist_external_conversation_item(
     return persisted.id
 
 
-async def _persist_skipped_kiro_pending_input(
+def _build_skipped_kiro_items(
     session_id: str,
-    skipped: pending_inputs.DrainedInput,
-    conversation_store: ConversationStore,
-) -> None:
-    """Persist a Kiro web input that never appeared in Kiro's JSONL transcript."""
-    turn_id = generate_task_id()
-    user_item = NewConversationItem(
-        type="message",
-        response_id=turn_id,
-        data=MessageData(role="user", content=skipped.content),
-        created_by=skipped.created_by,
-    )
-    error = ErrorData(
-        source="execution",
-        code="kiro_native_prompt_not_recorded",
-        message=(
-            "Kiro did not accept this web message into its structured session transcript. "
-            "The native terminal may have shown the underlying error."
-        ),
-    )
-    persisted_items = await asyncio.to_thread(
-        conversation_store.append,
-        session_id,
-        [
-            user_item,
-            NewConversationItem(type="error", response_id=turn_id, data=error),
-        ],
-    )
-    _publish_input_consumed(
-        session_id,
-        persisted_items[0],
-        cleared_pending_id=skipped.pending_id,
-    )
-    _publish_external_conversation_item(session_id, persisted_items[1])
+    skipped_entries: list[pending_inputs.DrainedInput],
+) -> list[NewConversationItem]:
+    """
+    Build ``NewConversationItem`` pairs for Kiro web inputs not in the transcript.
+
+    Each skipped entry produces ``[user_message, error_item]``. Stable IDs
+    derived from ``pending_id`` make each pair idempotent under the batch
+    append so no pre-flight has_item probe is needed — if the anchor item
+    is already persisted (a forwarder retry), these items are too, and
+    append returns the whole batch deduplicated.
+    """
+    items: list[NewConversationItem] = []
+    for skipped in skipped_entries:
+        turn_id = generate_task_id()
+        items.append(
+            NewConversationItem(
+                type="message",
+                response_id=turn_id,
+                data=MessageData(role="user", content=skipped.content),
+                created_by=skipped.created_by,
+                stable_id=uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"omnigent-skipped-kiro-user:{session_id}:{skipped.pending_id}",
+                ).hex,
+            )
+        )
+        items.append(
+            NewConversationItem(
+                type="error",
+                response_id=turn_id,
+                data=ErrorData(
+                    source="execution",
+                    code="kiro_native_prompt_not_recorded",
+                    message=(
+                        "Kiro did not accept this web message into its structured session "
+                        "transcript. The native terminal may have shown the underlying error."
+                    ),
+                ),
+                stable_id=uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"omnigent-skipped-kiro-error:{session_id}:{skipped.pending_id}",
+                ).hex,
+            )
+        )
+    return items
 
 
 async def _enrich_terminal_status_with_subagent_output(
@@ -5809,8 +5817,17 @@ async def _dispatch_session_event_to_runner_impl(
         # back on any failure/cancellation so a message the TUI never
         # received doesn't replay as a ghost.
         content = body.data.get("content")
+        raw_stable_id = body.data.get("stable_id")
+        web_stable_id = (
+            raw_stable_id
+            if isinstance(raw_stable_id, str)
+            and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
+            else None
+        )
         pending_id: str | None = (
-            pending_inputs.record(session_id, content, created_by=created_by)
+            pending_inputs.record(
+                session_id, content, created_by=created_by, stable_id=web_stable_id
+            )
             if isinstance(content, list) and content
             else None
         )
@@ -10047,7 +10064,6 @@ __all__ = [
     "_persist_native_cumulative_usage",
     "_persist_native_terminal_failure",
     "_persist_session_event",
-    "_persist_skipped_kiro_pending_input",
     "_publish_and_wait_for_harness_elicitation",
     "_publish_runner_recovered_status",
     "_publish_subtree_cost_to_ancestors",

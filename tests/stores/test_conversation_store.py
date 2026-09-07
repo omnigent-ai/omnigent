@@ -6260,24 +6260,6 @@ def test_repeated_persisted_twin_batch_leaves_conversation_metadata_alone(
     assert len(conversation_store.list_items(conv.id).data) == 1
 
 
-def test_has_item_probes_persisted_ids(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """``has_item`` sees a persisted stable id, scoped to its conversation."""
-    conv = conversation_store.create_conversation()
-    other = conversation_store.create_conversation()
-    stable = "2c" * 16
-    item = NewConversationItem(
-        type="message",
-        response_id="resp_x",
-        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
-        stable_id=stable,
-    )
-    assert conversation_store.has_item(conv.id, stable) is False
-    conversation_store.append(conv.id, [item])
-    assert conversation_store.has_item(conv.id, stable) is True
-    assert conversation_store.has_item(other.id, stable) is False
-
 
 # ── Connection-checkout budget ─────────────────────────
 

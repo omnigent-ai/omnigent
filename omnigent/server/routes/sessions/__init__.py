@@ -638,7 +638,6 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_native_cumulative_usage as _persist_native_cumulative_usage,
     _persist_native_terminal_failure as _persist_native_terminal_failure,
     _persist_session_event as _persist_session_event,
-    _persist_skipped_kiro_pending_input as _persist_skipped_kiro_pending_input,
     _publish_and_wait_for_harness_elicitation as _publish_and_wait_for_harness_elicitation,
     _publish_subtree_cost_to_ancestors as _publish_subtree_cost_to_ancestors,
     _recover_subagent_status_forward_via_parent as _recover_subagent_status_forward_via_parent,

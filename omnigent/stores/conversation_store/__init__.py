@@ -645,24 +645,6 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def has_item(self, conversation_id: str, item_id: str) -> bool:
-        """
-        Return whether an item with ``item_id`` exists in a conversation.
-
-        Existence probe for idempotent-append callers that must know
-        *before* appending whether a stable-id item is a duplicate
-        re-post, e.g. to decide whether order-sensitive sibling persists
-        that precede the append should run at all.
-
-        :param conversation_id: Unique conversation identifier,
-            e.g. ``"conv_abc123"``.
-        :param item_id: Item id to probe, e.g. a stable id derived
-            from a forwarder ``source_id``.
-        :returns: ``True`` when the item is already persisted.
-        """
-        ...
-
-    @abstractmethod
     def list_conversations(
         self,
         limit: int = 20,

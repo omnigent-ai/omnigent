@@ -119,6 +119,7 @@ class DrainedInput:
     pending_id: str
     content: list[dict[str, Any]]
     created_by: str | None = None
+    stable_id: str | None = None
 
 
 @dataclass
@@ -154,6 +155,7 @@ class _Entry:
     pending_id: str
     content: list[dict[str, Any]]
     created_by: str | None = None
+    stable_id: str | None = None
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
     # resolved at construction time rather than bound at class def.
     created_at: float = field(default_factory=lambda: _now())
@@ -193,6 +195,7 @@ def record(
     conversation_id: str,
     content: list[dict[str, Any]],
     created_by: str | None = None,
+    stable_id: str | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -211,10 +214,15 @@ def record(
         e.g. ``"alice@example.com"``. ``None`` when unknown. Stored
         so :func:`resolve_oldest` can apply it to the persisted item
         and broadcast it via ``session.input.consumed``.
+    :param stable_id: Stable 32-char hex id assigned by the web client to this
+        logical message submit. When set, the transcript forwarder uses it
+        directly as the persisted item's id so the store-level append is
+        idempotent across client retries. ``None`` for clients that do not
+        send one.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
     """
     pending_id = f"pending_{uuid.uuid4().hex}"
-    entry = _Entry(pending_id=pending_id, content=content, created_by=created_by)
+    entry = _Entry(pending_id=pending_id, content=content, created_by=created_by, stable_id=stable_id)
     with _lock:
         _evict_stale_locked(conversation_id, entry.created_at)
         _pending.setdefault(conversation_id, {})[pending_id] = entry
@@ -281,6 +289,7 @@ def resolve_oldest(conversation_id: str) -> DrainedInput | None:
             pending_id=entry.pending_id,
             content=copy.deepcopy(entry.content),
             created_by=entry.created_by,
+            stable_id=entry.stable_id,
         )
 
 
@@ -302,6 +311,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         pending_id=drained.pending_id,
         content=copy.deepcopy(drained.content),
         created_by=drained.created_by,
+        stable_id=drained.stable_id,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -419,6 +429,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         pending_id=entry.pending_id,
         content=copy.deepcopy(entry.content),
         created_by=entry.created_by,
+        stable_id=entry.stable_id,
     )
 
 

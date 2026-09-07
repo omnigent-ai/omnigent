@@ -2244,30 +2244,6 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         return persisted
 
-    def has_item(self, conversation_id: str, item_id: str) -> bool:
-        """
-        Return whether an item with ``item_id`` exists in a conversation.
-
-        Point lookup on the (workspace_id, conversation_id, id) primary
-        key; loads no item data. Used as the pre-append duplicate probe
-        for stable-id items (see :meth:`append`).
-
-        :param conversation_id: Unique conversation identifier,
-            e.g. ``"conv_abc123"``.
-        :param item_id: Item id to probe, e.g. a stable id derived
-            from a forwarder ``source_id``.
-        :returns: ``True`` when the item is already persisted.
-        """
-        with self._conv_session("has_conversation_item") as session:
-            row = session.execute(
-                select(SqlConversationItem.id).where(
-                    SqlConversationItem.workspace_id == current_workspace_id(),
-                    SqlConversationItem.conversation_id == conversation_id,
-                    SqlConversationItem.id == item_id,
-                )
-            ).first()
-            return row is not None
-
     def list_projects(
         self,
         accessible_by: str | None = None,

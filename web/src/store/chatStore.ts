@@ -204,6 +204,13 @@ export interface QueuedMessage {
    * Falls back to the current `boundAgentId` when absent.
    */
   agentId?: string;
+  /**
+   * Stable 32-char hex id for this logical message submit. Generated once at
+   * enqueue time and kept across retries so the server-side append is
+   * idempotent — a re-post of the same message after a network failure does
+   * not insert a duplicate conversation item.
+   */
+  stableId: string;
 }
 
 /**
@@ -1373,12 +1380,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (conversationId === null) return;
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
+    const stableId = crypto.randomUUID().replace(/-/g, "");
     setActive((s) => ({
       queuedMessages: [
         ...s.queuedMessages,
         {
           queueId,
           text,
+          stableId,
           conversationId,
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
           ...(files && files.length > 0 ? { files } : {}),
@@ -1562,7 +1571,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ];
         await postEvent(conversationId, {
           type: "message",
-          data: { role: "user", content },
+          data: { role: "user", content, stable_id: head.stableId },
         });
       })()
         .catch(() => {
@@ -1595,6 +1604,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!agentId) {
       throw new Error("chatStore.send: no agentId");
     }
+    const stableId = crypto.randomUUID().replace(/-/g, "");
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
     // into the running task's inbox. Keep `activeResponse` untouched in
@@ -1710,6 +1720,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         data: {
           role: "user",
           content: serverContent,
+          stable_id: stableId,
         },
       });
       // Policy denied the input — the server returned immediately
