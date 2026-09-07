@@ -844,6 +844,7 @@ export function VirtualBubbleList({
           <div
             key={item.key}
             data-index={item.index}
+            data-bubble-key={bubbleKey(bubble)}
             ref={virtualizer.measureElement}
             className="absolute top-0 left-0 w-full"
             style={{ transform: `translateY(${item.start - scrollMargin}px)` }}

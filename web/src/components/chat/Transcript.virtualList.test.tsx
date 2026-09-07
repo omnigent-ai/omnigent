@@ -47,6 +47,7 @@ it("remeasures scrollMargin when task padding changes without changing bubbles",
 
   const view = render(list(false, scrollEl));
   const row = view.container.querySelector<HTMLElement>('[data-index="0"]')!;
+  expect(row).toHaveAttribute("data-bubble-key", "user:user-1");
   const wrapper = row.parentElement!;
   wrapper.getBoundingClientRect = () => ({ top: 64 }) as DOMRect;
 

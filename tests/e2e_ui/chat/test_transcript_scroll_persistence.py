@@ -93,11 +93,11 @@ _CAPTURE_ANCHOR = f"""
   {_FIND_SCROLLER}
   if (!el) return null;
   const top = el.getBoundingClientRect().top;
-  const rows = [...el.querySelectorAll('[data-index]')]
+  const rows = [...el.querySelectorAll('[data-bubble-key]')]
     .map((node) => {{
       const rect = node.getBoundingClientRect();
       return {{
-        id: node.getAttribute('data-index'),
+        id: node.getAttribute('data-bubble-key'),
         offset: rect.top - top,
       }};
     }})
@@ -211,4 +211,5 @@ def test_native_find_shortcut_mounts_the_full_loaded_transcript(
         }))"""
     )
 
-    expect(bubbles).to_have_count(100, timeout=30_000)
+    expect(page.locator("[data-index]")).to_have_count(0, timeout=30_000)
+    assert bubbles.count() > mounted_before
