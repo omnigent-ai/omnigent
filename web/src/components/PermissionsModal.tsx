@@ -169,11 +169,9 @@ export function PermissionsModal({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">Share this session</DialogTitle>
           <DialogDescription>
-            {workspaceBlocked
-              ? "This conversation is in a home or root directory and cannot be shared on this server. Start a new conversation in a project directory to share it."
-              : sharingReadOnly
-                ? "This server allows read-only sharing — invite others to view this session."
-                : "Invite others to view or collaborate on this session."}
+            {sharingReadOnly
+              ? "This server allows read-only sharing — invite others to view this session."
+              : "Invite others to view or collaborate on this session."}
           </DialogDescription>
         </DialogHeader>
 
@@ -230,45 +228,50 @@ export function PermissionsModal({
         </div>
 
         {/* Add grant form */}
-        {!workspaceBlocked && (
-          <form onSubmit={handleGrant} className="flex items-end gap-2">
-            <div className="flex-1">
-              <label htmlFor="perm-user" className="text-sm font-medium text-muted-foreground">
-                User ID
-              </label>
-              <AddUserField value={newUserId} onChange={setNewUserId} />
-            </div>
-            <div>
-              <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
-                Level
-              </label>
-              <Select
-                value={newLevel}
-                onValueChange={setNewLevel}
-                componentId="diagnostics.permissions.grant_level"
-                valueHasNoPii
-              >
-                <SelectTrigger className="mt-1 w-24">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="1">Read</SelectItem>
-                  {/* Read-only sharing caps new grants at view; hide Edit. */}
-                  {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
-                </SelectContent>
-              </Select>
-            </div>
-            <Button
-              type="submit"
-              size="sm"
-              loading={grant.isPending}
-              disabled={!newUserId.trim()}
-              componentId="diagnostics.permissions.grant"
+        <form onSubmit={handleGrant} className="flex items-end gap-2">
+          <div className="flex-1">
+            <label htmlFor="perm-user" className="text-sm font-medium text-muted-foreground">
+              User ID
+            </label>
+            <AddUserField value={newUserId} onChange={setNewUserId} />
+          </div>
+          <div>
+            <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
+              Level
+            </label>
+            <Select
+              value={newLevel}
+              onValueChange={setNewLevel}
+              componentId="diagnostics.permissions.grant_level"
+              valueHasNoPii
             >
-              <UserPlusIcon className="mr-1 size-3.5" />
-              Grant
-            </Button>
-          </form>
+              <SelectTrigger className="mt-1 w-24">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="1">Read</SelectItem>
+                {/* Read-only sharing caps new grants at view; hide Edit. */}
+                {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
+              </SelectContent>
+            </Select>
+          </div>
+          <Button
+            type="submit"
+            size="sm"
+            loading={grant.isPending}
+            disabled={!newUserId.trim()}
+            componentId="diagnostics.permissions.grant"
+          >
+            <UserPlusIcon className="mr-1 size-3.5" />
+            Grant
+          </Button>
+        </form>
+
+        {workspaceBlocked && (
+          <p className="text-sm text-destructive">
+            This session&apos;s working directory (a home or root directory) cannot be shared on
+            this Omnigent server.
+          </p>
         )}
 
         {error && <p className="text-sm text-destructive">{error}</p>}

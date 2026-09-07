@@ -588,9 +588,7 @@ describe("PermissionsModal", () => {
         />,
         { wrapper: createSharingWrapper("restricted_read_only") },
       );
-      expect(
-        screen.queryByText(/This conversation is in a home or root directory/),
-      ).not.toBeInTheDocument();
+      expect(screen.queryByText(/This session's working directory/)).not.toBeInTheDocument();
       fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
       fireEvent.click(screen.getByRole("button", { name: /grant/i }));
       await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob", 1));
@@ -612,11 +610,10 @@ describe("PermissionsModal", () => {
           },
         );
 
-        expect(
-          screen.getByText(/This conversation is in a home or root directory/),
-        ).toBeInTheDocument();
-        expect(screen.queryByRole("button", { name: /grant/i })).not.toBeInTheDocument();
-        expect(screen.queryByLabelText("User ID")).not.toBeInTheDocument();
+        const warning = screen.getByText(/This session's working directory/);
+        expect(warning).toHaveClass("text-destructive");
+        fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
+        fireEvent.click(screen.getByRole("button", { name: /grant/i }));
         expect(screen.getByRole("switch")).toBeDisabled();
         fireEvent.click(screen.getByRole("switch"));
         await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
@@ -643,9 +640,7 @@ describe("PermissionsModal", () => {
         fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
         fireEvent.click(screen.getByRole("button", { name: /grant/i }));
         await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob", 1));
-        expect(
-          screen.queryByText(/This conversation is in a home or root directory/),
-        ).not.toBeInTheDocument();
+        expect(screen.queryByText(/This session's working directory/)).not.toBeInTheDocument();
       },
     );
 
