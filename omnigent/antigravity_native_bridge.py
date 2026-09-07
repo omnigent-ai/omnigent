@@ -376,6 +376,13 @@ _AGY_PLUGINS_DIR = "plugins"
 _AGY_IMPORT_MANIFEST = "import_manifest.json"
 
 
+# agy loads its global lifecycle hooks from ``<gemini_dir>/config/hooks.json``.
+# Hooks are how users install local policy gates (deny ``git commit
+# --no-verify``, force-pushes, ...), so an isolated dir without the file
+# silently drops every gate a dispatched session was supposed to enforce.
+_AGY_HOOKS_FILE = "hooks.json"
+
+
 # agy's non-plugin skill trees, relative to the Gemini dir — the "Global" and
 # "Shared" sources its ``/skills`` panel names. They are linked for the same
 # reason plugins are: :func:`~omnigent.spec.skill_sources._agy_skill_dirs`
@@ -531,8 +538,9 @@ def seed_isolated_agy_home(
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
     Copies known file-based agy OAuth markers, the user's ``settings.json``
-    (backend config such as the GCP project/location block), and
-    onboarding/migration state (NEVER moving or modifying the real files) into
+    (backend config such as the GCP project/location block), the user's global
+    lifecycle hooks (``config/hooks.json``), and onboarding/migration state
+    (NEVER moving or modifying the real files) into
     ``<bridge_dir>/agy-home/.gemini``.
     The runner keeps agy's real ``HOME`` intact and passes this directory through
     ``--gemini_dir``; on macOS that is required because agy uses keyring-backed
@@ -577,6 +585,7 @@ def seed_isolated_agy_home(
 
     _seed_isolated_agy_plugins(real_home, iso_gemini)
     _seed_isolated_agy_skills(real_home, iso_gemini)
+    _seed_isolated_agy_hooks(real_home, iso_gemini)
 
     if trusted_workspace is not None:
         _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
@@ -684,6 +693,33 @@ def _seed_isolated_agy_skills(real_home: Path, iso_gemini: Path) -> None:
     """
     for rel in _AGY_SKILL_DIRS:
         _link_into_isolated_gemini_dir(real_home / ".gemini" / rel, iso_gemini / rel)
+
+
+def _seed_isolated_agy_hooks(real_home: Path, iso_gemini: Path) -> None:
+    """Seed the user's global lifecycle hooks into the isolated Gemini dir.
+
+    agy loads its global hooks from ``<gemini_dir>/config/hooks.json``, so a
+    dispatched session launched under a bridge-owned ``--gemini_dir`` starts
+    with none of the user's hooks unless the file is seeded — silently dropping
+    hook-based policy gates that fire in every interactive ``agy``. Re-written
+    on every seed so the freshest real-home policy always wins, and copied
+    rather than linked so hook edits made inside a dispatched session (agy can
+    write ``hooks.json``) never mutate the user's real ``~/.gemini``.
+
+    Best-effort, like the plugin seed: a user with no global hooks simply gets
+    a session without them rather than a failed launch.
+
+    :param real_home: The user's real home directory.
+    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
+    """
+    real_hooks = real_home / ".gemini" / _MCP_CONFIG_DIR / _AGY_HOOKS_FILE
+    if not real_hooks.is_file():
+        return
+    iso_hooks = iso_gemini / _MCP_CONFIG_DIR / _AGY_HOOKS_FILE
+    with contextlib.suppress(OSError):
+        iso_hooks.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        iso_hooks.write_bytes(real_hooks.read_bytes())
+        os.chmod(iso_hooks, 0o600)
 
 
 def _link_into_isolated_gemini_dir(real: Path, link: Path) -> None:
