@@ -177,6 +177,22 @@ executor:
 CLI flags such as `--harness qwen` and `--model <id>` can override or supply
 missing executor values.
 
+## MiniMax Code
+
+`harness: minimax` runs [MiniMax Code](https://www.minimax.io/) through its
+ACP stdio server (`mcode acp`). Install the CLI with
+`curl -fsSL https://filecdn.minimax.chat/public/install.sh | bash`, then
+authenticate once with `mcode login`.
+
+```yaml
+executor:
+  harness: minimax            # aliases: mcode, minimax-code
+```
+
+MiniMax Code owns its authentication and model selection, so Omnigent stores no
+credential and rejects a `--model` override instead of silently dropping it.
+Run `mcode provider` to configure a custom provider or API key in MiniMax Code.
+
 ## Custom ACP agents
 
 `harness: acp:<slug>` runs any configured Agent Client Protocol server command.
