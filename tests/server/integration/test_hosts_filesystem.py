@@ -290,6 +290,43 @@ async def test_host_model_options_returns_prelaunch_catalog(
     }
 
 
+async def test_host_model_options_carries_probe_failure_reason(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """
+    An honest empty catalog reaches the picker with the host's reason.
+
+    A host that answers ``ok`` but resolved no models reports WHY in
+    ``error`` (e.g. its probe of the vendor CLI failed). That reason is a
+    string, so a response contract admitting only lists rejects the payload
+    and the picker gets a 500 instead of the explanation.
+    """
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["model:codex"] = {
+        "models": [],
+        "routable_models": [],
+        "error": "the codex model probe failed \u2014 see the host log",
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/codex/model-options",
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "models": [],
+        "routable_models": [],
+        "error": "the codex model probe failed \u2014 see the host log",
+    }
+
+
 async def test_list_filesystem_returns_paginated_entries(
     fs_setup: tuple[
         FastAPI,
