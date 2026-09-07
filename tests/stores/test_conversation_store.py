@@ -6260,7 +6260,6 @@ def test_repeated_persisted_twin_batch_leaves_conversation_metadata_alone(
     assert len(conversation_store.list_items(conv.id).data) == 1
 
 
-
 # ── Connection-checkout budget ─────────────────────────
 
 

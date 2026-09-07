@@ -5820,8 +5820,7 @@ async def _dispatch_session_event_to_runner_impl(
         raw_stable_id = body.data.get("stable_id")
         web_stable_id = (
             raw_stable_id
-            if isinstance(raw_stable_id, str)
-            and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
+            if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
             else None
         )
         pending_id: str | None = (

@@ -231,7 +231,9 @@ def record(
                 if existing.stable_id == stable_id:
                     return existing.pending_id
         pending_id = f"pending_{uuid.uuid4().hex}"
-        entry = _Entry(pending_id=pending_id, content=content, created_by=created_by, stable_id=stable_id)
+        entry = _Entry(
+            pending_id=pending_id, content=content, created_by=created_by, stable_id=stable_id
+        )
         _pending.setdefault(conversation_id, {})[pending_id] = entry
     return pending_id
 

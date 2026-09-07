@@ -850,10 +850,6 @@ export function ChatPage() {
   const isUnreachable =
     !sandboxLaunching && (liveness.kind === "host_offline" || liveness.kind === "local_stranded");
 
-  // Carries the stableId from a failedSendDraft so the retry reuses the same
-  // id — the server deduplicates on it and avoids re-dispatching to the runner.
-  const retryStableIdRef = useRef<string | null>(null);
-
   const onSend = useCallback(
     (text: string, files?: File[]) => {
       if (!agentId) return;
@@ -891,10 +887,7 @@ export function ChatPage() {
         chat.enqueueMessage(text, files);
         return;
       }
-      const retryStableId = retryStableIdRef.current;
-      retryStableIdRef.current = null;
       void useChatStore.getState().send(text, agentId, files, {
-        ...(retryStableId !== null ? { stableId: retryStableId } : {}),
         onConversationCreated: (newId) => {
           // Eager URL update: the moment the server tells us this
           // conversation's id, promote `/` → `/c/:newId`. Replace (not
@@ -2918,12 +2911,14 @@ function ComposerImpl({
     // conversation's draft and wrongly conclude the user is mid-sentence,
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
-    retryStableIdRef.current = failedSendDraft.stableId;
-    useChatStore.setState({ failedSendDraft: null });
+    useChatStore.setState({
+      failedSendDraft: null,
+      pendingRetryStableId: failedSendDraft.stableId ?? null,
+    });
     // The user started something new while the send was in flight — their
     // in-progress text wins over a clobbering restore.
     if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
-      retryStableIdRef.current = null;
+      useChatStore.setState({ pendingRetryStableId: null });
       return;
     }
     setValue(failedSendDraft.text);

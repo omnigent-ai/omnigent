@@ -214,9 +214,10 @@ export interface QueuedMessage {
    * Stable 32-char hex id for this logical message submit. Generated once at
    * enqueue time and kept across retries so the server-side append is
    * idempotent — a re-post of the same message after a network failure does
-   * not insert a duplicate conversation item.
+   * not insert a duplicate conversation item. Optional for backward
+   * compatibility with serialized queue state that predates this field.
    */
-  stableId: string;
+  stableId?: string;
 }
 
 /**
@@ -441,7 +442,18 @@ export interface ConversationState {
    * into — but the landing path binds a session first, so the reported flow
    * is covered.
    */
-  failedSendDraft: { conversationId: string; text: string; files: File[]; stableId: string } | null;
+  failedSendDraft: {
+    conversationId: string;
+    text: string;
+    files: File[];
+    stableId?: string;
+  } | null;
+  /**
+   * Stable id set by the failedSendDraft restore path so the next send()
+   * call can reuse it instead of generating a fresh UUID, preventing a
+   * duplicate dispatch on retry.
+   */
+  pendingRetryStableId: string | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -1360,6 +1372,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   streamBudgetExceeded: false,
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
+  pendingRetryStableId: null,
   sendLatchedAt: null,
   llmModel: null,
   pendingModelChange: null,
@@ -1610,7 +1623,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!agentId) {
       throw new Error("chatStore.send: no agentId");
     }
-    const stableId = opts?.stableId ?? crypto.randomUUID().replace(/-/g, "");
+    const retryId = get().pendingRetryStableId;
+    if (retryId !== null) setActive({ pendingRetryStableId: null });
+    const stableId = opts?.stableId ?? retryId ?? crypto.randomUUID().replace(/-/g, "");
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
     // into the running task's inbox. Keep `activeResponse` untouched in
