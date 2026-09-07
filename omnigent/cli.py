@@ -7473,16 +7473,23 @@ def _reject_agent_with_native_terminal_harness(harness: str) -> None:
     """
     Reject ``run AGENT --harness <x>-native``: native harnesses own their TUI.
 
-    A ``*-native`` harness mirrors an external CLI's own TUI; the agent spec's
-    prompt/tools are never consulted, and driving it through the REPL would
-    double-record every message (Omnigent turn + forwarder mirror). So an
-    explicit AGENT path combined with a native terminal harness has no coherent
-    meaning — fail loud and point at the dedicated subcommand.
+    Most ``*-native`` harnesses mirror an external CLI's own TUI and do not
+    consume an agent spec. A ``NATIVE_SERVER`` harness is the exception: it
+    owns a vendor server that loads bundle instructions and tools before
+    attaching the optional TUI, so it can consume a spec. Reject the remaining
+    native terminal harnesses rather than silently ignoring their agent bundle.
 
     :param harness: The requested ``--harness`` value (canonical or alias).
     :raises click.ClickException: When *harness* is a native terminal harness.
     """
+    from omnigent.harness_capabilities import IntegrationMode
+    from omnigent.harness_plugins import harness_capabilities
     from omnigent.native_coding_agents import native_coding_agent_for_harness
+
+    canonical = canonicalize_harness(harness) or harness
+    capabilities = harness_capabilities().get(canonical)
+    if capabilities is not None and capabilities.integration_mode is IntegrationMode.NATIVE_SERVER:
+        return
 
     native_agent = native_coding_agent_for_harness(harness)
     if native_agent is None:
