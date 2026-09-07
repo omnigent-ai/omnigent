@@ -363,7 +363,7 @@ describe("Sidebar session list", () => {
     },
   );
 
-  it("keeps the shared icon rightmost when a session state marker is present", () => {
+  it("keeps the session state rightmost when a shared icon is also present", () => {
     mockConversations([
       conv("shared_running", "Claude Code", {
         owner: "other@example.com",
@@ -374,8 +374,8 @@ describe("Sidebar session list", () => {
     selectSessionFilter("all");
 
     const row = screen.getByText("shared_running").closest("li")!;
-    expect(within(row).getByRole("img", { name: "Shared session" })).toHaveClass("right-1");
-    expect(within(row).getByTestId("session-state-badge").parentElement).toHaveClass("right-8");
+    expect(within(row).getByRole("img", { name: "Shared session" })).toHaveClass("right-8");
+    expect(within(row).getByTestId("session-state-badge").parentElement).toHaveClass("right-1");
   });
 
   it("does not mark the viewer's own sessions or sessions without ownership metadata", () => {

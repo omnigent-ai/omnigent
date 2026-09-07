@@ -3946,8 +3946,7 @@ function ConversationRowImpl({
     >
       {/* Row 1: the session name. Working, needs-approval, unseen, and draft
           markers render in the shared trailing indicator slot below. */}
-<<<<<<< HEAD
-      <div className="flex w-full items-center gap-1.5">
+      <div className="flex w-full items-center">
         <span
           className={cn(
             "relative min-w-0 truncate",
@@ -3956,10 +3955,6 @@ function ConversationRowImpl({
             isProvisionalLabel && "italic text-muted-foreground",
           )}
         >
-=======
-      <div className="flex w-full items-center">
-        <span className="relative min-w-0 truncate">
->>>>>>> 050a2dd25 (fix(web): align shared session indicator)
           {label}
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
@@ -4066,7 +4061,7 @@ function ConversationRowImpl({
         <span
           className={cn(
             SESSION_STATE_SLOT_CLASS,
-            showSharedIndicator ? "right-8" : "right-1",
+            "right-1",
             // The wide "awaiting" pill keeps its natural width; every other
             // marker (running/starting/unseen dot, or the draft pencil) sits in
             // the fixed centered box so it lines up under the kebab.
@@ -4092,7 +4087,10 @@ function ConversationRowImpl({
           role="img"
           aria-label="Shared session"
           title="Shared with you"
-          className="-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0"
+          className={cn(
+            "-translate-y-1/2 pointer-events-none absolute top-1/2 inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
+            hasSessionIndicator ? "right-8" : "right-1",
+          )}
         >
           <UsersIcon className="size-3.5" aria-hidden="true" />
         </span>
