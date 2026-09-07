@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
-import inspect
 import json
 import logging
 import os
@@ -856,8 +855,7 @@ def _extract_decorated_functions(
         metadata = get_tool_metadata(value)
         if metadata is None:
             continue
-        uses_tool_state = "tool_state" in inspect.signature(value).parameters
-        found.append((metadata.name, metadata, uses_tool_state))
+        found.append((metadata.name, metadata, metadata.uses_tool_state))
 
     if found:
         return found
