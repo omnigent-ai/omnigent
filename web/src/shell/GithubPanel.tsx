@@ -959,10 +959,10 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
             flex-none keep the two labels close and content-sized (the default
             flex-1 equalizes and spreads them). */}
           <TabsList variant="line" aria-label="Pull request" className="h-auto gap-0 p-0">
-            <TabsTrigger value="summary" className="flex-none">
+            <TabsTrigger value="summary" className="flex-none leading-none">
               Summary
             </TabsTrigger>
-            <TabsTrigger value="changes" className="flex-none">
+            <TabsTrigger value="changes" className="flex-none leading-none">
               Changes
             </TabsTrigger>
           </TabsList>
