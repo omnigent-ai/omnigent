@@ -1917,6 +1917,7 @@ def augment_claude_args(
     skills_filter: str | list[str] = "all",
     append_system_prompt: str | None = None,
     allowed_tools: tuple[str, ...] = (),
+    disallowed_tools: tuple[str, ...] = (),
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
 ) -> list[str]:
@@ -1959,6 +1960,9 @@ def augment_claude_args(
         Code's native ``--append-system-prompt`` flag.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
+    :param disallowed_tools: Claude tool names the launch endpoint cannot
+        serve (see ``endpoint_disallowed_claude_tools``), merged into
+        ``--disallowedTools`` alongside :data:`_OMNIGENT_DISALLOWED_TOOLS`.
     :param subagent_router_dir: Directory advertising the runner's
         ``route-subagent`` endpoint, threaded to
         :func:`build_hook_settings` so native ``Task`` spawns are routed.
@@ -1983,7 +1987,9 @@ def augment_claude_args(
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
     )
-    args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
+    args = _merge_disallowed_tools(
+        list(claude_args), (*_OMNIGENT_DISALLOWED_TOOLS, *disallowed_tools)
+    )
     args = _merge_allowed_tools(args, allowed_tools)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     _write_json_file(settings_path, hook_settings)

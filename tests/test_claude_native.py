@@ -294,6 +294,105 @@ def test_claude_terminal_request_preserves_user_model_arg(tmp_path, monkeypatch)
     assert args.count("--model") == 1
 
 
+@pytest.mark.parametrize(
+    ("claude_config", "expected"),
+    [
+        # No provider config: Claude Code's own native auth is first-party,
+        # which serves the web_search server tool.
+        (None, ()),
+        # No endpoint override: first-party API, serves web search.
+        (claude_native.ClaudeNativeUcodeConfig(env={}), ()),
+        # First-party base URL spelled explicitly: still serves web search.
+        (
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
+            ),
+            (),
+        ),
+        # A gateway base URL: WebSearch's nested server-tool request would
+        # follow it and be rejected, so the tool must be withheld.
+        (
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"}
+            ),
+            ("WebSearch",),
+        ),
+        # Bedrock: Claude Code detects this provider path itself and disables
+        # WebSearch natively, so the launch adds nothing.
+        (
+            claude_native.ClaudeNativeUcodeConfig(
+                env={
+                    "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example.com",
+                    "CLAUDE_CODE_USE_BEDROCK": "1",
+                }
+            ),
+            (),
+        ),
+    ],
+    ids=["no-config", "no-endpoint-override", "first-party-url", "gateway-url", "bedrock"],
+)
+def test_endpoint_disallowed_claude_tools(
+    claude_config: claude_native.ClaudeNativeUcodeConfig | None,
+    expected: tuple[str, ...],
+) -> None:
+    """
+    WebSearch is withheld exactly when the endpoint cannot serve it.
+
+    Claude Code keeps WebSearch enabled whenever the launch looks
+    first-party — including a launch that merely pins ``ANTHROPIC_BASE_URL``
+    at a gateway. The tool then fails at use time: its nested server-side
+    ``web_search`` request follows the base URL to the gateway, which rejects
+    it with a region restriction the user sees as the search outcome. Only
+    the launch composition knows the endpoint, so it must withhold the tool
+    there — and must NOT withhold it on the paths that serve it (first-party)
+    or already handle it (Bedrock).
+    """
+    assert claude_native.endpoint_disallowed_claude_tools(claude_config) == expected
+
+
+def test_claude_terminal_request_withholds_websearch_on_gateway(tmp_path, monkeypatch) -> None:
+    """
+    A gateway-backed terminal launch disallows the WebSearch tool.
+
+    If this regresses, a user asking a gateway-backed native Claude session
+    to search the web gets ``API Error: 400 Web search is only available in
+    the US ...`` as the search outcome instead of an answer.
+    """
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
+        api_key_helper="printf token",
+    )
+
+    body = claude_native._claude_terminal_request(
+        ("--print", "hi"),
+        command="claude",
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+        claude_config=config,
+    )
+
+    args = body["spec"]["args"]
+    assert "--disallowedTools" in args
+    disallowed = args[args.index("--disallowedTools") + 1].split(",")
+    assert "WebSearch" in disallowed
+
+
+def test_claude_terminal_request_keeps_websearch_on_first_party(tmp_path, monkeypatch) -> None:
+    """
+    A first-party launch (no endpoint override) injects no tool disallow.
+
+    api.anthropic.com serves the web_search server tool, so withholding
+    WebSearch there would strip working functionality.
+    """
+    body = claude_native._claude_terminal_request(
+        ("--print", "hi"),
+        command="claude",
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+        claude_config=None,
+    )
+
+    assert "--disallowedTools" not in body["spec"]["args"]
+
+
 def test_ucode_config_for_profile_reads_allowlisted_claude_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
