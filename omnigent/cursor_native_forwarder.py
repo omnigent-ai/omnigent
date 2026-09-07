@@ -929,6 +929,12 @@ async def forward_cursor_store_to_session(
     ) as client:
         while True:
             try:
+                # Snapshot completion before reading its transcript. A turn
+                # finishing during this poll must wait for the next read.
+                total_turn_ends = await asyncio.to_thread(
+                    cursor_native_status.count_turn_ends, bridge_dir
+                )
+                retrying_items = False
                 if store_path is None or not store_path.exists():
                     # On cold resume the runner pre-seeds the bridge state with
                     # the known store path (see ``preseed_resume_state``), so we
@@ -1102,6 +1108,7 @@ async def forward_cursor_store_to_session(
                                                 item.rowid,
                                                 failed_attempts,
                                             )
+                                            retrying_items = True
                                             break  # retry this item before any after it
                                         _logger.error(
                                             "cursor forwarder dropping item after %s "
@@ -1125,6 +1132,7 @@ async def forward_cursor_store_to_session(
                                             item.rowid,
                                             exc_info=True,
                                         )
+                                        retrying_items = True
                                         break
                             # Reached on a successful post, an ambiguous-delivery
                             # skip, a quarantine, or a non-posted sentinel row:
@@ -1171,10 +1179,7 @@ async def forward_cursor_store_to_session(
                 # supervisor restart never re-wakes the parent for a turn it
                 # already reported. Best-effort: a failed post leaves the count
                 # unadvanced so the next poll retries.
-                total_turn_ends = await asyncio.to_thread(
-                    cursor_native_status.count_turn_ends, bridge_dir
-                )
-                if total_turn_ends > await asyncio.to_thread(
+                if not retrying_items and total_turn_ends > await asyncio.to_thread(
                     cursor_native_status.read_posted_count, bridge_dir
                 ):
                     await _post_external_session_status(
