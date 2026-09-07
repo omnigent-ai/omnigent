@@ -9,6 +9,15 @@ vi.mock("@/lib/routing", () => ({
   useNavigate: () => navigate,
 }));
 
+const newSessionTarget = vi.hoisted(() => ({
+  route: "/",
+  target: { kind: "none" } as
+    { kind: "none" } | { kind: "project"; projectId: string | null; projectName: string },
+}));
+vi.mock("@/hooks/useNewSessionTarget", () => ({
+  useNewSessionTarget: () => newSessionTarget,
+}));
+
 const useConversations = vi.fn();
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
@@ -49,6 +58,8 @@ beforeEach(() => {
   navigate.mockClear();
   useConversations.mockReset();
   setSessions([]);
+  newSessionTarget.route = "/";
+  newSessionTarget.target = { kind: "none" };
 });
 afterEach(cleanup);
 
@@ -295,11 +306,33 @@ describe("CommandPalette — actions", () => {
   it("lists the built-in action commands", () => {
     renderPalette();
 
-    expect(screen.getByText("New chat")).toBeTruthy();
+    expect(screen.getByText("New session — No Project")).toBeTruthy();
     expect(screen.getByText("Go to Inbox")).toBeTruthy();
     expect(screen.getByText("Go to Settings")).toBeTruthy();
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Toggle workspace sidebar")).toBeTruthy();
+  });
+
+  it("routes the new-session action to the selected project", () => {
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const view = render(<CommandPalette {...props} />);
+
+    newSessionTarget.route = "/?project=Alpha%20Team";
+    newSessionTarget.target = {
+      kind: "project",
+      projectId: "prj_alpha",
+      projectName: "Alpha Team",
+    };
+    view.rerender(<CommandPalette {...props} />);
+
+    fireEvent.click(screen.getByText("New session in Alpha Team"));
+
+    expect(navigate).toHaveBeenCalledWith("/?project=Alpha%20Team");
   });
 
   it("runs a navigation action and closes the palette", () => {
@@ -332,7 +365,7 @@ describe("CommandPalette — actions", () => {
     });
 
     expect(screen.getByText("Go to Settings")).toBeTruthy();
-    expect(screen.queryByText("New chat")).toBeNull();
+    expect(screen.queryByText("New session — No Project")).toBeNull();
   });
 });
 

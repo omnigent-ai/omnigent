@@ -15,6 +15,8 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { readLastCreatedWorkspace, writeLastCreatedWorkspace } from "@/lib/lastCreatedWorkspace";
+import { readNewSessionTarget, writeNewSessionTarget } from "@/lib/newSessionTarget";
 
 // The landing screen drives the real Web-start flow end to end: the host and
 // first agent auto-select, the working directory seeds from the host's most-
@@ -291,7 +293,24 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen create flow", () => {
+  it("prefers the last successful create directory over general recent activity", async () => {
+    localStorage.setItem(
+      RECENT_KEY,
+      JSON.stringify({ host_1: ["/Users/corey/switched-host-location"] }),
+    );
+    writeLastCreatedWorkspace("host_1", "/Users/corey/created-session-location");
+
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "created-session-location",
+      ),
+    );
+  });
+
   it("posts host_id, workspace and agent_id to /v1/sessions and navigates", async () => {
+    writeNewSessionTarget({ kind: "project", projectId: "p_old", projectName: "Old" });
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
       json: async () => ({ id: "conv_new" }),
@@ -321,6 +340,33 @@ describe("NewChatLandingScreen create flow", () => {
 
     // On success the screen routes to the freshly created session.
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+    expect(readLastCreatedWorkspace("host_1")).toBe(SEEDED_WORKSPACE);
+    expect(readNewSessionTarget()).toEqual({ kind: "none" });
+  });
+
+  it("preserves a legal trailing-space directory in the create and its host default", async () => {
+    const exactWorkspace = "/Users/corey/projects/legal-trailing-space ";
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [exactWorkspace] }));
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "legal-trailing-space",
+      ),
+    );
+    typeMessage("inspect the exact directory");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { workspace: string };
+    expect(body.workspace).toBe(exactWorkspace);
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+    expect(readLastCreatedWorkspace("host_1")).toBe(exactWorkspace);
   });
 
   it("records the launched workspace under its host without corrupting other recents", async () => {
