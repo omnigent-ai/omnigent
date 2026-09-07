@@ -2641,7 +2641,11 @@ describe("chatStore — send while streaming (queueing)", () => {
     const body = JSON.parse((events[0]![1] as RequestInit).body as string);
     expect(body).toEqual({
       type: "message",
-      data: { role: "user", content: [{ type: "input_text", text: "queue me" }], stable_id: expect.any(String) },
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "queue me" }],
+        stable_id: expect.any(String),
+      },
     });
 
     const state = useChatStore.getState();
