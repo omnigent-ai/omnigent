@@ -180,11 +180,12 @@ afterEach(() => {
 });
 
 describe("GithubPanel", () => {
-  it("shows the PR header with title and CI check pills", async () => {
+  it("shows the PR title in the header and CI check pills on the Summary tab", async () => {
     renderPanel();
+    // Title + number live in the shared header (both tabs).
     expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
     expect(screen.getByText("#6000")).toBeInTheDocument();
-    // CI checks are on their own line as labeled pills (not a diffstat). A
+    // CI checks render on the Summary tab (the default) as labeled pills. A
     // zero bucket (pending) renders no pill.
     expect(screen.getByText("Checks")).toBeInTheDocument();
     expect(screen.getByText(/66\s*passed/)).toBeInTheDocument();
@@ -225,6 +226,8 @@ describe("GithubPanel", () => {
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
     const diffs = await screen.findAllByTestId("diff");
     expect(diffs.map((d) => d.getAttribute("data-path"))).toEqual(["hello.py", "src/app.ts"]);
+    // Checks live on the Summary tab, so they're gone once Changes is active.
+    expect(screen.queryByText("Checks")).toBeNull();
   });
 
   it("stacks a diff section per changed file", async () => {

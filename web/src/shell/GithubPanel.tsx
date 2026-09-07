@@ -65,6 +65,7 @@ import {
   useGithubPrDiff,
   type GithubChangedFile,
   type GithubCheckRun,
+  type GithubChecks,
   type GithubComment,
   type GithubInfo,
 } from "@/hooks/useGithub";
@@ -432,16 +433,50 @@ function GithubCommentCard({ comment }: { comment: GithubComment }) {
   );
 }
 
-/** The Summary tab body: the PR description followed by its comments. */
+/** The Summary tab body: CI checks, the PR description, then its comments. */
 function GithubSummaryTab({
+  checks,
   body,
   comments,
 }: {
+  checks: GithubChecks;
   body: string | null | undefined;
   comments: GithubComment[];
 }) {
   return (
     <div className="space-y-4 p-3">
+      {/* CI status checks (from the PR's statusCheckRollup) as pills; hover a
+          pill to see the job names in that bucket. */}
+      {checks.total > 0 && (
+        <section className="space-y-1.5">
+          <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+            Checks
+          </h3>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <CheckPill
+              label="passed"
+              count={checks.passing}
+              runs={checks.runs.filter((r) => r.bucket === "passing")}
+              icon={<CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />}
+              className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
+            />
+            <CheckPill
+              label="pending"
+              count={checks.pending}
+              runs={checks.runs.filter((r) => r.bucket === "pending")}
+              icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
+              className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+            />
+            <CheckPill
+              label="failed"
+              count={checks.failing}
+              runs={checks.runs.filter((r) => r.bucket === "failing")}
+              icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
+              className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
+            />
+          </div>
+        </section>
+      )}
       <section className="space-y-1.5">
         <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
           Description
@@ -881,8 +916,6 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   const pr = data.pr!;
   const checks = pr.checks;
   const comments = pr.comments ?? [];
-  // The diff controls only make sense on the Changes tab and only with files.
-  const showChangesControls = activeTab === "changes" && files.length > 0;
 
   return (
     <TooltipProvider delayDuration={0}>
@@ -917,59 +950,36 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
             </a>
           </div>
-          {/* CI status checks (from the PR's statusCheckRollup), on their own
-            line as pills; hover a pill to see the job names in that bucket. */}
-          {checks.total > 0 && (
-            <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-muted-foreground">
-              <span className="text-ui font-medium">Checks</span>
-              <CheckPill
-                label="passed"
-                count={checks.passing}
-                runs={checks.runs.filter((r) => r.bucket === "passing")}
-                icon={<CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />}
-                className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
-              />
-              <CheckPill
-                label="pending"
-                count={checks.pending}
-                runs={checks.runs.filter((r) => r.bucket === "pending")}
-                icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
-                className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-              />
-              <CheckPill
-                label="failed"
-                count={checks.failing}
-                runs={checks.runs.filter((r) => r.bucket === "failing")}
-                icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
-                className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
-              />
-            </div>
-          )}
-          {/* Tab bar (Summary | Changes). The diff controls — file-list toggle
-            (left of the tabs), layout + expand/collapse-all (right) — belong to
-            the Changes view, so they show only there and only with files. */}
-          <div className="mt-1.5 flex w-full items-center justify-between gap-2">
-            <div className="flex min-w-0 items-center gap-1">
-              {showChangesControls && (
-                <IconButton
-                  label={sidebarCollapsed ? "Show file list" : "Hide file list"}
-                  onClick={() => setSidebarCollapsed((v) => !v)}
-                  className="size-5 text-muted-foreground"
-                >
-                  {sidebarCollapsed ? (
-                    <PanelLeftOpenIcon className="size-3.5" />
-                  ) : (
-                    <PanelLeftCloseIcon className="size-3.5" />
-                  )}
-                </IconButton>
-              )}
-              <TabsList variant="line" aria-label="Pull request" className="h-auto gap-3 p-0">
-                <TabsTrigger value="summary">Summary</TabsTrigger>
-                <TabsTrigger value="changes">Changes</TabsTrigger>
-              </TabsList>
-            </div>
-            {showChangesControls && (
-              <div className="flex shrink-0 items-center gap-0.5">
+          {/* Tab bar (Summary | Changes). The diff controls live inside the
+            Changes tab on their own line, so they don't crowd the tabs. */}
+          <TabsList variant="line" aria-label="Pull request" className="mt-1.5 h-auto gap-3 p-0">
+            <TabsTrigger value="summary">Summary</TabsTrigger>
+            <TabsTrigger value="changes">Changes</TabsTrigger>
+          </TabsList>
+        </div>
+
+        {/* Summary: CI checks + the PR description + its conversation comments. */}
+        <TabsContent value="summary" className="min-h-0 flex-1 overflow-y-auto">
+          <GithubSummaryTab checks={checks} body={pr.body} comments={comments} />
+        </TabsContent>
+
+        {/* Changes: a controls row, then the sidebar (jump-to-file) + one scroll
+            of all files' diffs. */}
+        <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col">
+          {files.length > 0 && (
+            <div className="flex w-full shrink-0 items-center justify-between gap-2 border-b border-border px-2 py-1">
+              <IconButton
+                label={sidebarCollapsed ? "Show file list" : "Hide file list"}
+                onClick={() => setSidebarCollapsed((v) => !v)}
+                className="size-5 text-muted-foreground"
+              >
+                {sidebarCollapsed ? (
+                  <PanelLeftOpenIcon className="size-3.5" />
+                ) : (
+                  <PanelLeftCloseIcon className="size-3.5" />
+                )}
+              </IconButton>
+              <div className="flex items-center gap-0.5">
                 <IconButton
                   label={diffStyle === "split" ? "Switch to unified view" : "Switch to split view"}
                   onClick={toggleDiffStyle}
@@ -993,17 +1003,8 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
                   )}
                 </IconButton>
               </div>
-            )}
-          </div>
-        </div>
-
-        {/* Summary: the PR description + its conversation comments. */}
-        <TabsContent value="summary" className="min-h-0 flex-1 overflow-y-auto">
-          <GithubSummaryTab body={pr.body} comments={comments} />
-        </TabsContent>
-
-        {/* Changes: sidebar (jump-to-file) + one scroll of all files' diffs. */}
-        <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col">
+            </div>
+          )}
           <div ref={bodyRef as React.RefObject<HTMLDivElement>} className="flex min-h-0 flex-1">
             {!sidebarCollapsed && (
               <div
