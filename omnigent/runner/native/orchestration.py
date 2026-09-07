@@ -6630,9 +6630,8 @@ async def _auto_create_claude_terminal(
     await _cancel_auto_forwarder_task(session_id)
     reset_transcript_forward_state(bridge_dir)
     _logger.info(
-        "Claude terminal bridge prepared: session=%s bridge_dir=%s",
+        "Claude terminal bridge prepared: session=%s",
         session_id,
-        bridge_dir,
         extra={"session_id": session_id},
     )
     # Pre-accept Claude's first-run trust + onboarding TUI prompts for this

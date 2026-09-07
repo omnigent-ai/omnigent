@@ -5753,9 +5753,8 @@ def create_runner_app(
                 # forwarder to reconcile the row.
                 _logger.warning(
                     "claude-native model change for session=%s could not be verified: "
-                    "no statusLine snapshot in %s",
+                    "no statusLine snapshot",
                     conv_id,
-                    bridge_dir,
                     extra={"session_id": conv_id},
                 )
                 return Response(status_code=204)
