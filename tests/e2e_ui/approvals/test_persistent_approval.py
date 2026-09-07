@@ -8,8 +8,9 @@ approval card. The test clicks the "Approve & don't ask again for github.com"
 button and asserts the parked prompt drains.
 
 This replaces the original ``native_claude_session`` approach (real Claude Code
-+ real LLM to call WebFetch) with a ``seeded_session`` + synthetic hook POST —
-no native CLI required, completes in seconds.
++ real LLM to call WebFetch) with a ``claude_seeded_session`` + synthetic hook
+POST — no native CLI required, completes in seconds. The session's harness must
+be Claude because the endpoint rejects any other.
 
 This is the persistent-allow-rule counterpart to ``test_ask_user_question.py``
 (Claude's question tool) and ``test_exit_plan_mode.py`` (the plan card): all
@@ -59,11 +60,11 @@ def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) ->
 @pytest.mark.timeout(90)
 def test_persistent_approval_remembers_webfetch_domain(
     page: Page,
-    seeded_session: tuple[str, str],
+    claude_seeded_session: tuple[str, str],
 ) -> None:
     """Mock WebFetch permission-request → domain remember button → click → drain."""
-    base_url, session_id = seeded_session
-    _log.info("seeded session ready: base_url=%s session_id=%s", base_url, session_id)
+    base_url, session_id = claude_seeded_session
+    _log.info("claude session ready: base_url=%s session_id=%s", base_url, session_id)
 
     result_holder: dict = {}
 

@@ -230,6 +230,78 @@ async def test_permission_request_hook_accepts_kimi_namespaced_elicitation_id(
     assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
 
 
+async def test_permission_request_hook_rejects_non_claude_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A session bound to a non-Claude harness is rejected outright.
+
+    The endpoint hardcodes Claude's identity (message + policy
+    ``claude_native_permission``) into the elicitation it publishes, so a
+    stale or hand-edited hook config posting another harness's prompt here
+    would render a Claude-branded approval card on a non-Claude session.
+    The rejection must happen before any publish/park: no pending prompt,
+    no long-poll, and no Claude ``hookSpecificOutput`` contract in the
+    response.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    agent = await create_test_agent(
+        client,
+        "test-permission-non-claude",
+        executor={"type": "omnigent", "config": {"harness": "openai-agents"}},
+    )
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/hooks/permission-request",
+        json=await _claude_permission_payload(),
+    )
+    assert resp.status_code == 400, resp.text
+    assert "hookSpecificOutput" not in resp.text, (
+        "a non-Claude session must not receive Claude's decision contract"
+    )
+    assert pending_elicitations.count_for(session_id) == 0, (
+        "a rejected non-Claude hook POST must not park an elicitation"
+    )
+
+
+async def test_permission_request_hook_allows_claude_native_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A claude-native session still gets the full park -> verdict round trip.
+
+    The non-Claude gate keys on the session's resolved harness, and both
+    Claude harnesses are legitimate callers: the default test agent
+    (claude-sdk) covers the SDK spelling in the round-trip tests above;
+    this covers a custom agent declaring the native harness.
+    """
+    agent = await create_test_agent(
+        client,
+        "test-permission-claude-native",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload()
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+
+
 async def test_cursor_permission_request_hook_allow_round_trip(
     client: httpx.AsyncClient,
 ) -> None:
