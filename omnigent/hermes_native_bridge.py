@@ -267,13 +267,16 @@ def build_hermes_native_spawn_env(session_id: str) -> dict[str, str]:
 
 
 # Keys from the user's ``~/.hermes/config.yaml`` that the per-session
-# HERMES_HOME needs in order to authenticate with the inference provider.
+# HERMES_HOME needs: inference auth plus operator-provisioned MCP servers
+# (``mcp_servers`` merges under the bridge's own entry; the agent spec's
+# ``tools:`` never reaches this harness).
 _USER_CONFIG_KEYS = frozenset(
     {
         "model",
         "providers",
         "fallback_providers",
         "credential_pool_strategies",
+        "mcp_servers",
     }
 )
 
