@@ -810,18 +810,7 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
     # a clobbered value fails safe (lost trust is re-prompted, lost model defaults).
     # A cross-process lock is intentionally not taken (agy would not honor it).
     try:
-        settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix="settings.json.", dir=str(settings_path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, indent=2, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())  # crash-safe, mirrors ensure_agy_onboarding_complete
-            os.replace(tmp_name, settings_path)
-        finally:
-            if os.path.exists(tmp_name):
-                os.unlink(tmp_name)
+        _write_agy_settings_atomically(settings_path, data)
     except OSError:
         _logger.warning(
             "could not write agy settings.json at %s to disable the feedback survey",
@@ -830,8 +819,48 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
         )
 
 
+def _write_agy_settings_atomically(settings_path: Path, data: dict[str, object]) -> None:
+    """Atomically replace *settings_path* with *data* via a unique 0o600 temp file.
+
+    The write is atomic (mkstemp + os.replace) so a concurrent reader/writer never
+    sees a torn file, and mkstemp's unique O_EXCL-created name means concurrent
+    seeds never collide on one temp path and a planted symlink is never followed.
+    Perms are pinned to 0o600 explicitly rather than trusting the process umask —
+    settings can carry account/project metadata.
+
+    :param settings_path: Destination ``settings.json`` path.
+    :param data: JSON object to serialise.
+    :raises OSError: If the temp file cannot be created, written, or moved.
+    """
+    settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix="settings.json.", dir=str(settings_path.parent))
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+        except OSError:
+            os.close(fd)  # fdopen/fchmod failed before the with-block owned the fd
+            raise
+        with handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())  # crash-safe, mirrors ensure_agy_onboarding_complete
+        os.replace(tmp_name, settings_path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
 def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> None:
-    """Add *workspace* to isolated agy ``trustedWorkspaces`` settings."""
+    """Add *workspace* to isolated agy ``trustedWorkspaces`` settings.
+
+    Merge-only: every other key in the isolated ``settings.json`` is preserved,
+    and an existing file that cannot be parsed into a JSON object is left
+    UNTOUCHED rather than clobbered (mirrors
+    :func:`ensure_agy_feedback_survey_disabled` — the lost trust seed only means
+    agy re-prompts, while a rewrite would silently drop the file's other keys).
+    """
     settings_path = iso_gemini / "antigravity-cli" / "settings.json"
     data: dict[str, object] = {}
     if settings_path.is_file():
@@ -839,8 +868,14 @@ def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> Non
             loaded = json.loads(settings_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             loaded = None
-        if isinstance(loaded, dict):
-            data = loaded
+        if not isinstance(loaded, dict):
+            _logger.warning(
+                "isolated agy settings.json at %s is not a JSON object; leaving it "
+                "untouched (agy may re-prompt for workspace trust)",
+                settings_path,
+            )
+            return
+        data = loaded
     workspace_key = str(workspace.resolve())
     existing = data.get("trustedWorkspaces")
     trusted = list(existing) if isinstance(existing, list) else []
@@ -848,10 +883,7 @@ def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> Non
         return
     trusted.append(workspace_key)
     data["trustedWorkspaces"] = trusted
-    settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = settings_path.with_suffix(settings_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, settings_path)
+    _write_agy_settings_atomically(settings_path, data)
 
 
 def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) -> None:
