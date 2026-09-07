@@ -3,6 +3,7 @@ import {
   EllipsisVerticalIcon,
   FileIcon,
   GitCompareIcon,
+  GitForkIcon,
   InfoIcon,
   ListIcon,
   PanelLeftIcon,
@@ -145,12 +146,16 @@ interface ChatHeaderProps {
   wrapperLabel: string | null;
   /** Whether the Share button/menu entry should render. */
   canShare: boolean;
+  /** Whether the active session can be forked. */
+  canFork: boolean;
   /** Whether the rendered Share controls should be disabled. */
   shareDisabled?: boolean;
   /** User-facing reason for the disabled Share controls. */
   shareDisabledReason?: string;
   /** Open the share dialog. */
   onShare: () => void;
+  /** Open the fork dialog for the active session. */
+  onFork: () => void;
   /** Whether the agent has tools/policies worth surfacing. */
   hasAgentInfo: boolean;
   /** Open the mobile agent-info dialog. */
@@ -210,9 +215,11 @@ export function ChatHeader({
   boundAgent,
   wrapperLabel,
   canShare,
+  canFork,
   shareDisabled = false,
   shareDisabledReason,
   onShare,
+  onFork,
   hasAgentInfo,
   onAgentInfo,
   hasHeaderMenu,
@@ -360,9 +367,11 @@ export function ChatHeader({
       conversation={actionConversation}
       currentProject={projectName}
       canShare={canShare}
+      canFork={canFork}
       shareDisabled={shareDisabled}
       shareDisabledReason={shareDisabledReason}
       onShare={onShare}
+      onFork={onFork}
       hasAgentInfo={isMobile && hasAgentInfo}
       onAgentInfo={onAgentInfo}
       workspaceItems={isMobile ? workspaceItems : null}
@@ -510,10 +519,10 @@ export function ChatHeader({
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
         {conversationId && <ViewModeToggle />}
-        {/* Fallback mobile kebab for sessions with no owner-managed menu:
-            the action buttons above (Share · Agent info) plus the same
-            workspace-rail entries, so a phone still needs only one trigger. */}
-        {(hasHeaderMenu || workspaceItems) && (!actionConversation || !isMobile) && (
+        {/* Fallback kebab for sessions with no owner-managed menu. Desktop
+            exposes Fork; mobile also carries Share, Agent info, and the
+            workspace-rail entries so a phone still needs only one trigger. */}
+        {(hasHeaderMenu || workspaceItems || canFork) && (!actionConversation || !isMobile) && (
           // Non-modal on mobile: modal mode's body-wide pointer-events:none
           // makes the menu the sole touch target, so touch-target adjustment
           // snaps outside taps onto it and the menu can't be dismissed (see
@@ -526,12 +535,21 @@ export function ChatHeader({
                 size="icon"
                 aria-label="Session actions"
                 data-testid="session-actions-menu"
-                className="text-muted-foreground hover:text-foreground md:hidden max-md:size-11 max-md:rounded-full"
+                className={cn(
+                  "text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full",
+                  actionConversation && "md:hidden",
+                )}
               >
                 <EllipsisVerticalIcon className="size-4 max-md:size-5" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className={cn("min-w-44", MOBILE_GLASS_SURFACE)}>
+              {canFork && (
+                <DropdownMenuItem onSelect={onFork} data-testid="fallback-fork-conversation">
+                  <GitForkIcon className="size-4" />
+                  Fork
+                </DropdownMenuItem>
+              )}
               {canShare && (
                 <DropdownMenuItem
                   onSelect={

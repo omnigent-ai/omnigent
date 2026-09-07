@@ -30,6 +30,7 @@ import {
   FolderMinusIcon,
   FolderOpenIcon,
   GitBranchIcon,
+  GitForkIcon,
   InboxIcon,
   ListChecksIcon,
   ListFilterIcon,
@@ -194,6 +195,7 @@ import {
   writeLegacyPinnedConversationIds,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
+import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
@@ -3147,6 +3149,7 @@ function ConversationMenuItems({
   moveToProject,
   stopSession,
   setShareOpen,
+  setForkOpen,
   setIsEditing,
   setStopOpen,
   setDeleteOpen,
@@ -3176,6 +3179,7 @@ function ConversationMenuItems({
   moveToProject: ReturnType<typeof useMoveToProject>;
   stopSession: ReturnType<typeof useStopSession>;
   setShareOpen: (open: boolean) => void;
+  setForkOpen: (open: boolean) => void;
   setIsEditing: (editing: boolean) => void;
   setStopOpen: (open: boolean) => void;
   setDeleteOpen: (open: boolean) => void;
@@ -3283,6 +3287,10 @@ function ConversationMenuItems({
             </TooltipContent>
           </Tooltip>
         ))}
+      <C.Item data-testid="fork-conversation" onSelect={() => setForkOpen(true)}>
+        <GitForkIcon className="size-3.5" />
+        Fork
+      </C.Item>
       {isOwner ? (
         <C.Item
           data-testid="rename-conversation"
@@ -3584,6 +3592,7 @@ function ConversationRowImpl({
   // Opt-in "delete local branch" checkbox (worktree sessions only).
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [forkOpen, setForkOpen] = useState(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
   // Every row action gates on ownership alone — the sidebar carries no
@@ -3863,6 +3872,7 @@ function ConversationRowImpl({
     moveToProject,
     stopSession,
     setShareOpen,
+    setForkOpen,
     setIsEditing,
     setStopOpen,
     setDeleteOpen,
@@ -4208,6 +4218,17 @@ function ConversationRowImpl({
           sessionId={conversation.id}
           open={shareOpen}
           onOpenChange={setShareOpen}
+        />
+      )}
+      {forkOpen && (
+        <ForkSessionDialog
+          sourceSessionId={conversation.id}
+          sourceTitle={conversation.title}
+          sourceWorkspace={conversation.workspace}
+          sourceHostId={conversation.host_id}
+          sourceGitBranch={conversation.git_branch}
+          open
+          onOpenChange={setForkOpen}
         />
       )}
       <Dialog

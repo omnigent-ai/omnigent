@@ -2001,9 +2001,11 @@ export function AppShell() {
                     boundAgent={boundAgent}
                     wrapperLabel={wrapperLabel}
                     canShare={canShare}
+                    canFork={canClone}
                     shareDisabled={shareDisabled}
                     shareDisabledReason={shareDisabledReason}
                     onShare={() => setShareOpen(true)}
+                    onFork={() => forkDialogContextValue.openForkDialog()}
                     hasAgentInfo={hasAgentInfo}
                     onAgentInfo={() => setAgentInfoOpen(true)}
                     hasHeaderMenu={hasHeaderMenu}

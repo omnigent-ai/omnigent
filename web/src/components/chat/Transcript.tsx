@@ -569,6 +569,14 @@ export function VirtualBubbleList({
     conversationId: string;
     snapshot: TranscriptViewSnapshot;
   } | null>(null);
+  const lastMessageIndex = useMemo(
+    () =>
+      bubbles.findLastIndex(
+        (bubble) =>
+          bubble.kind === "assistant" || (bubble.kind === "user" && !isSystemBubble(bubble)),
+      ),
+    [bubbles],
+  );
 
   const wrapperRef = useRef<HTMLDivElement>(null);
   // The list isn't the scroll container's first child — indicators, padding,
@@ -817,6 +825,9 @@ export function VirtualBubbleList({
             bubble={bubble}
             isLastAssistant={index === lastAssistantIndex}
             showsWorking={showsWorking && index === lastAssistantIndex}
+            actionsPersistent={
+              index === lastMessageIndex && (bubble.kind === "assistant" || !showsWorking)
+            }
           />
         ))}
       </div>
@@ -841,6 +852,9 @@ export function VirtualBubbleList({
               bubble={bubble}
               isLastAssistant={item.index === lastAssistantIndex}
               showsWorking={showsWorking && item.index === lastAssistantIndex}
+              actionsPersistent={
+                item.index === lastMessageIndex && (bubble.kind === "assistant" || !showsWorking)
+              }
             />
           </div>
         );

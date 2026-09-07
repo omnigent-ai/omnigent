@@ -1,4 +1,4 @@
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
@@ -10,6 +10,15 @@ const bubble: Extract<Bubble, { kind: "user" }> = {
   kind: "user",
   itemId: "user-1",
   content: [{ type: "input_text", text: "hello" }],
+};
+
+const assistantBubble: Extract<Bubble, { kind: "assistant" }> = {
+  kind: "assistant",
+  responseId: "response-1",
+  stableId: "response-1",
+  lifecycle: "completed",
+  error: null,
+  items: [{ kind: "text", itemId: "assistant-1", text: "hello back", final: true }],
 };
 
 function list(
@@ -34,6 +43,29 @@ function list(
       </ConversationContent>
     </Conversation>
   );
+}
+
+function messageList(bubbles: Bubble[], showsWorking: boolean) {
+  return (
+    <Conversation>
+      <ConversationContent>
+        <VirtualBubbleList
+          bubbles={bubbles}
+          scrollEl={null}
+          lastAssistantIndex={bubbles.findLastIndex((item) => item.kind === "assistant")}
+          showsWorking={showsWorking}
+          conversationId="conv-1"
+          hasTasks={false}
+          disableVirtualization
+          onGeometryChange={vi.fn()}
+        />
+      </ConversationContent>
+    </Conversation>
+  );
+}
+
+function actionFooter(button: HTMLElement): HTMLElement {
+  return button.parentElement!.parentElement!;
 }
 
 it("remeasures scrollMargin when task padding changes without changing bubbles", async () => {
@@ -105,4 +137,26 @@ it("renders every bubble in normal flow after native find is detected", () => {
 
   expect(view.container.querySelector('[data-index="0"]')).toBeNull();
   expect(view.container.querySelectorAll('[data-testid="message-bubble"]')).toHaveLength(1);
+});
+
+it("keeps actions visible only on the final settled message", () => {
+  const bubbles: Bubble[] = [assistantBubble, bubble, { kind: "compaction", itemId: "compact-1" }];
+  const view = render(messageList(bubbles, false));
+  const copyButtons = screen.getAllByRole("button", { name: "Copy" });
+
+  expect(actionFooter(copyButtons[0]!)).toHaveClass("md:opacity-0");
+  expect(actionFooter(copyButtons[1]!)).not.toHaveClass("md:opacity-0");
+
+  view.rerender(messageList(bubbles, true));
+  expect(actionFooter(screen.getAllByRole("button", { name: "Copy" })[1]!)).toHaveClass(
+    "md:opacity-0",
+  );
+});
+
+it("keeps the final assistant actions visible while its response is active", () => {
+  render(messageList([bubble, { ...assistantBubble, lifecycle: "streaming" }], true));
+
+  expect(actionFooter(screen.getAllByRole("button", { name: "Copy" })[1]!)).not.toHaveClass(
+    "md:opacity-0",
+  );
 });

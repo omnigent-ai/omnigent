@@ -142,6 +142,12 @@ vi.mock("@/hooks/useConversations", () => ({
 vi.mock("./AgentTypeFilter", () => ({ AgentTypeFilter: () => null }));
 vi.mock("./ReportIssueButton", () => ({ ReportIssueButton: () => null }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+vi.mock("./ForkSessionDialog", () => ({
+  ForkSessionDialog: ({ open, sourceSessionId }: { open: boolean; sourceSessionId: string }) =>
+    open ? (
+      <div data-testid="fork-session-dialog" data-source-session-id={sourceSessionId} />
+    ) : null,
+}));
 // Force a multi-user (non-local) server so the "Shared with me" tab renders —
 // jsdom's default loopback origin would otherwise read as single-user and hide
 // the tabs the shared-session row actions rely on.
@@ -1133,6 +1139,18 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("opens the fork dialog for the selected session", () => {
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(screen.getByTestId("fork-session-dialog")).toHaveAttribute(
+      "data-source-session-id",
+      "conv_1",
+    );
+  });
+
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();
 

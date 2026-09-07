@@ -498,12 +498,16 @@ export const BubbleView = memo(
     bubble,
     isLastAssistant = false,
     showsWorking = false,
+    actionsPersistent = false,
   }: {
     bubble: Bubble;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
+    actionsPersistent?: boolean;
   }) {
-    if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
+    if (bubble.kind === "user") {
+      return <UserBubble bubble={bubble} actionsPersistent={actionsPersistent} />;
+    }
     if (bubble.kind === "compaction_loading") {
       return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
@@ -524,12 +528,14 @@ export const BubbleView = memo(
         bubble={bubble}
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
+        actionsPersistent={actionsPersistent}
       />
     );
   },
   (prev, next) =>
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
+    (prev.actionsPersistent ?? false) === (next.actionsPersistent ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
 );
 
@@ -582,7 +588,13 @@ function AttachmentChip({ icon: Icon, label }: { icon: LucideIcon; label: string
   );
 }
 
-function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
+function UserBubble({
+  bubble,
+  actionsPersistent,
+}: {
+  bubble: Extract<Bubble, { kind: "user" }>;
+  actionsPersistent: boolean;
+}) {
   const sessionId = useChatStore((s) => s.conversationId);
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
@@ -737,7 +749,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
         {/* Skip an empty row when there is neither a timestamp nor a copy
             action. 40%-visible on touch, hover/focus-reveal on desktop. */}
         {(ts || text) && (
-          <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+          <div
+            className={cn(
+              "flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity",
+              !actionsPersistent &&
+                "md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
+            )}
+          >
             {ts && (
               <span
                 className="select-none text-[11px] leading-4 text-foreground/56"
@@ -769,10 +787,12 @@ function AssistantBubble({
   bubble,
   isLastAssistant = false,
   showsWorking = false,
+  actionsPersistent = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
+  actionsPersistent?: boolean;
 }) {
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
@@ -863,7 +883,13 @@ function AssistantBubble({
         {/* Skipped on a fold-only bubble, when there is neither a timestamp nor
             actions, and on an error-only bubble. Order: actions, then timestamp. */}
         {!foldOnly && !errorOnly && (ts || markdownText) && (
-          <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+          <div
+            className={cn(
+              "flex items-center gap-3 py-1 opacity-40 transition-opacity",
+              !actionsPersistent &&
+                "md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
+            )}
+          >
             {markdownText && (
               <MessageActions>
                 <MessageAction

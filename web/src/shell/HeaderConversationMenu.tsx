@@ -12,6 +12,7 @@ import {
   EllipsisIcon,
   FolderInputIcon,
   GitBranchIcon,
+  GitForkIcon,
   InfoIcon,
   MailIcon,
   PencilIcon,
@@ -64,9 +65,11 @@ interface HeaderConversationMenuProps {
   conversation: Conversation;
   currentProject: string | null;
   canShare: boolean;
+  canFork: boolean;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   onShare: () => void;
+  onFork: () => void;
   hasAgentInfo?: boolean;
   onAgentInfo?: () => void;
   /** Mobile workspace-rail entries (Files · Agents · Shells · Logs). */
@@ -92,9 +95,11 @@ export function HeaderConversationMenu({
   conversation,
   currentProject,
   canShare,
+  canFork,
   shareDisabled = false,
   shareDisabledReason,
   onShare,
+  onFork,
   hasAgentInfo = false,
   onAgentInfo,
   workspaceItems = null,
@@ -212,6 +217,16 @@ export function HeaderConversationMenu({
         >
           <ShareIcon className="size-3.5" />
           Share
+        </DropdownMenuItem>
+      )}
+      {canFork && (
+        <DropdownMenuItem
+          data-testid="header-fork-conversation"
+          className={itemClass}
+          onSelect={onFork}
+        >
+          <GitForkIcon className="size-3.5" />
+          Fork
         </DropdownMenuItem>
       )}
       {hasAgentInfo && onAgentInfo && (
