@@ -171,6 +171,113 @@ class TestApprovalKeystroke:
         assert sent == []
 
 
+def _open_menu_pane(command: str, *, scrollback: str = "") -> str:
+    """A pane rendering kimi's OPEN permission panel for *command*.
+
+    Mirrors the live layout: the panel is bounded by full-width ``─`` rules and
+    shows the gated command; *scrollback* (already-answered prompts, transcript)
+    sits above the panel's top rule.
+    """
+    rule = " " + "─" * 80
+    return (
+        f"{scrollback}"
+        " ● Running a command\n"
+        f"   $ {command}\n"
+        f"{rule}\n"
+        "   ▶ Run this command?\n"
+        "\n"
+        "   cwd: /tmp/ws\n"
+        f"   $ {command}\n"
+        "\n"
+        "   ▶ 1. Approve once\n"
+        "     2. Approve for this session\n"
+        "     3. Reject\n"
+        "     4. Reject with feedback\n"
+        "\n"
+        "   ↑/↓ select · 1/2/3/4 choose · ↵ confirm\n"
+        f"{rule}\n"
+    )
+
+
+#: The answered menu A as it lingers in scrollback — its command line survives,
+#: the numbered options do not.
+_ANSWERED_MENU_A = (
+    " ● Ran a command\n"
+    "   $ touch marker_a.txt\n"
+    "   Command executed successfully.\n"
+    "\n"
+    "   Approved: Running: touch marker_a.txt\n"
+    "\n"
+    " ● Tool A completed.\n"
+    "\n"
+)
+
+
+class TestApprovalKeystrokeIdentity:
+    """The verdict must stay with ITS menu: a stale web verdict for an already-
+    answered prompt must not be typed into a different, later menu."""
+
+    _stub_tmux = TestApprovalKeystroke._stub_tmux
+
+    def test_injects_when_open_menu_is_the_verdicts_own(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pane = _open_menu_pane("touch marker_b.txt", scrollback=_ANSWERED_MENU_A)
+        sent = self._stub_tmux(monkeypatch, pane=pane)
+        assert (
+            inject_approval_keystroke(
+                tmp_path, key=APPROVE_KEY, tool_input={"command": "touch marker_b.txt"}
+            )
+            is True
+        )
+        assert sent == [
+            ("send-keys", "-t", "main", APPROVE_KEY),
+            ("send-keys", "-t", "main", "Enter"),
+        ]
+
+    def test_stale_verdict_never_answers_a_different_open_menu(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Menu A was answered in the terminal (scrollback); menu B is open. A
+        # web verdict raised for A must not be typed into B — even though A's
+        # command text is still visible in scrollback above the panel border.
+        pane = _open_menu_pane("touch marker_b.txt", scrollback=_ANSWERED_MENU_A)
+        sent = self._stub_tmux(monkeypatch, pane=pane)
+        assert (
+            inject_approval_keystroke(
+                tmp_path, key=DENY_KEY, tool_input={"command": "touch marker_a.txt"}
+            )
+            is False
+        )
+        assert sent == []
+
+    def test_no_usable_identity_falls_back_to_presence_guard(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An input with no searchable string values cannot be matched — keep the
+        # legacy presence-only behavior rather than breaking those approvals.
+        pane = _open_menu_pane("touch marker_b.txt")
+        sent = self._stub_tmux(monkeypatch, pane=pane)
+        assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY, tool_input={}) is True
+        assert sent[0] == ("send-keys", "-t", "main", APPROVE_KEY)
+
+    def test_long_command_matches_by_wrapped_prefix(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A narrow pane wraps long commands; the needle is a prefix so the
+        # match still lands on the panel's first rendered line.
+        long_command = "echo " + "a" * 100
+        pane = _open_menu_pane(long_command[:40])  # pane truncates the rendering
+        sent = self._stub_tmux(monkeypatch, pane=pane)
+        assert (
+            inject_approval_keystroke(
+                tmp_path, key=APPROVE_KEY, tool_input={"command": long_command}
+            )
+            is True
+        )
+        assert len(sent) == 2
+
+
 class TestSettlePaneReadiness:
     """``_settle_pane`` must recognize the real kimi TUI chrome so it returns on
     the first capture — a wrong marker silently burns the full readiness timeout

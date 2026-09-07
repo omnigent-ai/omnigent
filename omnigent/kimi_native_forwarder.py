@@ -19,8 +19,15 @@ and recency. Relevant wire events:
 - ``{"type": "context.append_loop_event", "event": {"type": "content.part",
   "part": {"type": "text", "text": …}, "uuid": …}}`` → an assistant message.
   (``part.type == "think"`` is reasoning, mirrored as a transient
-  ``external_output_reasoning_delta`` from ``part["think"]``; ``tool.call`` /
-  ``tool.result`` events are still skipped — the embedded terminal shows them.)
+  ``external_output_reasoning_delta`` from ``part["think"]``.)
+- ``{"event": {"type": "tool.call", "toolCallId": …, "name": …, "args": {…}}}`` /
+  ``{"event": {"type": "tool.result", "toolCallId": …, "result": {"output": …}}}``
+  → ``function_call`` / ``function_call_output`` items (the hermes/cursor
+  contract). Beyond transcript parity, the mirrored result is what lets the
+  server's terminal-resolved fast path drain a parked web ApprovalCard once the
+  user answered kimi's permission menu in the terminal — a tool result is only
+  written after that menu was answered (approve or reject), so without this
+  mirror the stale card would keep a live verdict aimed at any later menu.
 
 Each mirrored turn is POSTed as an ``external_conversation_item`` to
 ``/v1/sessions/{id}/events`` (the same shape :mod:`omnigent.kimi_native_hook`
@@ -69,9 +76,16 @@ class KimiWireItem:
     text: str
     response_id: str
     # "message" (a user/assistant turn → external_conversation_item),
-    # "reasoning" (a think block → external_output_reasoning_delta), or
-    # "turn_end" (an ``end_turn`` step → external_session_status: idle).
+    # "reasoning" (a think block → external_output_reasoning_delta),
+    # "turn_end" (an ``end_turn`` step → external_session_status: idle),
+    # "tool_call" (a tool.call event → a ``function_call`` item), or
+    # "tool_result" (a tool.result event → a ``function_call_output`` item,
+    # whose ``text`` carries the tool output).
     kind: str = "message"
+    # Tool identity for the "tool_call" / "tool_result" kinds.
+    call_id: str = ""
+    tool_name: str = ""
+    arguments: str = ""
 
 
 _MirrorItem = KimiWireItem
@@ -227,6 +241,8 @@ def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
                 response_id=f"kimi:turn_end:{line_no}",
                 kind="turn_end",
             )
+        if event_type in ("tool.call", "tool.result"):
+            return _tool_event_to_item(line_no, event_type, event)
         if event_type != "content.part":
             return None
         part = event.get("part")
@@ -261,6 +277,51 @@ def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
             )
         return None
     return None
+
+
+def _tool_event_to_item(
+    line_no: int, event_type: str, event: dict[str, object]
+) -> KimiWireItem | None:
+    """Map a ``tool.call`` / ``tool.result`` loop event to a mirror item.
+
+    Both approve and reject paths write these rows — a rejected call records a
+    ``tool.result`` whose output says the user rejected it — so the mirrored
+    ``function_call_output`` is a reliable "the terminal already ruled on this
+    call" signal for the server's terminal-resolved fast path.
+    """
+    call_id = event.get("toolCallId")
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    if event_type == "tool.call":
+        name = event.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        args = event.get("args")
+        uuid = event.get("uuid")
+        response_id = f"kimi:{uuid}" if isinstance(uuid, str) and uuid else f"kimi:line:{line_no}"
+        return KimiWireItem(
+            line_no=line_no,
+            role="assistant",
+            text="",
+            response_id=response_id,
+            kind="tool_call",
+            call_id=call_id,
+            tool_name=name,
+            arguments=json.dumps(args) if isinstance(args, dict) else "{}",
+        )
+    result = event.get("result")
+    output = ""
+    if isinstance(result, dict):
+        raw = result.get("output")
+        output = raw if isinstance(raw, str) else json.dumps(result, ensure_ascii=False)
+    return KimiWireItem(
+        line_no=line_no,
+        role="assistant",
+        text=output,
+        response_id=f"kimi:result:{call_id}:{line_no}",
+        kind="tool_result",
+        call_id=call_id,
+    )
 
 
 def read_kimi_wire_items(wire_path: Path, last_line: int) -> list[KimiWireItem]:
@@ -314,6 +375,47 @@ async def _post_conversation_item(
         "type": "external_conversation_item",
         "data": {
             "item_type": "message",
+            "item_data": item_data,
+            "response_id": item.response_id,
+        },
+    }
+    url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
+    resp = await client.post(url, headers=headers, json=body)
+    resp.raise_for_status()
+
+
+async def _post_tool_item(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    item: KimiWireItem,
+    agent_name: str,
+) -> None:
+    """POST one mirrored tool call/result as an external conversation item.
+
+    Uses the same ``function_call`` / ``function_call_output`` shapes as the
+    hermes/cursor forwarders. Mirroring the output also arms the server's
+    terminal-resolved fast path: it correlates the result back to a parked
+    permission prompt by the call's tool identity and resolves it, so a menu
+    answered in the terminal releases its web ApprovalCard.
+    """
+    if item.kind == "tool_call":
+        item_type = "function_call"
+        item_data: dict[str, object] = {
+            "agent": agent_name,
+            "name": item.tool_name,
+            "arguments": item.arguments,
+            "call_id": item.call_id,
+        }
+    else:
+        item_type = "function_call_output"
+        item_data = {"call_id": item.call_id, "output": item.text}
+    body = {
+        "type": "external_conversation_item",
+        "data": {
+            "item_type": item_type,
             "item_data": item_data,
             "response_id": item.response_id,
         },
@@ -441,6 +543,15 @@ async def forward_kimi_wire_to_session(
                                 headers=headers,
                                 session_id=session_id,
                                 item=item,
+                            )
+                        elif item.kind in ("tool_call", "tool_result"):
+                            await _post_tool_item(
+                                client,
+                                base_url=base_url,
+                                headers=headers,
+                                session_id=session_id,
+                                item=item,
+                                agent_name=agent_name,
                             )
                         else:
                             await _post_conversation_item(
