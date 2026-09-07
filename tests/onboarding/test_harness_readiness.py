@@ -320,6 +320,9 @@ def test_configured_harness_map_covers_all_spellings(
         "pi",
         "pi-native",
         "native-pi",
+        # Oh My Pi (``omp --mode rpc``) + alias; gates on the omp CLI.
+        "omp",
+        "oh-my-pi",
         "cursor",
         # Native Cursor (``omni cursor``) — gates on the cursor-agent CLI.
         "cursor-native",

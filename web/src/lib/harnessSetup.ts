@@ -145,7 +145,7 @@ export function harnessCredentialFamily(harness: string | null | undefined): str
   if (!harness) return null;
   if (["claude", "claude-native", "native-claude"].includes(harness)) return "anthropic";
   if (["codex", "codex-native", "native-codex"].includes(harness)) return "openai";
-  if (["pi", "pi-native", "native-pi"].includes(harness)) return "anthropic";
+  if (["pi", "pi-native", "native-pi", "omp", "oh-my-pi"].includes(harness)) return "anthropic";
   return null;
 }
 
@@ -164,7 +164,8 @@ export function harnessCredentialFamily(harness: string | null | undefined): str
 export function harnessCredentialAdoptFamilies(harness: string | null | undefined): string[] {
   const family = harnessCredentialFamily(harness);
   if (family === null) return [];
-  if (["pi", "pi-native", "native-pi"].includes(harness as string)) return ["anthropic", "openai"];
+  if (["pi", "pi-native", "native-pi", "omp", "oh-my-pi"].includes(harness as string))
+    return ["anthropic", "openai"];
   return [family];
 }
 

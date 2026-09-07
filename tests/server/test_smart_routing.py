@@ -306,6 +306,33 @@ def test_infer_models_unknown_harness() -> None:
     assert infer_models(None) is None
 
 
+def test_omp_shares_pi_family() -> None:
+    """omp routes as a pi-family harness (same gateway models, same wires).
+
+    Without the entry, omp subagent routing degrades three ways: catalog
+    rows from pi-family workers never match, there is no static-model
+    fallback, and a picked pi-family model redirects the child off "omp".
+    """
+    from omnigent.runner.subagent_routing import _target_harness
+    from omnigent.server.smart_routing import (
+        _HARNESS_FAMILY,
+        catalog_models_for_harness,
+        models_in_family,
+    )
+
+    assert _HARNESS_FAMILY["omp"] == "pi"
+    assert infer_models("omp") == infer_models("pi")
+    assert infer_models("omp") is not None
+    # A pi worker row serves an omp session (matched by family, not id).
+    assert catalog_models_for_harness({"pi": ["databricks-claude-x"]}, "omp") == [
+        "databricks-claude-x"
+    ]
+    # pi-family filtering is permissive — every model passes, as for pi.
+    assert models_in_family("omp", ["anything"]) == ["anything"]
+    # A picked pi-family model keeps the child on omp instead of redirecting.
+    assert _target_harness("omp", "pi", "pi") == "omp"
+
+
 def test_models_fixture_unknown_harness() -> None:
     assert _models_for("cursor") is None
     assert _models_for("antigravity") is None
