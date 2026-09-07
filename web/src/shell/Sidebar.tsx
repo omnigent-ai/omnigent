@@ -197,6 +197,7 @@ import {
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
+import { getEmbedRoot } from "../lib/host";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // right-1 edge in every viewport: on desktop it fades on hover so the pin +
@@ -2343,7 +2344,7 @@ function ConversationList({
               </div>
             ) : null}
           </DragOverlay>,
-          document.body,
+          getEmbedRoot() ?? document.body,
         )}
       </DndContext>
     </SidebarRowDataProvider>
