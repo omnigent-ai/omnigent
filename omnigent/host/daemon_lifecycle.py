@@ -25,6 +25,7 @@ import logging
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from omnigent.process_logging import data_dir
 
@@ -65,13 +66,71 @@ class HostDaemonRecord:
     config_sig: str | None = None
 
 
-def normalize_daemon_target(server_url: str | None) -> str:
+def normalize_daemon_target(server_url: str | None, *, base_dir: Path | None = None) -> str:
     """Return the registry key for a daemon target.
 
+    A local server instance is identified by its data dir, so a loopback URL
+    naming the port tracked in that dir's ``local_server.pid`` addresses the
+    same instance as local mode: both collapse to ``"local"``. One instance
+    therefore keeps one record (and one daemon) across ``--server`` spellings
+    such as ``http://127.0.0.1:6767`` vs ``http://localhost:6767``.
+
     :param server_url: Requested server URL, or ``None`` / empty for local mode.
-    :returns: ``"local"`` for local mode, else the URL without a trailing slash.
+    :param base_dir: Data-directory override; defaults to :func:`data_dir`.
+    :returns: ``"local"`` for the data dir's own instance, else the URL
+        without a trailing slash.
     """
-    return _LOCAL_DAEMON_MARKER if not server_url else server_url.rstrip("/")
+    if not server_url:
+        return _LOCAL_DAEMON_MARKER
+    target = server_url.rstrip("/")
+    if _is_tracked_local_server_url(target, base_dir=base_dir):
+        return _LOCAL_DAEMON_MARKER
+    return target
+
+
+_LOOPBACK_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _is_tracked_local_server_url(url: str, *, base_dir: Path | None = None) -> bool:
+    """Whether *url* is a loopback spelling of this data dir's tracked server.
+
+    The pidfile is the data dir's declaration of which port its local server
+    owns. Liveness and health are deliberately not probed here so a target's
+    registry key stays stable instead of flapping with server health.
+
+    :param url: Normalized (trailing-slash-stripped) server URL.
+    :param base_dir: Data-directory override; defaults to :func:`data_dir`.
+    :returns: ``True`` when the URL's host is loopback and its port matches
+        the tracked local server port.
+    """
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError:
+        return False
+    if port is None or parsed.hostname not in _LOOPBACK_HOSTNAMES:
+        return False
+    return port == _tracked_local_server_port(base_dir=base_dir)
+
+
+def _tracked_local_server_port(*, base_dir: Path | None = None) -> int | None:
+    """Return the port recorded in the data dir's ``local_server.pid``, if any.
+
+    :param base_dir: Data-directory override; defaults to :func:`data_dir`.
+    :returns: The tracked port, or ``None`` when the pidfile is absent or
+        malformed.
+    """
+    pid_path = (base_dir if base_dir is not None else data_dir()) / "local_server.pid"
+    try:
+        lines = pid_path.read_text().strip().splitlines()
+    except OSError:
+        return None
+    if len(lines) < 2:
+        return None
+    try:
+        return int(lines[1])
+    except ValueError:
+        return None
 
 
 def _target_digest(target: str) -> str:
