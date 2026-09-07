@@ -79,6 +79,10 @@ export interface ExtensionContext {
     };
   };
   sessions: {
+    /** Optional, incomplete preview; start authoritative pagination with listPage(). */
+    getCached(options?: {
+      limit?: number;
+    }): Promise<ExtensionSessionSummary[] | null>;
     listPage(options?: {
       after?: string | null;
       limit?: number;
@@ -248,6 +252,15 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
       },
     },
     sessions: {
+      getCached(options) {
+        const limit = validateSessionPageLimit(
+          options?.limit,
+          (code, message) => new ExtensionApiError(code, message),
+        );
+        return request<ExtensionSessionSummary[] | null>("sessions.getCached", {
+          limit,
+        });
+      },
       listPage(options) {
         const limit = validateSessionPageLimit(
           options?.limit,

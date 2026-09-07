@@ -278,7 +278,11 @@ def sandbox_create(
     app_url = _normalize_server_url(server_url)
     workspace = derive_workspace(app_url)
     launcher = _require_cli_bootstrap(
-        get_launcher(provider, workspace_host=workspace.host if workspace is not None else None)
+        get_launcher(
+            provider,
+            workspace_host=workspace.host if workspace is not None else None,
+            server_url=app_url,
+        )
     )
     # The in-sandbox login only exists for providers that can forward
     # the browser's callback port — others skip it automatically, no
@@ -337,7 +341,11 @@ def sandbox_auth(
     app_url = _normalize_server_url(server_url)
     workspace = derive_workspace(app_url)
     launcher = _require_cli_bootstrap(
-        get_launcher(provider, workspace_host=workspace.host if workspace is not None else None)
+        get_launcher(
+            provider,
+            workspace_host=workspace.host if workspace is not None else None,
+            server_url=app_url,
+        )
     )
     login_app_oauth_in_sandbox(
         launcher,
@@ -402,7 +410,11 @@ def sandbox_connect(
     # the same workspace to find it.
     workspace = derive_workspace(app_url)
     launcher = _require_cli_bootstrap(
-        get_launcher(provider, workspace_host=workspace.host if workspace is not None else None)
+        get_launcher(
+            provider,
+            workspace_host=workspace.host if workspace is not None else None,
+            server_url=app_url,
+        )
     )
     connect_sandbox_host(
         launcher,

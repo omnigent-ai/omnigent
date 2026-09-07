@@ -4319,7 +4319,12 @@ async def test_context_tokens_emitted_when_turn_ends_without_result_message() ->
 
 
 @pytest.mark.asyncio
-async def test_assistant_message_model_flows_to_turn_usage() -> None:
+@pytest.mark.parametrize("synthetic_error", [False, True])
+@pytest.mark.parametrize("observed", [True, False])
+async def test_assistant_message_model_flows_to_turn_usage(
+    synthetic_error: bool,
+    observed: bool,
+) -> None:
     """The SDK's assistant-message model is forwarded in ``TurnComplete.usage``.
 
     When the agent spec pins no model (a delegating supervisor on the gateway),
@@ -4354,7 +4359,7 @@ async def test_assistant_message_model_flows_to_turn_usage() -> None:
         total_cost_usd=0.0,
         duration_ms=1,
         duration_api_ms=1,
-        is_error=False,
+        is_error=synthetic_error,
         num_turns=1,
         usage={"input_tokens": 100, "output_tokens": 50},
     )
@@ -4366,7 +4371,10 @@ async def test_assistant_message_model_flows_to_turn_usage() -> None:
         StreamEvent = SDKStreamEvent
         ResultMessage = SDKResultMessage
         ClaudeAgentOptions = SDKClaudeAgentOptions
-        messages = [assistant, sdk_result]
+        messages = [assistant] if observed else []
+        if synthetic_error:
+            messages.append(_AsstMsg(content=[], model="<synthetic>"))
+        messages.append(sdk_result)
 
         class ClaudeSDKClient:
             def __init__(self, options: object) -> None:
@@ -4385,7 +4393,7 @@ async def test_assistant_message_model_flows_to_turn_usage() -> None:
             async def disconnect(self) -> None:
                 return None
 
-    executor = ClaudeSDKExecutor()
+    executor = ClaudeSDKExecutor(model=None if observed else "configured-model")
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
         events = [
             e
@@ -4396,14 +4404,12 @@ async def test_assistant_message_model_flows_to_turn_usage() -> None:
             )
         ]
 
-    turn = next(e for e in events if isinstance(e, TurnComplete))
+    terminal_type = ExecutorError if synthetic_error else TurnComplete
+    turn = next(e for e in events if isinstance(e, terminal_type))
     assert turn.usage is not None
-    # No model is configured (no cfg.model / override), so a non-None model here
-    # can only be the one captured from the AssistantMessage.
-    assert turn.usage["model"] == "claude-opus-4-8", (
-        f"usage model {turn.usage.get('model')!r} != 'claude-opus-4-8' — the "
-        "assistant-message model was not captured/forwarded."
-    )
+    # Synthetic errors preserve the last real report, or the configured fallback.
+    expected_model = "claude-opus-4-8" if observed else "configured-model"
+    assert turn.usage["model"] == expected_model
 
 
 @pytest.mark.asyncio

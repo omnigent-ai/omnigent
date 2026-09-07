@@ -177,6 +177,9 @@ blaxel = ["blaxel>=0.4.1,<0.5"]
 # pool. Same lazy-import posture as the modal/daytona extras. Pre-1.0 SDK: pin
 # minor.
 boxlite = ["boxlite>=0.9.5,<1"]
+# Microsandbox launcher: local libkrun microVMs with an optional embedded SDK.
+# Require 0.6.9 for upstream bug fixes and pin the beta SDK's minor version.
+microsandbox = ["microsandbox>=0.6.9,<0.7"]
 # CoreWeave Sandbox launcher (`omnigent sandbox --provider cwsandbox` and
 # server-managed `sandbox.provider: cwsandbox`).
 # Same lazy-import posture as above. Pre-1.0 SDK: pin minor.

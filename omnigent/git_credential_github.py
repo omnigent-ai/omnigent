@@ -8,8 +8,14 @@ the sandbox's existing authenticated channel and prints back ``username`` /
 ``password``.
 
 Why this shape:
-- The **GitHub token is never persisted** in the sandbox — it's fetched fresh
-  per git operation and lives only in this short-lived process's stdout.
+- For **git**, the **GitHub token is never persisted** in the sandbox — it's
+  fetched fresh per git operation and lives only in this short-lived process's
+  stdout. (The gh CLI has no per-op credential hook, so
+  :func:`configure_host_gh` does materialize the token into gh's ``hosts.yml``
+  at launch — a within-sandbox persistence the threat model below already
+  admits, matching how ``~/.databrickscfg`` is written — and
+  :func:`start_host_gh_refresh` re-writes it on an interval so gh stays fresh
+  across the ~8h token expiry the git broker otherwise handles per-op.)
 - It is **executor-agnostic**: every executor already starts the host with a
   server URL + launch token, so nothing GitHub-specific is injected per
   executor. The host bakes the endpoint coordinates (server URL, host id, launch
@@ -39,13 +45,31 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
 
 import httpx
+import yaml
 
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR as _HOST_TOKEN_ENV_VAR
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 
 _TIMEOUT_S = 15.0
+
+
+def _in_sandbox() -> bool:
+    """Whether we're running inside a managed sandbox (host image sets ``IS_SANDBOX=1``).
+
+    The broker host integrations auto-materialize the owner's credentials into
+    the host's git / gh config. That's only ever wanted in a managed sandbox — a
+    disposable, per-session filesystem. A local ``omnigent host`` shares the
+    developer's real ``~/.gitconfig`` / ``~/.config/gh``, so every auto-apply must
+    be a no-op there. ``IS_SANDBOX=1`` is baked into the managed host image and
+    the k8s pod spec; it is absent on a local host.
+    """
+    return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
 
 
 def _read_git_request() -> dict[str, str]:
@@ -91,19 +115,6 @@ def _fetch_credential(server: str, host_id: str, host_token: str) -> tuple[str, 
     if not data or not data.get("connected") or not data.get("token"):
         return None
     return str(data.get("username") or "x-access-token"), str(data["token"])
-
-
-def resolve_github_token(server_url: str, host_id: str, host_token: str) -> str | None:
-    """Fetch the connected owner's GitHub token from the broker, or ``None``.
-
-    Public wrapper over the broker fetch for non-git callers — the read-only
-    GitHub panel's ``gh`` invocations need the per-user token directly rather than
-    via git's ``credential.helper``. ``None`` when the owner hasn't connected
-    GitHub or the broker is unreachable, so callers fall back to their ambient
-    (shared-token / local ``gh``) auth. Never raises.
-    """
-    cred = _fetch_credential(server_url, host_id, host_token)
-    return cred[1] if cred else None
 
 
 def _git_config(*args: str) -> None:
@@ -163,7 +174,12 @@ def configure_host_git(server_url: str, host_id: str) -> None:
     prior (inconclusive) clone probe may have installed, restoring the ambient
     helper. Only a connected owner, or an inconclusive probe (``None``,
     fail-closed like the clone), takes over github.com.
+
+    Sandbox-only (see :func:`_in_sandbox`): a no-op outside a managed sandbox, so
+    a local ``omnigent host`` never rewrites the developer's real ``~/.gitconfig``.
     """
+    if not _in_sandbox():
+        return
     token = (os.environ.get(_HOST_TOKEN_ENV_VAR) or "").strip()
     if not token:
         return
@@ -182,6 +198,159 @@ def configure_host_git(server_url: str, host_id: str) -> None:
         _git_config("user.email", owner)
         login = data.get("login")
         _git_config("user.name", str(login) if login else owner.split("@", 1)[0])
+
+
+def _gh_config_dir() -> Path:
+    """The gh CLI config dir (``GH_CONFIG_DIR`` override, else ``~/.config/gh``)."""
+    override = (os.environ.get("GH_CONFIG_DIR") or "").strip()
+    if override:
+        return Path(override)
+    return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "gh"
+
+
+def _write_gh_hosts(login: str, token: str) -> bool:
+    """Materialize the owner's ``github.com`` auth into gh's ``hosts.yml``.
+
+    The gh CLI does not consult git's ``credential.helper`` for its own API
+    calls (``gh api`` / ``gh pr`` / ``gh issue``); it reads ``oauth_token`` from
+    ``hosts.yml`` (or ``GH_TOKEN``).
+
+    Writes **only the** ``github.com`` **key, merging** into any existing
+    document so a user's other hosts survive (``hosts.yml`` is a multi-host map —
+    a GitHub Enterprise entry, a second account). This matters because the host's
+    ``GH_CONFIG_DIR`` is not always a throwaway sandbox one: a local ``omnigent
+    host`` resolves it to the real ``~/.config/gh``, where truncating would
+    destroy the developer's config on every refresh. Mirrors the Databricks
+    config writer in :mod:`omnigent.onboarding.setup`, which mutates one section
+    of ``~/.databrickscfg`` and writes the rest back rather than truncating.
+
+    Written via a fresh ``0600`` temp file + :func:`os.replace`, so the token is
+    never briefly world-readable and a concurrent ``gh`` read never sees a
+    partial file; :func:`yaml.safe_dump` quotes values correctly whatever they
+    contain.
+
+    NB deliberately no ``gh auth setup-git``: that would register gh as a git
+    credential helper and compete with the per-user broker, which must stay
+    authoritative for github.com so git ops fetch the token fresh per op.
+
+    :returns: ``True`` when written; ``False`` on any filesystem error.
+    """
+    hosts_path = _gh_config_dir() / "hosts.yml"
+    # Merge into the existing document so other hosts / accounts are preserved. A
+    # missing, unreadable, or non-mapping file is treated as empty (never a
+    # failure) — the worst case is starting a fresh map.
+    hosts: dict = {}
+    with contextlib.suppress(OSError, yaml.YAMLError):
+        loaded = yaml.safe_load(hosts_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            hosts = loaded
+    entry = hosts.get("github.com")
+    if not isinstance(entry, dict):
+        entry = {}
+    entry.update({"oauth_token": token, "user": login, "git_protocol": "https"})
+    hosts["github.com"] = entry
+
+    tmp: str | None = None
+    try:
+        hosts_path.parent.mkdir(parents=True, exist_ok=True)
+        # mkstemp creates the file 0600 (owner-only, umask-independent), so the
+        # credential never has a world-readable window; os.replace swaps it in
+        # atomically, so a concurrent gh read never sees a partial file.
+        fd, tmp = tempfile.mkstemp(dir=hosts_path.parent, prefix=".hosts.", suffix=".yml")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(hosts, handle, default_flow_style=False, sort_keys=True)
+        os.replace(tmp, hosts_path)
+    except (OSError, yaml.YAMLError):
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+        return False
+    return True
+
+
+def configure_host_gh(server_url: str, host_id: str) -> bool:
+    """Authenticate the sandbox's gh CLI as the session owner.
+
+    Companion to :func:`configure_host_git` (which wires git's per-op broker):
+    the gh CLI has no per-op credential hook, so — like the Databricks config
+    writer in :mod:`omnigent.onboarding.setup` materializes ``~/.databrickscfg``
+    — the owner's brokered GitHub token is materialized into ``hosts.yml`` at
+    host startup. The token is a short-lived, server-refreshed user token; it is
+    re-fetched on each host launch, so a long-lived session should relaunch to
+    refresh it.
+
+    Best-effort: a no-op when the host token is absent, the broker is
+    unreachable, or the owner hasn't linked GitHub (any ambient gh auth is left
+    untouched). Never raises.
+
+    :returns: ``True`` when gh was authenticated; ``False`` otherwise.
+    """
+    if not _in_sandbox():
+        return False
+    token = (os.environ.get(_HOST_TOKEN_ENV_VAR) or "").strip()
+    if not token:
+        return False
+    data = _fetch(server_url, host_id, token)
+    if not data or not data.get("connected") or not data.get("token"):
+        return False
+    gh_token = str(data["token"])
+    login = str(data.get("login") or data.get("username") or "x-access-token")
+    return _write_gh_hosts(login, gh_token)
+
+
+# How often the background refresher re-materializes gh's hosts.yml, in seconds.
+# NB the name deliberately avoids a TOKEN/KEY/SECRET/PASSWORD/CREDENTIAL segment:
+# the managed-sandbox launcher rejects env-passthrough names that look like a
+# credential (they would land in the Pod spec/etcd), and this is a plain integer.
+_GH_REFRESH_INTERVAL_ENV_VAR: str = "OMNIGENT_GH_REFRESH_INTERVAL_S"
+_GH_REFRESH_DEFAULT_S: int = 1800
+
+
+def _gh_refresh_interval_s() -> int:
+    """Resolve the gh-token refresh interval (env override, else 30 min).
+
+    Non-positive disables the refresher.
+    """
+    raw = (os.environ.get(_GH_REFRESH_INTERVAL_ENV_VAR) or "").strip()
+    if not raw:
+        return _GH_REFRESH_DEFAULT_S
+    try:
+        return int(raw)
+    except ValueError:
+        return _GH_REFRESH_DEFAULT_S
+
+
+def start_host_gh_refresh(server_url: str, host_id: str) -> threading.Thread | None:
+    """Keep the gh CLI's ``hosts.yml`` token fresh over a long-lived host.
+
+    Unlike git (whose per-op broker helper re-fetches the server-refreshed
+    token on every operation), the gh CLI reads a **static** ``hosts.yml``, so
+    the token :func:`configure_host_gh` writes at startup goes stale when the
+    GitHub App user token expires (~8h) and the server rotates it — a
+    long-running session would then hit ``gh api`` 401s. This best-effort daemon
+    thread re-materializes ``hosts.yml`` on an interval well under the token
+    lifetime, so gh stays authenticated for the life of the host. (An
+    agent-sandbox resume already refreshes it by re-running host startup; this
+    covers a session that stays live without ever suspending.)
+
+    :returns: The started daemon thread, or ``None`` when disabled (a
+        non-positive interval, or outside a managed sandbox) — mainly for tests.
+    """
+    if not _in_sandbox():
+        return None
+    interval = _gh_refresh_interval_s()
+    if interval <= 0:
+        return None
+
+    def _loop() -> None:
+        while True:
+            time.sleep(interval)
+            with contextlib.suppress(Exception):
+                configure_host_gh(server_url, host_id)
+
+    thread = threading.Thread(target=_loop, name="gh-token-refresh", daemon=True)
+    thread.start()
+    return thread
 
 
 def configure_clone_credentials(server_url: str, host_id: str) -> bool:

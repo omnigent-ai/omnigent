@@ -18,6 +18,7 @@ import getpass
 import hashlib
 import logging
 import os
+import platform
 import shutil
 import sys
 from collections.abc import Callable
@@ -129,6 +130,25 @@ IS_POSIX = os.name == "posix"
 IS_LINUX = sys.platform.startswith("linux")
 #: True on macOS specifically (the seatbelt sandbox platform).
 IS_DARWIN = sys.platform == "darwin"
+
+
+def is_wsl() -> bool:
+    """Return whether this Linux process is running under Windows Subsystem for Linux.
+
+    WSL reports itself as Linux to Python, so this deliberately checks the
+    kernel identity rather than relying on :data:`sys.platform`.
+    """
+    if not IS_LINUX:
+        return False
+    try:
+        version = Path("/proc/version").read_text(encoding="utf-8")
+    except OSError:
+        version = ""
+    kernel_identity = " ".join(
+        (version, platform.release(), platform.version(), platform.uname().release)
+    ).lower()
+    return "microsoft" in kernel_identity or "wsl" in kernel_identity
+
 
 #: Non-sensitive Windows environment variables that a spawned omnigent
 #: subprocess needs to function, for env-passthrough allowlists that otherwise

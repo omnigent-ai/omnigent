@@ -7,8 +7,13 @@ import contextlib
 import json
 import logging
 import os
+import pathlib
+import re
+import shlex
 import subprocess
 import sys
+
+import pytest
 
 from omnigent.inner.sandbox import (
     SandboxPolicy,
@@ -424,3 +429,101 @@ def test_exec_launcher_without_allowlist_keeps_inherited_env(tmp_path) -> None:
     child_env = json.loads(out_file.read_text())
     # Opt-in contract: no allowlist, no prune.
     assert child_env.get("DELIBERATE_EXTRA") == "kept"
+
+
+def _read_launcher(target: str) -> tuple[str, str]:
+    """Create a launcher for ``target`` and return ``(path, contents)``."""
+    path = create_exec_launcher(target, _noop_policy())
+    return path, pathlib.Path(path).read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shebang behaviour")
+def test_exec_launcher_shebang_is_bin_sh_not_sys_executable() -> None:
+    """The launcher must not name ``sys.executable`` in its shebang.
+
+    Spawners such as the Claude Agent SDK ``execve`` this file directly.
+    A ``#!<python>`` line is only executable when that python is itself
+    a native binary reachable within the kernel's shebang buffer; when
+    it is not, the spawn fails with an opaque ENOEXEC. ``/bin/sh`` is
+    the one interpreter that always satisfies the kernel.
+    """
+    wrapper_path, script = _read_launcher(sys.executable)
+    try:
+        assert script.startswith("#!/bin/sh\n"), script
+        assert f"#!{sys.executable}" not in script, script
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(wrapper_path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shebang behaviour")
+def test_exec_launcher_runs_when_sys_executable_is_a_shell_script(tmp_path, monkeypatch) -> None:
+    """A shim interpreter must still produce a runnable launcher.
+
+    macOS refuses to run a script whose shebang interpreter is itself a
+    ``#!`` script, so a python installed behind a wrapper (pyenv-style
+    shims, vendored launchers) used to make every wrapped harness
+    startup fail with ENOEXEC. Invoking the interpreter as an argument
+    of ``/bin/sh`` removes the nesting entirely.
+    """
+    shim = tmp_path / "python-shim"
+    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n', encoding="utf-8")
+    shim.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(shim))
+
+    wrapper_path, script = _read_launcher(sys.executable)
+    try:
+        assert script.startswith("#!/bin/sh\n"), script
+        result = subprocess.run(
+            [wrapper_path, "-c", "pass"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(wrapper_path)
+
+    assert result.returncode == 0, result
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shebang behaviour")
+def test_exec_launcher_runs_when_interpreter_path_has_a_space(tmp_path, monkeypatch) -> None:
+    """A space in the interpreter path must not split the exec.
+
+    A shebang line is split on whitespace, so ``/Applications/My
+    Python/bin/python3`` resolved to ``/Applications/My``. The shell
+    wrapper quotes the interpreter instead.
+    """
+    spaced_dir = tmp_path / "My Python"
+    spaced_dir.mkdir()
+    shim = spaced_dir / "python3"
+    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n', encoding="utf-8")
+    shim.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(shim))
+
+    wrapper_path, _script = _read_launcher(sys.executable)
+    try:
+        result = subprocess.run(
+            [wrapper_path, "-c", "pass"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(wrapper_path)
+
+    assert result.returncode == 0, result
+
+
+def test_exec_launcher_rejects_an_unnameable_interpreter(monkeypatch) -> None:
+    """An empty ``sys.executable`` must fail loudly, not silently.
+
+    Embedded interpreters leave ``sys.executable`` empty; writing the
+    launcher anyway yields a file no kernel can run, and the caller
+    only learns about it as ENOEXEC from an unrelated spawn.
+    """
+    monkeypatch.setattr(sys, "executable", "")
+    with pytest.raises(OSError, match=re.escape("sys.executable is empty")):
+        create_exec_launcher("/bin/true", _noop_policy())

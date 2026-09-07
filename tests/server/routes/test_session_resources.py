@@ -4273,6 +4273,127 @@ async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() 
 
 
 @pytest.mark.asyncio
+async def test_kiro_skipped_entries_persist_before_the_matched_item() -> None:
+    """Failed Kiro prompts must precede the accepted prompt in stored order."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "823dbd1aab969b5a813fac59bb977a77"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    for text in ("first failed", "second failed", "tell me a joke"):
+        pending_inputs.record(
+            sid, [{"type": "input_text", "text": text}], created_by="alice@example.com"
+        )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "tell me a joke"}],
+            },
+            "response_id": "kiro:prompt-joke",
+            "source_id": "kiro:prompt-joke:0",
+        },
+    )
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        # Stored order mirrors the live broadcast: both skipped web inputs
+        # (each a user message + error pair) precede the accepted prompt.
+        assert [i.type for i in store.appended_items] == [
+            "message",
+            "error",
+            "message",
+            "error",
+            "message",
+        ]
+        first_user, _err1, second_user, _err2, matched_user = store.appended_items
+        assert first_user.data.content == [{"type": "input_text", "text": "first failed"}]
+        assert second_user.data.content == [{"type": "input_text", "text": "second failed"}]
+        assert matched_user.data.content == [{"type": "input_text", "text": "tell me a joke"}]
+        assert item_id == matched_user.id
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_kiro_duplicate_repost_restores_skipped_entries_unpersisted() -> None:
+    """A duplicate re-post restores skipped drains instead of persisting them."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    class _DedupingStore(_ConversationStore):
+        """Store whose matched item is already persisted: every append dedupes."""
+
+        def append(self, conversation_id: str, items: list[Any]) -> list[Any]:
+            result = [
+                ConversationItem(
+                    id=item.stable_id or f"item_{i}",
+                    type=item.type,
+                    status="completed",
+                    response_id=item.response_id,
+                    created_at=1,
+                    data=item.data,
+                    deduplicated=True,
+                )
+                for i, item in enumerate(items)
+            ]
+            self.appended_items.extend(result)
+            return result
+
+    pending_inputs.reset_for_tests()
+    store = _DedupingStore()
+    sid = "823dbd1aab969b5a813fac59bb977a77"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    recorded = [
+        pending_inputs.record(
+            sid, [{"type": "input_text", "text": text}], created_by="alice@example.com"
+        )
+        for text in ("first failed", "second failed", "tell me a joke")
+    ]
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "tell me a joke"}],
+            },
+            "response_id": "kiro:prompt-joke",
+            "source_id": "kiro:prompt-joke:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        # The batch was submitted but all items came back deduplicated (retry
+        # of an already-committed message); skipped drains are restored.
+        assert all(item.deduplicated for item in store.appended_items)
+        snapshot = pending_inputs.snapshot_for(sid)
+        assert [entry["pending_id"] for entry in snapshot] == recorded
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
     """Opaque framework 500 bodies become explicit ensure errors.
 
@@ -4605,8 +4726,10 @@ async def test_relay_skips_malformed_resource_created_from_runner() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal_type", ["response.completed", "response.failed"])
+@pytest.mark.parametrize("reported_model", ["claude-opus-4-8", "<synthetic>"])
 async def test_relay_persists_harness_reported_model(
     terminal_type: str,
+    reported_model: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """SDK terminal usage records the concrete model on the session snapshot."""
@@ -4631,7 +4754,7 @@ async def test_relay_persists_harness_reported_model(
                             "input_tokens": 0,
                             "output_tokens": 0,
                             "total_tokens": 0,
-                            "model": "claude-opus-4-8",
+                            "model": reported_model,
                         },
                     },
                 }
@@ -4642,15 +4765,20 @@ async def test_relay_persists_harness_reported_model(
 
     await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
 
-    assert store.get_conversation(session_id).reported_model == "claude-opus-4-8"  # type: ignore[union-attr]
+    expected = None if reported_model == "<synthetic>" else reported_model
+    assert store.get_conversation(session_id).reported_model == expected  # type: ignore[union-attr]
     model_events = [event for event in published if event.get("type") == "session.model"]
-    assert model_events == [
-        {
-            "type": "session.model",
-            "conversation_id": session_id,
-            "model": "claude-opus-4-8",
-        }
-    ]
+    assert model_events == (
+        []
+        if expected is None
+        else [
+            {
+                "type": "session.model",
+                "conversation_id": session_id,
+                "model": "claude-opus-4-8",
+            }
+        ]
+    )
 
 
 @pytest.mark.asyncio

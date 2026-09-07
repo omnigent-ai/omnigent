@@ -146,6 +146,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
+    trim_terminal_output,
 )
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
@@ -3148,6 +3149,49 @@ def create_runner_app(
                 error["remediation"] = diagnosis.remediation
         return error
 
+    def _live_terminal_pane_snapshot(conv_id: str) -> str | None:
+        """Return the first captured pane text among the conversation's terminals.
+
+        Serves failures that strike while terminals are still alive (e.g. a
+        harness stream drop): the required-terminal *exit* diagnostics never
+        fire, yet what is on the pane right now is often the most actionable
+        context available (a CLI parked at a trust prompt, an auth error, ...).
+        """
+        registry = resource_registry.terminal_registry if resource_registry else None
+        if registry is None:
+            return None
+        for entry in registry.list_for_conversation(conv_id):
+            try:
+                pane = trim_terminal_output(entry.instance.last_pane_text())
+            except Exception:
+                _logger.exception(
+                    "Failed to read terminal pane diagnostics for %s",
+                    conv_id,
+                    extra={"session_id": conv_id},
+                )
+                continue
+            if pane:
+                return pane
+        return None
+
+    def _harness_stream_failure_message(conv_id: str, exc: BaseException) -> str:
+        """Compose the user-facing message for a harness stream failure.
+
+        Leads with the real transport cause (which otherwise reaches only the
+        runner log) and attaches the live pane snapshot as a ``Last captured
+        terminal output:`` block, which the web UI renders as diagnostics.
+        """
+        cause = str(exc).strip()
+        message = (
+            f"Harness stream connection error: {cause}"
+            if cause
+            else "Harness stream connection error."
+        )
+        pane = _live_terminal_pane_snapshot(conv_id)
+        if pane:
+            message = f"{message}\n\nLast captured terminal output:\n{pane}"
+        return message
+
     def _release_required_terminal_session(session_id: str) -> None:
         if process_manager is None:
             return
@@ -5709,9 +5753,8 @@ def create_runner_app(
                 # forwarder to reconcile the row.
                 _logger.warning(
                     "claude-native model change for session=%s could not be verified: "
-                    "no statusLine snapshot in %s",
+                    "no statusLine snapshot",
                     conv_id,
-                    bridge_dir,
                     extra={"session_id": conv_id},
                 )
                 return Response(status_code=204)
@@ -8163,17 +8206,14 @@ def create_runner_app(
                                                 {"message": _err_msg, "type": _err_type}
                                             )
                                             return
-                                        _dispatch_workdir = (
-                                            _resolved_workdir_for_spec(
-                                                _spec_for_dispatch_entry,
-                                                runner_workspace,
-                                            )
-                                            if _is_spec_local
-                                            else runner_workspace
+                                        _local_tool_workdir = _resolved_workdir_for_spec(
+                                            _spec_for_dispatch_entry,
+                                            runner_workspace,
                                         )
                                         _spec_for_dispatch = _unwrap_resolved_spec(
                                             _spec_for_dispatch_entry
                                         )
+                                        _dispatch_workspace = await _session_runtime_cwd(conv_id)
                                         event[_RUNNER_DISPATCHED_FIELD] = True
                                         raw_sse_bytes = _encode_sse_event(event)
                                         _agent_id_for_dispatch = cast(
@@ -8200,7 +8240,8 @@ def create_runner_app(
                                                     task_id=_omnigent_task_id or _response_id,
                                                     agent_id=_agent_id_for_dispatch,
                                                     agent_name=cast(str | None, body.get("model")),
-                                                    runner_workspace=_dispatch_workdir,
+                                                    runner_workspace=_dispatch_workspace,
+                                                    local_tool_workdir=_local_tool_workdir,
                                                     mcp_manager=cast(
                                                         "RunnerMcpManager", _dispatch_mcp
                                                     ),
@@ -8364,7 +8405,7 @@ def create_runner_app(
                 )
                 _error = {
                     "code": "connection_error",
-                    "message": "Harness stream connection error.",
+                    "message": _harness_stream_failure_message(conv_id, exc),
                     "type": type(exc).__name__,
                 }
                 _http_fail = {
@@ -11121,15 +11162,8 @@ def create_runner_app(
                     except (OmnigentError, httpx.HTTPError, RuntimeError):
                         pass
                 _agent_id_local = _session_agent_ids.get(session_id)
-                dispatch_workspace = (
-                    # A resolved entry with no bundle dir gets no workspace at
-                    # all: widening that to the runner workspace would hand a
-                    # sub-agent the tool tree its own bundle does not contain.
-                    spec_workdir
-                    if _is_spec_local_native_python_tool(spec, tool_name)
-                    else runner_workspace
-                )
                 try:
+                    dispatch_workspace = await _session_runtime_cwd(session_id)
                     output = await execute_tool(
                         tool_name=tool_name,
                         arguments=_json.dumps(arguments),
@@ -11142,6 +11176,7 @@ def create_runner_app(
                         agent_id=_agent_id_local,
                         agent_name=getattr(spec, "name", None),
                         runner_workspace=dispatch_workspace,
+                        local_tool_workdir=spec_workdir,
                         mcp_manager=None,
                         session_inbox=_session_inboxes.get(session_id),
                         session_async_tasks=_session_async_tasks.get(session_id),

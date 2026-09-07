@@ -202,6 +202,7 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 
 | Key | Meaning |
 |---|---|
+| `provider` | `kubernetes` (a Job with a fixed 7-day cap) or `agent_sandbox` (an agent-sandbox `Sandbox` that reclaims itself once idle): see [Self-reclaiming sandboxes](#self-reclaiming-sandboxes-provider-agent_sandbox). Both read this same `kubernetes:` block. |
 | `server_url` | URL the runner Pod's host dials back to (in-cluster service DNS by default). |
 | `host_config` | Optional, top-level under `sandbox:` (provider-agnostic, not inside `kubernetes:`): verbatim in-sandbox `~/.omnigent/config.yaml` content installed before `omnigent host` starts — e.g. a `providers:` block routing the `pi` harness through a self-hosted gateway (LiteLLM/vLLM). Server-managed: entries injected by a previous launch are replaced or removed on the next launch/resume; config created inside the sandbox survives. Keep secrets out via `api_key_ref: env:VAR`, resolved inside the runner Pod against the `secret_name` Secret. Validated at server startup. |
 | `namespace` | Runner-Pod namespace (defaults to `omnigent-sandboxes`). |
@@ -215,6 +216,94 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 | `in_cluster` | Optional cluster-config source: `true` (in-cluster SA only), `false` (kubeconfig only), omit (try in-cluster, then kubeconfig). |
 | `kubeconfig` | Optional kubeconfig path for the out-of-cluster fallback (env: `OMNIGENT_KUBERNETES_KUBECONFIG`). |
 | `pvc_mounts` | Optional pre-created PersistentVolumeClaims mounted into every runner Pod — see [Persistent storage mounts](#persistent-storage-mounts-pvc_mounts). |
+
+## Self-reclaiming sandboxes (`provider: agent_sandbox`)
+
+`provider: kubernetes` runs each sandbox as a `batch/v1` Job capped by
+`activeDeadlineSeconds` (7 days). That is a *fixed* lifetime, so an abandoned
+sandbox holds a node slot for a week whether or not anything ever ran in it.
+
+`provider: agent_sandbox` runs the identical Pod inside an
+[agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) `Sandbox`
+custom resource, whose `spec.shutdownTime` is a deadline the owner keeps pushing
+forward. The server refreshes it for as long as the sandbox has a live runner
+tunnel, so:
+
+- a busy sandbox lives as long as work keeps arriving;
+- an idle one is reclaimed within one window (default 1h, env
+  `OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S`);
+- the agent-sandbox controller does the teardown, so the Omnigent server never
+  enumerates or babysits live Pods.
+
+Switching is one line: every other key stays in the same `kubernetes:` block:
+
+```yaml
+sandbox:
+  provider: agent_sandbox      # was: kubernetes
+  server_url: http://omnigent.omnigent.svc.cluster.local
+  kubernetes:
+    namespace: omnigent-sandboxes
+    secret_name: omnigent-creds
+```
+
+Prerequisites:
+
+1. Install the agent-sandbox controller and its CRDs in the cluster.
+2. The `sandboxes` RBAC rule in `role.yaml` (already applied by this overlay).
+
+### Suspend and resume
+
+`shutdownPolicy` is `Retain`, so a lapsed deadline **suspends** the sandbox: the
+Pod is torn down, the `Sandbox` object and its volumes stay. Sending a new
+message in the session wakes it under the same sandbox id (the server's normal
+resume path), and the sandbox keeps its host identity and conversation.
+
+Deleting for good stays explicit: deleting the session terminates it, and a
+deployment-wide reaper handles sandboxes abandoned long-term. `kubectl get
+sandbox -n omnigent-sandboxes` shows suspended ones with `Ready=False`,
+`Reason=SandboxExpired`.
+
+### Durable workspace (`OMNIGENT_AGENT_SANDBOX_WORKSPACE_SIZE`)
+
+By default `$HOME` is an `emptyDir` and dies with the Pod, so a woken sandbox
+starts from an empty workspace. Set a size on the **server** to move `$HOME`
+onto a per-sandbox PersistentVolumeClaim instead:
+
+```yaml
+env:
+  - name: OMNIGENT_AGENT_SANDBOX_WORKSPACE_SIZE
+    value: "20Gi"
+  - name: OMNIGENT_AGENT_SANDBOX_STORAGE_CLASS   # optional
+    value: "fast-ssd"                            # omit for the default class
+```
+
+The claim covers all of `$HOME`, so the workspace, `~/.omnigent` and harness
+caches all survive a suspend. Requirements and caveats:
+
+- The cluster needs a StorageClass with a dynamic provisioner that supports
+  `ReadWriteOnce` (kind ships `standard`). Without one the Pod stays `Pending`
+  on an unbound claim.
+- One claim per sandbox, named `home-<sandbox-id>`, owned by the `Sandbox`, so
+  `terminate` (session delete) cascades it away. Nothing is shared between
+  sessions.
+- `volumeClaimTemplates` is immutable after a `Sandbox` is created, so enabling
+  or resizing this applies to **new** sandboxes only; existing ones keep the
+  workspace they were born with.
+- This is a different lane from `pvc_mounts` below, which stays what it is:
+  pre-created, deployment-global, shared, and rejected at/over `$HOME`. Use
+  `pvc_mounts` for shared datasets and caches, this for per-session work.
+
+### Warm pools are not usable yet
+
+The extension CRDs (`SandboxWarmPool` / `SandboxClaim`) look like the answer to
+slow image pulls, but they cannot help Omnigent as the API stands: a
+`SandboxClaim` that sets either `env` or `volumeClaimTemplates` is documented
+(and tested upstream) to force a **cold start**, and Omnigent needs both, a
+per-session host identity in `env` and a per-session workspace claim. A warm
+pod's pre-created volumes are also pool-owned and recycled across claims, which
+is not acceptable for sandbox isolation. Pre-pulling the host image onto nodes
+is the workaround until upstream can inject per-claim identity without
+discarding the warm pod.
 
 ## Persistent storage mounts (`pvc_mounts`)
 

@@ -641,6 +641,16 @@ _STREAM_READ_CHUNK_SIZE = 65536
 # inject a CancelledError that bypasses the SIGKILL path.
 _RPC_SESSION_CLOSE_REAP_TIMEOUT_S = 2.0
 
+# Idle budget for one stdout read during a turn. Expiry alone never ends
+# the turn (a long tool call may stay silent past it); only a real stdout
+# EOF does. Module-level so tests can patch it.
+_TURN_STDOUT_IDLE_TIMEOUT_S = 120.0
+
+# Post-error drain budget: after an errored message the only line left to
+# consume is the already-emitted ``agent_end``. Module-level so tests can
+# patch it.
+_TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S = 10.0
+
 # CLI flags whose values are sensitive (e.g. the full system prompt) and must
 # not be written to logs verbatim. The value following these flags is replaced
 # with a length-only placeholder.
@@ -1167,12 +1177,28 @@ class _PiRpcSession:
                 self._line_queue.put_nowait(line)
         return result
 
-    async def read_line(self, timeout: float = 120.0) -> str | None:
-        """Read the next JSONL line from Pi's stdout. Returns None on EOF."""
+    async def read_line(self, timeout: float = _TURN_STDOUT_IDLE_TIMEOUT_S) -> str | None:
+        """Read the next JSONL line from Pi's stdout.
+
+        Returns ``None`` on EOF **or** timeout; callers that must tell
+        the two apart check :meth:`stdout_at_eof`.
+        """
         try:
             return await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
         except asyncio.TimeoutError:
             return None
+
+    def stdout_at_eof(self) -> bool:
+        """Whether Pi's stdout is exhausted (process exited / pipe closed).
+
+        The background reader runs until EOF and pushes the ``None``
+        sentinel from its ``finally``, so a finished (or never-started)
+        reader means no further stdout lines can arrive, while a live
+        reader means a ``read_line`` ``None`` was only an idle timeout.
+        Also requires an empty queue so already-buffered lines are
+        drained before the stream is declared exhausted.
+        """
+        return (self._read_task is None or self._read_task.done()) and self._line_queue.empty()
 
     async def close(self) -> None:
         for task in (self._read_task, self._stderr_task):
@@ -2477,8 +2503,20 @@ class PiExecutor(Executor):
         while True:
             # After an errored message the only thing left to drain is the
             # already-emitted agent_end, so don't wait the full idle budget.
-            line = await rpc.read_line(timeout=120.0 if pending_error is None else 10.0)
+            line = await rpc.read_line(
+                timeout=_TURN_STDOUT_IDLE_TIMEOUT_S
+                if pending_error is None
+                else _TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S
+            )
             if line is None:
+                if pending_error is None and not rpc.stdout_at_eof():
+                    # Idle timeout, not process death: pi's stdout reader is
+                    # still running — e.g. a long tool call silent past the
+                    # idle budget. Keep waiting; a dead pi process delivers
+                    # a real EOF (reader finishes) instead. True hangs are
+                    # bounded by the harness-level idle watchdog.
+                    logger.debug("PiExecutor: stdout idle past budget; pi still running, waiting")
+                    continue
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                 elif not streamed_any and not response_text:

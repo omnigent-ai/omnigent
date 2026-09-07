@@ -544,12 +544,20 @@ def test_native_terminal_start_failure_names_the_readable_runner_log(
             f"expected the goose terminal start to fail, got {ensure_resp.status_code}: "
             f"{ensure_resp.text}"
         )
-        message = ensure_resp.json()["error"]["message"]
+        error = ensure_resp.json()["error"]
+        message = error["message"]
         assert "Native Goose terminal failed to start" in message, message
+
+        # The server normalizes runner errors to code + message, so recover the
+        # runner's correlation ID from that preserved public message.
+        error_id_match = re.search(r" Error ID: (err_[0-9a-f]{32})\.$", message)
+        assert error_id_match is not None, f"message has no error ID: {message!r}"
+        error_id = error_id_match.group(1)
+        error_id_suffix = error_id_match.group(0)
 
         # The daemon runs with HOME=tmp_path, so the runner's home-relative
         # path resolves back under the test's temp dir.
-        named_path = message.rsplit(": ", 1)[-1]
+        named_path = message.removesuffix(error_id_suffix).rsplit(": ", 1)[-1]
         assert named_path.endswith(".log"), f"message names no log file: {message!r}"
         runner_log = tmp_path / named_path[2:] if named_path.startswith("~/") else Path(named_path)
         assert runner_log.exists(), (
@@ -557,7 +565,9 @@ def test_native_terminal_start_failure_names_the_readable_runner_log(
         )
         # The message stays free of the raw cause; the named log carries it.
         assert "requires the 'goose' CLI" not in message
-        assert "requires the 'goose' CLI" in runner_log.read_text()
+        runner_log_text = runner_log.read_text()
+        assert "requires the 'goose' CLI" in runner_log_text
+        assert error_id in runner_log_text
 
     finally:
         host_proc.send_signal(signal.SIGTERM)

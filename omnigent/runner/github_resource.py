@@ -11,7 +11,14 @@ Design notes:
 - Commands run via plain :func:`subprocess.run` in the workspace root, NOT the
   sandboxed OS-env shell helper. The helper strips secrets from the environment,
   which would break ``gh`` auth; a plain subprocess inherits the runner process
-  environment (the developer's ``gh`` auth in local dev).
+  environment, so ``gh`` authenticates as it normally does — the developer's
+  ``gh`` login in local dev, and in a managed sandbox the per-user ``hosts.yml``
+  that :func:`omnigent.git_credential_github.configure_host_gh` writes from the
+  credential broker at host startup. In a sandbox we additionally scrub
+  ``GH_TOKEN``/``GITHUB_TOKEN`` from ``gh``'s env (gh ranks those *above*
+  ``hosts.yml``), so a stray ambient token — e.g. a gh-MCP env passthrough —
+  can't silently make the panel act as a shared identity instead of the
+  connected owner. Outside a sandbox the env is inherited untouched.
 - The list and patch are GitHub-computed, never a local ``git diff``, so a stale
   local ``origin/<base>`` can't inflate them with files outside the PR.
 - Only the on-demand per-file expand-context reader (:func:`github_file_diff`)
@@ -34,13 +41,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shlex
 import shutil
 import subprocess
 import time
 from typing import Any
 
-from omnigent.git_credential_github import resolve_github_token
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
 _logger = logging.getLogger(__name__)
@@ -52,8 +57,11 @@ _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
 
 # Fields requested from ``gh pr view``. Always pass ``--json`` — bare
 # ``gh pr view`` opens an interactive/pager view and misbehaves in a
-# non-interactive subprocess.
-_PR_VIEW_FIELDS = "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup"
+# non-interactive subprocess. ``body`` + ``comments`` feed the Summary tab;
+# both are accepted by ``gh pr list`` too, so the fork-fallback path shares them.
+_PR_VIEW_FIELDS = (
+    "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
+)
 
 
 def _gh_timeout_seconds() -> float:
@@ -69,74 +77,6 @@ def _gh_timeout_seconds() -> float:
     return _DEFAULT_GH_TIMEOUT_SECONDS
 
 
-# Cache the per-user broker token briefly so a panel-load burst (info + files +
-# diff = several gh calls) triggers at most one broker fetch — well within the
-# token's lifetime, and refreshed on the next burst so a long session never
-# holds a stale token.
-_BROKER_TOKEN_TTL_SECONDS = 60.0
-_broker_token_cache: tuple[float, str | None] = (0.0, None)
-
-
-_GH_HELPER_MODULE = "omnigent.git_credential_github"
-
-
-def _broker_coords_from_git_helper(cwd: str) -> tuple[str, str, str] | None:
-    """Parse ``(server, host_id, host_token)`` from the broker git credential helper.
-
-    ``configure_host_git`` installs, only when the owner has connected GitHub, a
-    github.com helper of the form ``!python3 -m omnigent.git_credential_github
-    --server <url> --host-id <id> --host-token <tok>``. Reading the coords back
-    from it is the reliable source here: it's present in the shared git config
-    exactly when the per-user broker applies, regardless of which env this process
-    runs in (the runner's server-URL env var isn't dependable). ``None`` when no
-    broker helper is configured — local dev, or a shared-token / not-connected
-    sandbox.
-    """
-    rc, out, _ = _git(["config", "--get-all", "credential.https://github.com.helper"], cwd=cwd)
-    if rc != 0:
-        return None
-    for line in out.splitlines():
-        if _GH_HELPER_MODULE not in line:
-            continue
-        try:
-            parts = shlex.split(line.lstrip("!"))
-        except ValueError:
-            continue
-        coords: dict[str, str] = {}
-        for flag, key in (
-            ("--server", "server"),
-            ("--host-id", "host_id"),
-            ("--host-token", "host_token"),
-        ):
-            if flag in parts and parts.index(flag) + 1 < len(parts):
-                coords[key] = parts[parts.index(flag) + 1]
-        if len(coords) == 3:
-            return coords["server"], coords["host_id"], coords["host_token"]
-    return None
-
-
-def _broker_github_token(coords: tuple[str, str, str]) -> str | None:
-    """Fetch (briefly cached) the connected owner's GitHub token for broker *coords*.
-
-    ``None`` when the broker is unreachable or the owner's token can't be
-    resolved. The caller distinguishes this ("coords present but token ``None``"
-    = *configured but unavailable*) from "no coords" (not connected) and fails
-    closed rather than falling back to the ambient identity. Cached briefly to
-    bound overhead; never raises.
-    """
-    global _broker_token_cache
-    now = time.monotonic()
-    cached_at, cached = _broker_token_cache
-    if now - cached_at < _BROKER_TOKEN_TTL_SECONDS:
-        return cached
-    try:
-        token = resolve_github_token(*coords)
-    except Exception:  # noqa: BLE001 - a broker hiccup must never break the panel
-        token = None
-    _broker_token_cache = (now, token)
-    return token
-
-
 def _run(
     argv: list[str],
     *,
@@ -149,9 +89,8 @@ def _run(
     :param argv: Command and arguments.
     :param cwd: Working directory to run in.
     :param timeout: Wall-clock cap in seconds.
-    :param env: Full environment for the child, or ``None`` to inherit the
-        runner process environment (the default — preserves the existing
-        secret-carrying env that ``gh`` / ``git`` rely on).
+    :param env: Full child environment, or ``None`` to inherit this process's
+        (the default).
     :returns: ``(returncode, stdout, stderr)``. ``returncode`` is ``None`` when
         the command could not run at all (spawn error / timeout), so callers can
         distinguish "ran and failed" from "never ran".
@@ -187,24 +126,21 @@ def _git(argv: list[str], *, cwd: str) -> tuple[int | None, str, str]:
     return _run(["git", *argv], cwd=cwd, timeout=_git_timeout_seconds())
 
 
+def _in_sandbox() -> bool:
+    """Whether the panel is running inside a managed sandbox (``IS_SANDBOX=1``)."""
+    return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
+
+
 def _gh(argv: list[str], *, cwd: str) -> tuple[int | None, str, str]:
-    # Per-user auth for the panel's gh, three-state on the broker helper coords:
-    #   - no broker configured (not connected / local dev) → inherit the runner
-    #     env (shared $GH_TOKEN / local gh auth), preserving prior behavior;
-    #   - connected + token resolved → run gh as the owner (GH_TOKEN/GITHUB_TOKEN);
-    #   - connected but broker unavailable → fail CLOSED: scrub the ambient GitHub
-    #     token so gh never silently acts as the shared identity (it reports
-    #     unauthenticated instead). gh reads GH_TOKEN, then GITHUB_TOKEN.
-    coords = _broker_coords_from_git_helper(cwd)
-    env: dict[str, str] | None
-    if coords is None:
-        env = None
-    else:
-        token = _broker_github_token(coords)
-        if token:
-            env = {**os.environ, "GH_TOKEN": token, "GITHUB_TOKEN": token}
-        else:
-            env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN")}
+    # In a managed sandbox the panel must authenticate as the connected owner via
+    # the per-user hosts.yml that configure_host_gh writes — never an ambient
+    # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
+    # token in the sandbox/runner env (e.g. a gh-MCP passthrough) can't silently
+    # make the panel act as a shared identity. Outside a sandbox (local dev) the
+    # env is inherited untouched, so the developer's own gh auth still works.
+    env: dict[str, str] | None = None
+    if _in_sandbox():
+        env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN")}
     return _run(["gh", *argv], cwd=cwd, timeout=_gh_timeout_seconds(), env=env)
 
 
@@ -262,6 +198,41 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
         "total": counts["passing"] + counts["failing"] + counts["pending"],
         "runs": runs,
     }
+
+
+# Cap the comments list so a very chatty PR can't bloat the payload; ``gh``
+# returns them oldest-first, so the cap keeps the earliest ``_MAX_COMMENTS``.
+_MAX_COMMENTS = 100
+
+
+def _shape_comments(raw: Any) -> list[dict[str, Any]]:
+    """Shape ``gh``'s PR ``comments`` into the Summary tab's comment list.
+
+    Keeps the top-level conversation comments GitHub shows by default: a
+    minimized/collapsed comment is dropped (mirroring the PR page). Each entry
+    is ``{author, body, created_at, url}``; the list is capped at
+    ``_MAX_COMMENTS``.
+    """
+    shaped: list[dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return shaped
+    for comment in raw:
+        if not isinstance(comment, dict):
+            continue
+        if comment.get("isMinimized"):
+            continue
+        author = comment.get("author")
+        shaped.append(
+            {
+                "author": author.get("login") if isinstance(author, dict) else None,
+                "body": str(comment.get("body") or ""),
+                "created_at": comment.get("createdAt") or None,
+                "url": comment.get("url") or None,
+            }
+        )
+        if len(shaped) >= _MAX_COMMENTS:
+            break
+    return shaped
 
 
 def _current_branch(root: str) -> str | None:
@@ -396,6 +367,7 @@ def github_info(root: str) -> dict[str, Any]:
     data = _pr_view_json(root, _PR_VIEW_FIELDS)
     if data is not None:
         author = data.get("author")
+        body = data.get("body")
         pr = {
             "number": data.get("number"),
             "title": data.get("title"),
@@ -406,6 +378,10 @@ def github_info(root: str) -> dict[str, Any]:
             "base_ref": data.get("baseRefName"),
             "head_ref": data.get("headRefName"),
             "checks": _summarize_checks(data.get("statusCheckRollup")),
+            # PR description + conversation comments feed the Summary tab; an
+            # empty body is null so the UI shows its "no description" state.
+            "body": body if isinstance(body, str) and body.strip() else None,
+            "comments": _shape_comments(data.get("comments")),
         }
     payload["pr"] = pr
 

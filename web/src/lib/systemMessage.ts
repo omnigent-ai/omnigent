@@ -7,6 +7,7 @@
 // markers instead of normal user bubbles.
 
 import type { MessageContentBlock } from "@/lib/blocks";
+import { isTextBlock } from "@/lib/blocks";
 
 export type SystemMessageKind =
   | "task_completed"
@@ -134,9 +135,7 @@ export function isSystemUserContent(content: MessageContentBlock[]): boolean {
   const hasAttachments = content.some((c) => c.type === "input_image" || c.type === "input_file");
   if (hasAttachments) return false;
   const text = content
-    .filter(
-      (c): c is Extract<MessageContentBlock, { type: "input_text" }> => c.type === "input_text",
-    )
+    .filter(isTextBlock)
     .map((c) => c.text)
     .join("")
     .replace(ATTACHED_RE, "")

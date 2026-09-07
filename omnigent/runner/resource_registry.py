@@ -160,7 +160,7 @@ class TerminalExitEvent:
     session_was_idle: bool = False
 
 
-def _trim_terminal_exit_output(text: str | None) -> str | None:
+def trim_terminal_output(text: str | None) -> str | None:
     """Bound terminal-output diagnostics so a failure report stays compact."""
     if text is None:
         return None
@@ -216,7 +216,7 @@ def _terminal_exit_diagnostics(
             )
         else:
             if isinstance(raw_last_output, str):
-                last_output = _trim_terminal_exit_output(raw_last_output)
+                last_output = trim_terminal_output(raw_last_output)
 
     exit_status: int | None = None
     read_exit_status = getattr(instance, "last_exit_status", None)

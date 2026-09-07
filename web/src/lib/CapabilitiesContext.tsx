@@ -24,7 +24,7 @@ export function CapabilitiesProvider({
   info,
   children,
 }: {
-  info: ServerInfo;
+  info: ServerInfo | "loading";
   children: ReactNode;
 }) {
   return <CapabilitiesContext.Provider value={info}>{children}</CapabilitiesContext.Provider>;

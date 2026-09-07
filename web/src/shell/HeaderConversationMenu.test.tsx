@@ -377,7 +377,9 @@ describe("HeaderConversationMenu", () => {
     mocks.isMobile = true;
     renderMenu();
     const mobileTrigger = screen.getByRole("button", { name: "Conversation actions" });
-    expect(mobileTrigger.querySelector("svg")).toHaveClass("size-4");
+    // 44px tap-target floor on phones, matching the sibling header controls.
+    expect(mobileTrigger).toHaveClass("max-md:size-11");
+    expect(mobileTrigger.querySelector("svg")).toHaveClass("size-5");
     openMenu();
     expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveClass("gap-2.5", "px-2.5", "py-2");
   });

@@ -14,10 +14,13 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator
+from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TextIO
+from unittest.mock import Mock
+from urllib.error import URLError
 
 import pytest
 
@@ -3507,6 +3510,233 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
     assert not loaded_payloads[1].startswith("\ufeff".encode("utf-8"))
 
 
+def _rejection_pane(name: str, draft: str = "") -> str:
+    """
+    Render a pane where Claude Code has rejected an unknown command.
+
+    Mirrors the real TUI output: the rejection prints as its own
+    bullet-led transcript line above the (now empty) composer.
+
+    :param name: The rejected command name without the slash.
+    :param draft: Text sitting in the composer; empty means idle.
+    :returns: The pane text.
+    """
+    return f"""\
+● Unknown command: /{name}
+──────────────────────────────
+❯ {draft}
+──────────────────────────────
+  ? for shortcuts
+"""
+
+
+def _run_unknown_command_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    content: str,
+    reject_name: str | None,
+) -> list[bytes]:
+    """
+    Drive ``inject_user_message`` against a fake TUI, optionally rejecting.
+
+    The fake pane accepts the paste into the composer; on Enter it either
+    starts a turn silently (``reject_name=None`` — a recognized skill) or
+    prints the "Unknown command" rejection line the way Claude Code does
+    for a name it cannot resolve.
+
+    :param tmp_path: Test temp dir for the bridge directory.
+    :param monkeypatch: Pytest monkeypatch for subprocess + timeouts.
+    :param content: User text to inject.
+    :param reject_name: Command name the fake TUI rejects, or ``None``.
+    :returns: The byte payloads delivered via ``load-buffer``, in order.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    # Keep the rejection watch fast: it polls the pane, which the fake
+    # answers instantly, so a short timeout keeps the no-rejection case
+    # from sleeping out the full production window.
+    monkeypatch.setattr("omnigent.claude_native_bridge._UNKNOWN_COMMAND_WATCH_TIMEOUT_S", 0.5)
+
+    loaded_payloads: list[bytes] = []
+    tui: dict[str, Any] = {"pane": _composer_pane(), "submits": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Record buffer payloads and simulate accept/reject on submit.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "load-buffer" in cmd:
+            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("[Pasted text #1 +2 lines]")
+        if cmd[-1] == "Enter":
+            tui["submits"] += 1
+            if reject_name is not None and tui["submits"] == 1:
+                tui["pane"] = _rejection_pane(reject_name)
+            else:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content=content)
+    return loaded_payloads
+
+
+def test_unknown_command_rejection_redelivers_escaped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A message rejected as "Unknown command" is re-delivered escaped.
+
+    Claude Code drops a message whose leading ``/name`` it does not
+    recognize without ever calling the model — the message would be
+    silently swallowed. The bridge must watch for the rejection and paste
+    the message again with the zero-width escape so it reaches the model
+    as plain user text.
+    """
+    payloads = _run_unknown_command_injection(
+        tmp_path,
+        monkeypatch,
+        content="/not-a-real-skill hello world",
+        reject_name="not-a-real-skill",
+    )
+    assert len(payloads) == 2, (
+        f"Expected the rejected message to be pasted twice (raw, then escaped); "
+        f"got {len(payloads)} paste(s)."
+    )
+    assert payloads[0].startswith(b"/not-a-real-skill")
+    assert payloads[1].startswith("\ufeff/not-a-real-skill hello world".encode("utf-8"))
+
+
+def test_unknown_name_accepted_as_skill_is_not_redelivered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An unknown-to-the-bridge name Claude Code accepts runs exactly once.
+
+    A real skill invocation prints no rejection, so the watch must lapse
+    without a second paste — re-delivering would run the skill twice.
+    """
+    payloads = _run_unknown_command_injection(
+        tmp_path,
+        monkeypatch,
+        content="/my-real-skill do the thing",
+        reject_name=None,
+    )
+    assert len(payloads) == 1, (
+        f"Expected a single paste for an accepted skill; got {len(payloads)}."
+    )
+    assert payloads[0].startswith(b"/my-real-skill")
+
+
+def test_plain_text_skips_the_rejection_watch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A message with no leading slash command never watches for a rejection.
+
+    The watch costs up to the full timeout when no rejection prints, so
+    ordinary messages must skip it entirely (no second paste either).
+    """
+    payloads = _run_unknown_command_injection(
+        tmp_path,
+        monkeypatch,
+        content="just a normal message",
+        reject_name=None,
+    )
+    assert len(payloads) == 1
+
+
+def test_stale_rejection_in_scrollback_does_not_trigger_redelivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A rejection of the same name already in scrollback is not "fresh".
+
+    The watch counts rejection lines against a pre-submit baseline; a
+    stale line from an earlier message keeps the count flat, so an
+    accepted skill re-sent after an earlier typo must not be re-delivered
+    escaped (which would duplicate the message).
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    monkeypatch.setattr("omnigent.claude_native_bridge._UNKNOWN_COMMAND_WATCH_TIMEOUT_S", 0.5)
+    stale = "● Unknown command: /my-skill\n"
+
+    loaded_payloads: list[bytes] = []
+    tui = {"pane": stale + _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Serve a pane whose scrollback already carries the rejection.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "load-buffer" in cmd:
+            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+        if "paste-buffer" in cmd:
+            tui["pane"] = stale + _composer_pane("[Pasted text #1 +2 lines]")
+        if cmd[-1] == "Enter":
+            # Accepted this time: the stale rejection stays, no new one.
+            tui["pane"] = stale + _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="/my-skill retry after typo fix")
+    assert len(loaded_payloads) == 1, (
+        f"A stale rejection must not trigger escaped re-delivery; "
+        f"got {len(loaded_payloads)} paste(s)."
+    )
+
+
+def test_rejection_line_matching_ignores_message_echo() -> None:
+    """
+    The rejection matcher counts rejections, not echoed composer text.
+
+    A user message *containing* the words "Unknown command: /x" renders
+    on a composer row (behind the prompt glyph) and must not count. The
+    TUI also reflows the rejection at the pane width — "Unknown command:"
+    and the name can land on separate lines — so a wrapped rejection must
+    still count.
+    """
+    counter = claude_native_bridge._count_unknown_command_rejections
+    needle = "Unknown command: /x"
+    assert counter("● Unknown command: /x\n❯ \n", needle) == 1
+    # Echoed in the composer draft — not a rejection line.
+    assert counter("❯ say Unknown command: /x\n", needle) == 0
+    assert counter("● Unknown command: /x\n● Unknown command: /x\n", needle) == 2
+    # Narrow pane: the TUI wraps the name onto its own line.
+    wrapped = "● Unknown command:\n  /x\n❯ \n"
+    assert counter(wrapped, needle) == 1
+    long_needle = "Unknown command: /definitely-not-a-real-command"
+    long_wrapped = "● Unknown command:\n  /definitely-not-a-real-command\n❯ \n"
+    assert counter(long_wrapped, long_needle) == 1
+
+
 def test_inject_user_message_raises_when_tmux_target_never_published(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4605,6 +4835,48 @@ def test_inject_slash_command_raises_when_tmux_target_never_published(
             command="/effort high",
             timeout_s=0.0,
         )
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        URLError("bridge unavailable"),
+        ConnectionResetError("connection reset"),
+        RemoteDisconnected("bridge disconnected"),
+        TimeoutError("notification timed out"),
+        BadStatusLine("invalid response"),
+    ],
+)
+def test_post_tools_changed_normalizes_transport_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transport_error: Exception
+) -> None:
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_server_info",
+        Mock(return_value={"url": "http://127.0.0.1:12345", "token": "test-token"}),
+    )
+    monkeypatch.setattr(claude_native_bridge.request, "urlopen", Mock(side_effect=transport_error))
+
+    with pytest.raises(RuntimeError, match="failed to notify Claude tool list change") as caught:
+        post_tools_changed(tmp_path)
+
+    assert caught.value.__cause__ is transport_error
+
+
+def test_post_tools_changed_preserves_programming_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_server_info",
+        Mock(return_value={"url": "http://127.0.0.1:12345", "token": "test-token"}),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge.request, "urlopen", Mock(side_effect=ValueError("bug"))
+    )
+
+    with pytest.raises(ValueError, match="bug"):
+        post_tools_changed(tmp_path)
 
 
 @pytest.mark.asyncio
@@ -5769,6 +6041,37 @@ def test_read_transcript_items_from_offset_returns_latest_model(
     )
 
     assert result.latest_model == "claude-opus-4-7"
+
+
+@pytest.mark.parametrize("initial_model", [None, "gateway-claude-model"])
+def test_transcript_synthetic_error_preserves_model(
+    tmp_path: Path, initial_model: str | None
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    models = [initial_model, "<synthetic>"] if initial_model else ["<synthetic>"]
+    transcript_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": f"a{index}",
+                    "message": {
+                        "role": "assistant",
+                        "model": model,
+                        "content": [{"type": "text", "text": "API Error: 429"}],
+                    },
+                }
+            )
+            + "\n"
+            for index, model in enumerate(models)
+        ),
+        encoding="utf-8",
+    )
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    assert result.latest_model == initial_model
+    assert result.items  # Error messages remain visible; only model metadata is ignored.
 
 
 def test_read_transcript_items_surfaces_custom_title_without_an_item(
@@ -8974,7 +9277,7 @@ async def test_hook_evaluate_endpoint_returns_deny_hook_output(
 async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Upstream failure denies PreToolUse and stays open for PostToolUse."""
+    """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
     client = _ScriptedPolicyClient(None)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
@@ -8985,7 +9288,7 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
             _PRE_TOOL_USE_PAYLOAD,
         )
         output = json.loads(body)
-        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
 
         post_body = await asyncio.to_thread(
             _relay_request_raw,
@@ -9060,7 +9363,7 @@ async def test_curl_evaluate_policy_command_round_trips(
     )
     assert result.returncode == 0, result.stderr
     output = json.loads(result.stdout)
-    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
 
 

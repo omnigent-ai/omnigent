@@ -413,6 +413,13 @@ export interface ErrorEvent {
 /** `response.compaction.in_progress` — server started compacting. */
 export interface CompactionInProgress {
   type: "compaction_in_progress";
+  /**
+   * Unix epoch seconds when the server first saw this compaction in
+   * progress. Stable across the repeated progress events a long compaction
+   * emits, so the elapsed counter can anchor to the true start — including
+   * after a page reload. Absent when the emitter doesn't track it.
+   */
+  startedAtS?: number;
 }
 
 /** `response.compaction.completed` — compaction finished successfully. */

@@ -83,7 +83,8 @@ describe("drainSessionPages", () => {
   it("validates SDK page limits before making a request", () => {
     expect(validateSessionPageLimit(undefined, failure)).toBe(25);
     expect(validateSessionPageLimit(1, failure)).toBe(1);
-    expect(() => validateSessionPageLimit(26, failure)).toThrow("session page limit");
+    expect(validateSessionPageLimit(1_000, failure)).toBe(1_000);
+    expect(() => validateSessionPageLimit(1_001, failure)).toThrow("session page limit");
   });
 
   it("propagates page failures unchanged", async () => {

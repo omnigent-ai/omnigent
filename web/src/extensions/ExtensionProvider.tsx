@@ -7,10 +7,12 @@ const EMPTY_EXTENSIONS: ExtensionCatalogItem[] = [];
 const NOOP_REFRESH = async () => EMPTY_EXTENSIONS;
 interface ExtensionContextValue {
   extensions: ExtensionCatalogItem[];
+  loading: boolean;
   refresh: () => Promise<ExtensionCatalogItem[]>;
 }
 const ExtensionContext = createContext<ExtensionContextValue>({
   extensions: EMPTY_EXTENSIONS,
+  loading: false,
   refresh: NOOP_REFRESH,
 });
 
@@ -20,7 +22,8 @@ export async function loadExtensionCatalog(
 ): Promise<ExtensionCatalogItem[]> {
   try {
     return await fetcher(signal);
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     console.warn("Extension catalog is unavailable");
     return EMPTY_EXTENSIONS;
   }
@@ -34,7 +37,7 @@ export function ExtensionCatalogProvider({
   children: ReactNode;
 }) {
   const value = useMemo<ExtensionContextValue>(
-    () => ({ extensions, refresh: async () => extensions }),
+    () => ({ extensions, loading: false, refresh: async () => extensions }),
     [extensions],
   );
   return <ExtensionContext.Provider value={value}>{children}</ExtensionContext.Provider>;
@@ -51,12 +54,19 @@ export function ExtensionProvider({ children }: { children: ReactNode }) {
   const extensions = query.data ?? EMPTY_EXTENSIONS;
   const { refetch } = query;
   const refresh = useCallback(async () => (await refetch()).data ?? EMPTY_EXTENSIONS, [refetch]);
-  const value = useMemo(() => ({ extensions, refresh }), [extensions, refresh]);
+  const value = useMemo(
+    () => ({ extensions, loading: query.isPending, refresh }),
+    [extensions, query.isPending, refresh],
+  );
   return <ExtensionContext.Provider value={value}>{children}</ExtensionContext.Provider>;
 }
 
 export function useExtensions(): ExtensionCatalogItem[] {
   return useContext(ExtensionContext).extensions;
+}
+
+export function useExtensionsLoading(): boolean {
+  return useContext(ExtensionContext).loading;
 }
 
 export function useRefreshExtensions(): () => Promise<ExtensionCatalogItem[]> {

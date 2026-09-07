@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
+from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 try:
     import tomllib
@@ -19,7 +24,9 @@ except ImportError:  # pragma: no cover - Python < 3.11
 from omnigent.codex_native_app_server import (
     _FRAMEWORK_APPROVED_TOOLS,
     _POLICY_HOOK_TIMEOUT_SECONDS,
+    CodexAppServerClient,
     CodexNativeAppServer,
+    NativeCodexLaunch,
     _build_native_codex_app_server_argv,
     _codex_policy_hooks_settings,
     _hooks_list_diagnostics,
@@ -38,6 +45,79 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
+
+
+@pytest.mark.parametrize(
+    "reader_error", [ConnectionClosedError(None, None), ConnectionClosedOK(None, None)]
+)
+async def test_client_close_cleans_up_after_reader_disconnect(reader_error: Exception) -> None:
+    client = CodexAppServerClient(ws_url="ws://127.0.0.1:12345")
+    websocket = AsyncMock(spec=ClientConnection)
+    client._ws = cast(ClientConnection, websocket)
+
+    async def fail_reader() -> None:
+        raise reader_error
+
+    reader = asyncio.create_task(fail_reader())
+    client._reader_task = reader
+    pending = asyncio.get_running_loop().create_future()
+    client._pending_requests[1] = pending
+    await asyncio.sleep(0)
+    assert reader.done()
+
+    await client.close()
+
+    assert pending.cancelled()
+    assert client._pending_requests == {}
+    assert client._reader_task is None
+    assert client._ws is None
+    websocket.close.assert_awaited_once()
+    await client.close()
+    websocket.close.assert_awaited_once()
+
+
+async def test_client_close_preserves_reader_bug_after_cleanup() -> None:
+    client = CodexAppServerClient(ws_url="ws://127.0.0.1:12345")
+    websocket = AsyncMock(spec=ClientConnection)
+    client._ws = cast(ClientConnection, websocket)
+
+    async def fail_reader() -> None:
+        raise ValueError("invalid event payload")
+
+    reader = asyncio.create_task(fail_reader())
+    client._reader_task = reader
+    pending = asyncio.get_running_loop().create_future()
+    client._pending_requests[1] = pending
+    await asyncio.sleep(0)
+
+    with pytest.raises(ValueError, match="invalid event payload"):
+        await client.close()
+
+    assert pending.cancelled()
+    assert client._pending_requests == {}
+    assert client._reader_task is None
+    assert client._ws is None
+    websocket.close.assert_awaited_once()
+
+
+async def test_client_close_clears_state_when_websocket_close_fails() -> None:
+    client = CodexAppServerClient(ws_url="ws://127.0.0.1:12345")
+    websocket = AsyncMock(spec=ClientConnection)
+    websocket.close.side_effect = ValueError("close failed")
+    client._ws = cast(ClientConnection, websocket)
+    reader = asyncio.create_task(asyncio.sleep(60))
+    client._reader_task = reader
+    pending = asyncio.get_running_loop().create_future()
+    client._pending_requests[1] = pending
+
+    with pytest.raises(ValueError, match="close failed"):
+        await client.close()
+
+    assert reader.cancelled()
+    assert pending.cancelled()
+    assert client._pending_requests == {}
+    assert client._reader_task is None
+    assert client._ws is None
 
 
 async def test_discover_codex_model_options_strips_secrets_and_stops_process(
@@ -692,8 +772,12 @@ async def test_codex_launch_catalog_reads_the_store_then_probes_once(
     )
     calls: list[int] = []
 
-    async def _fake_probe(*, codex_path: str | None = None) -> list[dict[str, object]]:
+    async def _fake_probe(
+        *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+    ) -> list[dict[str, object]]:
         del codex_path
+        assert launch is not None
+        assert launch.config_overrides == ['model_provider="openai"']
         calls.append(1)
         return [{"id": "gpt-5.6-terra", "model": "gpt-5.6-terra", "isDefault": True}]
 
@@ -704,6 +788,231 @@ async def test_codex_launch_catalog_reads_the_store_then_probes_once(
     assert first == second
     assert first == [{"id": "gpt-5.6-terra", "model": "gpt-5.6-terra", "isDefault": True}]
     assert len(calls) == 1, "the second read must come from the store, not a re-probe"
+
+
+@pytest.fixture
+def _catalog_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> NativeCodexLaunch:
+    """An isolated catalog shape whose supplied provider must not be re-resolved."""
+    from omnigent import codex_native_app_server
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(codex_native_app_server, "_find_codex_cli", lambda: sys.executable)
+
+    def _unexpected_resolution(*, model: object, spec: object = None) -> NativeCodexLaunch:
+        pytest.fail("catalog access must reuse the supplied launch shape")
+
+    monkeypatch.setattr(
+        codex_native_app_server, "resolve_native_codex_launch", _unexpected_resolution
+    )
+    return NativeCodexLaunch(
+        config_overrides=['model_provider="spec_provider"'], model=None, profile=None
+    )
+
+
+async def test_codex_reprobed_launch_catalog_refreshes_stale_rows_and_persists(
+    _catalog_launch: NativeCodexLaunch,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An awaited refresh returns the new answer, never the stale cached rows."""
+    from omnigent import codex_native_app_server, model_catalog_store
+
+    fingerprint = codex_native_app_server.codex_catalog_fingerprint(_catalog_launch)
+    stale = [{"id": "gpt-5.5", "isDefault": True}]
+    refreshed = [{"id": "gpt-5.6-terra", "isDefault": True}]
+    model_catalog_store.write_catalog("codex-native", fingerprint, stale)
+    path = model_catalog_store.catalog_path("codex-native", fingerprint)
+    old = path.stat().st_mtime - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+    os.utime(path, (old, old))
+    assert await codex_native_app_server.codex_launch_catalog_is_stale(launch=_catalog_launch)
+
+    async def _probe(
+        *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+    ) -> list[dict[str, object]]:
+        assert launch is _catalog_launch
+        return refreshed
+
+    monkeypatch.setattr(codex_native_app_server, "probe_codex_model_options", _probe)
+    result = await codex_native_app_server.codex_reprobed_launch_catalog(launch=_catalog_launch)
+
+    assert result == refreshed
+    assert model_catalog_store.read_catalog("codex-native", fingerprint) == refreshed
+    assert not await codex_native_app_server.codex_launch_catalog_is_stale(launch=_catalog_launch)
+
+
+@pytest.mark.parametrize("cached", [False, True], ids=["concurrent-miss", "background-refresh"])
+@pytest.mark.parametrize("cancel_waiter", [False, True], ids=["all-waiters", "cancelled-waiter"])
+async def test_codex_reprobed_launch_catalog_joins_existing_probe(
+    _catalog_launch: NativeCodexLaunch,
+    monkeypatch: pytest.MonkeyPatch,
+    cached: bool,
+    cancel_waiter: bool,
+) -> None:
+    """Concurrent decisions share the already-running miss or background probe."""
+    from omnigent import codex_native_app_server, model_catalog_store
+
+    fingerprint = codex_native_app_server.codex_catalog_fingerprint(_catalog_launch)
+    stale = [{"id": "gpt-5.5", "isDefault": True}]
+    refreshed = [{"id": "gpt-5.6-terra", "isDefault": True}]
+    if cached:
+        model_catalog_store.write_catalog("codex-native", fingerprint, stale)
+        path = model_catalog_store.catalog_path("codex-native", fingerprint)
+        old = path.stat().st_mtime - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+        os.utime(path, (old, old))
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    calls = 0
+
+    async def _probe(
+        *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+    ) -> list[dict[str, object]]:
+        nonlocal calls
+        assert launch is _catalog_launch
+        calls += 1
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return refreshed
+
+    monkeypatch.setattr(codex_native_app_server, "probe_codex_model_options", _probe)
+    first = asyncio.create_task(
+        codex_native_app_server.codex_launch_catalog(launch=_catalog_launch)
+    )
+    refreshes: list[asyncio.Task[Any]] = []
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        refreshes = [
+            asyncio.create_task(
+                codex_native_app_server.codex_reprobed_launch_catalog(launch=_catalog_launch)
+            )
+            for _ in range(2)
+        ]
+        await asyncio.sleep(0)
+        if cancel_waiter:
+            cancelled_waiter = refreshes.pop(0)
+            cancelled_waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled_waiter
+        assert not cancelled.is_set()
+        assert not any(task.done() for task in refreshes)
+        assert calls == 1
+    finally:
+        release.set()
+        first_rows, *fresh_rows = await asyncio.gather(first, *refreshes)
+
+    assert first_rows == (stale if cached else refreshed)
+    assert fresh_rows == [refreshed] * (1 if cancel_waiter else 2)
+    assert not cancelled.is_set()
+    assert calls == 1
+    assert model_catalog_store.read_catalog("codex-native", fingerprint) == refreshed
+
+
+async def test_codex_reprobed_launch_catalog_cancels_timed_out_probe_and_preserves_cache(
+    _catalog_launch: NativeCodexLaunch,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe deadline cancels stalled work, not just its shared-task waiter."""
+    from omnigent import codex_native_app_server, model_catalog_store
+
+    fingerprint = codex_native_app_server.codex_catalog_fingerprint(_catalog_launch)
+    stale = [{"id": "gpt-5.5", "isDefault": True}]
+    model_catalog_store.write_catalog("codex-native", fingerprint, stale)
+    path = model_catalog_store.catalog_path("codex-native", fingerprint)
+    old = path.stat().st_mtime - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+    os.utime(path, (old, old))
+    before = path.read_bytes(), path.stat().st_mtime_ns
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    calls = 0
+
+    async def _probe(
+        *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+    ) -> list[dict[str, object]]:
+        nonlocal calls
+        assert launch is _catalog_launch
+        calls += 1
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return []
+
+    monkeypatch.setattr(codex_native_app_server, "probe_codex_model_options", _probe)
+    monkeypatch.setattr(codex_native_app_server, "_MODEL_CATALOG_PROBE_TIMEOUT_SECONDS", 0.01)
+    assert await codex_native_app_server.codex_launch_catalog(launch=_catalog_launch) == stale
+    shared_probe = model_catalog_store._inflight[("codex-native", fingerprint)]
+    try:
+        result = await asyncio.wait_for(
+            codex_native_app_server.codex_reprobed_launch_catalog(launch=_catalog_launch),
+            timeout=2,
+        )
+    finally:
+        release.set()
+        await shared_probe
+
+    assert result is None
+    assert cancelled.is_set()
+    assert calls == 1
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+    assert ("codex-native", fingerprint) not in model_catalog_store._inflight
+    assert await codex_native_app_server.codex_launch_catalog_is_stale(launch=_catalog_launch)
+
+
+@pytest.mark.parametrize("failed", [False, True], ids=["empty", "failed"])
+async def test_codex_reprobed_launch_catalog_preserves_prior_cache_on_no_rows(
+    _catalog_launch: NativeCodexLaunch,
+    monkeypatch: pytest.MonkeyPatch,
+    failed: bool,
+) -> None:
+    """An empty or failed refresh cannot erase a previously useful answer."""
+    from omnigent import codex_native_app_server, model_catalog_store
+
+    fingerprint = codex_native_app_server.codex_catalog_fingerprint(_catalog_launch)
+    stale = [{"id": "gpt-5.5", "isDefault": True}]
+    model_catalog_store.write_catalog("codex-native", fingerprint, stale)
+    path = model_catalog_store.catalog_path("codex-native", fingerprint)
+    old = path.stat().st_mtime - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+    os.utime(path, (old, old))
+    before = path.read_bytes(), path.stat().st_mtime_ns
+
+    async def _probe(
+        *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+    ) -> list[dict[str, object]]:
+        assert launch is _catalog_launch
+        if failed:
+            raise OSError("provider unavailable")
+        return []
+
+    monkeypatch.setattr(codex_native_app_server, "probe_codex_model_options", _probe)
+    result = await codex_native_app_server.codex_reprobed_launch_catalog(launch=_catalog_launch)
+
+    assert result == (None if failed else [])
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+    assert model_catalog_store.read_catalog("codex-native", fingerprint) == stale
+    assert await codex_native_app_server.codex_launch_catalog_is_stale(launch=_catalog_launch)
+
+
+@pytest.mark.parametrize("reprobe", [False, True])
+async def test_codex_launch_catalog_unresolvable_launch_returns_none(
+    monkeypatch: pytest.MonkeyPatch, reprobe: bool
+) -> None:
+    """A broken provider configuration cannot crash catalog reads or refreshes."""
+    from omnigent import codex_native_app_server
+
+    def _boom(*, model: object, spec: object = None) -> NativeCodexLaunch:
+        raise RuntimeError("broken provider config")
+
+    monkeypatch.setattr(codex_native_app_server, "resolve_native_codex_launch", _boom)
+    read = (
+        codex_native_app_server.codex_reprobed_launch_catalog
+        if reprobe
+        else codex_native_app_server.codex_launch_catalog
+    )
+    assert await read() is None
 
 
 async def test_codex_launch_catalog_is_stale_reads_the_default_shape(
@@ -733,8 +1042,6 @@ async def test_codex_launch_catalog_is_stale_reads_the_default_shape(
     assert await codex_native_app_server.codex_launch_catalog_is_stale() is False
     path = model_catalog_store.catalog_path("codex-native", fingerprint)
     old = path.stat().st_mtime - (model_catalog_store.CATALOG_STALE_AFTER_S + 60)
-    import os
-
     os.utime(path, (old, old))
     assert await codex_native_app_server.codex_launch_catalog_is_stale() is True
 
@@ -2268,9 +2575,13 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
     assert Path(env["CODEX_HOME"]).is_dir()
 
 
+@pytest.mark.parametrize("reader", ["probe", "catalog", "reprobe"])
+@pytest.mark.parametrize("supplied", [False, True], ids=["ambient", "supplied-provider"])
 async def test_probe_codex_model_options_probes_every_launch_shape(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    reader: str,
+    supplied: bool,
 ) -> None:
     """A non-Databricks launch still probes, with its own overrides verbatim.
 
@@ -2279,18 +2590,28 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
     pin), and with no launch-pinned model Codex's own default marker
     stands.
     """
-    from omnigent import codex_native_app_server
+    from omnigent import codex_native_app_server, model_catalog_store
 
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
-    monkeypatch.setattr(
-        codex_native_app_server,
-        "resolve_native_codex_launch",
-        lambda *, model: codex_native_app_server.NativeCodexLaunch(
-            config_overrides=['model_provider="openai"'],
-            model=None,
-            profile=None,
-        ),
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    ambient = NativeCodexLaunch(
+        config_overrides=['model_provider="openai"'], model=None, profile=None
     )
+    spec_launch = NativeCodexLaunch(
+        config_overrides=[
+            'model_provider="spec_provider"',
+            'model_providers.spec_provider.base_url="https://provider.example/v1"',
+        ],
+        model=None,
+        profile=None,
+    )
+    resolutions: list[None] = []
+
+    def _resolve(*, model: None) -> NativeCodexLaunch:
+        resolutions.append(model)
+        return ambient
+
+    monkeypatch.setattr(codex_native_app_server, "resolve_native_codex_launch", _resolve)
     monkeypatch.setattr(codex_native_app_server, "_clean_codex_env", lambda: {"PATH": "/bin"})
     captured: dict[str, object] = {}
 
@@ -2348,13 +2669,32 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
     monkeypatch.setattr(codex_native_app_server, "_wait_for_discovery_listener", _fake_wait)
     monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
 
-    rows = await codex_native_app_server.probe_codex_model_options(codex_path="/test/codex")
+    read = {
+        "probe": codex_native_app_server.probe_codex_model_options,
+        "catalog": codex_native_app_server.codex_launch_catalog,
+        "reprobe": codex_native_app_server.codex_reprobed_launch_catalog,
+    }[reader]
+    rows = await read(codex_path="/test/codex", launch=spec_launch if supplied else None)
 
     assert rows == [{"id": "gpt-5.6-sol", "isDefault": True}, {"id": "gpt-5.5"}]
-    assert captured["config_overrides"] == ['model_provider="openai"']
+    expected_launch = spec_launch if supplied else ambient
+    assert captured["config_overrides"] == expected_launch.config_overrides
+    assert resolutions == ([] if supplied else [None])
     env = captured["env"]
     assert isinstance(env, dict)
     assert "DATABRICKS_HOST" not in env
+    fingerprint = codex_native_app_server.codex_catalog_fingerprint(
+        expected_launch, codex_path="/test/codex"
+    )
+    if reader != "probe":
+        assert model_catalog_store.read_catalog("codex-native", fingerprint) == rows
+        assert await read(codex_path="/test/codex", launch=expected_launch) == rows
+    if supplied:
+        ambient_fingerprint = codex_native_app_server.codex_catalog_fingerprint(
+            ambient, codex_path="/test/codex"
+        )
+        assert ambient_fingerprint != fingerprint
+        assert model_catalog_store.read_catalog("codex-native", ambient_fingerprint) is None
 
 
 def test_resolve_databricks_codex_model_matches_servable_ids() -> None:

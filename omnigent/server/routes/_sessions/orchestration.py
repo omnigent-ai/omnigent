@@ -11,8 +11,10 @@ import asyncio
 import contextlib
 import json
 import math
+import re
 import secrets
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
@@ -56,6 +58,7 @@ from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
+from omnigent.model_metadata import concrete_reported_model
 from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -1107,6 +1110,7 @@ def _build_session_response(
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
+        share_workspace_files=conv.share_workspace_files,
         context_window=context_window,
         last_total_tokens=last_total_tokens,
         # Seed the client's cost indicator on resume. Uses the SUBTREE
@@ -1374,9 +1378,9 @@ async def _persist_relay_reported_model(
     if not isinstance(usage_obj, dict):
         return
     raw_model = usage_obj.get("model")
-    if not isinstance(raw_model, str) or not raw_model.strip():
+    model = concrete_reported_model(raw_model)
+    if model is None:
         return
-    model = raw_model.strip()
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conv is None or conv.reported_model == model:
         return
@@ -2236,6 +2240,29 @@ async def _persist_external_conversation_item(
     :returns: Store-assigned conversation item id.
     """
     item = _parse_external_conversation_item(body)
+    # An at-least-once producer (the native transcript forwarders) retries a
+    # timed-out POST it cannot know the disposition of, so the item's id is
+    # derived from its ``source_id`` and the append is idempotent — the
+    # dedupe check rides the append's own transaction, under its
+    # conversation lock, costing the hot path no extra query. A dedupe hit
+    # comes back flagged so the duplicate's side effects are unwound below
+    # (no re-broadcast, and a wrongly-drained pending input is restored).
+    source_id = body.data.get("source_id")
+    if source_id is not None:
+        if not isinstance(source_id, str) or not source_id.strip() or len(source_id) > 256:
+            raise OmnigentError(
+                "external_conversation_item data.source_id must be a "
+                "non-empty string of at most 256 characters",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        item = item.model_copy(
+            update={
+                "stable_id": uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"omnigent-external-item:{session_id}:{source_id.strip()}",
+                ).hex
+            }
+        )
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry (FIFO) and fold the
     # entry's file blocks (image / file) into the item BEFORE persisting.
@@ -2245,6 +2272,7 @@ async def _persist_external_conversation_item(
     # Claude (not a queued web message) and has no pending entry, so
     # draining for it would hand the queued message's uploads to the marker.
     cleared_pending_id: str | None = None
+    drained: pending_inputs.DrainedInput | None = None
     skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
     if (
         item.type == "message"
@@ -2271,26 +2299,53 @@ async def _persist_external_conversation_item(
             # bubble then disappear once the committed item arrived.
             if drained.created_by is not None and item.created_by is None:
                 item = item.model_copy(update={"created_by": drained.created_by})
+            # A web client that sends stable_id gets store-level idempotency:
+            # use it directly as the item id so the append is a no-op on retry.
+            # source_id from the forwarder takes precedence when both are set.
+            if drained.stable_id is not None and item.stable_id is None:
+                item = item.model_copy(update={"stable_id": drained.stable_id})
         elif item.created_by is None and created_by is not None:
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
-    for skipped in skipped_kiro_pending:
-        await _persist_skipped_kiro_pending_input(
-            session_id,
-            skipped,
-            conversation_store,
-        )
+    # Build the batch: skipped Kiro entries first (their positions must
+    # precede the matched item to match broadcast order), then the anchor.
+    # Each skipped entry gets a pair of items (user message + error) with
+    # stable IDs derived from pending_id, so the whole batch is idempotent
+    # under the append lock — no separate has_item probe needed. When the
+    # anchor is already persisted (a forwarder retry), append returns every
+    # item as deduplicated and the queue entries are restored below.
+    skipped_new_items = _build_skipped_kiro_items(session_id, skipped_kiro_pending)
+    batch = [*skipped_new_items, item]
     pending_background_title = prepare_background_session_title(
         coordinator=background_title_coordinator,
         conversation=conv,
         event=SessionEventInput(type=item.type, data=item.data.model_dump()),
     )
-    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
+    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
+    persisted = persisted_items[-1]
+    if persisted.deduplicated:
+        # A re-post of an already-committed item: nothing new to render or
+        # title. Every pending entry consumed above belongs to a LATER user
+        # message — restore in original queue order (skipped entries preceded
+        # the match; restore prepends, so reverse).
+        for entry in reversed([*skipped_kiro_pending, drained]):
+            if entry is not None:
+                pending_inputs.restore(session_id, entry)
+        return persisted.id
+    # Not a duplicate: publish side effects for each skipped Kiro pair.
+    # Items are [user0, error0, user1, error1, ...]; 2 per skipped entry.
+    for i, skipped in enumerate(skipped_kiro_pending):
+        persisted_user = persisted_items[i * 2]
+        persisted_error = persisted_items[i * 2 + 1]
+        if not persisted_user.deduplicated:
+            _publish_input_consumed(
+                session_id, persisted_user, cleared_pending_id=skipped.pending_id
+            )
+            _publish_external_conversation_item(session_id, persisted_error)
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule()
-    persisted = persisted_items[0]
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )
@@ -2298,41 +2353,53 @@ async def _persist_external_conversation_item(
     return persisted.id
 
 
-async def _persist_skipped_kiro_pending_input(
+def _build_skipped_kiro_items(
     session_id: str,
-    skipped: pending_inputs.DrainedInput,
-    conversation_store: ConversationStore,
-) -> None:
-    """Persist a Kiro web input that never appeared in Kiro's JSONL transcript."""
-    turn_id = generate_task_id()
-    user_item = NewConversationItem(
-        type="message",
-        response_id=turn_id,
-        data=MessageData(role="user", content=skipped.content),
-        created_by=skipped.created_by,
-    )
-    error = ErrorData(
-        source="execution",
-        code="kiro_native_prompt_not_recorded",
-        message=(
-            "Kiro did not accept this web message into its structured session transcript. "
-            "The native terminal may have shown the underlying error."
-        ),
-    )
-    persisted_items = await asyncio.to_thread(
-        conversation_store.append,
-        session_id,
-        [
-            user_item,
-            NewConversationItem(type="error", response_id=turn_id, data=error),
-        ],
-    )
-    _publish_input_consumed(
-        session_id,
-        persisted_items[0],
-        cleared_pending_id=skipped.pending_id,
-    )
-    _publish_external_conversation_item(session_id, persisted_items[1])
+    skipped_entries: list[pending_inputs.DrainedInput],
+) -> list[NewConversationItem]:
+    """
+    Build ``NewConversationItem`` pairs for Kiro web inputs not in the transcript.
+
+    Each skipped entry produces ``[user_message, error_item]``. Stable IDs
+    derived from ``pending_id`` make each pair idempotent under the batch
+    append so no pre-flight has_item probe is needed — if the anchor item
+    is already persisted (a forwarder retry), these items are too, and
+    append returns the whole batch deduplicated.
+    """
+    items: list[NewConversationItem] = []
+    for skipped in skipped_entries:
+        turn_id = generate_task_id()
+        items.append(
+            NewConversationItem(
+                type="message",
+                response_id=turn_id,
+                data=MessageData(role="user", content=skipped.content),
+                created_by=skipped.created_by,
+                stable_id=uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"omnigent-skipped-kiro-user:{session_id}:{skipped.pending_id}",
+                ).hex,
+            )
+        )
+        items.append(
+            NewConversationItem(
+                type="error",
+                response_id=turn_id,
+                data=ErrorData(
+                    source="execution",
+                    code="kiro_native_prompt_not_recorded",
+                    message=(
+                        "Kiro did not accept this web message into its structured session "
+                        "transcript. The native terminal may have shown the underlying error."
+                    ),
+                ),
+                stable_id=uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"omnigent-skipped-kiro-error:{session_id}:{skipped.pending_id}",
+                ).hex,
+            )
+        )
+    return items
 
 
 async def _enrich_terminal_status_with_subagent_output(
@@ -3589,6 +3656,13 @@ def _kick_managed_wake_impl(
     # session page when the wake fires (the composer let them send into a
     # host_asleep session).
     _publish_sandbox_status(session_id, "provisioning")
+    wake_agent_store = getattr(app_state, "agent_store", None)
+    if wake_agent_store is None:
+        _logger.warning(
+            "session %s: wake has no agent store; woken runner stays unclassified",
+            session_id,
+            extra={"session_id": session_id},
+        )
     wake_task = asyncio.create_task(
         _run_managed_wake(
             session_id=session_id,
@@ -3599,6 +3673,8 @@ def _kick_managed_wake_impl(
             host_store=host_store,
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
+            agent_store=wake_agent_store,
+            agent_id=conv.agent_id,
         )
     )
     _managed_launch_tasks.add(wake_task)
@@ -3615,6 +3691,8 @@ async def _run_managed_wake(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    agent_store: AgentStore | None = None,
+    agent_id: str | None = None,
 ) -> None:
     """
     Wake a dormant resumable managed host in the background, settling the
@@ -3643,8 +3721,16 @@ async def _run_managed_wake(
         frame. ``None`` in minimal test wirings.
     :param tunnel_registry: Runner-tunnel registry used to await the launched
         runner's connection. ``None`` in minimal test wirings.
+    :param agent_store: Store the runner's agent classifier is resolved from,
+        or ``None`` (a stripped test wiring) to leave the runner unclassified.
+    :param agent_id: Agent the session is bound to, resolved through the
+        built-in gate into the woken runner Pod's ``omnigent.ai/agent``
+        classifier, or ``None`` to leave it unstamped.
     """
-    from omnigent.server.managed_hosts import resume_managed_host
+    from omnigent.server.managed_hosts import (
+        resolve_managed_agent_label,
+        resume_managed_host,
+    )
     from omnigent.server.routes import sessions as _facade
 
     host_id = conv.host_id
@@ -3668,8 +3754,25 @@ async def _run_managed_wake(
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
+        # Re-derived here rather than by the caller, matching the launch path:
+        # the read runs on the task that already owns the single-flight claim,
+        # and it is never read back from a stored label — so there is nothing to
+        # keep in sync, or to forge.
+        agent_name: str | None = None
+        if agent_store is not None and agent_id is not None:
+            agent_name = await asyncio.to_thread(
+                resolve_managed_agent_label,
+                agent_store,
+                agent_id,
+                session_id=session_id,
+            )
         await resume_managed_host(
-            host_id, host_store, sandbox_config, force=True, on_stage=_on_stage
+            host_id,
+            host_store,
+            sandbox_config,
+            force=True,
+            on_stage=_on_stage,
+            agent_name=agent_name,
         )
         _publish_sandbox_status(session_id, "connecting")
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -5713,8 +5816,16 @@ async def _dispatch_session_event_to_runner_impl(
         # back on any failure/cancellation so a message the TUI never
         # received doesn't replay as a ghost.
         content = body.data.get("content")
+        raw_stable_id = body.data.get("stable_id")
+        web_stable_id = (
+            raw_stable_id
+            if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
+            else None
+        )
         pending_id: str | None = (
-            pending_inputs.record(session_id, content, created_by=created_by)
+            pending_inputs.record(
+                session_id, content, created_by=created_by, stable_id=web_stable_id
+            )
             if isinstance(content, list) and content
             else None
         )
@@ -9623,8 +9734,8 @@ async def _get_session_snapshot(
 
     Centralizes the create/get response building so both endpoints
     return identical projections. The lifecycle ``status`` is
-    derived from the relay-fed ``_session_status_cache`` (the tasks
-    table has been removed).
+    derived from the relay-fed ``_session_status_cache``, falling back to
+    the persisted relay status after a server recycle (the tasks table is gone).
 
     :param conv_store: The conversation store to read from.
     :param session_id: Session/conversation identifier,
@@ -9716,7 +9827,10 @@ async def _get_session_snapshot(
             ),
         )
 
-    status = _session_status_from_cache(session_id)
+    # A server recycle clears this cache while the persisted relay status survives.
+    # Prefer it because native injection can finish before an external harness turn,
+    # making the runner's generic active-turn probe report a false ``idle``.
+    status = _session_status_from_cache(session_id, conv.live_status)
     if status == "idle":
         # Cache miss (or truly idle): either the server restarted, or the
         # relay has not yet published the first ``"running"`` event for a
@@ -9823,8 +9937,8 @@ async def _get_session_snapshot(
     # a verbatim ``reported_model``, it supersedes the spec-derived value on
     # the wire's ``llm_model`` field (the web renders and highlights only
     # from this).
-    if conv.reported_model:
-        llm_model = conv.reported_model
+    if reported_model := concrete_reported_model(conv.reported_model):
+        llm_model = reported_model
     # Skills are runner-owned: the bound runner discovers them against its
     # own filesystem (bundled skills + host skills under the session's
     # workspace and ``~/.claude/skills/``) — the host where the harness
@@ -9951,7 +10065,6 @@ __all__ = [
     "_persist_native_cumulative_usage",
     "_persist_native_terminal_failure",
     "_persist_session_event",
-    "_persist_skipped_kiro_pending_input",
     "_publish_and_wait_for_harness_elicitation",
     "_publish_runner_recovered_status",
     "_publish_subtree_cost_to_ancestors",

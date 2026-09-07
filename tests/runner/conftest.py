@@ -28,6 +28,7 @@ from tests.runner.helpers import NullServerClient
 REAL_CLAUDE_LAUNCH_CATALOG = claude_native.claude_launch_catalog
 REAL_CLAUDE_REPROBED_LAUNCH_CATALOG = claude_native.claude_reprobed_launch_catalog
 REAL_CODEX_LAUNCH_CATALOG = codex_native_app_server.codex_launch_catalog
+REAL_CODEX_REPROBED_LAUNCH_CATALOG = codex_native_app_server.codex_reprobed_launch_catalog
 
 # Project root: two parents up from this conftest (tests/runner/ → repo root).
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -56,6 +57,9 @@ def _isolated_model_catalog_store(
     monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _no_catalog)
     monkeypatch.setattr("omnigent.claude_native.claude_reprobed_launch_catalog", _no_catalog)
     monkeypatch.setattr("omnigent.codex_native_app_server.codex_launch_catalog", _no_catalog)
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.codex_reprobed_launch_catalog", _no_catalog
+    )
 
 
 @pytest.fixture(autouse=True)

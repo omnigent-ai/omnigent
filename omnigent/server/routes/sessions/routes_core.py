@@ -69,6 +69,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
@@ -180,6 +181,8 @@ from omnigent.server.schemas import (
     PaginatedList,
     ProjectSessionCreateRequest,
     ReadStatePutRequest,
+    ResetSessionModelOverrideRequest,
+    ResetSessionModelOverrideResponse,
     SessionAgentChangedEvent,
     SessionCreateRequest,
     SessionForkRequest,
@@ -1768,6 +1771,38 @@ def register_core_routes(
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
         return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
 
+    @router.post(
+        "/sessions/{session_id}/model-override/reset",
+        response_model=ResetSessionModelOverrideResponse,
+    )
+    async def reset_session_model_override(
+        request: Request,
+        session_id: str,
+        body: ResetSessionModelOverrideRequest,
+    ) -> ResetSessionModelOverrideResponse:
+        """Retire a rejected pick after fallback without replacing a newer selection."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or conv.agent_id is None:
+            raise _session_not_found()
+        try:
+            validate_model_override(body.expected_model_override)
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid expected_model_override: {exc}", code=ErrorCode.INVALID_INPUT
+            ) from exc
+        # The terminal already launched its fallback. This only retires metadata;
+        # forwarding another model change could undo a concurrent live selection.
+        reset = await asyncio.to_thread(
+            conversation_store.clear_model_override_if_matches,
+            session_id,
+            body.expected_model_override,
+        )
+        return ResetSessionModelOverrideResponse(reset=reset)
+
     @router.patch(
         "/sessions/{session_id}",
         response_model=None,
@@ -1815,11 +1850,18 @@ def register_core_routes(
         #   owner-gated stop (an editor must not hide/stop a session they can't
         #   issue that stop for). Presence is the signal for project (``""``
         #   unfiles), so gate on model_fields_set, not a non-None value.
+        # * MANAGE — exposing the workspace to view-level collaborators
+        #   (``share_workspace_files``). It is a sharing decision, so it sits
+        #   with the same tier that already controls who is granted access
+        #   (grant/revoke, public toggle) — the share dialog is manage-gated.
+        #   Presence is the signal (the flag's own True/False is the value).
         # * EDIT — every other field.
         #
-        # Owner implies edit, so a single check at the resolved level gates all
-        # three with no redundant second permission-store read.
+        # A higher tier implies the lower ones, so a single check at the
+        # resolved (strictest requested) level gates them all with no redundant
+        # second permission-store read.
         set_project = "project_id" in body.model_fields_set
+        set_share_workspace = "share_workspace_files" in body.model_fields_set
         pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
             PINNED_LABEL_KEY
         }
@@ -1827,6 +1869,8 @@ def register_core_routes(
             required_level = LEVEL_READ
         elif body.archived is not None or set_project:
             required_level = LEVEL_OWNER
+        elif set_share_workspace:
+            required_level = LEVEL_MANAGE
         else:
             required_level = LEVEL_EDIT
         await _require_access(
@@ -2131,6 +2175,9 @@ def register_core_routes(
                 None if clear_subagent_routing else subagent_routing_override
             ),
             _unset_subagent_routing_override=clear_subagent_routing,
+            # Owner opt-in for workspace-file browsing. Presence is the signal:
+            # an omitted field leaves it unchanged; True/False set or clear it.
+            share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
         )

@@ -693,6 +693,63 @@ async def test_edit_grant_blocked_from_stop_session_requires_owner(
     )
 
 
+async def test_share_workspace_files_requires_manage_and_reflects_in_snapshot(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Exposing the workspace to view-level collaborators is a sharing
+    decision, so PATCHing ``share_workspace_files`` needs manage — the same
+    tier that grants/revokes access. An editor is blocked; a manager can flip
+    it, and the value round-trips through the session snapshot (the contract
+    the share dialog and the file-rail gate both read).
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    s1 = await _create_session_as(auth_client, agent["id"], "user-a")
+    session_id = s1["id"]
+    # Fresh sessions are unshared: a read grant sees the conversation only.
+    assert s1.get("share_workspace_files") is False
+
+    await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="editor", level=LEVEL_EDIT
+    )
+    await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="manager", level=LEVEL_MANAGE
+    )
+
+    # An editor cannot decide who sees the workspace.
+    resp = await auth_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"share_workspace_files": True},
+        headers={"X-Forwarded-Email": "editor"},
+    )
+    assert resp.status_code == 403, (
+        f"An edit collaborator must not be able to expose the workspace to "
+        f"view-level users. Got {resp.status_code}: {resp.text}"
+    )
+
+    # A manager can, and the snapshot reflects it.
+    resp = await auth_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"share_workspace_files": True},
+        headers={"X-Forwarded-Email": "manager"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["share_workspace_files"] is True
+
+    snap = await auth_client.get(
+        f"/v1/sessions/{session_id}", headers={"X-Forwarded-Email": "manager"}
+    )
+    assert snap.json()["share_workspace_files"] is True
+
+    # Turning it back off round-trips too.
+    resp = await auth_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"share_workspace_files": False},
+        headers={"X-Forwarded-Email": "manager"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["share_workspace_files"] is False
+
+
 # ── Grant edit: can POST events but not manage permissions ───
 
 
@@ -2065,6 +2122,61 @@ async def test_patch_session_requires_edit_access(
     error_msg = resp.json()["error"]["message"]
     assert "owner" in error_msg.lower(), "403 message should mention owner requirement."
     assert f"--fork {session_id}" in error_msg, "403 message should suggest the fork CLI command."
+
+
+@pytest.mark.parametrize(
+    ("caller", "grant_level", "expected_status"),
+    [
+        pytest.param(None, None, 401, id="unauthenticated"),
+        pytest.param("unrelated", None, 404, id="unrelated"),
+        pytest.param("collaborator", LEVEL_READ, 403, id="reader"),
+        pytest.param("collaborator", LEVEL_EDIT, 200, id="editor"),
+        pytest.param("model-owner", None, 200, id="owner"),
+    ],
+)
+async def test_model_override_reset_requires_edit_access(
+    auth_client: httpx.AsyncClient,
+    caller: str | None,
+    grant_level: int | None,
+    expected_status: int,
+) -> None:
+    """Only the owner or an editor may conditionally clear a saved model pick."""
+    owner = "model-owner"
+    owner_headers = {"X-Forwarded-Email": owner}
+    agent = await create_test_agent(auth_client, user=owner)
+    session = await _create_session_as(auth_client, agent["id"], owner)
+    session_path = f"/v1/sessions/{session['id']}"
+    pick = "gpt-5.4-retired"
+    seeded = await auth_client.patch(
+        session_path,
+        json={"model_override": pick, "silent": True},
+        headers=owner_headers,
+    )
+    assert seeded.status_code == 200, seeded.text
+    assert seeded.json()["model_override"] == pick
+    if grant_level is not None:
+        assert caller is not None
+        grant = await _grant_permission(
+            auth_client,
+            session["id"],
+            granter=owner,
+            target_user=caller,
+            level=grant_level,
+        )
+        assert grant.status_code == 200, grant.text
+
+    reset = await auth_client.post(
+        f"{session_path}/model-override/reset",
+        json={"expected_model_override": pick},
+        headers={"X-Forwarded-Email": caller} if caller is not None else {},
+    )
+
+    assert reset.status_code == expected_status, reset.text
+    if expected_status == 200:
+        assert reset.json() == {"reset": True}
+    snapshot = await auth_client.get(session_path, headers=owner_headers)
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["model_override"] == (None if expected_status == 200 else pick)
 
 
 # ── GET /sessions/{id}/items with read access ──────────────

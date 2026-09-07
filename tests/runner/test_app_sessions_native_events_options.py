@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from pathlib import Path
 from typing import Any
@@ -2205,6 +2206,29 @@ async def test_events_model_change_confirms_against_the_status_file(
         ["claude-opus-4-6", "claude-opus-4-6", "claude-opus-4-7"],
     )
     assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_without_status_omits_bridge_path_from_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unverifiable model switch logs session context without the bridge path."""
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        resp = await _post_model_change_with_status_sequence(monkeypatch, [None])
+
+    assert resp.status_code == 204, resp.text
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "model change" in record.getMessage() and "could not be verified" in record.getMessage()
+    ]
+    assert messages == [
+        "claude-native model change for session=68c7c1acc5eeec3978c5e62043da51a5 "
+        "could not be verified: no statusLine snapshot"
+    ]
+    bridge_dir = bridge_dir_for_bridge_id("68c7c1acc5eeec3978c5e62043da51a5")
+    assert str(bridge_dir) not in messages[0]
 
 
 @pytest.mark.asyncio

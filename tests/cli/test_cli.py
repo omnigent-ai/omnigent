@@ -1095,16 +1095,14 @@ def test_help_groups_harnesses_and_other_commands() -> None:
     assert commands_at < result.output.index("server")
 
 
-def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
-    """The ``update`` alias is omitted from --help but stays registered."""
+def test_help_hides_deprecated_update_spelling_but_keeps_it_runnable() -> None:
+    """``update`` is omitted from --help but stays registered and runnable."""
     result = CliRunner().invoke(cli, ["--help"])
 
     assert result.exit_code == 0, result.output
     assert "upgrade" in result.output
-    # The alias line is suppressed so it doesn't duplicate ``upgrade``...
     assert "\n  update " not in result.output
-    # ...but it's still a real, invokable command.
-    assert cli.commands["update"] is cli.commands["upgrade"]
+    assert cli.commands["update"].hidden is True
 
 
 def test_help_hides_extras_gated_harness_when_sdk_missing(

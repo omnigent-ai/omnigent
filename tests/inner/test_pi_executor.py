@@ -1406,6 +1406,52 @@ class TestPiRpcSession(unittest.TestCase):
 
         _run(_test())
 
+    def test_stdout_at_eof_false_while_reader_running(self):
+        # A read_line timeout while the reader is alive is idle, not EOF.
+        async def _test():
+            rpc = _PiRpcSession()
+            rpc._line_queue = asyncio.Queue()
+            rpc._read_task = asyncio.create_task(asyncio.sleep(30))
+            try:
+                self.assertIsNone(await rpc.read_line(timeout=0.05))
+                self.assertFalse(rpc.stdout_at_eof())
+            finally:
+                rpc._read_task.cancel()
+                await asyncio.gather(rpc._read_task, return_exceptions=True)
+
+        _run(_test())
+
+    def test_stdout_at_eof_true_when_reader_finished_or_absent(self):
+        async def _test():
+            rpc = _PiRpcSession()
+            rpc._line_queue = asyncio.Queue()
+            # Never started (spawn failed) — nothing more can arrive.
+            self.assertTrue(rpc.stdout_at_eof())
+            # Finished reader (process exited, pipe closed).
+            rpc._read_task = asyncio.create_task(asyncio.sleep(0))
+            await asyncio.sleep(0.01)
+            self.assertTrue(rpc.stdout_at_eof())
+
+        _run(_test())
+
+    def test_stdout_at_eof_false_until_buffered_lines_drained(self):
+        # A finished reader with lines still queued is not EOF yet: the
+        # buffered output (and the None sentinel) must be drained first.
+        async def _test():
+            rpc = _PiRpcSession()
+            rpc._line_queue = asyncio.Queue()
+            rpc._line_queue.put_nowait('{"type": "agent_end"}')
+            rpc._line_queue.put_nowait(None)
+            rpc._read_task = asyncio.create_task(asyncio.sleep(0))
+            await asyncio.sleep(0.01)
+            self.assertFalse(rpc.stdout_at_eof())
+            self.assertEqual(await rpc.read_line(timeout=0.05), '{"type": "agent_end"}')
+            self.assertFalse(rpc.stdout_at_eof())
+            self.assertIsNone(await rpc.read_line(timeout=0.05))
+            self.assertTrue(rpc.stdout_at_eof())
+
+        _run(_test())
+
 
 # ---------------------------------------------------------------------------
 # PiExecutor constructor tests
@@ -2077,6 +2123,120 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertIsInstance(events[0], ExecutorError)
             self.assertIn("something went wrong", events[0].message)
+
+        _run(_test())
+
+    def test_stdout_idle_timeout_during_long_tool_call_keeps_waiting(self):
+        """A silent (>idle budget) tool call must not end the turn.
+
+        The stdout read times out repeatedly while pi's reader is still
+        running (long tool call producing no output); the turn must keep
+        waiting and complete when the final answer eventually arrives,
+        instead of dying with 'Pi process ended without response.'.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+            # A live reader task: pi is running, just silent.
+            fake_rpc._read_task = asyncio.create_task(asyncio.sleep(30))
+
+            async def feed_after_delay():
+                # Stay silent across several idle-timeout windows (the
+                # patched budget is 0.05s), then deliver the turn.
+                await asyncio.sleep(0.3)
+                for line in (
+                    json.dumps({"type": "response", "success": True}),
+                    json.dumps(
+                        {
+                            "type": "message_update",
+                            "assistantMessageEvent": {
+                                "type": "text_delta",
+                                "delta": "Done after long tool",
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "agent_end", "messages": []}),
+                ):
+                    fake_rpc._line_queue.put_nowait(line)
+
+            feeder = asyncio.create_task(feed_after_delay())
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            try:
+                with patch(
+                    "omnigent.inner.pi_executor._TURN_STDOUT_IDLE_TIMEOUT_S",
+                    0.05,
+                ):
+                    events = [
+                        e
+                        async for e in executor.run_turn(
+                            [{"role": "user", "content": "run the long task"}],
+                            [],
+                            "system",
+                        )
+                    ]
+            finally:
+                feeder.cancel()
+                fake_rpc._read_task.cancel()
+                await asyncio.gather(fake_rpc._read_task, return_exceptions=True)
+
+            errors = [e for e in events if isinstance(e, ExecutorError)]
+            self.assertEqual(
+                errors,
+                [],
+                f"idle timeout with a live pi process ended the turn: {errors}",
+            )
+            turn_complete = [e for e in events if isinstance(e, TurnComplete)]
+            self.assertEqual(len(turn_complete), 1)
+            self.assertEqual(turn_complete[0].response, "Done after long tool")
+
+        _run(_test())
+
+    def test_stdout_eof_from_finished_reader_still_errors(self):
+        """A real pi death (reader finished, None sentinel) still errors."""
+
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc._line_queue.put_nowait(None)  # reader's EOF sentinel
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+            # Finished reader: the process exited and stdout closed.
+            fake_rpc._read_task = asyncio.create_task(asyncio.sleep(0))
+            await asyncio.sleep(0.01)
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertIn("Pi process ended without response", events[0].message)
 
         _run(_test())
 

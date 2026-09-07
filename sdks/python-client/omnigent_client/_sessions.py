@@ -34,7 +34,7 @@ from pydantic import TypeAdapter
 from omnigent.server.schemas import ServerStreamEvent
 
 from ._child_status import child_summary_busy
-from ._errors import raise_for_status, require_json_object, response_body
+from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._timeouts import _SSE_TIMEOUT
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
@@ -1233,6 +1233,10 @@ async def _stream_session_events(
         to subscribe to, e.g. ``"conv_abc123"``.
     :yields: :class:`ServerStreamEvent` envelopes parsed from the SSE
         ``data:`` payload.
+    :raises OmnigentError: If the stream open fails with a non-2xx
+        status, including a redirect that was not followed.
+    :raises httpx.TooManyRedirects: If on-origin redirects loop past
+        httpx's limit.
     """
     async with http.stream(
         "GET",
@@ -1242,6 +1246,17 @@ async def _stream_session_events(
         if resp.status_code >= 400:
             await resp.aread()
             raise_for_status(resp.status_code, response_body(resp))
+        elif 300 <= resp.status_code < 400:
+            # OmnigentClient follows redirects, so a 3xx here was not
+            # followable (no Location header, a 304, or a caller-supplied
+            # client with redirects disabled). Parsing its non-SSE body
+            # would yield a silent, error-free, empty stream — fail loud
+            # instead.
+            raise OmnigentError(
+                f"stream open returned a 3xx response (status {resp.status_code}) "
+                "instead of an event stream",
+                resp.status_code,
+            )
 
         async for event in _parse_sse_lines(resp.aiter_lines()):
             yield event
