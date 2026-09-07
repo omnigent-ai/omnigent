@@ -1604,6 +1604,11 @@ def test_uninstalled_harness_shows_x_and_not_installed(isolated_config, monkeypa
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: False
     )
+    # Absence must not depend on this machine's PATH — seal the resolution
+    # ladder the absence label consults (override, then resolve_cli_binary).
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.resolve_cli_binary", lambda _name: None
+    )
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
     assert result.exit_code == 0, result.output
     out = result.output
@@ -1988,6 +1993,11 @@ def test_overview_lists_kiro_row(isolated_config, monkeypatch) -> None:
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: False
     )
+    # Absence must not depend on this machine's PATH — seal the resolution
+    # ladder the absence label consults (override, then resolve_cli_binary).
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.resolve_cli_binary", lambda _name: None
+    )
     options, selectable, descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
     names = _overview_row_names(options, selectable)
     kiro = names.index("Kiro")
@@ -2198,7 +2208,11 @@ def test_overview_status_color_distinguishes_missing_from_unconfigured(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: False
     )
-    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _name: None)
+    # The absence label resolves via harness_install's binding (override env
+    # var first, then the resolve_cli_binary ladder) — patch it there.
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.resolve_cli_binary", lambda _name: None
+    )
     options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )

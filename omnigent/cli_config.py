@@ -3634,14 +3634,14 @@ def _run_configure_harnesses_interactive() -> None:
     def _cli_absence_label(key: str) -> str:
         """Return a status label that distinguishes "missing" from "outdated".
 
-        When the binary is on PATH but ``harness_cli_installed`` is False, the
-        CLI is installed but on an unsupported version; saying "Not installed"
-        in that case is confusing for a user who knows they have the CLI.
+        When the binary resolves (on PATH or at its configured override path)
+        but ``harness_cli_installed`` is False, the CLI is installed but on an
+        unsupported version; saying "Not installed" in that case is confusing
+        for a user who knows they have the CLI.
         """
-        from omnigent._platform import resolve_cli_binary
+        from omnigent.onboarding.harness_install import resolve_harness_cli_binary
 
-        spec = harness_install_spec(key)
-        if spec is not None and resolve_cli_binary(spec.binary) is not None:
+        if resolve_harness_cli_binary(key) is not None:
             return "Needs upgrade"
         return "Not installed"
 
