@@ -522,6 +522,7 @@ describe("PermissionsModal", () => {
       expect(
         screen.getByText("Invite others to view or collaborate on this session."),
       ).toBeInTheDocument();
+      expect(screen.queryByText(/Please be careful when sharing/)).not.toBeInTheDocument();
       expect(
         screen.queryByText("Sharing has been disabled for this Omnigent server."),
       ).not.toBeInTheDocument();
@@ -538,6 +539,11 @@ describe("PermissionsModal", () => {
       expect(
         screen.getByText(
           "This server allows read-only sharing — invite others to view this session.",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "Please be careful when sharing. Read access will allow for reading of all session outputs.",
         ),
       ).toBeInTheDocument();
       // Read grants are still allowed, so the Grant control stays.
@@ -563,6 +569,11 @@ describe("PermissionsModal", () => {
       expect(
         screen.getByText(
           "This server allows read-only sharing — invite others to view this session.",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "Please be careful when sharing. Read access will allow for reading of all session outputs.",
         ),
       ).toBeInTheDocument();
       expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();

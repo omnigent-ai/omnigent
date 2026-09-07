@@ -168,10 +168,20 @@ export function PermissionsModal({
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">Share this session</DialogTitle>
-          <DialogDescription>
-            {sharingReadOnly
-              ? "This server allows read-only sharing — invite others to view this session."
-              : "Invite others to view or collaborate on this session."}
+          <DialogDescription asChild>
+            <div className="space-y-3">
+              <p>
+                {sharingReadOnly
+                  ? "This server allows read-only sharing — invite others to view this session."
+                  : "Invite others to view or collaborate on this session."}
+              </p>
+              {sharingReadOnly && (
+                <p>
+                  Please be careful when sharing. Read access will allow for reading of all session
+                  outputs.
+                </p>
+              )}
+            </div>
           </DialogDescription>
         </DialogHeader>
 
