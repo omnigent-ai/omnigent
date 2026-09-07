@@ -4999,6 +4999,8 @@ async def _launch_runner_on_host_impl(
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    *,
+    project_store: Any | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -5050,7 +5052,11 @@ async def _launch_runner_on_host_impl(
                 return last
             return _HostLaunchAttempt(runner_id=fresh.runner_id)
         attempt = await _launch_runner_on_host_locked(
-            fresh, conversation_store, host_registry, host_conn
+            fresh,
+            conversation_store,
+            host_registry,
+            host_conn,
+            project_store=project_store,
         )
         # Re-insert so the plain dict's insertion order is newest-last, then
         # evict from the front once past the cap.
@@ -5066,10 +5072,34 @@ async def _launch_runner_on_host_locked(
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    *,
+    project_store: Any | None = None,
 ) -> _HostLaunchAttempt:
     """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
+    from omnigent.host.project_attribution import (
+        PROJECT_ATTRIBUTION_ERROR_CODE,
+        ProjectAttributionError,
+        resolve_launch_attribution,
+    )
     from omnigent.runner.identity import token_bound_runner_id
+
+    harness = _resolve_harness(conv)
+    launch_attribution = None
+    if project_store is not None:
+        try:
+            launch_attribution = await asyncio.to_thread(
+                resolve_launch_attribution,
+                conv,
+                harness=harness,
+                project_store=project_store,
+            )
+        except ProjectAttributionError as exc:
+            return _HostLaunchAttempt(
+                runner_id=conv.runner_id or "",
+                error_code=PROJECT_ATTRIBUTION_ERROR_CODE,
+                error=str(exc),
+            )
 
     superseded_runner_id = conv.runner_id
     binding_token = secrets.token_urlsafe(32)
@@ -5114,7 +5144,9 @@ async def _launch_runner_on_host_locked(
             # Canonical harness (see _resolve_harness) so the host runs the
             # same configuration check it does at create-time launch. None
             # (agent not resolvable) skips the host-side check — fail open.
-            harness=_resolve_harness(conv),
+            harness=harness,
+            quota_route=launch_attribution.quota_route if launch_attribution else None,
+            project_enum=launch_attribution.project_enum if launch_attribution else None,
         )
     )
     try:

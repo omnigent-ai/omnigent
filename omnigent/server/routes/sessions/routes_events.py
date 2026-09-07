@@ -29,6 +29,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
+from omnigent.host.project_attribution import PROJECT_ATTRIBUTION_ERROR_CODE
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
@@ -795,6 +796,7 @@ def register_events_routes(
                         conversation_store,
                         _host_reg,
                         _host_conn,
+                        project_store=getattr(_app_state, "project_store", None),
                     )
                     # A structured refusal (harness not configured / workspace
                     # missing) leaves no runner to compact against — treat as
@@ -1670,7 +1672,27 @@ def register_events_routes(
                         conversation_store,
                         _host_reg,
                         _host_conn,
+                        project_store=getattr(request.app.state, "project_store", None),
                     )
+                    if launch_attempt.error_code == PROJECT_ATTRIBUTION_ERROR_CODE:
+                        item_id = await _persist_native_terminal_failure(
+                            session_id,
+                            conv,
+                            body,
+                            conversation_store,
+                            ErrorData(
+                                source="execution",
+                                code=ErrorCode.PROJECT_ATTRIBUTION_REQUIRED,
+                                message=(
+                                    launch_attempt.error
+                                    or "This personal native session has no trusted project "
+                                    "classification. File it in an allowed project and retry."
+                                ),
+                            ),
+                            runner_router,
+                            created_by=created_by,
+                        )
+                        return {"queued": True, "item_id": item_id}
                     if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
                         # The host refused: the agent's harness isn't
                         # configured there. This message was the real

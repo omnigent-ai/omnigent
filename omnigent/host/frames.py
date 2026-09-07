@@ -24,6 +24,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
+from omnigent.host.project_attribution import (
+    is_allowed_project_enum,
+    is_allowed_quota_route,
+)
 from omnigent.json_types import JsonObject as _JsonObject
 
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
@@ -173,6 +177,10 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param quota_route: Server-authoritative ``"personal-llmq"`` or
+        ``"work-vertex"`` route. Current hosts fail closed when absent.
+    :param project_enum: Closed personal-workstream enum. Required exactly for
+        personal launches and forbidden for work launches.
     """
 
     request_id: str
@@ -180,6 +188,8 @@ class HostLaunchRunnerFrame:
     workspace: str
     session_id: str | None = None
     harness: str | None = None
+    quota_route: str | None = None
+    project_enum: str | None = None
 
 
 @dataclass
@@ -1053,6 +1063,14 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
+        if frame.quota_route is not None and not is_allowed_quota_route(frame.quota_route):
+            raise ValueError("launch runner frame contains an unsupported quota_route")
+        if frame.project_enum is not None and not is_allowed_project_enum(frame.project_enum):
+            raise ValueError("launch runner frame contains an unsupported project_enum")
+        if frame.quota_route == "personal-llmq" and frame.project_enum is None:
+            raise ValueError("personal launch runner frame requires project_enum")
+        if frame.quota_route == "work-vertex" and frame.project_enum is not None:
+            raise ValueError("work launch runner frame cannot carry project_enum")
         return _encode_payload(
             {
                 "kind": HostFrameKind.LAUNCH_RUNNER.value,
@@ -1061,6 +1079,8 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "workspace": frame.workspace,
                 "session_id": frame.session_id,
                 "harness": frame.harness,
+                "quota_route": frame.quota_route,
+                "project_enum": frame.project_enum,
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -1558,12 +1578,24 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
     :param msg: Decoded frame object.
     :returns: Typed launch-runner frame.
     """
+    quota_route = _optional_nullable_str(msg, "quota_route")
+    project_enum = _optional_nullable_str(msg, "project_enum")
+    if quota_route is not None and not is_allowed_quota_route(quota_route):
+        raise ValueError("launch runner frame contains an unsupported quota_route")
+    if project_enum is not None and not is_allowed_project_enum(project_enum):
+        raise ValueError("launch runner frame contains an unsupported project_enum")
+    if quota_route == "personal-llmq" and project_enum is None:
+        raise ValueError("personal launch runner frame requires project_enum")
+    if quota_route == "work-vertex" and project_enum is not None:
+        raise ValueError("work launch runner frame cannot carry project_enum")
     return HostLaunchRunnerFrame(
         request_id=_required_str(msg, "request_id"),
         binding_token=_required_str(msg, "binding_token"),
         workspace=_required_str(msg, "workspace"),
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
+        quota_route=quota_route,
+        project_enum=project_enum,
     )
 
 

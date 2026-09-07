@@ -250,6 +250,8 @@ def test_launch_runner_frame_round_trip() -> None:
         binding_token="secret_token_xyz",
         workspace="/Users/corey/projects/frontend",
         session_id="conv_abc123",
+        quota_route="personal-llmq",
+        project_enum="chatgpt-playground",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostLaunchRunnerFrame)
@@ -257,6 +259,52 @@ def test_launch_runner_frame_round_trip() -> None:
     assert decoded.binding_token == "secret_token_xyz"
     assert decoded.workspace == "/Users/corey/projects/frontend"
     assert decoded.session_id == "conv_abc123"
+    assert decoded.project_enum == "chatgpt-playground"
+    assert decoded.quota_route == "personal-llmq"
+
+
+def test_launch_runner_frame_rejects_unknown_project_enum() -> None:
+    """The host tunnel must not accept client-invented quota classifications."""
+    payload = json.dumps(
+        {
+            "kind": "host.launch_runner",
+            "request_id": "req_001",
+            "binding_token": "secret_token_xyz",
+            "workspace": "/Users/corey/projects/frontend",
+            "session_id": "conv_abc123",
+            "project_enum": "attacker-selected-priority",
+        }
+    )
+
+    with pytest.raises(ValueError, match="project_enum"):
+        decode_host_frame(payload)
+
+
+@pytest.mark.parametrize(
+    ("quota_route", "project_enum"),
+    [
+        ("unknown", None),
+        ("personal-llmq", None),
+        ("work-vertex", "chatgpt-playground"),
+    ],
+)
+def test_launch_runner_frame_rejects_tampered_route_pairs(
+    quota_route: str,
+    project_enum: str | None,
+) -> None:
+    payload = json.dumps(
+        {
+            "kind": "host.launch_runner",
+            "request_id": "req_001",
+            "binding_token": "secret_token_xyz",
+            "workspace": "/tmp/project",
+            "quota_route": quota_route,
+            "project_enum": project_enum,
+        }
+    )
+
+    with pytest.raises(ValueError):
+        decode_host_frame(payload)
 
 
 def test_launch_runner_result_frame_success_round_trip() -> None:

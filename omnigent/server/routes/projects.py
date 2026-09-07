@@ -30,6 +30,18 @@ from omnigent.server.schemas import (
 )
 from omnigent.stores.project_store import ProjectStore
 
+_SERVER_OWNED_CONFIG_KEYS = frozenset({"quota_route"})
+
+
+def _reject_server_owned_config(config: dict[str, Any]) -> None:
+    """Reject client attempts to set launch-routing authorization metadata."""
+    forbidden = sorted(_SERVER_OWNED_CONFIG_KEYS.intersection(config))
+    if forbidden:
+        raise OmnigentError(
+            f"project config keys are server-owned: {', '.join(forbidden)}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
 
 def _to_response(project: Project) -> dict[str, Any]:
     """Convert a :class:`Project` entity to a ``ProjectObject`` response dict.
@@ -74,6 +86,7 @@ def create_projects_router(
             if the caller already has a project with this name.
         """
         user_id = require_user(request, auth_provider)
+        _reject_server_owned_config(body.config)
         project = await asyncio.to_thread(
             project_store.create,
             uuid.uuid4().hex,
@@ -128,12 +141,26 @@ def create_projects_router(
             projects.
         """
         user_id = require_user(request, auth_provider)
+        config = body.config
+        if config is not None:
+            _reject_server_owned_config(config)
+            existing = await asyncio.to_thread(
+                project_store.get,
+                project_id,
+                user_id=user_id,
+            )
+            if existing is None:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            config = dict(config)
+            for key in _SERVER_OWNED_CONFIG_KEYS:
+                if key in existing.config:
+                    config[key] = existing.config[key]
         project = await asyncio.to_thread(
             project_store.update,
             project_id,
             user_id=user_id,
             name=body.name,
-            config=body.config,
+            config=config,
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)

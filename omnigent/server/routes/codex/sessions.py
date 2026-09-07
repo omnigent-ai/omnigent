@@ -18,6 +18,7 @@ from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
+from omnigent.host.project_attribution import PROJECT_ATTRIBUTION_ERROR_CODE
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
@@ -242,11 +243,17 @@ async def _start_codex_goal_runner_on_bound_host(
             conversation_store,
             host_registry,
             host_conn,
+            project_store=getattr(app_state, "project_store", None),
         )
         if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
             raise OmnigentError(
                 launch_attempt.error or "host failed to launch runner: harness not configured",
                 code=ErrorCode.HARNESS_NOT_CONFIGURED,
+            )
+        if launch_attempt.error_code == PROJECT_ATTRIBUTION_ERROR_CODE:
+            raise OmnigentError(
+                launch_attempt.error or "host launch lacks trusted project attribution",
+                code=ErrorCode.PROJECT_ATTRIBUTION_REQUIRED,
             )
         return launch_attempt.runner_id
     if not await _maybe_relaunch_managed_sandbox(

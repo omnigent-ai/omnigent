@@ -1316,6 +1316,7 @@ def create_app(
                 tunnel_registry=tunnel_registry,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                project_store=project_store,
             )
             on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /
@@ -1395,6 +1396,7 @@ def create_app(
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.agent_store = agent_store
+    app.state.project_store = project_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
@@ -2788,6 +2790,7 @@ def create_app(
                 permission_store=permission_store,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
+                project_store=project_store,
                 feature_flags=resolved_feature_flags,
             ),
             prefix="/v1",

@@ -71,6 +71,16 @@ class ProjectStore(ABC):
         ...
 
     @abstractmethod
+    def get_for_session_launch(self, project_id: str) -> Project | None:
+        """Resolve a project already referenced by an authorized session.
+
+        This internal lookup remains workspace-scoped but is intentionally not
+        caller-scoped: relaunches may occur without an HTTP user context. Its
+        result must only be used after the conversation itself was authorized.
+        """
+        ...
+
+    @abstractmethod
     def list(self, *, user_id: str | None) -> list[Project]:
         """
         List the owner's projects ordered by ``created_at ASC, id ASC``.
