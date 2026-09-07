@@ -1,13 +1,4 @@
-import {
-  memo,
-  useCallback,
-  useDeferredValue,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useStickToBottomContext } from "use-stick-to-bottom";
@@ -186,10 +177,9 @@ function TranscriptImpl({
     }
     return ids;
   }, [blocks]);
-  // Defer one coherent display model. Every bubble-derived surface changes in
-  // the same commit, so the rail/spacer/indicators can never describe the new
-  // conversation while the virtual rows still show the previous one.
-  const nextDisplaySnapshot = useMemo(
+  // Keep every bubble-derived surface on one coherent model so the
+  // rail/spacer/indicators always describe the rows being rendered.
+  const display = useMemo(
     () => ({
       conversationId,
       bubbles,
@@ -219,8 +209,6 @@ function TranscriptImpl({
       showsWorking,
     ],
   );
-  const display = useDeferredValue(nextDisplaySnapshot);
-  const isSwitchPending = display.conversationId !== conversationId;
   const [nativeFindConversationId, setNativeFindConversationId] = useState<string | null>(null);
   useEffect(() => setNativeFindConversationId(null), [conversationId]);
   useEffect(() => {
@@ -314,13 +302,6 @@ function TranscriptImpl({
   }, [nav]);
 
   const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
-  useLayoutEffect(() => {
-    const content = scroller?.el.firstElementChild;
-    if (!(content instanceof HTMLElement)) return;
-    content.toggleAttribute("inert", isSwitchPending);
-    return () => content.removeAttribute("inert");
-  }, [isSwitchPending, scroller]);
-
   return (
     <>
       {/* Task tracker pinned above the thread. Sibling of the viewport (not an
@@ -336,7 +317,6 @@ function TranscriptImpl({
         <Conversation className={cn(!display.hasTasks && "chat-scroll-fade", "flex-1")}>
           <ConversationContent
             scrollClassName="transcript-hide-native-scrollbar"
-            aria-hidden={isSwitchPending || undefined}
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6",
               display.hasTasks ? "pt-4" : "pt-20",
