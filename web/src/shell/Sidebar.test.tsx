@@ -352,15 +352,31 @@ describe("Sidebar session list", () => {
       renderSidebar();
       selectSessionFilter("all");
 
-      const sharedRow = screen.getByText("shared_session").closest("a")!;
+      const sharedRow = screen.getByText("shared_session").closest("li")!;
       const indicator = within(sharedRow).getByRole("img", { name: "Shared session" });
       expect(indicator).toHaveAttribute("title", "Shared with you");
-      expect(indicator).toHaveClass("shrink-0");
+      expect(indicator).toHaveClass("w-6", "justify-center");
+      expect(indicator).toHaveClass("absolute", "right-1");
       expect(
-        within(screen.getByText("private_session").closest("a")!).queryByRole("img"),
+        within(screen.getByText("private_session").closest("li")!).queryByRole("img"),
       ).toBeNull();
     },
   );
+
+  it("keeps the shared icon rightmost when a session state marker is present", () => {
+    mockConversations([
+      conv("shared_running", "Claude Code", {
+        owner: "other@example.com",
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+    selectSessionFilter("all");
+
+    const row = screen.getByText("shared_running").closest("li")!;
+    expect(within(row).getByRole("img", { name: "Shared session" })).toHaveClass("right-1");
+    expect(within(row).getByTestId("session-state-badge").parentElement).toHaveClass("right-8");
+  });
 
   it("does not mark the viewer's own sessions or sessions without ownership metadata", () => {
     const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
