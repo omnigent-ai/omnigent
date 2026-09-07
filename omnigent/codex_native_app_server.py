@@ -75,7 +75,10 @@ CodexParams: TypeAlias = _JsonObject
 CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
-_CONNECT_TIMEOUT_SECONDS = 10.0
+# A managed quota overlay validates and trusts its command hooks with two
+# short-lived metadata app-servers before execing the real server. Leave room
+# for that reviewed startup path under load without weakening turn deadlines.
+_CONNECT_TIMEOUT_SECONDS = 45.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _STDERR_CHUNK_LIMIT = 65536
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
