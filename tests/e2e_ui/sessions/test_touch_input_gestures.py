@@ -179,6 +179,108 @@ def test_session_row_left_swipe_opens_default_delete_confirmation(
         context.close()
 
 
+@pytest.mark.parametrize("palette", ["omni", "nord"])
+def test_session_row_swipe_reversal_keeps_action_colors(
+    browser: Browser,
+    seeded_session: tuple[str, str],
+    palette: str,
+) -> None:
+    """Every reversal frame shows the new action's glyph and colors together."""
+    base_url, session_id = seeded_session
+    context = new_touch_context(browser, viewport=_PHONE_VIEWPORT, is_mobile=True)
+    context.add_init_script(
+        f"""localStorage.setItem('web-theme', 'dark');
+        localStorage.setItem('omnigent:ui-theme-palette', JSON.stringify('{palette}'));
+        localStorage.setItem('omnigent:swipe-actions',
+            JSON.stringify({{left: 'archive', right: 'delete'}}));"""
+    )
+    try:
+        page = context.new_page()
+        page.emulate_media(reduced_motion="no-preference")
+        page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        row_link = page.locator(f'a[href="/c/{session_id}"]')
+        expect(row_link).to_be_visible()
+        page.wait_for_function(
+            """() => Math.abs(document.querySelector('aside[aria-label="Conversations"]')
+                .getBoundingClientRect().left) < 0.01"""
+        )
+        frame = row_link.locator("xpath=ancestor::li[1]")
+        frame.evaluate(
+            """frame => {
+                window.swipeFrames = [];
+                window.readSwipeFrame = () => {
+                    const reveal = frame.querySelector(
+                        '[data-testid="conversation-swipe-reveal"]');
+                    if (!reveal) return null;
+                    const surface = frame.querySelector(
+                        '[data-testid="conversation-swipe-surface"]');
+                    const style = getComputedStyle(reveal);
+                    return {
+                        dx: new DOMMatrix(getComputedStyle(surface).transform).m41,
+                        archive: !!reveal.querySelector('.lucide-archive'),
+                        delete: !!reveal.querySelector('.lucide-trash-2'),
+                        color: style.color,
+                        background: style.backgroundColor,
+                        glyphColor: getComputedStyle(reveal.querySelector('svg')).color,
+                    };
+                };
+                const sample = () => {
+                    const current = window.readSwipeFrame();
+                    if (current) window.swipeFrames.push(current);
+                    window.swipeSampleFrame = requestAnimationFrame(sample);
+                };
+                sample();
+            }"""
+        )
+        box = frame.bounding_box()
+        assert box is not None
+        start_x = box["x"] + box["width"] / 2
+        start_y = box["y"] + box["height"] / 2
+        cdp = context.new_cdp_session(page)
+
+        # Isolated swipes supply the palette's correct, uncontaminated colors.
+        expected = {}
+        for offset in (-40, 40):
+            touch(cdp, "touchStart", start_x, start_y)
+            touch(cdp, "touchMove", start_x + offset, start_y)
+            page.wait_for_function("dx => window.readSwipeFrame()?.dx === dx", arg=offset)
+            expected[offset] = page.evaluate("window.readSwipeFrame()")
+            assert expected[offset]["archive"] == (offset < 0)
+            assert expected[offset]["delete"] == (offset > 0)
+            touch(cdp, "touchCancel")
+        assert expected[-40]["color"] != expected[40]["color"]
+
+        reversals = []
+        touch(cdp, "touchStart", start_x, start_y)
+        try:
+            for offset in (-40, 40, -40, 40, -40):
+                page.evaluate("window.swipeFrames = []")
+                touch(cdp, "touchMove", start_x + offset, start_y)
+                page.wait_for_function(
+                    "dx => window.swipeFrames.filter(frame => frame.dx === dx).length >= 3",
+                    arg=offset,
+                )
+                frames = page.evaluate("window.swipeFrames")
+                current = [sample for sample in frames if sample["dx"] == offset]
+                assert current
+                reversals.append((offset, current))
+        finally:
+            touch(cdp, "touchCancel")
+            page.evaluate("cancelAnimationFrame(window.swipeSampleFrame)")
+        expect(frame.get_by_test_id("conversation-swipe-reveal")).to_have_count(0)
+        expect(page.get_by_text("Delete conversation?", exact=True)).to_have_count(0)
+        expect(row_link).to_be_visible()
+        mismatches = [
+            {"actual": sample, "expected": expected[offset]}
+            for offset, frames in reversals
+            for sample in frames
+            if sample != expected[offset]
+        ]
+        assert not mismatches, f"swipe reversals mixed action colors: {mismatches}"
+    finally:
+        context.close()
+
+
 def test_session_row_long_press_opens_actions_menu(
     browser: Browser,
     seeded_session: tuple[str, str],
