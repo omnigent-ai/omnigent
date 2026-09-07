@@ -444,7 +444,9 @@ function GithubSummaryTab({
   comments: GithubComment[];
 }) {
   return (
-    <div className="space-y-4 p-3">
+    // Extra bottom padding so the last comment can scroll clear of the very
+    // bottom edge, where it's awkward to read.
+    <div className="space-y-4 p-3 pb-16">
       {/* CI status checks (from the PR's statusCheckRollup) as pills; hover a
           pill to see the job names in that bucket. */}
       {checks.total > 0 && (
@@ -959,10 +961,10 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
             flex-none keep the two labels close and content-sized (the default
             flex-1 equalizes and spreads them). */}
           <TabsList variant="line" aria-label="Pull request" className="h-auto gap-0 p-0">
-            <TabsTrigger value="summary" className="flex-none px-3 leading-none">
+            <TabsTrigger value="summary" className="flex-none border-0 px-3 leading-none">
               Summary
             </TabsTrigger>
-            <TabsTrigger value="changes" className="flex-none px-3 leading-none">
+            <TabsTrigger value="changes" className="flex-none border-0 px-3 leading-none">
               Changes
             </TabsTrigger>
           </TabsList>
