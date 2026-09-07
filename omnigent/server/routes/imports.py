@@ -596,13 +596,13 @@ def create_imports_router(
         try:
             async for ref in _import_local_core(body, user_id, host_conn, counts):
                 sessions.append(ref)
-        except OmnigentError:
+        except OmnigentError as exc:
             error_id, message = _record_local_import_failure()
             return JSONResponse(
-                status_code=500,
+                status_code=exc.http_status,
                 content={
                     "error": {
-                        "code": ErrorCode.INTERNAL_ERROR,
+                        "code": exc.code,
                         "error_id": error_id,
                         "message": message,
                     }

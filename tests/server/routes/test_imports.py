@@ -569,7 +569,7 @@ async def test_local_import_endpoints_redact_host_error(
 
     async def _fake_stream(**_kwargs: object):
         yield {}
-        raise OmnigentError(sensitive_detail, code=ErrorCode.INTERNAL_ERROR)
+        raise OmnigentError(sensitive_detail, code=ErrorCode.CONFLICT)
 
     monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
 
@@ -606,9 +606,9 @@ async def test_local_import_endpoints_redact_host_error(
         error_payload = events[0]
         assert error_payload["event"] == "error"
     else:
-        assert response.status_code == 500
+        assert response.status_code == 409
         error_payload = response.json()["error"]
-        assert error_payload["code"] == ErrorCode.INTERNAL_ERROR
+        assert error_payload["code"] == ErrorCode.CONFLICT
 
     error_id = error_payload["error_id"]
     assert error_id.startswith("err_")
