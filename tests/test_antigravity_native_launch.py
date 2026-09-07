@@ -142,7 +142,22 @@ class TestResolveNativeAntigravityLaunch:
 
 
 @pytest.fixture
-def fake_agy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
+def adc_credentials_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point ADC lookup at an isolated test file."""
+    monkeypatch.delenv("AGY_ADC_AUTH", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+    credentials_path = tmp_path / "application_default_credentials.json"
+    monkeypatch.setattr(_mod, "_adc_credentials_path", lambda: credentials_path)
+    return credentials_path
+
+
+@pytest.fixture
+def fake_agy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    adc_credentials_path: Path,
+) -> str:
     """Monkeypatch agy_binary_path to a deterministic fake path."""
     fake = str(tmp_path / "agy")
     monkeypatch.setattr(_mod, "agy_binary_path", lambda: fake)
@@ -165,14 +180,33 @@ class TestBuildAgyLaunch:
     # Fresh-session path (resume=False)
     # ------------------------------------------------------------------
 
-    def test_fresh_env_is_empty(self, fake_agy: str) -> None:
-        """Fresh session emits no env overrides (agy ignores all knobs)."""
+    def test_adc_present_sets_auth_env(self, fake_agy: str, adc_credentials_path: Path) -> None:
+        """A valid local ADC file enables agy's non-TTY auth mode."""
+        adc_credentials_path.write_text('{"type": "authorized_user"}', encoding="utf-8")
+        _, env = build_agy_launch(conversation_id=None, model=None, resume=False)
+        assert env == {"AGY_ADC_AUTH": "1"}
+
+    def test_adc_absent_does_not_set_auth_env(self, fake_agy: str) -> None:
+        """Without ADC credentials, the existing auth path remains unchanged."""
         _, env = build_agy_launch(
             conversation_id=None,
             model=None,
             resume=False,
         )
         assert env == {}
+
+    def test_operator_auth_value_is_preserved(
+        self, fake_agy: str, adc_credentials_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An operator-provided AGY_ADC_AUTH value is never overwritten."""
+        adc_credentials_path.write_text('{"type": "authorized_user"}', encoding="utf-8")
+        monkeypatch.setenv("AGY_ADC_AUTH", "operator-choice")
+        _, env = build_agy_launch(conversation_id=None, model=None, resume=False)
+        assert "AGY_ADC_AUTH" not in env
+
+    def test_no_project_id_is_hardcoded(self, fake_agy: str) -> None:
+        """Auth setup leaves quota-project selection to the ADC file."""
+        assert "vt-gcp-00038" not in Path(_mod.__file__).read_text(encoding="utf-8")
 
     def test_fresh_env_has_no_conversation_id(self, fake_agy: str) -> None:
         """Fresh session does NOT set ANTIGRAVITY_CONVERSATION_ID (agy ignores it)."""
