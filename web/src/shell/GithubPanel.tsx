@@ -958,7 +958,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
             Changes tab on their own line, so they don't crowd the tabs. gap-0 +
             flex-none keep the two labels close and content-sized (the default
             flex-1 equalizes and spreads them). */}
-          <TabsList variant="line" aria-label="Pull request" className="mt-1.5 h-auto gap-0 p-0">
+          <TabsList variant="line" aria-label="Pull request" className="h-auto gap-0 p-0">
             <TabsTrigger value="summary" className="flex-none">
               Summary
             </TabsTrigger>
