@@ -2270,6 +2270,15 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
     workspace does not serve passes through untouched, because the gateway's
     error beats a silent substitution.
 
+    An implicit default is additionally validated against the Codex Responses
+    route itself: some workspaces (Azure) advertise GPT models in the listing
+    that the route rejects with ``404 RESOURCE_DOES_NOT_EXIST``, so trusting
+    the listing alone pins a model whose first turn dies at the gateway. The
+    ranked candidates are probed in order and the first one the route serves
+    wins; when the probe cannot discriminate (route unreachable, or every
+    candidate rejected) the ranked default stands, so a transient probe
+    failure never downgrades the launch.
+
     :param host: Workspace origin, e.g. ``"https://example.com"``.
     :param profile: Databricks CLI profile backing the launch.
     :param requested: Explicit model id, or ``None`` to take the newest
@@ -2278,14 +2287,17 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
     """
     from omnigent.databricks_model_discovery import (
         discover_databricks_codex_models,
+        first_served_codex_model,
         select_servable_model,
     )
 
     servable: tuple[str, ...] = ()
+    token: str | None = None
     try:
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
         creds = resolve_databricks_workspace(profile)
+        token = creds.token
         # Discover against the host the launch actually posts to. This resolver
         # honors ``DATABRICKS_HOST`` while the launch host comes from the
         # profile section alone (``_databricks_gateway_host``), so using
@@ -2315,6 +2327,26 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
     if requested:
         return select_servable_model(requested, servable) or requested
     if servable:
+        if token is not None and len(servable) > 1:
+            try:
+                served = first_served_codex_model(host, token, servable)
+            except Exception:  # noqa: BLE001 — the ranked default is the fallback
+                _logger.warning(
+                    "native-codex: codex-route servability probe failed for "
+                    "profile %r; keeping the ranked default",
+                    profile,
+                    exc_info=True,
+                )
+                served = None
+            if served is not None and served != servable[0]:
+                _logger.warning(
+                    "native-codex: listing advertises %r but the codex route "
+                    "does not serve it; launching on %r instead",
+                    servable[0],
+                    served,
+                )
+            if served is not None:
+                return served
         return servable[0]
     return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
 

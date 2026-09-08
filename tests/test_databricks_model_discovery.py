@@ -371,3 +371,87 @@ def test_select_servable_model_matches_legacy_spelling() -> None:
     assert select_servable_model("databricks-gpt-5-6-luna", servable) == "system.ai.gpt-5-6-luna"
     # A model the workspace does not serve is left for the caller to pass through.
     assert select_servable_model("databricks-gpt-9-9", servable) is None
+
+
+def _probe_first_served(
+    candidates: tuple[str, ...],
+    served: set[str],
+    *,
+    seen: list[str] | None = None,
+    route_error: bool = False,
+) -> str | None:
+    """Probe *candidates* against a codex route that serves only *served*."""
+    from omnigent.databricks_model_discovery import first_served_codex_model
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/ai-gateway/codex/v1/responses"
+        assert request.headers["authorization"] == "Bearer token"
+        if route_error:
+            raise httpx.ConnectError("route unreachable", request=request)
+        import json
+
+        model = json.loads(request.content).get("model", "")
+        if seen is not None:
+            seen.append(model)
+        if model in served:
+            # A validation 400 for the minimal probe body still proves the
+            # model resource exists on the route.
+            return httpx.Response(400, json={"error": "invalid request"}, request=request)
+        return httpx.Response(404, json={"error_code": "RESOURCE_DOES_NOT_EXIST"}, request=request)
+
+    return first_served_codex_model(
+        "https://workspace.example.com",
+        "token",
+        candidates,
+        transport=httpx.MockTransport(_handler),
+    )
+
+
+def test_first_served_codex_model_skips_unserved_listing_entries() -> None:
+    """Advertised-but-unserved ids are skipped for the first id the route serves.
+
+    The Azure listing advertises GPT ids the codex route 404s; the probe must
+    walk the ranked candidates in order and stop on the first served one.
+    """
+    seen: list[str] = []
+    picked = _probe_first_served(
+        ("system.ai.gpt-5-6-sol", "system.ai.gpt-5-5", "system.ai.glm-5-2"),
+        served={"system.ai.glm-5-2"},
+        seen=seen,
+    )
+    assert picked == "system.ai.glm-5-2"
+    assert seen == ["system.ai.gpt-5-6-sol", "system.ai.gpt-5-5", "system.ai.glm-5-2"]
+
+
+def test_first_served_codex_model_takes_the_first_served_candidate() -> None:
+    """A served top candidate wins immediately — no extra probes."""
+    seen: list[str] = []
+    picked = _probe_first_served(
+        ("system.ai.gpt-5-6-sol", "system.ai.glm-5-2"),
+        served={"system.ai.gpt-5-6-sol", "system.ai.glm-5-2"},
+        seen=seen,
+    )
+    assert picked == "system.ai.gpt-5-6-sol"
+    assert seen == ["system.ai.gpt-5-6-sol"]
+
+
+def test_first_served_codex_model_rejecting_every_candidate_returns_none() -> None:
+    """When the route rejects every candidate the caller keeps its default."""
+    assert (
+        _probe_first_served(("system.ai.gpt-5-6-sol", "system.ai.gpt-5-5"), served=set()) is None
+    )
+
+
+def test_first_served_codex_model_unreachable_route_fails_open() -> None:
+    """A transport failure cannot discriminate, so the probe reports None."""
+    assert _probe_first_served(("system.ai.gpt-5-6-sol",), served=set(), route_error=True) is None
+
+
+def test_first_served_codex_model_caps_the_probe_walk() -> None:
+    """A large listing is probed only up to the cap so a launch cannot stall."""
+    from omnigent.databricks_model_discovery import _CODEX_PROBE_MAX_MODELS
+
+    seen: list[str] = []
+    candidates = tuple(f"system.ai.gpt-{n}-0" for n in range(_CODEX_PROBE_MAX_MODELS + 3))
+    assert _probe_first_served(candidates, served=set(), seen=seen) is None
+    assert seen == list(candidates[:_CODEX_PROBE_MAX_MODELS])

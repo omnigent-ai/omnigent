@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import httpx
@@ -16,6 +16,7 @@ CLAUDE_MODEL_FAMILIES: tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
 
 _MODEL_SERVICES_PATH = "/api/2.1/unity-catalog/model-services"
 _ANTHROPIC_MODELS_PATH = "/ai-gateway/anthropic/v1/models"
+_CODEX_RESPONSES_PATH = "/ai-gateway/codex/v1/responses"
 _MODEL_SERVICE_PREFIX = "model-services/"
 _SYSTEM_MODEL_PREFIX = "system.ai."
 _MODEL_SERVICES_MAX_RESULTS = 1000
@@ -23,6 +24,11 @@ _MODEL_SERVICES_PARENT = "schemas/system.ai"
 _PAGE_SIZE = 100
 _MAX_PAGES = 100
 _HTTP_TIMEOUT_S = 10.0
+# Servability probes bound launch latency: unserved ids are rejected at the
+# gateway's routing layer (fast 404s), so a handful of probes is cheap, while
+# an uncapped walk of a large listing could stall the launch.
+_CODEX_PROBE_MAX_MODELS = 5
+_CODEX_PROBE_TIMEOUT_S = 5.0
 
 
 #: Catalog spellings the same endpoint can be served under. Ordered by
@@ -411,6 +417,53 @@ def _codex_preference_rank(model_id: str) -> tuple[int, int, int, int, str]:
         return (0, 0, 0, 0, bare)
     _family, major, minor, tier = match.groups()
     return (1, int(major), int(minor), 0 if tier else 1, tier or "")
+
+
+# DATABRICKS-PATCH(codex-live-model-discovery)
+def first_served_codex_model(
+    workspace_url: str,
+    token: str,
+    candidates: Sequence[str],
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> str | None:
+    """Pick the first candidate the workspace's codex route actually serves.
+
+    The Unity Catalog listing reports what a workspace *advertises*, and on
+    some workspaces (Azure) that includes GPT models the Codex Responses
+    route rejects with ``404 RESOURCE_DOES_NOT_EXIST`` — so a launch default
+    taken from the listing alone can die on the user's first turn. The route
+    itself is the only servability oracle: each candidate gets a minimal
+    probe request, in rank order, and the first one the gateway does not
+    reject as absent wins.
+
+    Fail-open by design: any non-404 answer (including a validation 400 for
+    the deliberately minimal probe body) proves the model resource exists,
+    and an unreachable route returns ``None`` so the caller keeps its ranked
+    default — a transient failure must never silently downgrade the launch.
+
+    :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
+    :param token: Workspace bearer token.
+    :param candidates: Codex-servable ids, best first, e.g. the result of
+        :func:`discover_databricks_codex_models`. Probing stops after
+        ``_CODEX_PROBE_MAX_MODELS`` ids so a large listing cannot stall the
+        launch.
+    :returns: The first served id, or ``None`` when every probed candidate is
+        rejected or the route cannot be reached.
+    """
+    url = f"{workspace_url.rstrip('/')}{_CODEX_RESPONSES_PATH}"
+    headers = {"Authorization": f"Bearer {token}"}
+    with httpx.Client(transport=transport, timeout=_CODEX_PROBE_TIMEOUT_S) as client:
+        for model_id in candidates[:_CODEX_PROBE_MAX_MODELS]:
+            try:
+                response = client.post(url, headers=headers, json={"model": model_id})
+            except httpx.HTTPError:
+                # The route is unreachable, so the probe cannot discriminate;
+                # let the caller keep its ranked default.
+                return None
+            if response.status_code != 404:
+                return model_id
+    return None
 
 
 def select_servable_model(requested: str, servable: Iterable[str]) -> str | None:
