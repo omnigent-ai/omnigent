@@ -32,6 +32,7 @@ from collections.abc import (
 )
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, cast
 
@@ -77,7 +78,12 @@ from .executor import (
 )
 from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOOK_HEADROOM_S
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
-from .model_signer import ModelSignerSession, SignerReadiness
+from .model_signer import (
+    ModelSignerSession,
+    SignerLaunchConfig,
+    SignerReadiness,
+    SubprocessModelSigner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -880,7 +886,9 @@ def _populate_codex_home_config(
     symlink_files: tuple[str, ...] = _CODEX_HOME_SYMLINK_FILES
     if not include_credentials:
         symlink_files = tuple(
-            name for name in symlink_files if name not in {"auth.json", ".credentials.json"}
+            name
+            for name in symlink_files
+            if name not in {"auth.json", ".credentials.json", "memories_1.sqlite"}
         )
     if not minimal_config:
         symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
@@ -1865,6 +1873,28 @@ def _provider_codex_config_overrides(
     return overrides
 
 
+def _brokered_codex_config_overrides(
+    *,
+    model: str,
+    base_url: str,
+) -> list[str]:
+    """Pin Codex to the signer relay placeholder without a host auth command."""
+    provider_name = "omnigent_brokered"
+    return [
+        f"model={json.dumps(model)}",
+        f'model_provider="{provider_name}"',
+        "model_supports_reasoning_summaries=true",
+        (
+            f"model_providers.{provider_name}="
+            '{name="Omnigent Brokered",'
+            f"base_url={json.dumps(base_url)},"
+            'env_key="OPENAI_API_KEY",'
+            'wire_api="responses"}'
+        ),
+        'web_search="disabled"',
+    ]
+
+
 def _parse_optional_int(value: str | None) -> int | None:
     """Parse an optional integer env-var value.
 
@@ -2362,7 +2392,9 @@ class _CodexAppServerSession:
         codex_home_root = Path(tempfile.gettempdir())
         if self._cwd and self._cwd != "/":
             try:
-                codex_home_root = Path(self._cwd) / ".codex-tmp"
+                codex_home_root = Path(self._cwd) / (
+                    "omnigent-codex-tmp" if self._signer is not None else ".codex-tmp"
+                )
                 codex_home_root.mkdir(parents=True, exist_ok=True)
             except OSError:
                 # The cwd may be on a read-only filesystem — e.g. macOS
@@ -2415,6 +2447,7 @@ class _CodexAppServerSession:
             _populate_codex_home_config,
             self._codex_home_dir,
             config_source,
+            minimal_config=True if self._signer is not None else None,
             inject_hooks=router_bridge_dir is not None,
             extend_model_catalog=codex_extended_catalog_requested(self._env),
             include_credentials=self._signer is None,
@@ -2424,6 +2457,13 @@ class _CodexAppServerSession:
             self._codex_config_overrides,
             retry_policy=self._retry_policy,
         )
+        if self._signer is not None:
+            self._codex_config_overrides.extend(
+                [
+                    f"sqlite_home={json.dumps(str(self._codex_home_dir))}",
+                    "features.memories=false",
+                ]
+            )
         if router_bridge_dir is not None:
             write_codex_router_hooks_file(
                 self._codex_home_dir,
@@ -2435,6 +2475,13 @@ class _CodexAppServerSession:
         # history) in a private temp directory rather than the user's ~/.codex/.
         # This prevents subagent sessions from polluting the user's Codex history.
         proc_env = {**self._env, "CODEX_HOME": str(self._codex_home_dir)}
+        if self._signer is not None:
+            # Newer Codex builds keep some SQLite stores relative to HOME even
+            # when CODEX_HOME is set. Keep those stores inside the same private,
+            # sandbox-writable session directory and away from host ~/.codex.
+            proc_env["HOME"] = str(self._codex_home_dir)
+            proc_env["CFFIXED_USER_HOME"] = str(self._codex_home_dir)
+            proc_env["CODEX_SQLITE_HOME"] = str(self._codex_home_dir)
         try:
             process_cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             self._worker_launch = prepare_codex_worker(
@@ -3413,6 +3460,7 @@ def _default_app_session_factory(
     bundle_dir: Path | None,
     skills_filter: str | list[str],
     os_env: OSEnvSpec | None,
+    signer_launch_config: SignerLaunchConfig | None = None,
 ) -> _CodexAppServerSession:
     return _CodexAppServerSession(
         codex_path=codex_path,
@@ -3425,6 +3473,11 @@ def _default_app_session_factory(
         bundle_dir=bundle_dir,
         skills_filter=skills_filter,
         os_env=os_env,
+        signer_factory=(
+            (lambda: SubprocessModelSigner(signer_launch_config))
+            if signer_launch_config is not None
+            else None
+        ),
     )
 
 
@@ -3450,6 +3503,7 @@ class CodexExecutor(Executor):
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        signer_launch_config: SignerLaunchConfig | None = None,
     ) -> None:
         """Create a CodexExecutor.
 
@@ -3522,6 +3576,9 @@ class CodexExecutor(Executor):
             empty so Codex sees no skills; a list exposes only the
             named skills (looked up across all sources, bundle wins
             on name conflict).
+        :param signer_launch_config: Trusted, non-secret signer authority.
+            When set, the default session factory creates a fresh signer for
+            each session and Codex is pinned to its endpoint and placeholder.
         """
         self._cwd = cwd
         self._os_env_spec = os_env
@@ -3554,6 +3611,33 @@ class CodexExecutor(Executor):
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._env.update(self._retry_policy.codex_cli.env())
         self._codex_config_overrides: list[str] = []
+        if signer_launch_config is not None:
+            if os_env is None or os_env.sandbox is None or os_env.sandbox.type == "none":
+                raise OSError("signer-backed Codex worker requires an active sandbox")
+            if model is None:
+                raise ValueError("signer-backed Codex requires an explicit model")
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        model_provider_override,
+                        gateway_host,
+                        base_url_override,
+                        gateway_auth_command,
+                    )
+                )
+                or gateway
+            ):
+                raise ValueError(
+                    "signer-backed Codex uses only its trusted endpoint and cannot "
+                    "combine with gateway or provider overrides"
+                )
+            self._codex_config_overrides.extend(
+                _brokered_codex_config_overrides(
+                    model=model,
+                    base_url=signer_launch_config.endpoint,
+                )
+            )
         if model_provider_override is not None and gateway:
             # Both would fight over model_provider in the -c overrides; the
             # AP producer must emit exactly one routing mechanism.
@@ -3649,18 +3733,24 @@ class CodexExecutor(Executor):
                     auth_refresh_interval_ms=self._gateway_auth_refresh_interval_ms,
                 )
             )
-        if not enable_web_search:
+        if not enable_web_search and signer_launch_config is None:
             # Disable Codex's built-in web_search tool so the model can only reach
             # tools exposed by Omnigent as dynamicTools. The top-level web_search
             # key accepts "live", "cached", or "disabled".
             self._codex_config_overrides.append('web_search="disabled"')
         self._tool_executor: CodexToolExecutor | None = None
         self._session_states: dict[str, _CodexSessionState] = {}
-        self._app_session_factory: _AppSessionFactory = (
-            app_session_factory
-            if app_session_factory is not None
-            else _default_app_session_factory
-        )
+        self._app_session_factory: _AppSessionFactory
+        if app_session_factory is not None:
+            self._app_session_factory = app_session_factory
+        else:
+            self._app_session_factory = cast(
+                _AppSessionFactory,
+                partial(
+                    _default_app_session_factory,
+                    signer_launch_config=signer_launch_config,
+                ),
+            )
 
     def supports_streaming(self) -> bool:
         return True

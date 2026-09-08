@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -21,7 +22,11 @@ from .model_auth import (
     _provider_auth_message,
     _validated_authority,
 )
-from .model_egress import FrozenModelRoute
+from .model_egress import (
+    FrozenModelRoute,
+    ProviderModelBinding,
+    resolve_model_routes,
+)
 
 _READINESS_TIMEOUT_SECONDS = 15.0
 _SHUTDOWN_TIMEOUT_SECONDS = 6.0
@@ -52,13 +57,51 @@ class SignerLaunchConfig:
     auth_profile: str | None = None
 
     def __post_init__(self) -> None:
+        endpoint = urlsplit(self.endpoint)
+        endpoint_prefix = endpoint.path.rstrip("/")
+        if (
+            endpoint.scheme != "https"
+            or endpoint.hostname is None
+            or endpoint.username is not None
+            or endpoint.password is not None
+            or endpoint.port not in (None, 443)
+            or endpoint.query
+            or endpoint.fragment
+            or endpoint.path in ("", "/")
+            or len(self.routes) != 1
+            or self.routes[0].method != "POST"
+            or self.routes[0].host != endpoint.hostname.lower()
+            or self.routes[0].path != f"{endpoint_prefix}/responses"
+        ):
+            raise ValueError("signer authority must be exact POST trusted /responses")
         if self.binding_id == "databricks-ucode-v1":
-            endpoint = urlsplit(self.endpoint)
-            if endpoint.hostname is None or self.auth_profile is None:
+            if self.auth_profile is None:
                 raise ValueError("ucode signer requires trusted host and profile")
             _validated_authority(f"https://{endpoint.hostname}", self.auth_profile)
         elif self.auth_profile is not None:
             raise ValueError("test signer must not carry an authentication profile")
+
+    @classmethod
+    def from_trusted_authority(
+        cls,
+        *,
+        binding_id: str,
+        provider: ProviderModelBinding,
+        trusted_session_endpoint: str,
+        operator_model_egress: Sequence[str],
+        auth_profile: str | None = None,
+    ) -> SignerLaunchConfig:
+        """Build a signer launch from the explicit three-way authority intersection."""
+        return cls(
+            binding_id=binding_id,
+            endpoint=trusted_session_endpoint,
+            routes=resolve_model_routes(
+                provider=provider,
+                trusted_session_endpoint=trusted_session_endpoint,
+                operator_model_egress=operator_model_egress,
+            ),
+            auth_profile=auth_profile,
+        )
 
     def to_jsonable(self) -> dict[str, object]:
         """Return the strict non-secret child configuration."""

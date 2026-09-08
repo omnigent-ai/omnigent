@@ -21,6 +21,7 @@ from omnigent.inner.codex_executor import (
     _codex_builtin_tool_completion,
     _codex_cli_version,
     _CodexAppServerSession,
+    _CodexSessionState,
     _databricks_codex_config_overrides,
     _dynamic_tool_result_payload,
     _goal_objective_from_content,
@@ -29,6 +30,7 @@ from omnigent.inner.codex_executor import (
     _provider_codex_config_overrides,
     _to_codex_input_items,
 )
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     ExecutorError,
     ReasoningChunk,
@@ -38,6 +40,8 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
+from omnigent.inner.model_egress import FrozenModelRoute
+from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigner
 from omnigent.models.codex_model_vocabulary import codex_spawn_model
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
@@ -3905,6 +3909,61 @@ def test_run_turn_cli_config_passes_no_model_to_thread_create():
         assert fake_session.calls[0]["model"] is None
 
     _run(_t())
+
+
+def test_default_factory_wires_fresh_typed_signer_per_session(tmp_path: Path) -> None:
+    async def _t() -> None:
+        config = SignerLaunchConfig(
+            binding_id="test-fake-provider-v1",
+            endpoint="https://model.test/v1",
+            routes=(FrozenModelRoute(method="POST", host="model.test", path="/v1/responses"),),
+        )
+        executor = CodexExecutor(
+            cwd=str(tmp_path),
+            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+            codex_path="/bin/echo",
+            model="gpt-5.4-mini",
+            signer_launch_config=config,
+        )
+
+        first = await executor._ensure_app_session(
+            _CodexSessionState(),
+            signature=(None, "model", str(tmp_path), "workspace-write"),
+            effective_cwd=str(tmp_path),
+        )
+        second = await executor._ensure_app_session(
+            _CodexSessionState(),
+            signature=(None, "model", str(tmp_path), "workspace-write"),
+            effective_cwd=str(tmp_path),
+        )
+
+        first_signer = first._signer_factory()
+        second_signer = second._signer_factory()
+        assert isinstance(first_signer, SubprocessModelSigner)
+        assert isinstance(second_signer, SubprocessModelSigner)
+        assert first_signer is not second_signer
+        assert first_signer._config is config
+        rendered = "\n".join(executor._codex_config_overrides)
+        assert 'env_key="OPENAI_API_KEY"' in rendered
+        assert "auth=" not in rendered
+        assert "gateway_auth_command" not in rendered
+
+    _run(_t())
+
+
+def test_signer_backed_executor_rejects_missing_sandbox_before_session() -> None:
+    config = SignerLaunchConfig(
+        binding_id="test-fake-provider-v1",
+        endpoint="https://model.test/v1",
+        routes=(FrozenModelRoute(method="POST", host="model.test", path="/v1/responses"),),
+    )
+
+    with pytest.raises(OSError, match="requires an active sandbox"):
+        CodexExecutor(
+            codex_path="/bin/echo",
+            model="gpt-5.4-mini",
+            signer_launch_config=config,
+        )
 
 
 def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
