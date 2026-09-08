@@ -4408,6 +4408,10 @@ export function Composer({
   // "Attach to agent" button). Drained into ``mentionedItems`` below, then
   // cleared from the store so they aren't re-applied.
   const pendingComposerAttachments = useChatStore((s) => s.pendingComposerAttachments);
+  // Text pushed in from outside the composer (e.g. an OS Share intent, see
+  // shareIntake.ts). Drained into ``value`` below, then cleared from the
+  // store so it isn't re-applied on the next render.
+  const pendingComposerText = useChatStore((s) => s.pendingComposerText);
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
@@ -4748,6 +4752,21 @@ export function Composer({
     return () => useChatStore.getState().clearPendingComposerAttachments();
     // setMentionedItems is a stable useState setter (from useMentionBrowser).
   }, [pendingComposerAttachments, setMentionedItems]);
+
+  // Drain externally-queued composer text (an OS Share intent, see
+  // shareIntake.ts) the same way the attachment queue above is drained.
+  // Only fills an empty composer -- in-progress text the user already typed
+  // wins, same rule as the failed-send-draft restore below.
+  useEffect(() => {
+    if (pendingComposerText === null) return;
+    if (valueRef.current.trim() === "") {
+      setValue(pendingComposerText);
+      dirtyRef.current = true;
+      if (!isMobileRef.current) textareaRef.current?.focus();
+    }
+    useChatStore.getState().clearPendingComposerText();
+    return () => useChatStore.getState().clearPendingComposerText();
+  }, [pendingComposerText]);
 
   // Restore the text (and attachments) of a send that failed, so the user can
   // fix and resend instead of retyping. The composer is empty in the normal

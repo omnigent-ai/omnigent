@@ -627,6 +627,13 @@ export interface AppChatState {
    */
   pendingComposerAttachments: ComposerAttachment[];
   /**
+   * Text queued into the active composer from outside it — e.g. an OS Share
+   * intent handed off via a `#shared-text=` URL fragment at boot. The
+   * composer drains this into its own input state on mount/change, the same
+   * way it drains {@link ChatState.pendingComposerAttachments}.
+   */
+  pendingComposerText: string | null;
+  /**
    * True when this tab could not take an origin-wide stream slot for a
    * conversation it needed to open: every slot is held by other tabs and this
    * tab had no background stream of its own to reclaim. The active conversation
@@ -786,6 +793,10 @@ export interface ChatActions {
   addComposerAttachment: (attachment: ComposerAttachment) => void;
   /** Drain the queued composer attachments (called by the composer). */
   clearPendingComposerAttachments: () => void;
+  /** Queue text into the active composer from outside it. */
+  setPendingComposerText: (text: string) => void;
+  /** Drain the queued composer text (called by the composer). */
+  clearPendingComposerText: () => void;
   /** Stamp {@link ChatState.runnerLaunchedAt} now — call right after a
    *  successful `launchRunner` for the open session. */
   markRunnerLaunched: () => void;
@@ -1324,6 +1335,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   oldestItemId: null,
   flashItemId: null,
   pendingComposerAttachments: [],
+  pendingComposerText: null,
   streamBudgetExceeded: false,
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
@@ -1983,6 +1995,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // drained yet, so it can't bleed into the incoming composer (which drains
       // the store on mount).
       pendingComposerAttachments: [],
+      // Same reasoning: a queued share-intake text belongs to the composer
+      // that was active when it arrived, not whatever conversation this
+      // switch lands on.
+      pendingComposerText: null,
     });
     conversationRegistry.setActive(conversationId);
 
@@ -2125,6 +2141,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   clearPendingComposerAttachments: () => setActive({ pendingComposerAttachments: [] }),
+
+  setPendingComposerText: (text) => setActive({ pendingComposerText: text }),
+
+  clearPendingComposerText: () => setActive({ pendingComposerText: null }),
 
   dismissStreamBudgetBanner: () => rootSetState({ streamBudgetBannerDismissed: true }),
 

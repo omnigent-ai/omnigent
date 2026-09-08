@@ -5,6 +5,7 @@ import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useShareIntake } from "@/lib/shareIntake";
 import { AppShell } from "@/shell/AppShell";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
@@ -116,6 +117,7 @@ function App({ basename }: AppProps = {}) {
   // (no basename): `prefix` is empty, so every `path` below is identical to
   // the original relative route table.
   const prefix = basename ?? "";
+  useShareIntake();
   const info = useServerInfo();
   // While the probe is in flight, render nothing — first paint is
   // ~30ms after boot anyway, and flashing the chrome we may
