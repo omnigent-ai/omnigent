@@ -53,6 +53,7 @@ from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
+from .codex_worker import CodexWorkerLaunch, prepare_codex_worker
 from .databricks_executor import (
     _databricks_gateway_host,
 )
@@ -2258,6 +2259,7 @@ class _CodexAppServerSession:
         disable_native_tools: bool = False,
         bundle_dir: Path | None = None,
         skills_filter: str | list[str] = "all",
+        os_env: OSEnvSpec | None = None,
     ) -> None:
         self._codex_path = codex_path
         self._cwd = cwd
@@ -2268,6 +2270,7 @@ class _CodexAppServerSession:
         self._disable_native_tools = disable_native_tools
         self._bundle_dir = bundle_dir
         self._skills_filter = skills_filter
+        self._os_env_spec = os_env
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -2297,6 +2300,8 @@ class _CodexAppServerSession:
         self._fatal_gateway_error: _CodexGatewayError | None = None
         self._recent_events: list[CodexMessage] = []
         self._process_cwd: Path | None = None
+        self._worker_launch: CodexWorkerLaunch | None = None
+        self._containment_confirmed = False
         # Private CODEX_HOME so the subprocess never writes to the user's ~/.codex/.
         self._codex_home_dir: Path | None = None
         # Most recent ``thread/tokenUsage/updated`` payload's ``last``
@@ -2388,7 +2393,15 @@ class _CodexAppServerSession:
         # This prevents subagent sessions from polluting the user's Codex history.
         proc_env = {**self._env, "CODEX_HOME": str(self._codex_home_dir)}
         try:
-            argv = [self._codex_path, "app-server"]
+            process_cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
+            self._worker_launch = prepare_codex_worker(
+                codex_path=self._codex_path,
+                cwd=process_cwd,
+                codex_home=self._codex_home_dir,
+                os_env=self._os_env_spec,
+                spawn_env_names=list(proc_env),
+            )
+            argv = [self._worker_launch.launch_path, "app-server"]
             for override in self._codex_config_overrides:
                 argv.extend(["-c", override])
             self._proc = await _create_subprocess_exec(
@@ -2414,6 +2427,7 @@ class _CodexAppServerSession:
                     },
                 },
             )
+            self._containment_confirmed = self._worker_launch.sandboxed
             self._started = True
             if router_bridge_dir is not None:
                 # App-server threads run persisted-trusted hooks only, so the
@@ -2448,6 +2462,7 @@ class _CodexAppServerSession:
             self._loop = None
             self.thread_id = None
             self.active_turn_id = None
+            self._cleanup_worker_launch()
             self._cleanup_process_cwd()
             return
 
@@ -2483,7 +2498,15 @@ class _CodexAppServerSession:
         self.thread_id = None
         self.active_turn_id = None
         self._recent_events.clear()
+        self._cleanup_worker_launch()
         self._cleanup_process_cwd()
+
+    def _cleanup_worker_launch(self) -> None:
+        launch = self._worker_launch
+        self._worker_launch = None
+        self._containment_confirmed = False
+        if launch is not None:
+            launch.close()
 
     def _cleanup_process_cwd(self) -> None:
         if self._codex_home_dir is not None:
@@ -2591,6 +2614,8 @@ class _CodexAppServerSession:
     ) -> AsyncIterator[ExecutorEvent]:
         await self.start()
         assert self._proc is not None
+        if self._containment_confirmed:
+            sandbox = "danger-full-access"
 
         # Fresh turn: forget any prior turn's gateway-error signals and clear
         # the shared watchdog slot so a resolved earlier failure can't be
@@ -3291,6 +3316,7 @@ class _AppSessionFactory(Protocol):
         disable_native_tools: bool,
         bundle_dir: Path | None,
         skills_filter: str | list[str],
+        os_env: OSEnvSpec | None,
     ) -> _CodexAppServerSession: ...
 
 
@@ -3305,6 +3331,7 @@ def _default_app_session_factory(
     disable_native_tools: bool,
     bundle_dir: Path | None,
     skills_filter: str | list[str],
+    os_env: OSEnvSpec | None,
 ) -> _CodexAppServerSession:
     return _CodexAppServerSession(
         codex_path=codex_path,
@@ -3316,6 +3343,7 @@ def _default_app_session_factory(
         disable_native_tools=disable_native_tools,
         bundle_dir=bundle_dir,
         skills_filter=skills_filter,
+        os_env=os_env,
     )
 
 
@@ -3637,6 +3665,7 @@ class CodexExecutor(Executor):
             disable_native_tools=self._disable_native_tools,
             bundle_dir=self._bundle_dir,
             skills_filter=self._skills_filter,
+            os_env=self._os_env_spec,
         )
         state.app_session = app_session
         state.signature = signature
