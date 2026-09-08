@@ -10,9 +10,16 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
+from .model_auth import (
+    PROVIDER_AUTH_REQUIRED,
+    ProviderAuthRequired,
+    _provider_auth_message,
+    _validated_authority,
+)
 from .model_egress import FrozenModelRoute
 
 _READINESS_TIMEOUT_SECONDS = 15.0
@@ -26,6 +33,7 @@ _READINESS_KEYS = frozenset(
         "placeholder",
     }
 )
+_AUTH_ERROR_KEYS = frozenset({"status", "code"})
 
 
 class SignerStartError(RuntimeError):
@@ -39,10 +47,20 @@ class SignerLaunchConfig:
     binding_id: str
     endpoint: str
     routes: tuple[FrozenModelRoute, ...]
+    auth_profile: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.binding_id == "databricks-ucode-v1":
+            endpoint = urlsplit(self.endpoint)
+            if endpoint.hostname is None or self.auth_profile is None:
+                raise ValueError("ucode signer requires trusted host and profile")
+            _validated_authority(f"https://{endpoint.hostname}", self.auth_profile)
+        elif self.auth_profile is not None:
+            raise ValueError("test signer must not carry an authentication profile")
 
     def to_jsonable(self) -> dict[str, object]:
         """Return the strict non-secret child configuration."""
-        return {
+        payload: dict[str, object] = {
             "binding_id": self.binding_id,
             "endpoint": self.endpoint,
             "routes": [
@@ -50,6 +68,9 @@ class SignerLaunchConfig:
                 for route in self.routes
             ],
         }
+        if self.auth_profile is not None:
+            payload["auth_profile"] = self.auth_profile
+        return payload
 
 
 @dataclass(frozen=True)
@@ -140,7 +161,7 @@ class SubprocessModelSigner:
                 raise SignerStartError("model signer exited before readiness")
             if len(line) > 16_384:
                 raise SignerStartError("model signer returned oversized readiness")
-            readiness = _parse_readiness(line)
+            readiness = _parse_readiness(line, self._config)
         except Exception:
             await self._abort()
             raise
@@ -189,11 +210,23 @@ class SubprocessModelSigner:
         close_subprocess_transport(proc)
 
 
-def _parse_readiness(line: bytes) -> SignerReadiness:
+def _parse_readiness(line: bytes, config: SignerLaunchConfig) -> SignerReadiness:
     try:
         payload = json.loads(line)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SignerStartError("model signer returned invalid readiness") from exc
+    if (
+        isinstance(payload, dict)
+        and set(payload) == _AUTH_ERROR_KEYS
+        and payload.get("status") == "error"
+        and payload.get("code") == PROVIDER_AUTH_REQUIRED
+        and config.auth_profile is not None
+    ):
+        endpoint = urlsplit(config.endpoint)
+        assert endpoint.hostname is not None
+        raise ProviderAuthRequired(
+            _provider_auth_message(f"https://{endpoint.hostname}", config.auth_profile)
+        )
     if not isinstance(payload, dict) or set(payload) != _READINESS_KEYS:
         raise SignerStartError("model signer returned invalid readiness fields")
     if payload.get("status") != "ready":

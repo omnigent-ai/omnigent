@@ -19,12 +19,15 @@ from .egress.ca import ensure_ca, ensure_ca_bundle
 from .egress.certs import HostCertCache
 from .egress.proxy import EgressProxy, _parse_http_headers
 from .egress.rules import parse_rules
+from .model_auth import PROVIDER_AUTH_REQUIRED, ProviderAuthRequired, mint_ucode_token
 from .model_egress import FrozenModelRoute
 from .model_signing import SigningRejected, reconstruct_signed_request
 
 _CONFIG_KEYS = frozenset({"binding_id", "endpoint", "routes"})
+_UCODE_CONFIG_KEYS = _CONFIG_KEYS | {"auth_profile"}
 _ROUTE_KEYS = frozenset({"method", "host", "path"})
 _TEST_BINDING = "test-fake-provider-v1"
+_UCODE_BINDING = "databricks-ucode-v1"
 _MAX_CONFIG_BYTES = 64 * 1024
 _MAX_HEADER_BYTES = 64 * 1024
 
@@ -41,14 +44,14 @@ class _SignerRelay(EgressProxy):
         ca_cert_path: Path,
         ca_key_path: Path,
         ca_bundle_path: Path,
-        provider_port: int,
+        provider_port: int | None,
     ) -> None:
         super().__init__(
             parse_rules([f"{route.method} {route.host}{route.path}"]),
             ca_cert_path,
             ca_key_path,
             upstream_ca_bundle=ca_bundle_path,
-            block_private_destinations=False,
+            block_private_destinations=provider_port is None,
         )
         self._route = route
         self._placeholder = placeholder
@@ -58,7 +61,9 @@ class _SignerRelay(EgressProxy):
     async def _assert_destination_allowed(self, host: str, port: int) -> str | None:
         if host.lower() != self._route.host or port != 443:
             raise PermissionError("destination is outside the signer route")
-        return "127.0.0.1"
+        if self._provider_port is not None:
+            return "127.0.0.1"
+        return await super()._assert_destination_allowed(host, port)
 
     async def _forward_https(
         self,
@@ -96,9 +101,14 @@ class _SignerRelay(EgressProxy):
             return
 
         try:
+            connect_host = (
+                "127.0.0.1"
+                if self._provider_port is not None
+                else await self._assert_destination_allowed(signed.host, 443)
+            )
             upstream_reader, upstream_writer = await asyncio.open_connection(
-                "127.0.0.1",
-                self._provider_port,
+                connect_host or signed.host,
+                self._provider_port or 443,
                 ssl=self._upstream_ssl_ctx,
                 server_hostname=signed.host,
             )
@@ -184,15 +194,19 @@ async def _fake_provider(
             await writer.wait_closed()
 
 
-def _load_config(fd: int) -> tuple[str, FrozenModelRoute]:
+def _load_config(fd: int) -> tuple[str, FrozenModelRoute, str | None]:
     with os.fdopen(fd, "rb", closefd=True) as stream:
         raw = stream.read(_MAX_CONFIG_BYTES + 1)
     if len(raw) > _MAX_CONFIG_BYTES:
         raise ValueError("signer config is too large")
     payload = json.loads(raw)
-    if not isinstance(payload, dict) or set(payload) != _CONFIG_KEYS:
+    if not isinstance(payload, dict):
         raise ValueError("signer config fields are invalid")
-    if payload["binding_id"] != _TEST_BINDING:
+    binding_id = payload.get("binding_id")
+    expected_keys = _UCODE_CONFIG_KEYS if binding_id == _UCODE_BINDING else _CONFIG_KEYS
+    if set(payload) != expected_keys:
+        raise ValueError("signer config fields are invalid")
+    if binding_id not in (_TEST_BINDING, _UCODE_BINDING):
         raise ValueError("provider binding is unavailable")
     endpoint = urlsplit(str(payload["endpoint"]))
     routes = payload["routes"]
@@ -220,7 +234,8 @@ def _load_config(fd: int) -> tuple[str, FrozenModelRoute]:
         or route.path != f"{endpoint_prefix}/responses"
     ):
         raise ValueError("signer authority must be exact POST trusted /responses")
-    return str(payload["binding_id"]), route
+    auth_profile = str(payload["auth_profile"]) if binding_id == _UCODE_BINDING else None
+    return str(binding_id), route, auth_profile
 
 
 def _pick_relay_port() -> int:
@@ -233,7 +248,15 @@ def _pick_relay_port() -> int:
 
 
 async def _run(config_fd: int) -> int:
-    _, route = _load_config(config_fd)
+    binding_id, route, auth_profile = _load_config(config_fd)
+    if binding_id == _UCODE_BINDING:
+        assert auth_profile is not None
+        bearer_token = await mint_ucode_token(
+            host=f"https://{route.host}",
+            profile=auth_profile,
+        )
+    else:
+        bearer_token = f"fake-provider-bearer-{secrets.token_urlsafe(32)}"
     private_dir = Path(tempfile.mkdtemp(prefix="omnigent-model-signer-private-")).resolve()
     public_dir: Path | None = None
     relay: _SignerRelay | None = None
@@ -247,21 +270,21 @@ async def _run(config_fd: int) -> int:
         os.chmod(ca_cert, 0o444)
         os.chmod(ca_bundle, 0o444)
         placeholder = f"oa_cred_{secrets.token_urlsafe(24)}"
-        bearer_token = f"fake-provider-bearer-{secrets.token_urlsafe(32)}"
-
-        provider_context = HostCertCache(ca_cert, ca_key).get_ssl_context(route.host)
-        provider = await asyncio.start_server(
-            lambda reader, writer: _fake_provider(
-                reader,
-                writer,
-                route=route,
-                bearer_token=bearer_token,
-            ),
-            "127.0.0.1",
-            0,
-            ssl=provider_context,
-        )
-        provider_port = int(provider.sockets[0].getsockname()[1])
+        provider_port: int | None = None
+        if binding_id == _TEST_BINDING:
+            provider_context = HostCertCache(ca_cert, ca_key).get_ssl_context(route.host)
+            provider = await asyncio.start_server(
+                lambda reader, writer: _fake_provider(
+                    reader,
+                    writer,
+                    route=route,
+                    bearer_token=bearer_token,
+                ),
+                "127.0.0.1",
+                0,
+                ssl=provider_context,
+            )
+            provider_port = int(provider.sockets[0].getsockname()[1])
         relay = _SignerRelay(
             route=route,
             placeholder=placeholder,
@@ -301,6 +324,16 @@ def main() -> int:
     args = parser.parse_args()
     try:
         return asyncio.run(_run(args.config_fd))
+    except ProviderAuthRequired:
+        sys.stdout.write(
+            json.dumps(
+                {"status": "error", "code": PROVIDER_AUTH_REQUIRED},
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        sys.stdout.flush()
+        return 1
     except Exception:  # noqa: BLE001 - signer failures are intentionally opaque
         return 1
 

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import ssl
+import stat
 import sys
 from pathlib import Path
 
@@ -13,6 +15,7 @@ import pytest
 from omnigent.inner.egress.relay import start_relay
 from omnigent.inner.model_egress import FrozenModelRoute
 from omnigent.inner.model_signer import (
+    ProviderAuthRequired,
     SignerLaunchConfig,
     SignerStartError,
     SubprocessModelSigner,
@@ -30,6 +33,21 @@ def _config(binding_id: str) -> SignerLaunchConfig:
                 path="/serving-endpoints/openai/responses",
             ),
         ),
+    )
+
+
+def _ucode_config() -> SignerLaunchConfig:
+    return SignerLaunchConfig(
+        binding_id="databricks-ucode-v1",
+        endpoint="https://workspace.cloud.databricks.com/serving-endpoints/openai",
+        routes=(
+            FrozenModelRoute(
+                method="POST",
+                host="workspace.cloud.databricks.com",
+                path="/serving-endpoints/openai/responses",
+            ),
+        ),
+        auth_profile="agent-profile",
     )
 
 
@@ -129,8 +147,67 @@ async def test_helper_stderr_is_not_exposed_in_start_error(
     assert "SECRET_FROM_HELPER" not in str(raised.value)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="v1 signer uses config fd")
+async def test_ucode_auth_failure_has_stable_safe_recovery_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ucode = tmp_path / "ucode"
+    ucode.write_text(
+        "#!/bin/sh\n"
+        "printf 'SECRET_HELPER_STDERR' >&2\n"
+        "printf 'SECRET_TOKEN\\nextra-output\\n'\n"
+        "exit 19\n",
+        encoding="utf-8",
+    )
+    ucode.chmod(ucode.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}/usr/bin:/bin")
+    signer = SubprocessModelSigner(_ucode_config())
+
+    with pytest.raises(ProviderAuthRequired) as raised:
+        await signer.start()
+
+    assert raised.value.code == "PROVIDER_AUTH_REQUIRED"
+    message = str(raised.value)
+    assert "SECRET_HELPER_STDERR" not in message
+    assert "SECRET_TOKEN" not in message
+    assert "ucode configure" in message
+    assert (
+        "databricks auth login --host https://workspace.cloud.databricks.com "
+        "--profile agent-profile"
+    ) in message
+    assert await signer.wait() != 0
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="signer relay uses a Unix socket")
-async def test_real_signer_relays_only_placeholder_authorized_responses() -> None:
+async def test_ucode_auth_preflight_returns_only_non_secret_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ucode = tmp_path / "ucode"
+    ucode.write_text("#!/bin/sh\nprintf 'SECRET_BEARER_VALUE\\n'\n", encoding="utf-8")
+    ucode.chmod(ucode.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}/usr/bin:/bin")
+    signer = SubprocessModelSigner(_ucode_config())
+
+    readiness = await signer.start()
+
+    assert "SECRET_BEARER_VALUE" not in repr(readiness)
+    assert readiness.socket_path.exists()
+    await signer.close()
+    assert await signer.wait() == 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="signer relay uses a Unix socket")
+async def test_real_signer_relays_only_placeholder_authorized_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "ucode-ran"
+    ucode = tmp_path / "ucode"
+    ucode.write_text(f"#!/bin/sh\n: > {marker}\nexit 99\n", encoding="utf-8")
+    ucode.chmod(ucode.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}/usr/bin:/bin")
     config = SignerLaunchConfig(
         binding_id="test-fake-provider-v1",
         endpoint="https://model.test/v1",
@@ -195,5 +272,6 @@ async def test_real_signer_relays_only_placeholder_authorized_responses() -> Non
 
     await signer.close()
     assert await signer.wait() == 0
+    assert not marker.exists()
     assert not readiness.socket_path.exists()
     assert not readiness.ca_bundle_path.exists()
