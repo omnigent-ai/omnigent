@@ -76,9 +76,9 @@ function renderUsageRoute(enabled: boolean) {
   );
 }
 
-function renderRoute(path: string) {
+function renderRoute(path: string, features: Record<string, boolean> = {}) {
   return render(
-    <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+    <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, features }}>
       <MemoryRouter initialEntries={[path]}>
         <App />
       </MemoryRouter>
@@ -87,8 +87,14 @@ function renderRoute(path: string) {
 }
 
 describe("Canvas route", () => {
-  it("renders the native Canvas page inside the shell", async () => {
+  it("is not registered while the canvas feature is off", async () => {
     renderRoute("/canvas");
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText("canvas page")).toBeNull();
+  });
+
+  it("renders the native Canvas page inside the shell when the feature is on", async () => {
+    renderRoute("/canvas", { canvas: true });
     expect(await screen.findByText("canvas page")).toBeInTheDocument();
     expect(screen.getByText("app shell")).toBeInTheDocument();
   });

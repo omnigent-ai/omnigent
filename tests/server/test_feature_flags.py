@@ -7,6 +7,7 @@ import dataclasses
 import pytest
 
 from omnigent.server.feature_flags import (
+    CANVAS_ENV_VAR,
     FEATURE_DEFINITIONS,
     FEATURES_ENV_VAR,
     Feature,
@@ -22,6 +23,7 @@ def test_features_default_off() -> None:
     assert flags.frontend_dict() == {
         "usage_page": False,
         "harness_install": False,
+        "canvas": False,
     }
 
 
@@ -46,6 +48,26 @@ def test_removed_harness_install_variable_allows_explicit_off() -> None:
     flags = resolve_feature_flags({"OMNIGENT_HARNESS_INSTALL_ENABLED": "0"})
 
     assert not flags.enabled(Feature.HARNESS_INSTALL)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", " Yes "])
+def test_canvas_switch_enables_the_canvas_feature(value: str) -> None:
+    flags = resolve_feature_flags({CANVAS_ENV_VAR: value})
+
+    assert flags.enabled(Feature.CANVAS)
+    assert flags.frontend_dict()["canvas"] is True
+    assert flags.enabled_names() == ("canvas",)
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "off", "enabled"])
+def test_canvas_switch_is_off_for_other_values(value: str) -> None:
+    assert not resolve_feature_flags({CANVAS_ENV_VAR: value}).enabled(Feature.CANVAS)
+
+
+def test_canvas_is_also_a_regular_feature_name() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "canvas", CANVAS_ENV_VAR: "true"})
+
+    assert flags.enabled_names() == ("canvas",)
 
 
 def test_unknown_feature_fails_with_known_names() -> None:

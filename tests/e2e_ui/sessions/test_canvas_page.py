@@ -2,10 +2,30 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
 from playwright.sync_api import Page, Route, expect
+
+
+def _stub_server_info(page: Page, *, canvas: bool) -> None:
+    """Advertise one deterministic ``canvas`` release-feature value."""
+    body = json.dumps(
+        {
+            "accounts_enabled": False,
+            "single_user": True,
+            "login_url": None,
+            "needs_setup": False,
+            "features": {"canvas": canvas, "usage_page": False, "harness_install": False},
+            "harness_install_enabled": False,
+            "installable_harnesses": [],
+        }
+    )
+    page.route(
+        "**/v1/info",
+        lambda route: route.fulfill(status=200, content_type="application/json", body=body),
+    )
 
 
 def _session(
@@ -44,6 +64,16 @@ def _serve_list(sessions: list[dict[str, object]]):
     return serve
 
 
+def test_canvas_page_is_absent_while_the_feature_is_off(page: Page, live_server: str) -> None:
+    """A direct deep link cannot bypass the default-off navigation gate."""
+    _stub_server_info(page, canvas=False)
+
+    page.goto(f"{live_server}/canvas")
+
+    expect(page.get_by_role("heading", name="Page not found")).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("canvas-nav")).to_have_count(0)
+
+
 def test_canvas_page_groups_sessions_by_project_and_opens_them(
     page: Page,
     live_server: str,
@@ -57,6 +87,7 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
     sessions.append(
         _session("project-session", "Review the release", 1, project_id="project-release")
     )
+    _stub_server_info(page, canvas=True)
     page.route("**/v1/sessions?*", _serve_list(sessions))
     page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=projects))
 
@@ -90,6 +121,7 @@ def test_canvas_page_remembers_a_dragged_card_across_reloads(
 ) -> None:
     """A card dropped elsewhere keeps its spot after a reload; Reset layout regrids it."""
     sessions = [_session("only", "Only session", 1)]
+    _stub_server_info(page, canvas=True)
     page.route("**/v1/sessions?*", _serve_list(sessions))
     page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=[]))
 

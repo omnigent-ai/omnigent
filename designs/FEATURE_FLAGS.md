@@ -13,6 +13,9 @@ OMNIGENT_FEATURES=usage_page,harness_install
 ```
 
 Unset or empty means every release feature is off. Unknown names fail startup.
+The Canvas page also has a dedicated switch: `OMNIGENT_ENABLE_CANVAS=true` (or
+`1`/`yes`, any case) enables `canvas` without listing it in `OMNIGENT_FEATURES`,
+so deployments can toggle Canvas independently of the rest of the set.
 The former `OMNIGENT_HARNESS_INSTALL_ENABLED` switch is rejected with a
 migration hint; use `OMNIGENT_FEATURES=harness_install` instead. The server resolves the set once at startup and publishes frontend-visible
 values in `GET /v1/info` under `features`. Users must reload the web app after a
@@ -27,6 +30,7 @@ lifecycle metadata.
 | --- | --- | --- | --- | --- |
 | `usage_page` | Off | Web | 0.11.0 | Exposes the web Usage route, sidebar navigation, timeline, and cost breakdown details. The existing `GET /v1/usage` CLI API remains available while off. |
 | `harness_install` | Off | Onboarding | 0.11.0 | Allows the web UI to install or configure supported harnesses on a connected host. |
+| `canvas` | Off | Web | 0.15.0 | Exposes the web Canvas route (`/canvas`) and its sidebar navigation: top-level sessions as draggable cards, one canvas per project. Also enabled by `OMNIGENT_ENABLE_CANVAS=true`. |
 
 At the review release, each flag must be removed by making the feature
 unconditional, removing the feature, or moving a genuinely permanent operator

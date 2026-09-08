@@ -160,6 +160,15 @@ redeploy:
 --features usage_page,harness_install
 ```
 
+The Canvas page is off by default. Show it for a specific app by setting
+`OMNIGENT_ENABLE_CANVAS=true` in the environment when invoking the deploy
+script (equivalent to adding `canvas` to `--features`):
+
+```bash
+OMNIGENT_ENABLE_CANVAS=true uv run python deploy/databricks/deploy.py \
+    --app-name <canvas-enabled-app> ...
+```
+
 See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for the current
 inventory and rollback procedure.
 

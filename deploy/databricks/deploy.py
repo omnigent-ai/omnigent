@@ -65,6 +65,9 @@ _ENV_VARS_TO_CLEAR = (
 _BUNDLE_RESOURCE_KEY = "omnigent"
 
 _WHEEL_PREFIXES = ("omnigent-", "omnigent_client-", "omnigent_ui_sdk-")
+# Same switch the server honors at runtime (see omnigent/server/feature_flags.py).
+_ENABLE_CANVAS_ENV_VAR = "OMNIGENT_ENABLE_CANVAS"
+_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes"})
 
 
 def _log(msg: str) -> None:
@@ -729,7 +732,8 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Comma-separated deployment-wide release features, e.g. "
-            "'usage_page'. Empty keeps every release feature off."
+            "'usage_page'. Empty keeps every release feature off. "
+            f"{_ENABLE_CANVAS_ENV_VAR}=true in the deploy environment adds 'canvas'."
         ),
     )
     parser.add_argument(
@@ -938,12 +942,21 @@ def _ensure_compute_size(
     )
 
 
-def _bundle_vars(args: argparse.Namespace) -> list[str]:
-    """CLI args to pass to `databricks bundle` as --var pairs."""
+def _deploy_features(args: argparse.Namespace) -> str:
+    """``OMNIGENT_FEATURES`` for the app: ``--features`` plus Canvas when its switch is set."""
+    names = [name.strip() for name in args.features.split(",") if name.strip()]
+    canvas_switch = os.environ.get(_ENABLE_CANVAS_ENV_VAR, "").strip().lower()
+    if canvas_switch in _TRUTHY_ENV_VALUES and "canvas" not in names:
+        names.append("canvas")
     # The Apps API rejects an environment entry with an empty source. A single
     # space is trimmed by the feature parser and therefore preserves the
     # documented "no features" behavior while providing a valid value source.
-    features = args.features if args.features.strip() else " "
+    return ",".join(names) if names else " "
+
+
+def _bundle_vars(args: argparse.Namespace) -> list[str]:
+    """CLI args to pass to `databricks bundle` as --var pairs."""
+    features = _deploy_features(args)
     return [
         "--var",
         f"app_name={args.app_name}",

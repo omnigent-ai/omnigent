@@ -865,9 +865,19 @@ describe("Sidebar session list", () => {
     expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
   });
 
-  it("renders and highlights the Canvas nav row without lighting New session", () => {
+  it("hides Canvas navigation while the release feature is off", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar(true, "/canvas");
+
+    expect(screen.queryByTestId("canvas-nav")).toBeNull();
+  });
+
+  it("renders and highlights the Canvas nav row without lighting New session", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/canvas", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { canvas: true },
+    });
 
     const canvas = screen.getByTestId("canvas-nav");
     expect(canvas).toHaveAttribute("href", "/canvas");

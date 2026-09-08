@@ -581,6 +581,7 @@ function SidebarImpl({
   const branding = useBranding();
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
+  const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -1177,15 +1178,17 @@ function SidebarImpl({
                   )}
                 </Link>
               </Button>
-              <PrimaryNavLink
-                to="/canvas"
-                label="Canvas"
-                icon={LayoutDashboardIcon}
-                active={isCanvasPage}
-                onClick={onNavClick}
-                componentId="sidebar.canvas"
-                testId="canvas-nav"
-              />
+              {canvasEnabled && (
+                <PrimaryNavLink
+                  to="/canvas"
+                  label="Canvas"
+                  icon={LayoutDashboardIcon}
+                  active={isCanvasPage}
+                  onClick={onNavClick}
+                  componentId="sidebar.canvas"
+                  testId="canvas-nav"
+                />
+              )}
               <ExtensionPrimaryNavigation
                 activePageId={activeExtensionPageId}
                 onNavigate={onNavClick}
