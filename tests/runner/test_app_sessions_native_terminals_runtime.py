@@ -352,7 +352,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
     )
     monkeypatch.setattr(
         "omnigent.inner.codex_executor.populate_codex_skills_from_bundle",
-        lambda *_args: None,
+        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: "codex")
     monkeypatch.setattr(codex_app_mod, "_find_codex_cli", lambda: "codex")
