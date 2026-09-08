@@ -11,7 +11,7 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import httpx
@@ -1495,11 +1495,8 @@ async def _forward_available_subagents(
     candidate_meta_paths = [
         path
         for path in meta_paths
-        if _subagent_id_from_meta_path(path) not in updated.subagents
-        and start_retry_tracker.retry_delay_s(
-            f"subagent_start:{_subagent_id_from_meta_path(path)}"
-        )
-        is None
+        if (sid := _subagent_id_from_meta_path(path)) not in updated.subagents
+        and start_retry_tracker.retry_delay_s(f"subagent_start:{sid}") is None
     ]
     parents_by_tool_use = (
         await asyncio.to_thread(
@@ -1744,14 +1741,10 @@ async def _forward_available_subagents(
                     # someone needs to recover it.
                     seen.add(item.source_id)
                     seen_source_ids.append(item.source_id)
-                    new_entry = SubagentEntry(
-                        subagent_id=entry.subagent_id,
-                        child_conversation_id=entry.child_conversation_id,
-                        parent_subagent_id=entry.parent_subagent_id,
+                    new_entry = replace(
+                        new_entry,
                         byte_offset=entry.byte_offset,
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                        last_activity_ts=new_entry.last_activity_ts,
-                        last_status=new_entry.last_status,
                     )
                     updated = SubagentForwardState(
                         subagents={**updated.subagents, subagent_id: new_entry}
@@ -1774,14 +1767,10 @@ async def _forward_available_subagents(
                     item_retry_tracker.clear(retry_key)
                     seen.add(item.source_id)
                     seen_source_ids.append(item.source_id)
-                    new_entry = SubagentEntry(
-                        subagent_id=entry.subagent_id,
-                        child_conversation_id=entry.child_conversation_id,
-                        parent_subagent_id=entry.parent_subagent_id,
+                    new_entry = replace(
+                        new_entry,
                         byte_offset=entry.byte_offset,
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                        last_activity_ts=new_entry.last_activity_ts,
-                        last_status=new_entry.last_status,
                     )
                     updated = SubagentForwardState(
                         subagents={**updated.subagents, subagent_id: new_entry}
@@ -1811,14 +1800,11 @@ async def _forward_available_subagents(
             had_item = True
             seen.add(item.source_id)
             seen_source_ids.append(item.source_id)
-            new_entry = SubagentEntry(
-                subagent_id=entry.subagent_id,
-                child_conversation_id=entry.child_conversation_id,
-                parent_subagent_id=entry.parent_subagent_id,
+            new_entry = replace(
+                new_entry,
                 byte_offset=entry.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now,
-                last_status=new_entry.last_status,
             )
             updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})
             await _write_subagent_forward_state_async(bridge_dir, updated)
@@ -1826,28 +1812,21 @@ async def _forward_available_subagents(
         # posted successfully (or there were no items at all).
         # Advancing past a failed item permanently skips it.
         if not items_failed and (result.byte_offset != entry.byte_offset or had_item):
-            new_entry = SubagentEntry(
-                subagent_id=entry.subagent_id,
-                child_conversation_id=entry.child_conversation_id,
-                parent_subagent_id=entry.parent_subagent_id,
+            new_entry = replace(
+                entry,
                 byte_offset=result.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now if had_item else entry.last_activity_ts,
-                last_status=entry.last_status,
             )
         elif had_item:
             # Items DID flow but a later post failed — still record
             # the activity timestamp so the status badge advances,
             # but leave byte_offset at the previous tick's value so
             # the failed items get retried.
-            new_entry = SubagentEntry(
-                subagent_id=entry.subagent_id,
-                child_conversation_id=entry.child_conversation_id,
-                parent_subagent_id=entry.parent_subagent_id,
-                byte_offset=entry.byte_offset,
+            new_entry = replace(
+                entry,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now,
-                last_status=entry.last_status,
             )
 
         # Quiescence-based status. Sub-agent transcripts don't carry
@@ -1888,15 +1867,7 @@ async def _forward_available_subagents(
                     )
                 else:
                     status_retry_tracker.clear(retry_key)
-                    new_entry = SubagentEntry(
-                        subagent_id=new_entry.subagent_id,
-                        child_conversation_id=new_entry.child_conversation_id,
-                        parent_subagent_id=new_entry.parent_subagent_id,
-                        byte_offset=new_entry.byte_offset,
-                        seen_source_ids=new_entry.seen_source_ids,
-                        last_activity_ts=new_entry.last_activity_ts,
-                        last_status=desired_status,
-                    )
+                    new_entry = replace(new_entry, last_status=desired_status)
 
         if new_entry is not entry:
             updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})
