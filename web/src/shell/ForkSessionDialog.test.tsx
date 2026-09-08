@@ -941,6 +941,46 @@ describe("ForkSessionDialog", () => {
       );
     });
 
+    it("enables the submit for a typed tilde path without opening the browser", async () => {
+      // The reported journey: type "~/git/omnigent" into the field and stop —
+      // no Enter, no browsing. A tilde path reads like a real directory but
+      // the server never expands ~, so the submit used to stay greyed unless
+      // the user discovered the tree browser. The dialog now resolves ~
+      // against the host's home (from the home listing) so the typed path is
+      // directly submittable.
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      // Home listing: the first entry's parent (/Users/a) resolves the host's
+      // home, so "~/git/omnigent" expands to "/Users/a/git/omnigent".
+      useHostFilesystemMock.mockReturnValue({
+        data: { entries: [{ name: "git", path: "/Users/a/git", type: "directory" }] },
+        isPlaceholderData: false,
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useHostFilesystem>);
+      renderDialog(CODING);
+
+      openAdvanced();
+      const input = screen.getByTestId("workspace-path-input");
+      fireEvent.change(input, { target: { value: "~/git/omnigent" } });
+
+      // No Enter, no browser — the submit enables purely from the ~-resolve.
+      expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
+      await waitFor(() => expect(screen.getByTestId("fork-session-submit")).toBeEnabled());
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      // Launched with the resolved absolute path, not the raw tilde.
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_1",
+        "conv_fork",
+        "/Users/a/git/omnigent",
+        undefined,
+      );
+    });
+
     it("enables the submit when the browser resolves a committed tilde path", async () => {
       // The reported journey: type "~/git/omnigent" + Enter. The raw tilde
       // value fails isValidWorkspace (absolute-only), but Enter opens the

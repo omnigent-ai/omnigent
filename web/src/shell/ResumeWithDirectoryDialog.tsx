@@ -17,16 +17,18 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { WorkspacePicker, isNavigablePath, isUnresolvedWorkspacePath } from "./WorkspacePicker";
+import {
+  WorkspacePicker,
+  isNavigablePath,
+  isUnresolvedWorkspacePath,
+  resolveWorkspacePath,
+  useResolvedHostHome,
+} from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { HostLabel } from "./HostLabel";
 import { buildReconnectCommand } from "./ReconnectSessionDialog";
-import {
-  isValidWorkspace,
-  normalizeWorkspacePath,
-  sessionsSharingDirectory,
-} from "./NewChatDialog";
+import { normalizeWorkspacePath, sessionsSharingDirectory } from "./NewChatDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -167,8 +169,14 @@ export function ResumeWithDirectoryDialog({
     onOpenChange(next);
   }
 
-  const workspaceTrimmed = normalizeWorkspacePath(workspace) ?? "";
-  const workspaceValid = isValidWorkspace(workspace);
+  // Resolve a typed "~/…" path to its absolute form against the host's home,
+  // so it's directly submittable without opening the tree browser (the server
+  // never expands ~). Already-absolute values pass through normalized; a
+  // tilde path stays unresolved until the home listing arrives.
+  const resolvedHome = useResolvedHostHome(selectedHostId);
+  const resolvedWorkspace = resolveWorkspacePath(workspace, resolvedHome);
+  const workspaceTrimmed = resolvedWorkspace ?? normalizeWorkspacePath(workspace) ?? "";
+  const workspaceValid = resolvedWorkspace !== null;
 
   // Conflict hint: other *connected* sessions already working in the
   // picked directory on this host (same wiring as NewChatDialog).
@@ -214,12 +222,13 @@ export function ResumeWithDirectoryDialog({
     setBrowseNonce((n) => n + 1);
   }
 
-  // A committed "~/…" path is a real directory the host can list, but
-  // isValidWorkspace accepts only absolute paths (the server never expands
-  // ~), so the submit would stay greyed out. When the tree browser resolves
-  // the committed path to its absolute form, adopt that as the form value.
-  // Once the value is absolute, browsing deeper no longer rewrites it —
-  // that still takes the explicit "Select" click.
+  // A typed "~/…" path resolves against the host's home directly (see
+  // resolvedWorkspace), so the submit enables without browsing. This adopts
+  // the tree browser's resolved absolute path as a secondary route — a user
+  // who does open the browser while the value is still an unresolved tilde
+  // (e.g. before home loads) gets the absolute form written back. Once the
+  // value is absolute, browsing deeper no longer rewrites it — that still
+  // takes the explicit "Select" click.
   function onPickerNavigate(path: string): void {
     if (isUnresolvedWorkspacePath(workspace)) setWorkspace(path);
   }

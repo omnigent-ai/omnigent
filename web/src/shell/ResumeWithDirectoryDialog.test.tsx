@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ResumeWithDirectoryDialog } from "./ResumeWithDirectoryDialog";
 import { useHosts } from "@/hooks/useHosts";
+import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
@@ -70,6 +71,7 @@ vi.mock("./WorkspacePicker", async (importActual) => ({
   ),
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
 vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: vi.fn() }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: vi.fn(),
@@ -107,6 +109,7 @@ vi.mock("@/components/ui/select", () => ({
 }));
 
 const useHostsMock = vi.mocked(useHosts);
+const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const useDirectorySessionsMock = vi.mocked(useDirectorySessions);
 const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
 const getSessionMock = vi.mocked(getSessionSlim);
@@ -143,10 +146,17 @@ function renderDialog() {
 
 beforeEach(() => {
   useHostsMock.mockReset();
+  useHostFilesystemMock.mockReset();
   useDirectorySessionsMock.mockReset();
   useRunnerHealthMock.mockReset();
   getSessionMock.mockReset();
   launchRunnerMock.mockReset();
+  // No home listing by default (the ~-resolve tests override this); the
+  // absolute-path tests don't need it.
+  useHostFilesystemMock.mockReturnValue({
+    data: undefined,
+    isPlaceholderData: false,
+  } as unknown as ReturnType<typeof useHostFilesystem>);
   useDirectorySessionsMock.mockReturnValue({ data: [] } as unknown as ReturnType<
     typeof useDirectorySessions
   >);
@@ -274,6 +284,41 @@ describe("ResumeWithDirectoryDialog", () => {
       target: { value: "host_other" },
     });
     expect(await screen.findByTestId("resume-dir-mismatch-warning")).toBeTruthy();
+  });
+
+  it("enables the bind for a typed tilde path without opening the browser", async () => {
+    // The reported journey: type "~/git/omnigent" into the field and stop —
+    // no Enter, no browsing. The dialog resolves ~ against the host's home
+    // (from the home listing) so the typed path is directly submittable.
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_src", name: "laptop", owner: "me", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    useHostFilesystemMock.mockReturnValue({
+      data: { entries: [{ name: "git", path: "/Users/alice/git", type: "directory" }] },
+      isPlaceholderData: false,
+    } as unknown as ReturnType<typeof useHostFilesystem>);
+    getSessionMock.mockResolvedValue(sourceSession({ workspace: "/Users/alice/repo" }));
+
+    renderDialog();
+
+    const bindBtn = await screen.findByTestId("resume-dir-bind-button");
+    const input = screen.getByTestId("mock-workspace-input");
+    fireEvent.change(input, { target: { value: "~/git/omnigent" } });
+
+    // No Enter, no browser — the bind enables purely from the ~-resolve.
+    expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
+    await waitFor(() => expect((bindBtn as HTMLButtonElement).disabled).toBe(false));
+
+    fireEvent.click(bindBtn);
+    // Launched with the resolved absolute path, not the raw tilde.
+    await waitFor(() =>
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_src",
+        "conv_clone",
+        "/Users/alice/git/omnigent",
+        undefined,
+      ),
+    );
   });
 
   it("enables the bind when the browser resolves a committed tilde path", async () => {

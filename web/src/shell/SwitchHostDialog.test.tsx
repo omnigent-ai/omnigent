@@ -197,6 +197,34 @@ describe("SwitchHostDialog", () => {
     expect(screen.getByTestId("switch-host-option-host_old")).toBeInTheDocument();
   });
 
+  it("enables the switch for a typed tilde path without opening the browser", async () => {
+    // The reported journey: type "~/git/omnigent" into the field and stop —
+    // no Enter, no browsing. The dialog resolves ~ against the host's home
+    // (from the home listing) so the typed path is directly submittable.
+    useHostFilesystemMock.mockReturnValue({
+      data: { entries: [{ name: "git", path: "/Users/alice/git", type: "directory" }] },
+      isPlaceholderData: false,
+    } as unknown as ReturnType<typeof useHostFilesystem>);
+    renderDialog();
+
+    const button = await screen.findByTestId("switch-host-button");
+    const input = screen.getByTestId("mock-workspace-input");
+    fireEvent.change(input, { target: { value: "~/git/omnigent" } });
+
+    // No Enter, no browser — the switch enables purely from the ~-resolve.
+    expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+
+    fireEvent.click(button);
+    await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+    // Launched with the resolved absolute path, not the raw tilde.
+    expect(launchRunnerMock).toHaveBeenCalledWith(
+      "host_new",
+      "conv_1",
+      "/Users/alice/git/omnigent",
+    );
+  });
+
   it("enables the switch when the browser resolves a committed tilde path", async () => {
     // Same journey as the Fork dialog: type "~/git/omnigent" + Enter. The raw
     // tilde value fails isValidWorkspace (absolute-only), but committing it

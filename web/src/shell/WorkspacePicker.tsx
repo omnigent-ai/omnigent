@@ -230,6 +230,44 @@ export function isUnresolvedWorkspacePath(value: string): boolean {
   return isNavigablePath(trimmed) && !isHostAbsolutePath(trimmed);
 }
 
+/**
+ * Resolve a host's absolute home directory, so a typed ``~``-relative
+ * workspace can be expanded to the absolute path the server requires —
+ * without the user ever opening the tree browser.
+ *
+ * Lists the host's home (the endpoint's ``""`` form) and derives the
+ * absolute home from the first entry's parent (all entries share one
+ * parent). Returns ``null`` until it resolves — an offline host, an empty
+ * home (no entry to derive from), or a listing still in flight. Shares the
+ * picker's ``["host-filesystem", hostId, ""]`` query key, so opening the
+ * browser afterwards costs no extra request.
+ *
+ * @param hostId Host to resolve, or ``null`` to stay unresolved.
+ * @returns The host's absolute home path, or ``null`` if not yet known.
+ */
+export function useResolvedHostHome(hostId: string | null): string | null {
+  const { data, isPlaceholderData } = useHostFilesystem(hostId, hostId === null ? null : "");
+  const first = data && !isPlaceholderData ? data.entries[0] : undefined;
+  return first ? parentOf(first.path) : null;
+}
+
+/**
+ * Expand a typed workspace value to the absolute path the server needs,
+ * resolving a leading ``~`` against the host's home. Returns the absolute
+ * path (already-absolute values pass through normalized), or ``null`` when
+ * it can't be resolved yet — a ``~``-path whose home hasn't loaded, or an
+ * unusable (relative / empty) value. Callers gate the submit on a non-null
+ * result and launch with it.
+ *
+ * @param value Raw workspace text, e.g. ``"~/projects/app"`` or ``"/tmp"``.
+ * @param home Resolved absolute home (see {@link useResolvedHostHome}), or
+ *   ``null`` if not yet known.
+ * @returns The absolute workspace, or ``null`` when unresolved/unusable.
+ */
+export function resolveWorkspacePath(value: string, home: string | null): string | null {
+  return normalizeTypedPath(value, home);
+}
+
 export function listingFilter(
   pathInput: string,
   currentAbsolute: string,
