@@ -460,8 +460,12 @@ async def test_list_filesystem_offline_host_returns_409(
     )
     host_store.set_offline("3d9665477127e41f42de3f4109418173")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.get("/v1/hosts/3d9665477127e41f42de3f4109418173/filesystem")
+        resp = await client.get(
+            "/v1/hosts/3d9665477127e41f42de3f4109418173/filesystem",
+            params={"roots": "true"},
+        )
     assert resp.status_code == 409
+    assert "offline" in resp.text
 
 
 async def test_list_filesystem_missing_path_returns_404(
@@ -606,6 +610,7 @@ async def test_list_filesystem_owner_check_blocks_other_users(
         resp = await client.get(
             "/v1/hosts/f54bb9272002938a3a934bfcb6bb228a/filesystem",
             headers={"X-Test-User": "bob@example.com"},
+            params={"roots": "true"},
         )
     assert resp.status_code == 403
 
@@ -674,6 +679,53 @@ async def test_list_filesystem_forwards_pagination_params(
         )
     assert resp.status_code == 200
     assert captured == {"limit": 5, "after": "/foo/m", "before": None}
+
+
+async def test_list_filesystem_roots_forwards_empty_path(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """The roots query sends the Host's explicit root-enumeration sentinel."""
+    app, registry, _comm, replies, _drain = fs_setup
+    connection = registry.get(_HOST_ID)
+    assert connection is not None
+    connection.hello.filesystem_roots = True
+    replies[""] = {"entries": [], "has_more": False}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"/v1/hosts/{_HOST_ID}/filesystem",
+            params={"roots": "true"},
+        )
+
+    assert response.status_code == 200
+
+
+async def test_list_filesystem_roots_rejects_legacy_host(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """An old Host must not interpret the empty roots sentinel as its CWD."""
+    app, _registry, _comm, _replies, _drain = fs_setup
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"/v1/hosts/{_HOST_ID}/filesystem",
+            params={"roots": "true"},
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "host does not support filesystem root enumeration"}
 
 
 async def test_list_filesystem_limit_above_max_rejected(

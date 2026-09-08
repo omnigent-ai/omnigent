@@ -109,6 +109,9 @@ class HostHelloFrame:
         ``omnigent.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host, or a startup probe
         that failed) — never treat it as "nothing is gateway-backed".
+    :param filesystem_roots: Whether this Host understands an empty filesystem
+        path as a request to enumerate platform roots. Older Hosts omit the
+        field and therefore decode as ``False``.
     """
 
     version: str
@@ -119,6 +122,7 @@ class HostHelloFrame:
     gateway_inference: dict[str, bool] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+    filesystem_roots: bool = False
 
 
 @dataclass
@@ -405,15 +409,16 @@ class HostListDirFrame:
 
     Used by ``GET /v1/hosts/{id}/filesystem/{path}`` to render the
     directory picker before any runner exists. The host owns ``~``
-    resolution; the server passes whatever the user supplied (or
-    ``~`` when the REST path is empty).
+    resolution. After this Host advertises filesystem-root support,
+    the server may use an empty path to request platform roots.
 
     :param request_id: Unique ID for correlating the result, e.g.
         ``"req_list_1"``.
     :param path: Absolute or tilde-prefixed directory path, e.g.
         ``"/Users/corey/projects"`` or ``"~/projects"``. Same rules
         as ``host.stat`` — the host expands ``~`` against its own
-        process owner's home.
+        process owner's home. An empty path is reserved for platform-root
+        enumeration after this Host advertised the capability.
     :param limit: Maximum entries to return per page,
         e.g. ``20``. Pagination is in-memory at the host since
         most directories fit easily in one page.
@@ -1049,6 +1054,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "gateway_inference": frame.gateway_inference,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
+                "filesystem_roots": frame.filesystem_roots,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1558,6 +1564,9 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
+        filesystem_roots=(
+            _required_bool(msg, "filesystem_roots") if "filesystem_roots" in msg else False
+        ),
     )
 
 

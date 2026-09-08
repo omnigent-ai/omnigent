@@ -2348,17 +2348,60 @@ class HostProcess:
         symlinks for type detection (matching ``host.stat``), and
         returns a paginated result. ``~`` in the input path expands
         against the host process owner's home, same rules as
-        ``host.stat``. Per-entry I/O errors (broken symlinks,
+        ``host.stat``. An empty path enumerates platform roots and is
+        sent only after this Host advertised filesystem-root support.
+        Per-entry I/O errors (broken symlinks,
         ephemeral files) are silently skipped so a single bad
         entry doesn't fail the whole listing — same posture as
         the runner's ``list_dir``.
 
-        :param frame: The list_dir request frame. ``frame.path``
-            may be absolute or tilde-prefixed; ``limit`` /
-            ``after`` / ``before`` drive pagination.
+        :param frame: The list_dir request frame. ``frame.path`` may be
+            absolute, tilde-prefixed, or the capability-gated empty platform
+            roots sentinel; ``limit`` / ``after`` / ``before`` drive
+            pagination.
         :returns: List_dir result frame with entries sorted by
             name plus a ``has_more`` flag for the page.
         """
+        if frame.path == "":
+            if os.name == "nt":
+                list_drives = getattr(os, "listdrives", None)
+                drives: list[str] = (
+                    cast(list[str], list_drives())
+                    if callable(list_drives)
+                    else [
+                        f"{letter}:\\"
+                        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                        if os.path.isdir(f"{letter}:\\")
+                    ]
+                )
+                roots = [
+                    HostListDirEntry(
+                        name=drive,
+                        path=drive,
+                        type="directory",
+                        bytes=None,
+                        modified_at=0,
+                    )
+                    for drive in drives
+                ]
+            else:
+                roots = [
+                    HostListDirEntry(
+                        name="/",
+                        path="/",
+                        type="directory",
+                        bytes=None,
+                        modified_at=0,
+                    )
+                ]
+            return _paginate_list_dir(
+                entries=roots,
+                request_id=frame.request_id,
+                limit=frame.limit,
+                after=frame.after,
+                before=frame.before,
+            )
+
         try:
             expanded = os.path.expanduser(frame.path)
         except (TypeError, ValueError) as exc:
@@ -3777,6 +3820,7 @@ class HostProcess:
             gateway_inference=self._gateway_inference,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
+            filesystem_roots=True,
         )
         try:
             encoded_hello = encode_host_frame(hello)
