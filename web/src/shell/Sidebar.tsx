@@ -35,6 +35,7 @@ import {
   ListChecksIcon,
   ListFilterIcon,
   LaptopIcon,
+  LayoutDashboardIcon,
   Loader2Icon,
   MailIcon,
   MessageCircleDashedIcon,
@@ -176,6 +177,7 @@ import {
   writeSessionFilter,
 } from "@/lib/sessionFilterPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
+import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
 import { NewProjectButton } from "./NewProjectButton";
@@ -378,6 +380,7 @@ interface SidebarProps {
 function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
+  isCanvasPage: boolean;
   isTasksPage: boolean;
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
@@ -389,6 +392,7 @@ function useActiveNavItem(): {
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
+  const isCanvasPage = !isExtensionRoute && leaf === "canvas";
   const isTasksPage = !isExtensionRoute && leaf === "tasks";
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
@@ -396,6 +400,7 @@ function useActiveNavItem(): {
   const isNewSessionRoute =
     activeConversationId == null &&
     !isInboxPage &&
+    !isCanvasPage &&
     !isTasksPage &&
     !isUsagePage &&
     !isExtensionRoute;
@@ -410,6 +415,7 @@ function useActiveNavItem(): {
   return {
     isNewChatPage,
     isInboxPage,
+    isCanvasPage,
     isTasksPage,
     isUsagePage,
     activeExtensionPageId,
@@ -758,6 +764,7 @@ function SidebarImpl({
   const {
     isNewChatPage,
     isInboxPage,
+    isCanvasPage,
     isTasksPage,
     isUsagePage,
     activeExtensionPageId,
@@ -1170,6 +1177,15 @@ function SidebarImpl({
                   )}
                 </Link>
               </Button>
+              <PrimaryNavLink
+                to="/canvas"
+                label="Canvas"
+                icon={LayoutDashboardIcon}
+                active={isCanvasPage}
+                onClick={onNavClick}
+                componentId="sidebar.canvas"
+                testId="canvas-nav"
+              />
               <ExtensionPrimaryNavigation
                 activePageId={activeExtensionPageId}
                 onNavigate={onNavClick}

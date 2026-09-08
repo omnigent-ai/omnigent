@@ -49,6 +49,10 @@ const InboxPage = withPageView(
   "inbox",
   lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
 );
+const CanvasPage = withPageView(
+  "canvas",
+  lazy(() => import("@/pages/CanvasPage").then((m) => ({ default: m.CanvasPage }))),
+);
 const TasksPage = withPageView(
   "tasks",
   lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
@@ -149,6 +153,7 @@ function App({ basename }: AppProps = {}) {
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+          <Route path={`${prefix}/canvas`} element={<CanvasPage />} />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
           {isFeatureEnabled(info, "usage_page") && (
             <Route path={`${prefix}/usage`} element={<UsagePage />} />
