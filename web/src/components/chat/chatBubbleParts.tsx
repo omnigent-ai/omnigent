@@ -751,9 +751,8 @@ function UserBubble({
         {(ts || text) && (
           <div
             className={cn(
-              "flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity",
-              !actionsPersistent &&
-                "md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
+              "flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:group-hover:opacity-100 md:group-focus-within:opacity-100",
+              !actionsPersistent && "md:opacity-0",
             )}
           >
             {ts && (
@@ -885,9 +884,8 @@ function AssistantBubble({
         {!foldOnly && !errorOnly && (ts || markdownText) && (
           <div
             className={cn(
-              "flex items-center gap-3 py-1 opacity-40 transition-opacity",
-              !actionsPersistent &&
-                "md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
+              "flex items-center gap-3 py-1 opacity-40 transition-opacity md:group-hover:opacity-100 md:group-focus-within:opacity-100",
+              !actionsPersistent && "md:opacity-0",
             )}
           >
             {markdownText && (

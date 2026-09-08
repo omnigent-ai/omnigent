@@ -146,6 +146,7 @@ it("keeps actions visible only on the final settled message", () => {
 
   expect(actionFooter(copyButtons[0]!)).toHaveClass("md:opacity-0");
   expect(actionFooter(copyButtons[1]!)).not.toHaveClass("md:opacity-0");
+  expect(actionFooter(copyButtons[1]!)).toHaveClass("md:group-hover:opacity-100");
 
   view.rerender(messageList(bubbles, true));
   expect(actionFooter(screen.getAllByRole("button", { name: "Copy" })[1]!)).toHaveClass(
