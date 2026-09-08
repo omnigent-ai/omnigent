@@ -2867,6 +2867,96 @@ async def test_delta_coalescer_close_gives_up_on_a_wedged_worker(
 
 
 @pytest.mark.asyncio
+async def test_delta_coalescer_flush_waits_out_a_draining_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``flush()`` must not abandon its barrier while the worker is still posting.
+
+    Codex queues chunks faster than each awaited post drains them, so a backlog
+    outlives any single bound. Giving up then returned before the queued text was
+    posted -- reordering it after whatever the caller sent next -- and logged a
+    timeout every time.
+    """
+
+    class _SlowClient:
+        """Client whose posts are slower than one per-stall bound."""
+
+        def __init__(self) -> None:
+            self.posts: list[tuple[str, dict]] = []
+
+        async def post(self, url: str, *, json: dict) -> httpx.Response:
+            await asyncio.sleep(0.02)
+            self.posts.append((url, json))
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    # One stall is far shorter than the backlog takes to drain, so the old
+    # single-shot wait would expire mid-drain.
+    monkeypatch.setattr(fwd, "_DELTA_MARKER_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(fwd, "_DELTA_BARRIER_MAX_WAIT_SECONDS", 30.0)
+    client = _SlowClient()
+    coalescer = _coalescer(client)
+    coalescer._ensure_worker()
+    # Distinct message ids so each chunk flushes as its own post.
+    for i in range(10):
+        coalescer._queue.put_nowait(
+            fwd._DeltaChunk(message_id=f"m{i}", tool_call_id=None, delta=f"chunk-{i}\n")
+        )
+
+    with caplog.at_level("WARNING", logger="omnigent.codex_native_forwarder"):
+        await asyncio.wait_for(coalescer.flush(), timeout=30.0)
+
+    # The ordering guarantee held: every queued delta was posted before flush returned.
+    assert len(client.posts) == 10
+    assert not [r for r in caplog.records if "timed out" in r.getMessage()]
+
+    await coalescer.close()
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_flush_gives_up_on_a_wedged_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A worker making no progress must still release ``flush()`` on the cap.
+
+    The progress extension must not become an unbounded wait: with the worker
+    stuck inside one post, no flush ever completes, so the caller gives up.
+    """
+
+    class _HangingClient:
+        """Client whose post never returns, wedging the worker inside a flush."""
+
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+
+        async def post(self, *args: object, **kwargs: object) -> None:
+            self.entered.set()
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(fwd, "_DELTA_MARKER_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(fwd, "_DELTA_BARRIER_MAX_WAIT_SECONDS", 0.2)
+    client = _HangingClient()
+    coalescer = _coalescer(client)
+    coalescer._ensure_worker()
+    coalescer._queue.put_nowait(fwd._DeltaChunk(message_id="m1", tool_call_id=None, delta="x\n"))
+    await asyncio.wait_for(client.entered.wait(), timeout=5.0)
+    worker = coalescer._worker_task
+    assert worker is not None
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with caplog.at_level("WARNING", logger="omnigent.codex_native_forwarder"):
+        await asyncio.wait_for(coalescer.flush(), timeout=5.0)
+
+    # Released on the cap, not held for the worker's 3600s post.
+    assert loop.time() - started < 1.0
+    timeouts = [r for r in caplog.records if "timed out" in r.getMessage()]
+    assert timeouts, "a wedged worker must still report the timeout"
+    worker.cancel()
+
+
+@pytest.mark.asyncio
 async def test_delta_coalescer_worker_survives_an_already_settled_marker() -> None:
     """Resolving a marker whose future is already settled must not kill the worker.
 
