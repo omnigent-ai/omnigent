@@ -331,7 +331,7 @@ describe("CanvasPage", () => {
     act(() => {
       dragStop(new MouseEvent("mouseup"), { id: "conv_2", position: { x: 400.4, y: 120.6 } });
     });
-    expect(readCanvasLayout()).toEqual({ positions: { conv_2: { x: 400, y: 121 } } });
+    expect(readCanvasLayout(null)).toEqual({ positions: { conv_2: { x: 400, y: 121 } } });
     unmount();
 
     renderPage();
@@ -352,7 +352,7 @@ describe("CanvasPage", () => {
       ]),
     );
     window.localStorage.setItem(
-      canvasLayoutStorageKey(),
+      canvasLayoutStorageKey(null),
       JSON.stringify({
         version: 1,
         positions: { conv_main: [900, 900], conv_alpha: [50, 50] },
@@ -364,19 +364,19 @@ describe("CanvasPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reset layout" }));
 
     expect(screen.getByTestId("flow-node-conv_main")).toHaveAttribute("data-x", "0");
-    expect(readCanvasLayout()).toEqual({ positions: { conv_alpha: { x: 50, y: 50 } } });
+    expect(readCanvasLayout(null)).toEqual({ positions: { conv_alpha: { x: 50, y: 50 } } });
   });
 
   it("forgets saved spots of deleted sessions once the list is complete", () => {
     window.localStorage.setItem(
-      canvasLayoutStorageKey(),
+      canvasLayoutStorageKey(null),
       JSON.stringify({ version: 1, positions: { conv_gone: [1, 1], conv_1: [7, 7] } }),
     );
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([conversation("conv_1", 1)]),
     );
     renderPage();
-    expect(readCanvasLayout().positions).toEqual({ conv_1: { x: 7, y: 7 } });
+    expect(readCanvasLayout(null).positions).toEqual({ conv_1: { x: 7, y: 7 } });
   });
 
   it("selects a project created from the tab strip once the list includes it", () => {

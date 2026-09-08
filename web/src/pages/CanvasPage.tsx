@@ -52,6 +52,7 @@ import {
 } from "@/canvas/canvasLayout";
 import { useCanvasSessions } from "@/canvas/canvasSessions";
 import {
+  EMPTY_CANVAS_LAYOUT,
   readCanvasLayout,
   withoutPositions,
   withPosition,
@@ -64,6 +65,7 @@ import { SessionCard, type SessionCardNode } from "@/canvas/SessionCard";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useProjects, type Conversation, type ProjectSummary } from "@/hooks/useConversations";
+import { useViewerId } from "@/hooks/useViewerId";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
@@ -146,6 +148,7 @@ function CanvasSurface() {
   const [searchParams, setSearchParams] = useSearchParams();
   const { trackClick } = useOmnigentAnalytics();
   const { fitView } = useReactFlow();
+  const viewerId = useViewerId();
   const { sessions, loaded, loadingMore, complete, error, refresh } = useCanvasSessions();
   const projectsQuery = useProjects();
   const projects = projectsQuery.data ?? EMPTY_PROJECTS;
@@ -156,8 +159,10 @@ function CanvasSurface() {
   );
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
   const activeCanvasRef = useRef(activeCanvas);
-  const layoutRef = useRef<CanvasLayout | null>(null);
-  layoutRef.current ??= readCanvasLayout();
+  // Loaded per viewer (the store is keyed by server and user) in the positions
+  // effect below, so identity resolving after mount swaps in the right layout.
+  const layoutRef = useRef<CanvasLayout>(EMPTY_CANVAS_LAYOUT);
+  const layoutViewerRef = useRef<string | null | undefined>(undefined);
   // Live positions for every session, including unsaved grid slots.
   const positionsRef = useRef<CanvasPositions>({});
   // True once the user pans or zooms by hand; auto-fits then leave the view
@@ -177,8 +182,8 @@ function CanvasSurface() {
   }, []);
 
   const visibleSessions = useMemo(
-    () => sessionsOnCanvas(sessions, activeCanvas, projects),
-    [sessions, activeCanvas, projects],
+    () => sessionsOnCanvas(sessions, activeCanvas, projects, viewerId),
+    [sessions, activeCanvas, projects, viewerId],
   );
   const pullRequests = usePullRequests(visibleSessions);
   const activeProject = useMemo(
@@ -186,15 +191,18 @@ function CanvasSurface() {
     [projects, activeCanvas],
   );
 
-  const persist = useCallback((layout: CanvasLayout) => {
-    layoutRef.current = layout;
-    try {
-      writeCanvasLayout(layout);
-      if (aliveRef.current) setStorageWarning(null);
-    } catch {
-      if (aliveRef.current) setStorageWarning("Canvas layout could not be saved.");
-    }
-  }, []);
+  const persist = useCallback(
+    (layout: CanvasLayout) => {
+      layoutRef.current = layout;
+      try {
+        writeCanvasLayout(layout, viewerId);
+        if (aliveRef.current) setStorageWarning(null);
+      } catch {
+        if (aliveRef.current) setStorageWarning("Canvas layout could not be saved.");
+      }
+    },
+    [viewerId],
+  );
 
   const fitCanvas = useCallback(
     (duration = 0) => {
@@ -248,13 +256,22 @@ function CanvasSurface() {
   );
 
   // Unplaced cards get grid slots whenever the session or project set changes.
-  // Declared before the node rebuild below so it runs first in the same commit.
+  // When the viewer changes (identity resolving after mount), reload that
+  // viewer's saved layout and lay everything out again from it. Declared before
+  // the node rebuild below so it runs first in the same commit.
   useEffect(() => {
-    positionsRef.current = mergeCanvasPositions(sessions, projects, {
-      ...(layoutRef.current?.positions ?? {}),
-      ...positionsRef.current,
-    });
-  }, [sessions, projects]);
+    if (layoutViewerRef.current !== viewerId) {
+      layoutViewerRef.current = viewerId;
+      layoutRef.current = readCanvasLayout(viewerId);
+      positionsRef.current = {};
+    }
+    positionsRef.current = mergeCanvasPositions(
+      sessions,
+      projects,
+      { ...layoutRef.current.positions, ...positionsRef.current },
+      viewerId,
+    );
+  }, [sessions, projects, viewerId]);
 
   // Cards follow the active canvas; drags update the node state directly and
   // land in positionsRef on drop, so rebuilding here never loses a move.
@@ -315,7 +332,7 @@ function CanvasSurface() {
 
   // Once the full list is known, forget spots of sessions that no longer exist.
   useEffect(() => {
-    if (!complete || !layoutRef.current) return;
+    if (!complete) return;
     const layout = layoutRef.current;
     const pruned = prunePositions(
       layout.positions,
@@ -368,7 +385,7 @@ function CanvasSurface() {
     (_event: MouseEvent | TouchEvent, node: SessionCardNode) => {
       const position = { x: Math.round(node.position.x), y: Math.round(node.position.y) };
       positionsRef.current = { ...positionsRef.current, [node.id]: position };
-      if (layoutRef.current) persist(withPosition(layoutRef.current, node.id, position));
+      persist(withPosition(layoutRef.current, node.id, position));
     },
     [persist],
   );
@@ -388,7 +405,7 @@ function CanvasSurface() {
     positionsRef.current = { ...kept, ...mergeSessionPositions(visibleSessions, {}) };
     scheduleFit();
     setNodes(nodesFor(visibleSessions, positionsRef.current, pullRequests));
-    if (layoutRef.current) persist(withoutPositions(layoutRef.current, ids));
+    persist(withoutPositions(layoutRef.current, ids));
   }, [nodesFor, persist, pullRequests, scheduleFit, trackClick, visibleSessions]);
 
   const newSession = () => {

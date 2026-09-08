@@ -147,9 +147,14 @@ def test_canvas_page_remembers_a_dragged_card_across_reloads(
     page.mouse.down()
     page.mouse.move(before["x"] + 140, before["y"] + 120, steps=8)
     page.mouse.up()
+    # The layout entry is keyed by server and viewer; match on the prefix.
+    read_layout = (
+        "() => { const key = Object.keys(localStorage)"
+        ".find(k => k.startsWith('omnigent:canvas-layout:')); "
+        "return key ? JSON.parse(localStorage.getItem(key)) : null; }"
+    )
     page.wait_for_function(
-        "() => Object.keys(JSON.parse(localStorage.getItem("
-        "`omnigent:canvas-layout:${location.origin}`) ?? '{}').positions ?? {}).length === 1"
+        f"() => Object.keys((({read_layout})() ?? {{}}).positions ?? {{}}).length === 1"
     )
     moved = card.bounding_box()
     assert moved is not None
@@ -172,10 +177,7 @@ def test_canvas_page_remembers_a_dragged_card_across_reloads(
     expect(page.locator(".react-flow__node").first).to_have_attribute(
         "style", re.compile(r"translate\(0px, 0px\)")
     )
-    page.wait_for_function(
-        "() => !(JSON.parse(localStorage.getItem("
-        "`omnigent:canvas-layout:${location.origin}`) ?? '{}').positions ?? {}).only"
-    )
+    page.wait_for_function(f"() => !((({read_layout})() ?? {{}}).positions ?? {{}}).only")
 
 
 def test_canvas_cards_follow_live_session_updates(page: Page, live_server: str) -> None:

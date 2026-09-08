@@ -15,33 +15,38 @@ afterEach(() => {
 });
 
 describe("canvas layout storage", () => {
-  it("scopes the entry to the server identity", () => {
-    expect(canvasLayoutStorageKey()).toBe(`omnigent:canvas-layout:${window.location.origin}`);
+  it("scopes the entry to the server identity and the viewer", () => {
+    expect(canvasLayoutStorageKey("user_1")).toBe(
+      `omnigent:canvas-layout:${window.location.origin}:user_1`,
+    );
+    expect(canvasLayoutStorageKey(null)).toBe(
+      `omnigent:canvas-layout:${window.location.origin}:anonymous`,
+    );
   });
 
   it("reads an empty layout when nothing valid is stored", () => {
-    expect(readCanvasLayout()).toEqual(EMPTY_CANVAS_LAYOUT);
-    window.localStorage.setItem(canvasLayoutStorageKey(), "{not json");
-    expect(readCanvasLayout()).toEqual(EMPTY_CANVAS_LAYOUT);
+    expect(readCanvasLayout("u")).toEqual(EMPTY_CANVAS_LAYOUT);
+    window.localStorage.setItem(canvasLayoutStorageKey("u"), "{not json");
+    expect(readCanvasLayout("u")).toEqual(EMPTY_CANVAS_LAYOUT);
     window.localStorage.setItem(
-      canvasLayoutStorageKey(),
+      canvasLayoutStorageKey("u"),
       JSON.stringify({ version: LAYOUT_VERSION + 1, positions: { a: [1, 2] } }),
     );
-    expect(readCanvasLayout()).toEqual(EMPTY_CANVAS_LAYOUT);
+    expect(readCanvasLayout("u")).toEqual(EMPTY_CANVAS_LAYOUT);
   });
 
   it("round-trips positions, dropping malformed entries and ignoring unknown keys", () => {
-    writeCanvasLayout({ positions: { a: { x: 10.4, y: -20.6 }, b: { x: 5_000_000, y: 0 } } });
-    const raw = JSON.parse(window.localStorage.getItem(canvasLayoutStorageKey()) ?? "{}") as {
+    writeCanvasLayout({ positions: { a: { x: 10.4, y: -20.6 }, b: { x: 5_000_000, y: 0 } } }, "u");
+    const raw = JSON.parse(window.localStorage.getItem(canvasLayoutStorageKey("u")) ?? "{}") as {
       positions: Record<string, unknown>;
       viewports?: unknown;
     };
     raw.positions.broken = ["x", 1];
     // Layouts saved before the view stopped being persisted carry this key.
     raw.viewports = { main: { x: 1, y: 2, zoom: 0.5 } };
-    window.localStorage.setItem(canvasLayoutStorageKey(), JSON.stringify(raw));
+    window.localStorage.setItem(canvasLayoutStorageKey("u"), JSON.stringify(raw));
 
-    expect(readCanvasLayout()).toEqual({
+    expect(readCanvasLayout("u")).toEqual({
       positions: { a: { x: 10, y: -21 }, b: { x: 1_000_000, y: 0 } },
     });
   });
@@ -54,8 +59,8 @@ describe("canvas layout storage", () => {
         { x: index, y: 0 },
       ]),
     );
-    writeCanvasLayout({ positions });
-    const stored = readCanvasLayout().positions;
+    writeCanvasLayout({ positions }, "u");
+    const stored = readCanvasLayout("u").positions;
     expect(Object.keys(stored)).toHaveLength(MAX_SAVED_POSITIONS);
     expect(stored.s0).toBeUndefined();
     expect(stored[`s${MAX_SAVED_POSITIONS}`]).toEqual({ x: MAX_SAVED_POSITIONS, y: 0 });

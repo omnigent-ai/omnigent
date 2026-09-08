@@ -8,6 +8,8 @@ import type { Conversation } from "@/hooks/useConversations";
 import { fetchGithubInfo } from "@/hooks/useGithub";
 
 export const PULL_REQUEST_REFRESH_MS = 300_000;
+/** A failed lookup is retried this soon instead of waiting the full refresh window. */
+export const PULL_REQUEST_RETRY_MS = 60_000;
 export const PULL_REQUEST_CONCURRENCY = 4;
 /** Matches the GitHub panel so the runner is asked at most every 30s per session. */
 const GITHUB_INFO_STALE_MS = 30_000;
@@ -82,12 +84,15 @@ function samePullRequest(
 
 /**
  * The open pull request (if any) for each branch-bearing session in
- * ``sessions``, refreshed at most every five minutes per session. Pass a
- * memoized list — the queue is rebuilt whenever it changes.
+ * ``sessions``, refreshed at most every five minutes per session (a failed
+ * lookup retries after one minute). Pass a memoized list — the queue is
+ * rebuilt whenever it changes, and re-checked on a timer in between.
  */
 export function usePullRequests(sessions: readonly Conversation[]): CanvasPullRequests {
   const queryClient = useQueryClient();
   const [pullRequests, setPullRequests] = useState<CanvasPullRequests>({});
+  // Bumped on a timer so lookups fall due even while the session list is unchanged.
+  const [tick, setTick] = useState(0);
   const checkedAtRef = useRef<Record<string, number>>({});
   const queueRef = useRef<PullRequestQueue | null>(null);
   queueRef.current ??= new PullRequestQueue(PULL_REQUEST_CONCURRENCY);
@@ -95,8 +100,10 @@ export function usePullRequests(sessions: readonly Conversation[]): CanvasPullRe
 
   useEffect(() => {
     aliveRef.current = true;
+    const timer = setInterval(() => setTick((value) => value + 1), PULL_REQUEST_RETRY_MS);
     return () => {
       aliveRef.current = false;
+      clearInterval(timer);
       queueRef.current?.clear();
     };
   }, []);
@@ -114,12 +121,21 @@ export function usePullRequests(sessions: readonly Conversation[]): CanvasPullRe
       due.map((session) => ({
         key: session.id,
         run: async () => {
+          // Claim the slot so a rebuilt queue does not re-enqueue an in-flight lookup;
+          // a failure below shortens the wait to the retry window.
           checkedAtRef.current[session.id] = Date.now();
-          const info = await queryClient.fetchQuery({
-            queryKey: ["github-info", session.id],
-            queryFn: () => fetchGithubInfo(session.id),
-            staleTime: GITHUB_INFO_STALE_MS,
-          });
+          let info;
+          try {
+            info = await queryClient.fetchQuery({
+              queryKey: ["github-info", session.id],
+              queryFn: () => fetchGithubInfo(session.id),
+              staleTime: GITHUB_INFO_STALE_MS,
+            });
+          } catch (error) {
+            checkedAtRef.current[session.id] =
+              Date.now() - PULL_REQUEST_REFRESH_MS + PULL_REQUEST_RETRY_MS;
+            throw error;
+          }
           if (!aliveRef.current) return;
           const pr = info.available ? info.pr : null;
           const next: CanvasPullRequest | null =
@@ -135,7 +151,7 @@ export function usePullRequests(sessions: readonly Conversation[]): CanvasPullRe
       })),
     );
     return () => queue.clear();
-  }, [queryClient, sessions]);
+  }, [queryClient, sessions, tick]);
 
   return pullRequests;
 }

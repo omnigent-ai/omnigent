@@ -86,16 +86,25 @@ describe("canvases", () => {
   });
 
   it("files sessions by first-class id or legacy label and the rest on Main", () => {
-    expect(canvasIdFor(inProject, projects)).toBe("proj_a");
-    expect(canvasIdFor(labelled, projects)).toBe("name:Legacy");
-    expect(canvasIdFor(orphan, projects)).toBe(MAIN_CANVAS_ID);
-    expect(sessionsOnCanvas(all, MAIN_CANVAS_ID, projects)).toEqual([orphan, loose]);
-    expect(sessionsOnCanvas(all, "proj_a", projects)).toEqual([inProject]);
-    expect(sessionsOnCanvas(all, "name:Legacy", projects)).toEqual([labelled]);
+    expect(canvasIdFor(inProject, projects, null)).toBe("proj_a");
+    expect(canvasIdFor(labelled, projects, null)).toBe("name:Legacy");
+    expect(canvasIdFor(orphan, projects, null)).toBe(MAIN_CANVAS_ID);
+    expect(sessionsOnCanvas(all, MAIN_CANVAS_ID, projects, null)).toEqual([orphan, loose]);
+    expect(sessionsOnCanvas(all, "proj_a", projects, null)).toEqual([inProject]);
+    expect(sessionsOnCanvas(all, "name:Legacy", projects, null)).toEqual([labelled]);
+  });
+
+  it("keeps a shared session the viewer does not own on Main, like the sidebar", () => {
+    const shared = session("shared", 5, { project_id: "proj_a", owner: "someone-else" });
+    const mine = session("mine", 4, { project_id: "proj_a", owner: "me" });
+    expect(canvasIdFor(shared, projects, "me")).toBe(MAIN_CANVAS_ID);
+    expect(canvasIdFor(mine, projects, "me")).toBe("proj_a");
+    // Until identity resolves, shared rows are not filed either.
+    expect(canvasIdFor(shared, projects, null)).toBe(MAIN_CANVAS_ID);
   });
 
   it("starts every canvas at its own grid origin while keeping saved spots", () => {
-    const positions = mergeCanvasPositions(all, projects, { loose: { x: 640, y: 0 } });
+    const positions = mergeCanvasPositions(all, projects, { loose: { x: 640, y: 0 } }, null);
     expect(positions.in_project).toEqual({ x: 0, y: 0 });
     expect(positions.labelled).toEqual({ x: 0, y: 0 });
     expect(positions.orphan).toEqual({ x: 0, y: 0 });

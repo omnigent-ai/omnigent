@@ -1,11 +1,17 @@
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createElement, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import type { GithubChecks, GithubInfo } from "@/hooks/useGithub";
 import * as githubHook from "@/hooks/useGithub";
-import { PULL_REQUEST_CONCURRENCY, PullRequestQueue, usePullRequests } from "./pullRequests";
+import {
+  PULL_REQUEST_CONCURRENCY,
+  PULL_REQUEST_REFRESH_MS,
+  PULL_REQUEST_RETRY_MS,
+  PullRequestQueue,
+  usePullRequests,
+} from "./pullRequests";
 
 vi.mock("@/hooks/useGithub", () => ({ fetchGithubInfo: vi.fn() }));
 
@@ -121,6 +127,45 @@ describe("usePullRequests", () => {
 
     gates.get("branch_1")!.resolve(info(null));
     await waitFor(() => expect(result.current.branch_1).toBeNull());
+  });
+
+  it("retries a failed lookup after the retry window, not the full refresh window", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.mocked(githubHook.fetchGithubInfo)
+      .mockRejectedValueOnce(new Error("runner offline"))
+      .mockResolvedValue(
+        info({
+          number: 3,
+          title: "Back",
+          state: "OPEN",
+          url: "https://github.com/acme/repo/pull/3",
+          is_draft: false,
+          author: null,
+          base_ref: null,
+          head_ref: null,
+          checks: NO_CHECKS,
+        }),
+      );
+    const sessions = [session("s", "main")];
+    const { result } = renderHook(() => usePullRequests(sessions), { wrapper });
+    await waitFor(() => expect(githubHook.fetchGithubInfo).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PULL_REQUEST_RETRY_MS + 50);
+    });
+    await waitFor(() => expect(githubHook.fetchGithubInfo).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.s).toMatchObject({ number: 3 }));
+
+    // A successful lookup is not repeated until the full refresh window elapses.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PULL_REQUEST_RETRY_MS + 50);
+    });
+    expect(githubHook.fetchGithubInfo).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PULL_REQUEST_REFRESH_MS);
+    });
+    await waitFor(() => expect(githubHook.fetchGithubInfo).toHaveBeenCalledTimes(3));
+    vi.useRealTimers();
   });
 
   it("ignores pull requests without an https URL", async () => {

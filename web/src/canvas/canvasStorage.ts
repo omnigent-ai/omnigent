@@ -1,8 +1,10 @@
 // Persisted card positions for the Canvas page. The view itself is not saved:
 // every canvas opens fitted to its cards.
 //
-// One localStorage entry per server (keyed by the server identity, so an
-// embedded host that proxies several backends keeps their layouts apart).
+// One localStorage entry per server and user (keyed by the server identity,
+// so an embedded host that proxies several backends keeps their layouts
+// apart, and by the viewer's user id, so two people sharing a browser profile
+// against one server never see or overwrite each other's layout).
 // Reads never throw — a missing, malformed, or older-version entry reads as
 // an empty layout. Writes may throw (quota); callers surface that as a warning.
 
@@ -26,8 +28,8 @@ interface StoredLayout {
 
 export const EMPTY_CANVAS_LAYOUT: CanvasLayout = { positions: {} };
 
-export function canvasLayoutStorageKey(): string {
-  return `${STORAGE_KEY_PREFIX}:${getOmnigentServerIdentity() ?? "default"}`;
+export function canvasLayoutStorageKey(viewerId: string | null): string {
+  return `${STORAGE_KEY_PREFIX}:${getOmnigentServerIdentity() ?? "default"}:${viewerId ?? "anonymous"}`;
 }
 
 function boundedCoordinate(value: number): number {
@@ -50,10 +52,10 @@ function parsePositions(value: unknown): CanvasPositions {
   return positions;
 }
 
-export function readCanvasLayout(): CanvasLayout {
+export function readCanvasLayout(viewerId: string | null): CanvasLayout {
   if (typeof window === "undefined") return EMPTY_CANVAS_LAYOUT;
   try {
-    const raw = window.localStorage.getItem(canvasLayoutStorageKey());
+    const raw = window.localStorage.getItem(canvasLayoutStorageKey(viewerId));
     if (!raw) return EMPTY_CANVAS_LAYOUT;
     const parsed = JSON.parse(raw) as Partial<StoredLayout> | null;
     if (!parsed || typeof parsed !== "object" || parsed.version !== LAYOUT_VERSION) {
@@ -66,7 +68,7 @@ export function readCanvasLayout(): CanvasLayout {
 }
 
 /** Persist the layout. Throws when localStorage is unavailable or full. */
-export function writeCanvasLayout(layout: CanvasLayout): void {
+export function writeCanvasLayout(layout: CanvasLayout, viewerId: string | null): void {
   const entries = Object.entries(layout.positions).slice(-MAX_SAVED_POSITIONS);
   const stored: StoredLayout = {
     version: LAYOUT_VERSION,
@@ -77,7 +79,7 @@ export function writeCanvasLayout(layout: CanvasLayout): void {
       ]),
     ),
   };
-  window.localStorage.setItem(canvasLayoutStorageKey(), JSON.stringify(stored));
+  window.localStorage.setItem(canvasLayoutStorageKey(viewerId), JSON.stringify(stored));
 }
 
 export function withPosition(

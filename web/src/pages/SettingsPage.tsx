@@ -41,6 +41,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useViewerId } from "@/hooks/useViewerId";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
@@ -104,7 +105,7 @@ import {
   fetchGithubStatus,
   type GithubConnectionStatus,
 } from "@/lib/githubIntegration";
-import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
@@ -238,34 +239,6 @@ const PoliciesPage = lazy(() =>
 const SharingPage = lazy(() =>
   import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
 );
-
-/**
- * The current viewer's user id, resolved reactively. Uses `getCurrentUserId`
- * (NOT `getCurrentAuthorId`): ownership compares against the session's `owner`
- * grant, which in single-user mode is the reserved `"local"` id — and
- * `getCurrentAuthorId` nulls `"local"` out (it's for author labels), which
- * would make the viewer's own sessions read as shared and vanish from the
- * default "My sessions" tab. `getCurrentUserId` keeps `"local"` and is the
- * identical real email in multi-user mode. It is synchronous (populated once
- * `resolveIdentity` has run — which `main.tsx` kicks off at boot), but on a
- * cold mount it can still be null for a tick, so we also await
- * `resolveIdentity()` and re-render when it lands. Keeping this reactive
- * (rather than a bare module read) means the My/Shared split settles correctly
- * the moment identity is known, without a manual refresh.
- */
-function useViewerId(): string | null {
-  const [viewerId, setViewerId] = useState<string | null>(() => getCurrentUserId());
-  useEffect(() => {
-    let cancelled = false;
-    void resolveIdentity().then(() => {
-      if (!cancelled) setViewerId(getCurrentUserId());
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  return viewerId;
-}
 
 /**
  * Settings content panel. The section nav lives in the sidebar card

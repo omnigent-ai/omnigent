@@ -2,7 +2,7 @@
 // session belongs to, and where its card sits when the user has not placed it.
 
 import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
-import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
+import { sessionBelongsToProject } from "@/shell/sidebarNav";
 
 export const CARD_WIDTH = 280;
 export const CARD_HEIGHT = 132;
@@ -24,17 +24,16 @@ export function projectCanvasId(project: ProjectSummary): string {
   return project.id ?? `name:${project.name}`;
 }
 
-// Same dual-read membership the sidebar uses: the first-class `project_id` OR
-// the legacy `omni_project` label names the folder.
+// Same membership rule as the sidebar's folders (`sessionBelongsToProject`):
+// first-class id or legacy label, and owner-only filing. A shared session the
+// viewer does not own stays on Main, as it does in the sidebar.
 export function canvasIdFor(
   conversation: Conversation,
   projects: readonly ProjectSummary[],
+  viewerId: string | null,
 ): string {
-  const label = conversation.labels?.[PROJECT_LABEL_KEY];
-  const project = projects.find(
-    (candidate) =>
-      (candidate.id !== null && conversation.project_id === candidate.id) ||
-      (label !== undefined && candidate.name === label),
+  const project = projects.find((candidate) =>
+    sessionBelongsToProject(conversation, candidate, viewerId),
   );
   return project ? projectCanvasId(project) : MAIN_CANVAS_ID;
 }
@@ -43,8 +42,9 @@ export function sessionsOnCanvas(
   sessions: readonly Conversation[],
   canvasId: string,
   projects: readonly ProjectSummary[],
+  viewerId: string | null,
 ): Conversation[] {
-  return sessions.filter((session) => canvasIdFor(session, projects) === canvasId);
+  return sessions.filter((session) => canvasIdFor(session, projects, viewerId) === canvasId);
 }
 
 function cellKey(position: CanvasPosition): string {
@@ -95,10 +95,11 @@ export function mergeCanvasPositions(
   sessions: readonly Conversation[],
   projects: readonly ProjectSummary[],
   saved: CanvasPositions,
+  viewerId: string | null,
 ): CanvasPositions {
   const groups = new Map<string, Conversation[]>();
   for (const session of sessions) {
-    const canvasId = canvasIdFor(session, projects);
+    const canvasId = canvasIdFor(session, projects, viewerId);
     groups.set(canvasId, [...(groups.get(canvasId) ?? []), session]);
   }
   let positions: CanvasPositions = {};
