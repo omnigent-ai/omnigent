@@ -28,7 +28,12 @@ anyone needs to read through.
    `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"agy"|"pi", title="review-<task_slug>",
    args={purpose: "review", input: "<the diff> + <the acceptance contract>.
    Review ONLY against the contract. Report blocking / non-blocking /
-   suggestions. Do not edit code."})`. Give it the diff as text — do NOT point
+   suggestions. Do not edit code. You are a leaf reviewer. You have no
+   sub-agents and no ability to delegate — do not attempt to dispatch, and do
+   not describe a delegation plan. Review the diff in this message yourself and
+   return the structured report. Check that changed docstrings/comments
+   describe the shipped diff, not an approach that was tried and
+   rejected."})`. Give it the diff as text — do NOT point
    it at the implementer's worktree. Fetch the diff and emit the
    `sys_session_send` call in the SAME turn you decide to review — never end a
    turn having only announced "I'll load cross-review and fetch the diff" with
