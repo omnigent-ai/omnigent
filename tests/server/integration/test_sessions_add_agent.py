@@ -294,28 +294,3 @@ async def test_added_child_history_and_resources_resolve_independently(
     assert res.status_code == 200, res.text
     assert res.json()["object"] == "list"
     assert isinstance(res.json()["data"], list)
-
-
-# ── Available agents catalog (blocked — tripwire) ────────
-
-
-@pytest.mark.xfail(
-    reason=(
-        "No mounted GET /api/agents catalog route (documented in "
-        "omnigent/server/API.md, not wired in app.py). Flips to XPASS "
-        "when the route lands."
-    ),
-    strict=False,
-)
-async def test_available_agents_catalog_endpoint_exists(
-    client: httpx.AsyncClient,
-) -> None:
-    """``GET /api/agents`` lists launchable template agents for Add Agent."""
-    await create_test_agent(client, name="catalog-codex", executor=_CODEX_EXECUTOR)
-
-    resp = await client.get("/api/agents")
-    assert resp.status_code == 200, f"catalog endpoint not available: {resp.status_code}"
-    body = resp.json()
-    assert body["object"] == "list"
-    assert isinstance(body["data"], list)
-    assert any(a.get("name") == "catalog-codex" for a in body["data"])

@@ -11071,7 +11071,7 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
                     "encrypted_content": "gAAAA_encrypted",
                 },
             ],
-            "window_id": 2,
+            "window_id": "01a070e2-2665-7d62-9b74-973decf239b7",
             "response_id": "compact_1",
         },
         {
@@ -11106,7 +11106,7 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
     compacted_records = [r for r in records if r["type"] == "compacted"]
     assert len(compacted_records) == 1
     cp = compacted_records[0]["payload"]
-    assert cp["window_id"] == 2
+    assert cp["window_id"] == "01a070e2-2665-7d62-9b74-973decf239b7"
     assert len(cp["replacement_history"]) == 2
     assert cp["replacement_history"][1]["encrypted_content"] == "gAAAA_encrypted"
     # Post-compaction message should still be present

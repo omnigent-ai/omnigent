@@ -1081,19 +1081,16 @@ async def forward_claude_transcript_to_session(
                 # successful posts, so resuming retries the interrupted step.
                 _logger.warning(
                     "Claude transcript forwarder iteration exceeded %.0fs; "
-                    "cancelled the stalled await and resuming; session=%s "
-                    "bridge_dir=%s",
+                    "cancelled the stalled await and resuming; session=%s",
                     _FORWARD_LOOP_STALL_DEADLINE_S,
                     session_id,
-                    bridge_dir,
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
             except Exception:
                 _logger.exception(
-                    "Claude transcript forwarder loop failed; session=%s bridge_dir=%s",
+                    "Claude transcript forwarder loop failed; session=%s",
                     session_id,
-                    bridge_dir,
                     extra={"session_id": session_id},
                 )
             await asyncio.sleep(poll_interval_s)
@@ -1955,10 +1952,8 @@ async def _forward_session_cost(
                 delay = max(delay, float(raw_retry_after)) if raw_retry_after else delay
         dedupe.cost_retry_not_before = time.monotonic() + delay
         _logger.warning(
-            "Failed to forward Claude session cost; session=%s bridge_dir=%s "
-            "http_status=%s retry_in=%.1fs",
+            "Failed to forward Claude session cost; session=%s http_status=%s retry_in=%.1fs",
             session_id,
-            bridge_dir,
             _http_status_for_log(exc),
             delay,
             exc_info=True,
@@ -2079,10 +2074,8 @@ async def supervise_forwarder(
             # to return normally. Treat any normal return as a crash
             # and restart.
             _logger.warning(
-                "Claude transcript forwarder returned unexpectedly; restarting; "
-                "session=%s bridge_dir=%s",
+                "Claude transcript forwarder returned unexpectedly; restarting; session=%s",
                 session_id,
-                bridge_dir,
                 extra={"session_id": session_id},
             )
         except asyncio.CancelledError:
@@ -2096,11 +2089,9 @@ async def supervise_forwarder(
             # Log AFTER the healthy-uptime reset so the reported delay
             # matches the sleep that actually follows.
             _logger.error(
-                "Claude transcript forwarder crashed; restarting in %.1fs; "
-                "session=%s bridge_dir=%s",
+                "Claude transcript forwarder crashed; restarting in %.1fs; session=%s",
                 backoff_s,
                 session_id,
-                bridge_dir,
                 exc_info=crash_exc,
                 extra={"session_id": session_id},
             )
@@ -2882,11 +2873,10 @@ async def _forward_available_status_events(
                                 if decision.exhausted:
                                     _logger.error(
                                         "Dropping compaction boundary (hook path) after "
-                                        "permanent HTTP failures; session=%s bridge_dir=%s "
-                                        "seq=%s attempts=%s http_status=%s; leaving pending "
+                                        "permanent HTTP failures; session=%s seq=%s "
+                                        "attempts=%s http_status=%s; leaving pending "
                                         "token for a possible transcript-path retry",
                                         session_id,
-                                        bridge_dir,
                                         seq,
                                         decision.attempts,
                                         _http_status_for_log(exc),
@@ -2896,10 +2886,9 @@ async def _forward_available_status_events(
                                 else:
                                     _logger.warning(
                                         "Failed to persist compaction boundary (hook path); "
-                                        "session=%s bridge_dir=%s seq=%s attempt=%s "
+                                        "session=%s seq=%s attempt=%s "
                                         "permanent=%s next_retry_s=%.3f http_status=%s",
                                         session_id,
-                                        bridge_dir,
                                         seq,
                                         decision.attempts,
                                         decision.permanent,
@@ -3016,10 +3005,9 @@ async def _forward_available_status_events(
             if decision.exhausted:
                 _logger.error(
                     "Dropping Claude hook status after permanent HTTP failures; "
-                    "session=%s bridge_dir=%s event_cursor=%s status=%s "
+                    "session=%s event_cursor=%s status=%s "
                     "attempts=%s http_status=%s",
                     session_id,
-                    bridge_dir,
                     record.event_cursor,
                     status,
                     decision.attempts,
@@ -3030,7 +3018,6 @@ async def _forward_available_status_events(
                     await _post_forwarder_failed_status(
                         client,
                         session_id=session_id,
-                        bridge_dir=bridge_dir,
                         reason=f"hook status {status} rejected",
                         response_id=response_id,
                     )
@@ -3038,11 +3025,10 @@ async def _forward_available_status_events(
                 await _write_hook_state_async(bridge_dir, durable)
                 continue
             _logger.warning(
-                "Failed to forward Claude hook status; session=%s bridge_dir=%s "
-                "event_cursor=%s status=%s attempt=%s permanent=%s "
+                "Failed to forward Claude hook status; session=%s event_cursor=%s "
+                "status=%s attempt=%s permanent=%s "
                 "next_retry_s=%.3f http_status=%s",
                 session_id,
-                bridge_dir,
                 record.event_cursor,
                 status,
                 decision.attempts,
@@ -3099,7 +3085,6 @@ async def _ensure_state_for_transcript(
     if state is not None and state.transcript_path == transcript_path:
         validated = _validated_transcript_state(
             state,
-            bridge_dir=bridge_dir,
             session_id=session_id,
         )
         if validated != state:
@@ -3109,7 +3094,6 @@ async def _ensure_state_for_transcript(
     if disk_state is not None and disk_state.transcript_path == transcript_path:
         validated = _validated_transcript_state(
             disk_state,
-            bridge_dir=bridge_dir,
             session_id=session_id,
         )
         if validated != disk_state:
@@ -3264,13 +3248,12 @@ async def _handle_compact_summary_item(
             # NB: the *_process_total counters are module-global, accumulating
             # across ALL sessions in this forwarder process (reset only on a
             # fresh process / the test seam), not per-session. The session=/
-            # bridge_dir= fields scope THIS skip; the total is process-wide.
+            # session= fields scope THIS skip; the total is process-wide.
             _logger.warning(
                 "Skipping isCompactSummary with no pending PreCompact and no "
                 "persisted boundary (likely a missed PreCompact hook); "
-                "session=%s bridge_dir=%s precompact_miss_process_total=%s",
+                "session=%s precompact_miss_process_total=%s",
                 session_id,
-                bridge_dir,
                 _compaction_skip_stats.precompact_miss,
                 extra={"session_id": session_id},
             )
@@ -3278,9 +3261,8 @@ async def _handle_compact_summary_item(
             _compaction_skip_stats.expected_skip += 1
             _logger.debug(
                 "Skipping isCompactSummary with no consumable token (expected "
-                "replay/dedupe); session=%s bridge_dir=%s expected_skip_process_total=%s",
+                "replay/dedupe); session=%s expected_skip_process_total=%s",
                 session_id,
-                bridge_dir,
                 _compaction_skip_stats.expected_skip,
                 extra={"session_id": session_id},
             )
@@ -3486,10 +3468,9 @@ async def _forward_available_items(
             if decision.exhausted:
                 _logger.error(
                     "Dropping Claude transcript item after permanent HTTP failures; "
-                    "session=%s bridge_dir=%s source_id=%s item_type=%s "
+                    "session=%s source_id=%s item_type=%s "
                     "attempts=%s http_status=%s",
                     session_id,
-                    bridge_dir,
                     item.source_id,
                     item.item_type,
                     decision.attempts,
@@ -3516,7 +3497,6 @@ async def _forward_available_items(
                 await _post_forwarder_failed_status(
                     client,
                     session_id=session_id,
-                    bridge_dir=bridge_dir,
                     reason=f"transcript item {item.source_id} rejected",
                     response_id=current_response_id,
                 )
@@ -3542,9 +3522,8 @@ async def _forward_available_items(
                 _logger.warning(
                     "Skipping Claude transcript item after an ambiguous POST failure "
                     "(may already be committed); not retrying to avoid a duplicate; "
-                    "session=%s bridge_dir=%s source_id=%s item_type=%s http_status=%s",
+                    "session=%s source_id=%s item_type=%s http_status=%s",
                     session_id,
-                    bridge_dir,
                     item.source_id,
                     item.item_type,
                     _http_status_for_log(exc),
@@ -3567,11 +3546,10 @@ async def _forward_available_items(
                 await _write_forward_state_async(bridge_dir, updated)
                 continue
             _logger.warning(
-                "Failed to forward Claude transcript item; session=%s bridge_dir=%s "
-                "source_id=%s item_type=%s attempt=%s permanent=%s "
+                "Failed to forward Claude transcript item; session=%s source_id=%s "
+                "item_type=%s attempt=%s permanent=%s "
                 "next_retry_s=%.3f http_status=%s",
                 session_id,
-                bridge_dir,
                 item.source_id,
                 item.item_type,
                 decision.attempts,
@@ -3673,10 +3651,8 @@ async def _forward_available_items(
                 dedupe.recorded_token_usage = record_token_usage
         except httpx.HTTPError as exc:
             _logger.warning(
-                "Failed to forward Claude transcript usage; session=%s bridge_dir=%s "
-                "http_status=%s",
+                "Failed to forward Claude transcript usage; session=%s http_status=%s",
                 session_id,
-                bridge_dir,
                 _http_status_for_log(exc),
                 exc_info=True,
                 extra={"session_id": session_id},
@@ -3798,19 +3774,16 @@ def _validated_hook_state(
     current_fingerprint = _jsonl_cursor_fingerprint(hooks_path, state.byte_offset)
     if current_fingerprint is None:
         _logger.warning(
-            "Claude hook JSONL cursor invalid; resetting cursor; "
-            "session=%s bridge_dir=%s byte_offset=%s",
+            "Claude hook JSONL cursor invalid; resetting cursor; session=%s byte_offset=%s",
             session_id,
-            bridge_dir,
             state.byte_offset,
             extra={"session_id": session_id},
         )
     elif state.cursor_fingerprint is None:
         _logger.warning(
             "Claude hook JSONL cursor missing fingerprint; resetting cursor; "
-            "session=%s bridge_dir=%s byte_offset=%s",
+            "session=%s byte_offset=%s",
             session_id,
-            bridge_dir,
             state.byte_offset,
             extra={"session_id": session_id},
         )
@@ -3819,9 +3792,8 @@ def _validated_hook_state(
     else:
         _logger.warning(
             "Claude hook JSONL cursor fingerprint changed; resetting cursor; "
-            "session=%s bridge_dir=%s byte_offset=%s",
+            "session=%s byte_offset=%s",
             session_id,
-            bridge_dir,
             state.byte_offset,
             extra={"session_id": session_id},
         )
@@ -3868,14 +3840,12 @@ def _read_transcript_items_for_state(
 def _validated_transcript_state(
     state: TranscriptForwardState,
     *,
-    bridge_dir: Path,
     session_id: str,
 ) -> TranscriptForwardState:
     """
     Reset a transcript cursor if its byte-offset fingerprint is stale.
 
     :param state: Transcript cursor loaded from memory or disk.
-    :param bridge_dir: Native Claude bridge directory.
     :param session_id: Omnigent session/conversation id, e.g.
         ``"conv_abc123"``. Used for diagnostics.
     :returns: ``state`` unchanged when its byte cursor still matches
@@ -3893,10 +3863,8 @@ def _validated_transcript_state(
             return state
         _logger.warning(
             "Claude transcript cursor invalid; skipping to end of transcript; "
-            "session=%s bridge_dir=%s transcript=%s byte_offset=%s",
+            "session=%s byte_offset=%s",
             session_id,
-            bridge_dir,
-            state.transcript_path,
             state.byte_offset,
             extra={"session_id": session_id},
         )
@@ -3918,10 +3886,8 @@ def _validated_transcript_state(
             )
         _logger.warning(
             "Claude transcript cursor missing fingerprint; skipping to end of transcript; "
-            "session=%s bridge_dir=%s transcript=%s byte_offset=%s",
+            "session=%s byte_offset=%s",
             session_id,
-            bridge_dir,
-            state.transcript_path,
             state.byte_offset,
             extra={"session_id": session_id},
         )
@@ -3930,10 +3896,8 @@ def _validated_transcript_state(
     else:
         _logger.warning(
             "Claude transcript cursor fingerprint changed; skipping to end of transcript; "
-            "session=%s bridge_dir=%s transcript=%s byte_offset=%s",
+            "session=%s byte_offset=%s",
             session_id,
-            bridge_dir,
-            state.transcript_path,
             state.byte_offset,
             extra={"session_id": session_id},
         )
@@ -4194,9 +4158,8 @@ async def _forward_available_deltas(
         except httpx.HTTPError as exc:
             _logger.debug(
                 "Dropping Claude streamed delta after HTTP failure; session=%s "
-                "bridge_dir=%s message_id=%s index=%s http_status=%s",
+                "message_id=%s index=%s http_status=%s",
                 session_id,
-                bridge_dir,
                 delta.message_id,
                 delta.index,
                 _http_status_for_log(exc),
@@ -4784,7 +4747,6 @@ async def _post_forwarder_failed_status(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    bridge_dir: Path,
     reason: str,
     response_id: str | None = None,
 ) -> None:
@@ -4793,7 +4755,6 @@ async def _post_forwarder_failed_status(
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
-    :param bridge_dir: Native Claude bridge directory.
     :param reason: Diagnostic reason for the failure event, e.g.
         ``"transcript item item-1 rejected"``.
     :param response_id: Active turn's response id, so this ``failed``
@@ -4812,10 +4773,8 @@ async def _post_forwarder_failed_status(
         )
     except httpx.HTTPError:
         _logger.warning(
-            "Failed to publish Claude forwarder failure status; "
-            "session=%s bridge_dir=%s reason=%s",
+            "Failed to publish Claude forwarder failure status; session=%s reason=%s",
             session_id,
-            bridge_dir,
             reason,
             exc_info=True,
             extra={"session_id": session_id},
@@ -5342,10 +5301,8 @@ async def _maybe_dismiss_stranded_compaction_spinner(
         )
     except httpx.HTTPError:
         _logger.warning(
-            "Failed to dismiss stranded compaction spinner after a /compact refusal; "
-            "session=%s bridge_dir=%s",
+            "Failed to dismiss stranded compaction spinner after a /compact refusal; session=%s",
             session_id,
-            bridge_dir,
             exc_info=True,
             extra={"session_id": session_id},
         )
@@ -5433,11 +5390,9 @@ async def _claim_standalone_completion(bridge_dir: Path) -> int | None:
             # duplicate. Clear the stale window as we go.
             _logger.warning(
                 "Compaction completion-ack armed for seq=%s not in persisted_seqs=%s; "
-                "persisting standalone boundary rather than absorbing (bias-to-safe); "
-                "bridge_dir=%s",
+                "persisting standalone boundary rather than absorbing (bias-to-safe)",
                 ack_seq,
                 state.persisted_seqs,
-                bridge_dir,
             )
         next_seq = state.last_seq + 1
         _write_compaction_state(

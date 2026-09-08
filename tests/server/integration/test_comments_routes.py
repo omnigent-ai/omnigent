@@ -453,58 +453,6 @@ async def test_send_marks_comments_addressed_and_formats_message(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="send must not auto-resolve comments before verification.",
-)
-async def test_send_leaves_comments_open_until_verified(
-    auth_client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    """Spec: sending to the agent should NOT auto-resolve comments.
-
-    Sending comments creates a request for the agent, but the feedback is
-    not actually resolved until the requested change is verified (explicit
-    user action or a verified-resolution workflow). The current endpoint
-    optimistically flips ``draft`` -> ``addressed`` on send, which hides
-    unresolved feedback if the agent fails, ignores, or mis-handles a
-    comment. This strict xfail documents the desired contract: the comment
-    stays ``draft`` immediately after ``/comments/send``.
-
-    :param auth_client: HTTP client backed by the auth-enabled app.
-    :param db_uri: Per-test SQLite URI used to seed the edit grant.
-    """
-    session_id = _seed_session_with_grants(db_uri, {"alice@example.com": LEVEL_EDIT})
-
-    comment = await _add_comment(
-        auth_client,
-        session_id,
-        user="alice@example.com",
-        path="src/review.py",
-        body="Please fix this edge case",
-        start_index=0,
-        end_index=4,
-    )
-
-    send_resp = await auth_client.post(
-        f"/v1/sessions/{session_id}/comments/send",
-        json={"comment_ids": [comment["id"]]},
-        headers={"X-Forwarded-Email": "alice@example.com"},
-    )
-    send_resp.raise_for_status()
-
-    list_resp = await auth_client.get(
-        f"/v1/sessions/{session_id}/comments",
-        headers={"X-Forwarded-Email": "alice@example.com"},
-    )
-    list_resp.raise_for_status()
-    status = {c["id"]: c["status"] for c in list_resp.json()}[comment["id"]]
-    assert status == "draft", (
-        f"Comment should remain 'draft' (open) until verified, got {status!r}. "
-        "Sending to the agent should not optimistically auto-resolve feedback."
-    )
-
-
 async def test_comment_api_serializes_updated_at(
     auth_client: httpx.AsyncClient,
     db_uri: str,

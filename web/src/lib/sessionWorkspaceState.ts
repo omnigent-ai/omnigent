@@ -25,6 +25,8 @@ export interface SessionWorkspaceState {
   openTerminals?: string[];
   /** The active shell tab (null = a file/scope view is active). */
   selectedTerminalKey?: string | null;
+  openBrowsers?: string[];
+  selectedBrowserId?: string | null;
 }
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
@@ -81,6 +83,18 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (record.selectedTerminalKey === null || typeof record.selectedTerminalKey === "string") {
     state.selectedTerminalKey = record.selectedTerminalKey;
   }
+  if (Array.isArray(record.openBrowsers)) {
+    state.openBrowsers = [
+      ...new Set(
+        record.openBrowsers.filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        ),
+      ),
+    ];
+  }
+  if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
+    state.selectedBrowserId = record.selectedBrowserId;
+  }
   return state;
 }
 
@@ -135,6 +149,11 @@ export function writeSessionWorkspaceState(
   // Same bound for shell tabs (also appended in open order).
   if (next.openTerminals && next.openTerminals.length > MAX_OPEN_FILES) {
     next.openTerminals = next.openTerminals.slice(-MAX_OPEN_FILES);
+  }
+  // Same bound for browser tabs. Native view creation enforces its own lower
+  // runtime cap; this keeps the persisted rail from growing without bound.
+  if (next.openBrowsers && next.openBrowsers.length > MAX_OPEN_FILES) {
+    next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_FILES);
   }
   // Drop any existing entry and re-append so the most-recently-touched session
   // moves to the end; pruning then evicts from the front (oldest-touched).

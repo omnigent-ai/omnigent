@@ -1871,6 +1871,25 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true");
   });
 
+  it("keeps peeking while the pointer rests on the header toggle that armed it", async () => {
+    // During the card's click-through entry window the pointer still hit-tests
+    // to the chat-header toggle beneath it, so a wobble there must count as
+    // "inside the peek surface" — not arm the outside-dismiss timer.
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    const toggle = screen.getByRole("button", { name: /open sidebar/i });
+    fireEvent.pointerEnter(toggle);
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));
+
+    fireEvent.pointerMove(toggle);
+    await new Promise((resolve) => {
+      // Past the 200ms dismiss grace, so "still peeking" is a real result.
+      setTimeout(resolve, 350);
+    });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true");
+  });
+
   it("keeps the sidebar pinned open for the whole /settings visit", () => {
     // Repeated toggles all resolve to open while on the page: collapsing is what
     // removes the only exit, so the guard refuses that direction throughout.
@@ -3672,6 +3691,19 @@ describe("AppShell clone/fork action", () => {
 });
 
 describe("AppShell share action", () => {
+  it("passes the conversation workspace to the Share dialog before the snapshot loads", () => {
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_home", permission_level: 4, workspace: "/home/alice" }]);
+      renderShell("/c/conv_home", serverInfo({ sharing_mode: "restricted_read_only" }));
+      fireEvent.click(screen.getByRole("button", { name: /share session/i }));
+      expect(
+        screen.getByText(/This session's working directory \(a home or root directory\)/),
+      ).toBeInTheDocument();
+      expect(screen.getByText(/Please be careful when sharing/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^grant$/i })).toBeInTheDocument();
+    });
+  });
+
   it("shows the Share button to an owner of a top-level session", () => {
     // permission_level 4 = owner. Share is owner-only; a top-level session
     // the viewer owns can be shared. (A multi-user owner's list row carries

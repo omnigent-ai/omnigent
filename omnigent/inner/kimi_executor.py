@@ -16,7 +16,11 @@ Omnigent turn:
 - captures the kimi session id from the ``role:"meta"`` /
   ``type:"session.resume_hint"`` line for resume on the next turn,
 - uses the subprocess's ``cwd=`` for the working directory (upstream
-  has no ``--work-dir`` flag).
+  has no ``--work-dir`` flag),
+- after the subprocess exits, best-effort sums the turn's ``usage.record``
+  rows from kimi's persisted ``wire.jsonl`` (the stream-json stdout carries
+  no usage or model records) into ``TurnComplete.usage``, stamping the
+  effective model from ``llm.request``.
 
 Kimi runs its own agent loop and its own tools (Bash, edit, read, web,
 …) — Omnigent does not re-execute them. The executor advertises
@@ -82,6 +86,8 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
+from omnigent.kimi_native_credentials import resolve_user_kimi_home
+from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 
 _logger = logging.getLogger(__name__)
 
@@ -99,6 +105,201 @@ _SESSION_RESUME_RE = re.compile(
     r"To resume this session:\s+\S+\s+-r\s+(\S+)",
     re.IGNORECASE,
 )
+
+
+#: One-shot log guard keys (schema drift logs once per process, not per row).
+_WARNED_KEYS: set[str] = set()
+
+
+def _warn_once(key: str, msg: str, *args: object) -> None:
+    """Log *msg* at warning level only the first time *key* is seen."""
+    if key in _WARNED_KEYS:
+        return
+    _WARNED_KEYS.add(key)
+    _logger.warning(msg, *args)
+
+
+def _token_count(raw: object) -> int | None:
+    """A pinned token-count field: a non-boolean, non-negative int, else None."""
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw
+    return None
+
+
+def _find_wire_log(home: Path, session_id: str) -> Path | None:
+    """Locate the session's persisted wire log under *home*, or ``None``.
+
+    The session dir name equals the resume-hint session id
+    (``session_<uuid>``); workspaces (``wd_*``) are globbed because the
+    hint doesn't say which one the session lives under.
+    """
+    try:
+        for wire in (home / "sessions").glob(f"*/{session_id}/agents/main/wire.jsonl"):
+            if wire.is_file():
+                return wire
+    except OSError:
+        return None
+    return None
+
+
+def _sum_wire_usage(
+    wire_path: Path,
+    *,
+    offset: int,
+    turn_start_ms: int,
+) -> tuple[dict[str, int] | None, str | None, int]:
+    """Sum the turn's ``usage.record`` rows from the wire log's new bytes.
+
+    Reads from byte *offset* (the per-session checkpoint). On the first read
+    of a wire log (``offset == 0``) the file may carry a resumed session's
+    history (``-C`` / ``-S`` into an existing session), so rows are also
+    gated on a STRICT ``time >= turn_start_ms`` — no backward allowance, or a
+    turn finished moments before the resume would be re-billed. With a
+    checkpoint, every new row belongs to this turn and no time gate applies.
+
+    Rows are validated against the pinned Kimi Code 0.34.0 schema (four
+    non-boolean, non-negative int counts + a model string); drifted rows are
+    skipped whole and logged once — never partially counted.
+
+    :returns: ``(token sums or None when no row counted, effective model or
+        None, new checkpoint offset)``. The model prefers the ``llm.request``
+        (provider-resolved id, then alias) PAIRED with a counted record —
+        each record consumes the request immediately preceding it — and
+        falls back to the newest counted record's own model, so a resumed
+        log's historical request can never stamp a later turn whose own
+        request row is missing. Tolerant of a missing/unreadable file and
+        malformed rows.
+    """
+    try:
+        with wire_path.open("rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            start = offset if 0 <= offset <= size else 0
+            fh.seek(start)
+            blob = fh.read()
+    except OSError as exc:
+        _warn_once(
+            f"wire-unreadable:{wire_path}",
+            "kimi executor: cannot read wire log %s (no usage reported): %s",
+            wire_path,
+            exc,
+        )
+        return None, None, offset
+    first_read = start == 0
+    # Collection runs only after the subprocess has exited, so these bytes are
+    # stable: a valid final JSON row without a newline must bill, while an
+    # invalid fragment is deliberately consumed because no writer can finish it.
+    totals = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    counted = False
+    # Request→usage pairing: each usage.record is produced by the llm.request
+    # immediately preceding it, so a request only attributes tokens when one
+    # of ITS usage rows is counted. A timeless historical request followed by
+    # its own (uncounted, pre-turn) usage row is consumed by that row and can
+    # never mis-stamp a later counted row whose own request went missing.
+    request_model: str | None = None
+    pending_request: str | None = None
+    record_model: str | None = None
+    for raw in blob.decode("utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        row: object = None
+        if line.startswith("{"):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                row = None
+        if not isinstance(row, dict):
+            # Torn write / non-JSON noise: skip, but keep the diagnostic.
+            _warn_once(
+                f"wire-badrow:{wire_path}",
+                "kimi executor: skipping unparseable wire row(s) in %s "
+                "(further rows logged at debug)",
+                wire_path,
+            )
+            _logger.debug("kimi executor: unparseable wire row: %.200s", line)
+            continue
+        row_type = row.get("type")
+        if row_type == "llm.request":
+            # A resumed log's historical requests must not attribute this
+            # turn — but real 0.34.0 ``llm.request`` rows carry NO ``time``
+            # (pinned fixtures), so the first-read gate applies only to rows
+            # that DO have one. A timeless historical row is harmless: the
+            # newest request wins, and this turn's own (also timeless)
+            # request comes later in the log. Usage rows stay strictly
+            # time-gated below — attribution can tolerate this, billing
+            # cannot.
+            if first_read:
+                request_time = _token_count(row.get("time"))
+                if request_time is not None and request_time < turn_start_ms:
+                    continue
+            # Provider-resolved model id, falling back to the configured alias.
+            candidate = row.get("model")
+            if not (isinstance(candidate, str) and candidate):
+                candidate = row.get("modelAlias")
+            if isinstance(candidate, str) and candidate:
+                pending_request = candidate
+            continue
+        if row_type == "turn.ended":
+            # Failed turns can end without usage; their request must not stamp a
+            # later record whose own request row is absent.
+            pending_request = None
+            continue
+        if row_type != "usage.record":
+            continue
+        # Every usage scope consumes the request that produced it. Aggregate
+        # records are not billed here, but leaving their request pending would
+        # misattribute the next turn-scoped row.
+        consumed_request, pending_request = pending_request, None
+        if row.get("usageScope") != "turn":
+            continue
+        model = row.get("model")
+        row_time = _token_count(row.get("time"))
+        usage = row.get("usage")
+        counts: dict[str, int] | None = None
+        if isinstance(usage, dict):
+            counts = {}
+            for wire_key, out_key in (
+                ("inputOther", "input_tokens"),
+                ("output", "output_tokens"),
+                ("inputCacheRead", "cache_read_input_tokens"),
+                ("inputCacheCreation", "cache_creation_input_tokens"),
+            ):
+                value = _token_count(usage.get(wire_key))
+                if value is None:
+                    counts = None
+                    break
+                counts[out_key] = value
+        if counts is None or not (isinstance(model, str) and model) or row_time is None:
+            # Schema drift: skip the whole record — partial/zero sums would
+            # be silently wrong and the checkpoint advances irreversibly.
+            _warn_once(
+                f"usage.record-drift:{wire_path}",
+                "kimi executor: skipping usage.record not matching the pinned "
+                "0.34.0 schema (further drift logged at debug): %r",
+                row,
+            )
+            _logger.debug("kimi executor: skipped drifted usage.record: %r", row)
+            continue
+        if first_read and row_time < turn_start_ms:
+            continue
+        for out_key, value in counts.items():
+            totals[out_key] += value
+        record_model = model
+        if consumed_request is not None:
+            request_model = consumed_request
+        counted = True
+    if counted:
+        # The relay path stores total_tokens as its own accumulator (never
+        # derived), so omitting it would report 0 total forever.
+        totals["total_tokens"] = sum(totals.values())
+    # Checkpoint exactly what was consumed: complete lines only (any trailing
+    # fragment was cut above), and never bytes appended after the read.
+    return (totals if counted else None), (request_model or record_model), start + len(blob)
 
 
 def _parse_truthy(value: str | None) -> bool:
@@ -212,6 +413,14 @@ class KimiExecutor(Executor):
         # Per-session state: kimi session id captured from the prior turn's
         # ``role:"meta"`` event, fed to ``-S <id>`` on the next turn.
         self._session_id: str | None = None
+        # Byte-offset checkpoints into each kimi session's persisted wire log,
+        # so a turn only sums the usage records new since the prior turn.
+        self._wire_offsets: dict[str, int] = {}
+        # Sessions whose usage collection already failed (no/empty wire):
+        # maps to the FIRST failed turn's start, so a later first read bills
+        # those turns' late-appearing rows instead of gating on the current
+        # turn's start (and seeding must not snapshot EOF past them).
+        self._first_read_floor_ms: dict[str, int] = {}
         # Tracks whether we've already warned this session about tools
         # being declared without a provider-injection bridge (one warning
         # per session; the tool-injection bridge is a deferred follow-up).
@@ -339,6 +548,86 @@ class KimiExecutor(Executor):
         argv.extend(["-p", prompt_text])
         return argv
 
+    def _seed_wire_checkpoint(self) -> None:
+        """Snapshot the resumed session's wire EOF before spawning.
+
+        A known session id with no checkpoint (e.g. an earlier extraction
+        failure) must not bill pre-existing records to this turn: everything
+        already in the file predates the spawn. Best-effort.
+        """
+        session_id = self._session_id
+        if not session_id or session_id in self._wire_offsets:
+            return
+        if session_id in self._first_read_floor_ms:
+            # An earlier turn's collection yielded no usage (missing, empty,
+            # or unreadable wire), so rows written since that turn are still
+            # unbilled: snapshotting EOF now would skip them forever. The
+            # first read starts at 0, gated on the recorded floor instead.
+            return
+        try:
+            wire = _find_wire_log(resolve_user_kimi_home(), session_id)
+            if wire is not None:
+                self._wire_offsets[session_id] = wire.stat().st_size
+        except Exception:
+            # Best-effort boundary (e.g. Path.home() in a HOME-less env):
+            # seeding must never fail the turn.
+            _logger.exception("kimi executor: wire checkpoint seeding failed")
+            return
+
+    def _collect_turn_usage(self, turn_start_ms: int) -> dict[str, object] | None:
+        """Best-effort per-turn token usage from kimi's persisted wire log.
+
+        Kimi's stream-json stdout carries no usage/model records, but the
+        session's ``wire.jsonl`` does. Sums the turn's ``usage.record`` rows
+        (new since this session's byte checkpoint) into ``TurnComplete.usage``
+        keys, stamping the effective model from ``llm.request`` so the server
+        attributes tokens per model. Never raises — any failure logs at debug
+        and reports no usage.
+        """
+        session_id = self._session_id
+        if not session_id:
+            return None
+        try:
+            wire_path = _find_wire_log(resolve_user_kimi_home(), session_id)
+            if wire_path is None:
+                _warn_once(
+                    f"wire-missing:{session_id}",
+                    "kimi executor: no wire log found for %s (no usage reported "
+                    "this turn; retried next turn)",
+                    session_id,
+                )
+                # Remember the FIRST failed turn's start: its rows may appear
+                # late and must still bill on the eventual first read.
+                self._first_read_floor_ms.setdefault(session_id, turn_start_ms)
+                return None
+            offset = self._wire_offsets.get(session_id, 0)
+            floor_ms = self._first_read_floor_ms.get(session_id, turn_start_ms)
+            totals, model, new_offset = _sum_wire_usage(
+                wire_path, offset=offset, turn_start_ms=floor_ms
+            )
+            self._wire_offsets[session_id] = new_offset
+            if totals is None:
+                # ANY first collection that yields no usage — wire missing
+                # (handled above), empty, unreadable, or holding zero billable
+                # rows — records the FIRST such turn's start, so rows flushed
+                # late still bill on the eventual productive read instead of
+                # failing a later turn's time gate.
+                if offset == 0:
+                    self._first_read_floor_ms.setdefault(session_id, turn_start_ms)
+                return None
+            # A read actually consumed billable rows; the pending-first-read
+            # floor has served its purpose.
+            self._first_read_floor_ms.pop(session_id, None)
+            usage: dict[str, object] = dict(totals)
+            if model:
+                usage["model"] = model
+            _notify_usage_from_dict(model=model or self._model or "kimi", usage=usage)
+            return usage
+        except Exception:
+            # Best-effort boundary: usage extraction must never fail the turn.
+            _logger.exception("kimi executor: wire-log usage extraction failed")
+            return None
+
     def _translate_event(self, payload: Mapping[str, object]) -> list[ExecutorEvent]:
         """Translate one kimi stream-json line into Omnigent events.
 
@@ -456,6 +745,14 @@ class KimiExecutor(Executor):
         argv[0] = self._sandbox_launch_path(tuple(env.keys()))
 
         started_at = time.monotonic()
+        # Checkpoint a resumed session's wire EOF before spawning, so the
+        # usage read after exit never bills pre-existing records to this turn.
+        self._seed_wire_checkpoint()
+        # Wall-clock floor for the wire-log usage read: on the first read of a
+        # resumed session's log, only records stamped at/after this turn count.
+        # Truncated to whole ms — record ``time`` stamps are ms-resolution, so
+        # the strict gate must compare at the same granularity.
+        turn_start_ms = int(time.time() * 1000)
         process: asyncio.subprocess.Process | None = None
         stderr_buf = bytearray()
         any_text_emitted = False
@@ -557,6 +854,7 @@ class KimiExecutor(Executor):
 
         yield TurnComplete(
             response="".join(final_text_parts) if any_text_emitted else None,
+            usage=self._collect_turn_usage(turn_start_ms),
         )
 
     # -- session lifecycle ---------------------------------------------------

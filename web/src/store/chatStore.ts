@@ -79,6 +79,7 @@ import type {
   StreamEvent,
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
+import { randomUUID } from "@/lib/randomUUID";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
@@ -1399,7 +1400,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (conversationId === null) return;
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
-    const stableId = crypto.randomUUID().replace(/-/g, "");
+    const stableId = randomUUID().replace(/-/g, "");
     setActive((s) => ({
       queuedMessages: [
         ...s.queuedMessages,
@@ -1625,7 +1626,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
     const retryId = get().pendingRetryStableId;
     if (retryId !== null) setActive({ pendingRetryStableId: null });
-    const stableId = opts?.stableId ?? retryId ?? crypto.randomUUID().replace(/-/g, "");
+    const stableId = opts?.stableId ?? retryId ?? randomUUID().replace(/-/g, "");
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
     // into the running task's inbox. Keep `activeResponse` untouched in

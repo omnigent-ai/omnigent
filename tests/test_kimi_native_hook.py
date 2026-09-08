@@ -11,7 +11,13 @@ import httpx
 import pytest
 
 from omnigent import kimi_native_hook
-from omnigent.kimi_native_bridge import APPROVE_KEY, DENY_KEY, write_hook_config
+from omnigent.kimi_native_bridge import (
+    APPROVE_KEY,
+    DENY_KEY,
+    KimiApprovalPromptAmbiguousError,
+    KimiApprovalPromptNotFoundError,
+    write_hook_config,
+)
 from omnigent.native_policy_hook import _EVAL_UNAVAILABLE_REASON
 
 
@@ -176,7 +182,7 @@ def test_permission_request_injects_keystroke_for_verdict(
     monkeypatch.setattr(
         kimi_native_hook,
         "_request_web_approval",
-        lambda url, headers, body: posted.append({"url": url, "body": body}) or verdict,
+        lambda url, headers, body, **kwargs: posted.append({"url": url, "body": body}) or verdict,
     )
     keys = _capture_injection(monkeypatch)
 
@@ -201,6 +207,76 @@ def test_permission_request_no_verdict_injects_nothing(
 
     assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
     assert keys == []
+
+
+def test_permission_request_reparks_after_injection_miss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = _governed_bridge(tmp_path)
+    _feed_stdin(monkeypatch, {"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+    verdicts = iter(["allow", "deny"])
+    posted: list[dict[str, object]] = []
+    deadlines: list[object] = []
+    keys: list[str] = []
+
+    def _request(
+        url: str, headers: dict[str, str], body: dict[str, object], **kwargs: object
+    ) -> str:
+        del url, headers
+        posted.append(body.copy())
+        deadlines.append(kwargs.get("deadline"))
+        return next(verdicts)
+
+    def _inject(bridge_dir: Path, *, key: str, timeout_s: float) -> bool:
+        del bridge_dir, timeout_s
+        keys.append(key)
+        if len(keys) == 1:
+            raise KimiApprovalPromptNotFoundError("menu moved")
+        return True
+
+    monkeypatch.setattr(kimi_native_hook, "_request_web_approval", _request)
+    monkeypatch.setattr(kimi_native_hook, "inject_approval_keystroke", _inject)
+    monkeypatch.setattr(kimi_native_hook, "_approval_still_pending", lambda _bridge: True)
+    monkeypatch.setattr(kimi_native_hook.time, "monotonic", lambda: 100.0)
+
+    assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+    assert keys == [APPROVE_KEY, DENY_KEY]
+    assert len(posted) == 2
+    assert posted[0]["_omnigent_elicitation_id"] == posted[1]["_omnigent_elicitation_id"]
+    assert deadlines == [
+        100.0 + kimi_native_hook._PERMISSION_RETRY_WINDOW_S,
+        100.0 + kimi_native_hook._PERMISSION_RETRY_WINDOW_S,
+    ]
+
+
+def test_permission_request_does_not_repark_ambiguous_injection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = _governed_bridge(tmp_path)
+    _feed_stdin(monkeypatch, {"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+    requests: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        kimi_native_hook,
+        "_request_web_approval",
+        lambda url, headers, body, **kwargs: requests.append(body.copy()) or "allow",
+    )
+    keys: list[str] = []
+
+    def _inject(bridge_dir: Path, *, key: str, timeout_s: float) -> bool:
+        del bridge_dir, timeout_s
+        keys.append(key)
+        raise KimiApprovalPromptAmbiguousError("same menu remained")
+
+    monkeypatch.setattr(kimi_native_hook, "inject_approval_keystroke", _inject)
+    monkeypatch.setattr(
+        kimi_native_hook,
+        "_approval_still_pending",
+        lambda _bridge: (_ for _ in ()).throw(AssertionError("must not re-park")),
+    )
+
+    assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+    assert len(requests) == 1
+    assert keys == [APPROVE_KEY]
 
 
 def test_permission_request_ungoverned_no_request(
@@ -243,3 +319,158 @@ def test_verdict_from_response(response: object, expected: str | None) -> None:
 
 def test_unknown_subcommand_returns_2(capsys: pytest.CaptureFixture[str]) -> None:
     assert kimi_native_hook.main(["bogus", "--bridge-dir", "/tmp/x"]) == 2
+
+
+def test_request_web_approval_reparks_after_read_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = [
+        httpx.ReadTimeout("poll expired", request=httpx.Request("POST", "http://server")),
+        httpx.Response(
+            200,
+            json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+            request=httpx.Request("POST", "http://server"),
+        ),
+    ]
+    requests: list[dict[str, object]] = []
+
+    class _Client:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            requests.append({"url": url, "json": json})
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+    monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
+
+    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
+    assert len(requests) == 2
+    assert requests[0]["json"] == requests[1]["json"] == body
+
+
+def test_request_web_approval_reparks_empty_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = [
+        httpx.Response(200, content=b"", request=httpx.Request("POST", "http://server")),
+        httpx.Response(
+            200,
+            json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+            request=httpx.Request("POST", "http://server"),
+        ),
+    ]
+    requests: list[dict[str, object]] = []
+
+    class _Client:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            requests.append({"url": url, "json": json})
+            return responses.pop(0)
+
+    monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
+
+    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
+    assert len(requests) == 2
+    assert requests[0]["json"] == requests[1]["json"] == body
+
+
+def test_request_web_approval_does_not_repark_after_menu_is_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    response = httpx.Response(200, content=b"", request=httpx.Request("POST", "http://server"))
+    requests: list[dict[str, object]] = []
+    probes: list[Path] = []
+
+    class _Client:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            requests.append({"url": url, "json": json})
+            return response
+
+    monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
+    monkeypatch.setattr(
+        kimi_native_hook,
+        "approval_prompt_visible",
+        lambda bridge_dir: probes.append(bridge_dir) or False,
+    )
+
+    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    assert (
+        kimi_native_hook._request_web_approval("http://server", {}, body, bridge_dir=tmp_path)
+        is None
+    )
+    assert len(requests) == 1
+    assert probes == [tmp_path, tmp_path]
+
+
+def test_permission_read_timeout_leaves_global_deadline_margin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeouts: list[httpx.Timeout] = []
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            timeouts.append(kwargs["timeout"])
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
+    monkeypatch.setattr(kimi_native_hook.time, "monotonic", lambda: 0.0)
+
+    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
+    request_budget = (
+        kimi_native_hook._PERMISSION_RETRY_WINDOW_S
+        - kimi_native_hook._PERMISSION_DEADLINE_MARGIN_S
+    )
+    assert timeouts[0].connect is not None
+    assert timeouts[0].read is not None
+    assert timeouts[0].connect + timeouts[0].read <= request_budget
+
+
+def test_permission_poll_budget_is_below_kimi_hook_ceiling() -> None:
+    assert (
+        kimi_native_hook._PERMISSION_RETRY_WINDOW_S
+        + kimi_native_hook._SURFACE_TIMEOUT_S
+        + kimi_native_hook._APPROVAL_SURFACE_BUDGET_S
+        < kimi_native_hook._KIMI_HOOK_TIMEOUT_S
+    )

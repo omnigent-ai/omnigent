@@ -88,6 +88,7 @@ from omnigent.runtime.harnesses._executor_adapter import (
 )
 from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy
@@ -10997,6 +10998,11 @@ class _ContractSnapshotClient(NullServerClient):
 _CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
 
 
+def _contract_composed_instructions(*parts: str) -> str:
+    """Compose expected author/request text with framework guidance."""
+    return "\n\n".join((*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION))
+
+
 async def _contract_run_no_harness(
     http: httpx.AsyncClient, conv: str, recording: _RecordingHarnessClient
 ) -> dict[str, Any]:
@@ -11105,7 +11111,10 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
         pytest.param(
             "child_present",
             "no_harness",
-            {"status": 200, "instructions": "Worker instructions."},
+            {
+                "status": 200,
+                "instructions": _contract_composed_instructions("Worker instructions."),
+            },
             id="child_present-no_harness",
         ),
         pytest.param(
@@ -11114,21 +11123,30 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             # same child; caller text composes additively on top.
             {
                 "status": 200,
-                "instructions": (f"Worker instructions.\n\n{_CONTRACT_CALLER_INSTRUCTIONS}"),
+                "instructions": _contract_composed_instructions(
+                    "Worker instructions.", _CONTRACT_CALLER_INSTRUCTIONS
+                ),
             },
             id="child_present-known_harness",
         ),
         pytest.param(
             "child_present",
             "background",
-            {"terminal_status": "idle", "instructions": "Worker instructions."},
+            {
+                "terminal_status": "idle",
+                "instructions": _contract_composed_instructions("Worker instructions."),
+            },
             id="child_present-background",
         ),
         # child missing: all paths agree — warn, fall back to the parent spec.
         pytest.param(
             "child_missing",
             "no_harness",
-            {"status": 200, "error": None, "instructions": "Root instructions."},
+            {
+                "status": 200,
+                "error": None,
+                "instructions": _contract_composed_instructions("Root instructions."),
+            },
             id="child_missing-no_harness-parent",
         ),
         pytest.param(
@@ -11137,14 +11155,20 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             # same shape as child_present — caller text still composes additively.
             {
                 "status": 200,
-                "instructions": (f"Root instructions.\n\n{_CONTRACT_CALLER_INSTRUCTIONS}"),
+                "instructions": _contract_composed_instructions(
+                    "Root instructions.", _CONTRACT_CALLER_INSTRUCTIONS
+                ),
             },
             id="child_missing-known_harness-parent",
         ),
         pytest.param(
             "child_missing",
             "background",
-            {"status": 202, "terminal_status": "idle", "instructions": "Root instructions."},
+            {
+                "status": 202,
+                "terminal_status": "idle",
+                "instructions": _contract_composed_instructions("Root instructions."),
+            },
             id="child_missing-background-parent",
         ),
         # ── Resolver raises: same three-way split, different trigger.
@@ -11196,7 +11220,7 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             "background",
             {
                 "terminal_status": "idle",
-                "instructions": "Worker instructions.",
+                "instructions": _contract_composed_instructions("Worker instructions."),
                 "resolver_calls": 1,
             },
             id="cache_holds_child-background-shortcut",
@@ -11206,7 +11230,9 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             "known_harness",
             {
                 "status": 200,
-                "instructions": (f"Worker instructions.\n\n{_CONTRACT_CALLER_INSTRUCTIONS}"),
+                "instructions": _contract_composed_instructions(
+                    "Worker instructions.", _CONTRACT_CALLER_INSTRUCTIONS
+                ),
                 "resolver_calls": 1,
             },
             id="cache_holds_child-known_harness-shortcut",
@@ -11215,7 +11241,11 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
         pytest.param(
             "cache_holds_child",
             "no_harness",
-            {"status": 200, "instructions": "Worker instructions.", "resolver_calls": 2},
+            {
+                "status": 200,
+                "instructions": _contract_composed_instructions("Worker instructions."),
+                "resolver_calls": 2,
+            },
             id="cache_holds_child-no_harness-resolves-again",
         ),
     ],

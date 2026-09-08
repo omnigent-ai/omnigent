@@ -656,6 +656,7 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     use_envelope: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Host-spawned terminal launch reads session effort and passes ``--effort``.
@@ -743,18 +744,26 @@ async def test_auto_create_claude_terminal_passes_session_effort(
         else None
     )
 
-    await _auto_create_claude_terminal(
-        session_id,
-        _FakeResourceRegistry(),
-        lambda _sid, _evt: None,
-        server_client=fake_client,
-        session_init=session_init,
-    )
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        await _auto_create_claude_terminal(
+            session_id,
+            _FakeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            session_init=session_init,
+        )
 
     args = captured["spec"].args
     assert "--effort" in args
     effort_idx = args.index("--effort")
     assert args[effort_idx + 1] == "high"
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "Claude terminal bridge prepared" in record.getMessage()
+    ]
+    assert messages == [f"Claude terminal bridge prepared: session={session_id}"]
+    assert str(bridge_dir_for_bridge_id(session_id)) not in messages[0]
 
     await fake_client.aclose()
 

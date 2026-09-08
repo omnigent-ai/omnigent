@@ -2875,7 +2875,9 @@ def _daemon_host_identity_changed(record: _HostDaemonRecord) -> bool:
     if record.host_id is None:
         return False
     current_host_id = _load_existing_host_id()
-    return record.host_id != current_host_id
+    from omnigent.db.db_models import normalize_uuid
+
+    return normalize_uuid(record.host_id) != normalize_uuid(current_host_id)
 
 
 def _terminate_host_unit(record: _HostDaemonRecord, *, reason: str) -> None:
@@ -9996,7 +9998,27 @@ def host_reset_id(yes: bool) -> None:
 
     :param yes: When ``True``, skip the confirmation prompt.
     """
-    from omnigent.host.identity import CONFIG_PATH, reset_host_id
+    from omnigent.host.identity import (
+        CONFIG_PATH,
+        HOST_ID_ENV_VAR,
+        HOST_NAME_ENV_VAR,
+        host_identity_env_override_active,
+        reset_host_id,
+    )
+
+    # With OMNIGENT_HOST_ID / OMNIGENT_HOST_NAME set, the host takes its
+    # identity from the environment, not config.yaml (both set → env identity
+    # used; only one set → startup errors). Either way resetting the id in the
+    # file will not change the machine's identity, so refuse and point at the
+    # env vars rather than let a config write mislead the user.
+    if host_identity_env_override_active():
+        raise click.ClickException(
+            f"This machine's host identity is controlled by the {HOST_ID_ENV_VAR} / "
+            f"{HOST_NAME_ENV_VAR} environment variable(s), so resetting the id in the "
+            "config file will not change it. This is normally a server-managed "
+            f"sandbox host, whose identity the server owns. Unset {HOST_ID_ENV_VAR} "
+            f"and {HOST_NAME_ENV_VAR} first if you need to reset the persisted id."
+        )
 
     running = [record for record in _list_daemon_records() if _pid_alive(record.pid)]
     if running:

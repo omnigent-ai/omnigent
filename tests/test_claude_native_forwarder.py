@@ -3035,6 +3035,8 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
         thread.join(timeout=5.0)
 
     assert "Claude transcript forwarder loop failed" in caplog.text
+    assert "session=conv_abc" in caplog.text
+    assert str(bridge_dir) not in caplog.text
     assert request["body"]["type"] == "external_conversation_item"
     assert request["body"]["data"]["item_data"] == {
         "role": "assistant",
@@ -4281,7 +4283,6 @@ def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprin
             seen_source_ids=("old-source",),
             cursor_fingerprint=None,
         ),
-        bridge_dir=tmp_path / "bridge",
         session_id="conv_abc",
     )
 
@@ -4297,7 +4298,8 @@ def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprin
     )
     assert "cursor missing fingerprint" in caplog.text
     assert "conv_abc" in caplog.text
-    assert str(tmp_path / "bridge") in caplog.text
+    assert str(tmp_path / "bridge") not in caplog.text
+    assert str(transcript_path) not in caplog.text
 
 
 def test_validated_transcript_state_adopts_fingerprint_at_offset_zero_without_reset(
@@ -4340,7 +4342,6 @@ def test_validated_transcript_state_adopts_fingerprint_at_offset_zero_without_re
 
     validated = forwarder._validated_transcript_state(
         state,
-        bridge_dir=tmp_path / "bridge",
         session_id="conv_fresh",
     )
 
@@ -4425,7 +4426,6 @@ def test_validated_transcript_state_preserves_seen_source_ids_on_stale_reset(
 
     validated = forwarder._validated_transcript_state(
         state,
-        bridge_dir=tmp_path / "bridge",
         session_id="conv_replaced",
     )
 
@@ -4445,6 +4445,9 @@ def test_validated_transcript_state_preserves_seen_source_ids_on_stale_reset(
 
     # Warning logged because the fingerprint genuinely changed.
     assert "cursor fingerprint changed" in caplog.text
+    assert "session=conv_replaced" in caplog.text
+    assert str(tmp_path / "bridge") not in caplog.text
+    assert str(transcript_path) not in caplog.text
 
 
 # ── supervise_forwarder ────────────────────────────────────────────
@@ -4532,6 +4535,8 @@ async def test_supervise_forwarder_restarts_after_crash(
     # skips the post-iteration sleep.
     assert sleeps == [forwarder._SUPERVISOR_INITIAL_BACKOFF_S]
     assert "Claude transcript forwarder crashed" in caplog.text
+    assert "session=conv_abc" in caplog.text
+    assert str(tmp_path) not in caplog.text
 
 
 @pytest.mark.asyncio

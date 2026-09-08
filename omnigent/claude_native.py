@@ -439,6 +439,23 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     return host == "anthropic.com" or host.endswith(".anthropic.com")
 
 
+def _ambient_env_is_non_anthropic_gateway() -> bool:
+    """Whether the ambient process env routes through a non-Anthropic gateway.
+
+    Used as the ``claude_config is None`` counterpart to
+    :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. Isaac)
+    set ``ANTHROPIC_BASE_URL`` to a Databricks gateway, the catalog and its
+    fingerprint must treat the env as a non-canonical endpoint.
+    """
+    from urllib.parse import urlparse
+
+    base_url = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    if not base_url:
+        return False
+    host = (urlparse(base_url).hostname or "").lower()
+    return host != "anthropic.com" and not host.endswith(".anthropic.com")
+
+
 def _claude_family(token: str) -> str | None:
     """
     The family alias a model id or alias folds onto, bracket markers dropped.
@@ -1208,12 +1225,14 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     from omnigent.model_catalog_store import binary_identity, fingerprint_of
 
     command, _ = resolve_claude_launch("claude", [])
+    ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
     return fingerprint_of(
         "claude-native",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
         binary_identity(command),
+        ambient_gateway,
     )
 
 
@@ -1240,7 +1259,10 @@ async def claude_model_catalog(
     if probe is None:
         return None
     rows = list(probe.alias_rows)
-    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+    _non_canonical = (
+        claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
+    ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
+    if _non_canonical:
         rows = [row for row in rows if not str(row.get("model", "")).startswith("claude-")]
 
     configured_pin = claude_config.model if claude_config is not None else None
@@ -1262,11 +1284,10 @@ async def claude_model_catalog(
         # Append the observed default as its own honest row — but never
         # claim a bare Anthropic id is launchable on an endpoint that
         # rejects that spelling.
-        servable = (
-            claude_config is None
-            or _serves_canonical_anthropic_ids(claude_config)
-            or not default_model.startswith("claude-")
-        )
+        _canonical_ids_ok = (
+            claude_config is None and not _ambient_env_is_non_anthropic_gateway()
+        ) or (claude_config is not None and _serves_canonical_anthropic_ids(claude_config))
+        servable = _canonical_ids_ok or not default_model.startswith("claude-")
         if servable:
             # The probe's printed label describes the ENUMERATION run's
             # model; it only names a config-pinned default when the two are
