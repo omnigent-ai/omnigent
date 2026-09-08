@@ -40,7 +40,7 @@ from omnigent.entities.session_resources import (
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
 
 if TYPE_CHECKING:
-    from omnigent.claude_native_status_file import SessionStatusPoller
+    from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.inner.terminal import TerminalInstance
@@ -160,7 +160,7 @@ class TerminalExitEvent:
     session_was_idle: bool = False
 
 
-def _trim_terminal_exit_output(text: str | None) -> str | None:
+def trim_terminal_output(text: str | None) -> str | None:
     """Bound terminal-output diagnostics so a failure report stays compact."""
     if text is None:
         return None
@@ -216,7 +216,7 @@ def _terminal_exit_diagnostics(
             )
         else:
             if isinstance(raw_last_output, str):
-                last_output = _trim_terminal_exit_output(raw_last_output)
+                last_output = trim_terminal_output(raw_last_output)
 
     exit_status: int | None = None
     read_exit_status = getattr(instance, "last_exit_status", None)
@@ -1382,11 +1382,11 @@ class SessionResourceRegistry:
             *blocked_on* names the dialog the agent is parked on, if any.
         :returns: A ``SessionStatusPoller`` the watcher drives per tick.
         """
-        from omnigent.claude_native_bridge import (
+        from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_conversation_id,
             read_claude_session_id,
         )
-        from omnigent.claude_native_status_file import SessionStatusPoller
+        from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 
         bridge_dir = bridge_dir_for_conversation_id(session_id)
 

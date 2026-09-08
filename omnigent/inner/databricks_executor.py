@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 import httpx
 
-from omnigent import model_catalog
+from omnigent.models import model_catalog
 
 if TYPE_CHECKING:
     from openai import OpenAI, Stream

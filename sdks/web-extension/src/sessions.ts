@@ -22,7 +22,7 @@ export interface ExtensionSessionPage {
 }
 
 export const SESSION_PAGE_DEFAULT_LIMIT = 25;
-export const SESSION_PAGE_MAX_LIMIT = 25;
+export const SESSION_PAGE_MAX_LIMIT = 1_000;
 export const SESSIONS_LIST_ALL_MAX_PAGES = 200;
 export const SESSIONS_LIST_ALL_MAX_SESSIONS = 5_000;
 

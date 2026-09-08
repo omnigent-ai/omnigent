@@ -139,6 +139,24 @@ def test_fake_row_login_command() -> None:
     assert _FAKE_ROW.binary == "fakecli"
 
 
+def test_spawn_env_mirrors_row_omnigent_mcp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rows that opt out of MCP injection must propagate that to the wrap.
+
+    A vendor CLI that rejects ``session/new`` mcpServers (jcode) fails every
+    session if the Omnigent MCP server is advertised, so the row flag has to
+    reach ``HARNESS_ACP_OMNIGENT_MCP`` rather than relying on the wrap's
+    default-on.
+    """
+    no_mcp_row = dataclasses.replace(_FAKE_ROW, omnigent_mcp=False)
+    monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", no_mcp_row)
+    env = _build_acp_cli_spawn_env(_spec("fakecli"), harness="fakecli")
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
+
+    monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", _FAKE_ROW)
+    env = _build_acp_cli_spawn_env(_spec("fakecli"), harness="fakecli")
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "1"
+
+
 # ---------------------------------------------------------------------------
 # Per-row registration (parametrized over the real catalog)
 # ---------------------------------------------------------------------------
@@ -197,6 +215,7 @@ def test_catalog_row_spawn_env_builds(name: str) -> None:
     if row.args:
         assert argv[-len(row.args) :] == list(row.args)
     assert env["HARNESS_ACP_NAME"] == row.label
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == ("1" if row.omnigent_mcp else "0")
 
 
 # ---------------------------------------------------------------------------

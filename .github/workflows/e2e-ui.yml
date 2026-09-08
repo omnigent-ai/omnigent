@@ -10,7 +10,7 @@ name: E2E UI Tests
 # Triggers:
 #   pull_request        ALL PRs (same-repo + fork). Draft PRs skip.
 #   schedule            09:00 UTC daily, alongside nightly.yml.
-#   workflow_dispatch   manual run. Input `branch` selects a non-main ref.
+#   workflow_dispatch   manual run on the selected workflow ref.
 
 on:
   pull_request:
@@ -22,19 +22,13 @@ on:
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
-    inputs:
-      branch:
-        description: "Branch to run UI tests against"
-        required: false
-        default: "main"
 
 permissions:
   contents: read
 
 concurrency:
-  # PRs key by number, dispatch by branch (so re-runs cancel); push /
-  # schedule key by SHA so each merge to `main` gets its own run.
-  group: e2e-ui-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}
+  # PRs key by number, dispatch by ref (so re-runs cancel), and schedule by SHA.
+  group: e2e-ui-${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && github.ref) || github.sha }}
   cancel-in-progress: true
 
 env:
@@ -106,8 +100,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
@@ -160,8 +152,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0

@@ -397,7 +397,7 @@ def test_github_changes_lists_pr_files(tmp_path: Path, monkeypatch) -> None:
 
     _git_branch_repo(tmp_path)
 
-    def fake_gh(argv, *, cwd):
+    def fake_gh(argv, *, cwd, token=None):
         if tuple(argv[:2]) == ("pr", "view"):
             return (0, '{"number": 3}', "")
         if tuple(argv[:1]) == ("api",):
@@ -434,7 +434,7 @@ def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None
 
     _git_branch_repo(tmp_path)
 
-    def fake_gh(argv, *, cwd):
+    def fake_gh(argv, *, cwd, token=None):
         if tuple(argv[:2]) == ("pr", "view"):
             return (0, '{"number": 3}', "")
         if tuple(argv[:2]) == ("pr", "diff"):

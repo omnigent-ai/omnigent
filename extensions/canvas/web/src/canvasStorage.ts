@@ -16,7 +16,7 @@ export interface CanvasViewport {
   x: number;
   y: number;
   zoom: number;
-  /** Canvas container size when saved; a viewport only fits the size it was made for. */
+  /** Container size used to restore the same center after resizing. */
   width?: number;
   height?: number;
 }

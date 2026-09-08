@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
 import httpx
@@ -14,7 +15,11 @@ from fastapi.responses import JSONResponse
 from omnigent.db.utils import builtin_agent_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.host_registry import HostRegistry
-from omnigent.server.routes.imports import _stream_local_sessions_from_host, create_imports_router
+from omnigent.server.routes.imports import (
+    LocalImportRequest,
+    _stream_local_sessions_from_host,
+    create_imports_router,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
@@ -227,6 +232,15 @@ def test_imported_session_ref_allows_null_title() -> None:
     assert ImportedSessionRef(session_id="conv_y", title=None).title is None
 
 
+def test_exact_local_import_requires_one_harness_and_trims_id() -> None:
+    """An exact id is normalized and cannot be paired with the all selector."""
+    request = LocalImportRequest(host_id="h1", source="claude", session_id="  exact-id  ")
+    assert request.session_id == "exact-id"
+
+    with pytest.raises(ValueError, match="requires a specific harness"):
+        LocalImportRequest(host_id="h1", source="all", session_id="exact-id")
+
+
 async def test_stream_local_sessions_yields_each_then_stops_on_done() -> None:
     """The streaming consumer yields one session per frame, then cleans up on done.
 
@@ -273,6 +287,37 @@ async def test_stream_local_sessions_yields_each_then_stops_on_done() -> None:
     assert [s["external_session_id"] for s in got] == ["c1", "c2"]
     # The per-request queue is removed once the stream ends.
     assert conn.pending_import_local == {}
+
+
+async def test_stream_local_sessions_sends_exact_session_id() -> None:
+    """The server carries an exact id through the host tunnel request."""
+    from omnigent.host.frames import HostImportLocalByIdFrame, decode_host_frame
+
+    conn = SimpleNamespace(host_id="h1", pending_import_local={})
+    sent: list[HostImportLocalByIdFrame] = []
+
+    class _Reg:
+        def send_text(self, host_conn: object, frame: str) -> None:
+            decoded = decode_host_frame(frame)
+            assert isinstance(decoded, HostImportLocalByIdFrame)
+            sent.append(decoded)
+            (queue,) = conn.pending_import_local.values()
+            queue.put_nowait(("done", {"status": "ok", "error": None}))
+
+    got = [
+        session
+        async for session in _stream_local_sessions_from_host(
+            host_registry=_Reg(),  # type: ignore[arg-type]
+            host_conn=conn,  # type: ignore[arg-type]
+            source="codex",
+            limit=10,
+            session_id="session-exact",
+        )
+    ]
+
+    assert got == []
+    assert sent[0].source == "codex"
+    assert sent[0].session_id == "session-exact"
 
 
 async def test_stream_local_sessions_surfaces_host_failed_count() -> None:
@@ -510,6 +555,74 @@ async def test_local_import_stream_emits_ndjson_session_then_done(
         assert conversation_store.get_conversation(e["session_id"]) is not None
 
 
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "stream"])
+async def test_local_import_endpoints_redact_host_error(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stream: bool,
+) -> None:
+    """Host failures retain diagnostics in logs but not either API response."""
+    from omnigent.server.routes import imports as imports_module
+
+    sensitive_detail = "host read failed at /private/transcripts/session.json\nTraceback: secret"
+
+    async def _fake_stream(**_kwargs: object):
+        yield {}
+        raise OmnigentError(sensitive_detail, code=ErrorCode.CONFLICT)
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            SqlAlchemyConversationStore(db_uri),
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=SimpleNamespace(get=lambda _host_id: host_conn),  # type: ignore[arg-type]
+            host_store=SimpleNamespace(  # type: ignore[arg-type]
+                get_host=lambda _host_id: SimpleNamespace(user_id=None)
+            ),
+        ),
+        prefix="/v1",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    with caplog.at_level(logging.ERROR, logger=imports_module.__name__):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                f"/v1/imports/local{'/stream' if stream else ''}",
+                json={
+                    "host_id": "host_0123456789abcdef0123456789abcdef",
+                    "source": "claude",
+                    "limit": 5,
+                },
+            )
+
+    if stream:
+        events = [json.loads(line) for line in response.text.splitlines() if line.strip()]
+        error_payload = events[0]
+        assert error_payload["event"] == "error"
+    else:
+        assert response.status_code == 409
+        error_payload = response.json()["error"]
+        assert error_payload["code"] == ErrorCode.CONFLICT
+
+    error_id = error_payload["error_id"]
+    assert error_id.startswith("err_")
+    assert len(error_id) == 36
+    int(error_id.removeprefix("err_"), 16)
+    assert error_payload["message"] == (
+        "The local session import stopped unexpectedly. "
+        f"Retry the import or contact an administrator. Error ID: {error_id}."
+    )
+    assert sensitive_detail not in response.text
+    assert sensitive_detail in caplog.text
+    assert error_id in caplog.text
+
+
 def _host_import_client(db_uri: str, host_registry: HostRegistry) -> httpx.AsyncClient:
     """Mount only the imports router with host support wired, auth disabled.
 
@@ -540,13 +653,22 @@ def _host_import_client(db_uri: str, host_registry: HostRegistry) -> httpx.Async
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
-async def test_import_local_live_host_off_replica_is_wrong_replica(db_uri: str) -> None:
+async def test_import_local_live_host_off_replica_is_wrong_replica(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A live host absent from this replica is WRONG_REPLICA, not "not connected".
 
     Regression: the route used to flatten every registry miss into a 409
     CONFLICT, so a host live on another replica never got the 400 wrong_replica
     signal the client re-addresses on — the import failed permanently.
+
+    Only a sharded (multi-replica) deployment has an "other replica" to
+    re-address to, so force the sharded signal on — the test host stack has no
+    lakebox module, which auto-detects as single-replica.
     """
+    from omnigent.server.routes import _host_launch
+
+    monkeypatch.setattr(_host_launch, "_deployment_is_sharded", lambda: True)
     host_id = "host_0123456789abcdef0123456789abcdef"
     HostStore(db_uri).upsert_on_connect(host_id, "laptop", "alice@example.com")
     async with _host_import_client(db_uri, HostRegistry()) as client:
@@ -556,6 +678,22 @@ async def test_import_local_live_host_off_replica_is_wrong_replica(db_uri: str) 
         )
     assert res.status_code == 400
     assert res.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+
+
+async def test_import_local_live_host_single_replica_is_conflict(db_uri: str) -> None:
+    """On a single-replica deployment a live-but-absent host is a 409, not a
+    WRONG_REPLICA the client can never satisfy (no other replica to re-address
+    to). Auto-detection reports single-replica when no lakebox module is present,
+    which is the default in the test stack."""
+    host_id = "host_0123456789abcdef0123456789abcded"
+    HostStore(db_uri).upsert_on_connect(host_id, "laptop", "alice@example.com")
+    async with _host_import_client(db_uri, HostRegistry()) as client:
+        res = await client.post(
+            "/v1/imports/local",
+            json={"host_id": host_id, "source": "all", "limit": 5},
+        )
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == ErrorCode.CONFLICT
 
 
 async def test_import_local_offline_host_is_conflict(db_uri: str) -> None:

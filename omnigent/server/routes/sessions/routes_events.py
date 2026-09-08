@@ -208,9 +208,6 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
-from omnigent.session_lifecycle import (
-    is_session_closed,
-)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
@@ -222,6 +219,9 @@ from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedE
 from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.tools.client_specified import parse_client_side_tool_specs
+from omnigent.util.session_lifecycle import (
+    is_session_closed,
+)
 
 _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
@@ -2362,7 +2362,7 @@ def register_events_routes(
         host_store_for_managed = getattr(request.app.state, "host_store", None)
         if conv.host_id is not None and host_store_for_managed is not None:
             bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
-            if bound_host is not None and bound_host.sandbox_id is not None:
+            if bound_host is not None and bound_host.sandbox_provider is not None:
                 from omnigent.server.managed_hosts import terminate_managed_host
 
                 await terminate_managed_host(

@@ -1056,9 +1056,13 @@
                 "type": "integer"
               },
               {
+                "type": "string"
+              },
+              {
                 "type": "null"
               }
             ],
+            "description": "Opaque vendor compaction-window identifier. Current Codex writes a UUID string to `payload.window_id` on its `type == \"compacted\"` rollout JSONL record; older Codex rollouts used integer counters there.",
             "title": "Window Id"
           }
         },
@@ -1100,7 +1104,7 @@
         "type": "object"
       },
       "CompactionInProgressEvent": {
-        "description": "Conversation history is being compacted.\n\nEmitted by `omnigent/runtime/compaction.py` while a\ncompaction step runs so clients can render a \"summarizing\nhistory\u2026\" indicator. Wire shape matches `compaction.py:765`.",
+        "description": "Conversation history is being compacted.\n\nEmitted by `omnigent/runtime/compaction.py` while a\ncompaction step runs so clients can render a \"summarizing\nhistory\u2026\" indicator. Wire shape matches `compaction.py:765`.\n\nA long compaction is announced repeatedly (once per status poll), so\nclients must treat every event carrying the same `started_at` as one\ncompaction \u2014 refreshing their indicator rather than stacking another.",
         "properties": {
           "sequence_number": {
             "anyOf": [
@@ -1114,6 +1118,20 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unix epoch timestamp (seconds) when this compaction was first reported in progress. Stable across repeated progress events for the same compaction, so clients can anchor an elapsed counter to the true start \u2014 including after a page reload. `None` when the emitter does not track it.",
+            "title": "Started At"
           },
           "type": {
             "const": "response.compaction.in_progress",
@@ -2852,7 +2870,7 @@
         "type": "object"
       },
       "LocalImportRequest": {
-        "description": "Request to import the caller's recent local harness sessions from a host.\n\nUnlike `/imports` (the CLI posts already-normalized items), the server\nasks the chosen host to read + normalize its own transcripts over the\ntunnel \u2014 the transcripts live on the caller's machine, not the server.",
+        "description": "Request to import local harness sessions from a host.\n\nUnlike `/imports` (the CLI posts already-normalized items), the server\nasks the chosen host to read + normalize its own transcripts over the\ntunnel \u2014 the transcripts live on the caller's machine, not the server. A\nsupplied `session_id` loads that exact session without enumerating local\nhistory.",
         "properties": {
           "host_id": {
             "title": "Host Id",
@@ -2865,6 +2883,19 @@
             "minimum": 1.0,
             "title": "Limit",
             "type": "integer"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
           },
           "source": {
             "anyOf": [
@@ -3856,6 +3887,36 @@
           "delta"
         ],
         "title": "ReasoningTextDeltaEvent",
+        "type": "object"
+      },
+      "ResetSessionModelOverrideRequest": {
+        "additionalProperties": false,
+        "description": "Reset a launch-time model selection only while that selection is current.",
+        "properties": {
+          "expected_model_override": {
+            "minLength": 1,
+            "title": "Expected Model Override",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_model_override"
+        ],
+        "title": "ResetSessionModelOverrideRequest",
+        "type": "object"
+      },
+      "ResetSessionModelOverrideResponse": {
+        "description": "Whether the launch-time selection was still current and was cleared.",
+        "properties": {
+          "reset": {
+            "title": "Reset",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "reset"
+        ],
+        "title": "ResetSessionModelOverrideResponse",
         "type": "object"
       },
       "ResourceEventData": {
@@ -6538,6 +6599,12 @@
             ],
             "description": "Managed-sandbox launch progress while the session's background sandbox launch is in flight or has failed \u2014 see `SandboxStatus`. `None` for sessions without a managed launch and once the launch succeeds. Sourced from the Omnigent server's in-memory `_session_sandbox_status_cache` at snapshot build time, so a client opening the session mid-launch sees the current stage."
           },
+          "share_workspace_files": {
+            "default": false,
+            "description": "Whether the owner opted into letting view-level collaborators browse the workspace (Files/Changes/GitHub surfaces). `False` by default \u2014 read grants share the conversation only. The web share dialog reads this to render the toggle, and the rail reads it to decide whether to mount the file surfaces for a view-only viewer.",
+            "title": "Share Workspace Files",
+            "type": "boolean"
+          },
           "skills": {
             "description": "Skills the bound agent has access to \u2014 the merged result of the agent spec's bundled `skills` and the host-scope skills discovered along the agent workdir / `~/.claude/skills/` (subject to the spec's `skills_filter`). Mirrors what the TUI passes to the runner at startup. Empty list when the agent spec cannot be loaded, or when bundled + host discovery yields nothing.",
             "items": {
@@ -8119,6 +8186,18 @@
             ],
             "description": "Identifier of a registered runner, e.g. `\"runner_abc123\"`. `None` leaves runner binding unchanged.",
             "title": "Runner Id"
+          },
+          "share_workspace_files": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opt-in that lets people with *view* (read-only) access browse the session's workspace files. `True` turns sharing on, `False` turns it off (back to edit-only, the default), `None` leaves it unchanged. Manage-gated \u2014 it sits with the grant/revoke and public-access controls that decide who can see the session. Never widens absolute-path browsing, which stays owner-only.",
+            "title": "Share Workspace Files"
           },
           "silent": {
             "default": false,
@@ -9714,7 +9793,7 @@
     },
     "/v1/imports/local": {
       "post": {
-        "description": "Import the caller's recent local transcripts from a chosen host.\n\nThe transcripts live on the caller's machine, so the read happens on\nthe connected host over its tunnel \u2014 the server can't see them. The\nhost enumerates + normalizes the most recent sessions; the server\nimports those not already imported.\n\nBuffered form: returns the whole batch's tally in one JSON body. For a\nlive per-session list use `POST /v1/imports/local/stream`. Not atomic:\neach session is persisted as its frame arrives, so if the host drops\nmid-stream this raises after the sessions read so far are already\ncommitted; a retry is idempotent (they come back as already-imported).",
+        "description": "Import local transcripts from a chosen host.\n\nThe transcripts live on the caller's machine, so the read happens on\nthe connected host over its tunnel \u2014 the server can't see them. The\nhost loads an exact id or enumerates recent sessions, then normalizes\nthem; the server imports those not already imported.\n\nBuffered form: returns the whole batch's tally in one JSON body. For a\nlive per-session list use `POST /v1/imports/local/stream`. Not atomic:\neach session is persisted as its frame arrives, so if the host drops\nmid-stream this raises after the sessions read so far are already\ncommitted; a retry is idempotent (they come back as already-imported).",
         "operationId": "import_local_sessions_v1_imports_local_post",
         "requestBody": {
           "content": {
@@ -9756,7 +9835,7 @@
     },
     "/v1/imports/local/stream": {
       "post": {
-        "description": "Stream the caller's recent local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch; a terminal `{\"event\": \"done\", ...}`\ncarries the tally. A mid-stream host failure emits `{\"event\": \"error\", ...}` before `done` \u2014 the sessions read so far are already committed\nand a retry is idempotent. Request validation still fails ahead of the\nstream with the usual HTTP error.",
+        "description": "Stream local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch; a terminal `{\"event\": \"done\", ...}`\ncarries the tally. A mid-stream host failure emits `{\"event\": \"error\", ...}` before `done` \u2014 the sessions read so far are already committed\nand a retry is idempotent. Request validation still fails ahead of the\nstream with the usual HTTP error.",
         "operationId": "import_local_sessions_stream_v1_imports_local_stream_post",
         "requestBody": {
           "content": {
@@ -12030,6 +12109,59 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/model-override/reset": {
+      "post": {
+        "description": "Retire a rejected pick after fallback without replacing a newer selection.",
+        "operationId": "reset_session_model_override_v1_sessions__session_id__model_override_reset_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetSessionModelOverrideRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResetSessionModelOverrideResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reset Session Model Override",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/owner": {
       "get": {
         "description": "Return the owner of a session.\n\nRequires read-level access.\n\n**Returns:** `{\"owner\": \"<user_id>\"}` or `{\"owner\": null}`.",
@@ -12346,7 +12478,7 @@
     },
     "/v1/sessions/{session_id}/policies/evaluate": {
       "post": {
-        "description": "Generic policy evaluation endpoint (proto-compatible).\n\nAccepts an `EvaluationRequest` JSON body whose `event`\nfield carries the phase (`PHASE_TOOL_CALL`,\n`PHASE_TOOL_RESULT`, `PHASE_LLM_REQUEST`,\n`PHASE_LLM_RESPONSE`), the event data, and optional\ncontext. Returns an `EvaluationResponse` with the policy\nverdict (`result`), an optional `reason`, and optional\n`data` for content-rewriting policies.\n\nUsed by Claude Code's `PreToolUse` and `PostToolUse`\ncommand hooks (via `omnigent.claude_native_hook`) to\nevaluate admin policies on native tool calls. Also usable\nby any client that speaks the proto-compatible JSON schema.\n\n**Returns:** `EvaluationResponse` JSON with `result`, `reason`, and optional `data`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session doesn't exist, 400 if the body is malformed.",
+        "description": "Generic policy evaluation endpoint (proto-compatible).\n\nAccepts an `EvaluationRequest` JSON body whose `event`\nfield carries the phase (`PHASE_TOOL_CALL`,\n`PHASE_TOOL_RESULT`, `PHASE_LLM_REQUEST`,\n`PHASE_LLM_RESPONSE`), the event data, and optional\ncontext. Returns an `EvaluationResponse` with the policy\nverdict (`result`), an optional `reason`, and optional\n`data` for content-rewriting policies.\n\nUsed by Claude Code's `PreToolUse` and `PostToolUse`\ncommand hooks (via `omnigent.harnesses.claude_native.hook`) to\nevaluate admin policies on native tool calls. Also usable\nby any client that speaks the proto-compatible JSON schema.\n\n**Returns:** `EvaluationResponse` JSON with `result`, `reason`, and optional `data`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session doesn't exist, 400 if the body is malformed.",
         "operationId": "evaluate_policy_v1_sessions__session_id__policies_evaluate_post",
         "parameters": [
           {
@@ -13963,6 +14095,48 @@
           }
         },
         "summary": "List Session Github Changes",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/preferences": {
+      "post": {
+        "description": "Apply the GitHub panel's account (and optional base) selection.\n\nPersists the choice \u2014 a per-workspace account preference in the user\nconfig, and `gh repo set-default` when a base is given \u2014 then returns the\nrefreshed `session.github.info`. Served by the runner when it's online,\nelse by the host over its tunnel (both run the same\n`github_resource.set_github_preference` against the local config +\nworkspace), so a preference change works with the runner asleep.\n\n**Returns:** The refreshed `session.github.info` object.",
+        "operationId": "set_session_github_preference_v1_sessions__session_id__resources_github_preferences_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Session Github Preference",
         "tags": [
           "session_resources"
         ]

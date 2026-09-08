@@ -10,7 +10,10 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
-from omnigent.claude_native import ClaudeNativeUcodeConfig, claude_native_model_options
+from omnigent.harnesses.claude_native.main import (
+    ClaudeNativeUcodeConfig,
+    claude_native_model_options,
+)
 from tests.e2e_ui.conftest import fetch_with_retry, seed_committed_turn
 
 _EXPECTED_ROWS = [

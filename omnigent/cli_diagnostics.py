@@ -28,6 +28,7 @@ import contextlib
 import io
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -106,6 +107,42 @@ class _LoggingStreamSnapshot:
 
 
 _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
+
+# ---------------------------------------------------------------------------
+# Surfaced log-tail redaction
+# ---------------------------------------------------------------------------
+
+#: URL userinfo: ``scheme://user:password@host`` — e.g. a database URI baked
+#: into a migration error's copy-pasteable command. Redacts the whole
+#: userinfo (the lookahead keeps the ``@host`` part readable). The shared
+#: :func:`omnigent.process_logging.redact_log_text` filter does not cover
+#: URL userinfo, so :func:`redact_secrets` applies this pattern on top.
+#:
+#: The greedy ``\S+`` anchors on the *last* ``@`` in the whitespace-delimited
+#: token: passwords may legally contain ``/`` and ``@`` (SQLAlchemy accepts
+#: ``postgresql://user:p/ss@host``), so stopping at the first ``/`` or ``@``
+#: would leak the rest of the password. Anchoring on the last ``@`` can
+#: over-redact a credential-free URL whose path contains ``@``, which is the
+#: safe direction for surfaced log text.
+_URL_USERINFO_PATTERN = re.compile(r"(://)\S+(?=@)")
+
+_REDACTED = "[REDACTED]"
+
+
+def redact_secrets(text: str) -> str:
+    """
+    Public wrapper around the diagnostics redaction filter.
+
+    For callers outside the logging pipeline that are about to surface
+    captured log content on a user-visible channel (e.g. the server-log
+    tail embedded in a startup error) and must scrub secret-shaped
+    substrings — including URL userinfo like
+    ``postgresql+psycopg://user:password@host`` — first.
+
+    :param text: Arbitrary log text (may include tracebacks).
+    :returns: Scrubbed text.
+    """
+    return _URL_USERINFO_PATTERN.sub(rf"\g<1>{_REDACTED}", redact_log_text(text))
 
 
 class _RedactingStderr(io.TextIOBase):
@@ -361,6 +398,37 @@ def print_stale_host_hint() -> None:
         "host instances, then try again.",
         file=dest,
     )
+
+
+#: Attribute an exception may carry to opt out of the stale-host recovery
+#: hint (:func:`print_stale_host_hint`). Any exception type representing a
+#: failure that hint cannot fix (a missing dependency, a failed background
+#: server whose real cause is already surfaced inline) can set this to
+#: ``True`` — keeps :mod:`cli_diagnostics` decoupled from the modules that
+#: raise those errors.
+SUPPRESS_RECOVERY_HINT_ATTR = "omnigent_suppress_recovery_hint"
+
+
+def suppresses_recovery_hint(exc: BaseException) -> bool:
+    """
+    Report whether the stale-host recovery hint should be withheld for *exc*.
+
+    The hint (:func:`print_stale_host_hint`) assumes the failure may be a
+    runner tunnel rejection caused by stale host processes. That is
+    misleading for whole classes of error ``omnigent stop`` cannot fix — a
+    missing Python dependency (e.g. the ``psycopg`` Postgres driver) or a
+    background local server that crashed with its real cause already
+    surfaced inline. Suppressing the hint for those keeps the error
+    pointing at the real fix.
+
+    :param exc: The exception about to be surfaced by :func:`omnigent.cli.main`.
+    :returns: ``True`` when the hint should be suppressed — either *exc* is an
+        :class:`ImportError` (missing dependency) or it carries a truthy
+        :data:`SUPPRESS_RECOVERY_HINT_ATTR` marker.
+    """
+    if isinstance(exc, ImportError):
+        return True
+    return bool(getattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, False))
 
 
 def log_cli_exception(exc: BaseException, *, prefix: str = "CLI error") -> None:

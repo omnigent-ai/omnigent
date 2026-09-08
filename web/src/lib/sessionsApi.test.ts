@@ -108,6 +108,7 @@ describe("createSession", () => {
       harness: null,
       modelOverride: undefined,
       costControlModeOverride: undefined,
+      shareWorkspaceFiles: false,
       reasoningEffort: undefined,
       pendingElicitations: [],
       pendingInputs: [],
@@ -1038,6 +1039,34 @@ describe("importLocalSessions", () => {
     );
     // The session that streamed before the error was still handed to the caller.
     expect(seen).toEqual(["c1"]);
+  });
+
+  it("sends an exact session ID with its harness", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c1", title: "Exact" }),
+        JSON.stringify({ event: "done", imported: 1, already_imported: 0, failed: 0 }),
+      ]),
+    );
+
+    await importLocalSessions("host_1", "codex", 25, undefined, "session-exact");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_id: "host_1",
+      source: "codex",
+      limit: 25,
+      session_id: "session-exact",
+    });
+  });
+
+  it("does not fall back to a server that cannot distinguish an exact import", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 }));
+
+    await expect(
+      importLocalSessions("host_1", "codex", 25, undefined, "session-exact"),
+    ).rejects.toThrow("Direct session import is not supported");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("falls back to the buffered endpoint when the stream endpoint 404s", async () => {

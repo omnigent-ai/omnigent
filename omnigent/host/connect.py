@@ -34,7 +34,6 @@ from omnigent.debug_logging import (
     PRIMARY_SESSION_ID_ENV_VAR,
     USER_ID_ENV_VAR,
 )
-from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -52,9 +51,11 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
+    HostFsWriteFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportedLocalSession,
+    HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
     HostImportLocalSessionFrame,
@@ -147,8 +148,9 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
-from omnigent.suspend_watch import watch_for_resume
-from omnigent.tls import client_ssl_context
+from omnigent.util.env_credentials import env_names_with_omnigent_prefix
+from omnigent.util.suspend_watch import watch_for_resume
+from omnigent.util.tls import client_ssl_context
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
@@ -402,9 +404,10 @@ _MAX_CONSECUTIVE_AUTH_ERRORS = 3
 # process listens on the port — the local server is gone, not unreachable.
 _LOOPBACK_REFUSED_FATAL_ATTEMPTS = 100
 
-# Consecutive post-connect 401/403 rejections (~5 min at the backoff cap)
-# before the retry loop escalates from "check your VPN" to a re-auth prompt.
-# Operator-facing only — the host keeps retrying and never exits.
+# Consecutive post-connect 401/403 (or 404) rejections (~90 s at the backoff
+# cap) before the retry loop escalates its operator message from a transient
+# hint to a "this may not self-heal" prompt. Operator-facing only — the host
+# keeps retrying and never exits.
 _AUTH_REJECT_ESCALATE_ATTEMPTS = 30
 
 # Consecutive accepted-then-silent connections (upgrade completed, then the
@@ -586,6 +589,25 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # ssh-agent auth, so git-over-SSH and SSH-cert-authenticated tooling
         # fail with "dial unix: missing address".
         "SSH_AUTH_SOCK",
+        # gcloud Application Default Credentials selectors, same class as
+        # KUBECONFIG above: AGY_ADC_AUTH is the boolean the Antigravity CLI
+        # (agy) reads to pick ADC auth, GOOGLE_APPLICATION_CREDENTIALS is a
+        # filesystem path to the ADC file (not the credential itself), and the
+        # project ids are plain selectors. Without them the CLI->daemon->runner
+        # strips drop the user's gcloud login, so every antigravity-native pane
+        # dispatched through a background host blocks at agy's interactive
+        # "Select login method" menu despite a valid ADC credential.
+        # CLOUDSDK_CONFIG / CLOUDSDK_ACTIVE_CONFIG_NAME select a non-default
+        # gcloud config dir/name. Deliberately exact names, NOT a CLOUDSDK_
+        # prefix: gcloud also defines CLOUDSDK_AUTH_ACCESS_TOKEN /
+        # CLOUDSDK_AUTH_REFRESH_TOKEN, which are live credentials and must not
+        # ride an open-ended prefix into the runner/harness environment.
+        "AGY_ADC_AUTH",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_QUOTA_PROJECT",
+        "CLOUDSDK_CONFIG",
+        "CLOUDSDK_ACTIVE_CONFIG_NAME",
         # Telemetry master opt-in. MUST propagate, or the daemon-spawned runner
         # (and the harness it spawns) never see OMNIGENT_TELEMETRY_ENABLED, so
         # telemetry.init() no-ops there and omni-runner / omni-harness export
@@ -622,6 +644,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
 # Allowed by prefix: locale family (``LC_*``), MLflow, and OpenTelemetry config —
 # both the standard ``OTEL_*`` vars and Omnigent's ``OMNIGENT_OTEL_*`` knobs
 # (capture-content, FastAPI toggle) so they reach the runner/harness too.
+# No ``CLOUDSDK_`` prefix on purpose: it would also pass gcloud's
+# ``CLOUDSDK_AUTH_*`` bearer/refresh tokens; the two config selectors are
+# allowlisted by exact name above instead.
 _RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_", "OMNIGENT_OTEL_")
 
 # Harness credential / endpoint env vars forwarded host→runner when
@@ -885,7 +910,7 @@ class ModelOptionsResult:
 
 def _model_configuration_source_for_harness(harness: str) -> dict[str, str] | None:
     """Resolve the host's ambient model provider without exposing credentials."""
-    from omnigent.model_catalog import model_configuration_source, resolve_model_provider
+    from omnigent.models.model_catalog import model_configuration_source, resolve_model_provider
     from omnigent.spec.types import AgentSpec, ExecutorSpec
 
     spec = AgentSpec(
@@ -977,7 +1002,7 @@ class HostProcess:
         # into every runner this host spawns; None on a non-Databricks server.
         self._origin_workspace_id: str | None = None
         try:
-            from omnigent.server_url import ServerUrl
+            from omnigent.util.server_url import ServerUrl
 
             self._origin_workspace_id = ServerUrl.from_api_base(self._server_url).org_id
         except Exception:  # noqa: BLE001 — attribution is best-effort
@@ -1005,6 +1030,10 @@ class HostProcess:
         # upgrade or any non-refused error. Fatal past a bounded streak only
         # when the server URL is loopback (the local server is gone).
         self._refused_streak = 0
+        # Consecutive post-connect 404s (a proxy answering for a restarting
+        # backend); reset by an accepted upgrade or any non-404 error. Never
+        # fatal — bounds only how loudly the retry loop escalates.
+        self._transient_404_streak = 0
         # Consecutive connections that were accepted but died without a single
         # inbound frame; reset by any received frame or a rejected upgrade.
         # Past a bound the reconnect loop escalates instead of fast-recycling.
@@ -1319,7 +1348,7 @@ class HostProcess:
         :returns: The display URL, e.g.
             ``"https://ws.databricks.com/omnigent?o=123"``.
         """
-        from omnigent.server_url import display_server_url
+        from omnigent.util.server_url import display_server_url
 
         return display_server_url(self._server_url)
 
@@ -1443,11 +1472,15 @@ class HostProcess:
             without their own client-actionable guidance.
         :returns: A :class:`HostConnectError` for a permanent 4xx, or
             ``None`` for a transient status (retryable 4xx in
-            :data:`_RETRYABLE_UPGRADE_STATUSES`, or any non-4xx such as a
-            5xx server bounce) that the reconnect loop should retry.
+            :data:`_RETRYABLE_UPGRADE_STATUSES`, a 404 on a host that has
+            already connected per :meth:`_classify_transient_404`, or any
+            non-4xx such as a 5xx server bounce) that the reconnect loop
+            should retry.
         """
         if status in _RETRYABLE_UPGRADE_STATUSES or not (400 <= status < 500):
             return None
+        if status == 404:
+            return self._classify_transient_404()
         if status in (401, 403):
             # Fresh hosts can race OAuth refresh; connected hosts preserve active sessions.
             self._auth_retry_streak += 1
@@ -1543,6 +1576,67 @@ class HostProcess:
             f"Connection refused (HTTP {status}): the server rejected the host "
             "tunnel request. This is a permanent error; retrying will not help. "
             "Check the server URL and your access."
+        )
+
+    def _classify_transient_404(self) -> HostConnectError | None:
+        """Treat a 404 on the tunnel upgrade as a transient restart blip.
+
+        A reverse proxy in front of the server answers 404 for the tunnel
+        route while the backend container restarts (upgrade, config change,
+        agent re-seed bounce). A host that has already completed an upgrade
+        in this process rides that window out indefinitely, so a routine
+        server bounce never tears down its live runner sessions.
+
+        A host that has NEVER connected keeps the pre-existing behaviour: a
+        404 is a permanent client error and fails loud on the first attempt,
+        so a genuinely wrong server URL -- or a server too old to expose the
+        tunnel route -- surfaces immediately instead of hanging.
+
+        :returns: ``None`` while an already-connected host should retry the
+            404, or a :class:`HostConnectError` for a never-connected host.
+
+        Note: a future "host is gone" signal must use a distinct status
+        (e.g. 410), never 404, or it would be retried forever here.
+        """
+        if self._ever_connected:
+            self._transient_404_streak += 1
+            cause = (
+                "Connection refused (HTTP 404): the host tunnel route is not "
+                "answering — the server is likely restarting behind its proxy."
+            )
+            if (
+                self._transient_404_streak >= _AUTH_REJECT_ESCALATE_ATTEMPTS
+                and self._transient_404_streak % _AUTH_REJECT_ESCALATE_ATTEMPTS == 0
+            ):
+                # A sustained streak is no longer a restart blip: the route may
+                # be genuinely gone (rollback, URL change). Escalate the
+                # operator signal but keep retrying to preserve live sessions.
+                escalated = (
+                    f"{cause} It has answered 404 "
+                    f"{self._transient_404_streak} times in a row — this is no "
+                    "longer a brief restart window. Check the server URL and "
+                    "deployment. Still retrying."
+                )
+                _logger.warning("%s", escalated)
+                print(f"⚠ {escalated}", file=sys.stderr, flush=True)
+            else:
+                _logger.warning("%s Retrying.", cause)
+                if self._transient_404_streak == 1:
+                    # The warning lands in the CLI log file — print once per
+                    # restart window so a foreground `omnigent host` isn't
+                    # silent while it rides the 404s out.
+                    print(
+                        f"⚠ {cause} Retrying — it will reconnect automatically "
+                        "once the server is back.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            return None
+        return HostConnectError(
+            "Connection refused (HTTP 404): the server did not expose the "
+            "host tunnel route. The server URL may be wrong, or the server "
+            "may predate the host API (the /v1/hosts tunnel route). Check the "
+            "URL and that the server is up to date, then retry."
         )
 
     async def _handle_launch(
@@ -2137,13 +2231,16 @@ class HostProcess:
         )
 
     async def _handle_import_local(
-        self, ws: websockets.asyncio.client.ClientConnection, frame: HostImportLocalFrame
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        frame: HostImportLocalFrame | HostImportLocalByIdFrame,
     ) -> None:
-        """Stream the host's recent local transcripts, one frame per session.
+        """Stream requested local transcripts, one frame per session.
 
-        The host owns the session files (``~/.claude`` etc.). It enumerates the
-        targets ("all" merges every harness into one global recency order, top
-        ``limit`` total), then reads + normalizes each and sends it immediately
+        The host owns the session files (``~/.claude`` etc.). An exact session
+        id is loaded directly; otherwise it enumerates the targets ("all"
+        merges every harness into one global recency order, top ``limit``
+        total). It reads + normalizes each and sends it immediately
         (``host.import_local_session``) so a large batch never rides in one frame
         and the server persists as each arrives. A terminal ``host.import_local_done``
         closes the stream. Sessions that fail to load are skipped; a single-harness
@@ -2157,6 +2254,8 @@ class HostProcess:
             )
             from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
 
+            if isinstance(frame, HostImportLocalByIdFrame):
+                return [(frame.source, frame.session_id)], None
             if frame.source == "all":
                 return list(list_recent_sessions_across_harnesses(limit=frame.limit)), None
             source = cast(ImportSource, frame.source)
@@ -2685,7 +2784,7 @@ class HostProcess:
 
         :returns: The catalog listing, or ``None`` when unavailable.
         """
-        from omnigent.codex_native_app_server import codex_launch_catalog
+        from omnigent.harnesses.codex_native.app_server import codex_launch_catalog
 
         try:
             rows = await codex_launch_catalog()
@@ -2708,7 +2807,10 @@ class HostProcess:
 
         :returns: The catalog listing, or ``None`` when unavailable.
         """
-        from omnigent.claude_native import claude_launch_catalog, resolve_native_claude_config
+        from omnigent.harnesses.claude_native.main import (
+            claude_launch_catalog,
+            resolve_native_claude_config,
+        )
 
         try:
             config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
@@ -2757,7 +2859,7 @@ class HostProcess:
 
         if harness == "pi-native":
             try:
-                from omnigent.pi_native_credentials import pi_native_model_options
+                from omnigent.harnesses.pi_native.credentials import pi_native_model_options
 
                 pi_models = await asyncio.to_thread(pi_native_model_options)
             except Exception:
@@ -2778,7 +2880,7 @@ class HostProcess:
             # of its own, so the endpoint listing IS the harness truth — the
             # ids are already in the exact spelling the SDK sends.
             try:
-                from omnigent.model_catalog import list_models_for_worker
+                from omnigent.models.model_catalog import list_models_for_worker
                 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
                 sdk_spec = AgentSpec(
@@ -2890,6 +2992,79 @@ class HostProcess:
         if op == "github_pr_diff":
             return r.github_pr_diff()
         raise ValueError(f"unknown fs op: {op!r}")
+
+    def _handle_fs_write(self, frame: HostFsWriteFrame) -> HostFsResultFrame:
+        """Serve a workspace-mutating op from the host (runner-offline fallback).
+
+        Mirrors :meth:`_handle_fs_request` but for the small set of writes the
+        host can serve — currently the GitHub account/base preference, which
+        touches the host's ``~/.omnigent/config.yaml`` and runs ``gh``/``git`` in
+        the workspace. Called inside a worker thread by the dispatcher.
+
+        :param frame: The write frame (op + workspace + params).
+        :returns: A result frame with the refreshed payload, or an error frame.
+        """
+        try:
+            expanded = os.path.expanduser(frame.workspace)
+        except (TypeError, ValueError) as exc:
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=400,
+                error_code="invalid_workspace",
+                error=f"workspace path expansion failed: {exc}",
+            )
+        if not os.path.isdir(expanded):
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=404,
+                error_code="not_found",
+                error="workspace directory does not exist on host",
+            )
+        try:
+            payload = self._dispatch_fs_write_op(expanded, frame.op, frame.params or {})
+        except ValueError as exc:
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=400,
+                error_code="invalid_request",
+                error=str(exc),
+            )
+        except Exception as exc:
+            _logger.exception("host fs_write op %r failed", frame.op)
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=500,
+                error_code="fs_write_failed",
+                error=str(exc),
+            )
+        return HostFsResultFrame(request_id=frame.request_id, status="ok", payload=payload)
+
+    @staticmethod
+    def _dispatch_fs_write_op(
+        workspace: str,
+        op: str,
+        params: dict[str, object],
+    ) -> dict[str, object]:
+        """Route a write op to its handler. Writes call ``github_resource``
+        directly (not the read-only ``WorkspaceReader``).
+
+        :raises ValueError: On an unknown op.
+        """
+        from typing import cast
+
+        from omnigent.runner import github_resource
+
+        if op == "github_set_preference":
+            return github_resource.set_github_preference(
+                workspace,
+                account=cast("str | None", params.get("account")),
+                remote=cast("str | None", params.get("remote")),
+            )
+        raise ValueError(f"unknown fs write op: {op!r}")
 
     async def _handle_create_worktree(
         self,
@@ -3164,7 +3339,7 @@ class HostProcess:
         # crash no new runner may ever launch on this machine, so the host
         # (re)start is the reliable moment to reclaim them. Best-effort and
         # off-loop: a sweep failure must never block host registration.
-        from omnigent.native_bridge_common import reap_orphaned_native_bridge_dirs
+        from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
 
         try:
             reaped_bridge_dirs = await asyncio.to_thread(reap_orphaned_native_bridge_dirs)
@@ -3231,6 +3406,10 @@ class HostProcess:
                     ):
                         # Keep the refresh window limited to consecutive auth rejections.
                         self._auth_retry_streak = 0
+                    if not (isinstance(exc, InvalidStatus) and exc.response.status_code == 404):
+                        # The 404 streak counts CONSECUTIVE restart-window
+                        # rejections only, so escalation reflects one outage.
+                        self._transient_404_streak = 0
                     # Refused on loopback is decisive: nothing listens on the
                     # port and no network path can heal it, so bound the
                     # retries. Remote refusals retry forever (outages recover).
@@ -3508,6 +3687,7 @@ class HostProcess:
         self._login_redirect_streak = 0
         self._auth_retry_streak = 0
         self._refused_streak = 0
+        self._transient_404_streak = 0
         self._conn_upgrade_accepted = True
         # A completed upgrade proves the endpoint healthy — the next drop's
         # prompt reconnect is wanted again.
@@ -3932,6 +4112,10 @@ class HostProcess:
             # off the event loop and reply when it completes.
             fs_result = await asyncio.to_thread(self._handle_fs_request, frame)
             await ws.send(encode_host_frame(fs_result))
+        elif isinstance(frame, HostFsWriteFrame):
+            # gh/git writes can block; run off the event loop and reply back.
+            fs_write_result = await asyncio.to_thread(self._handle_fs_write, frame)
+            await ws.send(encode_host_frame(fs_write_result))
         elif isinstance(frame, HostModelOptionsFrame):
             # Every dispatched frame already runs on its own task (see
             # _start_frame_task), so a cold harness probe here cannot stall
@@ -3947,7 +4131,7 @@ class HostProcess:
                     error=f"model options resolution crashed for {frame.harness!r}",
                 )
             await ws.send(encode_host_frame(options_result))
-        elif isinstance(frame, HostImportLocalFrame):
+        elif isinstance(frame, (HostImportLocalFrame, HostImportLocalByIdFrame)):
             # Streams one host.import_local_session per session (reads run off the
             # event loop inside), then a terminal host.import_local_done.
             await self._handle_import_local(ws, frame)
@@ -4009,7 +4193,7 @@ def run_host_process(
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
     # User-facing: the display form (workspace /omnigent URL with ?o= when
     # known) — the API mount is an implementation detail.
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     print(
         f"Connecting to {display_server_url(server_url)} as {identity.name!r} ({identity.host_id})"

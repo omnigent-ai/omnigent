@@ -23,7 +23,7 @@ import json
 import secrets
 import shlex
 from abc import ABC, abstractmethod
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -549,7 +549,9 @@ class SandboxLifecycle(ABC):
         Optional capability: the default implementation raises
         :class:`SandboxCapabilityError` — providers whose SDK exposes
         programmatic termination override it. Used by the server's
-        managed-host cleanup when a managed session is deleted.
+        managed-host cleanup when a managed session is deleted. Implementations
+        must treat an already-absent sandbox as success so cleanup can retry
+        safely after a crash or database failure.
 
         :param sandbox_id: The sandbox to terminate, e.g.
             ``"sb-a1b2c3"``.
@@ -807,6 +809,10 @@ class SandboxHostLauncher(SandboxLifecycle):
     Kubernetes) inherit this class directly and override :meth:`start_host`
     without needing any exec transport.
     """
+
+    def reaper_identity(self, workspace_id: int) -> AbstractContextManager[None]:
+        """Bind credentials needed for background cleanup in one workspace."""
+        return nullcontext()
 
     @abstractmethod
     def start_host(

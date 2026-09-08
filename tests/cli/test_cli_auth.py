@@ -231,6 +231,66 @@ def test_store_and_load_databricks_record(token_dir) -> None:
     )
 
 
+def test_pointer_record_reads_as_absent_without_expiry_warning(
+    token_dir, monkeypatch, caplog
+) -> None:
+    """A pointer record is "nothing stored", never an expired login.
+
+    Pointer records hold no session JWT and no ``expires_at``; reading the
+    missing expiry as 0 made every fresh CLI process warn "Stored login
+    session ... expired on 1970-01-01" for a server whose auth chain then
+    authenticated fine via the workspace record.
+    """
+    import logging
+
+    from omnigent.cli_auth import load_token, store_databricks_auth
+
+    # The once-per-process dedupe must not mask the warning here.
+    monkeypatch.setattr("omnigent.cli_auth._warned_expired_servers", set())
+
+    store_databricks_auth(
+        server_url="https://myapp-123.aws.databricksapps.com",
+        workspace_host="https://example.databricks.com",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+        assert load_token("https://myapp-123.aws.databricksapps.com") is None
+
+    expiry_warnings = [r for r in caplog.records if "expired" in r.getMessage()]
+    assert not expiry_warnings, (
+        f"Pointer record spuriously warned as an expired login: "
+        f"{[r.getMessage() for r in expiry_warnings]}"
+    )
+
+
+def test_expired_session_token_still_warns(token_dir, monkeypatch, caplog) -> None:
+    """A genuinely lapsed session JWT keeps its actionable expiry warning.
+
+    Silencing pointer records must not also silence real expiry — the
+    warning is an operator's first breadcrumb before a misleading 403.
+    """
+    import logging
+    import time as time_mod
+
+    from omnigent.cli_auth import load_token, store_token
+
+    monkeypatch.setattr("omnigent.cli_auth._warned_expired_servers", set())
+
+    store_token(
+        server_url="http://localhost:8000",
+        token="jwt-lapsed",
+        user_id="alice@example.com",
+        expires_at=time_mod.time() - 10,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+        assert load_token("http://localhost:8000") is None
+
+    assert any("expired" in r.getMessage() for r in caplog.records), (
+        "Expected the expiry warning for a real lapsed session token."
+    )
+
+
 def test_databricks_request_headers_org_only(token_dir) -> None:
     """A recorded ?o= selector surfaces as the workspace-routing header.
 

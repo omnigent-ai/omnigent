@@ -7,7 +7,7 @@
 //      but a late-arriving listing (home resolving) must NOT clobber
 //      what the user is typing.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -19,6 +19,8 @@ import {
   listingFilter,
   normalizeTypedPath,
   parentOf,
+  resolveWorkspacePath,
+  useResolvedHostHome,
   WorkspacePicker,
 } from "./WorkspacePicker";
 import {
@@ -248,6 +250,86 @@ describe("isHostAbsolutePath", () => {
     expect(isHostAbsolutePath("C:\\Users\\alice")).toBe(true);
     expect(isHostAbsolutePath("~/work")).toBe(false);
     expect(isHostAbsolutePath("")).toBe(false);
+  });
+});
+
+describe("resolveWorkspacePath", () => {
+  it("resolves a typed tilde path against the host's home", () => {
+    // The reported bug: a "~/…" workspace reads like a real directory but the
+    // server never expands ~. Resolving it against home makes it directly
+    // submittable without opening the tree browser.
+    expect(resolveWorkspacePath("~/git/omnigent", "/Users/alice")).toBe(
+      "/Users/alice/git/omnigent",
+    );
+    expect(resolveWorkspacePath("~", "/Users/alice")).toBe("/Users/alice");
+  });
+
+  it("passes an already-absolute path through, no home needed", () => {
+    expect(resolveWorkspacePath("/tmp/work", null)).toBe("/tmp/work");
+    expect(resolveWorkspacePath("  /tmp/work/  ", null)).toBe("/tmp/work");
+    expect(resolveWorkspacePath("/", null)).toBe("/");
+  });
+
+  it("preserves an absolute path verbatim — no slash-run collapsing", () => {
+    // Absolute values must match the prior normalizeWorkspacePath (trailing
+    // slash strip only). Routing them through normalizeTypedPath would rewrite
+    // a typed leading "//foo" → "/foo" — a behavior change we avoid.
+    expect(resolveWorkspacePath("//foo", null)).toBe("//foo");
+    expect(resolveWorkspacePath("/a//b", null)).toBe("/a//b");
+  });
+
+  it("stays null for a tilde path until home resolves, and for unusable input", () => {
+    // Home not yet known → the submit stays gated rather than launching a
+    // literal "~/…" the server can't use.
+    expect(resolveWorkspacePath("~/git/omnigent", null)).toBeNull();
+    expect(resolveWorkspacePath("relative/dir", "/Users/alice")).toBeNull();
+    expect(resolveWorkspacePath("", "/Users/alice")).toBeNull();
+  });
+});
+
+describe("useResolvedHostHome", () => {
+  beforeEach(() => {
+    useHostFilesystemMock.mockReset();
+  });
+
+  it("derives the absolute home from the home listing's first entry", () => {
+    // Entries share one parent, so the first entry's parent is home.
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("git", "/Users/alice/git")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+    const { result: hook } = renderHook(() => useResolvedHostHome("host_1"));
+    expect(hook.current).toBe("/Users/alice");
+  });
+
+  it("stays null for a null host, an empty home, or placeholder data", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+    expect(renderHook(() => useResolvedHostHome("host_1")).result.current).toBeNull();
+
+    // Placeholder (prior dir kept on screen mid-load) must not resolve home
+    // from the wrong directory.
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("git", "/Users/alice/git")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: true,
+      }),
+    );
+    expect(renderHook(() => useResolvedHostHome("host_1")).result.current).toBeNull();
+
+    useHostFilesystemMock.mockReturnValue(
+      result({ data: undefined, isLoading: false, isPlaceholderData: false }),
+    );
+    expect(renderHook(() => useResolvedHostHome(null)).result.current).toBeNull();
   });
 });
 

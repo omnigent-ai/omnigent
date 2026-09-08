@@ -11,8 +11,8 @@ from typing import Any
 
 import pytest
 
-import omnigent.kiro_native_bridge as bridge
-from omnigent.kiro_native_bridge import (
+import omnigent.harnesses.kiro_native.bridge as bridge
+from omnigent.harnesses.kiro_native.bridge import (
     KIRO_ACP_RECORD_PATH_ENV_VAR,
     KIRO_NATIVE_BRIDGE_DIR_ENV_VAR,
     acp_record_path,
@@ -511,7 +511,7 @@ def test_build_kiro_mcp_config_targets_serve_mcp(tmp_path: Path) -> None:
     assert server["args"] == [
         "-I",
         "-m",
-        "omnigent.claude_native_bridge",
+        "omnigent.harnesses.claude_native.bridge",
         "serve-mcp",
         "--bridge-dir",
         str(bridge_dir),

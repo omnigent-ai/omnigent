@@ -18,15 +18,15 @@ from omnigent.entities import (
 )
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
-from omnigent.session_lifecycle import (
+from omnigent.spec import AgentSpec
+from omnigent.stores import ConversationStore
+from omnigent.tools.base import Tool, ToolContext
+from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
     CLOSED_TITLE_INFIX,
     is_session_closed,
 )
-from omnigent.spec import AgentSpec
-from omnigent.stores import ConversationStore
-from omnigent.tools.base import Tool, ToolContext
 
 # Maximum number of recent conversation items to include in
 # check_sub_agents activity for non-completed sub-agents.
@@ -410,9 +410,11 @@ def _build_sys_session_send_schema(
                                             "max_cost_usd": {
                                                 "type": "number",
                                                 "description": (
-                                                    "Optional hard limit in USD. "
-                                                    "Blocks tool calls once exceeded "
-                                                    "on expensive models."
+                                                    "Optional hard limit in USD. Once "
+                                                    "subtree spend reaches it, the next "
+                                                    "gate asks the user to approve "
+                                                    "lifting the cap; work stays blocked "
+                                                    "until they approve."
                                                 ),
                                             },
                                             "ask_thresholds_usd": {

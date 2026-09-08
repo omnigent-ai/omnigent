@@ -59,8 +59,8 @@ from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
     record_websocket_disconnected,
 )
-from omnigent.suspend_watch import watch_for_resume
-from omnigent.tls import client_ssl_context
+from omnigent.util.suspend_watch import watch_for_resume
+from omnigent.util.tls import client_ssl_context
 
 _logger = logging.getLogger(__name__)
 
@@ -181,6 +181,7 @@ async def dispatch_via_asgi(
     response_status: list[int] = []
     response_headers_raw: list[tuple[bytes, bytes]] = []
     head_sent_to_ws: bool = False
+    end_sent_to_ws: bool = False
 
     async def receive() -> Message:
         nonlocal body_sent
@@ -202,7 +203,7 @@ async def dispatch_via_asgi(
         return await disconnect
 
     async def send(event: Message) -> None:
-        nonlocal head_sent_to_ws
+        nonlocal head_sent_to_ws, end_sent_to_ws
         ev_type = event.get("type")
         if ev_type == "http.response.start":
             response_status.append(event["status"])
@@ -243,15 +244,16 @@ async def dispatch_via_asgi(
                 )
             if not event.get("more_body", False):
                 await send_text(encode_frame(ResponseEndFrame(id=frame.id)))
+                end_sent_to_ws = True
 
     try:
         await app(scope, receive, send)
     except Exception:
         # If the app crashed BEFORE sending head, surface a 500 so
         # the server's request-side awaiter doesn't hang. If it
-        # crashed AFTER head, it's already streaming — best we can
-        # do is end the response so the consumer doesn't wait
-        # forever.
+        # crashed AFTER head, it's already streaming — send an
+        # error-flagged ResponseEndFrame so the server-side consumer
+        # sees an exception rather than a clean EOF after partial body.
         if not head_sent_to_ws:
             await send_text(
                 encode_frame(
@@ -271,7 +273,15 @@ async def dispatch_via_asgi(
                     )
                 )
             )
-        await send_text(encode_frame(ResponseEndFrame(id=frame.id)))
+        # If a clean end already went out (more_body=False), the response is
+        # complete on the wire; a second, error-flagged end frame could race
+        # the consumer and spuriously abort a fully-delivered response. Send
+        # at most one end frame per request.
+        if not end_sent_to_ws:
+            # Only flag the end frame as an error when head was already sent;
+            # the pre-head path delivers a well-formed 500 that closes cleanly.
+            end_error = "runner_stream_error" if head_sent_to_ws else None
+            await send_text(encode_frame(ResponseEndFrame(id=frame.id, error=end_error)))
         raise
 
 
@@ -448,7 +458,7 @@ async def serve_tunnel(
                     # Show the display form (workspace /omnigent URL, ?o=
                     # when known), not the internal API mount; it round-trips
                     # through `omnigent login` to the same server.
-                    from omnigent.server_url import display_server_url
+                    from omnigent.util.server_url import display_server_url
 
                     raise RuntimeError(
                         f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
@@ -476,7 +486,7 @@ async def serve_tunnel(
                             # --host`, which would need the workspace host,
                             # not the server URL (for workspace-hosted
                             # servers the API mount is the wrong --host).
-                            from omnigent.server_url import display_server_url
+                            from omnigent.util.server_url import display_server_url
 
                             login_hint = (
                                 f"run `omnigent login {display_server_url(server_url)}` "

@@ -77,7 +77,9 @@ from omnigent.host.daemon_lifecycle import (
 from omnigent.host.daemon_lifecycle import write_daemon_record as _write_daemon_record_impl
 from omnigent.host.local_server import (
     _DEFAULT_LOCAL_PORT,
+    LocalServerStartupError,
     _pid_alive,
+    consume_failed_server_log_tail,
     ensure_local_omnigent_server,
     local_server_status,
     local_server_url_if_healthy,
@@ -87,7 +89,6 @@ from omnigent.host.local_server import (
 )
 from omnigent.inner import _proc, ui
 from omnigent.integration_daemon import IntegrationDaemon
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
 from omnigent.process_logging import (
     LOG_LEVEL_ENV_VAR,
@@ -96,8 +97,9 @@ from omnigent.process_logging import (
     env_truthy,
     process_log_dir_reference,
 )
-from omnigent.server_url import ServerUrl
-from omnigent.server_url import org_id_from_url as _org_id_from_url
+from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.server_url import ServerUrl
+from omnigent.util.server_url import org_id_from_url as _org_id_from_url
 
 if TYPE_CHECKING:
     import socket
@@ -2278,6 +2280,7 @@ def main() -> None:
         log_cli_exception,
         print_stale_host_hint,
         setup_cli_logging,
+        suppresses_recovery_hint,
     )
 
     setup_cli_logging(argv)
@@ -2314,7 +2317,10 @@ def main() -> None:
     except click.ClickException as exc:
         log_cli_exception(exc, prefix="Click CLI error")
         exc.show()
-        if suggest_stale_host_recovery:
+        # Withhold the stale-host hint for failures `omnigent stop` cannot
+        # fix — a crashed background server (LocalServerStartupError) or a
+        # missing dependency — whose real cause is already surfaced above.
+        if suggest_stale_host_recovery and not suppresses_recovery_hint(exc):
             print_stale_host_hint()
         raise SystemExit(exc.exit_code) from exc
     except click.Abort as exc:
@@ -2593,7 +2599,7 @@ def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) ->
         as ``"online"``; ``False`` if the host id is unknown, the server
         is unreachable, or the host reports offline.
     """
-    from omnigent.claude_native_bridge import url_component
+    from omnigent.harnesses.claude_native.bridge import url_component
 
     host_id = record.host_id or _load_existing_host_id()
     if host_id is None:
@@ -2875,7 +2881,9 @@ def _daemon_host_identity_changed(record: _HostDaemonRecord) -> bool:
     if record.host_id is None:
         return False
     current_host_id = _load_existing_host_id()
-    return record.host_id != current_host_id
+    from omnigent.db.db_models import normalize_uuid
+
+    return normalize_uuid(record.host_id) != normalize_uuid(current_host_id)
 
 
 def _terminate_host_unit(record: _HostDaemonRecord, *, reason: str) -> None:
@@ -3575,7 +3583,7 @@ def _discover_local_server_url(
 
     :param timeout: Max seconds to wait, e.g. ``60.0``.
     :returns: The loopback server URL, e.g. ``"http://127.0.0.1:8123"``.
-    :raises click.ClickException: If the daemon exits first, or the server
+    :raises LocalServerStartupError: If the daemon exits first, or the server
         does not come up within the timeout.
     """
     import time
@@ -3586,13 +3594,23 @@ def _discover_local_server_url(
         if url is not None:
             return url
         if not _host_daemon_alive():
-            raise click.ClickException(
+            # The server crashed in the daemon's subprocess; surface its
+            # sanitized log tail here (attributed by daemon PID) — terminal
+            # stderr is the only place the user actually looks.
+            record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
+            daemon_pid = record.pid if record is not None else None
+            detail = ""
+            tail_info = consume_failed_server_log_tail(daemon_pid)
+            if tail_info is not None:
+                tail_path, tail = tail_info
+                detail = f"\n  Server log: {tail_path}\n\n  Last 50 lines:\n{tail}"
+            raise LocalServerStartupError(
                 "The local daemon exited before its Omnigent server became ready. "
                 f"See logs under {process_log_dir_reference('host')} and "
-                f"{process_log_dir_reference('server')}."
+                f"{process_log_dir_reference('server')}." + detail
             )
         time.sleep(0.2)
-    raise click.ClickException(
+    raise LocalServerStartupError(
         f"Timed out after {timeout:.0f}s waiting for the local Omnigent server to "
         f"start. See {process_log_dir_reference('server')} for details."
     )
@@ -6702,7 +6720,7 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
 
     from omnigent.chat import _remote_headers
     from omnigent.db.utils import builtin_agent_id
-    from omnigent.native_coding_agents import native_coding_agent_for_harness
+    from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 
     src_path = Path(input_path)
     if not src_path.is_file():
@@ -7171,66 +7189,66 @@ class _NativeTerminalDispatchSpec:
 
 _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
     "claude": _NativeTerminalDispatchSpec(
-        module="omnigent.claude_native",
+        module="omnigent.harnesses.claude_native.main",
         function="run_claude_native",
         args_param="extra_args",
         prompt_param="prompt",
     ),
     "codex": _NativeTerminalDispatchSpec(
-        module="omnigent.codex_native",
+        module="omnigent.harnesses.codex_native.main",
         function="run_codex_native",
         args_param="extra_args",
         model_strategy="first_class",
         prompt_param="prompt",
     ),
     "pi": _NativeTerminalDispatchSpec(
-        module="omnigent.pi_native",
+        module="omnigent.harnesses.pi_native.main",
         function="run_pi_native",
         args_param="extra_args",
     ),
     "opencode": _NativeTerminalDispatchSpec(
-        module="omnigent.opencode_native",
+        module="omnigent.harnesses.opencode_native.main",
         function="run_opencode_native",
         args_param="extra_args",
         model_strategy="first_class",
     ),
     "cursor": _NativeTerminalDispatchSpec(
-        module="omnigent.cursor_native",
+        module="omnigent.harnesses.cursor_native.main",
         function="run_cursor_native",
         args_param="extra_args",
     ),
     "kimi": _NativeTerminalDispatchSpec(
-        module="omnigent.kimi_native",
+        module="omnigent.harnesses.kimi_native.main",
         function="run_kimi_native",
         args_param="extra_args",
     ),
     "kiro": _NativeTerminalDispatchSpec(
-        module="omnigent.kiro_native",
+        module="omnigent.harnesses.kiro_native.main",
         function="run_kiro_native",
         args_param="extra_args",
         model_strategy="first_class",
         prompt_param="prompt",
     ),
     "goose": _NativeTerminalDispatchSpec(
-        module="omnigent.goose_native",
+        module="omnigent.harnesses.goose_native.main",
         function="run_goose_native",
         args_param="extra_args",
         model_strategy="explicit_passthrough",
     ),
     "antigravity": _NativeTerminalDispatchSpec(
-        module="omnigent.antigravity_native",
+        module="omnigent.harnesses.antigravity_native.main",
         function="run_antigravity_native",
         args_param="extra_args",
         model_strategy="first_class",
     ),
     "qwen": _NativeTerminalDispatchSpec(
-        module="omnigent.qwen_native",
+        module="omnigent.harnesses.qwen_native.main",
         function="run_qwen_native",
         args_param="extra_args",
         model_strategy="explicit_passthrough",
     ),
     "hermes": _NativeTerminalDispatchSpec(
-        module="omnigent.hermes_native",
+        module="omnigent.harnesses.hermes_native.main",
         function="run_hermes_native",
         args_param="extra_args",
         model_strategy="explicit_passthrough",
@@ -7279,7 +7297,7 @@ def _dispatch_native_terminal_harness(
     :returns: ``True`` when *harness* is a native terminal harness and was
         dispatched here; ``False`` when it is not one (caller continues).
     """
-    from omnigent.native_coding_agents import native_coding_agent_for_harness
+    from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 
     native_agent = native_coding_agent_for_harness(harness)
     if native_agent is None:
@@ -7482,7 +7500,7 @@ def _reject_agent_with_native_terminal_harness(harness: str) -> None:
     :param harness: The requested ``--harness`` value (canonical or alias).
     :raises click.ClickException: When *harness* is a native terminal harness.
     """
-    from omnigent.native_coding_agents import native_coding_agent_for_harness
+    from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 
     native_agent = native_coding_agent_for_harness(harness)
     if native_agent is None:
@@ -7845,7 +7863,7 @@ def _require_live_conversation(
     )
     # ``_host_http_json`` reports transport failures as status 0 (never
     # raises), so the server-down and missing-session cases both land here.
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     if result.status_code == 0:
         raise click.ClickException(
@@ -7917,7 +7935,7 @@ def attach(
             "`--server <url>`."
         )
     if conversation is None:
-        from omnigent.server_url import display_server_url
+        from omnigent.util.server_url import display_server_url
 
         server_display = display_server_url(base_url)
         raise click.ClickException(
@@ -8439,7 +8457,7 @@ def _maybe_open_host_web_ui(
     if _resolve_auto_open_conversation_setting(cfg) is False:
         return
     from omnigent.conversation_browser import open_conversation_url
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     web_url = display_server_url(server_url)
     try:
@@ -8492,7 +8510,7 @@ def _run_background_host(
         if _local_daemon_serves_target(target, server or None):
             local_record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
             if local_record is not None:
-                from omnigent.server_url import display_server_url
+                from omnigent.util.server_url import display_server_url
 
                 _confirm_background_host_registered(local_record)
                 click.echo(f"The local host daemon already serves {display_server_url(target)}.")
@@ -8526,7 +8544,7 @@ def _run_background_host(
     click.echo(f"{headline} (pid {record.pid}).")
     # User-facing: the display form (workspace /omnigent URL with ?o= when
     # known) — the API mount is an implementation detail.
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     _echo_host_field("server", _cli_style(display_server_url(server_url), fg="cyan"))
     if record.log_path is not None:
@@ -9057,7 +9075,7 @@ def _runner_online_map(
     :returns: Map of ``runner_id`` to ``True`` / ``False``. ``None``
         means the runner status could not be resolved.
     """
-    from omnigent.claude_native_bridge import url_component
+    from omnigent.harnesses.claude_native.bridge import url_component
 
     runner_ids = sorted(
         {
@@ -9156,7 +9174,7 @@ def _add_daemon_host_status(
     if not isinstance(host_id, str) or not host_id:
         payload["error"] = "host id is not available in local config"
         return
-    from omnigent.claude_native_bridge import url_component
+    from omnigent.harnesses.claude_native.bridge import url_component
 
     host_result = _host_http_json(
         base_url=base_url,
@@ -9350,7 +9368,7 @@ def _host_display_url(value: _HostJsonValue) -> _HostJsonValue:
     :returns: The display URL, or *value* unchanged when it is not a URL.
     """
     if isinstance(value, str) and value.startswith(("http://", "https://")):
-        from omnigent.server_url import display_server_url
+        from omnigent.util.server_url import display_server_url
 
         return display_server_url(value)
     return value
@@ -9730,7 +9748,7 @@ def _stop_session_on_server(
     :param session_id: Session id, e.g. ``"conv_abc123"``.
     :raises click.ClickException: If the server rejects the stop event.
     """
-    from omnigent.claude_native_bridge import url_component
+    from omnigent.harnesses.claude_native.bridge import url_component
 
     # This is a standalone CLI process with an empty session→host map, so read
     # the session's host from its record first: the stop_session event is a
@@ -9996,7 +10014,27 @@ def host_reset_id(yes: bool) -> None:
 
     :param yes: When ``True``, skip the confirmation prompt.
     """
-    from omnigent.host.identity import CONFIG_PATH, reset_host_id
+    from omnigent.host.identity import (
+        CONFIG_PATH,
+        HOST_ID_ENV_VAR,
+        HOST_NAME_ENV_VAR,
+        host_identity_env_override_active,
+        reset_host_id,
+    )
+
+    # With OMNIGENT_HOST_ID / OMNIGENT_HOST_NAME set, the host takes its
+    # identity from the environment, not config.yaml (both set → env identity
+    # used; only one set → startup errors). Either way resetting the id in the
+    # file will not change the machine's identity, so refuse and point at the
+    # env vars rather than let a config write mislead the user.
+    if host_identity_env_override_active():
+        raise click.ClickException(
+            f"This machine's host identity is controlled by the {HOST_ID_ENV_VAR} / "
+            f"{HOST_NAME_ENV_VAR} environment variable(s), so resetting the id in the "
+            "config file will not change it. This is normally a server-managed "
+            f"sandbox host, whose identity the server owns. Unset {HOST_ID_ENV_VAR} "
+            f"and {HOST_NAME_ENV_VAR} first if you need to reset the persisted id."
+        )
 
     running = [record for record in _list_daemon_records() if _pid_alive(record.pid)]
     if running:
@@ -11197,7 +11235,7 @@ def _workspace_api_server_url(server: str) -> str:
 
     import httpx as _httpx
 
-    from omnigent.server_url import (
+    from omnigent.util.server_url import (
         WORKSPACE_API_PATH,
         WORKSPACE_UI_PATH,
         display_server_url,
@@ -11407,7 +11445,7 @@ def _resolve_server_url(server: str) -> ServerUrl:
         ``"https:"`` for an empty value, or the unroutable ``https://local``.
     """
     from omnigent.conversation_browser import strip_conversation_path
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     if _is_local_server_request(server):
         raise click.ClickException(
@@ -11550,7 +11588,7 @@ def _workspace_hosted_profile_org_id(
     profile_name: str | None = None,
 ) -> str | None:
     """Return the CLI-recorded workspace id for workspace-hosted Omnigent."""
-    from omnigent.server_url import is_workspace_hosted_url
+    from omnigent.util.server_url import is_workspace_hosted_url
 
     if not is_workspace_hosted_url(server):
         return None
@@ -11881,7 +11919,7 @@ def _remember_default_server(server: str) -> None:
         ``"https://example.databricks.com/api/2.0/omnigent"``. Stored as-is
         (the wire form); the confirmation shows the display form.
     """
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     _save_global_config({"server": server})
     click.echo(f"Set {display_server_url(server)} as your default server.")

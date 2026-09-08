@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.opencode_native_provider import (
+from omnigent.harnesses.opencode_native.provider import (
     OpenCodeGatewayResolution,
     _gateway_endpoint_for_model,
     _strip_jsonc_comments,
@@ -27,7 +27,7 @@ from omnigent.opencode_native_provider import (
 @pytest.fixture(autouse=True)
 def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: types.SimpleNamespace(
             model_id=f"catalog-{provider_name}-{family}-default"
         ),
@@ -46,7 +46,7 @@ def test_build_omnigent_mcp_server_points_serve_mcp_at_bridge_dir() -> None:
     cmd = entry["command"]
     # Launches the SHARED serve-mcp relay, pointed at THIS bridge dir.
     assert cmd[-3:] == ["serve-mcp", "--bridge-dir", "/tmp/bridge-xyz"]
-    assert "omnigent.claude_native_bridge" in cmd
+    assert "omnigent.harnesses.claude_native.bridge" in cmd
     assert entry.get("environment", {}).get("PYTHONUNBUFFERED") == "1"
 
 
@@ -67,7 +67,7 @@ def test_build_omnigent_mcp_server_rejects_non_string_values(
     server: dict[str, object],
 ) -> None:
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.build_mcp_config",
+        "omnigent.harnesses.claude_native.bridge.build_mcp_config",
         lambda bridge_dir, *, python_executable=None: {"mcpServers": {"omnigent": server}},
     )
 
@@ -197,7 +197,7 @@ def test_resolve_gateway_none_when_no_token(monkeypatch: pytest.MonkeyPatch) -> 
 def test_build_mcp_block_stdio_and_http() -> None:
     from types import SimpleNamespace as N
 
-    from omnigent.opencode_native_provider import build_opencode_mcp_block
+    from omnigent.harnesses.opencode_native.provider import build_opencode_mcp_block
 
     servers = [
         N(
@@ -242,7 +242,7 @@ def test_build_mcp_block_stdio_and_http() -> None:
 def test_build_mcp_block_http_databricks_injects_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
     from types import SimpleNamespace as N
 
-    import omnigent.opencode_native_provider as prov
+    import omnigent.harnesses.opencode_native.provider as prov
 
     monkeypatch.setattr(prov, "_databricks_bearer_token", lambda _p: "tok123")
     servers = [
@@ -577,7 +577,7 @@ def test_merge_user_provider_config_handles_jsonc_trailing_commas(
 def test_build_mcp_block_preserves_custom_timeout() -> None:
     from types import SimpleNamespace as N
 
-    from omnigent.opencode_native_provider import build_opencode_mcp_block
+    from omnigent.harnesses.opencode_native.provider import build_opencode_mcp_block
 
     servers = [
         N(
@@ -608,7 +608,7 @@ def test_build_mcp_block_preserves_custom_timeout() -> None:
 
 
 def test_extract_progress_token_variants() -> None:
-    from omnigent.claude_native_bridge import _extract_progress_token
+    from omnigent.harnesses.claude_native.bridge import _extract_progress_token
 
     # Meta style (MCP standard)
     assert _extract_progress_token({"_meta": {"progressToken": "tok-123"}}) == "tok-123"
@@ -638,7 +638,7 @@ def test_mcp_progress_heartbeat_lifecycle() -> None:
         with stdout_lock:
             written_messages.append(payload)
 
-    import omnigent.claude_native_bridge as bridge_mod
+    import omnigent.harnesses.claude_native.bridge as bridge_mod
 
     orig_write = bridge_mod._write_jsonrpc
     bridge_mod._write_jsonrpc = fake_write

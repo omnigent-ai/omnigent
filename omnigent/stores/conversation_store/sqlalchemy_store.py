@@ -8,6 +8,7 @@ from typing import Any, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
+    LargeBinary,
     Select,
     and_,
     asc,
@@ -75,7 +76,7 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
-from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.session_import.models import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
@@ -141,6 +142,9 @@ _SESSION_OVERRIDE_KEYS = (
     "cost_control_mode_override",
     "subagent_routing_override",
     "harness_override",
+    # Stored as the string ``"on"`` when the owner shares workspace files
+    # with view-level collaborators; absent (SQL NULL blob key) otherwise.
+    "share_workspace_files",
 )
 
 
@@ -233,6 +237,8 @@ def _to_conversation(
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
+        # Stored as ``"on"`` / absent; surfaced as a plain bool on the entity.
+        share_workspace_files=overrides["share_workspace_files"] == "on",
         sub_agent_name=meta.sub_agent_name if meta else None,
         task_summary=meta.task_summary if meta else None,
         external_session_id=meta.external_session_id if meta else None,
@@ -2099,6 +2105,46 @@ class SqlAlchemyConversationStore(ConversationStore):
             # SQLite the database-level lock already serializes.
             self._lock_conversation(session, conversation_id)
 
+            # Idempotent-append probe: one query for the whole batch. Rows
+            # already persisted under a stable id ARE those items' append
+            # result; running under the lock just taken serializes with a
+            # concurrent retry (READ COMMITTED gives this statement a fresh
+            # snapshot after the lock wait), so it cannot double-insert.
+            stable_ids = [item.stable_id for item in items if item.stable_id is not None]
+            existing_by_id: dict[str, SqlConversationItem] = {}
+            deduped_by_id: dict[str, ConversationItem] = {}
+            if stable_ids:
+                existing_rows = (
+                    session.execute(
+                        select(SqlConversationItem).where(
+                            SqlConversationItem.workspace_id == current_workspace_id(),
+                            SqlConversationItem.conversation_id == conversation_id,
+                            SqlConversationItem.id.in_(stable_ids),
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                decoded = self._decode_item_data_batch([row.data for row in existing_rows])
+                existing_by_id = {row.id: row for row in existing_rows}
+                deduped_by_id.update(
+                    {
+                        row.id: _to_item(row, data).model_copy(update={"deduplicated": True})
+                        for row, data in zip(existing_rows, decoded, strict=True)
+                    }
+                )
+                if all(item.stable_id in existing_by_id for item in items):
+                    # Pure duplicate re-post: nothing inserts, so leave
+                    # ``updated_at`` and the position counter untouched — a
+                    # retry must not make an old conversation look active.
+                    # Membership (not a length compare) so a batch repeating
+                    # one persisted stable id still counts as pure.
+                    return [
+                        deduped_by_id[item.stable_id]
+                        for item in items
+                        if item.stable_id is not None
+                    ]
+
             # Bump updated_at on the conversation.
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if conv_row is not None:
@@ -2134,11 +2180,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             completed_status = encode_item_status("completed")  # items are final on append
             fts_rows: list[tuple[str, str, str]] = []
             row_values: list[dict[str, object]] = []
+            batch_stable: dict[str, ConversationItem] = {}
             for item, data in zip(items, encoded_data, strict=True):
+                if item.stable_id is not None:
+                    if item.stable_id in existing_by_id:
+                        persisted.append(deduped_by_id[item.stable_id])
+                        continue
+                    if item.stable_id in batch_stable:
+                        # Same stable id twice in one batch: the first
+                        # occurrence is this one's result too (inserting both
+                        # would collide on the primary key).
+                        persisted.append(
+                            batch_stable[item.stable_id].model_copy(update={"deduplicated": True})
+                        )
+                        continue
                 position = next_pos
                 next_pos += 1
                 search = self._item_search_text(item)
-                item_id = generate_item_id(item.type)
+                item_id = item.stable_id or generate_item_id(item.type)
                 values: dict[str, object] = {
                     "workspace_id": workspace_id,
                     "id": item_id,
@@ -2173,6 +2232,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                         created_by=item.created_by,
                     )
                 )
+                if item.stable_id is not None:
+                    batch_stable[item.stable_id] = persisted[-1]
             # One executemany for the batch: positions are pre-allocated above so
             # the rows carry no inter-row dependency, and a single round-trip
             # persists all N. A per-row ORM add round-trips per item, which
@@ -2811,6 +2872,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
+        share_workspace_files: bool | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
@@ -2848,6 +2910,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param _unset_harness_override: When ``True``, clear
             ``harness_override`` to ``None`` (used to replace the
             ``"auto"`` sentinel after first-message routing resolves).
+        :param share_workspace_files: Whether view-level collaborators may
+            browse the workspace. ``True`` stores the share flag, ``False``
+            clears it (back to edit-only), ``None`` leaves it unchanged.
         :param terminal_launch_args: Per-session native-terminal
             pass-through args, e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -2907,6 +2972,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             elif harness_override is not None:
                 overrides["harness_override"] = harness_override
                 overrides_changed = True
+            # Two-state flag: True stores ``"on"``, False clears it (edit-only
+            # again), None leaves it untouched.
+            if share_workspace_files is not None:
+                overrides["share_workspace_files"] = "on" if share_workspace_files else None
+                overrides_changed = True
             if overrides_changed:
                 row.session_overrides = _encode_session_overrides(overrides)
                 ap_changed = True
@@ -2957,6 +3027,46 @@ class SqlAlchemyConversationStore(ConversationStore):
         else:
             meta = self._get_meta(conversation_id)
         return _to_conversation(row, meta, labels)
+
+    def clear_model_override_if_matches(
+        self,
+        conversation_id: str,
+        expected_model_override: str,
+    ) -> bool:
+        """Clear only a matching model selection with an atomic settings compare-and-swap."""
+        workspace_id = current_workspace_id()
+        with self._conv_session("clear_model_override_if_matches") as session:
+            original = session.scalar(
+                select(SqlConversation.session_overrides).where(
+                    SqlConversation.workspace_id == workspace_id,
+                    SqlConversation.id == conversation_id,
+                )
+            )
+            overrides: dict[str, Any] = json.loads(original) if original else {}
+            if overrides.get("model_override") != expected_model_override:
+                return False
+            del overrides["model_override"]
+            encoded = json.dumps(overrides, separators=(",", ":")) if overrides else None
+            unchanged = SqlConversation.session_overrides == original
+            if self._conv_engine.dialect.name == "mysql":
+                # MySQL text collations can equate distinct, case-only model selections.
+                unchanged = SqlConversation.session_overrides.cast(LargeBinary) == (
+                    original.encode("utf-8") if original is not None else None
+                )
+            # Comparing the whole blob preserves concurrent updates to sibling settings too.
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == workspace_id,
+                        SqlConversation.id == conversation_id,
+                        unchanged,
+                    )
+                    .values(session_overrides=encoded, updated_at=now_epoch())
+                ),
+            )
+            return result.rowcount == 1
 
     def rename_conversation_if_title_matches(
         self,
@@ -3871,25 +3981,43 @@ class SqlAlchemyConversationStore(ConversationStore):
                 src_item.id: generate_item_id(decode_item_type(src_item.type))
                 for src_item in source_items
             }
-            decoded_item_data = self._decode_item_data_batch(
-                [src_item.data for src_item in source_items]
-            )
-
-            fts_rows: list[tuple[str, str, str]] = []
-            for pos, (src_item, decoded_data) in enumerate(
-                zip(source_items, decoded_item_data, strict=True)
-            ):
-                # src_item.type/status are int codes copied verbatim to the new
-                # row. Compaction data is the sole payload containing an item ID.
-                new_item_id = copied_item_ids[src_item.id]
-                copied_data = decoded_data
-                if decode_item_type(src_item.type) == "compaction":
+            # Copied rows reuse the source's already-encoded payload bytes (the
+            # encode transform depends only on item data); only compaction
+            # payloads change, remapped via one batch decode + one batch encode
+            # so a store whose encode is a per-call RPC never pays one
+            # round-trip per copied item inside this transaction.
+            compaction_positions = [
+                pos
+                for pos, src_item in enumerate(source_items)
+                if decode_item_type(src_item.type) == "compaction"
+            ]
+            remapped_compaction_data: dict[int, str] = {}
+            if compaction_positions:
+                decoded_compactions = self._decode_item_data_batch(
+                    [source_items[pos].data for pos in compaction_positions]
+                )
+                remapped: list[str] = []
+                for decoded_data in decoded_compactions:
                     compaction_data = json.loads(decoded_data)
                     boundary_id = compaction_data.get("last_item_id")
                     mapped_boundary_id = copied_item_ids.get(boundary_id)
                     if mapped_boundary_id is not None:
                         compaction_data["last_item_id"] = mapped_boundary_id
-                        copied_data = json.dumps(compaction_data)
+                    remapped.append(json.dumps(compaction_data))
+                remapped_compaction_data = dict(
+                    zip(
+                        compaction_positions,
+                        self._encode_item_data_batch(remapped),
+                        strict=True,
+                    )
+                )
+
+            fts_rows: list[tuple[str, str, str]] = []
+            for pos, src_item in enumerate(source_items):
+                # src_item.type/status/data are copied verbatim to the new row;
+                # compaction data alone is rewritten (the sole payload that
+                # contains an item ID).
+                new_item_id = copied_item_ids[src_item.id]
                 new_item = SqlConversationItem(
                     id=new_item_id,
                     conversation_id=new_conv.id,
@@ -3898,7 +4026,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     status=src_item.status,
                     position=pos,
                     type=src_item.type,
-                    data=self._encode_item_data(copied_data),
+                    data=remapped_compaction_data.get(pos, src_item.data),
                     search_text=src_item.search_text,
                     created_by=src_item.created_by,
                 )

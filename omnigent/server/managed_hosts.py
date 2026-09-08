@@ -16,7 +16,8 @@ survive a sandbox dying at the provider's lifetime cap.
 
 The sandbox host authenticates back with a dedicated launch token the
 server mints per launch (see
-:meth:`omnigent.stores.host_store.HostStore.register_managed_host` and
+:meth:`omnigent.stores.host_store.HostStore.register_managed_host`,
+:meth:`omnigent.stores.host_store.HostStore.replace_managed_host_sandbox`, and
 the managed-token branch in
 :mod:`omnigent.server.routes.host_tunnel`) — the user's own
 credentials never enter the sandbox.
@@ -32,12 +33,17 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         # lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|e2b|openshell|kubernetes
+         # lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|e2b|openshell|
+         # kubernetes|microsandbox
          provider: modal
          server_url: https://omnigent.example.com
          # For SEVERAL providers, replace `provider:` with a `providers:`
          # list (mutually exclusive); a create picks one by name via
          # `sandbox_provider`, else the first. See parse_sandbox_config.
+         reaper:                  # optional; deployment-wide, not per-provider
+           enabled: true          # default: false
+           terminate_after_offline_days: 30  # default: 30 days
+           sweep_interval_s: 86400            # default: 1 day
          host_config:             # optional; provider-agnostic. Verbatim
                                   # in-sandbox ~/.omnigent/config.yaml content,
                                   # installed before `omnigent host` starts
@@ -96,6 +102,16 @@ stores into ``create_app``):
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
                                              # as sandbox env
            cluster: my-gateway              # optional OpenShell gateway name
+         microsandbox:            # optional block (provider: microsandbox)
+           image: docker.io/me/omnigent-host:latest  # default: official image
+           env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
+                                             # as sandbox env
+           cpus: 2                           # default 2
+           memory_mib: 4096                  # default 4096
+           idle_timeout_s: 86400             # default 24h; 0 disables draining
+           network: host                     # host (default)|public-only|all
+           host_ports: [8317]                # extra guest-to-host ports (the
+                                             # server_url port is always allowed)
 
    Most providers default to a public prebaked host image, so
    ``provider`` + ``server_url`` is a complete config. Registry-backed
@@ -116,9 +132,11 @@ stores into ``create_app``):
    it connects to the gateway made active with ``openshell gateway
    select`` (``$OPENSHELL_GATEWAY`` / ``~/.config/openshell/active_gateway``,
    or ``sandbox.openshell.cluster``), so the server process needs
-   OpenShell gateway access. ``modal``, ``daytona``, ``blaxel``, ``cwsandbox``,
-   ``islo``, and ``openshell`` have managed-launch support; ``lakebox``
-   parses but rejects at launch.
+   OpenShell gateway access. The microsandbox launcher needs no
+   credentials at all: VMs run embedded on the server host itself
+   (Apple Silicon macOS / KVM Linux). Every provider except
+   ``lakebox`` has managed-launch support; ``lakebox`` parses but
+   rejects at launch.
 
 2. **Direct construction** (embedding deployments): build
    :class:`ManagedSandboxConfig` with a custom
@@ -148,6 +166,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import TYPE_CHECKING, cast
 
 import click
@@ -180,6 +199,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "microsandbox",
         "agent_sandbox",
     }
 )
@@ -194,6 +214,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "microsandbox",
         "agent_sandbox",
     }
 )
@@ -235,6 +256,11 @@ DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # re-authenticate its tunnel across reconnects while still expiring tokens of
 # boxes nobody removed. A relaunch mints a fresh token.
 BOXLITE_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Microsandbox VMs have no lifetime cap and drain when idle.
+# The seven-day policy keeps live VMs reconnecting while stale tokens expire.
+# A relaunch mints a fresh token.
+MICROSANDBOX_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # Launch-token lifetime for the YAML islo path. Islo sandboxes are
 # deleted by managed-session teardown; use the same 7-day policy bound
@@ -520,6 +546,23 @@ class ManagedSandboxConfig:
     host_config: dict[str, object] | None = None
 
 
+@dataclass(frozen=True)
+class ManagedSandboxReaperConfig:
+    """Deployment-wide managed sandbox reaper settings.
+
+    :param enabled: Whether the server lifespan starts the reaper loop.
+        Disabled by default because terminating user compute is destructive.
+    :param terminate_after_offline_days: Minimum number of days since the
+        managed host's last heartbeat/disconnect before its current sandbox
+        generation may be terminated.
+    :param sweep_interval_s: Seconds between complete deployment-wide sweeps.
+    """
+
+    enabled: bool = False
+    terminate_after_offline_days: int = 30
+    sweep_interval_s: int = 24 * 60 * 60
+
+
 @dataclass
 class ManagedSandboxDeployment:
     """
@@ -539,9 +582,14 @@ class ManagedSandboxDeployment:
     :param configs: One single-provider config per offered provider, in
         configured order. Never empty. The first is the deployment
         default a request that names no provider gets.
+    :param reaper: One deployment-wide reaper policy shared by every
+        configured provider.
     """
 
     configs: tuple[ManagedSandboxConfig, ...]
+    reaper: ManagedSandboxReaperConfig = dataclass_field(
+        default_factory=ManagedSandboxReaperConfig
+    )
 
     def __post_init__(self) -> None:
         # Enforce the "never empty" invariant the accessors rely on
@@ -552,7 +600,12 @@ class ManagedSandboxDeployment:
             raise ValueError("ManagedSandboxDeployment requires at least one provider config")
 
     @classmethod
-    def single(cls, config: ManagedSandboxConfig) -> ManagedSandboxDeployment:
+    def single(
+        cls,
+        config: ManagedSandboxConfig,
+        *,
+        reaper: ManagedSandboxReaperConfig | None = None,
+    ) -> ManagedSandboxDeployment:
         """
         Wrap one provider config as a one-provider deployment.
 
@@ -561,9 +614,10 @@ class ManagedSandboxDeployment:
         deployment uniformly.
 
         :param config: The single provider's config.
+        :param reaper: Optional deployment-wide reaper policy.
         :returns: A deployment offering exactly *config*.
         """
-        return cls(configs=(config,))
+        return cls(configs=(config,), reaper=reaper or ManagedSandboxReaperConfig())
 
     @property
     def default(self) -> ManagedSandboxConfig:
@@ -1070,12 +1124,63 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxDeployment | None:
         return None
     if not isinstance(raw, dict):
         raise ValueError("server config 'sandbox' must be a mapping")
+    reaper = _parse_managed_sandbox_reaper_config(raw)
     if "providers" in raw:
-        return _parse_multi_provider_sandbox_config(raw)
-    return ManagedSandboxDeployment.single(_parse_single_provider_sandbox_config(raw))
+        return _parse_multi_provider_sandbox_config(raw, reaper=reaper)
+    return ManagedSandboxDeployment.single(
+        _parse_single_provider_sandbox_config(raw),
+        reaper=reaper,
+    )
 
 
-def _parse_multi_provider_sandbox_config(raw: dict[str, object]) -> ManagedSandboxDeployment:
+def _parse_managed_sandbox_reaper_config(
+    raw: dict[str, object],
+) -> ManagedSandboxReaperConfig:
+    """Parse the deployment-wide ``sandbox.reaper`` block."""
+    reaper_raw = raw.get("reaper")
+    if reaper_raw is None:
+        return ManagedSandboxReaperConfig()
+    if not isinstance(reaper_raw, dict):
+        raise ValueError("server config 'sandbox.reaper' must be a mapping")
+    _reject_unknown_keys(
+        reaper_raw,
+        {"enabled", "terminate_after_offline_days", "sweep_interval_s"},
+        "sandbox.reaper",
+    )
+    enabled = reaper_raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("server config 'sandbox.reaper.enabled' must be a boolean")
+    terminate_after_offline_days = reaper_raw.get("terminate_after_offline_days", 30)
+    if (
+        not isinstance(terminate_after_offline_days, int)
+        or isinstance(terminate_after_offline_days, bool)
+        or terminate_after_offline_days <= 0
+    ):
+        raise ValueError(
+            "server config 'sandbox.reaper.terminate_after_offline_days' "
+            "must be a positive integer"
+        )
+    sweep_interval_s = reaper_raw.get("sweep_interval_s", 24 * 60 * 60)
+    if (
+        not isinstance(sweep_interval_s, int)
+        or isinstance(sweep_interval_s, bool)
+        or sweep_interval_s <= 0
+    ):
+        raise ValueError(
+            "server config 'sandbox.reaper.sweep_interval_s' must be a positive integer"
+        )
+    return ManagedSandboxReaperConfig(
+        enabled=enabled,
+        terminate_after_offline_days=terminate_after_offline_days,
+        sweep_interval_s=sweep_interval_s,
+    )
+
+
+def _parse_multi_provider_sandbox_config(
+    raw: dict[str, object],
+    *,
+    reaper: ManagedSandboxReaperConfig,
+) -> ManagedSandboxDeployment:
     """
     Parse the ``sandbox.providers`` list shape into a deployment.
 
@@ -1100,7 +1205,9 @@ def _parse_multi_provider_sandbox_config(raw: dict[str, object]) -> ManagedSandb
         )
     # Shared keys describe THIS server, so they ride into every entry
     # instead of being repeated per entry.
-    shared = {key: value for key, value in raw.items() if key not in {"providers", "provider"}}
+    shared = {
+        key: value for key, value in raw.items() if key not in {"providers", "provider", "reaper"}
+    }
     parsed: list[ManagedSandboxConfig] = []
     seen: set[str] = set()
     for index, entry in enumerate(entries):
@@ -1113,6 +1220,11 @@ def _parse_multi_provider_sandbox_config(raw: dict[str, object]) -> ManagedSandb
             raise ValueError(
                 f"server config 'sandbox.providers[{index}]' must not nest 'providers'"
             )
+        if "reaper" in entry:
+            raise ValueError(
+                "server config 'sandbox.reaper' is deployment-wide and must be set "
+                "next to 'providers', not inside a provider entry"
+            )
         config = _parse_single_provider_sandbox_config({**shared, **entry})
         # Always a str: the single-provider parser rejects anything else.
         name = str(config.provider)
@@ -1120,7 +1232,7 @@ def _parse_multi_provider_sandbox_config(raw: dict[str, object]) -> ManagedSandb
             raise ValueError(f"server config 'sandbox.providers' lists {name!r} more than once")
         seen.add(name)
         parsed.append(config)
-    return ManagedSandboxDeployment(configs=tuple(parsed))
+    return ManagedSandboxDeployment(configs=tuple(parsed), reaper=reaper)
 
 
 def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSandboxConfig:
@@ -1287,6 +1399,24 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             runtime_class=_parse_provider_string(raw, "kubernetes", "runtime_class"),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
+    elif provider == "microsandbox":
+        microsandbox_section = _parse_provider_section(raw, "microsandbox")
+        if microsandbox_section is not None:
+            _reject_unknown_keys(
+                microsandbox_section,
+                {"image", "cpus", "memory_mib", "env", "idle_timeout_s", "network", "host_ports"},
+                "sandbox.microsandbox",
+            )
+        launcher_factory = _microsandbox_launcher_factory(
+            image=_parse_provider_image(raw, "microsandbox"),
+            env=_parse_provider_env(raw, "microsandbox"),
+            cpus=_parse_provider_positive_int(raw, "microsandbox", "cpus"),
+            memory_mib=_parse_provider_positive_int(raw, "microsandbox", "memory_mib"),
+            idle_timeout_s=_parse_microsandbox_idle_timeout_s(raw),
+            network=_parse_microsandbox_network(raw),
+            host_ports=_resolve_microsandbox_host_ports(raw, server_url),
+        )
+        token_ttl_s = MICROSANDBOX_MANAGED_TOKEN_TTL_S
     elif provider in community:
         # A provider contributed through the `omnigent.sandbox_providers`
         # entry point group. The registry has validated it (name not shadowing
@@ -1296,7 +1426,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         #
         # Deliberately below every built-in branch and gated on `community`,
         # which excludes anything in SUPPORTED_SANDBOX_PROVIDERS. Built-ins
-        # that are listed but have no branch — `lakebox` today — must keep
+        # that are listed but have no branch - `lakebox` today - must keep
         # falling through to the staged rejection below rather than silently
         # gaining a launcher.
         section = _parse_provider_section(raw, provider)
@@ -2007,6 +2137,149 @@ def _openshell_launcher_factory(
         return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster, workspace=workspace)
 
     return _build
+
+
+def _microsandbox_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    cpus: int | None,
+    memory_mib: int | None,
+    idle_timeout_s: int | None,
+    network: str | None,
+    host_ports: list[int],
+) -> Callable[[], SandboxHostLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: microsandbox`` path.
+
+    :param image: Registry image reference with omnigent pre-installed, or
+        ``None`` to use the official prebaked host image (env-overridable; see
+        :mod:`omnigent.onboarding.sandboxes.microsandbox`).
+    :param env: Names of server-process environment variables (harness LLM
+        credentials, gateway URLs, ``GIT_TOKEN``) injected into every VM, or
+        ``None`` to resolve from the launcher's env-var fallback / inject
+        nothing.
+    :param cpus: vCPUs per VM, or ``None`` for the launcher default (2).
+    :param memory_mib: Memory per VM in MiB, or ``None`` for the launcher
+        default (4096).
+    :param idle_timeout_s: Idle-drain timeout in seconds (``0`` disables), or
+        ``None`` for the launcher default (24h).
+    :param network: Network mode (``host`` / ``public-only`` / ``all``), or
+        ``None`` for the launcher default (``host``).
+    :param host_ports: Guest-to-host TCP port allowlist for the ``host``
+        network mode - see :func:`_resolve_microsandbox_host_ports`.
+    :returns: A factory producing parameterized microsandbox launchers.
+    """
+
+    def _build() -> SandboxHostLauncher:
+        """Construct the microsandbox launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.microsandbox import MicrosandboxSandboxLauncher
+
+        return MicrosandboxSandboxLauncher(
+            image=image,
+            env=env,
+            cpus=cpus,
+            memory_mib=memory_mib,
+            idle_timeout_s=idle_timeout_s,
+            network=network,
+            host_ports=host_ports,
+        )
+
+    return _build
+
+
+def _parse_microsandbox_idle_timeout_s(raw: dict[str, object]) -> int | None:
+    """
+    Extract the microsandbox idle-drain timeout.
+
+    Omitted keeps the launcher's default (24h). ``0`` disables idle draining
+    entirely - VMs then run until explicitly terminated.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: The timeout in seconds, or ``None`` when omitted.
+    :raises ValueError: When the value is not a non-negative integer.
+    """
+    section = _parse_provider_section(raw, "microsandbox")
+    if section is None:
+        return None
+    value = section.get("idle_timeout_s")
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(
+            "server config 'sandbox.microsandbox.idle_timeout_s' must be a "
+            "non-negative integer (0 disables idle draining)"
+        )
+    return value
+
+
+def _resolve_microsandbox_host_ports(raw: dict[str, object], server_url: str) -> list[int]:
+    """
+    Resolve the guest-to-host TCP port allowlist for managed microsandbox VMs.
+
+    Managed VMs run untrusted agent code on the SAME machine as the server,
+    so their default ``host`` network mode is scoped to explicit ports rather
+    than the whole host: the port of *server_url* when it targets the host
+    gateway, plus any operator-listed ``sandbox.microsandbox.host_ports``
+    (e.g. a local LLM gateway). Public server URLs need only public egress and
+    do not implicitly expose the same port on the host machine.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param server_url: The validated ``sandbox.server_url`` value.
+    :returns: De-duplicated host port list, containing the server port only
+        when the URL targets ``host.microsandbox.internal``.
+    :raises ValueError: When ``host_ports`` is present but not a list of
+        integers in 1-65535, or the server URL carries no resolvable port.
+    """
+    from urllib.parse import urlsplit
+
+    from omnigent.onboarding.sandboxes.microsandbox import HOST_GATEWAY_NAME
+
+    split = urlsplit(server_url.strip())
+    server_port = split.port
+    if server_port is None:
+        server_port = {"http": 80, "https": 443}.get(split.scheme or "")
+    # `not` also rejects an explicit :0, which would otherwise pass through
+    # as a nonsensical allow-rule.
+    if not server_port:
+        raise ValueError(
+            "server config 'sandbox.server_url' must carry a resolvable "
+            "non-zero port for the microsandbox provider (an explicit :port, "
+            "or an http/https scheme)"
+        )
+    ports = [server_port] if (split.hostname or "").lower() == HOST_GATEWAY_NAME else []
+    section = _parse_provider_section(raw, "microsandbox")
+    extra = section.get("host_ports") if section is not None else None
+    if extra is not None:
+        if not isinstance(extra, list) or not all(
+            isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= 65535 for p in extra
+        ):
+            raise ValueError(
+                "server config 'sandbox.microsandbox.host_ports' must be a "
+                "list of TCP ports (1-65535), e.g. [8317]"
+            )
+        ports.extend(p for p in extra if p not in ports)
+    return ports
+
+
+def _parse_microsandbox_network(raw: dict[str, object]) -> str | None:
+    """
+    Extract and validate the microsandbox network mode.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: The validated mode, or ``None`` when omitted (launcher defaults
+        to ``host``).
+    :raises ValueError: When the value is not a recognized mode.
+    """
+    from omnigent.onboarding.sandboxes.microsandbox import NETWORK_MODES
+
+    value = _parse_provider_string(raw, "microsandbox", "network")
+    if value is not None and value not in NETWORK_MODES:
+        raise ValueError(
+            "server config 'sandbox.microsandbox.network' must be one of: "
+            f"{', '.join(NETWORK_MODES)} (got {value!r})"
+        )
+    return value
 
 
 def _parse_provider_section(raw: dict[str, object], provider: str) -> dict[str, object] | None:
@@ -2721,7 +2994,7 @@ async def launch_managed_host(
             status_code=502,
             detail=f"managed sandbox launch failed: {exc.message}",
         ) from exc
-    workspace = await _arm_and_start_host(
+    workspace = await _register_and_start_host(
         launcher=launcher,
         config=entry,
         host_store=host_store,
@@ -2774,7 +3047,7 @@ async def relaunch_managed_host(
         re-stamped as the new runner Pod's ``omnigent.ai/agent`` classifier
         (Kubernetes only), or ``None`` to leave it unstamped.
     :param on_stage: Progress observer forwarded to
-        :func:`_arm_and_start_host`; see :func:`launch_managed_host`.
+        :func:`_register_and_start_host`; see :func:`launch_managed_host`.
         ``None`` disables progress reporting.
     :returns: The (unchanged) host id + fresh in-sandbox workspace.
     :raises HTTPException: 400 when the host's recorded provider no
@@ -2796,7 +3069,13 @@ async def relaunch_managed_host(
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
     # can never leave two live sandboxes claiming one host identity.
-    await _terminate_sandbox_best_effort(launcher, host)
+    if host.sandbox_id is not None:
+        await _terminate_sandbox_best_effort(
+            launcher,
+            host.sandbox_id,
+            host_id=host.host_id,
+            provider=host.sandbox_provider,
+        )
     try:
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
@@ -2805,19 +3084,25 @@ async def relaunch_managed_host(
             status_code=502,
             detail=f"managed sandbox relaunch failed: {exc.message}",
         ) from exc
-    workspace = await _arm_and_start_host(
-        launcher=launcher,
-        config=entry,
-        host_store=host_store,
-        host_id=host.host_id,
-        host_name=host.name,
-        owner=host.user_id,
-        sandbox_id=sandbox_id,
-        repo=repo,
-        agent_name=agent_name,
-        on_stage=on_stage,
-        keep_host_on_failure=True,
-    )
+    try:
+        workspace = await _register_and_start_host(
+            launcher=launcher,
+            config=entry,
+            host_store=host_store,
+            host_id=host.host_id,
+            host_name=host.name,
+            owner=host.user_id,
+            sandbox_id=sandbox_id,
+            repo=repo,
+            agent_name=agent_name,
+            on_stage=on_stage,
+            keep_host_on_failure=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
+        ) from exc
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
 
 
@@ -2914,7 +3199,7 @@ async def _start_sandbox_host(
     )
 
 
-async def _arm_and_start_host(
+async def _register_and_start_host(
     *,
     launcher: SandboxHostLauncher,
     config: ManagedSandboxConfig,
@@ -2967,16 +3252,35 @@ async def _arm_and_start_host(
         registration fails.
     """
     token = secrets.token_urlsafe(32)
-    record = await asyncio.to_thread(
-        host_store.register_managed_host,
-        host_id=host_id,
-        name=host_name,
-        user_id=owner,
-        token=token,
-        provider=launcher.provider,
-        sandbox_id=sandbox_id,
-        token_expires_at=now_epoch() + config.token_ttl_s,
-    )
+    if keep_host_on_failure:
+        record = await asyncio.to_thread(
+            host_store.replace_managed_host_sandbox,
+            host_id=host_id,
+            user_id=owner,
+            token=token,
+            provider=launcher.provider,
+            sandbox_id=sandbox_id,
+            token_expires_at=now_epoch() + config.token_ttl_s,
+        )
+        if record is None:
+            await _terminate_sandbox_best_effort(
+                launcher,
+                sandbox_id,
+                host_id=host_id,
+                provider=launcher.provider,
+            )
+            raise ValueError(f"managed host {host_id!r} no longer exists")
+    else:
+        record = await asyncio.to_thread(
+            host_store.register_managed_host,
+            host_id=host_id,
+            name=host_name,
+            user_id=owner,
+            token=token,
+            provider=launcher.provider,
+            sandbox_id=sandbox_id,
+            token_expires_at=now_epoch() + config.token_ttl_s,
+        )
     try:
         # Uniform across providers: provision() fixed the sandbox id and the
         # token was armed against it above, so start_host starts the host with
@@ -3007,7 +3311,12 @@ async def _arm_and_start_host(
         # cap. Cleanup-then-reraise at a system boundary, not a
         # swallow: every path below re-raises as an HTTPException.
         if keep_host_on_failure:
-            await _terminate_sandbox_best_effort(launcher, record)
+            await _terminate_sandbox_best_effort(
+                launcher,
+                sandbox_id,
+                host_id=record.host_id,
+                provider=record.sandbox_provider,
+            )
             await asyncio.to_thread(host_store.revoke_launch_token, host_id)
         else:
             # The row was just armed with THIS single-provider config, so a
@@ -3182,7 +3491,7 @@ async def resume_managed_host(
     :param on_stage: Progress observer forwarded to the launcher's
         ``start_host`` (via :func:`_start_sandbox_host`), so a wake reports the
         launch-pipeline ``"starting"`` stage to the caller's progress surface
-        exactly like a fresh launch (:func:`_arm_and_start_host`) — without it a
+        exactly like a fresh launch (:func:`_register_and_start_host`) — without it a
         wake shows a single frozen ``"provisioning"`` band for its whole
         duration. ``None`` disables progress reporting.
     :param agent_name: Built-in agent classifier to re-stamp on the woken
@@ -3197,18 +3506,6 @@ async def resume_managed_host(
     # registry alone. Cheap gate before taking the lock.
     if not force and await asyncio.to_thread(host_store.is_online, host_id):
         return
-    host = await asyncio.to_thread(host_store.get_host, host_id)
-    if host is None:
-        return
-    # Provider-matched launcher (None if config dropped / provider changed).
-    # Resume needs a reattachable volume; others (e.g. Modal) fall through to
-    # the caller's host-offline path (the user starts a new session).
-    launcher = _launcher_for_teardown(host, config)
-    if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
-        return
-    # Re-arm with the recorded provider's own TTL / host_config.
-    entry = config.recorded(host.sandbox_provider)
-    sandbox_id = host.sandbox_id
     # Single-flight per host (see _resume_locks).
     resume_lock = _resume_locks.setdefault(host_id, asyncio.Lock())
     async with resume_lock:
@@ -3216,6 +3513,17 @@ async def resume_managed_host(
         # online while we waited.
         if not force and await asyncio.to_thread(host_store.is_online, host_id):
             return
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            return
+        # Provider-matched launcher (None if config dropped / provider changed).
+        # Resume needs a reattachable volume; others (e.g. Modal) fall through
+        # to the caller's fresh relaunch path.
+        launcher = _launcher_for_teardown(host, config)
+        if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
+            return
+        entry = config.recorded(host.sandbox_provider)
+        sandbox_id = host.sandbox_id
         _logger.info(
             "Waking dormant managed host %s (sandbox %s, provider %s)",
             host.host_id,
@@ -3224,20 +3532,39 @@ async def resume_managed_host(
         )
         try:
             await asyncio.to_thread(launcher.resume, sandbox_id)
-            # Mint a fresh token: the old one died with the host process's env
-            # (only its hash persists). register_managed_host's relaunch branch
-            # overwrites it in place, keeping the host_id's session bindings.
             token = secrets.token_urlsafe(32)
-            await asyncio.to_thread(
-                host_store.register_managed_host,
-                host_id=host.host_id,
-                name=host.name,
-                user_id=host.user_id,
-                token=token,
-                provider=launcher.provider,
+            armed = await asyncio.to_thread(
+                host_store.rearm_managed_host,
+                host.host_id,
                 sandbox_id=sandbox_id,
+                expected_updated_at=host.updated_at,
+                token=token,
                 token_expires_at=now_epoch() + entry.token_ttl_s,
             )
+            if armed is None:
+                current = await asyncio.to_thread(host_store.get_host, host.host_id)
+                if current is None:
+                    await _terminate_sandbox_best_effort(
+                        launcher,
+                        sandbox_id,
+                        host_id=host.host_id,
+                        provider=host.sandbox_provider,
+                    )
+                    raise ValueError(f"managed host {host.host_id!r} no longer exists")
+                if current.sandbox_id != sandbox_id:
+                    terminated = await _terminate_sandbox_best_effort(
+                        launcher,
+                        sandbox_id,
+                        host_id=host.host_id,
+                        provider=host.sandbox_provider,
+                    )
+                    if terminated and current.terminating_sandbox_id == sandbox_id:
+                        await asyncio.to_thread(
+                            host_store.mark_terminating_sandbox_terminated,
+                            host.host_id,
+                            sandbox_id=sandbox_id,
+                        )
+                return
             await _start_sandbox_host(
                 launcher,
                 sandbox_id,
@@ -3254,8 +3581,8 @@ async def resume_managed_host(
             )
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:
-            # A failed wake must NOT tear the sandbox down (the volume is the
-            # user's); just surface it.
+            # An ordinary failed wake must NOT tear the sandbox down (the volume
+            # is the user's); just surface it. Full teardown is handled above.
             if isinstance(exc, HTTPException):
                 raise
             message = exc.message if isinstance(exc, click.ClickException) else str(exc)
@@ -3272,65 +3599,60 @@ async def terminate_managed_host(
     """
     Terminate a managed host's sandbox and delete its host row.
 
-    Deleting the row is both teardown and revocation in one operation:
-    the host disappears from the picker AND its launch token stops
-    resolving. Best-effort on the sandbox side: termination failures
-    (or a missing/mismatched launcher after a config change) are
-    logged, not raised — the provider's lifetime cap reaps stragglers,
-    and the caller (session delete / launch-failure cleanup) must not
-    be blocked by provider hiccups.
+    The latest row is locked and deleted before provider termination. This
+    serializes full teardown with generation replacement: either teardown takes
+    the newly registered generation, or replacement observes the missing row
+    and cleans up its unregistered sandbox. Deleting the row also removes the
+    host from the picker and revokes its launch token. Provider termination
+    remains best-effort and never blocks database teardown.
 
-    :param host: The managed host to tear down (``sandbox_provider`` /
-        ``sandbox_id`` set; callers guard on that).
+    :param host: The managed host to tear down. Active and pending sandbox ids
+        are both terminated when present.
     :param host_store: Store holding the host row.
     :param config: The deployment's current sandbox config (supplies
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
     """
-    launcher = _launcher_for_teardown(host, config)
-    await _terminate_sandbox_best_effort(launcher, host)
-    await asyncio.to_thread(host_store.delete_host, host.host_id)
+    deleted = await asyncio.to_thread(host_store.delete_host, host.host_id)
+    if deleted is None:
+        return
+    launcher = _launcher_for_teardown(deleted, config)
+    sandbox_ids = dict.fromkeys((deleted.sandbox_id, deleted.terminating_sandbox_id))
+    for sandbox_id in sandbox_ids:
+        if sandbox_id is not None:
+            await _terminate_sandbox_best_effort(
+                launcher,
+                sandbox_id,
+                host_id=deleted.host_id,
+                provider=deleted.sandbox_provider,
+            )
 
 
 async def _terminate_sandbox_best_effort(
     launcher: SandboxHostLauncher | None,
-    host: Host,
-) -> None:
-    """
-    Terminate a managed host's sandbox without touching its row.
-
-    Best-effort by design: termination failures (or a
-    missing/mismatched launcher after a config change) are logged, not
-    raised — the provider's lifetime cap reaps stragglers, and callers
-    (session delete, launch-failure cleanup, relaunch) must not be
-    blocked by provider hiccups.
-
-    :param launcher: Provider-matched launcher from
-        :func:`_launcher_for_teardown`, or ``None`` when no matching
-        launcher is available (logged, nothing terminated).
-    :param host: The host whose ``sandbox_id`` names the sandbox.
-    """
-    if launcher is not None and host.sandbox_id is not None:
-        try:
-            await asyncio.to_thread(launcher.terminate, host.sandbox_id)
-        except Exception:  # noqa: BLE001 — deliberate broad catch: this is a
-            # provider-API boundary on a cleanup path. The provider SDK can
-            # fail here in many shapes (auth/config ClickException, network
-            # errors, SDK-internal exceptions), the sandbox may already be
-            # gone past its lifetime cap, and NONE of those may block the
-            # caller's remaining cleanup (deleting the host row / revoking
-            # the launch token), which only we can do.
-            _logger.warning(
-                "Failed to terminate managed sandbox %s (provider=%s) for host %s",
-                host.sandbox_id,
-                host.sandbox_provider,
-                host.host_id,
-                exc_info=True,
-            )
-    else:
+    sandbox_id: str,
+    *,
+    host_id: str,
+    provider: str | None,
+) -> bool:
+    """Terminate one provider sandbox id without touching its host row."""
+    if launcher is None:
         _logger.warning(
             "No launcher available for managed sandbox provider %s; "
             "sandbox %s must be deleted with the provider's own tooling",
-            host.sandbox_provider,
-            host.sandbox_id,
+            provider,
+            sandbox_id,
         )
+        return False
+    try:
+        await asyncio.to_thread(launcher.terminate, sandbox_id)
+        return True
+    except Exception:  # noqa: BLE001 — provider cleanup must remain best-effort.
+        _logger.warning(
+            "Failed to terminate managed sandbox %s (provider=%s) for host %s",
+            sandbox_id,
+            provider,
+            host_id,
+            exc_info=True,
+        )
+        return False

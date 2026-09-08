@@ -36,6 +36,14 @@ vi.mock("@/hooks/useGithub", () => ({
     isFetching: false,
   }),
   fetchGithubFileContents: async () => ({ before: "old", after: "new" }),
+  // The account selector (shown in the repo-unresolved empty state) calls this;
+  // stub the mutation shape it reads.
+  useSetGithubPreference: () => ({
+    mutate: () => {},
+    isPending: false,
+    isError: false,
+    error: null,
+  }),
 }));
 
 // The diff rendering (@pierre/diffs) is exercised by the library itself; here
@@ -53,6 +61,13 @@ vi.mock("@pierre/diffs/react", () => ({
 // The resolved theme mode drives @pierre/diffs' themeType.
 vi.mock("@/components/theme/useResolvedThemeMode", () => ({
   useResolvedThemeMode: () => "light",
+}));
+// The Summary tab renders markdown via MessageResponse (Streamdown); stub it to
+// a passthrough so tests assert the text without the real renderer.
+vi.mock("@/components/ai-elements/message", () => ({
+  MessageResponse: ({ children }: { children: string }) => (
+    <div data-testid="markdown">{children}</div>
+  ),
 }));
 
 import { GithubPanel, deriveGithubPanelState } from "./GithubPanel";
@@ -82,6 +97,15 @@ function renderPanel() {
       <GithubPanel conversationId="conv_1" />
     </QueryClientProvider>,
   );
+}
+
+/** Render, then switch to the Changes tab — Summary is the default, so the
+ *  diff view (and its toolbar) only exists after activating Changes. Radix
+ *  tabs select on pointer-down, so mouseDown (not click) flips the tab. */
+function renderChanges() {
+  const r = renderPanel();
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+  return r;
 }
 
 let scrollIntoView: ReturnType<typeof vi.fn>;
@@ -164,11 +188,12 @@ afterEach(() => {
 });
 
 describe("GithubPanel", () => {
-  it("shows the PR header with title and CI check pills", async () => {
+  it("shows the PR title in the header and CI check pills on the Summary tab", async () => {
     renderPanel();
+    // Title + number live in the shared header (both tabs).
     expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
     expect(screen.getByText("#6000")).toBeInTheDocument();
-    // CI checks are on their own line as labeled pills (not a diffstat). A
+    // CI checks render on the Summary tab (the default) as labeled pills. A
     // zero bucket (pending) renders no pill.
     expect(screen.getByText("Checks")).toBeInTheDocument();
     expect(screen.getByText(/66\s*passed/)).toBeInTheDocument();
@@ -176,14 +201,51 @@ describe("GithubPanel", () => {
     expect(screen.queryByText(/pending/)).toBeNull();
   });
 
-  it("stacks a diff section per changed file", async () => {
+  it("lands on the Summary tab, showing the PR description and comments", async () => {
+    state.info!.data!.pr!.body = "## Overview\nThis PR does the thing.";
+    state.info!.data!.pr!.comments = [
+      {
+        author: "octocat",
+        body: "Looks good to me!",
+        created_at: "2026-09-05T07:32:02Z",
+        url: "https://example.com/pr/6000#c1",
+      },
+    ];
     renderPanel();
+    // Summary is the default — the diff sections aren't mounted yet.
+    expect(screen.queryByTestId("diff")).toBeNull();
+    expect(await screen.findByText(/This PR does the thing\./)).toBeInTheDocument();
+    expect(screen.getByText("Comments (1)")).toBeInTheDocument();
+    expect(screen.getByText("octocat")).toBeInTheDocument();
+    expect(screen.getByText("Looks good to me!")).toBeInTheDocument();
+  });
+
+  it("shows Summary empty states when the PR has no body or comments", () => {
+    // The default fixture carries neither a body nor comments.
+    renderPanel();
+    expect(screen.getByText("No description provided.")).toBeInTheDocument();
+    expect(screen.getByText("No comments yet.")).toBeInTheDocument();
+    expect(screen.queryByTestId("diff")).toBeNull();
+  });
+
+  it("reveals the stacked diff after switching to the Changes tab", async () => {
+    renderPanel();
+    expect(screen.queryByTestId("diff")).toBeNull();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+    const diffs = await screen.findAllByTestId("diff");
+    expect(diffs.map((d) => d.getAttribute("data-path"))).toEqual(["hello.py", "src/app.ts"]);
+    // Checks live on the Summary tab, so they're gone once Changes is active.
+    expect(screen.queryByText("Checks")).toBeNull();
+  });
+
+  it("stacks a diff section per changed file", async () => {
+    renderChanges();
     const diffs = await screen.findAllByTestId("diff");
     expect(diffs.map((d) => d.getAttribute("data-path"))).toEqual(["hello.py", "src/app.ts"]);
   });
 
   it("jumps to a file's section when its sidebar row is clicked", async () => {
-    renderPanel();
+    renderChanges();
     await screen.findAllByTestId("diff");
     // Both the sidebar row and the section header are buttons matching the
     // name; the sidebar row (which scrolls) is first in the DOM.
@@ -193,7 +255,7 @@ describe("GithubPanel", () => {
   });
 
   it("collapses a file's diff when its section header is clicked", async () => {
-    renderPanel();
+    renderChanges();
     expect(await screen.findAllByTestId("diff")).toHaveLength(2);
     // The section header carries aria-expanded; the sidebar row doesn't.
     const header = screen.getByRole("button", { name: /app\.ts/, expanded: true });
@@ -204,7 +266,7 @@ describe("GithubPanel", () => {
   });
 
   it("collapses and expands every diff from the toolbar", async () => {
-    renderPanel();
+    renderChanges();
     expect(await screen.findAllByTestId("diff")).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
     expect(screen.queryAllByTestId("diff")).toHaveLength(0);
@@ -214,7 +276,7 @@ describe("GithubPanel", () => {
   });
 
   it("hides and shows the file sidebar from the toolbar", async () => {
-    renderPanel();
+    renderChanges();
     await screen.findAllByTestId("diff");
     // hello.py appears as a sidebar jump row and as a section header.
     expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(2);
@@ -226,7 +288,7 @@ describe("GithubPanel", () => {
   });
 
   it("toggles the diff layout between unified and split", async () => {
-    renderPanel();
+    renderChanges();
     await screen.findAllByTestId("diff");
     // Defaults to unified, so the toggle offers split; clicking flips its label.
     fireEvent.click(screen.getByRole("button", { name: "Switch to split view" }));
@@ -246,7 +308,7 @@ describe("GithubPanel", () => {
       error: null,
       isFetching: false,
     };
-    renderPanel();
+    renderChanges();
     // The lone omnigent → runner chain collapses to a single "omnigent/runner"
     // folder row (exact name; the diff section headers carry the full path).
     expect(await screen.findByRole("button", { name: "omnigent/runner" })).toBeInTheDocument();
@@ -265,7 +327,7 @@ describe("GithubPanel", () => {
       error: null,
       isFetching: false,
     };
-    renderPanel();
+    renderChanges();
     const folder = await screen.findByRole("button", { name: "omnigent/runner" });
     // Before collapse: the sidebar leaf + the diff section header both match.
     expect(screen.getAllByRole("button", { name: /app\.py/ })).toHaveLength(2);
@@ -284,7 +346,7 @@ describe("GithubPanel", () => {
     state.parsedFiles = [
       { name: "omnigent/new_name.py", prevName: "omnigent/old_name.py", type: "rename-pure" },
     ];
-    renderPanel();
+    renderChanges();
     // No diff body for a 100%-similarity rename — a note instead.
     expect(await screen.findByText("File renamed without changes.")).toBeInTheDocument();
     expect(screen.queryByTestId("diff")).toBeNull();
