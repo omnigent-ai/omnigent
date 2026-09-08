@@ -13,7 +13,7 @@ import pytest
 from omnigent.inner.codex_executor import _CodexAppServerSession, _populate_codex_home_config
 from omnigent.inner.codex_worker import CodexWorkerLaunch
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.model_signer import SignerReadiness
+from omnigent.inner.model_signer import SignerReadiness, SignerStartError
 
 
 class _Pipe:
@@ -153,6 +153,63 @@ async def test_signer_preflights_before_codex_state_and_worker_spawn(
         "spawn-worker",
     ]
     await session.close()
+
+
+async def test_signer_exit_before_worker_spawn_fails_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = _Signer([])
+    spawn = AsyncMock()
+
+    def _prepare(**kwargs: object) -> CodexWorkerLaunch:
+        del kwargs
+        signer.exited.set()
+        return CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.inner.codex_executor.prepare_codex_worker", _prepare)
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    session = _session(tmp_path, signer)
+
+    with pytest.raises(SignerStartError, match="exited during worker startup"):
+        await session.start()
+
+    spawn.assert_not_awaited()
+    assert signer.closed
+    assert session._worker_launch is None
+
+
+async def test_signer_exit_during_worker_spawn_tears_worker_down(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = _Signer([])
+    process = _Process()
+    terminate = Mock()
+
+    async def _spawn(*args: object, **kwargs: object) -> _Process:
+        del args, kwargs
+        signer.exited.set()
+        await asyncio.sleep(0)
+        return process
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.prepare_codex_worker",
+        Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
+    )
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _spawn)
+    monkeypatch.setattr("omnigent.inner.codex_executor._terminate_process_tree", terminate)
+    session = _session(tmp_path, signer)
+
+    with pytest.raises(SignerStartError, match="exited during worker startup"):
+        await session.start()
+
+    terminate.assert_called_with(process)
+    assert signer.closed
+    assert session._proc is None
+    assert session._worker_launch is None
 
 
 async def test_signer_backed_home_excludes_host_credential_files(

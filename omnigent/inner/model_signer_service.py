@@ -53,7 +53,6 @@ _HEADER_NAME_RE = re.compile(rb"[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 _STATUS_LINE_RE = re.compile(rb"HTTP/1\.1 ([1-5][0-9]{2})(?: ([\x20-\x7e]*))?\r\n\Z")
 _REQUEST_REJECTED_HEADERS = frozenset(
     {
-        "connection",
         "expect",
         "forwarded",
         "keep-alive",
@@ -161,6 +160,9 @@ def _parse_strict_header_lines(
 def _parse_strict_request_headers(raw: bytes) -> tuple[list[tuple[str, str]], int]:
     parsed = _parse_strict_header_lines(raw)
     by_name = {name.lower(): value for name, value in parsed}
+    connection = by_name.get("connection")
+    if connection is not None and connection.lower() != "keep-alive":
+        raise SigningRejected("request contains an unsupported Connection header")
     for name in by_name:
         if name in _REQUEST_REJECTED_HEADERS or name.startswith(
             ("proxy-", "sec-websocket-", "x-forwarded-")
@@ -179,7 +181,9 @@ def _parse_strict_request_headers(raw: bytes) -> tuple[list[tuple[str, str]], in
     length = int(length_raw)
     if length > _MAX_BODY_BYTES:
         raise SigningRejected("request body exceeds the configured limit")
-    return parsed, length
+    # Keep-alive controls only the client-to-relay connection. Never include
+    # this hop-by-hop header in the reconstructed upstream request.
+    return [(name, value) for name, value in parsed if name.lower() != "connection"], length
 
 
 def _parse_strict_response_head(status_line: bytes, headers_raw: bytes) -> _ParsedResponse:
@@ -306,7 +310,7 @@ class _SignerRelay(EgressProxy):
         request_line: bytes,
         headers_raw: bytes,
         body: bytes,
-    ) -> None:
+    ) -> bool:
         del request_line
         headers, _ = _parse_strict_request_headers(headers_raw)
         request_host = next(
@@ -314,7 +318,7 @@ class _SignerRelay(EgressProxy):
             "",
         )
         task = asyncio.current_task()
-        sni_host = self._tls_sni_by_task.pop(task, None) if task is not None else None
+        sni_host = self._tls_sni_by_task.get(task) if task is not None else None
         try:
             reconstruct_signed_request(
                 route=self._route,
@@ -330,12 +334,12 @@ class _SignerRelay(EgressProxy):
             )
         except SigningRejected:
             await self._send_forbidden(client_writer, "")
-            return
+            return False
         try:
             bearer_token = await self._credential_source.token_for_request()
         except ProviderAuthRequired:
             await self._send_auth_required(client_writer)
-            return
+            return False
         signed = reconstruct_signed_request(
             route=self._route,
             placeholder=self._placeholder,
@@ -350,7 +354,7 @@ class _SignerRelay(EgressProxy):
         )
         if port != 443:
             await self._send_forbidden(client_writer, "")
-            return
+            return False
 
         try:
             connect_host = (
@@ -369,7 +373,7 @@ class _SignerRelay(EgressProxy):
             )
         except (asyncio.TimeoutError, OSError):
             await self._send_bad_gateway(client_writer, "")
-            return
+            return False
 
         try:
             upstream_writer.write(f"{signed.method} {signed.path} HTTP/1.1\r\n".encode("ascii"))
@@ -378,7 +382,7 @@ class _SignerRelay(EgressProxy):
             upstream_writer.write(b"Connection: close\r\n\r\n")
             upstream_writer.write(signed.body)
             await upstream_writer.drain()
-            bytes_relayed, _ = await self._relay_response_observing_status(
+            bytes_relayed, _, keep_alive = await self._relay_response_observing_status(
                 upstream_reader,
                 client_writer,
             )
@@ -387,6 +391,8 @@ class _SignerRelay(EgressProxy):
                     client_writer,
                     "",
                 )
+                return False
+            return keep_alive
         finally:
             upstream_writer.close()
             with contextlib.suppress(Exception):
@@ -400,7 +406,7 @@ class _SignerRelay(EgressProxy):
         self,
         upstream_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, bool]:
         """Validate, sanitize, and stream one bounded upstream response."""
         started = asyncio.get_running_loop().time()
         try:
@@ -418,18 +424,22 @@ class _SignerRelay(EgressProxy):
             SigningRejected,
             ValueError,
         ):
-            return 0, 0
+            return 0, 0, False
         self._observe_upstream_status(response.status)
         try:
             reason = http.HTTPStatus(response.status).phrase
         except ValueError:
             reason = ""
+        no_body = response.status in (204, 304) or 100 <= response.status < 200
+        keep_alive = response.content_length is not None or no_body
         downstream_head = f"HTTP/1.1 {response.status} {reason}\r\n".encode("ascii")
         for name, value in response.headers:
             downstream_head += f"{name}: {value}\r\n".encode("ascii")
         if response.content_length is not None:
             downstream_head += f"Content-Length: {response.content_length}\r\n".encode("ascii")
-        downstream_head += b"Connection: close\r\n\r\n"
+        downstream_head += (
+            b"Connection: keep-alive\r\n\r\n" if keep_alive else b"Connection: close\r\n\r\n"
+        )
         client_writer.write(downstream_head)
         await self._read_response_part(client_writer.drain(), started=started)
         bytes_relayed = len(downstream_head)
@@ -456,8 +466,8 @@ class _SignerRelay(EgressProxy):
                     started=started,
                 )
         except (asyncio.IncompleteReadError, asyncio.TimeoutError, OSError, ValueError):
-            return bytes_relayed, response.status
-        return bytes_relayed + body_bytes, response.status
+            return bytes_relayed, response.status, False
+        return bytes_relayed + body_bytes, response.status, keep_alive
 
     @staticmethod
     async def _read_response_part(
