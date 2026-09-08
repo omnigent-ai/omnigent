@@ -121,6 +121,33 @@ describe("QueuedMessagesStrip", () => {
     }
   });
 
+  it("keeps row action icon strokes at composer weight on mobile", () => {
+    render(
+      <TooltipProvider>
+        <QueuedMessagesStrip
+          messages={[msg("q_1", "first")]}
+          onDelete={vi.fn()}
+          onEdit={vi.fn()}
+          onSteer={vi.fn()}
+          onReorder={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+    for (const name of [
+      "Reorder queued message",
+      "Send queued message now",
+      "Edit queued message",
+      "Remove queued message",
+    ]) {
+      const icon = screen.getByRole("button", { name }).querySelector("svg");
+      // Lucide strokes scale with rendered size (2 units / 24-unit viewBox):
+      // at max-md:size-5 (20px) the default draws 1.67px vs 1.33px on the
+      // composer's 16px icons, so the grown icon must thin its stroke
+      // (2 x 16/20 = 1.6) to keep the same effective weight.
+      expect(icon, name).toHaveClass("max-md:stroke-[1.6]");
+    }
+  });
+
   it("shows a drag handle per row only when onReorder is provided", () => {
     const { rerender } = render(
       <QueuedMessagesStrip messages={[msg("q_1", "first")]} onDelete={vi.fn()} onEdit={vi.fn()} />,

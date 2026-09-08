@@ -23,7 +23,12 @@ import { cn } from "@/lib/utils";
 const ACTION_BUTTON_CLASS =
   "flex shrink-0 items-center justify-center rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground max-md:size-11 max-md:text-muted-foreground";
 
-const ACTION_ICON_CLASS = "size-3.5 max-md:size-5";
+/**
+ * Lucide strokes scale with rendered size (2 units over a 24-unit viewBox), so
+ * the grown 20px mobile icon thins its stroke (2 x 16/20 = 1.6) to keep the
+ * same effective weight as the composer's 16px controls beside it.
+ */
+const ACTION_ICON_CLASS = "size-3.5 max-md:size-5 max-md:stroke-[1.6]";
 
 interface QueuedMessagesStripProps {
   /** Messages waiting to be flushed, in FIFO order (head first). */
