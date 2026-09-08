@@ -160,7 +160,11 @@ _COMPOSER_MODE_GLYPHS = (_CLAUDE_PROMPT_GLYPH, _SHELL_MODE_GLYPH)
 # rule on screen is where the footer begins (see
 # :func:`_permission_mode_from_pane`). Corner glyphs are included because
 # Claude Code has framed the input box both ways across versions.
-_BOX_RULE_CHARS = frozenset("─━╭╮╰╯│┃╌╍")
+_BOX_RULE_GLYPHS = "─━╭╮╰╯│┃╌╍"
+_BOX_RULE_CHARS = frozenset(_BOX_RULE_GLYPHS)
+# Shortest leading run of rule glyphs that can open a *labelled* rule, so an
+# ordinary output line starting with one box glyph is not read as a rule.
+_MIN_TITLED_RULE_RUN = 3
 # Footer rows the permission-mode reader falls back to scanning while the
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
@@ -4372,11 +4376,37 @@ def _is_box_rule(line: str) -> bool:
     the rule directly above the composer, so it is the position that
     identifies the box, not the corners.
 
-    :param line: A single pane line, e.g. ``"──────────"``.
+    A rule may also carry a **label**: Claude Code breaks the box's
+    opening rule with the session's title (``"──── my session ─"``). The
+    frame still marks the box, so a labelled rule counts as one. Demanding
+    every glyph be a rule glyph instead anchors :func:`_composer_row` on
+    the *closing* rule, which reports "no input box" with ``❯`` plainly on
+    screen and times the turn out with the message undelivered. A label is
+    accepted only between a leading run of at least
+    :data:`_MIN_TITLED_RULE_RUN` glyphs and a trailing run, spaced off from
+    both, and carrying no rule glyph itself, so ordinary output cannot pass
+    as a rule. That last condition matters: a pasted ``tree``/table line of
+    nested ``│`` glyphs and spaces must stay content, or
+    :func:`_composer_row` collects it as an interior rule and misses the
+    real opening rule the same way.
+
+    :param line: A single pane line, e.g. ``"──────────"`` or
+        ``"──────── my session ─"``.
     :returns: ``True`` when the line is a box-drawing rule.
     """
     stripped = line.strip()
-    return len(stripped) >= 3 and all(ch in _BOX_RULE_CHARS for ch in stripped)
+    if len(stripped) < 3:
+        return False
+    if all(ch in _BOX_RULE_CHARS for ch in stripped):
+        return True
+    lead = len(stripped) - len(stripped.lstrip(_BOX_RULE_GLYPHS))
+    trail = len(stripped) - len(stripped.rstrip(_BOX_RULE_GLYPHS))
+    if lead < _MIN_TITLED_RULE_RUN or trail < 1:
+        return False
+    label = stripped[lead : len(stripped) - trail]
+    if any(ch in _BOX_RULE_CHARS for ch in label):
+        return False
+    return label.startswith(" ") and label.endswith(" ") and bool(label.strip())
 
 
 def _submit_needle(content: str) -> str:
