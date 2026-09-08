@@ -6297,7 +6297,8 @@ def _read_compacted_history(rollout_path: Path) -> dict[str, object] | None:
     """Read the last ``Compacted`` entry from a rollout JSONL.
 
     Codex appends a ``{type: "compacted", payload: {replacement_history: [...],
-    window_id: N}}`` entry after compaction. Returns a dict with
+    window_id: ID}}`` rollout entry after compaction. Current Codex writes a
+    UUID string at this ``payload.window_id`` location. Returns a dict with
     ``replacement_history`` and ``window_id`` for persistence, or ``None``.
 
     :param rollout_path: Path to the rollout JSONL.

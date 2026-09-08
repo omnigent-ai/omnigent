@@ -45,7 +45,7 @@ import sys
 import tarfile
 import textwrap
 import time
-from collections.abc import Generator, Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -2792,6 +2792,7 @@ class MockedCodexNativeSession:
     base_url: str
     session_id: str
     sidecar: CodexResponsesSidecar
+    restart_server: Callable[[], None]
 
 
 def _write_mock_codex_provider_config(
@@ -2929,50 +2930,52 @@ def mocked_native_codex_session(
         "RUNNER_SERVER_URL": base_url,
     }
 
+    server_command = [
+        sys.executable,
+        "-c",
+        "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+        + "from omnigent.cli import main; main()",
+        "server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--database-uri",
+        f"sqlite:///{db_path}",
+        "--artifact-location",
+        str(artifact_dir),
+        "--agent",
+        str(agent_yaml_path),
+    ]
+
     log_handle = open(log_path, "w")  # noqa: SIM115
     runner_log_handle = open(runner_log_path, "w")  # noqa: SIM115
     proc: subprocess.Popen[bytes] | None = None
     runner_proc: subprocess.Popen[bytes] | None = None
     session_id: str | None = None
-    try:
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
-                + "from omnigent.cli import main; main()",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                f"sqlite:///{db_path}",
-                "--artifact-location",
-                str(artifact_dir),
-                "--agent",
-                str(agent_yaml_path),
-            ],
+
+    def _spawn_server() -> subprocess.Popen[bytes]:
+        """Start one server generation against the fixture's durable store."""
+        return subprocess.Popen(
+            server_command,
             env=server_env,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
         )
-        runner_proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=runner_env,
-            stdout=runner_log_handle,
-            stderr=subprocess.STDOUT,
-        )
 
+    def _wait_until_ready(
+        server_process: subprocess.Popen[bytes],
+        runner_process: subprocess.Popen[bytes],
+    ) -> None:
+        """Wait until both the server generation and surviving runner are ready."""
         deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-        ready = False
         last_error = "not polled yet"
         while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                last_error = f"process exited early with code {proc.returncode}"
+            if server_process.poll() is not None:
+                last_error = f"process exited early with code {server_process.returncode}"
                 break
-            if runner_proc.poll() is not None:
-                last_error = f"runner exited early with code {runner_proc.returncode}"
+            if runner_process.poll() is not None:
+                last_error = f"runner exited early with code {runner_process.returncode}"
                 break
             try:
                 resp = httpx.get(f"{base_url}/health", timeout=2)
@@ -2982,8 +2985,7 @@ def mocked_native_codex_session(
                         timeout=2,
                     )
                     if status_resp.status_code == 200 and status_resp.json()["online"] is True:
-                        ready = True
-                        break
+                        return
                     last_error = (
                         f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
                     )
@@ -2992,20 +2994,48 @@ def mocked_native_codex_session(
             except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
             time.sleep(_HEALTH_POLL_INTERVAL_S)
+        raise RuntimeError(
+            f"mocked Codex e2e server did not become healthy within "
+            f"{_HEALTH_TIMEOUT_S:.0f}s on {base_url} "
+            f"(last_error={last_error}).\n"
+            f"Server log at {log_path}:\n"
+            f"{log_path.read_text()[-3000:] if log_path.exists() else ''}\n"
+            f"Runner log at {runner_log_path}:\n"
+            f"{runner_log_path.read_text()[-3000:] if runner_log_path.exists() else ''}"
+        )
 
-        if not ready:
-            raise RuntimeError(
-                f"mocked Codex e2e server did not become healthy within "
-                f"{_HEALTH_TIMEOUT_S:.0f}s on {base_url} "
-                f"(last_error={last_error}).\n"
-                f"Server log at {log_path}:\n"
-                f"{log_path.read_text()[-3000:] if log_path.exists() else ''}\n"
-                f"Runner log at {runner_log_path}:\n"
-                f"{runner_log_path.read_text()[-3000:] if runner_log_path.exists() else ''}"
-            )
+    try:
+        proc = _spawn_server()
+        runner_proc = subprocess.Popen(
+            [sys.executable, "-m", "omnigent.runner._entry"],
+            env=runner_env,
+            stdout=runner_log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        _wait_until_ready(proc, runner_proc)
 
         session_id = _create_native_codex_session(base_url, runner_id, model=model)
-        yield MockedCodexNativeSession(base_url=base_url, session_id=session_id, sidecar=sidecar)
+
+        def _restart_server() -> None:
+            """Recycle only the server, preserving the runner and Codex turn."""
+            nonlocal proc
+            assert proc is not None
+            assert runner_proc is not None
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            proc = _spawn_server()
+            _wait_until_ready(proc, runner_proc)
+
+        yield MockedCodexNativeSession(
+            base_url=base_url,
+            session_id=session_id,
+            sidecar=sidecar,
+            restart_server=_restart_server,
+        )
     finally:
         if session_id is not None:
             with contextlib.suppress(httpx.HTTPError):

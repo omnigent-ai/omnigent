@@ -10752,3 +10752,133 @@ def test_catalog_fingerprint_survives_a_missing_binary(
     _point_claude_at(monkeypatch, tmp_path / "absent")
 
     assert isinstance(claude_native.claude_catalog_fingerprint(None), str)
+
+
+# ── ambient gateway detection ─────────────────────────────
+
+
+def test_ambient_env_is_non_anthropic_gateway_detects_databricks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient ANTHROPIC_BASE_URL pointing to Databricks is a gateway."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example.databricks.com/serving/v1")
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is True
+
+
+def test_ambient_env_is_non_anthropic_gateway_allows_anthropic_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient ANTHROPIC_BASE_URL pointing to Anthropic is NOT a gateway."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is False
+
+
+def test_ambient_env_is_non_anthropic_gateway_allows_anthropic_subdomain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient ANTHROPIC_BASE_URL on an Anthropic subdomain is NOT a gateway."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://test.anthropic.com")
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is False
+
+
+def test_ambient_env_is_non_anthropic_gateway_returns_false_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ambient ANTHROPIC_BASE_URL means not a gateway."""
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is False
+
+
+def test_catalog_fingerprint_includes_ambient_gateway_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fingerprint changes when ANTHROPIC_BASE_URL changes in ambient env.
+
+    When claude_config is None (managed settings), the ambient gateway URL
+    must be part of the fingerprint so gateway and non-gateway environments
+    don't share a catalog cache entry.
+    """
+    _point_claude_at(monkeypatch, tmp_path / "claude")
+    (tmp_path / "claude").write_text("binary")
+
+    # No gateway set
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    fp_no_gateway = claude_native.claude_catalog_fingerprint(None)
+
+    # Gateway set
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example.com/anthropic")
+    fp_with_gateway = claude_native.claude_catalog_fingerprint(None)
+
+    # Different gateway
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.databricks.com/anthropic")
+    fp_different_gateway = claude_native.claude_catalog_fingerprint(None)
+
+    # All three should be different
+    assert fp_no_gateway != fp_with_gateway
+    assert fp_no_gateway != fp_different_gateway
+    assert fp_with_gateway != fp_different_gateway
+
+
+async def test_claude_model_catalog_filters_canonical_ids_for_ambient_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When claude_config is None but ANTHROPIC_BASE_URL is a gateway, filter canonical IDs.
+
+    Managed settings (e.g. Isaac) may set ANTHROPIC_BASE_URL to a Databricks
+    gateway. The catalog must filter canonical claude-* IDs even when
+    claude_config is None.
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-4-6", "displayName": "Sonnet 4.6"},
+                {
+                    "id": "sonnet-gateway",
+                    "model": "system.ai.claude-sonnet-4-6[1m]",
+                    "displayName": "Sonnet 4.6 (Gateway)",
+                },
+                {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+            ],
+            default_model="system.ai.claude-sonnet-4-6[1m]",
+            default_label="Sonnet 4.6 (Gateway)",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example.com/anthropic")
+
+    rows = await claude_native.claude_model_catalog(None)
+
+    assert rows is not None
+    # Only the gateway-namespaced model should remain
+    assert [row["id"] for row in rows] == ["sonnet-gateway"]
+    # No canonical claude-* models
+    assert all(not str(row.get("model", "")).startswith("claude-") for row in rows)
+
+
+async def test_claude_model_catalog_keeps_canonical_ids_without_ambient_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When claude_config is None and no gateway URL is set, keep canonical IDs."""
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-4-6", "displayName": "Sonnet 4.6"},
+                {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+            ],
+            default_model="claude-opus-5",
+            default_label="Opus 5",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+
+    rows = await claude_native.claude_model_catalog(None)
+
+    assert rows is not None
+    # Both canonical models should be present
+    assert [row["id"] for row in rows] == ["sonnet", "opus"]
+    assert rows[1]["isDefault"] is True

@@ -1,0 +1,29 @@
+ │  ▐█████▌  Send /help for help information.                                                                         │
+ │                                                                                                                    │
+ │  Directory: <scratch>/kimi-fixture-after-paste                                                                    │
+ │  Session:   <session-id>                                                                                           │
+ │  Model:     dummy                                                                                                  │
+ │  Version:   0.34.0                                                                                                 │
+ │                                                                                                                    │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✨ Run the shell command now.
+
+ ● Running a command
+   $ printf after-paste
+   Press Ctrl+B to run in background
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Run this command?
+
+   cwd: <scratch>/kimi-fixture-after-paste
+   $ printf after-paste
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ dummy  <scratch>/kimi-fixture-after-paste       ! to run a shell command | /compact compresses context when it gets long
+                                                                                                  context: 1% (11/256k)

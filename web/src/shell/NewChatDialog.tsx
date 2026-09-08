@@ -69,6 +69,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { randomUUID } from "@/lib/randomUUID";
 import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
@@ -210,6 +211,7 @@ import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSw
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
+import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   useConversations,
@@ -1636,7 +1638,9 @@ function HarnessConfigModal({
   claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   claudeModelsLoading: boolean;
   claudeModelsError: string | null;
-  codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
+  // Full catalog rows (not a narrowed Pick): the Effort row reads each
+  // model's supportedReasoningEfforts ladder off the same response.
+  codexModelOptions: readonly NativeModelOption[];
   codexModelsLoading: boolean;
   codexModelsError: string | null;
   piModelOptions: readonly { id: string; displayName: string }[];
@@ -1720,6 +1724,35 @@ function HarnessConfigModal({
     () => codexModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [codexModelOptions],
   );
+  // Codex advertises a per-model effort ladder, so the Effort row follows the
+  // DRAFTED model — else picking another model still lists the old rungs.
+  // "Default" ("") resolves to the catalog-default row: for a new session
+  // that is the model a bare launch truly runs.
+  const codexEffortLevels = useMemo(
+    () =>
+      isCodex
+        ? codexEffortLevelsForModel(
+            codexModelOptions,
+            draftModel || (codexModelOptions.find((m) => m.isDefault)?.id ?? null),
+          )
+        : [],
+    [isCodex, codexModelOptions, draftModel],
+  );
+  // Drop a drafted level the newly-picked model doesn't offer, so no stale
+  // rung shows and Save never commits a level the model rejects. Codex only:
+  // other harnesses use a model-independent ladder.
+  const clampCodexDraftEffort = (modelId: string) => {
+    if (!isCodex) return;
+    setDraftEffort((prev) =>
+      prev &&
+      codexEffortLevelsForModel(
+        codexModelOptions,
+        modelId || (codexModelOptions.find((m) => m.isDefault)?.id ?? null),
+      ).includes(prev)
+        ? prev
+        : "",
+    );
+  };
   // The host catalog re-polls while the modal is open (a provider switch under
   // it). A draft the new catalog no longer lists would render a blank trigger,
   // so it falls back to Default.
@@ -1744,10 +1777,12 @@ function HarnessConfigModal({
       // "Default" = no override; defer routing to the spec default (null,
       // omitted from create) — never emit an explicit "on"/"off".
       setDraftRouting(null);
+      clampCodexDraftEffort("");
     } else {
       setDraftModel(value);
       // Picking an explicit model turns routing off (mutually exclusive).
       setDraftRouting(null);
+      clampCodexDraftEffort(value);
     }
   };
 
@@ -1780,13 +1815,16 @@ function HarnessConfigModal({
       if (entryHarness)
         writeHarnessOption(entryHarness, { model: draftModel, effort: draftEffort });
     } else if (hasApproval) {
-      if (isCodex) setPickedModel(draftModel);
+      if (isCodex) {
+        setPickedModel(draftModel);
+        setPickedEffort(draftEffort);
+      }
       setApprovalMode(draftApproval);
       setBypassSandbox(draftBypass);
       if (entryHarness) {
         writeHarnessOption(entryHarness, {
           mode: isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval,
-          ...(isCodex ? { model: draftModel } : {}),
+          ...(isCodex ? { model: draftModel, effort: draftEffort } : {}),
         });
       }
     } else if (hasCursor) {
@@ -1982,6 +2020,46 @@ function HarnessConfigModal({
                   )}
                 </RoutingModelSelect>
               </ConfigRow>
+              {/* Codex's effort ladder is per-model metadata off the same
+              catalog response; hidden when the drafted model advertises no
+              levels (mirroring the in-session gear's composer-config-effort
+              row). */}
+              {isCodex && codexEffortLevels.length > 0 && (
+                <ConfigRow label="Effort" description="Reasoning depth vs. speed">
+                  <Select
+                    // Smart Routing picks the model (and its effort) per
+                    // turn, so an explicit effort is meaningless: the row is
+                    // frozen and reads as an em-dash placeholder. Radix shows
+                    // the placeholder for the empty value, which no item can
+                    // carry.
+                    value={smartRoutingOn ? "" : draftEffort || EFFORT_SELECT_NONE}
+                    onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
+                    disabled={smartRoutingOn}
+                  >
+                    <SelectTrigger
+                      className="w-full cursor-pointer"
+                      data-testid="new-chat-landing-config-effort"
+                      aria-label="Reasoning effort"
+                    >
+                      <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
+                    </SelectTrigger>
+                    <SelectContent
+                      position="popper"
+                      align="start"
+                      className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
+                    >
+                      <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+                      {/* Codex efforts render raw — its ids aren't title-cased
+                      (matching the in-session gear's labeling). */}
+                      {codexEffortLevels.map((level) => (
+                        <SelectItem key={level} value={level}>
+                          {level}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </ConfigRow>
+              )}
               <ConfigRow label="Approval" description="What the agent can do without asking">
                 <DescribedSelect
                   // Codex adds the DANGEROUS full-bypass as a 4th option; when
@@ -2932,11 +3010,11 @@ export function NewChatLandingScreen() {
   );
 
   // Fill the branch field with a unique auto-generated name so the user can
-  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
-  // available in every browser the app targets; the short prefix keeps the
-  // dir/branch readable (worktree-1a2b3c4d).
+  // spin up a throwaway worktree without inventing one. Uses the secure-context-
+  // safe UUID helper (a plain-http self-hosted origin has no `crypto.randomUUID`);
+  // the short prefix keeps the dir/branch readable (worktree-1a2b3c4d).
   const generateBranchName = useCallback(() => {
-    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+    const suffix = randomUUID().replace(/-/g, "").slice(0, 8);
     const name = `worktree-${suffix}`;
     setBranchName(name);
     return name;
@@ -3226,8 +3304,19 @@ export function NewChatLandingScreen() {
                   : defaultModelLabel(codexModelOptions),
               },
             ];
+      // Mirror the modal's Effort row: em-dash while routing picks per turn,
+      // else the picked level (Codex ids render raw, not title-cased).
+      const effortRows = !isCodex
+        ? []
+        : [
+            {
+              label: "Effort",
+              value: routingOn ? EFFORT_UNAVAILABLE_PLACEHOLDER : pickedEffort || "Default",
+            },
+          ];
       return [
         ...modelRows,
+        ...effortRows,
         { label: "Approval", value: approvalValue },
         ...(isCodex ? sourceRows(codexModelOptions) : []),
       ];
@@ -3404,16 +3493,30 @@ export function NewChatLandingScreen() {
       // A remembered routing "on" outranks a remembered concrete model, and
       // also drops any model/effort left in the shared state (e.g. seeded for
       // Claude Code before the harness switch).
-      setPickedModel(
+      const seededCodexModel =
         (selectedNativeHarness === "codex-native" ? projectSeed(codexModelOptions) : null) ??
-          (!storedRoutingOn &&
+        (!storedRoutingOn &&
+        selectedNativeHarness === "codex-native" &&
+        stored.model != null &&
+        codexModelOptions.some((m) => m.id === stored.model)
+          ? stored.model
+          : "");
+      setPickedModel(seededCodexModel);
+      // Restore the remembered Codex effort only while the seeded model's
+      // ladder (the catalog default's when no model is pinned) still offers
+      // it — anything else resolves to "" so a level another harness left in
+      // the shared state never rides a Codex create.
+      setPickedEffort(
+        !storedRoutingOn &&
           selectedNativeHarness === "codex-native" &&
-          stored.model != null &&
-          codexModelOptions.some((m) => m.id === stored.model)
-            ? stored.model
-            : ""),
+          stored.effort != null &&
+          codexEffortLevelsForModel(
+            codexModelOptions,
+            seededCodexModel || (codexModelOptions.find((m) => m.isDefault)?.id ?? null),
+          ).includes(stored.effort)
+          ? stored.effort
+          : "",
       );
-      if (storedRoutingOn) setPickedEffort("");
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
     } else if (supportsAgySkipPermissions) {
@@ -4513,7 +4616,9 @@ export function NewChatLandingScreen() {
             reasoning_effort:
               !smartRoutingHarnessSelected &&
               !routingOwnsModel &&
-              (agentSupportsPermissionMode || selectedNativeHarness === "pi-native") &&
+              (agentSupportsPermissionMode ||
+                selectedNativeHarness === "pi-native" ||
+                nativeAgent?.harness === "codex-native") &&
               pickedEffort
                 ? pickedEffort
                 : undefined,
@@ -4591,7 +4696,8 @@ export function NewChatLandingScreen() {
           supportsCursorMode: agentSupportsCursorMode,
           supportsAgySkipPermissions: agentSupportsAgySkip,
           supportsModelPicker: agentSupportsModelPicker || nativeAgent?.harness === "codex-native",
-          supportsEffortPicker: selectedNativeHarness === "pi-native",
+          supportsEffortPicker:
+            selectedNativeHarness === "pi-native" || selectedNativeHarness === "codex-native",
           permissionMode,
           approvalMode,
           bypassSandbox,

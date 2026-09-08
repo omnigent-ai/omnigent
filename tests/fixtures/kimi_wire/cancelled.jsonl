@@ -1,0 +1,20 @@
+{"type": "metadata", "protocol_version": "1.5", "created_at": 1786190599907}
+{"type": "profile.bind", "modelAlias": "kimi-k3-databricks", "profileName": "agent", "thinkingEffort": "off", "systemPrompt": "[trimmed]", "environmentDisclosure": {"cwd": "/Users/bryan.li/Projects/omnigent", "date": {"disclosed": true, "value": {"localDate": "2026-08-08", "timeZone": "America/Los_Angeles"}}}, "agentsMdPaths": ["/Users/bryan.li/Projects/omnigent/AGENTS.md"], "activeToolNames": ["Read", "Write", "Edit", "Grep", "Glob", "Bash", "TaskList", "TaskOutput", "TaskStop", "CronCreate", "CronList", "CronDelete", "ReadMediaFile", "TodoList", "Skill", "WebSearch", "Agent", "AgentSwarm", "FetchURL", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "CreateGoal", "GetGoal", "SetGoalBudget", "UpdateGoal", "mcp__*"], "disallowedTools": [], "time": 1786190599940}
+{"type": "permission.set_mode", "mode": "manual", "time": 1786190599945}
+{"type": "turn.prompt", "input": [{"type": "text", "text": "sanitized user prompt"}], "origin": {"kind": "user"}, "time": 1786190599964}
+{"type": "context.append_message", "message": {"role": "user", "content": [{"type": "text", "text": "sanitized"}]}, "time": 1786190599965}
+{"type": "context.append_loop_event", "event": {"type": "step.begin", "uuid": "638e2fda-a22c-429a-ad26-232948d3d2d5", "turnId": "0", "step": 1}, "time": 1786190599967}
+{"type": "llm.tools_snapshot", "hash": "66eef09af59d50b31fd33b5d743d4b23d34864eca243eef7ac7f12a81d6a297e", "tools": [], "time": 1786190599973}
+{"type": "llm.request", "kind": "loop", "provider": "openai", "model": "system.ai.kimi-k3", "modelAlias": "kimi-k3-databricks"}
+{"type": "turn.cancel", "turnId": 0, "target": "active", "reason": "user_cancelled", "time": 1786190601074}
+{"type": "turn.ended", "turnId": 0, "reason": "cancelled", "durationMs": 1112, "time": 1786190601076}
+{"type": "context.append_message", "message": {"role": "user", "content": [{"type": "text", "text": "sanitized"}]}, "time": 1786190601076}
+{"type": "interruptionReminder.recorded", "turnId": 0, "time": 1786190601076}
+{"type": "turn.prompt", "input": [{"type": "text", "text": "sanitized user prompt"}], "origin": {"kind": "user"}, "time": 1786190602004}
+{"type": "context.append_message", "message": {"role": "user", "content": [{"type": "text", "text": "sanitized"}]}, "time": 1786190602004}
+{"type": "context.append_loop_event", "event": {"type": "step.begin", "uuid": "68595653-b42d-432f-b335-19b837d4e603", "turnId": "1", "step": 1}, "time": 1786190602005}
+{"type": "llm.request", "kind": "loop", "provider": "openai", "model": "system.ai.kimi-k3", "modelAlias": "kimi-k3-databricks"}
+{"type": "turn.cancel", "turnId": 1, "target": "active", "reason": "user_cancelled", "time": 1786190603037}
+{"type": "turn.ended", "turnId": 1, "reason": "cancelled", "durationMs": 1034, "time": 1786190603038}
+{"type": "context.append_message", "message": {"role": "user", "content": [{"type": "text", "text": "sanitized"}]}, "time": 1786190603038}
+{"type": "interruptionReminder.recorded", "turnId": 1, "time": 1786190603038}

@@ -529,6 +529,9 @@ Fix the root cause, not the symptom. Change the code the bug lives in, matching
 surrounding conventions, as small as the root cause allows. Do not touch the test
 to make it pass; the *code* must change to satisfy it.
 
+Keep code comments short. Prefer a single line; only write a longer comment
+when the complexity genuinely requires it.
+
 ### 2B.4 — Add targeted tests at the layer you changed
 
 The reproduction test is a full end-to-end journey — slow, one layer above your

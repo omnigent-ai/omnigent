@@ -2474,6 +2474,39 @@ def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
     return {"code": code, "message": message}
 
 
+def _harness_error_response_error(response: object) -> dict[str, str]:
+    """
+    Convert a non-streaming harness error response into a turn failure.
+
+    For example, ``{"error": "harness_spawn_failed", "detail": "See runner log"}``
+    becomes ``{"message": "harness_spawn_failed: See runner log"}``. Missing or
+    malformed bodies fall back to a short raw-body preview or a generic message.
+
+    :param response: Response returned instead of a ``StreamingResponse``.
+    :returns: An error dict suitable for :func:`_on_proxy_stream_end`.
+    """
+    text = ""
+    # A stub response without a body, a body that is not bytes, or bytes
+    # that are not UTF-8 all fall back to the generic message below.
+    with contextlib.suppress(UnicodeDecodeError, AttributeError, TypeError):
+        text = bytes(cast(Any, response).body).decode("utf-8")
+    payload: object = None
+    with contextlib.suppress(ValueError):
+        payload = json.loads(text)
+    if isinstance(payload, dict):
+        raw_detail = payload.get("detail")
+        raw_code = payload.get("error")
+        detail = raw_detail.strip() if isinstance(raw_detail, str) else ""
+        code = raw_code.strip() if isinstance(raw_code, str) else ""
+        if code and detail:
+            return {"message": f"{code}: {detail}"}
+        if detail:
+            return {"message": detail}
+        if code:
+            return {"message": code}
+    return {"message": text.strip()[:200] or "harness returned error response"}
+
+
 def _truncate_child_preview(text: str) -> str:
     """
     Truncate a child message preview to the cap with an ellipsis.
@@ -5756,9 +5789,8 @@ def create_runner_app(
                 # forwarder to reconcile the row.
                 _logger.warning(
                     "claude-native model change for session=%s could not be verified: "
-                    "no statusLine snapshot in %s",
+                    "no statusLine snapshot",
                     conv_id,
-                    bridge_dir,
                     extra={"session_id": conv_id},
                 )
                 return Response(status_code=204)
@@ -7652,25 +7684,14 @@ def create_runner_app(
         if isinstance(response, StreamingResponse):
             await _drain_streaming_response(response, conv)
         else:
-            err_detail = "harness returned error response"
-            if hasattr(response, "body"):
-                with contextlib.suppress(
-                    UnicodeDecodeError,
-                    AttributeError,
-                ):
-                    err_detail = bytes(response.body).decode(
-                        "utf-8",
-                    )[:200]
+            error = _harness_error_response_error(response)
             _logger.error(
                 "turn bg error for %s: %s",
                 conv,
-                err_detail,
+                error["message"],
                 extra={"session_id": conv},
             )
-            _on_proxy_stream_end(
-                conv,
-                error={"message": err_detail},
-            )
+            _on_proxy_stream_end(conv, error=error)
 
     async def _drain_streaming_response(
         response: StreamingResponse,
@@ -8600,7 +8621,7 @@ def create_runner_app(
                     if not isinstance(response, StreamingResponse):
                         _on_proxy_stream_end(
                             conversation_id,
-                            error={"message": "harness returned error response"},
+                            error=_harness_error_response_error(response),
                         )
                     return response
 
@@ -9413,7 +9434,7 @@ def create_runner_app(
         )
 
     async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
-        """Re-create a reaped native pane before forwarding a turn (#1349 self-heal).
+        """Re-create a reaped native pane before forwarding a turn (self-heal).
 
         The native-pane idle reaper may reclaim an idle pane while a session sits
         between turns. ``NativeServerHarness.run_turn`` forwards into the live
@@ -9422,8 +9443,12 @@ def create_runner_app(
         into a dead tmux target and lose the message. This re-ensures the pane
         first. Idempotent: a no-op when the harness is not a native CLI harness or
         the pane is already live. Reuses ``create_session_terminal``'s
-        ``ensure_native_terminal`` path, so the pane resumes via the vendor CLI's
-        own ``--resume`` (no fresh-start, no lost history).
+        ``ensure_native_terminal`` path. Healing restores a live pane, not the
+        CLI's in-context history: a harness that records a resumable chat id may
+        relaunch with its own ``--resume``, but continuity is best-effort, and a
+        harness without one (kimi — exempt from the reaper, so this only fires
+        for a crashed pane) always restarts a fresh TUI. Either way the prior
+        turns are guaranteed only in the server transcript.
 
         Detection has two layers: (1) the reaper POPPING the registry entry
         when it reaps (``registry.close()`` -> ``get()`` returns ``None``),

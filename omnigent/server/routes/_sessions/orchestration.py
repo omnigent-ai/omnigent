@@ -9736,8 +9736,8 @@ async def _get_session_snapshot(
 
     Centralizes the create/get response building so both endpoints
     return identical projections. The lifecycle ``status`` is
-    derived from the relay-fed ``_session_status_cache`` (the tasks
-    table has been removed).
+    derived from the relay-fed ``_session_status_cache``, falling back to
+    the persisted relay status after a server recycle (the tasks table is gone).
 
     :param conv_store: The conversation store to read from.
     :param session_id: Session/conversation identifier,
@@ -9829,7 +9829,10 @@ async def _get_session_snapshot(
             ),
         )
 
-    status = _session_status_from_cache(session_id)
+    # A server recycle clears this cache while the persisted relay status survives.
+    # Prefer it because native injection can finish before an external harness turn,
+    # making the runner's generic active-turn probe report a false ``idle``.
+    status = _session_status_from_cache(session_id, conv.live_status)
     if status == "idle":
         # Cache miss (or truly idle): either the server restarted, or the
         # relay has not yet published the first ``"running"`` event for a

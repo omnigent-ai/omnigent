@@ -6,7 +6,8 @@ import type { ServerInfo, SharingMode } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { PermissionsModal } from "./PermissionsModal";
 
-vi.mock("@/lib/permissionsApi", () => ({
+vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof api>()),
   listPermissions: vi.fn(),
   grantPermission: vi.fn(),
   revokePermission: vi.fn(),
@@ -563,6 +564,7 @@ describe("PermissionsModal", () => {
       expect(
         screen.getByText("Invite others to view or collaborate on this session."),
       ).toBeInTheDocument();
+      expect(screen.queryByText(/Please be careful when sharing/)).not.toBeInTheDocument();
       expect(
         screen.queryByText("Sharing has been disabled for this Omnigent server."),
       ).not.toBeInTheDocument();
@@ -581,6 +583,11 @@ describe("PermissionsModal", () => {
           "This server allows read-only sharing — invite others to view this session.",
         ),
       ).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "Please be careful when sharing. Read access will allow for reading of all session outputs.",
+        ),
+      ).toBeInTheDocument();
       // Read grants are still allowed, so the Grant control stays.
       expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();
       // The add-form level select must offer only Read (Edit is hidden). With no
@@ -593,9 +600,7 @@ describe("PermissionsModal", () => {
       expect(options.map((o) => o.textContent)).toEqual(["Read"]);
     });
 
-    it("restricted_read_only: presents the same read-only UI as read_only", async () => {
-      // The per-session home/root block is enforced server-side; the modal
-      // itself shows the read-only affordance for every session.
+    it("restricted_read_only: presents the same read-only UI when the workspace is unknown", async () => {
       listMock.mockResolvedValue([]);
 
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
@@ -608,6 +613,11 @@ describe("PermissionsModal", () => {
           "This server allows read-only sharing — invite others to view this session.",
         ),
       ).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "Please be careful when sharing. Read access will allow for reading of all session outputs.",
+        ),
+      ).toBeInTheDocument();
       expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();
       const trigger = screen.getByRole("combobox");
       trigger.focus();
@@ -615,6 +625,102 @@ describe("PermissionsModal", () => {
       const listbox = await screen.findByRole("listbox");
       const options = within(listbox).getAllByRole("option");
       expect(options.map((o) => o.textContent)).toEqual(["Read"]);
+    });
+  });
+
+  describe("workspace restrictions", () => {
+    it("allows read-only grants in project directories", async () => {
+      listMock.mockResolvedValue([]);
+      grantMock.mockResolvedValue({ conversation_id: "conv_abc", user_id: "bob", level: 1 });
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice/project"
+          open
+          onOpenChange={() => {}}
+        />,
+        { wrapper: createSharingWrapper("restricted_read_only") },
+      );
+      expect(screen.queryByText(/This session's working directory/)).not.toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
+      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob", 1));
+    });
+
+    it.each(["/home/alice", "/Users/bob", "/var/home/carol", "/root", "/"])(
+      "explains the restriction for %s before any submission",
+      async (workspace) => {
+        listMock.mockResolvedValue([]);
+        render(
+          <PermissionsModal
+            sessionId="conv_abc"
+            workspace={workspace}
+            open
+            onOpenChange={() => {}}
+          />,
+          {
+            wrapper: createSharingWrapper("restricted_read_only"),
+          },
+        );
+
+        const warning = screen.getByText(/This session's working directory/);
+        expect(warning).toHaveClass("text-destructive");
+        fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
+        fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+        expect(screen.getByRole("switch")).toBeDisabled();
+        fireEvent.click(screen.getByRole("switch"));
+        await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+        expect(grantMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(["on", "read_only"] as const)(
+      "does not block home directories in %s mode",
+      async (mode) => {
+        listMock.mockResolvedValue([]);
+        grantMock.mockResolvedValue({ conversation_id: "conv_abc", user_id: "bob", level: 1 });
+        render(
+          <PermissionsModal
+            sessionId="conv_abc"
+            workspace="/home/alice"
+            open
+            onOpenChange={() => {}}
+          />,
+          {
+            wrapper: createSharingWrapper(mode),
+          },
+        );
+        fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
+        fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+        await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob", 1));
+        expect(screen.queryByText(/This session's working directory/)).not.toBeInTheDocument();
+      },
+    );
+
+    it("keeps existing user and public grants revocable for blocked workspaces", async () => {
+      listMock.mockResolvedValue([
+        { conversation_id: "conv_abc", user_id: "alice", level: 4 },
+        { conversation_id: "conv_abc", user_id: "bob", level: 2 },
+        { conversation_id: "conv_abc", user_id: "__public__", level: 1 },
+      ]);
+      revokeMock.mockResolvedValue(undefined);
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice"
+          open
+          onOpenChange={() => {}}
+        />,
+        {
+          wrapper: createSharingWrapper("restricted_read_only"),
+        },
+      );
+      fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+      await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "bob"));
+      await waitFor(() => expect(screen.getByRole("switch")).toBeEnabled());
+      fireEvent.click(screen.getByRole("switch"));
+      await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "__public__"));
+      expect(grantMock).not.toHaveBeenCalled();
     });
   });
 

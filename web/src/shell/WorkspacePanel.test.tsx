@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -50,6 +51,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
+vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 
 const useTerminalsMock = vi.mocked(useTerminals);
 const useCreateTerminalMock = vi.mocked(useCreateTerminal);
@@ -57,7 +59,9 @@ const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   vi.clearAllMocks();
+  Reflect.deleteProperty(window, "omnigentDesktop");
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
   useCreateTerminalMock.mockReturnValue({
     mutate: vi.fn(),
@@ -384,9 +388,6 @@ describe("WorkspacePanel shell tabs", () => {
 });
 
 describe('WorkspacePanel "+" new-tab menu', () => {
-  // The "+" gates purely on shell access — the agent's declared terminals.
-  // (The embedded browser is one view per conversation, reached via its own
-  // pinned tab, so it isn't offered here.)
   const declaresShell = () =>
     useSessionAgentMock.mockReturnValue({ data: { terminals: ["zsh"] } } as unknown as ReturnType<
       typeof useSessionAgent
@@ -394,7 +395,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
   it("is hidden when the agent has no terminal access", () => {
     // No declared terminals (default mock: data undefined) → nothing to open.
-    renderWorkspace({ showBrowserTab: true });
+    renderWorkspace({ showBrowserTab: false });
     expect(screen.queryByRole("button", { name: "Open new" })).toBeNull();
   });
 
@@ -702,6 +703,32 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
 });
 
 describe("WorkspacePanel browser tab", () => {
+  it("offers browsers without shell access and creates multiple closable tabs", async () => {
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    const openBrowser = async () => {
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), {
+        button: 0,
+        ctrlKey: false,
+      });
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
+    };
+    await openBrowser();
+    const firstView = screen.getByTestId("browser-pane-stub").textContent;
+    await openBrowser();
+    expect(screen.getAllByRole("tab", { name: /^Browser \d/ })).toHaveLength(2);
+    expect(screen.getByTestId("browser-pane-stub").textContent).not.toBe(firstView);
+    fireEvent.click(screen.getByRole("tab", { name: "Browser 1" }));
+    expect(screen.getByTestId("browser-pane-stub")).toHaveTextContent(firstView!);
+    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+    await waitFor(() =>
+      expect(screen.getAllByRole("tab", { name: /^Browser \d/ })).toHaveLength(1),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("browser-pane-stub")).toHaveTextContent("conv_ws"),
+    );
+  });
+
   it("renders the Browser tab only when showBrowserTab is set", () => {
     renderWorkspace({ showBrowserTab: true });
     expect(screen.getByRole("tab", { name: /browser/i })).toBeInTheDocument();
@@ -718,5 +745,22 @@ describe("WorkspacePanel browser tab", () => {
     expect(screen.getByTestId("browser-pane-stub")).toBeInTheDocument();
     // And the file scope views are not mounted in that branch.
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+  });
+
+  it("shows an error when a native browser close fails", async () => {
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
+
+    Object.assign(window, {
+      omnigentDesktop: { browserClose: vi.fn().mockRejectedValue(new Error("disconnected")) },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("Couldn't close browser tab. Try again."),
+    );
   });
 });
