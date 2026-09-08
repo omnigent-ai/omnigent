@@ -223,7 +223,7 @@ def canonical_model_spelling(model: str) -> str:
     counterpart name the same model — :func:`normalize_model_for_provider`
     converts between them per provider — so comparisons that must treat
     the two spellings as equivalent (e.g. cost-tier ranking in
-    :mod:`omnigent.cost_plan`) compare in this form.
+    :mod:`omnigent.util.cost_plan`) compare in this form.
 
     :param model: A model id, e.g. ``"databricks-claude-haiku-4-5"``.
     :returns: The bare canonical id (``"claude-haiku-4-5"``) when the
@@ -269,7 +269,7 @@ def normalize_model_for_provider(model: str, provider_kind: str | None) -> str:
     :param model: A model id that already passed
         :func:`validate_model_override`, e.g. ``"claude-sonnet-4-6"``.
     :param provider_kind: The child's resolved provider kind from
-        :func:`omnigent.model_catalog.resolve_model_provider`, e.g.
+        :func:`omnigent.models.model_catalog.resolve_model_provider`, e.g.
         ``"databricks"`` or ``"key"``; ``None`` when undeterminable.
     :returns: The localized model id, or *model* unchanged.
     """

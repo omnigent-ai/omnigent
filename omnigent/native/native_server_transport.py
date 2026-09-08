@@ -5,7 +5,7 @@ runner owns: the runner starts the server + an event forwarder, and the
 harness injects web turns over this transport. OpenCode speaks HTTP + SSE
 (:class:`omnigent.harnesses.opencode_native.http_transport.OpenCodeHttpTransport`);
 :class:`NativeServerTransport` is the seam so the orchestration in
-:class:`omnigent.native_server_harness.NativeServerHarness` stays
+:class:`omnigent.native.native_server_harness.NativeServerHarness` stays
 protocol-agnostic.
 """
 
@@ -121,7 +121,7 @@ class NativeServerTransport(Protocol):
     Implementations encapsulate all wire details (process launch, session
     lifecycle, prompt injection, abort, event stream, fork, permission
     replies, TUI attach). The shared
-    :class:`~omnigent.native_server_harness.NativeServerHarness` calls only
+    :class:`~omnigent.native.native_server_harness.NativeServerHarness` calls only
     these methods.
     """
 

@@ -43,8 +43,8 @@ from typing import cast
 import httpx
 
 from omnigent.host.daemon_launch import error_text
-from omnigent.json_types import JsonObject as _JsonObject
-from omnigent.native_terminal import url_component
+from omnigent.native.native_terminal import url_component
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 # Pi session ids are UUIDv7 hex with dashes (e.g.
 # ``019efdb8-54c8-7c02-be27-875eb2620635``). Restrict the value we use in a

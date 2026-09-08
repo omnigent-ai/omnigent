@@ -29,10 +29,10 @@ from pathlib import Path
 
 import httpx
 
-from omnigent._native_forwarder_health import (
+from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
-from omnigent._native_forwarder_health import (
+from omnigent.native._native_forwarder_health import (
     record_post_failure as record_native_post_failure,
 )
 

@@ -13,8 +13,8 @@ import uuid
 from importlib.resources import files
 from pathlib import Path
 
-from omnigent import native_bridge_common
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.native import native_bridge_common
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 # Per-process tiebreaker for inbox ordering. The extension delivers inbox
 # files in lexicographic filename order, so a high-resolution timestamp alone

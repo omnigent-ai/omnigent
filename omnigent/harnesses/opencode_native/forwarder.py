@@ -45,7 +45,7 @@ from omnigent.harnesses.opencode_native.permissions import (
     parse_permission_request,
     reply_body,
 )
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 

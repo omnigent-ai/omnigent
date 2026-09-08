@@ -35,19 +35,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, cast
 
-from omnigent import _native_forwarder_health as native_forwarder_health
-from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary
-from omnigent.codex_model_vocabulary import (
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
+from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.models import model_catalog
+from omnigent.models.codex_model_vocabulary import (
     EXTENDED_CATALOG_MODELS,
     EXTENDED_MODEL_DEFAULT_EFFORT,
     EXTENDED_MODEL_EFFORTS,
 )
-from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
-from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
-from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
+from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
+from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport

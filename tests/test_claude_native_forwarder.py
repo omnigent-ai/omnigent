@@ -46,7 +46,7 @@ from omnigent.harnesses.claude_native.forwarder import (
     _reset_compaction_skip_stats,
     forward_claude_transcript_to_session,
 )
-from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
+from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 
 
 @pytest.fixture(autouse=True)

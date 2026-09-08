@@ -283,7 +283,7 @@ def test_builtin_native_provider_paths_resolve() -> None:
     This is the guard that keeps the provider rows honest: a typo'd import path
     or a renamed run_<x>_native symbol fails here rather than at dispatch time.
     """
-    from omnigent import native_dispatch
+    from omnigent.native import native_dispatch
 
     for provider in hp.native_providers():
         for hook in (

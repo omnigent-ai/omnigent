@@ -3397,7 +3397,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     import time
 
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
-    from omnigent import model_catalog_store
+    from omnigent.models import model_catalog_store
     from omnigent.runner import app as runner_app_mod
     from tests.runner.conftest import REAL_CODEX_LAUNCH_CATALOG
 
@@ -3645,7 +3645,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
     not string equality — a raw membership test refuses a model this host serves.
     """
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
-    from omnigent import model_catalog_store
+    from omnigent.models import model_catalog_store
     from omnigent.runner import app as runner_app_mod
     from tests.runner.conftest import REAL_CODEX_LAUNCH_CATALOG
 

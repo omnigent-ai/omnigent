@@ -1,4 +1,4 @@
-"""Tests for the :class:`omnigent.server_url.ServerUrl` value type.
+"""Tests for the :class:`omnigent.util.server_url.ServerUrl` value type.
 
 The one representation of an Omnigent server URL: requests target
 ``api_base``, user-facing messages show ``display``. These tests pin the
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.server_url import (
+from omnigent.util.server_url import (
     ServerUrl,
     display_server_url,
     is_workspace_hosted_url,

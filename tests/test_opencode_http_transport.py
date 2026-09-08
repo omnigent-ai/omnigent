@@ -16,7 +16,7 @@ from omnigent.harnesses.opencode_native.http_transport import (
     OpenCodeHttpTransport,
     build_prompt_payload,
 )
-from omnigent.native_server_transport import (
+from omnigent.native.native_server_transport import (
     NativeLaunchConfig,
     NativePermissionDecision,
     NativePrompt,

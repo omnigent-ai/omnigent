@@ -229,8 +229,8 @@ def test_routed_launch_model_reaches_the_terminal_env_as_the_custom_slot() -> No
     slot, which is the only spelling ``/model`` accepts for an id no family
     alias points at (``opus`` here resolves to the newer generation).
     """
-    from omnigent.claude_model_vocabulary import claude_model_command_arg
     from omnigent.harnesses.claude_native.main import claude_config_with_launch_model_pinned
+    from omnigent.models.claude_model_vocabulary import claude_model_command_arg
 
     config = ClaudeNativeUcodeConfig(
         env={

@@ -531,7 +531,7 @@ def model_in_family(family: str | None, model: str) -> bool:
     """
     if family is None or family == "pi":
         return True
-    from omnigent.model_catalog import model_family_token
+    from omnigent.models.model_catalog import model_family_token
 
     token = model_family_token(model)
     return token == "claude" if family == "claude" else token == "openai"
@@ -618,7 +618,7 @@ def _with_unadvertised_arms(models: list[str], family: str | None) -> list[str]:
     """
     if not models or family != _UNADVERTISED_ARM_FAMILY:
         return models
-    from omnigent.codex_model_vocabulary import EXTENDED_CATALOG_MODELS
+    from omnigent.models.codex_model_vocabulary import EXTENDED_CATALOG_MODELS
 
     extra = [
         model

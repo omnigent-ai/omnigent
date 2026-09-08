@@ -7,10 +7,10 @@ from dataclasses import replace
 from enum import Enum
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
-from omnigent.model_metadata import ModelMetadata
+from omnigent.models.model_metadata import ModelMetadata
 
 if TYPE_CHECKING:
-    from omnigent.model_catalog import ModelEntry
+    from omnigent.models.model_catalog import ModelEntry
 
 # These system models omit the finish reason Pi requires on Chat Completions.
 # ``glm-`` avoids matching vendor-direct ids without a system.ai alias.
@@ -115,7 +115,7 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
     reports them.
 
     :param model: A catalog entry, normally from
-        :func:`~omnigent.model_catalog.fetch_databricks_model_service_entries`
+        :func:`~omnigent.models.model_catalog.fetch_databricks_model_service_entries`
         enriched by :func:`enrich_databricks_model_catalog`.
     :returns: A Pi model entry, e.g.
         ``{"id": ..., "input": ["text", "image"], "contextWindow": 1000000}``.
@@ -161,7 +161,7 @@ def enrich_databricks_model_catalog(
 
     :param discovered: Live workspace entries.
     :param metadata_models: MLflow catalog entries, e.g. from
-        :func:`~omnigent.model_catalog.catalog_model_entries`.
+        :func:`~omnigent.models.model_catalog.catalog_model_entries`.
     :returns: The discovered entries with metadata filled in.
     """
     metadata_by_alias = {

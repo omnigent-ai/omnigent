@@ -222,7 +222,7 @@ _HEAVY_IMPORTS = (
     "httpx",
     "omnigent.inner.databricks_executor",
     "omnigent.inner.datamodel",
-    "omnigent.model_catalog",
+    "omnigent.models.model_catalog",
     "omnigent.spec.parser",
     "pydantic",
 )

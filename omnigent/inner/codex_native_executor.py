@@ -46,7 +46,7 @@ from omnigent.inner.native_attachments import (
     parse_data_uri,
     unresolved_attachment_marker,
 )
-from omnigent.reasoning_effort import (
+from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
     effort_for_model_switch,
     validate_effort,

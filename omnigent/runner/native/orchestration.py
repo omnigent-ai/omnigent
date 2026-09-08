@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
@@ -53,12 +53,12 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
 )
 from omnigent.harness_plugins import native_provider_for_key
-from omnigent.model_override import validate_model_override
-from omnigent.native_coding_agents import (
+from omnigent.models.model_override import validate_model_override
+from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
 )
-from omnigent.native_dispatch import resolve_hook
+from omnigent.native.native_dispatch import resolve_hook
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
@@ -3904,13 +3904,13 @@ async def _auto_create_codex_terminal(
     ):
         from dataclasses import replace as _dataclass_replace
 
-        from omnigent.codex_model_vocabulary import codex_reachable_model_slug
         from omnigent.harnesses.codex_native.app_server import (
             codex_launch_catalog,
             codex_launch_catalog_is_stale,
             codex_reprobed_launch_catalog,
         )
-        from omnigent.model_catalog_store import default_row
+        from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug
+        from omnigent.models.model_catalog_store import default_row
 
         _codex_catalog: list[_JsonObject] | None = None
         _codex_catalog_was_stale = False
@@ -5969,7 +5969,7 @@ def _build_claude_native_base_args(
     :returns: The assembled base args, e.g.
         ``("--resume", "<sid>", "--effort", "high")``.
     """
-    from omnigent.reasoning_effort import CLAUDE_EFFORTS
+    from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
     args: list[str] = []
     if resume_external_session_id:
@@ -6958,7 +6958,7 @@ async def _auto_create_claude_terminal(
             claude_launch_endpoint_label,
             claude_reprobed_launch_catalog,
         )
-        from omnigent.model_catalog_store import default_row
+        from omnigent.models.model_catalog_store import default_row
 
         launch_catalog: list[dict[str, object]] | None = None
         launch_catalog_was_stale = False

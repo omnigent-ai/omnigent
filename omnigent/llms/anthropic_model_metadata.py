@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from omnigent.model_metadata import (
+from omnigent.models.model_metadata import (
     ModelCapability,
     ModelMetadata,
     ModelReasoningMetadata,

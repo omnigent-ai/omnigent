@@ -48,8 +48,8 @@ from pathlib import Path
 
 import httpx
 
-from omnigent._native_post_delivery import post_external_session_status
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
+from omnigent.native._native_post_delivery import post_external_session_status
 
 _logger = logging.getLogger(__name__)
 

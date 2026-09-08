@@ -616,7 +616,7 @@ def test_spawn_env_carries_bridge_dir() -> None:
 
 def test_harness_registered_aliased_and_native() -> None:
     from omnigent.harness_aliases import canonicalize_harness, is_native_harness
-    from omnigent.native_coding_agents import native_coding_agent_for_harness
+    from omnigent.native.native_coding_agents import native_coding_agent_for_harness
     from omnigent.runtime.harnesses import _HARNESS_MODULES
     from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
 

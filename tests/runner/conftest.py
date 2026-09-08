@@ -50,7 +50,7 @@ def _isolated_model_catalog_store(
     explicitly.
     """
     store_dir = tmp_path_factory.mktemp("model_catalog_store")
-    monkeypatch.setattr("omnigent.model_catalog_store._data_dir", lambda: store_dir)
+    monkeypatch.setattr("omnigent.models.model_catalog_store._data_dir", lambda: store_dir)
 
     async def _no_catalog(*_args: Any, **_kwargs: Any) -> None:
         return None

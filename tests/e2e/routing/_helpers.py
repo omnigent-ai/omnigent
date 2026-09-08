@@ -168,7 +168,7 @@ def same_arm(left: str | None, right: str | None) -> bool:
     :param right: A model id, or ``None``.
     :returns: ``True`` when both name the same arm.
     """
-    from omnigent.codex_model_vocabulary import comparable_model_id
+    from omnigent.models.codex_model_vocabulary import comparable_model_id
 
     if not left or not right:
         return False

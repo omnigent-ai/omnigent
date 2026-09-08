@@ -591,7 +591,7 @@ class TestDatabricksExecutorConfig(unittest.TestCase):
                 return SimpleNamespace(model_id="catalog-databricks-claude-default")
 
             with patch(
-                "omnigent.model_catalog.resolve_catalog_model",
+                "omnigent.models.model_catalog.resolve_catalog_model",
                 side_effect=_resolve_model,
             ):
                 [e async for e in executor.run_turn([], [], "", config=ExecutorConfig())]

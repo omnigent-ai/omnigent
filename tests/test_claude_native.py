@@ -31,8 +31,8 @@ from websockets.frames import Close
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
-from omnigent.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
 from omnigent.spec import load_omnigent_yaml
@@ -57,7 +57,7 @@ from tests._image_fixtures import (
 @pytest.fixture(autouse=True)
 def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
             model_id=f"catalog-{provider_name}-{family}-default"
         ),
@@ -686,7 +686,7 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
         )
 
     monkeypatch.setattr(
-        "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+        "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
         _discover,
     )
 
@@ -810,7 +810,7 @@ def test_unpinned_family_alias_passes_through_on_the_anthropic_api() -> None:
 
 def test_launch_model_takes_the_custom_slot_when_no_alias_names_it() -> None:
     """A routed older generation gets its own spelling for later ``/model``."""
-    from omnigent.claude_model_vocabulary import claude_model_command_arg
+    from omnigent.models.claude_model_vocabulary import claude_model_command_arg
 
     config = claude_native.ClaudeNativeUcodeConfig(
         env={
@@ -985,7 +985,7 @@ def test_ucode_config_retains_live_fable_when_opted_in(
         lambda profile: SimpleNamespace(host="https://example.databricks.com", token="token"),
     )
     monkeypatch.setattr(
-        "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+        "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
         lambda host, token: DatabricksClaudeCatalog(
             families={
                 "fable": "system.ai.claude-fable-5",
@@ -1035,7 +1035,7 @@ def test_ucode_config_uses_cached_models_when_live_refresh_fails(
         raise httpx.ConnectError("offline")
 
     monkeypatch.setattr(
-        "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+        "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
         _fail,
     )
 
@@ -1076,7 +1076,7 @@ def test_ucode_config_rejects_authoritative_empty_live_catalog(
         lambda profile: SimpleNamespace(host="https://example.databricks.com", token="token"),
     )
     monkeypatch.setattr(
-        "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+        "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
         lambda host, token: DatabricksClaudeCatalog(families={}, model_ids=()),
     )
 
@@ -9862,7 +9862,7 @@ def test_tool_use_result_regression_old_flatten_would_crash_resume() -> None:
 
 def test_routed_arms_repoint_the_family_aliases() -> None:
     """A routing-enabled launch spells the frozen arms, not just the newest models."""
-    from omnigent.claude_model_vocabulary import claude_model_command_arg
+    from omnigent.models.claude_model_vocabulary import claude_model_command_arg
     from omnigent.server.smart_routing import task_v1_claude_arms
 
     config = claude_native.ClaudeNativeUcodeConfig(

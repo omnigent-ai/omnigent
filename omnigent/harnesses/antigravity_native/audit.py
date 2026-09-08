@@ -28,7 +28,7 @@ This module owns the pure, unit-testable pieces of that flow:
   records from one agy transcript step (the ``PLANNER_RESPONSE`` tool-call step).
 * :func:`build_audit_evaluation_request` — wrap a tool call as the proto
   ``EvaluationRequest`` the server's ``POST /policies/evaluate`` consumes,
-  reusing :func:`omnigent.native_policy_hook.hook_payload_to_evaluation_request`
+  reusing :func:`omnigent.native.native_policy_hook.hook_payload_to_evaluation_request`
   and stamping ``context.harness = "antigravity-native"`` + ``context.model``.
 * :func:`audit_verdict_is_violation` / :func:`audit_violation_warning_text` —
   classify a verdict and render the warning text.
@@ -55,7 +55,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from omnigent.native_policy_hook import (
+from omnigent.native.native_policy_hook import (
     PolicyHookEvaluationRequest,
     hook_payload_to_evaluation_request,
 )
@@ -144,7 +144,7 @@ def build_audit_evaluation_request(
     Build the proto ``EvaluationRequest`` for a post-hoc tool-call audit.
 
     Reuses the harness-neutral
-    :func:`omnigent.native_policy_hook.hook_payload_to_evaluation_request` with a
+    :func:`omnigent.native.native_policy_hook.hook_payload_to_evaluation_request` with a
     ``PreToolUse`` payload so the request lands on the ``PHASE_TOOL_CALL`` phase
     (the phase tool-name / cost / CEL deny policies fire on). ``mcp__omnigent__*``
     tools return ``None`` (already relay-enforced via ``ProxyMcpManager`` — see

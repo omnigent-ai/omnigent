@@ -32,15 +32,26 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypeAlias, TypedDict, TypeGuard
 from urllib.parse import urlparse
 
-from omnigent import model_catalog
 from omnigent.databricks_ai_gateway import (
     DATABRICKS_AI_GATEWAY_LABEL,
     DATABRICKS_TRUSTED_HOST_SUFFIXES,
     is_databricks_ai_gateway_url,
 )
-from omnigent.databricks_model_discovery import preferred_served_claude_model
-from omnigent.model_metadata import ModelWireAPI
-from omnigent.model_override import normalize_model_for_provider
+from omnigent.models import model_catalog
+from omnigent.models.databricks_model_discovery import preferred_served_claude_model
+from omnigent.models.model_metadata import ModelWireAPI
+from omnigent.models.model_override import normalize_model_for_provider
+from omnigent.models.pi_model_compatibility import (
+    PI_CLAUDE_THINKING_MODEL_FRAGMENTS,
+    SYSTEM_AI_RESPONSES_KEYWORDS,
+    DatabricksPiSurface,
+    PiModelEntry,
+    databricks_pi_surface_for_model,
+    enrich_databricks_model_catalog,
+    pi_model_is_reasoning,
+    pi_model_json_entry,
+    unsupported_in_pi,
+)
 from omnigent.onboarding.provider_config import (
     CHAT_WIRE_API,
     CLI_CONFIG_KIND,
@@ -53,25 +64,14 @@ from omnigent.onboarding.provider_config import (
     default_provider_for_harness,
     load_config,
 )
-from omnigent.pi_model_compatibility import (
-    PI_CLAUDE_THINKING_MODEL_FRAGMENTS,
-    SYSTEM_AI_RESPONSES_KEYWORDS,
-    DatabricksPiSurface,
-    PiModelEntry,
-    databricks_pi_surface_for_model,
-    enrich_databricks_model_catalog,
-    pi_model_is_reasoning,
-    pi_model_json_entry,
-    unsupported_in_pi,
-)
-from omnigent.reasoning_effort import (
+from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+from omnigent.util.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     PI_EFFORTS,
     PI_THINKING_OFF,
     to_pi_thinking_level,
     validate_effort,
 )
-from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
 if TYPE_CHECKING:
     # Annotation-only import (the runtime import is lazy inside the function,
@@ -423,7 +423,7 @@ def _default_claude_model_from(entries: list[_PiModelEntry]) -> str | None:
     :param entries: Live Claude entries, e.g. ``[{"id": "system.ai.claude-opus-5"}]``.
     :returns: The best servable id, or ``None`` when the listing was empty.
     """
-    from omnigent.databricks_model_discovery import _natural_model_key
+    from omnigent.models.databricks_model_discovery import _natural_model_key
 
     ids = [str(e["id"]) for e in entries if e.get("id")]
     # The precedence claude-native falls back to; newest within a tier.

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
-from omnigent.model_metadata import (
+from omnigent.models.model_metadata import (
     ModelCapability,
     ModelCostTier,
     ModelIntent,

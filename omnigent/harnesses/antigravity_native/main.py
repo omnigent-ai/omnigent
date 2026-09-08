@@ -76,7 +76,6 @@ import click
 import httpx
 import yaml
 
-from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import (
     ANTIGRAVITY_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
@@ -134,20 +133,21 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
-from omnigent.native_coding_agents import native_shell_terminal_spec
-from omnigent.native_terminal import (
+from omnigent.native._native_resume_hint import echo_native_resume_hint
+from omnigent.native.native_coding_agents import native_shell_terminal_spec
+from omnigent.native.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
 )
-from omnigent.native_terminal import (
+from omnigent.native.native_terminal import (
     DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
 )
-from omnigent.native_terminal import (
+from omnigent.native.native_terminal import (
     bind_session_runner as _bind_session_runner,
 )
-from omnigent.native_terminal import (
+from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
-from omnigent.native_terminal import (
+from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
 

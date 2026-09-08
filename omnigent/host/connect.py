@@ -34,7 +34,6 @@ from omnigent.debug_logging import (
     PRIMARY_SESSION_ID_ENV_VAR,
     USER_ID_ENV_VAR,
 )
-from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -148,8 +147,9 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
-from omnigent.suspend_watch import watch_for_resume
-from omnigent.tls import client_ssl_context
+from omnigent.util.env_credentials import env_names_with_omnigent_prefix
+from omnigent.util.suspend_watch import watch_for_resume
+from omnigent.util.tls import client_ssl_context
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
@@ -909,7 +909,7 @@ class ModelOptionsResult:
 
 def _model_configuration_source_for_harness(harness: str) -> dict[str, str] | None:
     """Resolve the host's ambient model provider without exposing credentials."""
-    from omnigent.model_catalog import model_configuration_source, resolve_model_provider
+    from omnigent.models.model_catalog import model_configuration_source, resolve_model_provider
     from omnigent.spec.types import AgentSpec, ExecutorSpec
 
     spec = AgentSpec(
@@ -1001,7 +1001,7 @@ class HostProcess:
         # into every runner this host spawns; None on a non-Databricks server.
         self._origin_workspace_id: str | None = None
         try:
-            from omnigent.server_url import ServerUrl
+            from omnigent.util.server_url import ServerUrl
 
             self._origin_workspace_id = ServerUrl.from_api_base(self._server_url).org_id
         except Exception:  # noqa: BLE001 — attribution is best-effort
@@ -1347,7 +1347,7 @@ class HostProcess:
         :returns: The display URL, e.g.
             ``"https://ws.databricks.com/omnigent?o=123"``.
         """
-        from omnigent.server_url import display_server_url
+        from omnigent.util.server_url import display_server_url
 
         return display_server_url(self._server_url)
 
@@ -2879,7 +2879,7 @@ class HostProcess:
             # of its own, so the endpoint listing IS the harness truth — the
             # ids are already in the exact spelling the SDK sends.
             try:
-                from omnigent.model_catalog import list_models_for_worker
+                from omnigent.models.model_catalog import list_models_for_worker
                 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
                 sdk_spec = AgentSpec(
@@ -3265,7 +3265,7 @@ class HostProcess:
         # crash no new runner may ever launch on this machine, so the host
         # (re)start is the reliable moment to reclaim them. Best-effort and
         # off-loop: a sweep failure must never block host registration.
-        from omnigent.native_bridge_common import reap_orphaned_native_bridge_dirs
+        from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
 
         try:
             reaped_bridge_dirs = await asyncio.to_thread(reap_orphaned_native_bridge_dirs)
@@ -4115,7 +4115,7 @@ def run_host_process(
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
     # User-facing: the display form (workspace /omnigent URL with ?o= when
     # known) — the API mount is an implementation detail.
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     print(
         f"Connecting to {display_server_url(server_url)} as {identity.name!r} ({identity.host_id})"

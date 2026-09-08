@@ -5,7 +5,7 @@ from collections.abc import Iterator
 import pytest
 
 import omnigent.harness_plugins as hp
-from omnigent import native_dispatch
+from omnigent.native import native_dispatch
 
 
 @pytest.fixture(autouse=True)

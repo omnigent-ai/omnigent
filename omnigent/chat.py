@@ -55,10 +55,10 @@ from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
-from omnigent.model_catalog import resolve_catalog_model
-from omnigent.model_resolver import ModelResolutionError
-from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
-from omnigent.native_dispatch import resolve_hook_for_key
+from omnigent.models.model_catalog import resolve_catalog_model
+from omnigent.models.model_resolver import ModelResolutionError
+from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native.native_dispatch import resolve_hook_for_key
 from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
@@ -593,7 +593,7 @@ def run_attach(
     # snapshot gives the agent name + harness for an honest banner.
     info = _attach_session_info(base_url=base_url, conversation_id=conversation_id)
     if not info.runner_online:
-        from omnigent.server_url import display_server_url
+        from omnigent.util.server_url import display_server_url
 
         raise click.ClickException(
             f"Session {conversation_id} has no online runner on "
@@ -1600,7 +1600,7 @@ def _unreachable_server_message(base_url: str) -> str:
             f"It may have stopped — run `{cli_invocation()} stop`, then try again. "
             f"Server logs are under {process_log_dir_reference('server')}."
         )
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     return (
         f"Could not connect to the Omnigent server at {display_server_url(base_url)}. "
@@ -1693,7 +1693,7 @@ async def _prepare_chat_session_via_daemon(
         wait_for_host_online,
         wait_for_runner_online,
     )
-    from omnigent.native_terminal import bind_session_runner
+    from omnigent.native.native_terminal import bind_session_runner
 
     async def resolve_session() -> tuple[str, bool]:
         """Fork, resume, or create the session to bind, and say if it is fresh.

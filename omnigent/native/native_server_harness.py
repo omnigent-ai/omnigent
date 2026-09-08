@@ -2,7 +2,7 @@
 
 The runner owns the native server + SSE/WS forwarder; this executor is the
 harness-side seam that injects web turns over a
-:class:`~omnigent.native_server_transport.NativeServerTransport`. It is
+:class:`~omnigent.native.native_server_transport.NativeServerTransport`. It is
 deliberately thin and transport-agnostic — the same orchestration drives
 both codex-native (WS JSON-RPC) and opencode-native (HTTP + SSE):
 
@@ -31,7 +31,7 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.native_server_transport import NativePrompt, NativeServerTransport
+from omnigent.native.native_server_transport import NativePrompt, NativeServerTransport
 
 _logger = logging.getLogger(__name__)
 

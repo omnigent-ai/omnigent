@@ -229,7 +229,7 @@ class TestRegistration:
         assert is_native_harness("native-kimi") is True
 
     def test_native_coding_agent_record(self) -> None:
-        from omnigent.native_coding_agents import native_coding_agent_for_harness
+        from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 
         agent = native_coding_agent_for_harness("kimi-native")
         assert agent is not None

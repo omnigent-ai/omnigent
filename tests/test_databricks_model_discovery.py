@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent.databricks_model_discovery import discover_databricks_claude_catalog
+from omnigent.models.databricks_model_discovery import discover_databricks_claude_catalog
 
 # One-shot stubs for the two discovery endpoints: ``(status, json_payload)``,
 # with a ``None`` payload meaning "no body" (a bare error response).
@@ -235,7 +235,7 @@ def test_truncated_pagination_warns(caplog: pytest.LogCaptureFixture) -> None:
             },
         )
 
-    with caplog.at_level("WARNING", logger="omnigent.databricks_model_discovery"):
+    with caplog.at_level("WARNING", logger="omnigent.models.databricks_model_discovery"):
         families = discover_databricks_claude_catalog(
             "https://workspace.example.com",
             "token",
@@ -293,7 +293,7 @@ def test_a_model_only_unity_catalog_serves_keeps_its_own_spelling() -> None:
 
 
 def test_family_shim_warns_and_delegates_to_the_catalog() -> None:
-    from omnigent.databricks_model_discovery import discover_databricks_claude_models
+    from omnigent.models.databricks_model_discovery import discover_databricks_claude_models
 
     def _handler(request: httpx.Request) -> httpx.Response:
         payload = (
@@ -314,7 +314,7 @@ def test_family_shim_warns_and_delegates_to_the_catalog() -> None:
 
 def _discover_codex(model_services: list[dict[str, str]]) -> tuple[str, ...]:
     """Run codex discovery against a canned ``system.ai`` model-services page."""
-    from omnigent.databricks_model_discovery import discover_databricks_codex_models
+    from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
 
     def _handler(request: httpx.Request) -> httpx.Response:
         assert request.url.params["parent"] == "schemas/system.ai"
@@ -365,7 +365,7 @@ def test_discover_codex_models_empty_listing_is_authoritative() -> None:
 
 def test_select_servable_model_matches_legacy_spelling() -> None:
     """A legacy ``databricks-`` request resolves to the served ``system.ai.`` id."""
-    from omnigent.databricks_model_discovery import select_servable_model
+    from omnigent.models.databricks_model_discovery import select_servable_model
 
     servable = ("system.ai.gpt-5-6-luna", "system.ai.gpt-5-5")
     assert select_servable_model("databricks-gpt-5-6-luna", servable) == "system.ai.gpt-5-6-luna"

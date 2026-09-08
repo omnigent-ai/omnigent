@@ -68,13 +68,12 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
     extract_summary_text,
 )
-from omnigent.native_coding_agents import (
+from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
 )
@@ -178,6 +177,7 @@ from omnigent.tools.builtins.load_skill import (
     find_skill_by_name,
     format_skill_meta_text,
 )
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
@@ -878,7 +878,7 @@ async def _complete_acp_subagent_child(
     :param title: The sub-agent's display name, used as the summary message's
         author; falls back to *child_key* when empty.
     """
-    from omnigent._native_post_delivery import post_external_session_status
+    from omnigent.native._native_post_delivery import post_external_session_status
 
     try:
         child_id = await asyncio.wait_for(
@@ -5323,12 +5323,12 @@ def create_runner_app(
 
     async def _write_back_codex_catalog(rows: list[_JsonObject]) -> None:
         try:
-            from omnigent import model_catalog_store
             from omnigent.harnesses.codex_native.app_server import (
                 codex_catalog_fingerprint,
                 mark_launch_default,
                 resolve_native_codex_launch,
             )
+            from omnigent.models import model_catalog_store
 
             launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
             fingerprint = codex_catalog_fingerprint(launch)
@@ -5358,7 +5358,7 @@ def create_runner_app(
             bridge_dir_for_session_id,
             enqueue_thinking_level_change,
         )
-        from omnigent.reasoning_effort import to_pi_thinking_level
+        from omnigent.util.reasoning_effort import to_pi_thinking_level
 
         if effort is None or not effort.strip():
             return Response(status_code=204)
@@ -5564,7 +5564,7 @@ def create_runner_app(
             bridge_dir_for_bridge_id,
             inject_slash_command,
         )
-        from omnigent.reasoning_effort import CLAUDE_EFFORTS
+        from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
         if effort is None or effort not in CLAUDE_EFFORTS:
             return Response(status_code=204)
@@ -5649,7 +5649,6 @@ def create_runner_app(
         conv_id: str,
         model: str | None,
     ) -> Response:
-        from omnigent.claude_model_vocabulary import claude_model_command_arg
         from omnigent.harnesses.claude_native.bridge import (
             SWITCH_MODEL_DIALOG_HINT,
             bridge_dir_for_bridge_id,
@@ -5661,6 +5660,7 @@ def create_runner_app(
         from omnigent.harnesses.claude_native.main import (
             resolve_claude_native_model_selection,
         )
+        from omnigent.models.claude_model_vocabulary import claude_model_command_arg
 
         if model is None or not model.strip():
             return Response(status_code=204)
@@ -6237,7 +6237,7 @@ def create_runner_app(
         message: str,
         policy_name: str | None = None,
     ) -> Response:
-        from omnigent.native_cost_popup import launch_cost_popup
+        from omnigent.native.native_cost_popup import launch_cost_popup
 
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "codex", "main") if registry is not None else None
@@ -6271,7 +6271,7 @@ def create_runner_app(
         message: str,
         policy_name: str | None = None,
     ) -> Response:
-        from omnigent.native_cost_popup import launch_cost_popup
+        from omnigent.native.native_cost_popup import launch_cost_popup
 
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "opencode", "main") if registry is not None else None
@@ -6304,7 +6304,7 @@ def create_runner_app(
         message: str,
         policy_name: str | None = None,
     ) -> Response:
-        from omnigent.native_cost_popup import launch_blocked_notice
+        from omnigent.native.native_cost_popup import launch_blocked_notice
 
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "opencode", "main") if registry is not None else None
@@ -6371,7 +6371,7 @@ def create_runner_app(
         harness = _session_harness_name(conv_id)
         if harness not in ("claude-native", "codex-native", "opencode-native"):
             return
-        from omnigent.native_cost_popup import launch_cost_popup, wait_for_tmux_client
+        from omnigent.native.native_cost_popup import launch_cost_popup, wait_for_tmux_client
 
         attached = await asyncio.to_thread(
             wait_for_tmux_client, socket_path, tmux_target, timeout_s=5.0
@@ -7451,7 +7451,7 @@ def create_runner_app(
         # a plugin harness may accept efforts this registry has never heard of.
         _reasoning = _turn_reasoning(conv, msg_body)
         if _reasoning is not None:
-            from omnigent.reasoning_effort import efforts_for_harness, format_supported
+            from omnigent.util.reasoning_effort import efforts_for_harness, format_supported
 
             _effort = _reasoning["effort"]
             _supported = efforts_for_harness(harness_name)
@@ -10381,7 +10381,7 @@ def create_runner_app(
         spec = await _resolve_session_agent_spec(session_id)
         if spec is None:
             return JSONResponse(status_code=200, content={"workers": {}})
-        from omnigent.model_catalog import catalog_for_spec
+        from omnigent.models.model_catalog import catalog_for_spec
 
         try:
             catalog = await asyncio.to_thread(catalog_for_spec, spec)
@@ -10522,7 +10522,10 @@ def create_runner_app(
 
     def _model_configuration_source(session_id: str) -> dict[str, str] | None:
         """Return the session's non-secret model-provider coordinates."""
-        from omnigent.model_catalog import model_configuration_source, resolve_model_provider
+        from omnigent.models.model_catalog import (
+            model_configuration_source,
+            resolve_model_provider,
+        )
 
         spec_entry = _session_spec_cache.get(session_id)
         if spec_entry is None:
@@ -11531,7 +11534,7 @@ def create_runner_app(
         and _pane_reaper_registry is not None
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
-        from omnigent.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
+        from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
             PANE_OUTPUT_BUSY_WINDOW_S,

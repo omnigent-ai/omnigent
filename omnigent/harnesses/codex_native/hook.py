@@ -6,7 +6,7 @@ per-session private ``CODEX_HOME`` (see
 a short subprocess before/after each built-in tool call, piping the hook
 payload on stdin and reading a verdict on stdout. The conversion to/from
 the Omnigent policy schema is shared with the Claude-native hook via
-:mod:`omnigent.native_policy_hook`.
+:mod:`omnigent.native.native_policy_hook`.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_policy_hook_config,
 )
-from omnigent.native_policy_hook import (
+from omnigent.native.native_policy_hook import (
     evaluation_response_to_hook_output,
     fail_ask_hook_output,
     hook_payload_to_evaluation_request,
@@ -75,7 +75,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
 
     Reads the hook JSON payload from stdin, converts it into the
     proto-compatible ``EvaluationRequest`` schema via
-    :func:`omnigent.native_policy_hook.hook_payload_to_evaluation_request`,
+    :func:`omnigent.native.native_policy_hook.hook_payload_to_evaluation_request`,
     POSTs to ``/v1/sessions/{id}/policies/evaluate``, and converts the
     ``EvaluationResponse`` back into Codex's hook output format
     (``hookSpecificOutput.permissionDecision`` for PreToolUse;
@@ -447,7 +447,7 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
     cost-budget gate reads the routed model rather than the launch one.
 
     The routed id is resolved against this pane's live ``model/list`` first
-    (see :mod:`omnigent.codex_model_vocabulary`), which is both the spelling
+    (see :mod:`omnigent.models.codex_model_vocabulary`), which is both the spelling
     translation and the reachability check. The routing verdict comes from a
     server-side gateway map that can go stale, and switching a pane onto a
     model its gateway cannot serve fails silently at the next turn — so a
@@ -461,9 +461,9 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
     """
     import asyncio
 
-    from omnigent.codex_model_vocabulary import codex_reachable_model_slug
     from omnigent.harnesses.codex_native.app_server import client_for_transport
     from omnigent.harnesses.codex_native.bridge import write_codex_config_model
+    from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug
     from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
 
     state = read_bridge_state(bridge_dir)

@@ -21,7 +21,7 @@ import logging
 import re
 from dataclasses import dataclass
 
-from omnigent.json_types import JsonObject
+from omnigent.util.json_types import JsonObject
 
 _logger = logging.getLogger(__name__)
 

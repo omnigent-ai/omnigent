@@ -374,7 +374,7 @@ def discover_databricks_codex_models(
     :raises httpx.HTTPError: When the listing cannot be read.
     :raises ValueError: When the listing is malformed.
     """
-    from omnigent.model_override import is_codex_compatible_model
+    from omnigent.models.model_override import is_codex_compatible_model
 
     headers = {"Authorization": f"Bearer {token}"}
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
@@ -396,8 +396,8 @@ def _codex_preference_rank(model_id: str) -> tuple[int, int, int, int, str]:
     :param model_id: A servable id, e.g. ``"system.ai.gpt-5-6-sol"``.
     :returns: A sort key; compare descending.
     """
-    from omnigent.codex_model_vocabulary import comparable_model_id
-    from omnigent.model_fallbacks import static_model_fallback
+    from omnigent.models.codex_model_vocabulary import comparable_model_id
+    from omnigent.models.model_fallbacks import static_model_fallback
     from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 
     bare = comparable_model_id(model_id)

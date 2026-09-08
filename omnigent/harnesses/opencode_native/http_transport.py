@@ -1,7 +1,7 @@
 """OpenCode HTTP + SSE implementation of :class:`NativeServerTransport`.
 
 All OpenCode wire details live here;
-:class:`omnigent.native_server_harness.NativeServerHarness` drives it through
+:class:`omnigent.native.native_server_harness.NativeServerHarness` drives it through
 the transport protocol only.
 
 The transport can build its client from three sources, in priority order:
@@ -25,14 +25,14 @@ from omnigent.harnesses.opencode_native.app_server import (
 )
 from omnigent.harnesses.opencode_native.bridge import read_bridge_state
 from omnigent.harnesses.opencode_native.client import OpenCodeClient
-from omnigent.json_types import JsonObject as _JsonObject
-from omnigent.native_server_transport import (
+from omnigent.native.native_server_transport import (
     NativeEvent,
     NativeLaunchConfig,
     NativePermissionDecision,
     NativePrompt,
     NativeServerHandle,
 )
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 

@@ -30,7 +30,7 @@ class StaticModelFallback:
 #: listing are simply not ranked by it.
 _CODEX_ARM_PREFERENCE = StaticModelFallback(
     model_ids=("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.5"),
-    owner="Databricks model discovery (omnigent.databricks_model_discovery)",
+    owner="Databricks model discovery (omnigent.models.databricks_model_discovery)",
     provenance="Omnigent's release-curated Codex arm ordering",
     discovery_gap="a workspace listing ranks models by neither recency nor capability",
 )

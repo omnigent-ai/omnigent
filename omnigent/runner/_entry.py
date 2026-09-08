@@ -1468,7 +1468,7 @@ def create_app(
     # harnesses — see native_bridge_common.reap_orphaned_native_bridge_dirs.
     # Best-effort: a sweep failure must never crash runner startup.
     try:
-        from omnigent.native_bridge_common import reap_orphaned_native_bridge_dirs
+        from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
 
         _reaped_bridge_dirs = reap_orphaned_native_bridge_dirs()
         if _reaped_bridge_dirs:

@@ -63,7 +63,6 @@ from pathlib import Path
 
 import httpx
 
-from omnigent._native_post_delivery import post_session_event_with_retry
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -98,6 +97,7 @@ from omnigent.harnesses.antigravity_native.steps import (
     pending_interaction,
 )
 from omnigent.harnesses.claude_native.bridge import url_component
+from omnigent.native._native_post_delivery import post_session_event_with_retry
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 _logger = logging.getLogger(__name__)

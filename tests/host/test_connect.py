@@ -88,7 +88,7 @@ def _isolated_model_catalog_store(
     seeing the real default layout.
     """
     store_dir = tmp_path_factory.mktemp("model_catalog_store")
-    monkeypatch.setattr("omnigent.model_catalog_store._data_dir", lambda: store_dir)
+    monkeypatch.setattr("omnigent.models.model_catalog_store._data_dir", lambda: store_dir)
 
 
 @pytest.fixture(autouse=True)
@@ -4227,7 +4227,7 @@ async def test_run_sweeps_orphaned_native_bridge_dirs_on_startup(
     _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
     sweeps: list[int] = []
     monkeypatch.setattr(
-        "omnigent.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
         lambda: sweeps.append(1) or 3,
     )
     host = _host()
@@ -4252,7 +4252,7 @@ async def test_run_survives_a_failing_native_bridge_dir_sweep(
         raise OSError("bridge root unreadable")
 
     monkeypatch.setattr(
-        "omnigent.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
         _boom,
     )
     host = _host()
@@ -4387,7 +4387,7 @@ async def test_handle_model_options_serves_claude_sdk_endpoint_listing(
 ) -> None:
     """SDK-mode Claude is a pass-through client, so the endpoint listing is
     the harness truth — served in the exact wire spelling the SDK sends."""
-    from omnigent.model_catalog import ModelEntry, ModelListing
+    from omnigent.models.model_catalog import ModelEntry, ModelListing
 
     def _fake_listing(spec: object, harness: str) -> ModelListing:
         assert harness == "claude-sdk"
@@ -4401,7 +4401,7 @@ async def test_handle_model_options_serves_claude_sdk_endpoint_listing(
             note="test catalog",
         )
 
-    monkeypatch.setattr("omnigent.model_catalog.list_models_for_worker", _fake_listing)
+    monkeypatch.setattr("omnigent.models.model_catalog.list_models_for_worker", _fake_listing)
     host = _make_host_process()
 
     result = await host._handle_model_options(
@@ -4430,7 +4430,7 @@ async def test_handle_model_options_claude_sdk_rides_the_probe_when_endpoints_li
     probed listing is the truth for this lane too.
     """
     from omnigent.host.connect import ModelOptionsResult
-    from omnigent.model_catalog import ModelListing
+    from omnigent.models.model_catalog import ModelListing
 
     def _fake_listing(spec: object, harness: str) -> ModelListing:
         assert harness == "claude-sdk"
@@ -4441,7 +4441,7 @@ async def test_handle_model_options_claude_sdk_rides_the_probe_when_endpoints_li
             note="the claude CLI login exposes no model-listing API before launch",
         )
 
-    monkeypatch.setattr("omnigent.model_catalog.list_models_for_worker", _fake_listing)
+    monkeypatch.setattr("omnigent.models.model_catalog.list_models_for_worker", _fake_listing)
     host = _make_host_process()
 
     async def _fake_probed() -> ModelOptionsResult:

@@ -8,7 +8,6 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from omnigent.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     REQUEST_SESSION_ID_ENV_VAR,
@@ -35,6 +34,7 @@ from omnigent.inner.executor import (
     describe_exception,
 )
 from omnigent.inner.native_attachments import attachment_reference_line
+from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
 

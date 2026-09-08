@@ -3,7 +3,7 @@
 Registers alongside the sub-agent dispatch surface so an orchestrator
 can deterministically learn which models each worker (and it itself)
 can run before passing an ``args.model`` to ``sys_session_send``. The
-enumeration logic lives in :mod:`omnigent.model_catalog`; the runner
+enumeration logic lives in :mod:`omnigent.models.model_catalog`; the runner
 dispatches this tool locally (see ``omnigent/runner/tool_dispatch.py``)
 and the in-process path runs the same enumerator via :meth:`invoke`.
 """
@@ -95,6 +95,6 @@ class SysListModelsTool(Tool):
             ``{source, verified, models, note}`` row.
         """
         del arguments, ctx
-        from omnigent.model_catalog import catalog_for_spec
+        from omnigent.models.model_catalog import catalog_for_spec
 
         return json.dumps(catalog_for_spec(self._spec))

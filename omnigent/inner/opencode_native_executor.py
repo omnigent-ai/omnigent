@@ -1,6 +1,6 @@
 """Executor that bridges Omnigent web turns into a native OpenCode session.
 
-Built on :class:`omnigent.native_server_harness.NativeServerHarness`: the
+Built on :class:`omnigent.native.native_server_harness.NativeServerHarness`: the
 runner owns the ``opencode serve`` process + SSE forwarder, and this
 executor injects the latest web turn over the
 :class:`omnigent.harnesses.opencode_native.http_transport.OpenCodeHttpTransport` using the
@@ -24,8 +24,8 @@ from omnigent.harnesses.opencode_native.bridge import (
     read_bridge_state,
 )
 from omnigent.harnesses.opencode_native.http_transport import OpenCodeHttpTransport
-from omnigent.native_server_harness import NativeServerHarness
-from omnigent.native_server_transport import NativePrompt
+from omnigent.native.native_server_harness import NativeServerHarness
+from omnigent.native.native_server_transport import NativePrompt
 
 # Canonical harness id, surfaced in harness error messages.
 OPENCODE_NATIVE_HARNESS_ID = "opencode-native"

@@ -85,7 +85,7 @@ from omnigent.inner.executor import (
     describe_exception,
 )
 from omnigent.llms.errors import PermanentLLMError
-from omnigent.reasoning_effort import ANTIGRAVITY_EFFORTS, validate_effort_or_llm_error
+from omnigent.util.reasoning_effort import ANTIGRAVITY_EFFORTS, validate_effort_or_llm_error
 
 _logger = logging.getLogger(__name__)
 

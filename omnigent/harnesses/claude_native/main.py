@@ -22,7 +22,6 @@ import subprocess
 import sys
 import uuid
 
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
@@ -31,6 +30,7 @@ from omnigent.runtime.tool_result_replay import (
     strip_unparseable_image_output,
     tool_result_content_blocks,
 )
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 # termios/tty are POSIX-only and drive the native (tmux/PTY) Claude terminal,
 # which is disabled on Windows. Guard the import so static checking keeps the
@@ -64,8 +64,6 @@ from omnigent_client._http import is_loopback_url
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
-from omnigent import model_catalog
-from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import (
@@ -81,13 +79,6 @@ from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
 from omnigent.claude_launcher import resolve_claude_launch
-from omnigent.claude_model_vocabulary import (
-    ALIAS_MODEL_ENV_VARS,
-    CUSTOM_MODEL_OPTION_ENV_VAR,
-    CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
-    LEGACY_CUSTOM_SLOT_ROW_ID,
-    claude_model_alias,
-)
 from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
@@ -119,23 +110,32 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
-from omnigent.native_coding_agents import native_shell_terminal_spec
-from omnigent.native_terminal import (
+from omnigent.models import model_catalog
+from omnigent.models.claude_model_vocabulary import (
+    ALIAS_MODEL_ENV_VARS,
+    CUSTOM_MODEL_OPTION_ENV_VAR,
+    CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
+    LEGACY_CUSTOM_SLOT_ROW_ID,
+    claude_model_alias,
+)
+from omnigent.native._native_resume_hint import echo_native_resume_hint
+from omnigent.native.native_coding_agents import native_shell_terminal_spec
+from omnigent.native.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
 )
-from omnigent.native_terminal import (
+from omnigent.native.native_terminal import (
     DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
 )
-from omnigent.native_terminal import (
+from omnigent.native.native_terminal import (
     DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
 )
-from omnigent.native_terminal import (
+from omnigent.native.native_terminal import (
     bind_session_runner as _bind_session_runner,
 )
-from omnigent.native_terminal import (
+from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
-from omnigent.native_terminal import (
+from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
 from omnigent.process_logging import log_info_once
@@ -447,7 +447,7 @@ def _claude_family(token: str) -> str | None:
         ``"claude-opus-4-8"``.
     :returns: The family alias, e.g. ``"opus"``, or ``None`` for none.
     """
-    from omnigent.claude_model_vocabulary import claude_model_alias
+    from omnigent.models.claude_model_vocabulary import claude_model_alias
 
     alias = claude_model_alias(token, {})
     return alias.partition("[")[0] if alias else None
@@ -476,7 +476,7 @@ def claude_catalog_serves_model(
         own login).
     :returns: ``True`` when the launch can run *model* against this catalog.
     """
-    from omnigent.model_catalog_store import catalog_contains
+    from omnigent.models.model_catalog_store import catalog_contains
 
     if catalog_contains(rows, model):
         return True
@@ -513,8 +513,8 @@ def claude_catalog_launch_spelling(
     :param model: A picker id or model id, e.g. ``"system.ai.claude-opus-5"``.
     :returns: The catalog's launch spelling for the model, or ``None``.
     """
-    from omnigent.claude_model_vocabulary import prefix_folded_model_id
-    from omnigent.model_catalog_store import catalog_contains
+    from omnigent.models.claude_model_vocabulary import prefix_folded_model_id
+    from omnigent.models.model_catalog_store import catalog_contains
 
     if catalog_contains(rows, model):
         return model
@@ -628,7 +628,7 @@ def claude_config_with_routed_arms_pinned(
     :returns: ``claude_config`` itself when no pin changes, otherwise a copy
         with the alias env repointed.
     """
-    from omnigent.claude_model_vocabulary import normalized_model_id
+    from omnigent.models.claude_model_vocabulary import normalized_model_id
 
     if claude_config is None or not routed_arms:
         return claude_config
@@ -681,7 +681,7 @@ def claude_config_with_launch_model_pinned(
         no slot change is needed, otherwise a copy with the custom-option
         env set.
     """
-    from omnigent.claude_model_vocabulary import (
+    from omnigent.models.claude_model_vocabulary import (
         claude_model_command_arg,
         normalized_model_id,
     )
@@ -1205,7 +1205,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     :returns: A stable fingerprint string.
     """
     from omnigent.claude_launcher import resolve_claude_launch
-    from omnigent.model_catalog_store import binary_identity, fingerprint_of
+    from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
 
     command, _ = resolve_claude_launch("claude", [])
     return fingerprint_of(
@@ -1300,7 +1300,7 @@ async def claude_launch_catalog(
     :param claude_config: The resolved launch config, or ``None``.
     :returns: Catalog rows, or ``None`` when no catalog could be obtained.
     """
-    from omnigent import model_catalog_store
+    from omnigent.models import model_catalog_store
 
     fingerprint = claude_catalog_fingerprint(claude_config)
     return await model_catalog_store.ensure_catalog(
@@ -1321,7 +1321,7 @@ async def claude_reprobed_launch_catalog(
     :param claude_config: The resolved launch config, or ``None``.
     :returns: The fresh rows, or ``None`` when the probe failed.
     """
-    from omnigent import model_catalog_store
+    from omnigent.models import model_catalog_store
 
     fingerprint = claude_catalog_fingerprint(claude_config)
     return await model_catalog_store.reprobe_catalog(
@@ -1336,7 +1336,7 @@ def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None
     :param claude_config: The resolved launch config, or ``None``.
     :returns: ``True`` when the store holds only a stale entry.
     """
-    from omnigent import model_catalog_store
+    from omnigent.models import model_catalog_store
 
     return model_catalog_store.catalog_is_stale(
         "claude-native", claude_catalog_fingerprint(claude_config)
@@ -2687,7 +2687,7 @@ def _ucode_config_for_profile(
     if refresh_models:
         live_models: dict[str, str] | None = None
         try:
-            from omnigent.databricks_model_discovery import (
+            from omnigent.models.databricks_model_discovery import (
                 discover_databricks_claude_catalog,
             )
             from omnigent.runtime.credentials.databricks import (
@@ -6203,7 +6203,7 @@ def _websocket_connect(
     import websockets
 
     from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
-    from omnigent.tls import client_ssl_context
+    from omnigent.util.tls import client_ssl_context
 
     # Identify as a first-party client so the server's WebSocket origin
     # guard (CSWSH protection) allows the handshake — this attach client

@@ -33,7 +33,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from omnigent import native_bridge_common
+from omnigent.native import native_bridge_common
 
 # Env var the runner stamps on the harness process so the executor can
 # locate its bridge directory. Mirrors ``HARNESS_CODEX_NATIVE_BRIDGE_DIR``.
@@ -61,7 +61,7 @@ _XDG_CONFIG_DIR = "xdg-config"
 _MCP_BRIDGE_CONFIG_FILE = "bridge.json"
 # AP-routing snapshot the detached cost-approval popup process reads to resolve
 # the elicitation against the Omnigent server (mirrors codex-native's
-# ``policy_hook.json``; consumed by ``omnigent.native_cost_popup``).
+# ``policy_hook.json``; consumed by ``omnigent.native.native_cost_popup``).
 _COST_POPUP_CONFIG_FILE = "cost_popup.json"
 # Filename of the opencode plugin that bridges opencode's lifecycle hooks to the
 # Omnigent policy engine (REQUEST + TOOL_RESULT phases the reactive
@@ -395,7 +395,7 @@ def write_cost_popup_config(
     Write the AP-routing snapshot the cost-approval popup reads.
 
     The cost-budget approval modal runs as a detached
-    ``omnigent.native_cost_popup`` subprocess inside a ``tmux display-popup`` on
+    ``omnigent.native.native_cost_popup`` subprocess inside a ``tmux display-popup`` on
     the opencode pane; it must POST the verdict to the Omnigent server but cannot
     inherit the forwarder's in-memory client, so the base URL + a one-shot auth
     header snapshot are persisted here (same contract as codex-native's

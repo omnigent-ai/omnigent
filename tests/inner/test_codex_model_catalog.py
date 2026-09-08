@@ -15,13 +15,13 @@ from typing import Any
 
 import pytest
 
-from omnigent.codex_model_vocabulary import EXTENDED_CATALOG_MODELS
 from omnigent.inner import codex_executor
 from omnigent.inner.codex_executor import (
     extended_model_catalog,
     set_codex_model_catalog_path,
     write_codex_model_catalog,
 )
+from omnigent.models.codex_model_vocabulary import EXTENDED_CATALOG_MODELS
 
 _GLM_SLUG = EXTENDED_CATALOG_MODELS["glm-5-2"]
 

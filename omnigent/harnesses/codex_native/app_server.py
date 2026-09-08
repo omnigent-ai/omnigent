@@ -25,15 +25,14 @@ from cachetools import TTLCache
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
-from omnigent import model_catalog
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.models import model_catalog
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.spec.types import AgentSpec
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
 from omnigent.harnesses.codex_native.process_registry import (
     CodexNativeProcessOwnerLock,
@@ -65,6 +64,7 @@ from omnigent.inner.codex_executor import (
     write_codex_hooks_file,
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
+from omnigent.models.codex_model_vocabulary import codex_spawn_model
 from omnigent.process_logging import log_info_once, log_once
 
 _logger = logging.getLogger(__name__)
@@ -296,7 +296,7 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :param model: Validated model id to pin.
     """
-    from omnigent.reasoning_effort import clamp_effort_for_model
+    from omnigent.util.reasoning_effort import clamp_effort_for_model
 
     config_path = codex_home / "config.toml"
     # Same symlink-materialization dance as the MCP injection: never edit
@@ -942,7 +942,7 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
     :param pinned_model: The model the session runs, or ``None``.
     :returns: The rows with a single default marked.
     """
-    from omnigent.codex_model_vocabulary import comparable_model_id
+    from omnigent.models.codex_model_vocabulary import comparable_model_id
 
     codex_default_index: int | None = None
     pinned_index: int | None = None
@@ -1057,7 +1057,7 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
         one the caller's probe would launch.
     :returns: A stable fingerprint string.
     """
-    from omnigent.model_catalog_store import binary_identity, fingerprint_of
+    from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
 
     return fingerprint_of(
         "codex-native",
@@ -1072,7 +1072,7 @@ async def _codex_launch_catalog(
     *, codex_path: str | None, launch: NativeCodexLaunch | None, reprobe: bool
 ) -> list[_JsonObject] | None:
     """Read or refresh one launch shape without resolving a different probe shape."""
-    from omnigent import model_catalog_store
+    from omnigent.models import model_catalog_store
 
     try:
         if launch is None:
@@ -1146,7 +1146,7 @@ async def codex_launch_catalog_is_stale(
     :returns: ``True`` when the store holds only a stale entry; ``False``
         when it is fresh, absent, or the launch shape cannot resolve.
     """
-    from omnigent import model_catalog_store
+    from omnigent.models import model_catalog_store
 
     try:
         if launch is None:
@@ -2276,7 +2276,7 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
         servable one.
     :returns: The model id to pin on the codex launch.
     """
-    from omnigent.databricks_model_discovery import (
+    from omnigent.models.databricks_model_discovery import (
         discover_databricks_codex_models,
         select_servable_model,
     )

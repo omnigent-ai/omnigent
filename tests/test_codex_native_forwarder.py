@@ -2164,7 +2164,7 @@ async def test_post_session_event_records_connectivity_failure_for_watchdog(
     ``_log_post_transport_failure``) so the harness idle-turn watchdog can name
     the connectivity cause instead of a generic "wedged LLM" reason.
     """
-    from omnigent import _native_forwarder_health as health
+    from omnigent.native import _native_forwarder_health as health
 
     class _AlwaysConnectError:
         """Stub client whose every POST fails to connect."""

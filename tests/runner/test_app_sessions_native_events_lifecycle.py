@@ -1364,12 +1364,12 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
     a runner restart: an expired entry re-reads the store instead of serving
     the rows it cached at first read, and a warm store costs no new probe.
     """
-    from omnigent import model_catalog_store
     from omnigent.harnesses.claude_native.main import (
         ClaudeModelProbe,
         ClaudeNativeUcodeConfig,
         claude_catalog_fingerprint,
     )
+    from omnigent.models import model_catalog_store
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
     monkeypatch.setattr(

@@ -10,7 +10,6 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import native_policy_hook
 from omnigent.harnesses.codex_native import hook as codex_native_hook
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
@@ -19,6 +18,7 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state,
     write_policy_hook_config,
 )
+from omnigent.native import native_policy_hook
 from tests.native_hook_helpers import make_failing_client
 
 

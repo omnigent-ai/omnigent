@@ -79,7 +79,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
 
 def test_native_cancel_capability_follows_stop_registry() -> None:
     """Parent cancel capability must track ``_UNIFORM_STOP`` plus Claude."""
-    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
     from omnigent.runner.native.interrupt import (
         _UNIFORM_STOP,
         native_cancel_capability,

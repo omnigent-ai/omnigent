@@ -11,7 +11,6 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import native_policy_hook
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     ClaudeNativeHookInterpreterMismatchError,
@@ -22,6 +21,7 @@ from omnigent.harnesses.claude_native.bridge import (
     validate_claude_hook_interpreter_compatibility,
     write_active_session_id,
 )
+from omnigent.native import native_policy_hook
 from tests.native_hook_helpers import make_failing_client
 
 

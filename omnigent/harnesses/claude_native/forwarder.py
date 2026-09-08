@@ -16,11 +16,6 @@ from pathlib import Path
 
 import httpx
 
-from omnigent._native_post_delivery import (
-    append_dead_letter,
-    post_external_session_status,
-    post_may_have_been_delivered,
-)
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -48,8 +43,13 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
-from omnigent.model_metadata import concrete_reported_model
-from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
+from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native._native_post_delivery import (
+    append_dead_letter,
+    post_external_session_status,
+    post_may_have_been_delivered,
+)
+from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 
 _FORWARDER_STATE_FILE = "transcript_forwarder.json"
 _HOOK_STATE_FILE = "hook_forwarder.json"

@@ -607,7 +607,7 @@ async def resolve_turn_route(
         family guard) are not failures and stay chipless. ``None`` skips it.
     :returns: The verdict the hook enforces.
     """
-    from omnigent.codex_model_vocabulary import comparable_model_id
+    from omnigent.models.codex_model_vocabulary import comparable_model_id
 
     if conv is None:
         return _allow("session not found")
@@ -1426,12 +1426,15 @@ async def _apply_routed_model(
     """
     if harness != "claude-native" or not model:
         return True
-    from omnigent.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
     from omnigent.harnesses.claude_native.bridge import (
         SWITCH_MODEL_DIALOG_HINT,
         inject_slash_command,
         read_claude_status_model,
         read_model_env,
+    )
+    from omnigent.models.claude_model_vocabulary import (
+        claude_model_command_arg,
+        normalized_model_id,
     )
 
     live = read_claude_status_model(bridge_dir)

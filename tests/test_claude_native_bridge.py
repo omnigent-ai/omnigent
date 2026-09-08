@@ -24,7 +24,6 @@ from urllib.error import URLError
 
 import pytest
 
-from omnigent import native_cost_popup
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
@@ -64,7 +63,8 @@ from omnigent.inner.datamodel import (
     CredentialSourceSpec,
     OSEnvSandboxSpec,
 )
-from omnigent.reasoning_effort import CLAUDE_EFFORTS
+from omnigent.native import native_cost_popup
+from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 
 @pytest.fixture(autouse=True)
@@ -6934,7 +6934,7 @@ def test_display_cost_approval_popup_builds_detached_tmux_command(
     cost-popup module with all resolve inputs.
 
     Proves the modal targets the right tmux socket + pane + attached
-    client (``-c``), launches :mod:`omnigent.native_cost_popup`, and
+    client (``-c``), launches :mod:`omnigent.native.native_cost_popup`, and
     forwards the session/elicitation/message plus THIS bridge's
     ``permission_hook.json`` (where the popup reads the Omnigent url/token). A
     failure means native approval would render at the wrong pane/client,
@@ -6982,7 +6982,7 @@ def test_display_cost_approval_popup_builds_detached_tmux_command(
     assert args[args.index("-t") + 1] == "claude:0.0"
     # Inner command runs the popup module with every resolve input.
     inner = shlex.split(args[-1])
-    assert "omnigent.native_cost_popup" in inner
+    assert "omnigent.native.native_cost_popup" in inner
     assert "conv_abc123" in inner  # --session-id value
     assert "elicit_deadbeef" in inner  # --elicitation-id value
     assert "Cost $0.12 crossed the $0.10 checkpoint. Continue?" in inner  # --message

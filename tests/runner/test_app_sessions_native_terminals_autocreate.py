@@ -87,7 +87,7 @@ def test_read_relay_policy_config_returns_coords_from_tool_relay_json(
     tmp_path: Path,
 ) -> None:
     """read_relay_policy_config extracts relay URL, token, and session_id."""
-    from omnigent.native_policy_hook import read_relay_policy_config
+    from omnigent.native.native_policy_hook import read_relay_policy_config
 
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -101,7 +101,7 @@ def test_read_relay_policy_config_returns_coords_from_tool_relay_json(
 
 def test_read_relay_policy_config_returns_none_when_missing(tmp_path: Path) -> None:
     """read_relay_policy_config returns None when tool_relay.json absent."""
-    from omnigent.native_policy_hook import read_relay_policy_config
+    from omnigent.native.native_policy_hook import read_relay_policy_config
 
     assert read_relay_policy_config(tmp_path) is None
 
@@ -110,7 +110,7 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
     tmp_path: Path,
 ) -> None:
     """read_relay_policy_config returns None when session_id absent (relay not policy-capable)."""
-    from omnigent.native_policy_hook import read_relay_policy_config
+    from omnigent.native.native_policy_hook import read_relay_policy_config
 
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -3941,8 +3941,8 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
     import os
     import time
 
-    from omnigent import model_catalog_store
     from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+    from omnigent.models import model_catalog_store
     from tests.runner.conftest import (
         REAL_CLAUDE_LAUNCH_CATALOG,
         REAL_CLAUDE_REPROBED_LAUNCH_CATALOG,
@@ -4204,8 +4204,8 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
     import os
     import time
 
-    from omnigent import model_catalog_store
     from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+    from omnigent.models import model_catalog_store
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)

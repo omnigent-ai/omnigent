@@ -1,4 +1,4 @@
-"""Tests for :mod:`omnigent.tls` client-TLS trust resolution."""
+"""Tests for :mod:`omnigent.util.tls` client-TLS trust resolution."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import ssl
 import certifi
 import pytest
 
-import omnigent.tls as tls_module
-from omnigent.tls import client_ssl_context, resolve_ca_file
+import omnigent.util.tls as tls_module
+from omnigent.util.tls import client_ssl_context, resolve_ca_file
 
 
 def _verify_paths(cafile: str | None, openssl_cafile: str | None) -> ssl.DefaultVerifyPaths:

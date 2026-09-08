@@ -714,8 +714,8 @@ def test_launch_argv_and_config_pin_name_the_same_model(
     compare in) while argv carries the wire spelling; the guard asserts
     they name the same model, and byte-identity everywhere else.
     """
-    from omnigent.codex_model_vocabulary import comparable_model_id
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.models.codex_model_vocabulary import comparable_model_id
 
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server._find_codex_cli",
@@ -816,8 +816,8 @@ async def test_codex_reprobed_launch_catalog_refreshes_stale_rows_and_persists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An awaited refresh returns the new answer, never the stale cached rows."""
-    from omnigent import model_catalog_store
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.models import model_catalog_store
 
     fingerprint = codex_native_app_server.codex_catalog_fingerprint(_catalog_launch)
     stale = [{"id": "gpt-5.5", "isDefault": True}]
@@ -851,8 +851,8 @@ async def test_codex_reprobed_launch_catalog_joins_existing_probe(
     cancel_waiter: bool,
 ) -> None:
     """Concurrent decisions share the already-running miss or background probe."""
-    from omnigent import model_catalog_store
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.models import model_catalog_store
 
     fingerprint = codex_native_app_server.codex_catalog_fingerprint(_catalog_launch)
     stale = [{"id": "gpt-5.5", "isDefault": True}]
@@ -919,8 +919,8 @@ async def test_codex_reprobed_launch_catalog_cancels_timed_out_probe_and_preserv
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The probe deadline cancels stalled work, not just its shared-task waiter."""
-    from omnigent import model_catalog_store
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.models import model_catalog_store
 
     fingerprint = codex_native_app_server.codex_catalog_fingerprint(_catalog_launch)
     stale = [{"id": "gpt-5.5", "isDefault": True}]
@@ -974,8 +974,8 @@ async def test_codex_reprobed_launch_catalog_preserves_prior_cache_on_no_rows(
     failed: bool,
 ) -> None:
     """An empty or failed refresh cannot erase a previously useful answer."""
-    from omnigent import model_catalog_store
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.models import model_catalog_store
 
     fingerprint = codex_native_app_server.codex_catalog_fingerprint(_catalog_launch)
     stale = [{"id": "gpt-5.5", "isDefault": True}]
@@ -1028,8 +1028,8 @@ async def test_codex_launch_catalog_is_stale_reads_the_default_shape(
     """
     Stale only when the default shape's stored entry is past the TTL.
     """
-    from omnigent import model_catalog_store
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.models import model_catalog_store
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(
@@ -2603,8 +2603,8 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
     pin), and with no launch-pinned model Codex's own default marker
     stands.
     """
-    from omnigent import model_catalog_store
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.models import model_catalog_store
 
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
@@ -2731,7 +2731,7 @@ def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
             return_value=SimpleNamespace(token="tok"),
         ),
         patch(
-            "omnigent.databricks_model_discovery.discover_databricks_codex_models",
+            "omnigent.models.databricks_model_discovery.discover_databricks_codex_models",
             return_value=servable,
         ),
     ):

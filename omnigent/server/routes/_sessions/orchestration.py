@@ -58,8 +58,8 @@ from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
-from omnigent.model_metadata import concrete_reported_model
-from omnigent.native_coding_agents import (
+from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
 )
@@ -331,10 +331,6 @@ from omnigent.server.schemas import (
     SessionUsageEvent,
     SkillSummary,
 )
-from omnigent.session_lifecycle import (
-    labels_with_closed_status,
-    title_without_closed_marker,
-)
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -358,6 +354,10 @@ from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedE
 from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.telemetry.surface import classify_surface as _classify_surface
+from omnigent.util.session_lifecycle import (
+    labels_with_closed_status,
+    title_without_closed_marker,
+)
 
 
 async def _publish_and_wait_for_harness_elicitation(
@@ -4682,7 +4682,7 @@ def _routed_turn_model_spelling(
     options = _model_options_cache.get(session_id)
     if not options:
         return model
-    from omnigent.claude_model_vocabulary import (
+    from omnigent.models.claude_model_vocabulary import (
         claude_model_command_arg,
         model_vocabulary_env,
     )
@@ -8001,7 +8001,7 @@ def _spawn_pins_its_harness(
         return True
     if not body.sub_agent_name:
         return False
-    from omnigent.model_catalog import spec_harness
+    from omnigent.models.model_catalog import spec_harness
 
     sub_spec = _resolve_subagent_spec(
         agent=agent,

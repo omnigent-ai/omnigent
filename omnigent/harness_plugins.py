@@ -88,7 +88,7 @@ class NativeHarnessProvider:
     ``NativeCodingAgent`` is pure identity data; behavior lives here as a
     sibling row keyed by the same ``key``. Every value is a dotted import path
     (``module:attr`` or ``module.attr``) resolved lazily at dispatch time via
-    :mod:`omnigent.native_dispatch`, so building the registry never imports the
+    :mod:`omnigent.native.native_dispatch`, so building the registry never imports the
     runner / CLI / native-harness stack. Optional hooks are ``None`` when the
     behavior is not yet a module-level function the resolver can reach (e.g.
     interrupt/stop handlers that are still runner closures, or the inline

@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from omnigent._platform import stable_user_id
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_QWEN_NATIVE_BRIDGE_DIR"

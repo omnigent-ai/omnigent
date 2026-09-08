@@ -54,12 +54,12 @@ from typing import TYPE_CHECKING, Any, cast
 from urllib import request
 
 from omnigent._platform import is_wsl, stable_user_id
-from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.kiro_native.bridge import bridge_root as kiro_bridge_root
-from omnigent.json_types import JsonObject as _JsonObject
-from omnigent.model_metadata import concrete_reported_model
+from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
+from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     import httpx
@@ -68,12 +68,12 @@ if TYPE_CHECKING:
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.llms.context_window import ModelPricing
 
-from omnigent import native_bridge_common
 from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
 )
-from omnigent.reasoning_effort import CLAUDE_EFFORTS
+from omnigent.native import native_bridge_common
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 _logger = logging.getLogger(__name__)
 
@@ -3969,7 +3969,7 @@ def display_cost_approval_popup(
     """
     Overlay a cost-budget approval modal on the Claude Code tmux pane.
 
-    Launches :mod:`omnigent.native_cost_popup` inside a
+    Launches :mod:`omnigent.native.native_cost_popup` inside a
     ``tmux display-popup``, so a user working in the native terminal —
     not only the web ``ApprovalCard`` — can approve/decline a cost
     checkpoint. The popup script resolves the **same** elicitation Future
@@ -3984,7 +3984,7 @@ def display_cost_approval_popup(
     modal lives on the attached client until the user answers.
 
     Claude-native resolver for the harness-agnostic
-    :func:`omnigent.native_cost_popup.launch_cost_popup`: it reads the
+    :func:`omnigent.native.native_cost_popup.launch_cost_popup`: it reads the
     pane's tmux socket/target from this bridge's ``tmux.json`` and points
     the popup at *config_file* for Omnigent routing (base URL + auth
     headers, so no token lands on the command line), then delegates. The
@@ -4018,7 +4018,7 @@ def display_cost_approval_popup(
         *timeout_s* (the pane isn't up yet); the caller treats this as a
         best-effort miss and the web card remains answerable.
     """
-    from omnigent.native_cost_popup import launch_cost_popup
+    from omnigent.native.native_cost_popup import launch_cost_popup
 
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     launch_cost_popup(
@@ -4951,7 +4951,7 @@ def _tool_relay_handler_factory(
             # Heavy policy imports stay off this module's import path (hook
             # subprocesses import it); the relay runs inside the runner
             # process where these modules are already loaded.
-            from omnigent.native_policy_hook import (
+            from omnigent.native.native_policy_hook import (
                 evaluation_response_to_hook_output,
                 fail_ask_hook_output,
                 hook_payload_to_evaluation_request,

@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from omnigent import native_bridge_common
+from omnigent.native import native_bridge_common
 
 _logger = logging.getLogger(__name__)
 

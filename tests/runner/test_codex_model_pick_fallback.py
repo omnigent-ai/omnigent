@@ -16,10 +16,10 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from omnigent import model_catalog_store
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.codex_native import app_server as codex_app
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.models import model_catalog_store
 from omnigent.runner.app import ResolvedSpec
 from omnigent.runner.native import orchestration as runner_native
 from omnigent.spec.types import AgentSpec, ExecutorSpec

@@ -1,12 +1,12 @@
 """
 Unit tests for the native-terminal cost-approval popup script.
 
-Covers :mod:`omnigent.native_cost_popup` — the program that runs inside
+Covers :mod:`omnigent.native.native_cost_popup` — the program that runs inside
 a ``tmux display-popup`` on a native harness pane, reads an
 approve/decline answer, and POSTs the verdict to the Omnigent elicitation-
 resolve endpoint (the same endpoint the web ApprovalCard uses).
 
-The tests drive the public :func:`omnigent.native_cost_popup.main`
+The tests drive the public :func:`omnigent.native.native_cost_popup.main`
 entry point and assert on the exact HTTP request it issues (URL, method,
 JSON body) and on the no-request invariant when the popup is dismissed.
 """
@@ -22,7 +22,7 @@ from urllib import request
 
 import pytest
 
-from omnigent import native_cost_popup
+from omnigent.native import native_cost_popup
 
 _AP_URL = "http://127.0.0.1:8787"
 _SESSION_ID = "conv_abc123"

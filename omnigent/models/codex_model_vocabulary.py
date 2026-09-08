@@ -48,7 +48,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 #: Catalog prefixes stripped before comparing ids. Same list as
-#: :data:`omnigent.claude_model_vocabulary._CATALOG_PREFIXES`, and equal to
+#: :data:`omnigent.models.claude_model_vocabulary._CATALOG_PREFIXES`, and equal to
 #: :data:`omnigent.server.smart_routing.MODEL_ID_PREFIXES` (both asserted by
 #: ``tests/test_codex_model_vocabulary.py``); duplicated because this module
 #: stays stdlib-only for hook subprocesses, which also means it cannot honour
@@ -77,7 +77,7 @@ EXTENDED_MODEL_EFFORTS: dict[str, tuple[str, ...]] = {_GLM_ARM: ("low", "medium"
 
 #: Effort an extended model falls back to when the session asks for one its
 #: ladder bars. Must agree with
-#: :data:`omnigent.reasoning_effort._MODEL_EFFORT_FALLBACK` (asserted by
+#: :data:`omnigent.util.reasoning_effort._MODEL_EFFORT_FALLBACK` (asserted by
 #: ``test_codex_effort_clamp_matches_the_runtime_clamp``).
 EXTENDED_MODEL_DEFAULT_EFFORT: dict[str, str] = {_GLM_ARM: "medium"}
 

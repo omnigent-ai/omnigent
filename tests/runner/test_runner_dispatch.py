@@ -89,8 +89,8 @@ from omnigent.runtime.harnesses._executor_adapter import (
 from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
-from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
 )
@@ -5626,7 +5626,7 @@ def _install_cancel_pane(
     alive: bool | None,
 ) -> _CancelPane | None:
     """Install a fake terminal registry for one native child's ``main`` pane."""
-    from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+    from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 
     agent = native_coding_agent_for_wrapper_label(wrapper_label)
     assert agent is not None, f"unknown wrapper {wrapper_label!r}"

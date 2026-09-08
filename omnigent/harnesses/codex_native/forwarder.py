@@ -13,18 +13,6 @@ from pathlib import Path
 
 import httpx
 
-from omnigent._native_forwarder_health import (
-    note_post_success as note_native_post_success,
-)
-from omnigent._native_forwarder_health import (
-    record_post_failure as record_native_post_failure,
-)
-from omnigent._native_post_delivery import (
-    RepostResult,
-    append_dead_letter,
-    post_may_have_been_delivered,
-    replay_dead_letters,
-)
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
@@ -58,7 +46,19 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.native._native_forwarder_health import (
+    note_post_success as note_native_post_success,
+)
+from omnigent.native._native_forwarder_health import (
+    record_post_failure as record_native_post_failure,
+)
+from omnigent.native._native_post_delivery import (
+    RepostResult,
+    append_dead_letter,
+    post_may_have_been_delivered,
+    replay_dead_letters,
+)
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 

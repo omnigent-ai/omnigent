@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 import click
 
 from omnigent._platform import stable_user_id
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.harnesses.cursor_native.main import CursorModelOption

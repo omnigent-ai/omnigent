@@ -29,9 +29,9 @@ from omnigent.llms.types import (
     ResponseCompletedEvent,
     ResponseStreamEvent,
 )
-from omnigent.reasoning_effort import OPENAI_EFFORTS, validate_effort_or_llm_error
 from omnigent.runtime.llm_retry import classify_llm_error
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.reasoning_effort import OPENAI_EFFORTS, validate_effort_or_llm_error
 
 _logger = logging.getLogger(__name__)
 

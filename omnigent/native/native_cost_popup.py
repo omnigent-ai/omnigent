@@ -12,7 +12,7 @@ clears).
 The process is launched by the runner-side popup helper (e.g.
 :func:`omnigent.harnesses.claude_native.bridge.display_cost_approval_popup`) as::
 
-    python -I -m omnigent.native_cost_popup \
+    python -I -m omnigent.native.native_cost_popup \
         --config-file <bridge_dir>/cost_popup.json \
         --session-id conv_abc123 \
         --elicitation-id elicit_deadbeef \
@@ -218,7 +218,7 @@ def launch_cost_popup(
         python,
         "-I",
         "-m",
-        "omnigent.native_cost_popup",
+        "omnigent.native.native_cost_popup",
         "--config-file",
         str(config_file),
         "--session-id",
@@ -294,7 +294,15 @@ def launch_blocked_notice(
     if not clients:
         return
     python = python_executable or sys.executable
-    argv = [python, "-I", "-m", "omnigent.native_cost_popup", "--notice", "--message", message]
+    argv = [
+        python,
+        "-I",
+        "-m",
+        "omnigent.native.native_cost_popup",
+        "--notice",
+        "--message",
+        message,
+    ]
     if policy_name:
         argv += ["--policy-name", policy_name]
     inner_cmd = shlex.join(argv)
@@ -522,7 +530,7 @@ def main(argv: list[str] | None = None) -> int:
         clean dismissal, non-zero only via :class:`SystemExit` raised by
         the helpers on a hard failure.
     """
-    parser = argparse.ArgumentParser(prog="omnigent.native_cost_popup")
+    parser = argparse.ArgumentParser(prog="omnigent.native.native_cost_popup")
     parser.add_argument(
         "--notice",
         action="store_true",

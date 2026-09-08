@@ -732,7 +732,7 @@ def _post_hook_with_reattach(
     backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
     import httpx
 
-    from omnigent.native_policy_hook import _is_login_redirect_or_unauthorized
+    from omnigent.native.native_policy_hook import _is_login_redirect_or_unauthorized
 
     timeout = httpx.Timeout(_PERMISSION_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
     # Absolute backstop: even a run of held-poll severs (which don't count
@@ -834,7 +834,7 @@ def _main_permission_request(argv: list[str]) -> int:
     :returns: Process exit code. Returns ``0`` on transport failures so
         Claude Code falls back to its terminal prompt.
     """
-    from omnigent.native_policy_hook import policy_hook_reauth
+    from omnigent.native.native_policy_hook import policy_hook_reauth
 
     args = _parse_permission_args(argv)
     raw = sys.stdin.read()
@@ -909,7 +909,7 @@ def _main_ask_user_question(argv: list[str]) -> int:
     :returns: Process exit code. Returns ``0`` on any failure so Claude Code
         falls back to its terminal TUI prompt rather than blocking.
     """
-    from omnigent.native_policy_hook import policy_hook_reauth
+    from omnigent.native.native_policy_hook import policy_hook_reauth
 
     args = _parse_permission_args(argv)
     raw = sys.stdin.read()
@@ -1013,7 +1013,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     default when no policy matches) emits no output — "no opinion" — so
     Claude's own permission prompt still fires and the
     ``PermissionRequest`` hook can route it to the web UI. See
-    :func:`omnigent.native_policy_hook.evaluation_response_to_hook_output`.
+    :func:`omnigent.native.native_policy_hook.evaluation_response_to_hook_output`.
 
     For ``UserPromptSubmit``, this is the request-phase gate for native
     sessions (the server-level ``_evaluate_input_policy`` skips native
@@ -1045,7 +1045,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     :returns: Process exit code. Always ``0`` — blocking verdicts
         are expressed via the JSON output, not exit codes.
     """
-    from omnigent.native_policy_hook import (
+    from omnigent.native.native_policy_hook import (
         evaluation_response_to_hook_output,
         fail_ask_hook_output,
         hook_payload_to_evaluation_request,

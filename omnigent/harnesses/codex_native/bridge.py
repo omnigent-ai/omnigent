@@ -17,7 +17,7 @@ from pathlib import Path
 
 import tomllib
 
-from omnigent import native_bridge_common
+from omnigent.native import native_bridge_common
 
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
@@ -546,7 +546,7 @@ def write_codex_config_model(bridge_dir: Path, model: str) -> bool:
     :param model: Model id to record, e.g. ``"gpt-5.6-luna"``.
     :returns: ``True`` when the file was updated.
     """
-    from omnigent.reasoning_effort import clamp_effort_for_model
+    from omnigent.util.reasoning_effort import clamp_effort_for_model
 
     config_path = codex_home_for_bridge_dir(bridge_dir) / "config.toml"
     pin_line = f"model = {json.dumps(model)}"

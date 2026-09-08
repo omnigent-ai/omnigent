@@ -50,16 +50,16 @@ from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.env_credentials import (
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harness_aliases import canonicalize_harness
+from omnigent.spec.parser import check_unresolved_env_vars
+from omnigent.util.env_credentials import (
     _ENV_REF_RE,
     env_names_with_omnigent_prefix,
     expand_envvars_with_omnigent_prefix,
     getenv_with_omnigent_prefix,
     omnigent_prefixed_env_name,
 )
-from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_aliases import canonicalize_harness
-from omnigent.spec.parser import check_unresolved_env_vars
 
 _logger = logging.getLogger(__name__)
 

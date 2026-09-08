@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent import native_bridge_common
+from omnigent.native import native_bridge_common
 
 
 def test_write_owner_pid_marker_records_current_pid(tmp_path: Path) -> None:

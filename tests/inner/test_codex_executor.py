@@ -14,8 +14,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from omnigent import _native_forwarder_health as native_forwarder_health
-from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
     CodexExecutor,
@@ -40,7 +38,9 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
-from omnigent.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.models.codex_model_vocabulary import codex_spawn_model
+from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.native import _native_forwarder_health as native_forwarder_health
 
 
 def _run(coro):

@@ -302,7 +302,7 @@ async def forward_cursor_usage_to_session(
     """
     import httpx
 
-    from omnigent._native_post_delivery import post_external_session_status
+    from omnigent.native._native_post_delivery import post_external_session_status
 
     acc = _read_usage_state(bridge_dir)
     timeout = httpx.Timeout(_POST_TIMEOUT_S)

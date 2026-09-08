@@ -343,7 +343,7 @@ def write_policy_hook_config(
     # Wrapper shell script: sets env vars and execs the Python hook. It bakes a
     # one-shot auth token + workspace-routing header, so it is owner-only
     # (0o700) — the secret is never world-readable.
-    from omnigent.native_policy_hook import policy_hook_wrapper_script
+    from omnigent.native.native_policy_hook import policy_hook_wrapper_script
 
     wrapper = hermes_home / "omnigent-policy-hook.sh"
     wrapper.write_text(policy_hook_wrapper_script(server_url, session_id, hook_script_path))
@@ -439,7 +439,7 @@ def inject_relay_into_policy_hook(
         return False
 
     hook_script_path = str(Path(__file__).resolve().parent / "inner" / "hermes_policy_hook.py")
-    from omnigent.native_policy_hook import _RELAY_TOKEN_ENV, _RELAY_URL_ENV
+    from omnigent.native.native_policy_hook import _RELAY_TOKEN_ENV, _RELAY_URL_ENV
 
     new_text = (
         "#!/bin/sh\n"

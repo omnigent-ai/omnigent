@@ -18,11 +18,11 @@ import click
 import httpx
 import pytest
 
-from omnigent import native_terminal
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
 from omnigent.harnesses.codex_native import main as codex_native
 from omnigent.host import daemon_launch
+from omnigent.native import native_terminal
 
 pytestmark = pytest.mark.asyncio
 

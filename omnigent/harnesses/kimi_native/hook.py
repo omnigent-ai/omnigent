@@ -11,7 +11,7 @@ stdin, and reads the decision back from stdout as
   :func:`omnigent.harnesses.claude_native.hook._main_evaluate_policy`: it converts the
   Kimi hook payload into an Omnigent ``EvaluationRequest`` (the snake-cased
   Kimi fields ``tool_name`` / ``tool_input`` / ``hook_event_name`` line up
-  with :func:`omnigent.native_policy_hook.hook_payload_to_evaluation_request`),
+  with :func:`omnigent.native.native_policy_hook.hook_payload_to_evaluation_request`),
   POSTs to ``/v1/sessions/{id}/policies/evaluate``, and emits a ``deny`` only
   for a constraining ``POLICY_ACTION_DENY`` verdict. ``ALLOW`` (the engine's
   no-match default) emits nothing, so kimi's own in-TUI approval prompt still
@@ -51,7 +51,7 @@ from omnigent.harnesses.kimi_native.bridge import (
     read_active_session_id,
     read_hook_config,
 )
-from omnigent.native_policy_hook import (
+from omnigent.native.native_policy_hook import (
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,

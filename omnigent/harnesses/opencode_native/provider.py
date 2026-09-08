@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from omnigent import model_catalog
+from omnigent.models import model_catalog
 
 if TYPE_CHECKING:
     from omnigent.spec.types import MCPServerConfig

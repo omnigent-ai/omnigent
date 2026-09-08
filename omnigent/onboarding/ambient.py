@@ -36,10 +36,10 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.onboarding import codex_auth_readiness
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.onboarding.providers import PROVIDER_ENV_VARS
+from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 
 DetectedKind = Literal["key", "subscription", "local", "cli-config"]
 

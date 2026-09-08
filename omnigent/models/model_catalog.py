@@ -8,7 +8,7 @@ followed by the legacy auth fallthrough the spawn-env builders apply —
 and enumerate that provider's live model listing. The resolved provider
 *kind* is also what the ``sys_session_send`` dispatch gate consults for
 canonical→gateway-local model-id normalization
-(:func:`omnigent.model_override.normalize_model_for_provider`).
+(:func:`omnigent.models.model_override.normalize_model_for_provider`).
 
 Enumeration is deterministic per provider kind:
 
@@ -46,22 +46,22 @@ import httpx
 from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
-from omnigent.model_metadata import (
+from omnigent.models.model_metadata import (
     ModelCapability,
     ModelCostTier,
     ModelIntent,
     ModelMetadata,
     ModelWireAPI,
 )
-from omnigent.model_override import is_codex_compatible_model, model_family_mismatch
-from omnigent.model_resolver import (
+from omnigent.models.model_override import is_codex_compatible_model, model_family_mismatch
+from omnigent.models.model_resolver import (
     ModelResolution,
     ModelResolutionError,
     ModelResolutionRequest,
     resolve_model,
 )
+from omnigent.models.pi_model_compatibility import unsupported_in_pi
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     BEDROCK_KIND,
@@ -72,8 +72,8 @@ from omnigent.onboarding.provider_config import (
     SUBSCRIPTION_KIND,
     ProviderEntry,
 )
-from omnigent.pi_model_compatibility import unsupported_in_pi
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.onboarding.providers import ModelInfo
@@ -383,7 +383,7 @@ def model_family_token(model_id: str) -> str:
     """Tag a model id with the harness family that can serve it.
 
     Shares the token rule with
-    :func:`omnigent.model_override.model_family_mismatch`: Claude ids
+    :func:`omnigent.models.model_override.model_family_mismatch`: Claude ids
     contain ``"claude"``; the ``"openai"`` token covers every
     codex-compatible id (gpt/codex plus the GLM and Kimi families, which
     serve on the same Responses wire).
@@ -855,7 +855,7 @@ def list_models_for_worker(
 
     Resolves the worker's provider, fetches (or replays from the TTL
     cache) its unfiltered model listing, then applies the harness's
-    family rule from :func:`~omnigent.model_override.model_family_mismatch`
+    family rule from :func:`~omnigent.models.model_override.model_family_mismatch`
     — claude harnesses keep Claude ids, codex harnesses keep GPT ids,
     pi keeps everything.
 
