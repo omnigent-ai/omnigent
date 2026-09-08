@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { CommandIcon, WandSparklesIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { COMPOSER_POPOVER_MAX_H, COMPOSER_POPOVER_Z } from "@/pages/chatLayout";
 
 /**
  * Built-in slash commands the web UI recognises directly. Each entry
@@ -200,9 +201,11 @@ export function SlashCommandMenu({
   );
 
   return (
-    <div className="absolute bottom-full left-0 z-10 mb-2 flex items-end gap-2">
+    <div
+      className={cn("absolute bottom-full left-0 mb-2 flex items-end gap-2", COMPOSER_POPOVER_Z)}
+    >
       <div className="w-64 shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu">
-        <div ref={listRef} className="max-h-80 overflow-y-auto">
+        <div ref={listRef} className={cn(COMPOSER_POPOVER_MAX_H, "overflow-y-auto")}>
           {builtinRows.length > 0 && sectionHeader("Commands")}
           {builtinRows.map((row) => (
             <MenuRowButton
@@ -229,7 +232,10 @@ export function SlashCommandMenu({
       {active && (
         <div
           data-testid="slash-menu-detail"
-          className="hidden max-h-80 w-80 shrink-0 overflow-y-auto rounded-[12px] border border-border bg-popover p-2 shadow-menu md:block"
+          className={cn(
+            "hidden w-80 shrink-0 overflow-y-auto rounded-[12px] border border-border bg-popover p-2 shadow-menu md:block",
+            COMPOSER_POPOVER_MAX_H,
+          )}
         >
           <p className="font-mono text-sm font-medium text-foreground">{active.name}</p>
           <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
