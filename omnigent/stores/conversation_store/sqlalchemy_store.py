@@ -76,7 +76,7 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
-from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.session_import.models import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,

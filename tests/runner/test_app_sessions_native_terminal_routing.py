@@ -11,10 +11,8 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import (
-    codex_native_bridge,
-)
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (

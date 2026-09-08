@@ -29,7 +29,7 @@ def _stub_executor_catalog_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     def _resolve(provider_name: str, *, family: str, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(model_id=f"catalog-{provider_name}-{family}-default")
 
-    monkeypatch.setattr("omnigent.model_catalog.resolve_catalog_model", _resolve)
+    monkeypatch.setattr("omnigent.models.model_catalog.resolve_catalog_model", _resolve)
 
 
 # Diagnostic: dump every thread's stack every 90s. The dispatcher's

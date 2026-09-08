@@ -457,6 +457,46 @@ def test_ensure_host_daemon_respawns_on_host_identity_change(
     assert "args" in captured
 
 
+@pytest.mark.parametrize(
+    "configured_host_id",
+    [
+        "host_329c39d03aad39ccf2f8597d596676bd",
+        "329c39d0-3aad-39cc-f2f8-597d596676bd",
+    ],
+)
+def test_ensure_host_daemon_reuses_equivalent_host_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    configured_host_id: str,
+) -> None:
+    """Legacy and dashed forms do not replace a daemon using the bare UUID."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    target = "https://server.example.com"
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target=target,
+        mode="server",
+        server_url=target,
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+        host_id="329c39d03aad39ccf2f8597d596676bd",
+        config_sig=cli.server_config_signature(),
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_load_existing_host_id", lambda: configured_host_id)
+    torn_down: list[str] = []
+    monkeypatch.setattr(
+        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+    )
+
+    _ensure_host_daemon(target)
+
+    assert "args" not in captured
+    assert torn_down == []
+
+
 def test_ensure_host_daemon_respawns_on_config_drift(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1868,7 +1908,7 @@ def test_claude_command_routes_server_through_ensure_backend(
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.claude_native.run_claude_native",
+        "omnigent.harnesses.claude_native.main.run_claude_native",
         _fake_run_claude_native_capture(captured),
     )
 

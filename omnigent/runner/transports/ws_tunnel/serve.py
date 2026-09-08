@@ -59,8 +59,8 @@ from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
     record_websocket_disconnected,
 )
-from omnigent.suspend_watch import watch_for_resume
-from omnigent.tls import client_ssl_context
+from omnigent.util.suspend_watch import watch_for_resume
+from omnigent.util.tls import client_ssl_context
 
 _logger = logging.getLogger(__name__)
 
@@ -463,7 +463,7 @@ async def serve_tunnel(
                     # Show the display form (workspace /omnigent URL, ?o=
                     # when known), not the internal API mount; it round-trips
                     # through `omnigent login` to the same server.
-                    from omnigent.server_url import display_server_url
+                    from omnigent.util.server_url import display_server_url
 
                     raise RuntimeError(
                         f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
@@ -491,7 +491,7 @@ async def serve_tunnel(
                             # --host`, which would need the workspace host,
                             # not the server URL (for workspace-hosted
                             # servers the API mount is the wrong --host).
-                            from omnigent.server_url import display_server_url
+                            from omnigent.util.server_url import display_server_url
 
                             login_hint = (
                                 f"run `omnigent login {display_server_url(server_url)}` "

@@ -18,6 +18,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { authenticatedFetch } from "@/lib/identity";
+import { isTempConvId } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 
 /** True when `id` is the focused conversation and its agent loop is live. */
@@ -845,9 +846,13 @@ async function fetchWorkspaceEnvironment(conversationId: string): Promise<Worksp
  * (``metadata.root`` absent in the 200 response).
  */
 export function useWorkspaceEnvironment(
-  conversationId: string | undefined,
+  rawConversationId: string | undefined,
   options: WorkspaceQueryOptions = {},
 ) {
+  // A `temp:*` id (navigate-first new-chat window) has no server workspace —
+  // normalize to undefined so nothing (env, and the changed/all-files queries
+  // that gate on its result) hits `/v1/sessions/temp:*/resources/*`.
+  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
   const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
     queryKey: ["workspace-environment", conversationId],

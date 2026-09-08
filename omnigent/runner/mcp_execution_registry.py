@@ -17,7 +17,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from time import monotonic
 
-from omnigent.json_types import JsonObject
+from omnigent.util.json_types import JsonObject
 
 _COMPLETED_TTL_S = 300.0
 _MAX_COMPLETED = 1024

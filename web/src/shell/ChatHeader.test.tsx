@@ -69,6 +69,7 @@ function renderHeader(props: {
   boundAgent?: Agent;
   wrapperLabel?: string | null;
   canShare?: boolean;
+  canFork?: boolean;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   hasHeaderMenu?: boolean;
@@ -77,6 +78,7 @@ function renderHeader(props: {
   showFilesPanel?: boolean;
   mobileMenu?: typeof mobileMenu;
   onOpenSidebar?: (peek?: boolean) => void;
+  onFork?: () => void;
 }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -99,9 +101,11 @@ function renderHeader(props: {
             boundAgent={props.boundAgent}
             wrapperLabel={props.wrapperLabel ?? null}
             canShare={props.canShare ?? false}
+            canFork={props.canFork ?? false}
             shareDisabled={props.shareDisabled}
             shareDisabledReason={props.shareDisabledReason}
             onShare={() => {}}
+            onFork={props.onFork ?? (() => {})}
             hasAgentInfo={props.hasAgentInfo ?? false}
             onAgentInfo={() => {}}
             hasHeaderMenu={props.hasHeaderMenu ?? false}
@@ -456,7 +460,9 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
                 boundAgent={undefined}
                 wrapperLabel={null}
                 canShare={false}
+                canFork={false}
                 onShare={() => {}}
+                onFork={() => {}}
                 hasAgentInfo={false}
                 onAgentInfo={() => {}}
                 hasHeaderMenu={false}
@@ -478,7 +484,9 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
               boundAgent={undefined}
               wrapperLabel={null}
               canShare={false}
+              canFork={false}
               onShare={() => {}}
+              onFork={() => {}}
               hasAgentInfo={false}
               onAgentInfo={() => {}}
               hasHeaderMenu={false}
@@ -733,6 +741,30 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
 
     expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
     expect(screen.getByTestId("session-actions-menu")).toBeInTheDocument();
+  });
+
+  it("keeps the desktop fallback menu limited to Fork", () => {
+    const onFork = vi.fn();
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: null,
+      canFork: true,
+      hasAgentInfo: true,
+      hasRailContent: true,
+      showFilesPanel: true,
+      onFork,
+    });
+
+    const trigger = screen.getByTestId("desktop-fork-actions-menu");
+    fireEvent.pointerDown(trigger, { button: 0 });
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Fork",
+    ]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(onFork).toHaveBeenCalledOnce();
   });
 
   it("folds the workspace-rail entries into the one mobile kebab", () => {

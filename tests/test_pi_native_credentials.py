@@ -1,4 +1,4 @@
-"""Tests for omnigent.pi_native_credentials (native Pi provider wiring)."""
+"""Tests for omnigent.harnesses.pi_native.credentials (native Pi provider wiring)."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent import pi_native_credentials as creds
+from omnigent.harnesses.pi_native import credentials as creds
 
 
 @pytest.fixture(autouse=True)
 def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
             model_id=f"catalog-{provider_name}-{family}-default"
         ),
@@ -701,7 +701,7 @@ def test_cli_config_databricks_warns_on_unresolvable(
     monkeypatch.setenv("HOME", str(tmp_path))
     import logging
 
-    with caplog.at_level(logging.INFO, logger="omnigent.pi_native_credentials"):
+    with caplog.at_level(logging.INFO, logger="omnigent.harnesses.pi_native.credentials"):
         assert (
             creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config) is None
         )
@@ -1402,8 +1402,8 @@ def test_fetch_pi_model_lists_carries_catalog_token_limits(
 
     import httpx
 
-    from omnigent import model_catalog
-    from omnigent.model_metadata import ModelMetadata
+    from omnigent.models import model_catalog
+    from omnigent.models.model_metadata import ModelMetadata
 
     payload = {
         "model_services": [
@@ -1467,7 +1467,7 @@ def test_fetch_pi_model_lists_survives_catalog_outage(monkeypatch: pytest.Monkey
 
     import httpx
 
-    from omnigent import model_catalog
+    from omnigent.models import model_catalog
 
     payload = {
         "model_services": [
@@ -1549,7 +1549,7 @@ def _mock_databricks_model_lists(
 def _set_catalog_default(monkeypatch: pytest.MonkeyPatch, model_id: str) -> None:
     """Set the release-curated Databricks Claude default for one test."""
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(model_id=model_id),
     )
 
@@ -2005,7 +2005,7 @@ def test_launch_renders_config_once(monkeypatch: pytest.MonkeyPatch, tmp_path: P
 
 def test_default_claude_model_from_picks_by_tier_then_newest() -> None:
     """Pi's launch default follows the ``opus > sonnet > …`` precedence, newest first."""
-    from omnigent.pi_native_credentials import _default_claude_model_from
+    from omnigent.harnesses.pi_native.credentials import _default_claude_model_from
 
     entries = [
         {"id": "system.ai.claude-sonnet-5"},
@@ -2133,7 +2133,7 @@ def test_cli_config_pi_provider_uses_live_discovery_over_catalog_default(
     # Stub catalog default to an unserved id (the bug: this must NOT win).
     UNSERVED_DEFAULT = "databricks-claude-fable-5"
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(model_id=UNSERVED_DEFAULT),
     )
 
@@ -2191,7 +2191,7 @@ def test_cli_config_pi_provider_explicit_override_wins_over_discovery(
     the live list (callers are responsible for validating overrides).
     """
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda *_a, **_kw: SimpleNamespace(model_id="databricks-claude-fable-5"),
     )
     monkeypatch.setattr(
@@ -2236,7 +2236,7 @@ def test_cli_config_pi_provider_discovery_failure_falls_back_to_catalog_default(
     the model), rather than returning None or raising.
     """
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda *_a, **_kw: SimpleNamespace(model_id="catalog-databricks-claude-default"),
     )
 

@@ -653,13 +653,22 @@ def _host_import_client(db_uri: str, host_registry: HostRegistry) -> httpx.Async
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
-async def test_import_local_live_host_off_replica_is_wrong_replica(db_uri: str) -> None:
+async def test_import_local_live_host_off_replica_is_wrong_replica(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A live host absent from this replica is WRONG_REPLICA, not "not connected".
 
     Regression: the route used to flatten every registry miss into a 409
     CONFLICT, so a host live on another replica never got the 400 wrong_replica
     signal the client re-addresses on — the import failed permanently.
+
+    Only a sharded (multi-replica) deployment has an "other replica" to
+    re-address to, so force the sharded signal on — the test host stack has no
+    lakebox module, which auto-detects as single-replica.
     """
+    from omnigent.server.routes import _host_launch
+
+    monkeypatch.setattr(_host_launch, "_deployment_is_sharded", lambda: True)
     host_id = "host_0123456789abcdef0123456789abcdef"
     HostStore(db_uri).upsert_on_connect(host_id, "laptop", "alice@example.com")
     async with _host_import_client(db_uri, HostRegistry()) as client:
@@ -669,6 +678,22 @@ async def test_import_local_live_host_off_replica_is_wrong_replica(db_uri: str) 
         )
     assert res.status_code == 400
     assert res.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+
+
+async def test_import_local_live_host_single_replica_is_conflict(db_uri: str) -> None:
+    """On a single-replica deployment a live-but-absent host is a 409, not a
+    WRONG_REPLICA the client can never satisfy (no other replica to re-address
+    to). Auto-detection reports single-replica when no lakebox module is present,
+    which is the default in the test stack."""
+    host_id = "host_0123456789abcdef0123456789abcded"
+    HostStore(db_uri).upsert_on_connect(host_id, "laptop", "alice@example.com")
+    async with _host_import_client(db_uri, HostRegistry()) as client:
+        res = await client.post(
+            "/v1/imports/local",
+            json={"host_id": host_id, "source": "all", "limit": 5},
+        )
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == ErrorCode.CONFLICT
 
 
 async def test_import_local_offline_host_is_conflict(db_uri: str) -> None:

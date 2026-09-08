@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
@@ -49,20 +49,14 @@ import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.model_override import (
+from omnigent.models.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
     normalize_model_for_provider,
     validate_model_override,
 )
-from omnigent.native_coding_agents import public_agent_name
+from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.runtime import pending_elicitations
-from omnigent.session_lifecycle import (
-    CLOSED_LABEL_KEY,
-    CLOSED_LABEL_VALUE,
-    is_session_closed,
-    title_without_closed_marker,
-)
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -109,6 +103,12 @@ from omnigent.tools.builtins.timer import (
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
+from omnigent.util.session_lifecycle import (
+    CLOSED_LABEL_KEY,
+    CLOSED_LABEL_VALUE,
+    is_session_closed,
+    title_without_closed_marker,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -1613,7 +1613,7 @@ def _validate_subagent_reasoning_effort(effort: str, harness: str | None) -> str
     :raises ValueError: If the harness supports no effort override, or
         the value falls outside its vocabulary.
     """
-    from omnigent.reasoning_effort import efforts_for_harness, validate_effort
+    from omnigent.util.reasoning_effort import efforts_for_harness, validate_effort
 
     canonical = canonicalize_harness(harness) if harness is not None else None
     supported = efforts_for_harness(harness)
@@ -1879,7 +1879,7 @@ def _subagent_harness(sub_agent_name: str, agent_spec: AgentSpec | None) -> str 
         available.
     :returns: Harness id, e.g. ``"codex-native"``, or ``None``.
     """
-    from omnigent.model_catalog import spec_harness
+    from omnigent.models.model_catalog import spec_harness
 
     sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
     return spec_harness(sub_spec) if sub_spec is not None else None
@@ -2010,7 +2010,7 @@ def _normalize_subagent_model(
     Localize a per-dispatch model id for the child's resolved provider.
 
     Runs after the family guard (see
-    :func:`omnigent.model_override.normalize_model_for_provider` for
+    :func:`omnigent.models.model_override.normalize_model_for_provider` for
     the ordering rationale): a canonical vendor id is prefixed with
     ``databricks-`` when the child routes through the Databricks
     gateway, and the prefix is stripped for a vendor-direct child. When
@@ -2024,7 +2024,7 @@ def _normalize_subagent_model(
     :param harness: The child's declared harness, e.g. ``"claude-native"``.
     :returns: The id to persist as ``model_override``.
     """
-    from omnigent.model_catalog import resolve_model_provider
+    from omnigent.models.model_catalog import resolve_model_provider
 
     sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
     if sub_spec is None or harness is None:
@@ -2053,7 +2053,7 @@ async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
 
     Runs the enumeration off the event loop — provider resolution reads
     config files and the listing fetches hit provider HTTP APIs (TTL-
-    cached in :mod:`omnigent.model_catalog`).
+    cached in :mod:`omnigent.models.model_catalog`).
 
     :param agent_spec: The calling session's agent spec; its
         ``sub_agents`` define the worker rows.
@@ -2062,7 +2062,7 @@ async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
     """
     if agent_spec is None:
         return "Error: sys_list_models requires an agent spec"
-    from omnigent.model_catalog import catalog_for_spec
+    from omnigent.models.model_catalog import catalog_for_spec
 
     catalog = await asyncio.to_thread(catalog_for_spec, agent_spec)
     return json.dumps(catalog)

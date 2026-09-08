@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from omnigent.claude_model_vocabulary import claude_model_alias
 from omnigent.inner.hook_scripts import claude_router_hook, subagent_router
+from omnigent.models.claude_model_vocabulary import claude_model_alias
 from tests.inner.conftest import advertise_relay_tools, advertise_router
 
 

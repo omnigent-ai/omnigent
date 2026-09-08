@@ -5,8 +5,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent import native_policy_hook
-from omnigent.native_policy_hook import (
+from omnigent.native import native_policy_hook
+from omnigent.native.native_policy_hook import (
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
     fail_ask_hook_output,
@@ -583,12 +583,13 @@ def test_post_evaluate_with_retry_no_reauth_fails_on_redirect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    With no ``reauth`` callable, a login-redirect yields ``None`` (legacy).
+    With no ``reauth`` callable, a login-redirect fails closed with a clear reason.
 
-    Callers without a token source (e.g. codex/kimi today) see the same
-    behavior as before this change: ``raise_for_status`` rejects the 302 as a
-    non-retryable <500, the helper returns ``None``, and the caller fails
-    closed. Guards against the new branch altering that.
+    Callers without a token source (e.g. codex/kimi today) still fail closed on
+    a 302→/oidc bounce, but the helper rejects the redirect explicitly (rather
+    than leaning on ``raise_for_status``'s version-dependent 3xx handling and a
+    cryptic downstream "empty/malformed response"): it returns ``None`` with an
+    error that names the login redirect, and does not retry.
     """
     seen_headers: list[dict[str, str]] = []
     redirect = httpx.Response(
@@ -606,6 +607,7 @@ def test_post_evaluate_with_retry_no_reauth_fails_on_redirect(
     )
     assert resp is None
     assert error is not None
+    assert "login redirect" in error and "302" in error
     assert len(seen_headers) == 1  # one attempt; a 302 is not retried without reauth
 
 
@@ -616,8 +618,8 @@ def test_post_evaluate_with_retry_reauth_unavailable_fails_closed(
     When re-mint yields no token, the helper returns ``None`` (caller fails closed).
 
     Re-auth is best-effort: a ``reauth`` that returns ``None`` (no creds /
-    transient mint failure) must not loop — it falls through to
-    ``raise_for_status`` (302 → non-retryable) so the caller keeps the
+    transient mint failure) must not loop — the redirect is rejected explicitly
+    (returning ``None`` with a login-redirect error) so the caller keeps the
     fail-closed safety net.
     """
     seen_headers: list[dict[str, str]] = []
@@ -641,6 +643,7 @@ def test_post_evaluate_with_retry_reauth_unavailable_fails_closed(
     )
     assert resp is None
     assert error is not None
+    assert "login redirect" in error and "302" in error
     assert len(seen_headers) == 1  # one attempt only; no retry loop
 
 
