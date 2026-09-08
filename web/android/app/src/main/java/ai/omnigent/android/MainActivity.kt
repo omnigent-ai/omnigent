@@ -47,6 +47,7 @@ import androidx.webkit.WebViewFeature
  */
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
+    private lateinit var pendingLoginOverlay: PendingLoginOverlay
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
     private val loginManager = OidcLoginManager()
@@ -159,6 +160,18 @@ class MainActivity : AppCompatActivity() {
         // (values/values-night colors.xml) so it adapts to light/dark mode.
         val container = FrameLayout(this)
         container.addView(webView)
+        // Covers the WebView while a system-browser login runs (and renders the
+        // give-up state): without it the last-painted SPA document stays
+        // presented and the app looks signed in while every API call is 401.
+        // Added below the switcher pill so server switching stays reachable.
+        pendingLoginOverlay = PendingLoginOverlay(this, onRetry = ::retryLogin)
+        container.addView(
+            pendingLoginOverlay,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
         val dp = resources.displayMetrics.density
         switchButton =
             TextView(this).apply {
@@ -355,6 +368,9 @@ class MainActivity : AppCompatActivity() {
         val origin = pinnedOrigin ?: return
         if (loginAttempts >= MAX_LOGIN_ATTEMPTS) {
             authLog("login attempts exhausted ($loginAttempts) — not retrying")
+            // Giving up must be user-visible: leave the error overlay (with its
+            // retry action) instead of the stale as-if-signed-in SPA page.
+            showLoginError()
             return
         }
         // start() no-ops when a login is already in flight — a multi-hop OIDC
@@ -362,8 +378,9 @@ class MainActivity : AppCompatActivity() {
         // Count (and re-arm the history clear for) only a call that actually
         // launches a flow, so re-entrant redirects can't burn the retry budget
         // without ever relaunching and suppress a legitimate later retry.
-        if (!loginManager.start(this, origin, ::onSessionToken)) return
+        if (!loginManager.start(this, origin, ::onSessionToken, ::onLoginFailed)) return
         loginAttempts++
+        showLoginPending()
         // A re-login (session expired mid-use) bounces through the IdP again,
         // leaving a stopped off-origin entry + stale pre-expiry pages on the back
         // stack. Re-arm the one-shot history clear so the next authenticated
@@ -394,6 +411,7 @@ class MainActivity : AppCompatActivity() {
         // this only ever rejects a malformed/hostile value, never a valid login.
         if (!isJwtShaped(token)) {
             authLog("onSessionToken: token not JWT-shaped — rejecting")
+            showLoginError()
             return
         }
         val origin = pinnedOrigin ?: return
@@ -420,8 +438,11 @@ class MainActivity : AppCompatActivity() {
             )
             // A rejected cookie means the reload would land unauthenticated,
             // bounce to login, and re-launch the browser — burning the retry
-            // budget on a failure that retrying can't fix. Stay put instead.
-            if (!accepted) return@setCookie
+            // budget on a failure that retrying can't fix. Stay put, but say so.
+            if (!accepted) {
+                showLoginError()
+                return@setCookie
+            }
             cookies.flush()
             webView.loadUrl(origin)
         }
@@ -529,6 +550,8 @@ class MainActivity : AppCompatActivity() {
         pageLoaded = false
         historyCleared = false
         loginAttempts = 0
+        // The old server's pending/failed login state must not cover the new one.
+        hideLoginOverlay()
         (switchButton as? TextView)?.text = hostLabelOf(serverUrl)
         installBridge()
         webView.loadUrl(serverUrl)
@@ -616,8 +639,53 @@ class MainActivity : AppCompatActivity() {
         }
         pageLoaded = true
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
+        hideLoginOverlay() // real app content is presentable again
         flushPendingActivation()
         emitInsets()
+    }
+
+    /**
+     * Cover the stale SPA while the system-browser login runs: the WebView still
+     * holds the last-painted (unauthenticated) document, which reads as a normal
+     * signed-in home screen. INVISIBLE keeps the WebView laid out and loading in
+     * the background so the post-login reload proceeds under the overlay.
+     */
+    private fun showLoginPending() {
+        pendingLoginOverlay.showPending()
+        webView.visibility = View.INVISIBLE
+    }
+
+    /** Login can't proceed — replace the fake signed-in page with a visible error. */
+    private fun showLoginError() {
+        pendingLoginOverlay.showError()
+        webView.visibility = View.INVISIBLE
+    }
+
+    private fun hideLoginOverlay() {
+        pendingLoginOverlay.visibility = View.GONE
+        webView.visibility = View.VISIBLE
+    }
+
+    /** The browser flow ended without a session (dismissed, timed out, network). */
+    private fun onLoginFailed() {
+        if (isDestroyed || isFinishing || !::pendingLoginOverlay.isInitialized) return
+        // Only while the login is still unresolved (overlay up): a poll that
+        // times out long after a pinned-origin page authenticated must not
+        // cover the working app with a stale error.
+        if (pendingLoginOverlay.visibility != View.VISIBLE) return
+        showLoginError()
+    }
+
+    /**
+     * User-gesture retry from the error overlay. A deliberate tap re-arms the
+     * retry budget — the cap exists to stop unattended relaunch loops, not to
+     * lock the user out of recovering. Cancels any straggling flow first so the
+     * retry always launches a fresh browser instead of no-oping against it.
+     */
+    private fun retryLogin() {
+        loginManager.cancel()
+        loginAttempts = 0
+        startLogin()
     }
 
     private fun flushPendingActivation() {
