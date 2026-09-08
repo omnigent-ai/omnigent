@@ -13,13 +13,20 @@ import socket
 import sys
 import tempfile
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import urlsplit
 
 from .egress.ca import ensure_ca, ensure_ca_bundle
 from .egress.certs import HostCertCache
 from .egress.proxy import EgressProxy, _parse_http_headers
 from .egress.rules import parse_rules
-from .model_auth import PROVIDER_AUTH_REQUIRED, ProviderAuthRequired, mint_ucode_token
+from .model_auth import (
+    PROVIDER_AUTH_REQUIRED,
+    ProviderAuthRequired,
+    _provider_auth_message,
+    mint_ucode_token,
+)
+from .model_credential import CredentialLifecycle
 from .model_egress import FrozenModelRoute
 from .model_signing import SigningRejected, reconstruct_signed_request
 
@@ -30,7 +37,29 @@ _TEST_BINDING = "test-fake-provider-v1"
 _UCODE_BINDING = "databricks-ucode-v1"
 _MAX_CONFIG_BYTES = 64 * 1024
 _MAX_HEADER_BYTES = 64 * 1024
+_UCODE_MAX_CACHE_AGE_SECONDS = 5 * 60.0
+_UCODE_REFRESH_SKEW_SECONDS = 30.0
+_UCODE_MIN_REFRESH_INTERVAL_SECONDS = 2.0
+_UCODE_BACKOFF_BASE_SECONDS = 2.0
+_UCODE_BACKOFF_MAX_SECONDS = 30.0
 _E2E_MARKER = "BROKERED_E2E_OK upstream_saw_signer_only_fake_bearer=true"
+
+
+class _CredentialSource(Protocol):
+    async def token_for_request(self) -> str: ...
+
+    def invalidate_after_unauthorized(self) -> None: ...
+
+
+class _StaticCredential:
+    def __init__(self, token: str) -> None:
+        self._token = token
+
+    async def token_for_request(self) -> str:
+        return self._token
+
+    def invalidate_after_unauthorized(self) -> None:
+        pass
 
 
 class _SignerRelay(EgressProxy):
@@ -41,7 +70,8 @@ class _SignerRelay(EgressProxy):
         *,
         route: FrozenModelRoute,
         placeholder: str,
-        bearer_token: str,
+        bearer_token: str | None = None,
+        credential_source: _CredentialSource | None = None,
         ca_cert_path: Path,
         ca_key_path: Path,
         ca_bundle_path: Path,
@@ -56,7 +86,9 @@ class _SignerRelay(EgressProxy):
         )
         self._route = route
         self._placeholder = placeholder
-        self._bearer_token = bearer_token
+        if (bearer_token is None) == (credential_source is None):
+            raise ValueError("signer relay requires exactly one credential source")
+        self._credential_source = credential_source or _StaticCredential(bearer_token or "")
         self._provider_port = provider_port
 
     async def _assert_destination_allowed(self, host: str, port: int) -> str | None:
@@ -82,10 +114,15 @@ class _SignerRelay(EgressProxy):
         host_values = message.get_all("Host", [])
         request_host = host_values[0] if len(host_values) == 1 else ""
         try:
+            bearer_token = await self._credential_source.token_for_request()
+        except ProviderAuthRequired:
+            await self._send_auth_required(client_writer)
+            return
+        try:
             signed = reconstruct_signed_request(
                 route=self._route,
                 placeholder=self._placeholder,
-                bearer_token=self._bearer_token,
+                bearer_token=bearer_token,
                 method=method,
                 connect_host=host,
                 sni_host=host,
@@ -124,7 +161,10 @@ class _SignerRelay(EgressProxy):
             upstream_writer.write(b"Connection: close\r\n\r\n")
             upstream_writer.write(signed.body)
             await upstream_writer.drain()
-            bytes_relayed, _ = await self._relay_response(upstream_reader, client_writer)
+            bytes_relayed, _ = await self._relay_response_observing_status(
+                upstream_reader,
+                client_writer,
+            )
             if bytes_relayed == 0:
                 await self._send_bad_gateway(
                     client_writer,
@@ -134,6 +174,57 @@ class _SignerRelay(EgressProxy):
             upstream_writer.close()
             with contextlib.suppress(Exception):
                 await upstream_writer.wait_closed()
+
+    def _observe_upstream_status(self, status: int) -> None:
+        if status == 401:
+            self._credential_source.invalidate_after_unauthorized()
+
+    async def _relay_response_observing_status(
+        self,
+        upstream_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> tuple[int, int]:
+        """Observe only the status line needed for credential invalidation."""
+        try:
+            status_line = await asyncio.wait_for(
+                upstream_reader.readline(),
+                timeout=60,
+            )
+        except (asyncio.TimeoutError, OSError):
+            return 0, 0
+        if (
+            not status_line.endswith(b"\r\n")
+            or len(status_line) > _MAX_HEADER_BYTES
+            or len(status_line) < 14
+            or status_line[:7] not in (b"HTTP/1.",)
+        ):
+            return 0, 0
+        parts = status_line.rstrip(b"\r\n").split(b" ", 2)
+        if (
+            len(parts) < 2
+            or parts[0] not in (b"HTTP/1.0", b"HTTP/1.1")
+            or len(parts[1]) != 3
+            or not parts[1].isdigit()
+        ):
+            return 0, 0
+        status = int(parts[1])
+        self._observe_upstream_status(status)
+        client_writer.write(status_line)
+        await client_writer.drain()
+        relayed, _ = await self._relay_response(upstream_reader, client_writer)
+        return len(status_line) + relayed, status
+
+    @staticmethod
+    async def _send_auth_required(writer: asyncio.StreamWriter) -> None:
+        body = b'{"error":{"code":"PROVIDER_AUTH_REQUIRED"}}'
+        response = (
+            b"HTTP/1.1 401 Unauthorized\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body
+        )
+        with contextlib.suppress(Exception):
+            writer.write(response)
+            await writer.drain()
 
 
 async def _fake_provider(
@@ -407,15 +498,29 @@ def _pick_relay_port() -> int:
 
 async def _run(config_fd: int) -> int:
     binding_id, route, auth_profile = _load_config(config_fd)
+    credential_lifecycle: CredentialLifecycle | None = None
     if binding_id == _UCODE_BINDING:
         assert auth_profile is not None
-        bearer_token = await mint_ucode_token(
-            host=f"https://{route.host}",
-            profile=auth_profile,
+        host = f"https://{route.host}"
+        credential_lifecycle = CredentialLifecycle(
+            helper=lambda: mint_ucode_token(host=host, profile=auth_profile),
+            auth_required=lambda: ProviderAuthRequired(_provider_auth_message(host, auth_profile)),
+            max_cache_age_s=_UCODE_MAX_CACHE_AGE_SECONDS,
+            refresh_skew_s=_UCODE_REFRESH_SKEW_SECONDS,
+            min_refresh_interval_s=_UCODE_MIN_REFRESH_INTERVAL_SECONDS,
+            backoff_base_s=_UCODE_BACKOFF_BASE_SECONDS,
+            backoff_max_s=_UCODE_BACKOFF_MAX_SECONDS,
         )
+        await credential_lifecycle.start()
+        fake_bearer_token = None
     else:
-        bearer_token = f"fake-provider-bearer-{secrets.token_urlsafe(32)}"
-    private_dir = Path(tempfile.mkdtemp(prefix="omnigent-model-signer-private-")).resolve()
+        fake_bearer_token = f"fake-provider-bearer-{secrets.token_urlsafe(32)}"
+    try:
+        private_dir = Path(tempfile.mkdtemp(prefix="omnigent-model-signer-private-")).resolve()
+    except BaseException:
+        if credential_lifecycle is not None:
+            await credential_lifecycle.close()
+        raise
     public_dir: Path | None = None
     relay: _SignerRelay | None = None
     provider: asyncio.Server | None = None
@@ -436,7 +541,7 @@ async def _run(config_fd: int) -> int:
                     reader,
                     writer,
                     route=route,
-                    bearer_token=bearer_token,
+                    bearer_token=fake_bearer_token or "",
                 ),
                 "127.0.0.1",
                 0,
@@ -446,7 +551,8 @@ async def _run(config_fd: int) -> int:
         relay = _SignerRelay(
             route=route,
             placeholder=placeholder,
-            bearer_token=bearer_token,
+            bearer_token=fake_bearer_token,
+            credential_source=credential_lifecycle,
             ca_cert_path=ca_cert,
             ca_key_path=ca_key,
             ca_bundle_path=ca_bundle,
@@ -468,6 +574,8 @@ async def _run(config_fd: int) -> int:
     finally:
         if relay is not None:
             await relay.stop()
+        if credential_lifecycle is not None:
+            await credential_lifecycle.close()
         if provider is not None:
             provider.close()
             await provider.wait_closed()
