@@ -239,6 +239,7 @@ async def launch_or_reuse_daemon_runner(
     session_id: str,
     workspace: str,
     fresh: bool = False,
+    wait_online_timeout_s: float | None = None,
 ) -> str:
     """
     Ensure the session is bound to a daemon-spawned runner; return its id.
@@ -247,6 +248,12 @@ async def launch_or_reuse_daemon_runner(
     (resume into a live session). Otherwise clears any stale binding and
     asks the server to launch a fresh runner on the host via
     ``POST /v1/hosts/{host_id}/runners`` (which atomically binds it).
+
+    Pass *wait_online_timeout_s* to have the returned runner be online.
+    That folds in the wait every caller already runs next, and lets the
+    reuse path skip it: reuse already proved the tunnel is registered
+    moments earlier, from the same registry the wait polls, so the wait's
+    first request only asks the question again.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param host_id: This machine's host id, e.g. ``"host_abc123"``.
@@ -258,8 +265,14 @@ async def launch_or_reuse_daemon_runner(
         Safe to set when the session was just created in this same startup
         sequence — a brand-new session can't have a runner bound yet, so
         the read would always return empty and only add latency (~2-3s).
-    :returns: The bound runner id, e.g. ``"runner_abc123"``.
-    :raises click.ClickException: If the launch request fails.
+    :param wait_online_timeout_s: Max seconds to wait for a freshly
+        launched runner's tunnel, e.g. ``60.0``. ``None`` (the default)
+        returns as soon as the launch is accepted and leaves the wait to
+        the caller — the historical contract.
+    :returns: The bound runner id, e.g. ``"runner_abc123"``. Online
+        already when *wait_online_timeout_s* was passed.
+    :raises click.ClickException: If the launch request fails, or if a
+        freshly launched runner does not come online in time.
     """
     if fresh:
         existing = None
@@ -268,6 +281,9 @@ async def launch_or_reuse_daemon_runner(
         existing = _json_body(snap).get("runner_id") if snap.status_code == 200 else None
     if isinstance(existing, str) and existing:
         if await runner_is_online(client, existing):
+            # Online per the tunnel registry as of a moment ago, which is
+            # exactly what wait_for_runner_online polls — so callers that
+            # asked us to guarantee online need no further request.
             return existing
         # Stale binding (offline runner): clear it so the launch
         # endpoint's atomic ``UPDATE ... WHERE runner_id IS NULL`` can
@@ -304,6 +320,10 @@ async def launch_or_reuse_daemon_runner(
     runner_id = resp.json().get("runner_id")
     if not isinstance(runner_id, str) or not runner_id:
         raise click.ClickException("Host launch response did not include a runner_id.")
+    if wait_online_timeout_s is not None:
+        # A just-launched runner is still booting ("launching"), so this one
+        # genuinely has to poll.
+        await wait_for_runner_online(client, runner_id, timeout_s=wait_online_timeout_s)
     return runner_id
 
 
