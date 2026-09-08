@@ -3613,9 +3613,10 @@ describe("AppShell share action", () => {
       renderShell("/c/conv_home", serverInfo({ sharing_mode: "restricted_read_only" }));
       fireEvent.click(screen.getByRole("button", { name: /share session/i }));
       expect(
-        screen.getByText(/This conversation is in a home or root directory/),
+        screen.getByText(/This session's working directory \(a home or root directory\)/),
       ).toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: /^grant$/i })).not.toBeInTheDocument();
+      expect(screen.getByText(/Please be careful when sharing/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^grant$/i })).toBeInTheDocument();
     });
   });
 
