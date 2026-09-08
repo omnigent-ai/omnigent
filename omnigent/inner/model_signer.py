@@ -16,6 +16,7 @@ from ._subprocess_lifecycle import close_subprocess_transport
 from .model_egress import FrozenModelRoute
 
 _READINESS_TIMEOUT_SECONDS = 15.0
+_SHUTDOWN_TIMEOUT_SECONDS = 6.0
 _READINESS_KEYS = frozenset(
     {
         "status",
@@ -164,7 +165,7 @@ class SubprocessModelSigner:
                 except (BrokenPipeError, ConnectionError):
                     pass
             try:
-                await asyncio.wait_for(proc.wait(), timeout=2)
+                await asyncio.wait_for(proc.wait(), timeout=_SHUTDOWN_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
                 _proc.terminate_tree(proc)
                 try:

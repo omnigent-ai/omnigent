@@ -15,7 +15,8 @@ import pytest
 from omnigent.inner.codex_executor import _CodexAppServerSession
 from omnigent.inner.codex_worker import prepare_codex_worker
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.inner.model_signer import SignerReadiness
+from omnigent.inner.sandbox import SandboxPolicy, with_additional_write_roots
 
 
 class _Pipe:
@@ -151,6 +152,101 @@ def test_successful_active_sandbox_returns_owned_launcher(
     worker.close()
     worker.close()
     assert not launcher.exists()
+
+
+def test_signer_readiness_adds_only_relay_and_public_ca(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    codex = tmp_path / "bin" / "codex"
+    codex.parent.mkdir()
+    codex.touch()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    signer_dir = tmp_path / "signer"
+    signer_dir.mkdir()
+    socket_path = signer_dir / "relay.sock"
+    socket_path.touch()
+    ca_bundle = signer_dir / "ca-bundle.pem"
+    ca_bundle.write_text("PUBLIC CA", encoding="utf-8")
+    readiness = SignerReadiness(
+        relay_port=43123,
+        socket_path=socket_path,
+        ca_bundle_path=ca_bundle,
+        placeholder="oa_cred_session",
+    )
+    launcher = tmp_path / "launcher"
+    launcher.touch()
+    backend = Mock()
+    backend.wrap_launcher_argv.return_value = ["/usr/bin/sandbox-exec", str(codex)]
+    captured: dict[str, SandboxPolicy] = {}
+
+    def _create_launcher(target: str, policy: SandboxPolicy) -> str:
+        captured["policy"] = policy
+        return str(launcher)
+
+    monkeypatch.setattr(
+        "omnigent.inner.codex_worker.resolve_sandbox",
+        Mock(return_value=_active_policy(tmp_path)),
+    )
+    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", _create_launcher)
+    worker_env = {"PATH": os.environ["PATH"], "CODEX_HOME": str(codex_home)}
+
+    worker = prepare_codex_worker(
+        codex_path=str(codex),
+        cwd=tmp_path,
+        codex_home=codex_home,
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+        spawn_env_names=list(worker_env),
+        signer_readiness=readiness,
+        worker_env=worker_env,
+    )
+
+    policy = captured["policy"]
+    assert policy.egress_relay_port == readiness.relay_port
+    assert policy.egress_socket_path == str(readiness.socket_path)
+    assert policy.allow_network is False
+    assert policy.read_roots is not None
+    assert signer_dir in policy.read_roots
+    assert {path.name for path in signer_dir.iterdir()} == {"ca-bundle.pem", "relay.sock"}
+    assert worker_env["HTTPS_PROXY"] == "http://127.0.0.1:43123"
+    assert worker_env["OPENAI_API_KEY"] == readiness.placeholder
+    assert worker_env["SSL_CERT_FILE"] == str(readiness.ca_bundle_path)
+    assert str(readiness.socket_path) not in worker_env.values()
+    assert "token" not in str(policy.to_jsonable()).lower()
+    worker.close()
+
+
+def test_signer_readiness_rejects_unwrapped_worker(tmp_path: Path) -> None:
+    readiness = SignerReadiness(
+        relay_port=43123,
+        socket_path=Path("/private/signer/relay.sock"),
+        ca_bundle_path=Path("/private/signer/ca-bundle.pem"),
+        placeholder="oa_cred_session",
+    )
+
+    with pytest.raises(OSError, match="requires an active sandbox"):
+        prepare_codex_worker(
+            codex_path=str(tmp_path / "codex"),
+            cwd=tmp_path,
+            codex_home=tmp_path / "codex-home",
+            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")),
+            spawn_env_names=[],
+            signer_readiness=readiness,
+            worker_env={},
+        )
+
+
+def test_launcher_scratch_clone_preserves_exact_relay(tmp_path: Path) -> None:
+    policy = _active_policy(tmp_path)
+    policy.egress_relay_port = 43123
+    policy.egress_socket_path = "/private/signer/relay.sock"
+
+    cloned = with_additional_write_roots(policy, [tmp_path / "launcher-scratch"])
+
+    assert cloned.egress_relay_port == 43123
+    assert cloned.egress_socket_path == "/private/signer/relay.sock"
 
 
 def test_explicit_none_sandbox_keeps_direct_worker_path(tmp_path: Path) -> None:
