@@ -19,10 +19,10 @@ Where they disagree, the observed column wins and the gap is written down.
 
 | # | Finding | Evidence |
 |---|---|---|
-| 1 | `initial_items` are stored but never dispatched to a native TUI | A/B on one session, below |
+| 1 | `initial_items` are stored but never dispatched to a native TUI — **now warned about** | A/B on one session, below |
 | 2 | A workspace under `/tmp` kills the `claude-native` terminal | `required_terminal_exited`, below |
 | 3 | A malformed client body returns HTTP 500, not 422 | `POST /v1/sessions`, below |
-| 4 | `GET /v1/harnesses` exposes 9 of 26 harnesses | registry vs. endpoint, below |
+| 4 | `GET /v1/harnesses` exposed 9 of 26 harnesses — **fixed here** | registry vs. endpoint, below |
 | 5 | The picker offers uninstalled harnesses and hides installed ones | availability table, below |
 
 ## Installed versions
@@ -169,6 +169,14 @@ to the harness. A client that creates a session with a prompt and waits gets
 silence — no error, no rejection, just an idle session holding a message that
 looks delivered.
 
+**Partly addressed** in this branch. The full fix — dispatching seeded items
+once the runner comes up — is a real change to session creation that cannot be
+verified without a deploy, so it stays open as issue #2. What is fixed is the
+*silence*: the create response now carries an
+`initial_items_seeded_not_dispatched` warning and the server logs one, so the
+downgrade is visible when it happens instead of being inferred from a session
+that never leaves `idle`.
+
 ### Finding 2 — a `/tmp` workspace kills the `claude-native` terminal
 
 Session `de255488`, identical request except `workspace` pointed at a
@@ -221,8 +229,12 @@ native-TUI wrapper, which is to say every harness Oz's fleet actually launches
 `antigravity-native`, `qwen-native`, `kimi-native`), plus `open-responses` and
 `openai-agents`.
 
-The data is computed and then not served. Nothing in the UI can answer "does
+The data is computed and then not served. Nothing in the UI could answer "does
 this harness support subagents?" for a harness the UI can launch.
+
+**Fixed** in this branch: the endpoint now also returns a `capabilities` map
+keyed by harness spelling, covering all 26 — the same shape and reasoning as
+the existing `setup_steps` map. The picker catalog (`data`) is unchanged.
 
 ### Finding 5 — the picker inverts availability
 
