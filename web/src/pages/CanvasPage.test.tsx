@@ -1,7 +1,7 @@
 // Tests for the Canvas page (`/canvas`). React Flow is stubbed to a plain list
 // that exposes the props the page drives (nodes, drag-stop, double-click), and
-// the session/project hooks are mocked at their seams; the layout, storage,
-// and card modules run for real.
+// the session loader and project hook are mocked at their seams; the layout,
+// storage, and card modules run for real.
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
+import * as canvasSessions from "@/canvas/canvasSessions";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { canvasLayoutStorageKey, readCanvasLayout } from "@/canvas/canvasStorage";
 import { CanvasPage, LARGE_CANVAS_SESSION_COUNT } from "./CanvasPage";
@@ -67,9 +68,9 @@ vi.mock("@xyflow/react", () => ({
 
 vi.mock("@/hooks/useConversations", async (importActual) => ({
   ...(await importActual<typeof conversationsHook>()),
-  useConversations: vi.fn(),
   useProjects: vi.fn(),
 }));
+vi.mock("@/canvas/canvasSessions", () => ({ useCanvasSessions: vi.fn() }));
 vi.mock("@/hooks/useGithub", () => ({
   fetchGithubInfo: vi.fn(async () => ({ object: "session.github.info", available: false })),
 }));
@@ -96,17 +97,19 @@ function conversation(id: string, updatedAt: number, overrides: Partial<Conversa
   } as Conversation;
 }
 
-function conversationsStub(rows: Conversation[], overrides: Record<string, unknown> = {}) {
+function sessionsStub(
+  rows: Conversation[],
+  overrides: Partial<canvasSessions.CanvasSessions> = {},
+): canvasSessions.CanvasSessions {
   return {
-    data: { pages: [{ data: rows, first_id: null, last_id: null, has_more: false }] },
-    isLoading: false,
+    sessions: rows,
+    loaded: true,
+    loadingMore: false,
+    complete: true,
     error: null,
-    hasNextPage: false,
-    isFetchingNextPage: false,
-    fetchNextPage: vi.fn(),
-    refetch: vi.fn(),
+    refresh: vi.fn(async () => undefined),
     ...overrides,
-  } as unknown as ReturnType<typeof conversationsHook.useConversations>;
+  };
 }
 
 function projectsStub(projects: ProjectSummary[] | undefined) {
@@ -144,7 +147,7 @@ beforeEach(() => {
   flowProps.current = null;
   flowFitView.mockClear();
   flowSetViewport.mockClear();
-  vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([]));
+  vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub([]));
   vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub([]));
 });
 
@@ -153,29 +156,20 @@ afterEach(() => {
 });
 
 describe("CanvasPage", () => {
-  it("renders top-level, non-archived sessions as cards and drains remaining pages", async () => {
-    const fetchNextPage = vi.fn();
-    vi.mocked(conversationsHook.useConversations).mockReturnValue(
-      conversationsStub(
-        [
-          conversation("conv_1", 3),
-          conversation("conv_2", 2),
-          conversation("conv_archived", 5, { archived: true }),
-          conversation("conv_child", 4, { parent_session_id: "conv_1" }),
-        ],
-        { hasNextPage: true, fetchNextPage },
-      ),
+  it("renders loaded sessions as cards while later pages are still arriving", async () => {
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("conv_1", 3), conversation("conv_2", 2)], {
+        loadingMore: true,
+        complete: false,
+      }),
     );
     renderPage();
 
     expect(screen.getByRole("heading", { name: "Canvas" })).toBeInTheDocument();
     expect(screen.getByTestId("flow-node-conv_1")).toBeInTheDocument();
     expect(screen.getByTestId("flow-node-conv_2")).toBeInTheDocument();
-    expect(screen.queryByTestId("flow-node-conv_archived")).toBeNull();
-    expect(screen.queryByTestId("flow-node-conv_child")).toBeNull();
     expect(screen.getByText("2 sessions")).toBeInTheDocument();
     expect(screen.getByRole("status", { name: "Loading sessions" })).toBeInTheDocument();
-    expect(fetchNextPage).toHaveBeenCalled();
     // Pages still pending: open at the readable viewport instead of fitting a partial set.
     await waitFor(() =>
       expect(flowSetViewport).toHaveBeenCalledWith({ x: 24, y: 24, zoom: 0.9 }, { duration: 0 }),
@@ -184,8 +178,8 @@ describe("CanvasPage", () => {
   });
 
   it("fits a completed small canvas and keeps the count quiet", async () => {
-    vi.mocked(conversationsHook.useConversations).mockReturnValue(
-      conversationsStub([conversation("conv_1", 1)]),
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("conv_1", 1)]),
     );
     renderPage();
     expect(screen.getByText("1 session")).toBeInTheDocument();
@@ -195,8 +189,8 @@ describe("CanvasPage", () => {
   });
 
   it("opens a large completed canvas at a readable viewport", async () => {
-    vi.mocked(conversationsHook.useConversations).mockReturnValue(
-      conversationsStub(
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub(
         Array.from({ length: LARGE_CANVAS_SESSION_COUNT + 1 }, (_, index) =>
           conversation(`conv_${index}`, index),
         ),
@@ -211,8 +205,8 @@ describe("CanvasPage", () => {
 
   it("groups sessions into Main and project canvases and switches between them", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
-    vi.mocked(conversationsHook.useConversations).mockReturnValue(
-      conversationsStub([
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([
         conversation("conv_loose", 3),
         conversation("conv_alpha", 2, { project_id: "proj_a" }),
         conversation("conv_legacy", 1, { labels: { [PROJECT_LABEL_KEY]: "Legacy" } }),
@@ -244,8 +238,8 @@ describe("CanvasPage", () => {
 
   it("shows explicit empty states per canvas", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
-    vi.mocked(conversationsHook.useConversations).mockReturnValue(
-      conversationsStub([conversation("conv_alpha", 2, { project_id: "proj_a" })]),
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("conv_alpha", 2, { project_id: "proj_a" })]),
     );
     renderPage();
     expect(screen.getByText("No sessions outside projects")).toBeInTheDocument();
@@ -255,8 +249,8 @@ describe("CanvasPage", () => {
 
   it("opens a session on double-click and starts new sessions in the active project", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
-    vi.mocked(conversationsHook.useConversations).mockReturnValue(
-      conversationsStub([conversation("conv_1", 1, { project_id: "proj_a" })]),
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("conv_1", 1, { project_id: "proj_a" })]),
     );
     const { unmount } = renderPage();
 
@@ -277,8 +271,8 @@ describe("CanvasPage", () => {
   });
 
   it("persists dragged positions and restores them on the next mount", async () => {
-    vi.mocked(conversationsHook.useConversations).mockReturnValue(
-      conversationsStub([conversation("conv_1", 2), conversation("conv_2", 1)]),
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("conv_1", 2), conversation("conv_2", 1)]),
     );
     const { unmount } = renderPage();
     const dragStop = flowProps.current?.onNodeDragStop as (
@@ -305,8 +299,8 @@ describe("CanvasPage", () => {
 
   it("resets only the active canvas's saved layout", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
-    vi.mocked(conversationsHook.useConversations).mockReturnValue(
-      conversationsStub([
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([
         conversation("conv_main", 2),
         conversation("conv_alpha", 1, { project_id: "proj_a" }),
       ]),
@@ -340,8 +334,8 @@ describe("CanvasPage", () => {
         viewports: {},
       }),
     );
-    vi.mocked(conversationsHook.useConversations).mockReturnValue(
-      conversationsStub([conversation("conv_1", 1)]),
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("conv_1", 1)]),
     );
     renderPage();
     expect(readCanvasLayout().positions).toEqual({ conv_1: { x: 7, y: 7 } });
@@ -372,19 +366,19 @@ describe("CanvasPage", () => {
   });
 
   it("shows an initial error with retry, then a quiet banner once cards exist", () => {
-    const refetch = vi.fn();
-    vi.mocked(conversationsHook.useConversations).mockReturnValue(
-      conversationsStub([], { data: undefined, error: new Error("boom"), refetch }),
+    const refresh = vi.fn(async () => undefined);
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([], { loaded: false, complete: false, error: "boom", refresh }),
     );
     const { unmount } = renderPage();
     expect(screen.getByRole("alert")).toHaveTextContent("Canvas could not load");
     expect(screen.getByRole("alert")).toHaveTextContent("boom");
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(refetch).toHaveBeenCalled();
+    expect(refresh).toHaveBeenCalled();
     unmount();
 
-    vi.mocked(conversationsHook.useConversations).mockReturnValue(
-      conversationsStub([conversation("conv_1", 1)], { error: new Error("offline") }),
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("conv_1", 1)], { error: "offline" }),
     );
     renderPage();
     expect(screen.getByTestId("flow-node-conv_1")).toBeInTheDocument();

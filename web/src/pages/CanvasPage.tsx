@@ -5,11 +5,10 @@
  *
  * Built entirely from existing primitives, with no server surface of its own:
  *
- * - Sessions come from the same `useConversations` list the sidebar shows,
- *   kept live by the `WS /v1/sessions/updates` stream. The page drains the
- *   remaining pages while mounted (like the inbox), so cards for older
- *   sessions appear progressively behind the header's "Loading sessions"
- *   spinner.
+ * - Sessions load through `useCanvasSessions`: the sidebar's cached rows paint
+ *   at once, then the canonical list arrives in 1,000-row pages behind the
+ *   header's "Loading sessions" spinner, and refreshes every 30 seconds and on
+ *   window focus.
  * - Projects come from `useProjects`; the **+** tab reuses the sidebar's
  *   `NewProjectButton`, so creating a project here is the same
  *   `POST /v1/projects` the sidebar performs.
@@ -56,22 +55,17 @@ import {
   type CanvasLayout,
   type CanvasViewport,
 } from "@/canvas/canvasStorage";
+import { useCanvasSessions } from "@/canvas/canvasSessions";
 import { usePullRequests, type CanvasPullRequests } from "@/canvas/pullRequests";
 import { SessionCard, type SessionCardNode } from "@/canvas/SessionCard";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import {
-  useConversations,
-  useProjects,
-  type Conversation,
-  type ProjectSummary,
-} from "@/hooks/useConversations";
+import { useProjects, type Conversation, type ProjectSummary } from "@/hooks/useConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useNavigate } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { NewProjectButton } from "@/shell/NewProjectButton";
 import { ProjectRowIcon } from "@/shell/ProjectPicker";
-import { dedupeConversationsById } from "@/shell/sidebarNav";
 
 import "@xyflow/react/dist/style.css";
 
@@ -94,16 +88,6 @@ const CONTROL_CLASS =
 
 function sessionCountLabel(count: number): string {
   return count === 1 ? "1 session" : `${count} sessions`;
-}
-
-/** Top-level, non-archived rows across every loaded page, deduplicated. */
-export function topLevelSessions(
-  pages: readonly { data: Conversation[] }[] | undefined,
-): Conversation[] {
-  if (!pages) return [];
-  return dedupeConversationsById(pages.flatMap((page) => page.data)).filter(
-    (session) => !session.archived && session.parent_session_id == null,
-  );
 }
 
 function CanvasControls({ onReset }: { onReset: () => void }) {
@@ -151,19 +135,9 @@ function CanvasSurface() {
   const navigate = useNavigate();
   const { trackClick } = useOmnigentAnalytics();
   const { fitView, getViewport, setViewport } = useReactFlow();
-  const conversationsQuery = useConversations("", false, { reconcileWhileConnected: true });
-  const { data, hasNextPage, isFetchingNextPage, fetchNextPage, error, isLoading, refetch } =
-    conversationsQuery;
-  // Drain the remaining pages while mounted: a session on the canvas may sit
-  // far below the sidebar's first page. The cache is shared with the sidebar.
-  useEffect(() => {
-    if (hasNextPage && !isFetchingNextPage) void fetchNextPage();
-  }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
+  const { sessions, loaded, loadingMore, complete, error, refresh } = useCanvasSessions();
   const projectsQuery = useProjects();
   const projects = projectsQuery.data ?? EMPTY_PROJECTS;
-  const sessions = useMemo(() => topLevelSessions(data?.pages), [data]);
-  const loaded = data !== undefined;
-  const complete = loaded && !hasNextPage;
 
   const [nodes, setNodes] = useState<SessionCardNode[]>([]);
   const [activeCanvas, setActiveCanvas] = useState(MAIN_CANVAS_ID);
@@ -451,17 +425,13 @@ function CanvasSurface() {
           <div role="alert" className="flex flex-col items-center gap-2 p-6 text-center">
             <TriangleAlertIcon aria-hidden className="size-5 text-muted-foreground" />
             <strong className="font-medium">Canvas could not load</strong>
-            <span className="text-ui text-muted-foreground">
-              {error instanceof Error ? error.message : "Could not load sessions"}
-            </span>
-            <Button variant="outline" size="sm" className="mt-2" onClick={() => void refetch()}>
+            <span className="text-ui text-muted-foreground">{error}</span>
+            <Button variant="outline" size="sm" className="mt-2" onClick={() => void refresh()}>
               Retry
             </Button>
           </div>
         ) : (
-          isLoading && (
-            <Spinner className="size-5 text-muted-foreground" aria-label="Loading Canvas" />
-          )
+          <Spinner className="size-5 text-muted-foreground" aria-label="Loading Canvas" />
         )}
       </div>
     );
@@ -493,7 +463,7 @@ function CanvasSurface() {
           <h1 className="text-2xl font-semibold">Canvas</h1>
           <div className="flex items-center gap-1.5 text-ui text-muted-foreground">
             <span>{sessionCountLabel(visibleSessions.length)}</span>
-            {!complete && <Spinner className="size-3.5" aria-label="Loading sessions" />}
+            {loadingMore && <Spinner className="size-3.5" aria-label="Loading sessions" />}
           </div>
         </div>
       </header>
@@ -540,7 +510,7 @@ function CanvasSurface() {
           role="alert"
           className="mx-6 mb-3 rounded-md border px-3 py-2 text-ui text-muted-foreground"
         >
-          Refresh failed: {error instanceof Error ? error.message : "Could not load sessions"}
+          Refresh failed: {error}
         </div>
       )}
       {storageWarning && (
