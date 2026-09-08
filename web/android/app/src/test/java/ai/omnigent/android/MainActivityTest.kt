@@ -181,6 +181,32 @@ class MainActivityTest {
     }
 
     @Test
+    fun `a load-then-crash loop still trips the budget despite successful page loads`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+
+        // The common real crash shape: the page loads fine (onPageReady fires),
+        // then the renderer crashes seconds later. A budget reset on page load
+        // would clear the counter every cycle and the guard would never trip;
+        // the time-window budget must accumulate these clustered crashes.
+        var dead = activity.webView()
+        repeat(4) {
+            dead.loadUrl("https://example.com/chat/heavy")
+            // Simulate the successful load that precedes each crash.
+            dead.webViewClient.onPageFinished(dead, "https://example.com/chat/heavy")
+            dead.webViewClient.onRenderProcessGone(dead, rendererGone(crashed = true))
+            dead = activity.webView()
+        }
+
+        // The 4th crash exceeded the budget even though every cycle had a healthy
+        // load in between: the recovery page is shown, breaking the loop.
+        assertTrue(
+            "load-then-crash loop must still trip the budget",
+            shadowOf(dead).lastLoadDataWithBaseURL?.data?.contains("Reload") == true,
+        )
+    }
+
+    @Test
     fun `system reclaims never exhaust the crash budget`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()

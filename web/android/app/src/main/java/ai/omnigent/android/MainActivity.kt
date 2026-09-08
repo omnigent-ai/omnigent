@@ -62,10 +62,11 @@ class MainActivity : AppCompatActivity() {
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var historyCleared = false // drop pre-auth/login-redirect history once
 
-    // Renderer-crash budget: real crashes (didCrash) inside a rolling window are
-    // counted so a page that reliably kills its renderer can't wedge the app in
-    // an invisible rebuild→reload→crash loop. Reset on a healthy page load and
-    // when the window elapses. System reclaims (didCrash=false) don't count.
+    // Renderer-crash budget: real crashes (didCrash) clustered within a sliding
+    // time window are counted so a page that reliably kills its renderer can't
+    // wedge the app in an invisible rebuild→reload→crash loop. Not reset on page
+    // load (a load-then-crash loop would clear it every cycle); crashes spaced
+    // beyond the window reset it. System reclaims (didCrash=false) don't count.
     private var rendererCrashes = 0
     private var rendererCrashWindowStart = 0L
 
@@ -760,10 +761,12 @@ class MainActivity : AppCompatActivity() {
         }
         pageLoaded = true
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
-        // A healthy render clears the crash budget: only crashes with no good
-        // page in between accumulate toward the give-up threshold.
-        rendererCrashes = 0
-        rendererCrashWindowStart = 0L
+        // Deliberately does NOT reset the renderer-crash budget: a page that
+        // loads fine and then crashes the renderer (delayed JS/WebGL/OOM — the
+        // common shape) fires onPageReady every cycle, so resetting here would
+        // clear the budget before each next crash and the loop guard would never
+        // trip. The time window in withinCrashBudget() handles isolated crashes:
+        // ones spaced beyond the window reset; ones clustered tightly accumulate.
         flushPendingActivation()
         emitInsets()
     }
