@@ -1859,7 +1859,7 @@ export function AppShell() {
     [canClone],
   );
   const workspacePanelVisible = Boolean(
-    conversationId &&
+    serverConversationId &&
     hasRailContent &&
     rightPanelOpen &&
     (terminalFirst || !panelOpen) &&
@@ -2082,9 +2082,9 @@ export function AppShell() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
-                {conversationId && workspacePanelVisible && (
+                {serverConversationId && workspacePanelVisible && (
                   <WorkspacePanel
-                    conversationId={conversationId}
+                    conversationId={serverConversationId}
                     width={inlinePanelWidth}
                     inert={inlinePanelWidth === 0}
                     handleProps={inlinePanelHandleProps}
@@ -2194,11 +2194,11 @@ export function AppShell() {
                 </MobilePanelDrawer>
               )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
-              {conversationId && selectedFilePath !== null && (
+              {serverConversationId && selectedFilePath !== null && (
                 <div className="md:hidden">
                   <FileViewer
                     open
-                    conversationId={conversationId}
+                    conversationId={serverConversationId}
                     path={selectedFilePath}
                     onClose={closeFileViewer}
                     onNavigateTo={openFileViewer}

@@ -589,6 +589,19 @@ describe("AppShell header", () => {
     expect(screen.getByTestId("fork-probe")).toHaveAttribute("data-can-fork", "false");
   });
 
+  it("does not mount file viewers for a temp route with a stale file selection", () => {
+    writeSessionWorkspaceState("temp:12345678", {
+      open: true,
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    });
+    mockConversations([{ id: "temp:12345678", permission_level: null, provisional: true }]);
+    renderShell("/c/temp:12345678");
+
+    expect(screen.queryByTestId("file-viewer")).toBeNull();
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+  });
+
   it("shows owner actions for a top-level session omitted from conversation pages", () => {
     mockConversations([]);
     useSessionMock.mockReturnValue({
