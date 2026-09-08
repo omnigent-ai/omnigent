@@ -77,6 +77,7 @@ from .executor import (
 )
 from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOOK_HEADROOM_S
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
+from .model_signer import ModelSignerSession, SignerReadiness
 
 logger = logging.getLogger(__name__)
 
@@ -2260,6 +2261,7 @@ class _CodexAppServerSession:
         bundle_dir: Path | None = None,
         skills_filter: str | list[str] = "all",
         os_env: OSEnvSpec | None = None,
+        signer_factory: Callable[[], ModelSignerSession] | None = None,
     ) -> None:
         self._codex_path = codex_path
         self._cwd = cwd
@@ -2271,6 +2273,12 @@ class _CodexAppServerSession:
         self._bundle_dir = bundle_dir
         self._skills_filter = skills_filter
         self._os_env_spec = os_env
+        self._signer_factory = signer_factory
+        self._signer: ModelSignerSession | None = None
+        self._signer_readiness: SignerReadiness | None = None
+        self._signer_watch_task: asyncio.Task[None] | None = None
+        self._signer_exited = False
+        self._closing = False
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -2314,9 +2322,30 @@ class _CodexAppServerSession:
         self._stdin_lock = asyncio.Lock()
 
     async def start(self) -> None:
+        """Start signer and worker transactionally."""
+        try:
+            await self._start_unchecked()
+        except Exception:
+            await self.close()
+            raise
+
+    async def _start_unchecked(self) -> None:
         if self._started:
             return
         self._loop = asyncio.get_running_loop()
+        if self._signer_factory is not None:
+            signer = self._signer_factory()
+            self._signer = signer
+            try:
+                self._signer_readiness = await signer.start()
+            except Exception:
+                with suppress(Exception):
+                    await signer.close()
+                self._signer = None
+                self._signer_readiness = None
+                raise
+            self._signer_exited = False
+            self._signer_watch_task = asyncio.create_task(self._watch_signer())
         codex_home_root = Path(tempfile.gettempdir())
         if self._cwd and self._cwd != "/":
             try:
@@ -2448,6 +2477,8 @@ class _CodexAppServerSession:
             raise
 
     async def close(self) -> None:
+        self._closing = True
+        await self._close_signer()
         current_loop = asyncio.get_running_loop()
         if self._loop is not None and self._loop is not current_loop:
             if self._proc is not None and self._proc.returncode is None:
@@ -2464,6 +2495,7 @@ class _CodexAppServerSession:
             self.active_turn_id = None
             self._cleanup_worker_launch()
             self._cleanup_process_cwd()
+            self._closing = False
             return
 
         if self._proc is not None and self._proc.returncode is None:
@@ -2500,6 +2532,36 @@ class _CodexAppServerSession:
         self._recent_events.clear()
         self._cleanup_worker_launch()
         self._cleanup_process_cwd()
+        self._closing = False
+
+    async def _watch_signer(self) -> None:
+        signer = self._signer
+        if signer is None:
+            return
+        try:
+            await signer.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - any signer failure invalidates the worker
+            logger.debug("model signer watcher failed", exc_info=True)
+        self._signer_exited = True
+        if not self._closing and self._proc is not None and self._proc.returncode is None:
+            _terminate_process_tree(self._proc)
+
+    async def _close_signer(self) -> None:
+        signer = self._signer
+        self._signer = None
+        if signer is not None:
+            with suppress(Exception):
+                await signer.close()
+        task = self._signer_watch_task
+        self._signer_watch_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        self._signer_readiness = None
+        self._signer_exited = False
 
     def _cleanup_worker_launch(self) -> None:
         launch = self._worker_launch
