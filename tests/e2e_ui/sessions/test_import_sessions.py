@@ -119,7 +119,10 @@ def test_settings_import_panel_imports_one_session_by_id(
     page.get_by_role("option", name="Session by ID").click()
     page.get_by_test_id("import-source-select").click()
     page.get_by_role("option", name="Codex").click()
-    page.get_by_test_id("import-session-id").fill("session-exact")
+    session_id_input = page.get_by_test_id("import-session-id")
+    session_id_input.fill("  session-exact  ")
+    session_id_input.blur()
+    expect(session_id_input).to_have_value("session-exact")
     page.get_by_test_id("import-submit").click()
 
     expect(page.get_by_test_id("import-result")).to_contain_text("Imported 1", timeout=30_000)

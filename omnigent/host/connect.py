@@ -42,6 +42,7 @@ from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    IMPORT_LOCAL_BY_ID_CAPABILITY,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -3770,6 +3771,7 @@ class HostProcess:
             frame_protocol_version=1,
             name=self._identity.name,
             runners=self._alive_runner_ids(),
+            capabilities=[IMPORT_LOCAL_BY_ID_CAPABILITY],
             configured_harnesses=self._configured_harnesses,
             gateway_inference=self._gateway_inference,
             telemetry_opt_out=_tel_opt_out,

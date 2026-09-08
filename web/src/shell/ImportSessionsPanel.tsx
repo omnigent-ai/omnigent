@@ -80,6 +80,7 @@ export function ImportSessionsPanel() {
     if (hostId === null) return;
     const exactSessionId = sessionId.trim();
     if (mode === "session" && exactSessionId.length === 0) return;
+    if (mode === "session") setSessionId(exactSessionId);
     setSubmitting(true);
     setError(null);
     setResult(null);
@@ -199,6 +200,7 @@ export function ImportSessionsPanel() {
             autoComplete="off"
             placeholder="Enter a session ID"
             onChange={(event) => setSessionId(event.target.value)}
+            onBlur={() => setSessionId((value) => value.trim())}
             onKeyDown={(event) => {
               if (event.key === "Enter") void handleImport();
             }}

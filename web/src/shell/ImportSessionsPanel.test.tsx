@@ -125,6 +125,8 @@ describe("ImportSessionsPanel", () => {
     const idInput = screen.getByTestId("import-session-id");
     expect(screen.getByTestId("import-submit")).toBeDisabled();
     fireEvent.change(idInput, { target: { value: "  session-exact  " } });
+    fireEvent.blur(idInput);
+    expect(idInput).toHaveValue("session-exact");
     fireEvent.click(screen.getByTestId("import-submit"));
 
     await waitFor(() =>

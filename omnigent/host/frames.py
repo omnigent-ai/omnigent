@@ -38,6 +38,9 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
+# Host supports loading one local harness transcript without enumerating history.
+IMPORT_LOCAL_BY_ID_CAPABILITY = "import_local_by_id"
+
 
 class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
@@ -95,6 +98,8 @@ class HostHelloFrame:
     :param runners: Runner IDs currently alive on this host.
         Enables state reconciliation on reconnect — the server
         diffs this against sessions in the DB.
+    :param capabilities: Additive host features the server may use. An empty
+        list means the host predates capability negotiation.
     :param configured_harnesses: Per-harness readiness on this
         machine, e.g. ``{"claude-sdk": True, "codex": False}``
         (see ``omnigent.onboarding.harness_readiness``). Keys
@@ -115,6 +120,7 @@ class HostHelloFrame:
     frame_protocol_version: int
     name: str
     runners: list[str] = field(default_factory=list)
+    capabilities: list[str] = field(default_factory=list)
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     gateway_inference: dict[str, bool] | None = None
     telemetry_opt_out: bool = False
@@ -1045,6 +1051,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "frame_protocol_version": frame.frame_protocol_version,
                 "name": frame.name,
                 "runners": list(frame.runners),
+                "capabilities": list(frame.capabilities),
                 "configured_harnesses": frame.configured_harnesses,
                 "gateway_inference": frame.gateway_inference,
                 "telemetry_opt_out": frame.telemetry_opt_out,
@@ -1554,6 +1561,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         frame_protocol_version=_required_int(msg, "frame_protocol_version"),
         name=_required_str(msg, "name"),
         runners=_optional_str_list(msg, "runners"),
+        capabilities=_optional_str_list(msg, "capabilities"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),

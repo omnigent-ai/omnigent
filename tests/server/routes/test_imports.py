@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import HostHelloFrame
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.imports import (
     LocalImportRequest,
@@ -709,3 +710,26 @@ async def test_import_local_offline_host_is_conflict(db_uri: str) -> None:
         )
     assert res.status_code == 409
     assert res.json()["error"]["code"] == ErrorCode.CONFLICT
+
+
+async def test_import_local_by_id_rejects_host_without_capability(db_uri: str) -> None:
+    """An older host fails before the streaming response or tunnel request starts."""
+    host_id = "host_0123456789abcdef0123456789abcdef"
+    HostStore(db_uri).upsert_on_connect(host_id, "laptop", "alice@example.com")
+    registry = HostRegistry()
+    conn = registry.register(
+        host_id,
+        SimpleNamespace(),  # type: ignore[arg-type]
+        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop"),
+        owner=None,
+    )
+
+    async with _host_import_client(db_uri, registry) as client:
+        res = await client.post(
+            "/v1/imports/local/stream",
+            json={"host_id": host_id, "source": "codex", "session_id": "session-exact"},
+        )
+
+    assert res.status_code == 409
+    assert "update and restart the host" in res.json()["error"]["message"]
+    assert conn.outbound_queue.empty()

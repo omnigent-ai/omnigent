@@ -19,7 +19,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.host.frames import HostImportLocalByIdFrame, HostImportLocalFrame, encode_host_frame
+from omnigent.host.frames import (
+    IMPORT_LOCAL_BY_ID_CAPABILITY,
+    HostImportLocalByIdFrame,
+    HostImportLocalFrame,
+    encode_host_frame,
+)
 from omnigent.native_coding_agents import native_coding_agent_for_harness
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
@@ -482,6 +487,15 @@ def create_imports_router(
             # an offline host: WRONG_REPLICA (400) so the client re-addresses
             # keyless, CONFLICT (409) only when the row is genuinely stale.
             raise host_absent_error(host)
+        if (
+            body.session_id is not None
+            and IMPORT_LOCAL_BY_ID_CAPABILITY not in host_conn.hello.capabilities
+        ):
+            raise OmnigentError(
+                f"host '{host_conn.host_id}' does not support importing by session ID; "
+                "update and restart the host, then try again",
+                code=ErrorCode.CONFLICT,
+            )
         return user_id, host_conn
 
     async def _import_local_core(

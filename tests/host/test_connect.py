@@ -30,6 +30,7 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    IMPORT_LOCAL_BY_ID_CAPABILITY,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -1341,6 +1342,7 @@ async def test_hello_advertises_installed_version() -> None:
     hello = decode_host_frame(tunnel.sent[0])
     assert isinstance(hello, HostHelloFrame)
     assert hello.version == VERSION
+    assert hello.capabilities == [IMPORT_LOCAL_BY_ID_CAPABILITY]
     # Guard against the old hard-coded literal creeping back.
     assert hello.version != "0.1.0"
 

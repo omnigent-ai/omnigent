@@ -599,12 +599,24 @@ def load_codex_session(
     codex_home: Path | None = None,
 ) -> LocalSessionImport:
     """Load one Codex session from its local rollout JSONL file."""
-    configured_home = os.environ.get("CODEX_HOME")
-    home = codex_home or (Path(configured_home).expanduser() if configured_home else None)
-    home = home or Path.home() / ".codex"
-    rollout_path = _find_codex_rollout(home, session_id) or _find_archived_codex_rollout(
-        home, session_id
-    )
+    default_home = Path.home() / ".codex"
+    if codex_home is not None:
+        homes = (codex_home,)
+    else:
+        configured_home = os.environ.get("CODEX_HOME")
+        configured = Path(configured_home).expanduser() if configured_home else default_home
+        homes = (configured,) if configured == default_home else (configured, default_home)
+
+    home = homes[0]
+    rollout_path: Path | None = None
+    for candidate_home in homes:
+        candidate = _find_codex_rollout(
+            candidate_home, session_id
+        ) or _find_archived_codex_rollout(candidate_home, session_id)
+        if candidate is not None:
+            home = candidate_home
+            rollout_path = candidate
+            break
     if rollout_path is None:
         raise SessionImportNotFoundError(f"Codex session {session_id!r} was not found")
 

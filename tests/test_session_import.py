@@ -686,6 +686,22 @@ def _write_codex_threads_db(
         con.close()
 
 
+def test_load_codex_session_falls_back_to_default_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inherited isolated CODEX_HOME does not hide the user's normal transcripts."""
+    session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    user_home = tmp_path / "user"
+    _write_codex_rollout(user_home / ".codex", session_id, first_message="from default home")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "isolated-codex-home"))
+    monkeypatch.setattr("pathlib.Path.home", lambda: user_home)
+
+    imported = load_codex_session(session_id)
+
+    assert imported.title == "from default home"
+
+
 def test_load_codex_session_uses_custom_thread_title(tmp_path: Path) -> None:
     """A renamed Codex thread (title != first message) carries its custom name."""
     session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
