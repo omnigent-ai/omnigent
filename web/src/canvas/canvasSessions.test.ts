@@ -5,10 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import * as identity from "@/lib/identity";
 import {
+  applyLiveRows,
   cachedSessionPreview,
   INITIAL_SESSION_PAGE_LIMIT,
   loadAllSessions,
   SESSION_PAGE_LIMIT,
+  SESSION_POLL_INTERVAL_MS,
   useCanvasSessions,
 } from "./canvasSessions";
 
@@ -160,6 +162,31 @@ describe("cachedSessionPreview", () => {
   });
 });
 
+describe("applyLiveRows", () => {
+  it("takes fresher live rows, ignores older ones, and drops rows that became archived", () => {
+    const stale = session("a", 5, { status: "idle", title: null });
+    const untouched = session("b", 7);
+    const olderInCache = session("c", 9);
+    const live = new Map([
+      ["a", session("a", 5, { status: "running", title: "Named" })],
+      ["b", session("b", 7)],
+      ["c", session("c", 3, { status: "running" })],
+      ["d", session("d", 8, { archived: true })],
+    ]);
+    const next = applyLiveRows([stale, untouched, olderInCache, session("d", 8)], live);
+    expect(next.map((row) => [row.id, row.status, row.title])).toEqual([
+      ["a", "running", "Named"],
+      ["b", "idle", "b"],
+      ["c", "idle", "c"],
+    ]);
+  });
+
+  it("returns an equal list when nothing renders differently", () => {
+    const rows = [session("a", 5)];
+    expect(applyLiveRows(rows, new Map([["a", session("a", 5)]]))).toEqual(rows);
+  });
+});
+
 describe("useCanvasSessions", () => {
   function wrapper(client: QueryClient) {
     return ({ children }: { children: ReactNode }) =>
@@ -193,6 +220,54 @@ describe("useCanvasSessions", () => {
     expect(result.current.sessions.map((row) => row.id)).toEqual(["fresh"]);
     expect(result.current.loadingMore).toBe(false);
     expect(result.current.error).toBeNull();
+  });
+
+  it("mirrors a stream patch to the sidebar cache without re-fetching", async () => {
+    const client = new QueryClient();
+    const key = ["conversations", "", true];
+    client.setQueryData(key, {
+      pageParams: [undefined],
+      pages: [page([session("s", 5, { title: null })], null, false)],
+    });
+    vi.mocked(identity.authenticatedFetch).mockResolvedValueOnce(
+      jsonResponse(page([session("s", 5, { title: null })], null, false)),
+    );
+    const { result } = renderHook(() => useCanvasSessions(), { wrapper: wrapper(client) });
+    await waitFor(() => expect(result.current.complete).toBe(true));
+    expect(result.current.sessions[0]).toMatchObject({ status: "idle", title: null });
+
+    // What SessionUpdatesProvider does when the stream reports the session running.
+    act(() => {
+      client.setQueryData(key, {
+        pageParams: [undefined],
+        pages: [page([session("s", 5, { status: "running", title: "Ugh" })], null, false)],
+      });
+    });
+    await waitFor(() =>
+      expect(result.current.sessions[0]).toMatchObject({ status: "running", title: "Ugh" }),
+    );
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("polls again after each interval while the page is visible", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.mocked(identity.authenticatedFetch).mockImplementation(async () =>
+      jsonResponse(page([], null, false)),
+    );
+    const { result } = renderHook(() => useCanvasSessions(), {
+      wrapper: wrapper(new QueryClient()),
+    });
+    await waitFor(() => expect(result.current.complete).toBe(true));
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
+    });
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
+    });
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(3);
   });
 
   it("reports an initial failure and keeps cards through a failed refresh on focus", async () => {

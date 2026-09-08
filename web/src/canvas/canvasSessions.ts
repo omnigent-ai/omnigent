@@ -3,6 +3,9 @@
 // several hundred sessions take dozens of sequential requests to fill. The
 // canvas instead paints a preview from the sidebar's cache at once, then loads
 // the canonical list in 1,000-row pages, and refreshes on a timer and on focus.
+// Between refreshes it mirrors the sidebar's list cache, which the
+// `WS /v1/sessions/updates` stream patches in place, so a card's status,
+// title, and unread state change the moment the sidebar row does.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type InfiniteData, type QueryClient, useQueryClient } from "@tanstack/react-query";
@@ -124,6 +127,61 @@ function mergePartial(existing: readonly Conversation[], loaded: Conversation[])
   return [...loaded, ...existing.filter((session) => !loadedIds.has(session.id))];
 }
 
+/** The fields a card renders or files by; anything else changing is not worth a re-render. */
+function sameCard(left: Conversation, right: Conversation): boolean {
+  return (
+    left.status === right.status &&
+    left.title === right.title &&
+    left.updated_at === right.updated_at &&
+    (left.pending_elicitations_count ?? 0) === (right.pending_elicitations_count ?? 0) &&
+    (left.git_branch ?? null) === (right.git_branch ?? null) &&
+    (left.project_id ?? null) === (right.project_id ?? null) &&
+    (left.workspace ?? null) === (right.workspace ?? null) &&
+    (left.archived ?? false) === (right.archived ?? false) &&
+    left.labels?.omni_project === right.labels?.omni_project
+  );
+}
+
+/** Newest copy of every row in the sidebar's list cache, by id. */
+function liveRows(queryClient: QueryClient): Map<string, Conversation> {
+  const live = new Map<string, Conversation>();
+  const entries = queryClient.getQueriesData<InfiniteData<ConversationsPage, string | undefined>>({
+    queryKey: ["conversations"],
+  });
+  for (const [, data] of entries) {
+    for (const page of data?.pages ?? []) {
+      for (const row of page.data) {
+        const known = live.get(row.id);
+        if (!known || row.updated_at >= known.updated_at) live.set(row.id, row);
+      }
+    }
+  }
+  return live;
+}
+
+/**
+ * Overlay the sidebar's live rows onto the canvas rows: a cached row that is
+ * at least as recent and renders differently replaces the canvas copy. Rows
+ * that became archived drop off. Returns the input when nothing changed.
+ */
+export function applyLiveRows(
+  sessions: readonly Conversation[],
+  live: ReadonlyMap<string, Conversation>,
+): Conversation[] {
+  let changed = false;
+  const next: Conversation[] = [];
+  for (const row of sessions) {
+    const fresh = live.get(row.id);
+    if (!fresh || fresh.updated_at < row.updated_at || sameCard(fresh, row)) {
+      next.push(row);
+      continue;
+    }
+    changed = true;
+    if (isTopLevelActive(fresh)) next.push(fresh);
+  }
+  return changed ? next : [...sessions];
+}
+
 export function useCanvasSessions(): CanvasSessions {
   const queryClient = useQueryClient();
   const [state, setState] = useState(() => {
@@ -192,28 +250,44 @@ export function useCanvasSessions(): CanvasSessions {
     return request;
   }, []);
 
-  // Initial load, then poll like the sidebar does and catch up on window focus.
+  // Initial load, then poll like the sidebar does and catch up when the tab
+  // becomes visible or the window regains focus.
   useEffect(() => {
     void refresh();
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
     const refreshIfVisible = () => {
       if (!document.hidden) void refresh();
     };
-    const schedule = () => {
-      timer = setTimeout(async () => {
-        if (!document.hidden) await refresh();
-        if (!cancelled) schedule();
-      }, SESSION_POLL_INTERVAL_MS);
-    };
-    schedule();
+    const timer = setInterval(refreshIfVisible, SESSION_POLL_INTERVAL_MS);
     window.addEventListener("focus", refreshIfVisible);
+    document.addEventListener("visibilitychange", refreshIfVisible);
     return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
+      clearInterval(timer);
       window.removeEventListener("focus", refreshIfVisible);
+      document.removeEventListener("visibilitychange", refreshIfVisible);
     };
   }, [refresh]);
+
+  // Live updates: the sessions stream patches the sidebar's cache in place;
+  // mirror those rows so cards change with the sidebar instead of on the next poll.
+  useEffect(() => {
+    const mirror = () => {
+      const next = applyLiveRows(sessionsRef.current, liveRows(queryClient));
+      if (next === sessionsRef.current) return;
+      if (
+        next.length === sessionsRef.current.length &&
+        next.every((row, i) => row === sessionsRef.current[i])
+      ) {
+        return;
+      }
+      sessionsRef.current = next;
+      setState((current) => ({ ...current, sessions: next }));
+    };
+    const unsubscribe = queryClient.getQueryCache().subscribe((event) => {
+      if (event.query.queryKey[0] === "conversations") mirror();
+    });
+    mirror();
+    return unsubscribe;
+  }, [queryClient]);
 
   return { ...state, refresh };
 }

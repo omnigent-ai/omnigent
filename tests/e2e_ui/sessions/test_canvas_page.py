@@ -6,7 +6,10 @@ import json
 import re
 from pathlib import Path
 
+import httpx
 from playwright.sync_api import Page, Route, expect
+
+from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 
 def _stub_server_info(page: Page, *, canvas: bool) -> None:
@@ -173,3 +176,48 @@ def test_canvas_page_remembers_a_dragged_card_across_reloads(
         "() => !(JSON.parse(localStorage.getItem("
         "`omnigent:canvas-layout:${location.origin}`) ?? '{}').positions ?? {}).only"
     )
+
+
+def test_canvas_cards_follow_live_session_updates(page: Page, live_server: str) -> None:
+    """A change pushed over the sessions stream reaches the card without a list re-fetch."""
+    create = httpx.post(
+        f"{live_server}/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = create.json()["session_id"]
+    httpx.patch(
+        f"{live_server}/v1/sessions/{session_id}",
+        json={"title": "Canvas live before"},
+        timeout=10.0,
+    ).raise_for_status()
+
+    _stub_server_info(page, canvas=True)
+    canvas_list_requests: list[str] = []
+    page.on(
+        "request",
+        lambda request: (
+            canvas_list_requests.append(request.url)
+            if "/v1/sessions?" in request.url and "limit=1000" in request.url
+            else None
+        ),
+    )
+    page.goto(f"{live_server}/canvas")
+    expect(
+        page.get_by_test_id("session-card").filter(has_text="Canvas live before")
+    ).to_be_visible(timeout=30_000)
+    requests_after_load = len(canvas_list_requests)
+
+    httpx.patch(
+        f"{live_server}/v1/sessions/{session_id}",
+        json={"title": "Canvas live after"},
+        timeout=10.0,
+    ).raise_for_status()
+
+    # Well inside the 30 s poll, so this came over the stream via the sidebar cache.
+    expect(page.get_by_test_id("session-card").filter(has_text="Canvas live after")).to_be_visible(
+        timeout=10_000
+    )
+    assert len(canvas_list_requests) == requests_after_load
