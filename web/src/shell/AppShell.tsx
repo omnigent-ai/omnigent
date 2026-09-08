@@ -93,6 +93,7 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
+import { FileMenuProvider } from "./FileContextMenu";
 import { FileViewerContext } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
@@ -1858,7 +1859,7 @@ export function AppShell() {
     !filesPanelOpen,
   );
 
-  return (
+  const shellContent = (
     <FileViewerContext.Provider value={fileViewerContextValue}>
       <TerminalFirstContextProvider value={terminalFirstContextValue}>
         <ForkDialogContextProvider value={forkDialogContextValue}>
@@ -2286,6 +2287,11 @@ export function AppShell() {
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
     </FileViewerContext.Provider>
+  );
+  return (
+    <FileMenuProvider root={workspaceRoot} hostId={activeSession?.hostId ?? null}>
+      {shellContent}
+    </FileMenuProvider>
   );
 }
 

@@ -1,4 +1,4 @@
-"""E2E: the FileViewer "Copy link to file" button yields a shareable URL.
+"""E2E: the FileViewer "Copy Omnigent Link" button yields a shareable URL.
 
 The toolbar's copy-link action writes ``window.location.href`` (carrying
 ``?file=<path>``) to the clipboard and flashes a "Copied!" confirmation
@@ -25,6 +25,8 @@ from pathlib import Path
 import httpx
 import pytest
 from playwright.sync_api import Browser, Page, expect
+
+from tests.e2e_ui.conftest import open_right_rail
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -72,7 +74,7 @@ def test_copy_link_is_shareable_in_a_new_browser(
 
     # Click the copy-link toolbar action and confirm the "Copied!" feedback
     # (the button swaps to a check icon; its tooltip becomes "Copied!").
-    copy_btn = file_viewer.get_by_role("button", name="Copy link to file")
+    copy_btn = file_viewer.get_by_role("button", name="Copy Omnigent Link")
     expect(copy_btn).to_be_visible()
     copy_btn.click()
 
@@ -96,3 +98,53 @@ def test_copy_link_is_shareable_in_a_new_browser(
         expect(fresh_viewer.get_by_text(_FILE_BODY).first).to_be_visible(timeout=20_000)
     finally:
         fresh_context.close()
+
+
+def test_file_menus_copy_paths_without_copying_the_app_url(
+    page: Page,
+    seeded_shareable_session: tuple[str, str],
+) -> None:
+    """Tree, tab, path and overflow actions copy real filesystem paths."""
+    base_url, session_id = seeded_shareable_session
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    env = page.request.get(f"{base_url}/v1/sessions/{session_id}/resources/environments/default")
+    assert env.ok, env.text()
+    absolute_path = f"{env.json()['metadata']['root'].rstrip('/')}/{_FILE_PATH}"
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name=re.compile("^Files")).click()
+    row = rail.get_by_role("button", name=_FILE_PATH, exact=True)
+    expect(row).to_be_visible(timeout=30_000)
+    row.click(button="right")
+    expect(page.get_by_role("menuitem", name=re.compile("^Show in"))).to_have_count(0)
+    page.get_by_role("menuitem", name="Copy Path", exact=True).click()
+    expect(page.get_by_text("Path copied", exact=True).first).to_be_visible()
+    assert page.evaluate("() => navigator.clipboard.readText()") == absolute_path
+    expect(rail.get_by_test_id("file-viewer")).to_have_count(0)
+
+    row.click()
+    viewer = rail.get_by_test_id("file-viewer")
+    expect(viewer.get_by_text(_FILE_BODY).first).to_be_visible(timeout=20_000)
+    tab = rail.locator(f'div[role="button"][title="{_FILE_PATH}"]')
+    tab.click(button="right")
+    page.get_by_role("menuitem", name="Copy Relative Path", exact=True).click()
+    assert page.evaluate("() => navigator.clipboard.readText()") == _FILE_PATH
+    expect(tab).to_have_attribute("aria-current", "true")
+
+    viewer.locator(f'span[title="{_FILE_PATH}"]').click(button="right")
+    page.get_by_role("menuitem", name="Copy Path", exact=True).click()
+    assert page.evaluate("() => navigator.clipboard.readText()") == absolute_path
+
+    viewer.get_by_role("button", name="View settings", exact=True).click()
+    page.get_by_role("menuitem", name="Copy Relative Path", exact=True).click()
+    assert page.evaluate("() => navigator.clipboard.readText()") == _FILE_PATH
+
+    # Shrink through the real resize control to exercise the collapsed menu.
+    handle = rail.get_by_role("separator", name="Resize panel")
+    for _ in range(20):
+        handle.press("ArrowRight")
+    viewer.get_by_role("button", name="More actions", exact=True).click()
+    expect(page.get_by_role("menuitem", name="Copy Omnigent Link", exact=True)).to_be_visible()
+    page.get_by_role("menuitem", name="Copy Relative Path", exact=True).click()
+    assert page.evaluate("() => navigator.clipboard.readText()") == _FILE_PATH

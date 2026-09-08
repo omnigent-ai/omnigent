@@ -67,6 +67,7 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { FileContextMenu, useFileMenuActions } from "./FileContextMenu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { useFileDiff } from "@/hooks/useFileDiff";
@@ -895,6 +896,7 @@ function FileViewerBody({
     icon: ReactNode;
     onSelect: () => void;
     active: boolean;
+    disabled?: boolean;
     /** Keep the menu open after selecting — for toggles the user may flip in a
      * row (e.g. wrap + whitespace). Action items (Find) omit it so the menu
      * closes as they hand off. */
@@ -1062,7 +1064,9 @@ function FileViewerBody({
   // — handy when the viewer runs in a narrow pane — and mirrors GitHub's
   // diff-settings menu. The toggles keep the menu open; actions close it as they
   // hand off.
+  const fileMenuActions = useFileMenuActions(path, isDeletedFile);
   const settingsMenu: ToolbarOption[] = [
+    ...fileMenuActions,
     {
       key: "search",
       label: "Find in file",
@@ -1111,8 +1115,8 @@ function FileViewerBody({
   });
   toolbarActions.push({
     key: "copy-link",
-    label: "Copy link to file",
-    tooltip: linkCopied ? "Copied!" : "Copy link",
+    label: "Copy Omnigent Link",
+    tooltip: linkCopied ? "Omnigent link copied!" : "Copy Omnigent Link",
     icon: linkCopied ? (
       <CheckIcon className="size-4 text-green-500" />
     ) : (
@@ -1176,6 +1180,7 @@ function FileViewerBody({
             {action.menu.map((item) => (
               <DropdownMenuItem
                 key={item.key}
+                disabled={item.disabled}
                 className="whitespace-nowrap"
                 onSelect={
                   interactive
@@ -1311,7 +1316,11 @@ function FileViewerBody({
             </div>
           )}
           {/* Always show the file path/name in the toolbar, in every view. */}
-          <span className="min-w-0 truncate font-mono text-sm text-muted-foreground">{path}</span>
+          <FileContextMenu path={path} deleted={isDeletedFile}>
+            <span title={path} className="min-w-0 truncate font-mono text-sm text-muted-foreground">
+              {path}
+            </span>
+          </FileContextMenu>
         </div>
         <div
           className="relative flex min-w-0 items-center justify-end gap-1"
@@ -1418,6 +1427,7 @@ function FileViewerBody({
                       action.menu.map((option) => (
                         <DropdownMenuItem
                           key={option.key}
+                          disabled={option.disabled}
                           className="whitespace-nowrap"
                           onSelect={(e) => {
                             if (option.keepOpen) e.preventDefault();

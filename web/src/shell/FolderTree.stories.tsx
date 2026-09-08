@@ -2,6 +2,7 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent, within } from "storybook/test";
 import type { WorkspaceChangedFile, WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import { StoryQueryRouter } from "@/storybook/StoryProviders";
+import { FileMenuProvider } from "./FileContextMenu";
 import { FolderTree } from "./FolderTree";
 
 const file = (path: string, bytes: number): WorkspaceFile => ({
@@ -106,5 +107,24 @@ export const ExpandedFolders: Story = {
     const canvas = within(canvasElement);
     await userEvent.click(canvas.getByRole("button", { name: "src/" }));
     await userEvent.click(canvas.getByRole("button", { name: "lib/" }));
+  },
+};
+
+export const ContextMenuActions: Story = {
+  tags: ["!visual-snapshot"],
+  args: {
+    ...TreeWithChanges.args,
+    conversationId: "story-file-menu",
+  },
+  decorators: [
+    (Story) => (
+      <FileMenuProvider root="/Users/demo/project" hostId="story-local-host">
+        <Story />
+      </FileMenuProvider>
+    ),
+  ],
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.pointer({ keys: "[MouseRight]", target: canvas.getByText("App.tsx") });
   },
 };

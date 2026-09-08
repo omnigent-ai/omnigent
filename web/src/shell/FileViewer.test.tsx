@@ -1,3 +1,7 @@
+import { FileMenuProvider } from "./FileContextMenu";
+import { copyText } from "@/lib/clipboard";
+
+vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
 // Tests for FileViewer's comments-panel open/close semantics and URL sync:
 //
 //   1. Panel stays closed on fresh open regardless of whether the file has comments.
@@ -237,15 +241,17 @@ function viewerTree({
   return (
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[url]}>
-        <LocationDisplay />
-        <FileViewer
-          open={open}
-          conversationId="conv_1"
-          path={path}
-          onClose={onClose}
-          sort={sort}
-          onNavigateTo={onNavigateTo}
-        />
+        <FileMenuProvider root="/workspace" hostId={null}>
+          <LocationDisplay />
+          <FileViewer
+            open={open}
+            conversationId="conv_1"
+            path={path}
+            onClose={onClose}
+            sort={sort}
+            onNavigateTo={onNavigateTo}
+          />
+        </FileMenuProvider>
       </MemoryRouter>
     </QueryClientProvider>
   );
@@ -799,7 +805,7 @@ describe("FileViewer copy-link button", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     renderViewer({ open: true });
 
-    expect(screen.getByRole("button", { name: "Copy link to file" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy Omnigent Link" })).toBeInTheDocument();
   });
 });
 
@@ -1775,5 +1781,38 @@ describe("FileViewer 3D model files", () => {
     renderViewer({ open: true, path: "mesh.obj" });
     expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
     expect(screen.queryByRole("button", { name: "View source" })).toBeNull();
+  });
+});
+
+describe("viewer filesystem actions", () => {
+  beforeEach(() => useCommentsMock.mockReturnValue(makeCommentsQuery([])));
+
+  it.each([false, true])(
+    "copies the filesystem path from the ellipsis menu (collapsed=%s)",
+    (collapsed) => {
+      if (collapsed) installCollapsedToolbar();
+      renderViewer({ open: true, path: "src/main.py" });
+      fireEvent.pointerDown(
+        screen.getByRole("button", { name: collapsed ? "More actions" : "View settings" }),
+        { button: 0 },
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "Copy Path" }));
+      expect(copyText).toHaveBeenCalledWith("/workspace/src/main.py");
+    },
+  );
+
+  it("offers path copying on the displayed path itself", () => {
+    renderViewer({ open: true, path: "src/main.py" });
+    fireEvent.contextMenu(screen.getByTitle("src/main.py"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy Relative Path" }));
+    expect(copyText).toHaveBeenCalledWith("src/main.py");
+  });
+
+  it("explicitly identifies the URL-sharing action in the overflow menu", () => {
+    installCollapsedToolbar();
+    renderViewer({ open: true });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Copy Omnigent Link" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Copy link" })).toBeNull();
   });
 });

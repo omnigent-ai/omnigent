@@ -391,3 +391,27 @@ describe("FolderTree default expansion on conversation switch", () => {
     expect(screen.getByRole("button", { name: "beta/" })).toHaveAttribute("aria-expanded", "true");
   });
 });
+
+it("offers a file's path on right-click without opening the file", () => {
+  const select = vi.fn();
+  renderTree({
+    files: [{ path: "src/main.ts", name: "main.ts", type: "file", bytes: 10, modified_at: null }],
+    onFileSelect: select,
+  });
+  fireEvent.contextMenu(screen.getByText("main.ts"));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Copy Relative Path" }));
+  expect(copyTextMock).toHaveBeenCalledWith("src/main.ts");
+  expect(select).not.toHaveBeenCalled();
+});
+
+it("offers a folder's path on right-click without toggling it", () => {
+  renderTree({
+    files: [{ path: "src/main.ts", name: "main.ts", type: "file", bytes: 10, modified_at: null }],
+  });
+  const folder = screen.getByRole("button", { name: "src/" });
+  expect(folder).toHaveAttribute("aria-expanded", "true");
+  fireEvent.contextMenu(folder);
+  fireEvent.click(screen.getByRole("menuitem", { name: "Copy Relative Path" }));
+  expect(copyTextMock).toHaveBeenCalledWith("src");
+  expect(folder).toHaveAttribute("aria-expanded", "true");
+});

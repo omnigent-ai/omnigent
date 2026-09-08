@@ -33,6 +33,7 @@ const { autoUpdater } = require("electron-updater");
 const { createDesktopUpdater } = require("./desktop_updater");
 const { createUpdateOverlay } = require("./update_overlay");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
+const { registerFileReveal } = require("./fileReveal");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -2919,6 +2920,13 @@ function registerIpc() {
       }
     };
     return serverManager.startLocalServer(cliPath, onLine);
+  });
+
+  registerFileReveal({
+    ipcMain,
+    shell,
+    isPinnedOriginSender,
+    localHostId: () => omnigentCli.localHostId(),
   });
 
   // SPA → this machine's identity: is the CLI installed, and its host id. Both

@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   getServerPicker,
+  revealFile,
+  supportsFileReveal,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
@@ -591,5 +593,28 @@ describe("getServerPicker / switchServer over the iOS bridge", () => {
     setIOS(true, true, true);
     iosGetServerPicker.mockRejectedValueOnce(new Error("bridge down"));
     await expect(getServerPicker()).resolves.toBeNull();
+  });
+});
+
+describe("native file reveal", () => {
+  it("degrades gracefully in browsers and older shells", async () => {
+    setElectron(false);
+    expect(supportsFileReveal()).toBe(false);
+    expect(await revealFile("host", "/file")).toBe(false);
+    setElectron(true);
+    expect(supportsFileReveal()).toBe(false);
+    expect(await revealFile("host", "/file")).toBe(false);
+  });
+  it("forwards the host and path and reports IPC failures", async () => {
+    const reveal = vi.fn().mockResolvedValue(true);
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      revealFile: reveal,
+    };
+    expect(supportsFileReveal()).toBe(true);
+    expect(await revealFile("local", "/a file")).toBe(true);
+    expect(reveal).toHaveBeenCalledWith("local", "/a file");
+    reveal.mockRejectedValueOnce(new Error("IPC disconnected"));
+    expect(await revealFile("local", "/a file")).toBe(false);
   });
 });

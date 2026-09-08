@@ -168,6 +168,8 @@ interface ElectronDesktopApi extends NativeShellApi {
    * idle, so the web never shows a (duplicate) banner. Absent on older shells.
    */
   updates?: ElectronUpdateBridge;
+  /** Reveal an item belonging to this machine in its native file manager. */
+  revealFile?: (hostId: string, path: string) => Promise<boolean>;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
   getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
@@ -889,5 +891,18 @@ export async function resetCliPath(): Promise<CliStatus | null> {
   } catch (err) {
     console.warn("[nativeBridge] electron resetCliPath failed:", err);
     return null;
+  }
+}
+
+/** Whether the desktop shell can reveal local files. */
+export function supportsFileReveal(): boolean {
+  return typeof electronApi()?.revealFile === "function";
+}
+
+export async function revealFile(hostId: string, path: string): Promise<boolean> {
+  try {
+    return (await electronApi()?.revealFile?.(hostId, path)) ?? false;
+  } catch {
+    return false;
   }
 }

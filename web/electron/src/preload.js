@@ -101,6 +101,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   openServerSetup: () => {
     ipcRenderer.send("omnigent:open-server-setup");
   },
+  /** Reveal a local host item in the OS file manager. */
+  revealFile: (hostId, path) => ipcRenderer.invoke("omnigent:reveal-file", hostId, path),
   /**
    * This machine's identity — `{ cliInstalled, hostId }` — read from local
    * config with no subprocess, so it's instant. Lets the SPA recognize "this

@@ -37,6 +37,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { type ChangedSort, FlatFileList } from "./FlatFileList";
+import { FileMenuProvider } from "./FileContextMenu";
 import { FolderTree } from "./FolderTree";
 import { useScrollRestore } from "./useScrollRestore";
 
@@ -584,27 +585,29 @@ export function FilesPanel({
             runnerWentOffline={runnerWentOffline}
           />
         ) : (
-          <FolderTree
-            files={allFilesQuery.data?.data}
-            isLoading={allFilesQuery.isLoading}
-            isError={allFilesQuery.isError}
-            error={allFilesQuery.error}
-            onFileSelect={openTreeFile}
-            conversationId={conversationId}
-            showHidden={showHidden}
-            onShowHidden={() => onShowHiddenChange(true)}
-            changedFiles={changedQuery.data?.data}
-            sort={changedSort}
-            runnerWentOffline={runnerWentOffline}
-            searchQuery={debouncedTreeSearch}
-            searchResults={treeSearchQuery.data}
-            isSearching={treeSearchQuery.isFetching}
-            isSearchError={treeSearchQuery.isError}
-            searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}
-            browseLocation={locationParam}
-            onNavigateDir={navigateToChild}
-            scrollParentRef={scrollRef}
-          />
+          <FileMenuProvider root={workingDir} hostId={session?.hostId ?? null}>
+            <FolderTree
+              files={allFilesQuery.data?.data}
+              isLoading={allFilesQuery.isLoading}
+              isError={allFilesQuery.isError}
+              error={allFilesQuery.error}
+              onFileSelect={openTreeFile}
+              conversationId={conversationId}
+              showHidden={showHidden}
+              onShowHidden={() => onShowHiddenChange(true)}
+              changedFiles={changedQuery.data?.data}
+              sort={changedSort}
+              runnerWentOffline={runnerWentOffline}
+              searchQuery={debouncedTreeSearch}
+              searchResults={treeSearchQuery.data}
+              isSearching={treeSearchQuery.isFetching}
+              isSearchError={treeSearchQuery.isError}
+              searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}
+              browseLocation={locationParam}
+              onNavigateDir={navigateToChild}
+              scrollParentRef={scrollRef}
+            />
+          </FileMenuProvider>
         )}
       </section>
     </div>

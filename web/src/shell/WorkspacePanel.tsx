@@ -46,6 +46,7 @@ import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { FilesPanel } from "./FilesPanel";
+import { FileContextMenu } from "./FileContextMenu";
 import { FileViewer } from "./FileViewer";
 import { GithubPanel } from "./GithubPanel";
 import type { ChangedSort } from "./FlatFileList";
@@ -340,64 +341,65 @@ function FileTabsStrip({
         const name = path.split("/").pop() ?? path;
         const active = path === activeFilePath;
         return (
-          <div
-            key={path}
-            ref={active ? activeTabRef : undefined}
-            role="button"
-            tabIndex={0}
-            aria-current={active}
-            title={path}
-            onClick={() => onFileSelect(path)}
-            onAuxClick={(e) => {
-              // Middle click (button 1) closes the tab, matching browser /
-              // editor tab conventions.
-              if (e.button === 1) {
-                e.preventDefault();
-                onCloseFile(path);
-              }
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                onFileSelect(path);
-              }
-            }}
-            className={cn(
-              // Match the fixed TabsTrigger pill's box metrics (h-24 / px-8 /
-              // rounded-8 / 13px medium) so file tabs and Files/Terminals tabs
-              // are the same height and the active chip lines up across both
-              // sets. `group/tab` drives the hover-revealed close overlay below.
-              // `overflow-hidden` clips the hover-close gradient overlay to the
-              // pill's rounded corners so its rectangular edges can't poke out.
-              "group/tab relative flex h-[24px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-              active
-                ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-            )}
-          >
-            <FileIcon className="size-4 shrink-0" />
-            <span className="min-w-0 truncate">{name}</span>
-            {/* Close button: hidden until hover, then revealed over a gradient
+          <FileContextMenu key={path} path={path}>
+            <div
+              ref={active ? activeTabRef : undefined}
+              role="button"
+              tabIndex={0}
+              aria-current={active}
+              title={path}
+              onClick={() => onFileSelect(path)}
+              onAuxClick={(e) => {
+                // Middle click (button 1) closes the tab, matching browser /
+                // editor tab conventions.
+                if (e.button === 1) {
+                  e.preventDefault();
+                  onCloseFile(path);
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onFileSelect(path);
+                }
+              }}
+              className={cn(
+                // Match the fixed TabsTrigger pill's box metrics (h-24 / px-8 /
+                // rounded-8 / 13px medium) so file tabs and Files/Terminals tabs
+                // are the same height and the active chip lines up across both
+                // sets. `group/tab` drives the hover-revealed close overlay below.
+                // `overflow-hidden` clips the hover-close gradient overlay to the
+                // pill's rounded corners so its rectangular edges can't poke out.
+                "group/tab relative flex h-[24px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                active
+                  ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
+                  : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
+              )}
+            >
+              <FileIcon className="size-4 shrink-0" />
+              <span className="min-w-0 truncate">{name}</span>
+              {/* Close button: hidden until hover, then revealed over a gradient
                 that fades the truncated filename into the tab's background so
                 the "x" never collides with the text. The overlay only shows on
                 hover, where both active and inactive tabs share the same OPAQUE
                 selection surface — fade to that exact color. (A translucent
                 fade like var(--muted) would stack over the hover background and
                 darken the right edge into a visible gradient patch.) */}
-            <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
-              <button
-                type="button"
-                aria-label={`Close ${name}`}
-                className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onCloseFile(path);
-                }}
-              >
-                <XIcon className="size-4" />
-              </button>
-            </span>
-          </div>
+              <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
+                <button
+                  type="button"
+                  aria-label={`Close ${name}`}
+                  className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onCloseFile(path);
+                  }}
+                >
+                  <XIcon className="size-4" />
+                </button>
+              </span>
+            </div>
+          </FileContextMenu>
         );
       })}
     </div>

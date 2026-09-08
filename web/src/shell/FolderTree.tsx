@@ -21,6 +21,7 @@ import {
   gitStatusLabel,
   gitStatusLetter,
 } from "./fileStatusUtils";
+import { FileContextMenu } from "./FileContextMenu";
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { useCursorTooltip } from "./useCursorTooltip";
@@ -744,74 +745,76 @@ function FileRowItem({
 
   return (
     <li className="list-none">
-      <div
-        className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-1 pr-2 hover:bg-muted"
-        style={{ paddingLeft: `${indentFor(depth)}px` }}
-      >
-        <IndentGuides depth={depth} />
-        <button
-          type="button"
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
-          onClick={() => !isDeleted && onFileSelect(path)}
-          disabled={isDeleted}
+      <FileContextMenu path={path} deleted={isDeleted}>
+        <div
+          className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-1 pr-2 hover:bg-muted"
+          style={{ paddingLeft: `${indentFor(depth)}px` }}
         >
-          <FileIcon
-            className={cn("size-3.5 shrink-0", fileColorClass ?? "text-muted-foreground")}
-          />
-          <span
-            className={cn(
-              "min-w-0 flex-1 truncate font-mono text-ui md:text-sm",
-              labelIsPath ? "[direction:rtl]" : fileStatus === "created" && "font-semibold",
-              isDeleted && "line-through opacity-50",
-              fileColorClass,
-            )}
-            {...handlers}
+          <IndentGuides depth={depth} />
+          <button
+            type="button"
+            className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
+            onClick={() => !isDeleted && onFileSelect(path)}
+            disabled={isDeleted}
           >
-            {labelIsPath ? <bdi>{displayLabel}</bdi> : displayLabel}
-          </span>
-          {fileStatus && (
-            // Centred in the shared status column so the A/M/D badge lands in
-            // the same x as a directory row's dirty dot.
+            <FileIcon
+              className={cn("size-3.5 shrink-0", fileColorClass ?? "text-muted-foreground")}
+            />
             <span
-              className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
+              className={cn(
+                "min-w-0 flex-1 truncate font-mono text-ui md:text-sm",
+                labelIsPath ? "[direction:rtl]" : fileStatus === "created" && "font-semibold",
+                isDeleted && "line-through opacity-50",
+                fileColorClass,
+              )}
+              {...handlers}
             >
-              <span
-                className={cn(
-                  "rounded px-1 py-0.5 font-mono text-[10px]",
-                  isDeleted
-                    ? "bg-destructive/10 text-destructive"
-                    : fileStatus === "created"
-                      ? "bg-green-500/10 text-green-600 dark:text-green-400"
-                      : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
-                )}
-                title={gitStatusLabel(fileStatus)}
-              >
-                {gitStatusLetter(fileStatus)}
-              </span>
+              {labelIsPath ? <bdi>{displayLabel}</bdi> : displayLabel}
             </span>
-          )}
-        </button>
-        {/* One trailing column, always rendered so every row (directories
+            {fileStatus && (
+              // Centred in the shared status column so the A/M/D badge lands in
+              // the same x as a directory row's dirty dot.
+              <span
+                className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
+              >
+                <span
+                  className={cn(
+                    "rounded px-1 py-0.5 font-mono text-[10px]",
+                    isDeleted
+                      ? "bg-destructive/10 text-destructive"
+                      : fileStatus === "created"
+                        ? "bg-green-500/10 text-green-600 dark:text-green-400"
+                        : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+                  )}
+                  title={gitStatusLabel(fileStatus)}
+                >
+                  {gitStatusLetter(fileStatus)}
+                </span>
+              </span>
+            )}
+          </button>
+          {/* One trailing column, always rendered so every row (directories
             included) shares it: metadata at rest, the copy/download pair on
             hover. */}
-        <span
-          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
-        >
-          {bytes !== null && !isDeleted && (
-            <span className="text-muted-foreground text-[10px] group-hover:invisible">
-              {formatBytes(bytes)}
-            </span>
-          )}
-          <span className="absolute inset-0 flex items-center justify-end gap-0.5">
-            {!isDeleted && conversationId ? (
-              <FileDownloadButton conversationId={conversationId} path={path} />
-            ) : (
-              <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+          <span
+            className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
+          >
+            {bytes !== null && !isDeleted && (
+              <span className="text-muted-foreground text-[10px] group-hover:invisible">
+                {formatBytes(bytes)}
+              </span>
             )}
-            <CopyPathButton path={path} revealOnHover />
+            <span className="absolute inset-0 flex items-center justify-end gap-0.5">
+              {!isDeleted && conversationId ? (
+                <FileDownloadButton conversationId={conversationId} path={path} />
+              ) : (
+                <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+              )}
+              <CopyPathButton path={path} revealOnHover />
+            </span>
           </span>
-        </span>
-      </div>
+        </div>
+      </FileContextMenu>
       {tooltip}
     </li>
   );
@@ -936,56 +939,60 @@ const TreeNodeRow = memo(function TreeNodeRow({
     // toggle, and a button nested inside a button is invalid HTML. The toggle
     // still spans everything up to the copy button, so the clickable area is
     // effectively unchanged.
-    <div
-      className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-1 pr-2 hover:bg-muted"
-      style={{ paddingLeft: `${indentFor(depth)}px` }}
-    >
-      <IndentGuides depth={depth} />
-      <button
-        type="button"
-        className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
-        onClick={() => onTogglePath(node.path)}
-        // Finder's contract: single click expands in place, double click opens
-        // the folder as the new working folder. The browser fires the two
-        // single clicks first, so the row toggles twice (a no-op) before
-        // re-rooting replaces the tree outright.
-        onDoubleClick={onNavigateDir ? () => onNavigateDir(node.path) : undefined}
-        aria-expanded={open}
+    <FileContextMenu path={node.path}>
+      <div
+        className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-1 pr-2 hover:bg-muted"
+        style={{ paddingLeft: `${indentFor(depth)}px` }}
       >
-        <ChevronRightIcon
-          className={cn(
-            "size-3.5 shrink-0 text-muted-foreground transition-transform",
-            open && "rotate-90",
-          )}
-        />
-        <span
-          className={cn(
-            "min-w-0 flex-1 truncate font-mono text-ui md:text-sm",
-            dirStatus === "created" && "font-semibold",
-            dirDotClass,
-          )}
+        <IndentGuides depth={depth} />
+        <button
+          type="button"
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
+          onClick={() => onTogglePath(node.path)}
+          // Finder's contract: single click expands in place, double click opens
+          // the folder as the new working folder. The browser fires the two
+          // single clicks first, so the row toggles twice (a no-op) before
+          // re-rooting replaces the tree outright.
+          onDoubleClick={onNavigateDir ? () => onNavigateDir(node.path) : undefined}
+          aria-expanded={open}
         >
-          {node.name}/
-        </span>
-        {dirStatus && (
+          <ChevronRightIcon
+            className={cn(
+              "size-3.5 shrink-0 text-muted-foreground transition-transform",
+              open && "rotate-90",
+            )}
+          />
           <span
-            className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
-            aria-hidden
+            className={cn(
+              "min-w-0 flex-1 truncate font-mono text-ui md:text-sm",
+              dirStatus === "created" && "font-semibold",
+              dirDotClass,
+            )}
           >
-            <span className={cn("text-[8px] leading-none", dirDotClass)}>●</span>
+            {node.name}/
           </span>
-        )}
-      </button>
-      {/* The same trailing column as a file row. A folder has no size and
+          {dirStatus && (
+            <span
+              className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
+              aria-hidden
+            >
+              <span className={cn("text-[8px] leading-none", dirDotClass)}>●</span>
+            </span>
+          )}
+        </button>
+        {/* The same trailing column as a file row. A folder has no size and
           nothing to download, so the column shows only the copy button — with
           the download's footprint reserved beside it so that button lands in
           the same x as every file row's. */}
-      <span className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}>
-        <span className="absolute inset-0 flex items-center justify-end gap-0.5">
-          <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
-          <CopyPathButton path={node.path} label="Copy folder path" revealOnHover />
+        <span
+          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
+        >
+          <span className="absolute inset-0 flex items-center justify-end gap-0.5">
+            <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+            <CopyPathButton path={node.path} label="Copy folder path" revealOnHover />
+          </span>
         </span>
-      </span>
-    </div>
+      </div>
+    </FileContextMenu>
   );
 });
