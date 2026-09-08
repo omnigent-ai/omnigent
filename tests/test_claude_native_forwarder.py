@@ -5379,7 +5379,7 @@ async def test_subagent_watcher_parks_child_of_a_parked_parent(
             starts += 1
         return httpx.Response(202, json={})
 
-    caplog.set_level(logging.WARNING, logger="omnigent.claude_native_forwarder")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder")
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler),
         base_url="http://ap",
@@ -5464,7 +5464,7 @@ async def test_subagent_watcher_defers_a_spawn_owned_by_two_transcripts(
             starts += 1
         return httpx.Response(202, json={})
 
-    caplog.set_level(logging.DEBUG, logger="omnigent.claude_native_forwarder")
+    caplog.set_level(logging.DEBUG, logger="omnigent.harnesses.claude_native.forwarder")
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler),
         base_url="http://ap",
@@ -5522,7 +5522,7 @@ async def test_subagent_watcher_defers_and_logs_when_no_transcript_owns_the_spaw
             starts += 1
         return httpx.Response(202, json={})
 
-    caplog.set_level(logging.DEBUG, logger="omnigent.claude_native_forwarder")
+    caplog.set_level(logging.DEBUG, logger="omnigent.harnesses.claude_native.forwarder")
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler),
         base_url="http://ap",

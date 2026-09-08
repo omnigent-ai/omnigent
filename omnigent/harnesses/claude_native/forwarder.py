@@ -83,6 +83,9 @@ _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 # One per Claude Task-tool subagent; appears alongside the matching
 # ``agent-<id>.jsonl`` transcript.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
+# Claude's built-in sub-agent spawn tool; its tool-use id is the ``toolUseId``
+# stamped into each ``agent-<id>.meta.json``.
+_SUBAGENT_SPAWN_TOOL_NAME = "Agent"
 
 
 def _subagent_id_from_meta_path(meta_path: Path) -> str:
@@ -1394,6 +1397,11 @@ def _tool_use_ids_in_transcript(
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
+            # Only the sub-agent spawn tool mints the ids in ``.meta.json``.
+            # Restricting to it keeps an unrelated tool-use id collision from
+            # making a legitimate spawn look ambiguous.
+            if block.get("name") != _SUBAGENT_SPAWN_TOOL_NAME:
+                continue
             tool_use_id = block.get("id")
             if isinstance(tool_use_id, str) and tool_use_id:
                 tool_use_ids.add(tool_use_id)
@@ -1610,6 +1618,7 @@ async def _forward_available_subagents(
                             "agent_type": meta["agentType"],
                             "description": meta["description"],
                             "tool_use_id": meta["toolUseId"],
+                            "parent_subagent_id": parent_subagent_id,
                         },
                         reason="permanent HTTP failure after retries",
                         delivered_ambiguous=False,
