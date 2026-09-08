@@ -1468,7 +1468,7 @@ def create_app(
     # harnesses — see native_bridge_common.reap_orphaned_native_bridge_dirs.
     # Best-effort: a sweep failure must never crash runner startup.
     try:
-        from omnigent.native_bridge_common import reap_orphaned_native_bridge_dirs
+        from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
 
         _reaped_bridge_dirs = reap_orphaned_native_bridge_dirs()
         if _reaped_bridge_dirs:
@@ -1532,7 +1532,7 @@ def create_app(
         # boot reaps any such orphan whose owner lock is no longer held (its
         # runner is gone), so a fresh runner on the host cleans up what a dead
         # predecessor left. Held owner locks (live sibling runners) are skipped.
-        from omnigent.codex_native_process_registry import (
+        from omnigent.harnesses.codex_native.process_registry import (
             reconcile_codex_native_process_registry,
         )
 

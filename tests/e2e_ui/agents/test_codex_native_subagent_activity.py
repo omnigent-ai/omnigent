@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import Page, expect
 
-from omnigent import codex_native_forwarder
+from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from tests.e2e_ui.conftest import open_right_rail
 
 

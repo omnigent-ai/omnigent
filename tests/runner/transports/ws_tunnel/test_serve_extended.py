@@ -214,11 +214,17 @@ async def test_dispatch_via_asgi_app_crash_sends_500() -> None:
 
     end = decode_frame(sent[2])
     assert isinstance(end, ResponseEndFrame)
+    # Pre-head crash ends cleanly: the synthetic 500 body should be readable,
+    # not aborted.
+    assert end.error is None, (
+        f"pre-head crash sent error-flagged end frame: {end.error!r} — "
+        "breaks clean 500 delivery to the consumer"
+    )
 
 
 @pytest.mark.asyncio
 async def test_dispatch_via_asgi_app_crash_after_head_sends_end() -> None:
-    """An app crash after sending head still sends end frame."""
+    """An app crash after sending head still sends end frame, now error-flagged."""
 
     async def _late_crash_app(
         scope: dict[str, Any],
@@ -238,7 +244,13 @@ async def test_dispatch_via_asgi_app_crash_after_head_sends_end() -> None:
     frames = [decode_frame(s) for s in sent]
     assert isinstance(frames[0], ResponseHeadFrame)
     assert frames[0].status == 200
-    assert isinstance(frames[-1], ResponseEndFrame)
+    end = frames[-1]
+    assert isinstance(end, ResponseEndFrame)
+    # After-head crash must signal the error so the consumer raises rather than
+    # seeing a clean EOF after partial body.
+    assert end.error is not None, (
+        "after-head crash sent clean end frame — consumer would see silent EOF"
+    )
 
 
 @pytest.mark.asyncio

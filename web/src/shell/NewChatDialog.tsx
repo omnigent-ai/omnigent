@@ -69,6 +69,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { randomUUID } from "@/lib/randomUUID";
 import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
@@ -100,7 +101,12 @@ import {
   rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
-import { setPendingInitialPrompt } from "@/store/chatStore";
+import {
+  beginLocalConversation,
+  hydrateLocalConversation,
+  removeLocalConversation,
+  setPendingInitialPrompt,
+} from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
@@ -210,6 +216,7 @@ import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSw
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
+import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   useConversations,
@@ -218,12 +225,9 @@ import {
   moveConversationToProject,
   PROJECT_LABEL_KEY,
 } from "@/hooks/useConversations";
-import {
-  collectConversationIds,
-  type ConversationsInfiniteData,
-  type SessionListWireItem,
-} from "@/lib/sessionListCache";
+import type { SessionListWireItem } from "@/lib/sessionListCache";
 import { nextPushedSession } from "@/lib/sessionUpdatesSocket";
+import { CLIENT_CREATE_TOKEN_LABEL, newTempConversation } from "@/lib/tempConversationId";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
@@ -1636,7 +1640,9 @@ function HarnessConfigModal({
   claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   claudeModelsLoading: boolean;
   claudeModelsError: string | null;
-  codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
+  // Full catalog rows (not a narrowed Pick): the Effort row reads each
+  // model's supportedReasoningEfforts ladder off the same response.
+  codexModelOptions: readonly NativeModelOption[];
   codexModelsLoading: boolean;
   codexModelsError: string | null;
   piModelOptions: readonly { id: string; displayName: string }[];
@@ -1720,6 +1726,35 @@ function HarnessConfigModal({
     () => codexModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [codexModelOptions],
   );
+  // Codex advertises a per-model effort ladder, so the Effort row follows the
+  // DRAFTED model — else picking another model still lists the old rungs.
+  // "Default" ("") resolves to the catalog-default row: for a new session
+  // that is the model a bare launch truly runs.
+  const codexEffortLevels = useMemo(
+    () =>
+      isCodex
+        ? codexEffortLevelsForModel(
+            codexModelOptions,
+            draftModel || (codexModelOptions.find((m) => m.isDefault)?.id ?? null),
+          )
+        : [],
+    [isCodex, codexModelOptions, draftModel],
+  );
+  // Drop a drafted level the newly-picked model doesn't offer, so no stale
+  // rung shows and Save never commits a level the model rejects. Codex only:
+  // other harnesses use a model-independent ladder.
+  const clampCodexDraftEffort = (modelId: string) => {
+    if (!isCodex) return;
+    setDraftEffort((prev) =>
+      prev &&
+      codexEffortLevelsForModel(
+        codexModelOptions,
+        modelId || (codexModelOptions.find((m) => m.isDefault)?.id ?? null),
+      ).includes(prev)
+        ? prev
+        : "",
+    );
+  };
   // The host catalog re-polls while the modal is open (a provider switch under
   // it). A draft the new catalog no longer lists would render a blank trigger,
   // so it falls back to Default.
@@ -1744,10 +1779,12 @@ function HarnessConfigModal({
       // "Default" = no override; defer routing to the spec default (null,
       // omitted from create) — never emit an explicit "on"/"off".
       setDraftRouting(null);
+      clampCodexDraftEffort("");
     } else {
       setDraftModel(value);
       // Picking an explicit model turns routing off (mutually exclusive).
       setDraftRouting(null);
+      clampCodexDraftEffort(value);
     }
   };
 
@@ -1780,13 +1817,16 @@ function HarnessConfigModal({
       if (entryHarness)
         writeHarnessOption(entryHarness, { model: draftModel, effort: draftEffort });
     } else if (hasApproval) {
-      if (isCodex) setPickedModel(draftModel);
+      if (isCodex) {
+        setPickedModel(draftModel);
+        setPickedEffort(draftEffort);
+      }
       setApprovalMode(draftApproval);
       setBypassSandbox(draftBypass);
       if (entryHarness) {
         writeHarnessOption(entryHarness, {
           mode: isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval,
-          ...(isCodex ? { model: draftModel } : {}),
+          ...(isCodex ? { model: draftModel, effort: draftEffort } : {}),
         });
       }
     } else if (hasCursor) {
@@ -1982,6 +2022,46 @@ function HarnessConfigModal({
                   )}
                 </RoutingModelSelect>
               </ConfigRow>
+              {/* Codex's effort ladder is per-model metadata off the same
+              catalog response; hidden when the drafted model advertises no
+              levels (mirroring the in-session gear's composer-config-effort
+              row). */}
+              {isCodex && codexEffortLevels.length > 0 && (
+                <ConfigRow label="Effort" description="Reasoning depth vs. speed">
+                  <Select
+                    // Smart Routing picks the model (and its effort) per
+                    // turn, so an explicit effort is meaningless: the row is
+                    // frozen and reads as an em-dash placeholder. Radix shows
+                    // the placeholder for the empty value, which no item can
+                    // carry.
+                    value={smartRoutingOn ? "" : draftEffort || EFFORT_SELECT_NONE}
+                    onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
+                    disabled={smartRoutingOn}
+                  >
+                    <SelectTrigger
+                      className="w-full cursor-pointer"
+                      data-testid="new-chat-landing-config-effort"
+                      aria-label="Reasoning effort"
+                    >
+                      <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
+                    </SelectTrigger>
+                    <SelectContent
+                      position="popper"
+                      align="start"
+                      className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
+                    >
+                      <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+                      {/* Codex efforts render raw — its ids aren't title-cased
+                      (matching the in-session gear's labeling). */}
+                      {codexEffortLevels.map((level) => (
+                        <SelectItem key={level} value={level}>
+                          {level}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </ConfigRow>
+              )}
               <ConfigRow label="Approval" description="What the agent can do without asking">
                 <DescribedSelect
                   // Codex adds the DANGEROUS full-bypass as a 4th option; when
@@ -2194,12 +2274,18 @@ interface LandingDraft {
 }
 
 let landingDraft: LandingDraft | null = null;
+let landingDraftRevision = 0;
+
+function writeLandingDraft(draft: LandingDraft | null): void {
+  landingDraft = draft;
+  landingDraftRevision += 1;
+}
 
 // Test-only: clears the preserved landing draft so each case starts from a
 // clean module state (the draft is module-scoped and survives unmount by
 // design, which would otherwise leak between tests).
 export function resetLandingDraft(): void {
-  landingDraft = null;
+  writeLandingDraft(null);
 }
 
 export function NewChatLandingScreen() {
@@ -2684,6 +2770,7 @@ export function NewChatLandingScreen() {
   // `submittedRef` is flipped once the draft is sent to a create, so the
   // snapshot is dropped instead of resurrected.
   const submittedRef = useRef(false);
+  const submittedDraftRevisionRef = useRef<number | null>(null);
   // Whether this composer is still on screen. The create POST can outlive
   // it — the user opens another session while the session bootstraps — and
   // the post-create navigation must not follow them there.
@@ -2721,7 +2808,11 @@ export function NewChatLandingScreen() {
     onScreenRef.current = true;
     return () => {
       onScreenRef.current = false;
-      landingDraft = submittedRef.current ? null : draftRef.current;
+      if (!submittedRef.current) {
+        writeLandingDraft(draftRef.current);
+      } else if (submittedDraftRevisionRef.current === landingDraftRevision) {
+        writeLandingDraft(null);
+      }
     };
   }, []);
 
@@ -2932,11 +3023,11 @@ export function NewChatLandingScreen() {
   );
 
   // Fill the branch field with a unique auto-generated name so the user can
-  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
-  // available in every browser the app targets; the short prefix keeps the
-  // dir/branch readable (worktree-1a2b3c4d).
+  // spin up a throwaway worktree without inventing one. Uses the secure-context-
+  // safe UUID helper (a plain-http self-hosted origin has no `crypto.randomUUID`);
+  // the short prefix keeps the dir/branch readable (worktree-1a2b3c4d).
   const generateBranchName = useCallback(() => {
-    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+    const suffix = randomUUID().replace(/-/g, "").slice(0, 8);
     const name = `worktree-${suffix}`;
     setBranchName(name);
     return name;
@@ -3226,8 +3317,19 @@ export function NewChatLandingScreen() {
                   : defaultModelLabel(codexModelOptions),
               },
             ];
+      // Mirror the modal's Effort row: em-dash while routing picks per turn,
+      // else the picked level (Codex ids render raw, not title-cased).
+      const effortRows = !isCodex
+        ? []
+        : [
+            {
+              label: "Effort",
+              value: routingOn ? EFFORT_UNAVAILABLE_PLACEHOLDER : pickedEffort || "Default",
+            },
+          ];
       return [
         ...modelRows,
+        ...effortRows,
         { label: "Approval", value: approvalValue },
         ...(isCodex ? sourceRows(codexModelOptions) : []),
       ];
@@ -3404,16 +3506,30 @@ export function NewChatLandingScreen() {
       // A remembered routing "on" outranks a remembered concrete model, and
       // also drops any model/effort left in the shared state (e.g. seeded for
       // Claude Code before the harness switch).
-      setPickedModel(
+      const seededCodexModel =
         (selectedNativeHarness === "codex-native" ? projectSeed(codexModelOptions) : null) ??
-          (!storedRoutingOn &&
+        (!storedRoutingOn &&
+        selectedNativeHarness === "codex-native" &&
+        stored.model != null &&
+        codexModelOptions.some((m) => m.id === stored.model)
+          ? stored.model
+          : "");
+      setPickedModel(seededCodexModel);
+      // Restore the remembered Codex effort only while the seeded model's
+      // ladder (the catalog default's when no model is pinned) still offers
+      // it — anything else resolves to "" so a level another harness left in
+      // the shared state never rides a Codex create.
+      setPickedEffort(
+        !storedRoutingOn &&
           selectedNativeHarness === "codex-native" &&
-          stored.model != null &&
-          codexModelOptions.some((m) => m.id === stored.model)
-            ? stored.model
-            : ""),
+          stored.effort != null &&
+          codexEffortLevelsForModel(
+            codexModelOptions,
+            seededCodexModel || (codexModelOptions.find((m) => m.isDefault)?.id ?? null),
+          ).includes(stored.effort)
+          ? stored.effort
+          : "",
       );
-      if (storedRoutingOn) setPickedEffort("");
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
     } else if (supportsAgySkipPermissions) {
@@ -4233,7 +4349,8 @@ export function NewChatLandingScreen() {
   // dropped it on the strength of the submit.
   function returnDraftToUser() {
     submittedRef.current = false;
-    if (!onScreenRef.current) landingDraft = draftRef.current;
+    submittedDraftRevisionRef.current = null;
+    if (!onScreenRef.current) writeLandingDraft(draftRef.current);
   }
 
   async function handleCreate() {
@@ -4245,6 +4362,11 @@ export function NewChatLandingScreen() {
     // form submit) and Enter-key sends alike. After the guard so guarded no-ops
     // don't emit, matching the disabled Start button.
     trackClick("new_chat.start_session", "button");
+    // BrowserRouter may defer its React update even though history already
+    // changed. Remember the submit location so a late create cannot redirect
+    // after the user has navigated elsewhere while this component is still
+    // mounted in the outgoing transition tree.
+    const createLocation = window.location.href;
     // Remember the repo/branch for next time (seeds the picker on the next
     // visit). Only when a repo is actually set — a no-repo session leaves the
     // remembered repo untouched rather than clearing it.
@@ -4253,11 +4375,29 @@ export function NewChatLandingScreen() {
     }
     setCreating(true);
     setCreateError(null);
+    let localConv: {
+      tempConvId: string;
+      pendingMsgTempId: string;
+      createToken: string;
+    } | null = null;
+    // Single teardown for EVERY create-failure exit (the `catch` and the
+    // `"error" in created` early return): drop the client-only conversation and,
+    // if the user is still on it, send them back to landing so the restored
+    // draft (and the create error) have somewhere to surface. Without this, a
+    // failure after the navigate-first jump strands a read-only phantom chat.
+    const tearDownLocalConversation = () => {
+      if (localConv === null) return;
+      const stillOnTempRoute = window.location.pathname.endsWith(`/c/${localConv.tempConvId}`);
+      const wasViewing = removeLocalConversation(localConv.tempConvId);
+      // Gated on `wasViewing` (not `onScreenRef` — the landing already unmounted).
+      if (wasViewing && stillOnTempRoute) navigate("/");
+    };
     // The draft is spent from the moment it is submitted: it belongs to the
     // session now being created, so a detour back to this screen must not
     // hand it back pre-filled. Flipped here rather than on the response
     // because the create outlives an unmount; a create that fails hands the
     // draft back via returnDraftToUser.
+    submittedDraftRevisionRef.current = landingDraftRevision;
     submittedRef.current = true;
     try {
       const trimmedBranch = branchName.trim();
@@ -4310,7 +4450,6 @@ export function NewChatLandingScreen() {
       const initialPrompt =
         buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null) +
         sanitizeInitialPrompt(message);
-
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
       // selects which CLI bridge the runner launches — the values are the
@@ -4407,32 +4546,17 @@ export function NewChatLandingScreen() {
         setPendingAgent(null);
       } else {
         // Normal path: bind to an existing registered agent.
-        // Which pushed row is ours: the one this tab has never seen, bound
-        // to the agent and host we're about to ask for. Sub-agent children
-        // are never a create's result. Snapshotting the known ids BEFORE
-        // the POST is what makes "never seen" mean "created by this call".
-        const knownSessionIds = new Set(
-          collectConversationIds(
-            [
-              ...queryClient.getQueriesData<ConversationsInfiniteData>({
-                queryKey: ["conversations"],
-              }),
-              ...queryClient.getQueriesData<ConversationsInfiniteData>({
-                queryKey: ["project-sessions"],
-              }),
-            ].map(([, cached]) => cached),
-          ),
-        );
-        // A sandbox create has no host to match on until the sandbox
-        // registers one, so it waits for the response like before.
-        const matchOwnCreate =
-          sandboxSelected || !selectedHostId
-            ? null
-            : (item: SessionListWireItem) =>
-                !knownSessionIds.has(item.id) &&
-                item.parent_session_id == null &&
-                item.agent_id === effectiveAgentId &&
-                item.host_id === selectedHostId;
+        const provisional = newTempConversation();
+        try {
+          localConv = beginLocalConversation(initialPrompt, files, provisional);
+          if (localConv !== null) navigate(`/c/${localConv.tempConvId}`);
+        } catch {
+          /* non-fatal: the response still opens the server session */
+        }
+        const createToken = localConv?.createToken ?? provisional.token;
+        const matchOwnCreate = (item: SessionListWireItem) =>
+          item.parent_session_id == null &&
+          item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
         const createRequest = authenticatedFetch("/v1/sessions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -4479,7 +4603,10 @@ export function NewChatLandingScreen() {
             // placeholder, so the placeholder's wrapper labels, launch args and
             // model would all describe a CLI the router may not pick. The
             // server stamps the routed wrapper's labels once it has rebound.
-            labels: smartRoutingHarnessSelected ? undefined : createLabels,
+            labels: {
+              ...(smartRoutingHarnessSelected ? {} : createLabels),
+              [CLIENT_CREATE_TOKEN_LABEL]: createToken,
+            },
             // Permission / approval / cursor mode → CLI flag pair, persisted as
             // terminal_launch_args. Omitted for the default and non-native agents.
             terminal_launch_args: smartRoutingHarnessSelected
@@ -4508,7 +4635,9 @@ export function NewChatLandingScreen() {
             reasoning_effort:
               !smartRoutingHarnessSelected &&
               !routingOwnsModel &&
-              (agentSupportsPermissionMode || selectedNativeHarness === "pi-native") &&
+              (agentSupportsPermissionMode ||
+                selectedNativeHarness === "pi-native" ||
+                nativeAgent?.harness === "codex-native") &&
               pickedEffort
                 ? pickedEffort
                 : undefined,
@@ -4526,17 +4655,12 @@ export function NewChatLandingScreen() {
               smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
           }),
         });
-        // The create doesn't answer until the host has spawned a runner — a
-        // process boot, seconds of it — but the session row exists (and is
-        // announced on the updates stream) almost immediately. Open the chat
-        // on whichever id lands first: the pushed row typically wins by
-        // seconds, and the chat page renders from the id alone, showing its
-        // own starting spinner while the runner comes up.
+        // Managed launch validation continues after the row is announced, so
+        // only its HTTP response can resolve the temp chat.
         const abortPush = new AbortController();
-        const pushedRow =
-          matchOwnCreate === null
-            ? Promise.resolve(null)
-            : nextPushedSession(matchOwnCreate, abortPush.signal);
+        const pushedRow = sandboxSelected
+          ? Promise.resolve(null)
+          : nextPushedSession(matchOwnCreate, abortPush.signal);
         const confirmed = (async (): Promise<{ id: string } | { error: string }> => {
           const response = await createRequest;
           if (!response.ok) return { error: await describeCreateError(response) };
@@ -4560,12 +4684,18 @@ export function NewChatLandingScreen() {
           });
           confirmed.then(resolve, reject);
         });
+        abortPush.abort();
         // A row is only written (and announced) after the create has validated
         // the workspace and agent, so winning on the push can't skip past an
         // error the user needed to see on this screen.
         if ("error" in created) {
           returnDraftToUser();
-          setCreateError(created.error);
+          // On the navigate-first path the landing screen is unmounted, so tear
+          // down the phantom chat, return to landing, and surface the error as a
+          // toast (survives the remount); inline error only when still on landing.
+          tearDownLocalConversation();
+          if (localConv !== null) showToast(created.error);
+          else setCreateError(created.error);
           return;
         }
         data = { id: created.id };
@@ -4586,7 +4716,8 @@ export function NewChatLandingScreen() {
           supportsCursorMode: agentSupportsCursorMode,
           supportsAgySkipPermissions: agentSupportsAgySkip,
           supportsModelPicker: agentSupportsModelPicker || nativeAgent?.harness === "codex-native",
-          supportsEffortPicker: selectedNativeHarness === "pi-native",
+          supportsEffortPicker:
+            selectedNativeHarness === "pi-native" || selectedNativeHarness === "codex-native",
           permissionMode,
           approvalMode,
           bypassSandbox,
@@ -4639,42 +4770,57 @@ export function NewChatLandingScreen() {
       // next time. Recorded only on a successful create, so a harness the user
       // merely browsed past never earns a primary slot.
       if (selectedNativeHarness !== null) addRecentHarness(selectedNativeHarness);
-      // Fire-and-forget: don't block navigation on the sidebar list refresh.
-      // The background refetch (or the WS session_added push) backfills the
-      // new session's row within ~1s of landing in the chat; the chat itself
-      // loads from the session id and never reads the sidebar cache.
-      void queryClient.refetchQueries({ queryKey: ["conversations"] });
-      void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
-      // A first message matching one of the agent's bundled skills is
-      // handed off as a structured invocation so ChatPage auto-sends it
-      // as a `slash_command` event (server resolves the skill) instead
-      // of plain text the agent would see as a literal "/name". Native
-      // terminal agents keep plain text — their CLI owns slash commands.
-      setPendingInitialPrompt(data.id, {
-        text: initialPrompt,
-        skill: isNativeTerminalAgent
-          ? null
-          : matchSkillInvocation(initialPrompt, agent?.skills ?? []),
-        files,
-      });
-      // Label the new row with the prompt until the server's seed title lands.
-      recordOptimisticTitle(data.id, initialPrompt);
+      // A first message matching one of the agent's bundled skills is sent as a
+      // structured `slash_command` (server resolves the skill) rather than the
+      // literal "/name". Native terminal agents keep plain text — their CLI owns
+      // slash commands.
+      const skill = isNativeTerminalAgent
+        ? null
+        : matchSkillInvocation(initialPrompt, agent?.skills ?? []);
       // Scope the recall entry to the new session id so ArrowUp surfaces it in
-      // the freshly-opened chat (whose composer reads the same per-conversation
-      // key). Sanitized text so recall reproduces exactly what was sent.
+      // the freshly-opened chat. Sanitized text so recall reproduces what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
-      landingDraft = null;
-      // Only follow the create while the user is still on the landing
-      // screen. A create that outlived it means they moved on to another
-      // session; jumping them into this one now would hijack that. The
-      // session is created either way and its first message stays held
-      // for whenever they open it.
-      if (onScreenRef.current) navigate(`/c/${data.id}`);
+      if (submittedDraftRevisionRef.current === landingDraftRevision) {
+        writeLandingDraft(null);
+      }
+      void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
+
+      // `localConv` is set only when a real agent id was resolved up front, so
+      // it's safe to POST the first message with it.
+      if (localConv !== null && effectiveAgentId !== null) {
+        const tempRouteSuffix = `/c/${localConv.tempConvId}`;
+        // Hydrate the temp id onto the real id and POST the first message.
+        hydrateLocalConversation(
+          localConv.tempConvId,
+          data.id,
+          effectiveAgentId,
+          initialPrompt,
+          files,
+          localConv.pendingMsgTempId,
+          skill,
+          navigate,
+          () => window.location.pathname.endsWith(tempRouteSuffix),
+        );
+        void queryClient.refetchQueries({ queryKey: ["conversations"] });
+      } else {
+        // Server-first: a pending custom agent (or no client cache in tests).
+        // Label the row, stash the first message for ChatPage to send, navigate.
+        recordOptimisticTitle(data.id, initialPrompt);
+        void queryClient.refetchQueries({ queryKey: ["conversations"] });
+        setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
+        if (onScreenRef.current && window.location.href === createLocation) {
+          navigate(`/c/${data.id}`);
+        }
+      }
     } catch {
+      const msg = "Couldn't reach the server. Check your connection and try again.";
+      tearDownLocalConversation();
       returnDraftToUser();
-      setCreateError("Couldn't reach the server. Check your connection and try again.");
+      // Toast when the landing screen is gone (navigate-first); inline otherwise.
+      if (localConv !== null) showToast(msg);
+      else setCreateError(msg);
     } finally {
       setCreating(false);
     }

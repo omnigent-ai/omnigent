@@ -1547,7 +1547,7 @@ async def test_cleanup_session_preserves_live_native_bridge_dir(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.claude_native_bridge as claude_bridge
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
 
     monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
     monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)

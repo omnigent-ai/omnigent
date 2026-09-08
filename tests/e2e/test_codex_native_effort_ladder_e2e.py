@@ -460,8 +460,7 @@ def test_persisted_max_effort_is_delivered_on_codex_native_turn(
         assert not drop_lines, (
             "the runner silently dropped the session's persisted "
             "reasoning_effort='max' on the codex-native turn (the per-turn "
-            "half of the codex-native effort-ladder gap):\n  "
-            + "\n  ".join(drop_lines[:3])
+            "half of the codex-native effort-ladder gap):\n  " + "\n  ".join(drop_lines[:3])
         )
         assert delivery_seen, (
             "the codex-native turn never demonstrably reached the runner's "

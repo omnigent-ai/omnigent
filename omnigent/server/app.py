@@ -766,7 +766,7 @@ def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
     import inspect
     import tempfile
 
-    from omnigent.native_dispatch import resolve_hook
+    from omnigent.native.native_dispatch import resolve_hook
     from omnigent.spec import materialize_bundle
 
     materialize = resolve_hook(provider, "materialize_agent_spec")
@@ -803,7 +803,7 @@ def _ensure_default_native_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 
     for agent in NATIVE_CODING_AGENTS:
         provider = native_provider_for_key(agent.key)

@@ -69,6 +69,7 @@ function renderHeader(props: {
   boundAgent?: Agent;
   wrapperLabel?: string | null;
   canShare?: boolean;
+  canFork?: boolean;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   hasHeaderMenu?: boolean;
@@ -77,6 +78,7 @@ function renderHeader(props: {
   showFilesPanel?: boolean;
   mobileMenu?: typeof mobileMenu;
   onOpenSidebar?: (peek?: boolean) => void;
+  onFork?: () => void;
 }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -99,9 +101,11 @@ function renderHeader(props: {
             boundAgent={props.boundAgent}
             wrapperLabel={props.wrapperLabel ?? null}
             canShare={props.canShare ?? false}
+            canFork={props.canFork ?? false}
             shareDisabled={props.shareDisabled}
             shareDisabledReason={props.shareDisabledReason}
             onShare={() => {}}
+            onFork={props.onFork ?? (() => {})}
             hasAgentInfo={props.hasAgentInfo ?? false}
             onAgentInfo={() => {}}
             hasHeaderMenu={props.hasHeaderMenu ?? false}
@@ -206,6 +210,41 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
       expect(onOpenSidebar).not.toHaveBeenCalledWith(true);
       fireEvent.click(toggle);
       expect(onOpenSidebar).toHaveBeenLastCalledWith(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("suppresses the hover tooltip once the dwell fires the peek", () => {
+    // The peek card fades in click-through, so the pointer keeps resting on the
+    // toggle past the tooltip's own delay. The peek is the intended hover
+    // reveal, so its "Open sidebar" tooltip must not also pop over the card.
+    vi.useFakeTimers();
+    try {
+      renderHeader({ sidebarOpen: false });
+      const toggle = screen.getByRole("button", { name: "Open sidebar" });
+
+      fireEvent.pointerEnter(toggle);
+      // Past the 400ms peek dwell and the tooltip's 600ms hover delay.
+      act(() => vi.advanceTimersByTime(1000));
+
+      expect(screen.queryByRole("tooltip", { name: "Open sidebar" })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still shows the tooltip on keyboard focus (no peek armed)", () => {
+    // Focus never arms a peek, so the tooltip stays available for a11y.
+    vi.useFakeTimers();
+    try {
+      renderHeader({ sidebarOpen: false });
+      const toggle = screen.getByRole("button", { name: "Open sidebar" });
+
+      fireEvent.focus(toggle);
+      act(() => vi.advanceTimersByTime(1000));
+
+      expect(screen.getByRole("tooltip", { name: "Open sidebar" })).toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }
@@ -421,7 +460,9 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
                 boundAgent={undefined}
                 wrapperLabel={null}
                 canShare={false}
+                canFork={false}
                 onShare={() => {}}
+                onFork={() => {}}
                 hasAgentInfo={false}
                 onAgentInfo={() => {}}
                 hasHeaderMenu={false}
@@ -443,7 +484,9 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
               boundAgent={undefined}
               wrapperLabel={null}
               canShare={false}
+              canFork={false}
               onShare={() => {}}
+              onFork={() => {}}
               hasAgentInfo={false}
               onAgentInfo={() => {}}
               hasHeaderMenu={false}
@@ -698,6 +741,30 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
 
     expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
     expect(screen.getByTestId("session-actions-menu")).toBeInTheDocument();
+  });
+
+  it("keeps the desktop fallback menu limited to Fork", () => {
+    const onFork = vi.fn();
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: null,
+      canFork: true,
+      hasAgentInfo: true,
+      hasRailContent: true,
+      showFilesPanel: true,
+      onFork,
+    });
+
+    const trigger = screen.getByTestId("desktop-fork-actions-menu");
+    fireEvent.pointerDown(trigger, { button: 0 });
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Fork",
+    ]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(onFork).toHaveBeenCalledOnce();
   });
 
   it("folds the workspace-rail entries into the one mobile kebab", () => {

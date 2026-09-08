@@ -17,15 +17,17 @@ import pytest
 import tomllib
 import yaml
 
-from omnigent import codex_native, codex_native_app_server, codex_native_forwarder
 from omnigent._runner_startup import RunnerStartupProgress
-from omnigent.codex_native_bridge import (
+from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+from omnigent.harnesses.codex_native import main as codex_native
+from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     clear_bridge_state,
     read_bridge_state,
     write_bridge_state,
 )
-from omnigent.codex_native_elicitation import codex_elicitation_id
+from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.spec import load
 
 # The default-stance auto-review override normalize_codex_permission_launch_args
@@ -36,7 +38,7 @@ _AUTO_REVIEW_ARGS = ["-c", 'approvals_reviewer="auto_review"']
 @pytest.fixture(autouse=True)
 def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "omnigent.model_catalog.resolve_catalog_model",
+        "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
             model_id=f"catalog-{provider_name}-{family}-default"
         ),
@@ -762,7 +764,7 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
         return fake_client
 
     monkeypatch.setattr(
-        "omnigent.codex_native_app_server.CodexAppServerClient",
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
         fake_client_factory,
     )
 
@@ -1447,7 +1449,7 @@ def test_build_codex_remote_args_bypass_emits_flag_and_strips_conflicts(
     sandbox`` and strips the conflicting ``--sandbox`` / ``--ask-for-approval``
     pairs.
 
-    See :func:`omnigent.codex_native_app_server._strip_approval_sandbox_flags`.
+    See :func:`omnigent.harnesses.codex_native.app_server._strip_approval_sandbox_flags`.
     Asserting the exact argv guards three things: the bypass flag is present
     exactly once, the conflicting flag pairs are removed (with their values),
     and the bypass flag lands before any ``resume`` subcommand (codex rejects
@@ -1794,7 +1796,7 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
     # Patch at the source: the forwarder builds its fallback client via
     # client_for_transport, which constructs the app_server module's class.
     monkeypatch.setattr(
-        "omnigent.codex_native_app_server.CodexAppServerClient", fake_client_factory
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", fake_client_factory
     )
 
     async def run() -> None:
@@ -7615,7 +7617,7 @@ def test_record_launch_for_fresh_session_persists_current_cwd(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    from omnigent.codex_native_state import read_launch_state
+    from omnigent.harnesses.codex_native.state import read_launch_state
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -7640,7 +7642,7 @@ def test_align_working_directory_with_session_matching_cwd_is_noop(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    from omnigent.codex_native_state import write_launch_state
+    from omnigent.harnesses.codex_native.state import write_launch_state
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path / "state"))
@@ -7672,7 +7674,7 @@ def test_align_working_directory_with_session_switches_to_recorded_cwd(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    from omnigent.codex_native_state import write_launch_state
+    from omnigent.harnesses.codex_native.state import write_launch_state
 
     recorded = tmp_path / "recorded"
     current = tmp_path / "current"
@@ -7703,7 +7705,7 @@ def test_align_working_directory_with_session_missing_recorded_cwd_raises(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    from omnigent.codex_native_state import write_launch_state
+    from omnigent.harnesses.codex_native.state import write_launch_state
 
     current = tmp_path / "current"
     missing = tmp_path / "missing"
@@ -7968,7 +7970,9 @@ async def test_prepare_codex_terminal_fresh_session_passes_developer_instruction
     (``codex_native.py``), where the CLI-launched path can discard the value
     while the managed-host path still receives it.
     """
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "codex-bridge"
+    )
 
     async def _fake_create_session(_client: object, _bundle: bytes, *, bridge_id: str) -> str:
         del _client, _bundle, bridge_id
@@ -8393,8 +8397,13 @@ async def test_prepare_codex_terminal_via_daemon_live_resume_skips_config_patch(
     original_async_client = httpx.AsyncClient
     calls: list[tuple[str, str, object]] = []
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
     live_rollout = _write_source_rollout(
         codex_home=codex_home_for_bridge_dir(bridge_dir_for_bridge_id("conv_live")),
@@ -8501,8 +8510,13 @@ async def test_prepare_codex_terminal_hot_resume_does_not_rewrite_rollout(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.chdir(workspace)
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
     live_rollout = _write_source_rollout(
         codex_home=codex_home_for_bridge_dir(bridge_dir_for_bridge_id(bridge_id)),
@@ -8877,7 +8891,9 @@ def test_attach_with_forwarder_uses_direct_tmux_when_socket_is_local(
         """
         raise AssertionError("WebSocket attach path should not be used")
 
-    monkeypatch.setattr("omnigent.codex_native.shutil.which", lambda _name: "/usr/bin/tmux")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main.shutil.which", lambda _name: "/usr/bin/tmux"
+    )
     monkeypatch.setattr(codex_native, "_attach_direct_tmux", fake_attach_direct_tmux)
     monkeypatch.setattr(codex_native, "_attach_with_reconnect", fail_attach_with_reconnect)
 
@@ -9128,7 +9144,9 @@ def test_attach_terminal_resource_runner_owned_missing_socket_fails_loud(
         """
         raise AssertionError("Runner-owned Codex attach must not use WebSocket")
 
-    monkeypatch.setattr("omnigent.codex_native.shutil.which", lambda _name: "/usr/bin/tmux")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main.shutil.which", lambda _name: "/usr/bin/tmux"
+    )
     monkeypatch.setattr(codex_native, "_attach_with_reconnect", fail_attach_with_reconnect)
 
     with pytest.raises(click.ClickException) as exc_info:
@@ -9208,7 +9226,9 @@ def test_attach_with_forwarder_falls_back_when_tmux_socket_is_not_local(
         assert active_session_id_reader() == "conv_rotated"
         websocket_attaches.append(attach_url)
 
-    monkeypatch.setattr("omnigent.codex_native.shutil.which", lambda _name: "/usr/bin/tmux")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main.shutil.which", lambda _name: "/usr/bin/tmux"
+    )
     monkeypatch.setattr(codex_native, "_attach_direct_tmux", fail_attach_direct_tmux)
     monkeypatch.setattr(codex_native, "_attach_with_reconnect", fake_attach_with_reconnect)
 
@@ -10410,9 +10430,14 @@ def test_clone_codex_rollout_rewrites_id_and_structural_cwd_into_clone_home(
     workspace, the rollout lands in the CLONE's CODEX_HOME under the
     target id, and record order is preserved.
     """
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
     source_thread = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     target_thread = "019eaa11-1111-7222-8333-444455556666"
     source_cwd = "/repo/worktree-source"
@@ -10464,9 +10489,14 @@ def test_clone_codex_rollout_leaves_historical_cwd_untouched(
     workspace; rewriting them would fabricate history. Only the two
     structural fields move.
     """
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
     source_thread = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     target_thread = "019eaa11-1111-7222-8333-444455556666"
     source_cwd = "/repo/worktree-source"
@@ -10511,9 +10541,14 @@ def test_clone_codex_rollout_leaves_source_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The source rollout is read-only — cloning never mutates it."""
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
     source_thread = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     source_cwd = "/repo/worktree-source"
 
@@ -10547,9 +10582,14 @@ def test_clone_codex_rollout_returns_none_when_source_missing(
     the source rollout must not strand the clone pointing at a missing
     thread.
     """
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
     clone_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id("conv_clone"))
 
     result = codex_native._clone_codex_rollout(
@@ -10572,9 +10612,14 @@ def test_clone_codex_rollout_returns_none_for_unsafe_target_id(
     Guards against path traversal via the minted id being interpolated
     into the rollout filename.
     """
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
 
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
     source_thread = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     source_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id("conv_source"))
     _write_source_rollout(codex_home=source_home, thread_id=source_thread, source_cwd="/repo/src")
@@ -11071,7 +11116,7 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
                     "encrypted_content": "gAAAA_encrypted",
                 },
             ],
-            "window_id": 2,
+            "window_id": "01a070e2-2665-7d62-9b74-973decf239b7",
             "response_id": "compact_1",
         },
         {
@@ -11106,7 +11151,7 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
     compacted_records = [r for r in records if r["type"] == "compacted"]
     assert len(compacted_records) == 1
     cp = compacted_records[0]["payload"]
-    assert cp["window_id"] == 2
+    assert cp["window_id"] == "01a070e2-2665-7d62-9b74-973decf239b7"
     assert len(cp["replacement_history"]) == 2
     assert cp["replacement_history"][1]["encrypted_content"] == "gAAAA_encrypted"
     # Post-compaction message should still be present
@@ -11259,8 +11304,8 @@ def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A startup timeout records the launch routing summary in the bridge error (#2745)."""
-    from omnigent import codex_native_forwarder as _fwd
-    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.harnesses.codex_native import forwarder as _fwd
+    from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error
     from omnigent.runner.native import orchestration as native_orch
 
     bridge_dir = tmp_path / "bridge"
@@ -11307,8 +11352,8 @@ def test_codex_discover_thread_login_required_records_error_before_waiting(
     immediately with an actionable message instead of burning the 30s
     thread-start timeout (the "Codex TUI never started a thread" hang).
     """
-    from omnigent import codex_native_forwarder as _fwd
-    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.harnesses.codex_native import forwarder as _fwd
+    from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error
     from omnigent.runner.native import orchestration as native_orch
 
     bridge_dir = tmp_path / "bridge"
@@ -11361,8 +11406,8 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     attached terminal starts the thread, and the stale fail-fast cause must
     not shadow the now-working bridge state.
     """
-    from omnigent import codex_native_forwarder as _fwd
-    from omnigent.codex_native_bridge import (
+    from omnigent.harnesses.codex_native import forwarder as _fwd
+    from omnigent.harnesses.codex_native.bridge import (
         read_bridge_startup_error,
         read_bridge_state,
     )

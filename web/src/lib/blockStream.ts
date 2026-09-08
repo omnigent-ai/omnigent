@@ -749,6 +749,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       yield {
         type: "compaction_loading",
         ctx: ctx(state),
+        ...(event.startedAtS !== undefined ? { startedAtS: event.startedAtS } : {}),
       } satisfies CompactionInProgressBlock;
       return;
     }

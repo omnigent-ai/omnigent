@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.reasoning_effort import (
+from omnigent.util.reasoning_effort import (
     ANTHROPIC_EFFORTS,
     CODEX_EFFORTS,
     CODEX_NATIVE_EFFORTS,
@@ -237,7 +237,7 @@ def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
     returns ``None`` (callers cannot classify it, so a filter must pass the
     value through rather than drop what a plugin harness might accept).
     """
-    from omnigent.reasoning_effort import (
+    from omnigent.util.reasoning_effort import (
         CODEX_NATIVE_EFFORTS,
         GEMINI_EFFORTS,
         OPENAI_EFFORTS,
@@ -267,7 +267,7 @@ def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
 def test_efforts_for_harness_resolves_aliases() -> None:
     """An alias resolves to the same vocabulary as its canonical name."""
     from omnigent.harness_aliases import canonicalize_harness
-    from omnigent.reasoning_effort import efforts_for_harness
+    from omnigent.util.reasoning_effort import efforts_for_harness
 
     canonical = canonicalize_harness("claude-code") or "claude-code"
     assert efforts_for_harness("claude-code") == efforts_for_harness(canonical)

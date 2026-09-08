@@ -217,10 +217,14 @@ async def _drive_smart_routing_harness(base_url: str, session_id: str) -> None:
             # The router scores the typed message at create time.
             assert body["smart_routing_message"] == "refactor the auth module", body
             # None of the placeholder wrapper's own knobs ride along — the
-            # router may pick the other harness entirely.
+            # router may pick the other harness entirely. The create-correlation
+            # label remains so the temporary chat can resolve from /updates.
             assert body.get("model_override") is None, body
             assert body.get("terminal_launch_args") is None, body
-            assert body.get("labels") is None, body
+            assert re.fullmatch(
+                r"[0-9a-f]{32}",
+                body["labels"]["omnigent.client_create_token"],
+            ), body
         finally:
             await browser.close()
 
