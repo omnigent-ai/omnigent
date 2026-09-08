@@ -5329,6 +5329,65 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
     assert restarted.subagents["b-grandchild"].parent_subagent_id == "a-child"
 
 
+async def test_subagent_watcher_defers_and_logs_when_no_transcript_owns_the_spawn(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A meta whose spawn record no transcript owns is deferred, not registered.
+
+    Claude can flush ``agent-<id>.meta.json`` before the spawning ``tool_use``
+    record lands in a transcript. The watcher must skip such an agent (retry next
+    tick) and log the miss so a spawn record that never arrives is diagnosable.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    subagents_dir.mkdir(parents=True, exist_ok=True)
+    (subagents_dir / "agent-orphan.meta.json").write_text(
+        json.dumps(
+            {
+                "agentType": "Explore",
+                "description": "spawn record not flushed yet",
+                "toolUseId": "toolu_missing",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (subagents_dir / "agent-orphan.jsonl").write_text("", encoding="utf-8")
+
+    starts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal starts
+        if json.loads(request.content).get("type") == "external_subagent_start":
+            starts += 1
+        return httpx.Response(202, json={})
+
+    caplog.set_level(logging.DEBUG, logger="omnigent.claude_native_forwarder")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert starts == 0
+    assert "orphan" not in state.subagents
+    assert "no resolved parent" in caplog.text
+    assert "toolu_missing" in caplog.text
+
+
 async def test_subagent_watcher_forwards_transcript_items_to_child_session(
     tmp_path: Path,
 ) -> None:

@@ -83,6 +83,13 @@ _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 # One per Claude Task-tool subagent; appears alongside the matching
 # ``agent-<id>.jsonl`` transcript.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
+
+
+def _subagent_id_from_meta_path(meta_path: Path) -> str:
+    """``agent-<id>.meta.json`` / ``agent-<id>.jsonl`` → ``<id>``."""
+    return meta_path.stem.removeprefix("agent-").removesuffix(".meta")
+
+
 _DEFAULT_POLL_INTERVAL_S = 0.25
 # Minimum spacing between permission-mode pane reads. Unlike the model mirror
 # (which reads a JSON file), this spawns a ``tmux capture-pane`` subprocess, so
@@ -1394,15 +1401,18 @@ def _subagent_parents_by_tool_use(
     transcript_path: Path,
     subagents_dir: Path,
 ) -> dict[str, str | None]:
-    """Correlate Claude spawn tool ids to their immediate transcript owner."""
+    """Correlate Claude spawn tool ids to their immediate transcript owner.
+
+    Reads the root transcript and every ``agent-*.jsonl`` in full. The caller
+    only invokes this while new sub-agent meta files are appearing (a bounded,
+    transient window), so the re-read cost is paid during spawn bursts, not on
+    every idle poll.
+    """
     owners: dict[str, str | None] = {}
     ambiguous: set[str] = set()
     transcript_owners: list[tuple[Path, str | None]] = [(transcript_path, None)]
     transcript_owners.extend(
-        (
-            path,
-            path.stem.removeprefix("agent-"),
-        )
+        (path, _subagent_id_from_meta_path(path))
         for path in sorted(subagents_dir.glob("agent-*.jsonl"))
     )
     for path, owner_id in transcript_owners:
@@ -1473,9 +1483,9 @@ async def _forward_available_subagents(
     candidate_meta_paths = [
         path
         for path in meta_paths
-        if path.stem.removeprefix("agent-").removesuffix(".meta") not in updated.subagents
+        if _subagent_id_from_meta_path(path) not in updated.subagents
         and start_retry_tracker.retry_delay_s(
-            "subagent_start:" + path.stem.removeprefix("agent-").removesuffix(".meta")
+            f"subagent_start:{_subagent_id_from_meta_path(path)}"
         )
         is None
     ]
@@ -1495,7 +1505,17 @@ async def _forward_available_subagents(
             continue
         tool_use_id = meta["toolUseId"]
         if tool_use_id not in parents_by_tool_use:
-            # The spawning transcript record may still be mid-write.
+            # No transcript owns this spawn yet: the record is still mid-write, or
+            # it resolved to two owners and was dropped as ambiguous. Either way we
+            # retry next tick; log so a persistent miss (e.g. a transcript-format
+            # drift) is diagnosable rather than silent.
+            _logger.debug(
+                "Deferring claude-native sub-agent with no resolved parent; "
+                "parent_session=%s subagent_id=%s tool_use_id=%s",
+                parent_session_id,
+                _subagent_id_from_meta_path(meta_path),
+                tool_use_id,
+            )
             continue
         pending.append((meta_path, meta, parents_by_tool_use[tool_use_id]))
 
@@ -1503,7 +1523,7 @@ async def _forward_available_subagents(
         deferred: list[tuple[Path, dict[str, str], str | None]] = []
         made_progress = False
         for meta_path, meta, parent_subagent_id in pending:
-            subagent_id = meta_path.stem.removeprefix("agent-").removesuffix(".meta")
+            subagent_id = _subagent_id_from_meta_path(meta_path)
             retry_key = f"subagent_start:{subagent_id}"
             if parent_subagent_id is None:
                 immediate_parent_session_id = parent_session_id
@@ -1589,6 +1609,16 @@ async def _forward_available_subagents(
             await _write_subagent_forward_state_async(bridge_dir, updated)
             made_progress = True
         if not made_progress:
+            # A full pass registered nothing: every deferred child is waiting on a
+            # parent we haven't seen on disk yet. Retry next tick; log the stuck
+            # set so a parent that never arrives doesn't strand children silently.
+            if deferred:
+                _logger.debug(
+                    "Deferring claude-native sub-agents whose parent is not yet "
+                    "registered; parent_session=%s pending=%s",
+                    parent_session_id,
+                    [_subagent_id_from_meta_path(path) for path, _, _ in deferred],
+                )
             break
         pending = deferred
 
