@@ -1051,6 +1051,11 @@ def _read_log_tail(log_path: Path, max_lines: int = 50) -> str:
     copy-pasteable command — because this text is displayed on terminals and
     routinely ends up pasted into bug reports.
 
+    When the byte window starts mid-file, the chopped first line is discarded
+    rather than surfaced: a fragment whose ``scheme://`` prefix fell outside
+    the window would evade the URL-userinfo redaction and could leak
+    ``user:password@host``.
+
     :param log_path: Log file to tail.
     :param max_lines: How many trailing lines to keep, e.g. ``50``.
     :returns: The sanitized tail, or a short placeholder when the file is
@@ -1062,13 +1067,24 @@ def _read_log_tail(log_path: Path, max_lines: int = 50) -> str:
         with log_path.open("rb") as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
-            fh.seek(max(0, size - _TAIL_MAX_BYTES))
+            offset = max(0, size - _TAIL_MAX_BYTES)
+            fh.seek(offset)
             raw = fh.read(_TAIL_MAX_BYTES).decode(errors="replace")
     except OSError as exc:
         return f"(could not read log file: {exc})"
     lines = raw.splitlines()
     if not lines:
         return "(empty log file)"
+    if offset:
+        # The window starts mid-file, so the first decoded line is (almost
+        # always) the chopped remainder of a longer line. A fragment whose
+        # ``scheme://`` prefix fell outside the window would defeat the
+        # URL-userinfo redaction below and leak ``user:password@host`` —
+        # exactly what this tail promises to scrub — so drop the partial
+        # line entirely: better a missing line than a credential-bearing one.
+        del lines[0]
+        if not lines:
+            return "(log tail suppressed: last line exceeds the tail read window)"
     tail = "\n".join(lines[-max_lines:])
     return redact_secrets(_ANSI_OR_CONTROL.sub("", tail))
 

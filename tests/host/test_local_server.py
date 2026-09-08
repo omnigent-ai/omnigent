@@ -1416,6 +1416,46 @@ def test_read_log_tail_is_bounded(tmp_path: Path) -> None:
     assert len(tail.splitlines()) == 50
 
 
+def test_read_log_tail_never_leaks_credentials_from_a_chopped_first_line(
+    tmp_path: Path,
+) -> None:
+    """
+    The 64 KiB tail window can start mid-line, chopping the ``scheme://``
+    prefix off a credential-bearing URI while leaving ``user:password@host``
+    in the retained fragment — which the userinfo redaction (anchored on
+    ``://``) would then miss. The partial first line must be discarded so
+    the chopped fragment can never reach the terminal.
+    """
+    log = tmp_path / "server.log"
+    password = "hunter2secret" * 6000  # one ~78 KB line, larger than the window
+    with log.open("w") as fh:
+        fh.write(f"connecting to postgresql+psycopg://user:{password}@host/db failed\n")
+        for i in range(10):
+            fh.write(f"context line {i}\n")
+        fh.write("ModuleNotFoundError: No module named 'psycopg'\n")
+
+    tail = local_server._read_log_tail(log, max_lines=50)
+
+    assert "hunter2secret" not in tail  # the chopped fragment never surfaces
+    assert "ModuleNotFoundError" in tail  # complete trailing lines survive
+    assert "context line 9" in tail
+
+
+def test_read_log_tail_suppresses_single_oversized_line(tmp_path: Path) -> None:
+    """
+    A log that is one line larger than the tail window has no complete line
+    inside the window; surfacing the fragment could leak a chopped
+    credential, so the tail is suppressed with a placeholder instead.
+    """
+    log = tmp_path / "server.log"
+    log.write_text("postgresql+psycopg://user:" + "s3cr3tvalue" * 7000 + "@host/db\n")
+
+    tail = local_server._read_log_tail(log)
+
+    assert "s3cr3tvalue" not in tail
+    assert tail == "(log tail suppressed: last line exceeds the tail read window)"
+
+
 def test_spawn_normalizes_paas_postgres_uri(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
