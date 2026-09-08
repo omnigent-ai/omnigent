@@ -94,6 +94,11 @@ _DELTA_FLUSH_CHAR_THRESHOLD = 64
 # unbounded wait parks the caller for good. Under the runner's 10s auto-forwarder cancel
 # budget so this resolves first.
 _DELTA_MARKER_TIMEOUT_SECONDS = 5.0
+# Cap for a mid-turn flush barrier, which has no cancel budget to stay under and
+# whose whole purpose is ordering: extending the wait while the worker keeps
+# draining is better than returning early and reordering the caller's next event.
+# Teardown's stop marker keeps the tighter bound above.
+_DELTA_BARRIER_MAX_WAIT_SECONDS = 30.0
 _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE = "external_reasoning_effort_change"
 # Context-compaction progress edge. Publishes the same
 # ``response.compaction.in_progress`` / ``response.compaction.completed`` SSE
@@ -1200,6 +1205,12 @@ class _OutputTextDeltaCoalescer:
         )
         self._worker_task: asyncio.Task[None] | None = None
         self._next_index_by_message_id: dict[str, int] = {}
+        # Read by a barrier waiter to tell a worker draining a backlog from one
+        # that is genuinely wedged. A post slower than one wait window would
+        # otherwise look wedged, so an in-flight post counts as progress too;
+        # the caller's overall cap is what bounds a truly stuck worker.
+        self._flushes_completed = 0
+        self._post_in_flight = False
 
     async def append(self, delta: str, *, message_id: str | None = None) -> None:
         """
@@ -1238,7 +1249,11 @@ class _OutputTextDeltaCoalescer:
         loop = asyncio.get_running_loop()
         done: asyncio.Future[None] = loop.create_future()
         self._queue.put_nowait(_DeltaFlushBarrier(done=done))
-        await self._await_marker(done, "flush barrier")
+        await self._await_marker(
+            done,
+            "flush barrier",
+            max_wait_seconds=_DELTA_BARRIER_MAX_WAIT_SECONDS,
+        )
 
     async def close(self) -> None:
         """
@@ -1264,7 +1279,13 @@ class _OutputTextDeltaCoalescer:
                 await self._worker_task
         self._worker_task = None
 
-    async def _await_marker(self, done: asyncio.Future[None], marker: str) -> None:
+    async def _await_marker(
+        self,
+        done: asyncio.Future[None],
+        marker: str,
+        *,
+        max_wait_seconds: float | None = None,
+    ) -> None:
         """
         Wait for the worker to resolve a queue marker.
 
@@ -1273,26 +1294,55 @@ class _OutputTextDeltaCoalescer:
         and the caller is arbitrary, so waiting on the marker alone stalls for the
         full bound on an ordinary shutdown.
 
+        The bound is per stall, not per wait: Codex streams fast enough to queue
+        many chunks ahead of a barrier, and the worker posts each batch as an
+        awaited request, so draining a backlog legitimately outlasts a single
+        bound. Waiting only that long abandoned the barrier mid-drain -- the
+        caller's ordering guarantee was silently dropped and every occurrence
+        logged a warning. So the wait extends while flushes keep completing and
+        gives up only once the worker stops making progress, still capped by
+        ``max_wait_seconds`` so a wedged worker cannot stall the caller
+        indefinitely.
+
         :param done: Future the worker resolves for this marker.
         :param marker: Marker name used in the timeout log.
+        :param max_wait_seconds: Overall cap across stalls, e.g. ``30.0``.
+            Defaults to one per-stall bound, which reproduces the single-shot
+            wait teardown needs to stay inside its cancel budget. Resolved at
+            call time so the bound stays patchable in tests.
         :returns: None once resolved, once the worker stops, or once the bound elapses.
         """
         worker = self._worker_task
         waiters: set[asyncio.Future[None] | asyncio.Task[None]] = {done}
         if worker is not None:
             waiters.add(worker)
-        await asyncio.wait(
-            waiters,
-            return_when=asyncio.FIRST_COMPLETED,
-            timeout=_DELTA_MARKER_TIMEOUT_SECONDS,
-        )
-        if not done.done() and (worker is None or not worker.done()):
-            _logger.warning(
-                "codex delta coalescer %s timed out after %.1fs (session=%s)",
-                marker,
-                _DELTA_MARKER_TIMEOUT_SECONDS,
-                self._session_id,
+        max_wait = _DELTA_MARKER_TIMEOUT_SECONDS if max_wait_seconds is None else max_wait_seconds
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        while True:
+            flushes_before = self._flushes_completed
+            remaining = max_wait - (loop.time() - started)
+            await asyncio.wait(
+                waiters,
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=min(_DELTA_MARKER_TIMEOUT_SECONDS, max(0.0, remaining)),
             )
+            if done.done() or (worker is not None and worker.done()):
+                return
+            waited = loop.time() - started
+            made_progress = self._flushes_completed != flushes_before or self._post_in_flight
+            if made_progress and waited < max_wait:
+                continue
+            _logger.warning(
+                "codex delta coalescer %s timed out after %.1fs (session=%s, "
+                "flushes_completed=%d, draining=%s)",
+                marker,
+                waited,
+                self._session_id,
+                self._flushes_completed,
+                made_progress,
+            )
+            return
 
     def _ensure_worker(self) -> None:
         """
@@ -1386,6 +1436,7 @@ class _OutputTextDeltaCoalescer:
         assert chunk is not None
         delta = "".join(buffer)
         if chunk.tool_call_id is not None:
+            self._post_in_flight = True
             try:
                 await _post_tool_output_delta(
                     self._client,
@@ -1395,6 +1446,9 @@ class _OutputTextDeltaCoalescer:
                 )
             except Exception:  # noqa: BLE001 - preserve the long-lived forwarder.
                 _logger.warning("Codex forwarder tool-output delta flush failed", exc_info=True)
+            finally:
+                self._post_in_flight = False
+            self._flushes_completed += 1
             return
         index: int | None = None
         final: bool | None = None
@@ -1402,6 +1456,7 @@ class _OutputTextDeltaCoalescer:
             index = self._next_index_by_message_id.get(chunk.message_id, 0)
             self._next_index_by_message_id[chunk.message_id] = index + 1
             final = False
+        self._post_in_flight = True
         try:
             await _post_output_text_delta(
                 self._client,
@@ -1413,6 +1468,9 @@ class _OutputTextDeltaCoalescer:
             )
         except Exception:  # noqa: BLE001 - preserve the long-lived forwarder.
             _logger.warning("Codex forwarder delta flush failed", exc_info=True)
+        finally:
+            self._post_in_flight = False
+        self._flushes_completed += 1
 
 
 class _SessionUsageCoalescer:
