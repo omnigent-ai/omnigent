@@ -208,7 +208,7 @@ def test_terminal_log_formatter_abbreviates_warning_and_source() -> None:
 
     assert re.match(
         r"WARN  \d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} "
-        r"codex_native_app_server\s+native_codex\s+\| native-codex: ready",
+        r"codex_native\.app_server\s+native_codex\s+\| native-codex: ready",
         output,
     )
     assert "WARNING" not in output

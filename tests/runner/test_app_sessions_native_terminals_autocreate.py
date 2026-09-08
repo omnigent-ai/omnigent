@@ -3412,7 +3412,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     assert "PermissionRequest" in settings["hooks"]
     permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
     assert permission_hook["type"] == "command"
-    assert "claude_native_hook permission-request" in permission_hook["command"]
+    assert "claude_native.hook permission-request" in permission_hook["command"]
 
     # The hook reads the server URL back out of this file at hook time,
     # so it must be written with the runner's Omnigent server URL.

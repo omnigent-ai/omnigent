@@ -9359,7 +9359,7 @@ async def test_curl_evaluate_policy_command_round_trips(
         assert "curl" in command and "evaluate-policy" in command
         # The Python hook must appear only as the relay-less fallback,
         # after the curl fast path.
-        assert command.index("curl") < command.index("claude_native_hook")
+        assert command.index("curl") < command.index("claude_native.hook")
 
         # Off-loop: the relay proxies through this test's event loop, so a
         # blocking subprocess.run here would deadlock the curl round trip.

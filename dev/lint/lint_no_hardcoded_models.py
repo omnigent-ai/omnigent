@@ -51,7 +51,7 @@ SKIP_PARTS = {
     "node_modules",
     "tests",
 }
-OWNED_FALLBACK_PATH = Path("omnigent/model_fallbacks.py")
+OWNED_FALLBACK_PATH = Path("omnigent/models/model_fallbacks.py")
 FALLBACK_METADATA_FIELDS = frozenset({"owner", "provenance", "discovery_gap"})
 
 
