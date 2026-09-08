@@ -5139,7 +5139,10 @@ function ComposerModelSource({
           <span
             tabIndex={0}
             data-testid="composer-model-source"
-            className="min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
+            // `flex` keeps the min-width chain flowing through this wrapper:
+            // as a plain span the label inside loses its flex-imposed width
+            // and its `truncate` never engages, running under the Stop button.
+            className="flex min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
           >
             {children}
           </span>
