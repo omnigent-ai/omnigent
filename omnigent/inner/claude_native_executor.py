@@ -411,14 +411,13 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
         or ``input_file`` blocks with a ``file_data`` data URI.
     :param bridge_dir: Bridge directory path for writing attachment
         files, e.g. ``Path("/tmp/omnigent/claude-native/<digest>")``.
-    :returns: Plain text content with file-path references prepended
-        for any materialized attachments.
+    :returns: Plain text content with file-path references kept at their
+        authored positions.
     """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        attachment_lines: list[str] = []
-        text_parts: list[str] = []
+        parts: list[str] = []
         for block in content:
             if not isinstance(block, dict):
                 continue
@@ -426,9 +425,8 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
             if block_type == "input_text":
                 text = block.get("text")
                 if isinstance(text, str):
-                    text_parts.append(text)
+                    parts.append(text)
             elif block_type in ("input_image", "input_file"):
-                attachment_lines.append(attachment_reference_line(block, bridge_dir))
-        parts = attachment_lines + text_parts
+                parts.append(attachment_reference_line(block, bridge_dir))
         return "\n\n".join(parts)
     return ""

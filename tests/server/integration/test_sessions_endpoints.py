@@ -1914,15 +1914,17 @@ async def test_external_user_message_folds_pending_image_into_durable_item(
 
         items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
         user_msg = next(item for item in items if item["type"] == "message")
-        # The image block was folded back in, ahead of the transcript text
-        # — so reloading history shows the image, not just the caption.
+        # The complete pending document becomes durable, so reload preserves
+        # the exact image/caption order without leaking the native marker.
         assert user_msg["content"][0] == {
             "type": "input_image",
             "file_id": "b08c893483887826e2b9f67165106700",
             "filename": "diagram.png",
         }
-        expected_text = "[Attached: /tmp/diagram.png]\n\nexplain this diagram"
-        assert user_msg["content"][1]["text"] == expected_text
+        assert user_msg["content"][1] == {
+            "type": "input_text",
+            "text": "explain this diagram",
+        }
         # The pending entry was drained — it won't double-render on rebind.
         assert pending_inputs.snapshot_for(session["id"]) == []
     finally:
@@ -1986,9 +1988,14 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
     "interrupt_text",
     ["[Request interrupted by user]", "[Request interrupted by user for tool use]"],
 )
+@pytest.mark.parametrize(
+    "attachment_echo",
+    ["[Attached: /tmp/uploads/shot.png]", "[Attachment shot.png could not be loaded]", ""],
+)
 async def test_external_interrupt_record_leaves_pending_input_for_real_message(
     client: httpx.AsyncClient,
     interrupt_text: str,
+    attachment_echo: str,
 ) -> None:
     """
     Regression: steering with an upload must not feed it to the interrupt marker.
@@ -2018,7 +2025,7 @@ async def test_external_interrupt_record_leaves_pending_input_for_real_message(
     try:
         for text in (
             interrupt_text,
-            "[Attached: /tmp/uploads/shot.png]",
+            attachment_echo,
         ):
             resp = await client.post(
                 f"/v1/sessions/{session['id']}/events",
@@ -2028,7 +2035,7 @@ async def test_external_interrupt_record_leaves_pending_input_for_real_message(
                         "item_type": "message",
                         "item_data": {
                             "role": "user",
-                            "content": [{"type": "input_text", "text": text}],
+                            "content": [] if not text else [{"type": "input_text", "text": text}],
                         },
                         "response_id": "native_turn_1",
                     },
@@ -2049,7 +2056,9 @@ async def test_external_interrupt_record_leaves_pending_input_for_real_message(
             "file_id": "file_shot1",
             "filename": "shot.png",
         }
-        assert steered["content"][1]["text"] == "[Attached: /tmp/uploads/shot.png]"
+        assert steered["content"][1:] == (
+            [{"type": "input_text", "text": attachment_echo}] if attachment_echo else []
+        )
         # The real message drained the entry (the marker must not have).
         assert pending_inputs.snapshot_for(session["id"]) == []
         assert pid
@@ -2057,23 +2066,16 @@ async def test_external_interrupt_record_leaves_pending_input_for_real_message(
         pending_inputs.reset_for_tests()
 
 
-async def test_external_interrupt_lookalike_still_drains_pending_input(
+async def test_external_interrupt_lookalike_without_attachment_marker_keeps_pending_input(
     client: httpx.AsyncClient,
 ) -> None:
-    """
-    The interrupt-record exemption must not swallow real user messages.
-
-    A user can type a message that merely resembles the marker. Over-matching
-    would skip the drain for it, stranding the pending entry and dropping the
-    upload it carries — the same class of bug from the other direction. The
-    regex is anchored, so a bracketed question is a normal message.
-    """
+    """Attachment-only pending input needs a recognized marker before draining."""
     from omnigent.runtime import pending_inputs
 
     pending_inputs.reset_for_tests()
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
-    pending_inputs.record(
+    pending_id = pending_inputs.record(
         session["id"],
         [{"type": "input_image", "file_id": "file_shot2", "filename": "shot.png"}],
     )
@@ -2098,12 +2100,10 @@ async def test_external_interrupt_lookalike_still_drains_pending_input(
 
         items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
         user_msg = next(item for item in items if item["type"] == "message")
-        assert user_msg["content"][0] == {
-            "type": "input_image",
-            "file_id": "file_shot2",
-            "filename": "shot.png",
-        }
-        assert pending_inputs.snapshot_for(session["id"]) == []
+        assert user_msg["content"] == [
+            {"type": "input_text", "text": "[Request interrupted by user?]"}
+        ]
+        assert pending_inputs.snapshot_for(session["id"])[0]["pending_id"] == pending_id
     finally:
         pending_inputs.reset_for_tests()
 

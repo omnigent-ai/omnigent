@@ -41,11 +41,12 @@ stuck pending and double-rendered. Per-session SSE ordering guarantees
 the i-th persisted user message corresponds to the i-th queued one, so
 each persisted native user message drains the oldest pending entry.
 
-The one imperfect case is interleaving a web-composer message with a
-message typed directly in the TUI: the TUI message (which has no pending
-entry) drains the oldest web entry, so that web bubble briefly
-disappears and reappears once it persists. It self-heals; the committed
-bubble always renders the just-persisted content regardless.
+When an attachment-bearing web message is interleaved with direct TUI
+input, :func:`resolve_oldest_for_mirrored_text` compares the visible text
+after removing materialized attachment markers. A clear mismatch leaves
+the web entry pending so its ordered content cannot overwrite the direct
+terminal message. Plain text messages retain FIFO matching because native
+transcripts may reformat quotes and whitespace.
 
 Limitations (identical to :mod:`pending_elicitations`):
 
@@ -66,17 +67,26 @@ evicted lazily on the next :func:`record` / :func:`snapshot_for` /
 from __future__ import annotations
 
 import copy
+import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
+
 # A pending entry is evicted this many seconds after it was recorded
 # if it was never drained by a matching persisted message. Covers the
 # vendor-TUI-never-accepted-the-message ghost; long enough that a slow
 # transcript round-trip on a busy session still drains normally.
 _TTL_S: float = 600.0
+_ATTACHED_MARKER_RE = re.compile(
+    rf"(?:\[Attached(?: file)?:\s*[^\]]*\]"
+    rf"|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN})\s*",
+    re.IGNORECASE,
+)
+_BLOCKQUOTE_PREFIX_RE = re.compile(r"^[ \t]*>[ \t]?", re.MULTILINE)
 
 
 def _now() -> float:
@@ -327,6 +337,48 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         _pending[conversation_id] = {drained.pending_id: entry, **entries}
 
 
+def resolve_oldest_for_mirrored_text(
+    conversation_id: str,
+    mirrored_text: str,
+) -> DrainedInput | None:
+    """Drain the FIFO head unless an attachment-bearing head clearly differs.
+
+    Native terminals provide no correlation id. Plain pending messages retain
+    the established FIFO behavior because transcript formatting may change
+    them. Attachment-bearing messages need a stricter guard: merging their
+    complete ordered content into unrelated direct-terminal text would replace
+    that message. Materialized ``[Attached: ...]`` lines, failed-materialization
+    markers, and Markdown blockquote prefixes are removed before comparison
+    because the pending content already represents those files and native
+    reply transcripts drop the quote markers. An attachment-only entry drains
+    only when a recognized marker supplies correlation evidence.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id)
+        if entries is None:
+            return None
+        oldest_id = next(iter(entries))
+        entry = entries[oldest_id]
+        has_files = any(
+            isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
+            for block in entry.content
+        )
+        if has_files:
+            marker_match = _ATTACHED_MARKER_RE.search(mirrored_text)
+            pending_text = _normalize_attachment_text(_content_text(entry.content))
+            observed_text = _normalize_attachment_text(_ATTACHED_MARKER_RE.sub("", mirrored_text))
+            if mirrored_text and (
+                (pending_text and pending_text != observed_text)
+                or (not pending_text and marker_match is None)
+            ):
+                return None
+        entries.pop(oldest_id)
+        if not entries:
+            _pending.pop(conversation_id, None)
+        return _drained_input(entry)
+
+
 def resolve_matching_text(conversation_id: str, text: str) -> MatchedDrain:
     """
     Drain through the first pending entry whose text matches ``text``.
@@ -459,6 +511,11 @@ def _content_text(content: list[dict[str, Any]]) -> str:
 def _normalize_text(text: str) -> str:
     """Normalize text enough to compare pending input with Kiro Prompt text."""
     return " ".join(text.split())
+
+
+def _normalize_attachment_text(text: str) -> str:
+    """Normalize the known native reply-quote transform for guarded matching."""
+    return _normalize_text(_BLOCKQUOTE_PREFIX_RE.sub("", text))
 
 
 def reset_for_tests() -> None:

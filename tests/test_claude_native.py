@@ -3175,6 +3175,27 @@ async def test_ensure_local_claude_resume_transcript_rematerializes_image_blocks
     assert "file_id" not in written.read_text(encoding="utf-8")
 
 
+def test_claude_resume_content_preserves_inline_attachment_order(tmp_path: Path) -> None:
+    """Rebuilt native prompts keep an attachment between its surrounding text."""
+    content = [
+        {"type": "input_text", "text": "before "},
+        {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,cG5nLWJ5dGVz",
+            "filename": "middle.png",
+        },
+        {"type": "input_text", "text": " after"},
+    ]
+
+    converted = claude_native._claude_user_content_from_api_blocks(content, tmp_path)
+
+    assert isinstance(converted, list)
+    texts = [block["text"] for block in converted]
+    assert texts[0] == "before "
+    assert texts[1].startswith("[Attached: ")
+    assert texts[2] == " after"
+
+
 @pytest.mark.asyncio
 async def test_ensure_local_claude_resume_transcript_marks_unresolvable_attachment(
     tmp_path: Path,
