@@ -149,22 +149,35 @@ class MainActivityTest {
     }
 
     @Test
-    fun `a renderer crash loop stops auto-recovering once the budget is spent`() {
+    fun `a renderer crash loop stops auto-reloading but still rebuilds a live WebView`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
 
-        // Drive MAX_RENDERER_CRASHES successful recoveries; each rebuilds.
-        repeat(3) {
-            val live = activity.webView()
-            live.webViewClient.onRenderProcessGone(live, rendererGone(crashed = true))
+        // Drive MAX_RENDERER_CRASHES + 1 clustered crashes: the last exceeds the
+        // budget. Each still rebuilds — the manual recovery paths (server-switcher
+        // Reload / Switch) reuse the webView field and would be dead if we left
+        // the corpse in place — so the loop is broken by WHAT loads, not by
+        // refusing to rebuild.
+        var dead = activity.webView()
+        repeat(4) {
+            dead.loadUrl("https://example.com/chat/loops")
+            val container = dead.parent as ViewGroup
+            dead.webViewClient.onRenderProcessGone(dead, rendererGone(crashed = true))
+            val rebuilt = activity.webView()
+            // Every death — even the over-budget one — yields a fresh, attached,
+            // non-destroyed WebView, so manual recovery always has a live target.
+            assertNotSame(dead, rebuilt)
+            assertSame(container, rebuilt.parent)
+            assertFalse(shadowOf(rebuilt).wasDestroyCalled())
+            dead = rebuilt
         }
-        val survivor = activity.webView()
 
-        // The next crash exceeds the budget: stop rebuilding, leave the dead
-        // WebView in place rather than feeding an endless rebuild→crash loop.
-        survivor.webViewClient.onRenderProcessGone(survivor, rendererGone(crashed = true))
-
-        assertSame(survivor, activity.webView())
+        // Over budget: the live WebView shows the offline recovery page (no route
+        // reload), so the crash loop can't continue while recovery stays possible.
+        assertTrue(
+            "over-budget recovery must load the local error page, not the route",
+            shadowOf(dead).lastLoadDataWithBaseURL?.data?.contains("Reload") == true,
+        )
     }
 
     @Test

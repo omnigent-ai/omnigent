@@ -299,16 +299,26 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * The WebView's renderer process died — crashed ([didCrash]), or reclaimed by
-     * the system under memory pressure. The instance can never render again, so
-     * detach and destroy it, swap in a freshly built WebView wired like the
-     * original (clients, bridge, insets), and reload where the user was. Without
-     * this the framework would terminate the whole app.
+     * the system under memory pressure. The instance can never render again
+     * (Android's contract: `reload()`/`loadUrl()` on it won't spin up a new
+     * renderer), so we ALWAYS detach and destroy it and swap in a freshly built
+     * WebView wired like the original (clients, bridge, insets). Without this the
+     * framework would terminate the whole app.
      *
-     * A real crash is budgeted ([MAX_RENDERER_CRASHES] within
-     * [RENDERER_CRASH_WINDOW_MS]): a page that reliably kills its renderer would
-     * otherwise loop rebuild→reload→crash forever. Once the budget is spent we
-     * stop auto-recovering and show a reload affordance instead. System reclaims
-     * (didCrash=false, routine while backgrounded) don't count against it.
+     * The crash budget decides only *what the fresh WebView loads*, never whether
+     * we rebuild — so every manual recovery path (the server-switcher pill's
+     * Reload / Switch) always acts on a live instance:
+     * - within budget: reload where the user was (the dead renderer's
+     *   last-committed same-origin route), so a mid-chat/terminal session comes
+     *   back instead of the landing page;
+     * - over budget (a real crash loop): load a local offline error page with a
+     *   retry link to the server root, breaking the rebuild→reload→crash loop
+     *   without stranding the user on a dead view.
+     *
+     * Transient in-page state (composer text, scroll) lived in the renderer heap
+     * and is lost either way — recovery preserves the route, not that state.
+     * System reclaims (didCrash=false, routine while backgrounded) never count
+     * against the budget.
      *
      * @param dead The WebView whose renderer died.
      * @param didCrash True for a genuine renderer crash, false for a
@@ -323,26 +333,10 @@ class MainActivity : AppCompatActivity() {
         // the healthy replacement.
         if (dead !== webView) return
 
-        // Reload where the user was, not the server root: the dead renderer's
-        // last-committed URL survives readable, so a same-origin deep route
-        // (mid-chat, a terminal) comes back instead of dropping to the landing
-        // page. Falls back to the server root when it's blank or foreign (an
-        // error/login page we shouldn't restore into). Transient in-page state
-        // (composer text, scroll) lived in the renderer heap and is lost either
-        // way — this only preserves the route.
         val serverUrl = ServerStore(this).currentServerUrl()
         val lastUrl = dead.url
-        val reloadUrl =
-            if (lastUrl != null && originOf(lastUrl) == pinnedOrigin) lastUrl else serverUrl
-
-        if (didCrash && !withinCrashBudget()) {
-            // Budget spent: a genuine crash loop. Stop rebuilding — that only
-            // feeds the loop — and leave the dead WebView in place showing the
-            // failure so the user isn't staring at an app that silently churns.
-            // The always-present server-switcher pill is the manual recovery path.
-            authLog("renderer crash budget exhausted; not auto-recovering")
-            return
-        }
+        val loopExhausted = didCrash && !withinCrashBudget()
+        if (loopExhausted) authLog("renderer crash budget exhausted; showing recovery page")
 
         val parent = dead.parent as? ViewGroup
         val index = parent?.indexOfChild(dead) ?: 0
@@ -361,24 +355,73 @@ class MainActivity : AppCompatActivity() {
         parent?.addView(webView, index)
         attachInsetsListener(webView)
         installBridge()
+        // A rebuilt view isn't guaranteed an immediate inset dispatch; request one
+        // so the IME resize margin isn't stale if the keyboard was up at death.
+        ViewCompat.requestApplyInsets(webView)
+
+        if (loopExhausted) {
+            // Offline page (no network fetch) so it can't itself re-trigger the
+            // crash; its retry link targets the server root, the least likely
+            // page to reproduce a route-specific crash.
+            webView.loadDataWithBaseURL(
+                null,
+                recoveryErrorHtml(serverUrl),
+                "text/html",
+                "utf-8",
+                null,
+            )
+            return
+        }
+
+        // Reload where the user was: a same-origin deep route comes back; blank or
+        // foreign (an error/login page we shouldn't restore into) falls back to
+        // the server root.
+        val reloadUrl =
+            if (lastUrl != null && originOf(lastUrl) == pinnedOrigin) lastUrl else serverUrl
         webView.loadUrl(reloadUrl)
     }
 
     /**
      * Consume one unit of the renderer-crash budget, returning whether recovery
-     * may proceed. The first crash (or the first after the window elapses) opens
-     * a fresh window; crashes are then counted until [MAX_RENDERER_CRASHES] is
-     * reached within [RENDERER_CRASH_WINDOW_MS]. A healthy page load
-     * ([onPageReady]) resets the budget so isolated crashes never accumulate.
+     * may auto-reload the route. A sliding window: the window start advances to
+     * now whenever [RENDERER_CRASH_WINDOW_MS] has elapsed since the last counted
+     * crash, so only crashes clustered tightly in time accumulate toward
+     * [MAX_RENDERER_CRASHES]. A healthy page load ([onPageReady]) also resets it.
      */
     private fun withinCrashBudget(): Boolean {
         val now = System.currentTimeMillis()
         if (now - rendererCrashWindowStart > RENDERER_CRASH_WINDOW_MS) {
-            rendererCrashWindowStart = now
             rendererCrashes = 0
         }
+        rendererCrashWindowStart = now
         rendererCrashes++
         return rendererCrashes <= MAX_RENDERER_CRASHES
+    }
+
+    /**
+     * Minimal self-contained recovery page shown after a renderer crash loop.
+     * No external assets or network so it can't reproduce the crash; the single
+     * link returns to the pinned server root (same origin, so the normal load
+     * path handles it).
+     */
+    private fun recoveryErrorHtml(serverUrl: String): String {
+        val escaped = serverUrl.replace("&", "&amp;").replace("\"", "&quot;")
+        return """
+            <!DOCTYPE html>
+            <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+              body { font-family: system-ui, sans-serif; margin: 0; min-height: 100vh;
+                     display: flex; flex-direction: column; align-items: center;
+                     justify-content: center; gap: 16px; padding: 24px; text-align: center; }
+              a.retry { padding: 12px 20px; border-radius: 8px; text-decoration: none;
+                        background: #2f6feb; color: #fff; font-weight: 600; }
+            </style></head>
+            <body>
+              <h2>Something went wrong</h2>
+              <p>The app hit a repeated display problem and stopped reloading on its own.</p>
+              <a class="retry" href="$escaped">Reload</a>
+            </body></html>
+        """.trimIndent()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
