@@ -37,6 +37,8 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, cast
 
+from packaging.version import InvalidVersion, Version
+
 from omnigent._platform import resolve_cli_binary
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
@@ -79,6 +81,7 @@ from .executor import (
 )
 from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOOK_HEADROOM_S
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
+from .model_auth import ProviderAuthRequired
 from .model_signer import (
     ModelSignerSession,
     SignerLaunchConfig,
@@ -420,6 +423,34 @@ def _find_codex_cli() -> str | None:
     return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
+async def _codex_cli_version_text(codex_path: str) -> str | None:
+    """Return the exact version token reported by ``codex --version``."""
+    try:
+        proc = await _create_subprocess_exec(
+            codex_path,
+            "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    try:
+        stdout, _ = await asyncio.wait_for(
+            proc.communicate(), timeout=_CODEX_VERSION_PROBE_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        with suppress(ProcessLookupError):
+            proc.kill()
+        with suppress(Exception):
+            await proc.wait()
+        return None
+    match = re.search(
+        r"(?<![A-Za-z0-9])(\d+\.\d+\.\d+(?:[-.][A-Za-z0-9.-]+)?)",
+        stdout.decode("utf-8", errors="replace"),
+    )
+    return match.group(1) if match is not None else None
+
+
 async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
     """
     Return the codex CLI version as a ``(major, minor, patch)`` tuple.
@@ -436,31 +467,37 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
         ``X.Y.Z`` token (caller treats ``None`` as "version unknown", not
         "too old").
     """
-    try:
-        proc = await _create_subprocess_exec(
-            codex_path,
-            "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-    except OSError:
+    raw = await _codex_cli_version_text(codex_path)
+    if raw is None:
         return None
-    try:
-        stdout, _ = await asyncio.wait_for(
-            proc.communicate(), timeout=_CODEX_VERSION_PROBE_TIMEOUT_SECONDS
-        )
-    except asyncio.TimeoutError:
-        # A hung `codex --version` must not block session startup: kill it
-        # and report the version as unknown (the caller proceeds).
-        with suppress(ProcessLookupError):
-            proc.kill()
-        with suppress(Exception):
-            await proc.wait()
-        return None
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", stdout.decode("utf-8", errors="replace"))
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", raw)
     if match is None:
         return None
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+_BROKERED_CODEX_MIN_VERSION = Version("0.140.0a19")
+_BROKERED_CODEX_MAX_VERSION = Version("0.140.0a20")
+
+
+async def _require_brokered_codex_version(codex_path: str) -> None:
+    """Fail closed unless Codex uses the wire version tested for brokered auth."""
+    raw = await _codex_cli_version_text(codex_path)
+    try:
+        version = Version(raw) if raw is not None else None
+    except InvalidVersion:
+        version = None
+    if (
+        version is None
+        or version < _BROKERED_CODEX_MIN_VERSION
+        or version >= _BROKERED_CODEX_MAX_VERSION
+    ):
+        shown = raw or "unparseable"
+        raise RuntimeError(
+            "unsupported Codex wire version "
+            f"{shown}; brokered authentication requires >= 0.140.0-alpha.19 "
+            "and < 0.140.0-alpha.20"
+        )
 
 
 _ProcessPath: TypeAlias = str | bytes | os.PathLike[str] | os.PathLike[bytes]
@@ -3664,6 +3701,8 @@ class CodexExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
+        self._signer_backed = signer_launch_config is not None
+        self._brokered_version_validated = False
         resolved_codex = codex_path or _find_codex_cli()
         if not resolved_codex:
             raise ImportError(
@@ -3917,6 +3956,11 @@ class CodexExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         cfg = config or ExecutorConfig()
+        if self._signer_backed and not self._brokered_version_validated:
+            # This probe must precede app-session construction: the latter
+            # creates and preflights the signer before launching the worker.
+            await _require_brokered_codex_version(self._codex_path)
+            self._brokered_version_validated = True
         session_key = _session_key(messages)
         state = self._session_states.setdefault(session_key, _CodexSessionState())
         # cfg.model (per-request /model override) wins over the spec default.
@@ -3979,5 +4023,9 @@ class CodexExecutor(Executor):
                 reasoning_effort=reasoning_effort,
             ):
                 yield event
+        except ProviderAuthRequired:
+            # Preserve the stable code and sanitized recovery detail through
+            # ExecutorAdapter into the response.failed envelope.
+            raise
         except Exception as exc:  # noqa: BLE001 — executor boundary converts any error into an ExecutorError event
             yield ExecutorError(message=f"Codex executor error: {exc}")

@@ -31,7 +31,6 @@ from .egress.rules import parse_rules
 from .model_auth import (
     PROVIDER_AUTH_REQUIRED,
     ProviderAuthRequired,
-    _provider_auth_message,
     mint_ucode_token,
 )
 from .model_credential import CredentialLifecycle
@@ -900,7 +899,7 @@ async def _run(config_fd: int) -> int:
         host = f"https://{route.host}"
         credential_lifecycle = CredentialLifecycle(
             helper=lambda: mint_ucode_token(host=host, profile=auth_profile),
-            auth_required=lambda: ProviderAuthRequired(_provider_auth_message(host, auth_profile)),
+            auth_required=lambda: ProviderAuthRequired.for_authority(host, auth_profile),
             max_cache_age_s=_UCODE_MAX_CACHE_AGE_SECONDS,
             refresh_skew_s=_UCODE_REFRESH_SKEW_SECONDS,
             min_refresh_interval_s=_UCODE_MIN_REFRESH_INTERVAL_SECONDS,

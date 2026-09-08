@@ -18,12 +18,9 @@ from omnigent.inner.model_signer import SignerLaunchConfig
 _CODEX = Path("/opt/homebrew/bin/codex")
 _MARKER = "BROKERED_E2E_OK upstream_saw_signer_only_fake_bearer=true"
 
-pytestmark = [
-    pytest.mark.skipif(sys.platform != "darwin", reason="requires real macOS Seatbelt"),
-    pytest.mark.skipif(not _CODEX.is_file(), reason="requires installed Homebrew Codex"),
-]
 
-
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires real macOS Seatbelt")
+@pytest.mark.skipif(not _CODEX.is_file(), reason="requires installed Homebrew Codex")
 async def test_real_codex_seatbelt_signer_turn_and_cleanup(
     tmp_path: Path,
 ) -> None:
@@ -104,3 +101,103 @@ async def test_real_codex_seatbelt_signer_turn_and_cleanup(
     assert set(Path("/tmp").glob("omnigent-model-signer-private-*")) == private_dirs_before
     assert not list(tmp_path.glob("omnigent-codex-tmp/omnigent-codex-home-*"))
     assert shutil.which("sandbox-exec") is not None
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or shutil.which("bwrap") is None,
+    reason="requires Linux with bubblewrap",
+)
+async def test_linux_bwrap_real_signer_relay_with_deterministic_worker(tmp_path: Path) -> None:
+    """Exercise real bwrap containment and the actual signer relay in CI."""
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        """#!/usr/bin/python3
+import json, os, sys, urllib.request
+if "--version" in sys.argv:
+    print("codex-cli 0.140.0-alpha.19")
+    raise SystemExit(0)
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "initialize":
+        result = {}
+    elif method == "thread/start":
+        result = {"thread": {"id": "thread-bwrap"}}
+    elif method == "turn/start":
+        body = json.dumps({"model": "gpt-5.4-mini", "input": "probe"}).encode()
+        upstream = urllib.request.Request(
+            "https://model.test/v1/responses",
+            data=body,
+            headers={
+                "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(upstream, timeout=10) as response:
+            assert response.status == 200
+            assert b"BROKERED_E2E_OK" in response.read()
+        result = {"turn": {"id": "turn-bwrap"}}
+    else:
+        result = {}
+    print(json.dumps({"id": request_id, "result": result}), flush=True)
+    if method == "turn/start":
+        print(json.dumps({
+            "method": "item/completed",
+            "params": {
+                "turnId": "turn-bwrap",
+                "item": {
+                    "id": "msg-bwrap",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "BROKERED_E2E_OK",
+                },
+            },
+        }), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config = SignerLaunchConfig(
+        binding_id="test-fake-provider-v1",
+        endpoint="https://model.test/v1",
+        routes=(FrozenModelRoute(method="POST", host="model.test", path="/v1/responses"),),
+    )
+    executor = CodexExecutor(
+        cwd=str(tmp_path),
+        os_env=OSEnvSpec(
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap",
+                read_paths=[str(tmp_path)],
+                write_paths=[str(tmp_path)],
+                allow_network=False,
+                cwd_hidden_scan_overflow="error",
+            ),
+        ),
+        codex_path=str(fake_codex),
+        model="gpt-5.4-mini",
+        enable_web_search=False,
+        disable_native_tools=True,
+        signer_launch_config=config,
+    )
+    events: list[object] = []
+    try:
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "probe", "session_id": "bwrap-e2e"}],
+            [],
+            "Return the marker.",
+        ):
+            events.append(event)
+        state = executor._session_states["bwrap-e2e"]
+        assert state.app_session is not None
+        assert state.app_session._containment_confirmed
+        assert state.app_session._worker_launch is not None
+        assert state.app_session._worker_launch.sandboxed
+    finally:
+        await executor.close()
+
+    assert any(
+        isinstance(event, TurnComplete) and event.response == "BROKERED_E2E_OK" for event in events
+    )

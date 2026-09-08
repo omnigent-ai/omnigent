@@ -28,6 +28,7 @@ from omnigent.inner.codex_executor import (
     _parse_codex_gateway_error,
     _prompt_for_turn,
     _provider_codex_config_overrides,
+    _require_brokered_codex_version,
     _to_codex_input_items,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -3665,6 +3666,79 @@ async def test_codex_cli_version_times_out_and_kills_proc(
     assert await _codex_cli_version("/usr/local/bin/codex") is None
     # The stuck process was killed, not leaked.
     assert proc.killed is True
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"codex-cli (unknown build)\n",
+        b"codex-cli 0.139.0\n",
+        b"codex-cli 0.140.0-alpha.18\n",
+        b"codex-cli 0.140.0-alpha.20\n",
+        b"codex-cli 0.140.0\n",
+        b"codex-cli 0.141.0\n",
+        b"codex-cli 1.0.0\n",
+    ],
+)
+async def test_brokered_codex_version_gate_rejects_unknown_wire_versions_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    output: bytes,
+) -> None:
+    async def _fake_exec(*_args: Any, **_kwargs: Any) -> _FakeVersionProcess:
+        return _FakeVersionProcess(stdout=output)
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
+
+    with pytest.raises(RuntimeError, match="unsupported Codex wire version"):
+        await _require_brokered_codex_version("/usr/local/bin/codex")
+
+
+async def test_brokered_codex_version_gate_accepts_tested_alpha_19(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_exec(*_args: Any, **_kwargs: Any) -> _FakeVersionProcess:
+        return _FakeVersionProcess(stdout=b"codex-cli 0.140.0-alpha.19\n")
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
+
+    await _require_brokered_codex_version("/usr/local/bin/codex")
+
+
+async def test_brokered_version_failure_precedes_signer_session_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    version_gate = AsyncMock(side_effect=RuntimeError("unsupported Codex wire version"))
+    app_session_factory = AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._require_brokered_codex_version", version_gate
+    )
+    signer_config = SignerLaunchConfig(
+        binding_id="test-fake-provider-v1",
+        endpoint="https://model.test/v1",
+        routes=(FrozenModelRoute(method="POST", host="model.test", path="/v1/responses"),),
+    )
+    executor = CodexExecutor(
+        cwd=str(tmp_path),
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+        model="gpt-5.4-mini",
+        codex_path="/usr/local/bin/codex",
+        app_session_factory=app_session_factory,
+        signer_launch_config=signer_config,
+    )
+
+    with pytest.raises(RuntimeError, match="unsupported Codex wire version"):
+        await anext(
+            executor.run_turn(
+                [{"role": "user", "content": "hello", "session_id": "version-gate"}],
+                [],
+                "",
+            )
+        )
+
+    version_gate.assert_awaited_once_with("/usr/local/bin/codex")
+    app_session_factory.assert_not_called()
+    assert executor._session_states == {}
 
 
 # ── model_provider_override (cli-config / subscription pinning) ─────────────

@@ -282,6 +282,27 @@ describe("ErrorBanner", () => {
     expect(screen.getByTestId("error-message-content")).toHaveTextContent(
       "Try this: Run the host as a non-root user (uid != 0).",
     );
+    expect(screen.queryByRole("button", { name: "Copy recovery command" })).toBeNull();
+  });
+
+  it("copies structured provider recovery commands without diagnostics", async () => {
+    const remediation = "ucode configure";
+    render(
+      <ErrorBanner
+        message="Provider authentication required."
+        source="harness"
+        code="PROVIDER_AUTH_REQUIRED"
+        title="Databricks authentication required"
+        cause="Databricks authentication is missing or expired."
+        remediation={remediation}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Databricks authentication required/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy recovery command" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Recovery command copied" })).toBeTruthy(),
+    );
+    expect(copyText).toHaveBeenLastCalledWith(remediation);
   });
 
   it("separates terminal diagnostics and last output into tabs", () => {

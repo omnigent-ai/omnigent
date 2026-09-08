@@ -19,7 +19,6 @@ from ._subprocess_lifecycle import close_subprocess_transport
 from .model_auth import (
     PROVIDER_AUTH_REQUIRED,
     ProviderAuthRequired,
-    _provider_auth_message,
     _validated_authority,
 )
 from .model_egress import (
@@ -275,8 +274,8 @@ def _parse_readiness(line: bytes, config: SignerLaunchConfig) -> SignerReadiness
     ):
         endpoint = urlsplit(config.endpoint)
         assert endpoint.hostname is not None
-        raise ProviderAuthRequired(
-            _provider_auth_message(f"https://{endpoint.hostname}", config.auth_profile)
+        raise ProviderAuthRequired.for_authority(
+            f"https://{endpoint.hostname}", config.auth_profile
         )
     if not isinstance(payload, dict) or set(payload) != _READINESS_KEYS:
         raise SignerStartError("model signer returned invalid readiness fields")

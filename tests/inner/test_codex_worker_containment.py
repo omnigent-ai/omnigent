@@ -470,6 +470,7 @@ def test_real_seatbelt_worker_reads_only_public_signer_state_and_relay_network(
     signer_public = Path(tempfile.mkdtemp(prefix="osp-", dir="/tmp")).resolve()
     signer_private = Path(tempfile.mkdtemp(prefix="osr-", dir="/tmp")).resolve()
     socket_path = signer_public / "relay.sock"
+    unrelated_socket_path = signer_public / "unrelated.sock"
     ca_bundle = signer_public / "ca-bundle.pem"
     ca_bundle.write_text("PUBLIC CA", encoding="utf-8")
     private_marker = signer_private / "bearer-token"
@@ -480,6 +481,18 @@ def test_real_seatbelt_worker_reads_only_public_signer_state_and_relay_network(
     unix_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     unix_listener.bind(str(socket_path))
     unix_listener.listen(1)
+    unrelated_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    unrelated_listener.bind(str(unrelated_socket_path))
+    unrelated_listener.listen(1)
+    host_socket_candidates = [
+        value
+        for value in (
+            "/var/run/docker.sock",
+            os.environ.get("SSH_AUTH_SOCK"),
+            os.environ.get("DATABRICKS_SDK_SERVICE"),
+        )
+        if value and Path(value).exists()
+    ]
     direct_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     direct_listener.bind(("127.0.0.1", 0))
     direct_listener.listen(1)
@@ -492,7 +505,7 @@ def test_real_seatbelt_worker_reads_only_public_signer_state_and_relay_network(
     codex = tmp_path / "codex"
     codex.write_text(
         "#!/usr/bin/python3\n"
-        "import pathlib, socket, sys\n"
+        "import os, pathlib, socket, sys\n"
         f"for path in ({str(private_marker)!r}, {str(host_marker)!r}):\n"
         "    try:\n"
         "        pathlib.Path(path).read_bytes()\n"
@@ -500,6 +513,17 @@ def test_real_seatbelt_worker_reads_only_public_signer_state_and_relay_network(
         "        pass\n"
         "    else:\n"
         "        sys.exit(91)\n"
+        f"assert {unrelated_socket_path.name!r} in os.listdir({str(signer_public)!r})\n"
+        f"for path in {[str(unrelated_socket_path), *host_socket_candidates]!r}:\n"
+        "    denied = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "    try:\n"
+        "        denied.connect(path)\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "    else:\n"
+        "        sys.exit(93)\n"
+        "    finally:\n"
+        "        denied.close()\n"
         f"relay = socket.create_connection(('127.0.0.1', {relay_port}), timeout=3)\n"
         "relay.close()\n"
         "try:\n"
@@ -550,10 +574,12 @@ def test_real_seatbelt_worker_reads_only_public_signer_state_and_relay_network(
     finally:
         worker.close()
         unix_listener.close()
+        unrelated_listener.close()
         direct_listener.close()
         host_marker.unlink(missing_ok=True)
         private_marker.unlink(missing_ok=True)
         socket_path.unlink(missing_ok=True)
+        unrelated_socket_path.unlink(missing_ok=True)
         ca_bundle.unlink(missing_ok=True)
         signer_public.rmdir()
         signer_private.rmdir()

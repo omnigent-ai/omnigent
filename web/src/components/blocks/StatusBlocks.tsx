@@ -402,23 +402,47 @@ export function ErrorBanner({
                 >
                   Message
                 </h4>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  className="size-6 text-muted-foreground hover:bg-muted hover:text-foreground"
-                  aria-label={
-                    copiedTarget === "message" ? "Error message copied" : "Copy error message"
-                  }
-                  onClick={() => void copy("message", messageText)}
-                  componentId="diagnostics.status.copy"
-                >
-                  {copiedTarget === "message" ? (
-                    <CheckIcon className="size-3.5" aria-hidden="true" />
-                  ) : (
-                    <CopyIcon className="size-3.5" aria-hidden="true" />
-                  )}
-                </Button>
+                <div className="flex items-center gap-1">
+                  {code === "PROVIDER_AUTH_REQUIRED" && remediation ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="xs"
+                      className="h-6 gap-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      aria-label={
+                        copiedTarget === "recovery"
+                          ? "Recovery command copied"
+                          : "Copy recovery command"
+                      }
+                      onClick={() => void copy("recovery", remediation)}
+                      componentId="diagnostics.status.recovery_copy"
+                    >
+                      {copiedTarget === "recovery" ? (
+                        <CheckIcon className="size-3.5" aria-hidden="true" />
+                      ) : (
+                        <CopyIcon className="size-3.5" aria-hidden="true" />
+                      )}
+                      Copy command
+                    </Button>
+                  ) : null}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="size-6 text-muted-foreground hover:bg-muted hover:text-foreground"
+                    aria-label={
+                      copiedTarget === "message" ? "Error message copied" : "Copy error message"
+                    }
+                    onClick={() => void copy("message", messageText)}
+                    componentId="diagnostics.status.copy"
+                  >
+                    {copiedTarget === "message" ? (
+                      <CheckIcon className="size-3.5" aria-hidden="true" />
+                    ) : (
+                      <CopyIcon className="size-3.5" aria-hidden="true" />
+                    )}
+                  </Button>
+                </div>
               </div>
               <div
                 data-testid="error-message-content"
