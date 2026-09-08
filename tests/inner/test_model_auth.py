@@ -13,6 +13,8 @@ from omnigent.inner._proc import process_alive
 from omnigent.inner.model_auth import (
     PROVIDER_AUTH_REQUIRED,
     ProviderAuthRequired,
+    _resolve_ucode_executable,
+    _TrustedExecutable,
     _ucode_auth_token_argv,
     mint_ucode_token,
 )
@@ -39,6 +41,60 @@ def test_ucode_argv_is_fixed_and_contains_only_validated_authority(tmp_path: Pat
         _PROFILE,
         "--force-refresh",
     ]
+
+
+def test_ucode_resolution_rejects_writable_parent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    unsafe_bin = tmp_path / "unsafe-bin"
+    unsafe_bin.mkdir(mode=0o755)
+    unsafe_bin.chmod(0o777)
+    _write_ucode(unsafe_bin / "ucode", "printf 'opaque-token-value\\n'\n")
+    monkeypatch.setenv("PATH", str(unsafe_bin))
+
+    with pytest.raises(PermissionError, match="unsafe"):
+        _resolve_ucode_executable()
+
+
+def test_ucode_resolution_rejects_unsafe_symlink_chain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    trusted_bin = tmp_path / "trusted-bin"
+    trusted_bin.mkdir(mode=0o755)
+    real = _write_ucode(trusted_bin / "ucode-real", "printf 'opaque-token-value\\n'\n")
+    unsafe_links = tmp_path / "unsafe-links"
+    unsafe_links.mkdir(mode=0o777)
+    unsafe_links.chmod(0o777)
+    link = unsafe_links / "ucode"
+    link.symlink_to(real)
+    monkeypatch.setenv("PATH", str(unsafe_links))
+
+    with pytest.raises(PermissionError, match="unsafe"):
+        _resolve_ucode_executable()
+
+
+async def test_ucode_replacement_after_validation_fails_before_exec(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executable = _write_ucode(tmp_path / "ucode", "printf 'first-token\\n'\n")
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}/usr/bin:/bin")
+    original_resolve = _resolve_ucode_executable
+
+    def _resolve_then_replace() -> _TrustedExecutable:
+        resolved = original_resolve()
+        replacement = _write_ucode(tmp_path / "replacement", "printf 'second-token\\n'\n")
+        replacement.replace(executable)
+        return resolved
+
+    monkeypatch.setattr(
+        "omnigent.inner.model_auth._resolve_ucode_executable", _resolve_then_replace
+    )
+
+    with pytest.raises(ProviderAuthRequired):
+        await mint_ucode_token(host=_HOST, profile=_PROFILE)
 
 
 @pytest.mark.parametrize(
