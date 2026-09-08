@@ -21,7 +21,7 @@ import logging
 import secrets
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
 from omnigent.db.utils import now_epoch
@@ -29,6 +29,7 @@ from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harnesses.codex_native.rate_limits import RATE_LIMITS_TTL_S
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
@@ -668,6 +669,30 @@ def create_hosts_router(
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "runners": [],
         }
+
+    @router.get("/hosts/{host_id}/codex-rate-limits")
+    async def get_host_codex_rate_limits(
+        request: Request, host_id: str, response: Response
+    ) -> dict[str, Any]:
+        """Return a fresh, sanitized snapshot reported by the connected Host."""
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        response.headers["Cache-Control"] = "private, no-store"
+        connection = host_registry.get(host.host_id)
+        snapshot = connection.hello.codex_rate_limits if connection is not None else None
+        captured = snapshot.get("captured_at") if isinstance(snapshot, dict) else None
+        now = now_epoch()
+        if (
+            not isinstance(captured, int)
+            or captured > now + 300
+            or now - captured > RATE_LIMITS_TTL_S
+        ):
+            snapshot = None
+        return {"rate_limits": snapshot}
 
     @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
     async def get_host_model_options(

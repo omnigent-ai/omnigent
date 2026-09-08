@@ -9130,6 +9130,51 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/codex-rate-limits": {
+      "get": {
+        "description": "Return a fresh, sanitized snapshot reported by the connected Host.",
+        "operationId": "get_host_codex_rate_limits_v1_hosts__host_id__codex_rate_limits_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Host Codex Rate Limits V1 Hosts  Host Id  Codex Rate Limits Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Host Codex Rate Limits",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/credentials/detected": {
       "get": {
         "description": "List adoptable credentials already present on a connected host.\n\nBacks the setup dialog's \"adopt an existing credential\" affordance: the\nhost reports which UI-auth-family credentials it already has as\nNON-secret descriptors (family + source label + env var name), so the UI\ncan offer a one-click \"Use it\". Owner-scoped and flag-gated like the\ncredential-write route (404 when disabled). Never returns a secret value.\n\n**Returns:** `{\"object\": \"detected_credentials\", \"credentials\": [...]}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 403 when not the owner, 409 when offline, 502/504 on host failure/timeout.",

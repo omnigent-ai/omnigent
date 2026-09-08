@@ -418,11 +418,13 @@ def test_harness_readiness_frame_without_gateway_inference_is_none() -> None:
         {
             "kind": "host.harness_readiness",
             "configured_harnesses": {"codex": True},
+            "codex_rate_limits": {"future_extension": True},
         }
     )
     decoded = decode_host_frame(encoded)
     assert isinstance(decoded, HostHarnessReadinessFrame)
     assert decoded.gateway_inference is None
+    assert decoded.codex_rate_limits is None
 
 
 def test_harness_readiness_frame_rejects_unknown_availability() -> None:
