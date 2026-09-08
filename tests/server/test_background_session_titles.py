@@ -49,6 +49,29 @@ async def test_prepare_background_title_for_eligible_session(db_uri: str) -> Non
     assert pending is not None
 
 
+async def test_prepare_background_title_skips_when_user_setting_is_disabled(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation(kind="default")
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return "Unused title"
+
+    pending = prepare_background_session_title(
+        coordinator=BackgroundSessionTitleCoordinator(store, generator),
+        conversation=conversation,
+        event=SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        ),
+        enabled=False,
+    )
+
+    assert pending is None
+
+
 async def test_prepare_background_title_from_message(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     agent_id = uuid.uuid4().hex

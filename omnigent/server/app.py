@@ -102,6 +102,7 @@ from omnigent.server.routes.sessions import (
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
+from omnigent.server.routes.user_settings import create_user_settings_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
@@ -2724,6 +2725,11 @@ def create_app(
         ),
         prefix="/v1",
         tags=["sharing"],
+    )
+    app.include_router(
+        create_user_settings_router(auth_provider, permission_store),
+        prefix="/v1",
+        tags=["user_settings"],
     )
 
     # First-class projects (owner-private session containers). Mounted only

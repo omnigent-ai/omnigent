@@ -424,6 +424,36 @@ class SqlAlchemyPermissionStore(PermissionStore):
             )
             return [_to_account(r) for r in rows if r.id not in _HIDDEN_LIST_USERS]
 
+    def get_background_session_titles_enabled(self, user_id: str) -> bool:
+        """Return the user's preference, treating missing and unset as enabled."""
+        with self._session("select_user_background_session_titles_setting") as session:
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
+            return row is None or row.background_session_titles_enabled is not False
+
+    def set_background_session_titles_enabled(self, user_id: str, enabled: bool) -> None:
+        """Upsert the user's explicit background-title preference."""
+        with self._session("set_user_background_session_titles_setting") as session:
+            values = {
+                "id": user_id,
+                "is_admin": False,
+                "background_session_titles_enabled": enabled,
+            }
+            if self._engine.dialect.name == "sqlite":
+                stmt = sqlite_insert(SqlUser).values(**values).on_conflict_do_update(
+                    index_elements=["workspace_id", "id"],
+                    set_={"background_session_titles_enabled": enabled},
+                )
+            elif self._engine.dialect.name == "mysql":
+                stmt = mysql_insert(SqlUser).values(**values).on_duplicate_key_update(
+                    background_session_titles_enabled=enabled
+                )
+            else:
+                stmt = pg_insert(SqlUser).values(**values).on_conflict_do_update(
+                    index_elements=["workspace_id", "id"],
+                    set_={"background_session_titles_enabled": enabled},
+                )
+            session.execute(stmt)
+
     def is_admin(self, user_id: str) -> bool:
         """Check the admin flag. See base class for contract."""
         with self._session("select_user_admin_status") as session:

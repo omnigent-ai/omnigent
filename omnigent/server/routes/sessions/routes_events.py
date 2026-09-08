@@ -76,6 +76,7 @@ from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
+from omnigent.server.user_settings import background_session_titles_enabled_for_user
 from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
@@ -1171,6 +1172,8 @@ def register_events_routes(
                 conversation_store,
                 created_by=created_by,
                 background_title_coordinator=background_title_coordinator,
+                permission_store=permission_store,
+                user_id=user_id,
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
@@ -1926,6 +1929,7 @@ def register_events_routes(
             coordinator=background_title_coordinator,
             conversation=conv,
             event=body,
+            enabled=await background_session_titles_enabled_for_user(permission_store, user_id),
         )
         # Schedule display-name generation for child sessions (the
         # title coordinator skips children because their title is

@@ -130,6 +130,7 @@ from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
+from omnigent.server.user_settings import background_session_titles_enabled_for_user
 from omnigent.server.routes._session_create_validation import (
     validate_session_agent,
     validate_session_model_metadata,
@@ -2218,6 +2219,8 @@ async def _persist_external_conversation_item(
     conversation_store: ConversationStore,
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    permission_store: PermissionStore | None = None,
+    user_id: str | None = None,
 ) -> str:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -2321,6 +2324,7 @@ async def _persist_external_conversation_item(
         coordinator=background_title_coordinator,
         conversation=conv,
         event=SessionEventInput(type=item.type, data=item.data.model_dump()),
+        enabled=await background_session_titles_enabled_for_user(permission_store, user_id),
     )
     persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
     persisted = persisted_items[-1]
@@ -8950,6 +8954,9 @@ async def _create_session_from_existing_agent(
                     coordinator=background_title_coordinator,
                     conversation=conv,
                     event=item,
+                    enabled=await background_session_titles_enabled_for_user(
+                        permission_store, user_id
+                    ),
                 )
                 await _dispatch_session_event_to_runner(
                     conv.id,

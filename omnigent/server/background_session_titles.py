@@ -403,10 +403,12 @@ def prepare_background_session_title(
     coordinator: BackgroundSessionTitleCoordinator | None,
     conversation: Conversation,
     event: SessionEventInput,
+    enabled: bool = True,
 ) -> PendingBackgroundSessionTitle | None:
     """Prepare a guarded first-turn title attempt for a top-level session."""
     if (
-        coordinator is None
+        not enabled
+        or coordinator is None
         or conversation.title is not None
         or conversation.parent_conversation_id is not None
         or not _background_session_title_harness_supported(conversation.harness_override)

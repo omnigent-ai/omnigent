@@ -392,6 +392,7 @@ class SqlUser(OmnigentBase):
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_login_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    background_session_titles_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
 
 class SqlAccountToken(OmnigentBase):
