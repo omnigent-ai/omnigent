@@ -19,7 +19,7 @@ import pytest
 from fastapi import FastAPI, Request
 from PIL import Image
 
-from omnigent.native_coding_agents import (
+from omnigent.native.native_coding_agents import (
     ANTIGRAVITY_NATIVE_AGENT_NAME,
     QWEN_NATIVE_AGENT_NAME,
 )
@@ -1095,7 +1095,7 @@ def test_ensure_default_native_agents_seeds_every_native_agent(
     the loop — or seeded under the wrong name/id — is caught here.
     """
     from omnigent.db.utils import builtin_agent_id
-    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 
     server_app._ensure_default_native_agents(
         seed_stores.agent_store,

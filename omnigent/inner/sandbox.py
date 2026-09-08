@@ -17,8 +17,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol, cast
 
-from omnigent.json_types import JsonValue
 from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
+from omnigent.util.json_types import JsonValue
 
 from .datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
 

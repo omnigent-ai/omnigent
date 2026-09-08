@@ -290,14 +290,14 @@ def _probe_launch_catalog(harness: str, rig: _NativeRig) -> list[dict[str, objec
     if harness == "codex":
         script = (
             "import asyncio, json, sys\n"
-            "from omnigent.codex_native_app_server import codex_launch_catalog\n"
+            "from omnigent.harnesses.codex_native.app_server import codex_launch_catalog\n"
             "rows = asyncio.run(codex_launch_catalog())\n"
             "open(sys.argv[1], 'w').write(json.dumps(rows or []))\n"
         )
     else:
         script = (
             "import asyncio, json, sys\n"
-            "from omnigent.claude_native import (\n"
+            "from omnigent.harnesses.claude_native.main import (\n"
             "    claude_launch_catalog,\n"
             "    resolve_native_claude_config,\n"
             ")\n"
@@ -373,12 +373,12 @@ def _create_unbound_native_session(base_url: str, harness: str) -> str:
 
     with tempfile.TemporaryDirectory() as tmp:
         if harness == "codex":
-            from omnigent.codex_native import _materialize_codex_agent_spec
+            from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
 
             spec_path = _materialize_codex_agent_spec(Path(tmp), model=None)
             wrapper_value = CODEX_NATIVE_WRAPPER_VALUE
         else:
-            from omnigent.claude_native import _materialize_claude_agent_spec
+            from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
 
             spec_path = _materialize_claude_agent_spec(Path(tmp))
             wrapper_value = CLAUDE_NATIVE_WRAPPER_VALUE

@@ -362,7 +362,7 @@ def _recorder_response_ids(record_file: Path) -> set[str]:
 
 def _kiro_pane_text(bridge_dir: Path) -> str:
     """Capture the live Kiro tmux pane (what the user's terminal shows)."""
-    from omnigent.kiro_native_bridge import read_tmux_info
+    from omnigent.harnesses.kiro_native.bridge import read_tmux_info
 
     info = read_tmux_info(bridge_dir)
     if info is None:
@@ -405,7 +405,7 @@ def _create_kiro_native_session(base_url: str, runner_id: str, workspace: Path) 
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.kiro_native import _materialize_kiro_agent_spec
+    from omnigent.harnesses.kiro_native.main import _materialize_kiro_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         spec_path = _materialize_kiro_agent_spec(Path(tmp), model=None)
@@ -457,7 +457,7 @@ def kiro_shim_session(
     if request.config.getoption("--ui-base-url"):
         pytest.skip("kiro permission-mirror e2e requires an isolated spawned server")
 
-    from omnigent.kiro_native_bridge import bridge_dir_for_session_id
+    from omnigent.harnesses.kiro_native.bridge import bridge_dir_for_session_id
     from omnigent.runner.identity import token_bound_runner_id
 
     server_tmp = tmp_path_factory.mktemp("e2e_ui_kiro_shim_server")
@@ -575,7 +575,7 @@ def kiro_shim_session(
     finally:
         if session_id is not None:
             try:
-                from omnigent.kiro_native_bridge import read_tmux_info
+                from omnigent.harnesses.kiro_native.bridge import read_tmux_info
 
                 info = read_tmux_info(bridge_dir_for_session_id(session_id))
                 httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
@@ -613,8 +613,8 @@ def test_concurrent_kiro_permissions_surface_serially(
     offset advanced past them), so the second approval card never appears while
     the Kiro TUI stays blocked on its next ``requires approval`` prompt.
     """
-    from omnigent.kiro_native_bridge import acp_record_path
-    from omnigent.kiro_native_permissions import kiro_permission_elicitation_id
+    from omnigent.harnesses.kiro_native.bridge import acp_record_path
+    from omnigent.harnesses.kiro_native.permissions import kiro_permission_elicitation_id
 
     base_url, session_id, bridge_dir = kiro_shim_session
     record_file = acp_record_path(bridge_dir)

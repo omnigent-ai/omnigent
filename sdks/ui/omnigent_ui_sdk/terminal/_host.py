@@ -251,7 +251,7 @@ class _SubagentNode:
     # web-parity ``Failed`` label (outranks a stale ``completed`` status).
     last_task_error: bool = False
     # Whether the child session is closed to new user input — derived from its
-    # labels / title via :func:`omnigent.session_lifecycle.is_session_closed`.
+    # labels / title via :func:`omnigent.util.session_lifecycle.is_session_closed`.
     # Sticky (a closed session never reopens); gates interactive chat: a closed
     # child is view-only because a ``message`` to it returns 409 CONFLICT.
     closed: bool = False
@@ -3170,7 +3170,7 @@ class TerminalHost:
         # session 409s). Imported lazily to keep this UI SDK importable without
         # the ``omnigent`` server package on the path.
         if not node.closed:
-            from omnigent.session_lifecycle import is_session_closed
+            from omnigent.util.session_lifecycle import is_session_closed
 
             if is_session_closed(child.get("labels"), child.get("title")):
                 node.closed = True

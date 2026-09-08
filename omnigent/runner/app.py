@@ -30,9 +30,9 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overl
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
-    from omnigent.claude_native_bridge import ClaudeNativeToolRelay
-    from omnigent.codex_native_bridge import CodexNativeBridgeState
+    from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
     from omnigent.llms.client import Client as LLMClient
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.runner.policy import PolicyVerdict
@@ -68,13 +68,12 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
     extract_summary_text,
 )
-from omnigent.native_coding_agents import (
+from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
 )
@@ -178,6 +177,7 @@ from omnigent.tools.builtins.load_skill import (
     find_skill_by_name,
     format_skill_meta_text,
 )
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
@@ -878,7 +878,7 @@ async def _complete_acp_subagent_child(
     :param title: The sub-agent's display name, used as the summary message's
         author; falls back to *child_key* when empty.
     """
-    from omnigent._native_post_delivery import post_external_session_status
+    from omnigent.native._native_post_delivery import post_external_session_status
 
     try:
         child_id = await asyncio.wait_for(
@@ -2778,7 +2778,7 @@ def create_runner_app(
             return _session_claude_launch_configs[session_id]
         task = _session_claude_launch_config_tasks.get(session_id)
         if task is None:
-            from omnigent.claude_native import resolve_native_claude_config
+            from omnigent.harnesses.claude_native.main import resolve_native_claude_config
 
             async def _load() -> ClaudeNativeUcodeConfig | None:
                 spec = await _resolve_session_agent_spec(session_id)
@@ -5048,7 +5048,7 @@ def create_runner_app(
         action: str,
         missing_state_log_level: int = logging.WARNING,
     ) -> CodexNativeBridgeState | None:
-        from omnigent.codex_native_bridge import (
+        from omnigent.harnesses.codex_native.bridge import (
             CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
             read_bridge_state,
@@ -5088,7 +5088,7 @@ def create_runner_app(
         conv_id: str,
         settings: _JsonObject,
     ) -> Response:
-        from omnigent.codex_native_app_server import client_for_transport
+        from omnigent.harnesses.codex_native.app_server import client_for_transport
 
         if not settings:
             return Response(status_code=204)
@@ -5207,7 +5207,7 @@ def create_runner_app(
                     "detail": "Codex-native plan-mode update requires a current model.",
                 },
             )
-        from omnigent.codex_native_bridge import (
+        from omnigent.harnesses.codex_native.bridge import (
             DeveloperInstructionsReadState,
             read_codex_config_developer_instructions_state_from_home,
         )
@@ -5315,12 +5315,12 @@ def create_runner_app(
         return JSONResponse(status_code=200, content={"approval_mode": preset.value})
 
     async def _codex_native_model_options(conv_id: str) -> list[_JsonObject]:
-        from omnigent.codex_native_app_server import (
+        from omnigent.harnesses.codex_native.app_server import (
             client_for_transport,
             list_codex_model_options,
             mark_launch_default,
         )
-        from omnigent.codex_native_bridge import read_codex_home_config_model
+        from omnigent.harnesses.codex_native.bridge import read_codex_home_config_model
 
         state = await _codex_native_bridge_state_for_session(
             conv_id,
@@ -5356,12 +5356,12 @@ def create_runner_app(
 
     async def _write_back_codex_catalog(rows: list[_JsonObject]) -> None:
         try:
-            from omnigent import model_catalog_store
-            from omnigent.codex_native_app_server import (
+            from omnigent.harnesses.codex_native.app_server import (
                 codex_catalog_fingerprint,
                 mark_launch_default,
                 resolve_native_codex_launch,
             )
+            from omnigent.models import model_catalog_store
 
             launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
             fingerprint = codex_catalog_fingerprint(launch)
@@ -5387,11 +5387,11 @@ def create_runner_app(
         conv_id: str,
         effort: str | None,
     ) -> Response:
-        from omnigent.pi_native_bridge import (
+        from omnigent.harnesses.pi_native.bridge import (
             bridge_dir_for_session_id,
             enqueue_thinking_level_change,
         )
-        from omnigent.reasoning_effort import to_pi_thinking_level
+        from omnigent.util.reasoning_effort import to_pi_thinking_level
 
         if effort is None or not effort.strip():
             return Response(status_code=204)
@@ -5422,7 +5422,10 @@ def create_runner_app(
         conv_id: str,
         model: str | None,
     ) -> Response:
-        from omnigent.pi_native_bridge import bridge_dir_for_session_id, enqueue_model_change
+        from omnigent.harnesses.pi_native.bridge import (
+            bridge_dir_for_session_id,
+            enqueue_model_change,
+        )
 
         if model is None or not model.strip():
             return Response(status_code=204)
@@ -5491,7 +5494,7 @@ def create_runner_app(
         rendered, which the Omnigent server persists as the session's
         current mode.
         """
-        from omnigent.claude_native_bridge import (
+        from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
             set_permission_mode,
         )
@@ -5549,7 +5552,7 @@ def create_runner_app(
         produced no pane is not waited on either (inject keeps its own short
         advertisement timeout in both cases).
         """
-        from omnigent.claude_native_bridge import claude_pane_ready
+        from omnigent.harnesses.claude_native.bridge import claude_pane_ready
 
         terminal_registry = resource_registry.terminal_registry if resource_registry else None
         if terminal_registry is None:
@@ -5589,12 +5592,12 @@ def create_runner_app(
         conv_id: str,
         effort: str | None,
     ) -> Response:
-        from omnigent.claude_native_bridge import (
+        from omnigent.harnesses.claude_native.bridge import (
             EFFORT_DIALOG_HINT,
             bridge_dir_for_bridge_id,
             inject_slash_command,
         )
-        from omnigent.reasoning_effort import CLAUDE_EFFORTS
+        from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
         if effort is None or effort not in CLAUDE_EFFORTS:
             return Response(status_code=204)
@@ -5645,7 +5648,7 @@ def create_runner_app(
         persisted request and the forwarder's verbatim report remain the
         authoritative record either way.
         """
-        from omnigent.claude_native_bridge import (
+        from omnigent.harnesses.claude_native.bridge import (
             SWITCH_MODEL_DIALOG_HINT,
             confirm_dialog_if_open,
             read_claude_status_model,
@@ -5679,11 +5682,7 @@ def create_runner_app(
         conv_id: str,
         model: str | None,
     ) -> Response:
-        from omnigent.claude_model_vocabulary import claude_model_command_arg
-        from omnigent.claude_native import (
-            resolve_claude_native_model_selection,
-        )
-        from omnigent.claude_native_bridge import (
+        from omnigent.harnesses.claude_native.bridge import (
             SWITCH_MODEL_DIALOG_HINT,
             bridge_dir_for_bridge_id,
             confirm_dialog_if_open,
@@ -5691,6 +5690,10 @@ def create_runner_app(
             read_claude_status_model,
             read_model_env,
         )
+        from omnigent.harnesses.claude_native.main import (
+            resolve_claude_native_model_selection,
+        )
+        from omnigent.models.claude_model_vocabulary import claude_model_command_arg
 
         if model is None or not model.strip():
             return Response(status_code=204)
@@ -5834,7 +5837,7 @@ def create_runner_app(
         conv_id: str,
         model: str | None,
     ) -> Response:
-        from omnigent.cursor_native_bridge import (
+        from omnigent.harnesses.cursor_native.bridge import (
             bridge_dir_for_session_id,
             inject_model_command,
         )
@@ -5866,7 +5869,7 @@ def create_runner_app(
         conv_id: str,
         model: str | None,
     ) -> Response:
-        from omnigent.kiro_native_bridge import (
+        from omnigent.harnesses.kiro_native.bridge import (
             bridge_dir_for_session_id,
             inject_model_command,
         )
@@ -5892,7 +5895,7 @@ def create_runner_app(
         return Response(status_code=204)
 
     async def _handle_claude_native_compact(conv_id: str) -> Response:
-        from omnigent.claude_native_bridge import (
+        from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
             inject_slash_command,
         )
@@ -5948,8 +5951,11 @@ def create_runner_app(
         return Response(status_code=200)
 
     async def _handle_opencode_native_compact(conv_id: str) -> Response:
-        from omnigent.opencode_native_bridge import bridge_dir_for_bridge_id, read_bridge_state
-        from omnigent.opencode_native_client import OpenCodeClientError
+        from omnigent.harnesses.opencode_native.bridge import (
+            bridge_dir_for_bridge_id,
+            read_bridge_state,
+        )
+        from omnigent.harnesses.opencode_native.client import OpenCodeClientError
 
         server = _AUTO_OPENCODE_SERVERS.get(conv_id)
         state = read_bridge_state(bridge_dir_for_bridge_id(conv_id))
@@ -5992,12 +5998,15 @@ def create_runner_app(
         return Response(status_code=200)
 
     async def _opencode_native_model_options(conv_id: str) -> list[_JsonObject]:
-        from omnigent.opencode_native_app_server import (
+        from omnigent.harnesses.opencode_native.app_server import (
             filtered_server_env,
             list_opencode_cli_model_options,
         )
-        from omnigent.opencode_native_bridge import bridge_dir_for_bridge_id, read_bridge_state
-        from omnigent.opencode_native_client import OpenCodeClient
+        from omnigent.harnesses.opencode_native.bridge import (
+            bridge_dir_for_bridge_id,
+            read_bridge_state,
+        )
+        from omnigent.harnesses.opencode_native.client import OpenCodeClient
 
         bridge_dir = bridge_dir_for_bridge_id(conv_id)
         state = read_bridge_state(bridge_dir)
@@ -6028,7 +6037,7 @@ def create_runner_app(
             await client.aclose()
 
     async def _handle_opencode_native_model_change(conv_id: str, model: str | None) -> Response:
-        from omnigent.opencode_native_bridge import (
+        from omnigent.harnesses.opencode_native.bridge import (
             bridge_dir_for_bridge_id,
             update_model_override,
         )
@@ -6072,7 +6081,10 @@ def create_runner_app(
         return Response(status_code=200)
 
     async def _handle_cursor_native_compact(conv_id: str) -> Response:
-        from omnigent.cursor_native_bridge import bridge_dir_for_session_id, inject_user_message
+        from omnigent.harnesses.cursor_native.bridge import (
+            bridge_dir_for_session_id,
+            inject_user_message,
+        )
 
         bridge_dir = bridge_dir_for_session_id(conv_id)
         _publish_event(conv_id, {"type": "response.compaction.in_progress", "task_id": conv_id})
@@ -6095,7 +6107,7 @@ def create_runner_app(
         return Response(status_code=200)
 
     async def _handle_pi_native_compact(conv_id: str) -> Response:
-        from omnigent.pi_native_bridge import bridge_dir_for_session_id, enqueue_compact
+        from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id, enqueue_compact
 
         try:
             await asyncio.to_thread(
@@ -6119,7 +6131,7 @@ def create_runner_app(
         return Response(status_code=200)
 
     def _inject_codex_compact(socket_path: str, target: str) -> None:
-        from omnigent.claude_native_bridge import _run_tmux
+        from omnigent.harnesses.claude_native.bridge import _run_tmux
 
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
@@ -6138,7 +6150,7 @@ def create_runner_app(
         # (digit 1) confirms. A settle pause between keystrokes is required — each
         # screen draws asynchronously, and typing the command then pressing Enter
         # back-to-back races the slash-menu so the command never submits.
-        from omnigent.claude_native_bridge import _run_tmux
+        from omnigent.harnesses.claude_native.bridge import _run_tmux
 
         # Reset to a clean composer so the command submits: close any stray
         # menu/popup, then clear the line. C-u also wipes any text the TUI user
@@ -6160,7 +6172,7 @@ def create_runner_app(
         # target, so a keystroke that hit a non-existent menu row (a preset this
         # codex build doesn't offer) is reported as not-applied rather than the
         # label claiming a mode the TUI never entered.
-        from omnigent.claude_native_bridge import _capture_pane
+        from omnigent.harnesses.claude_native.bridge import _capture_pane
 
         marker = "Permissions updated to "
         deadline = time.monotonic() + _CODEX_PERMISSION_CONFIRM_BUDGET_S
@@ -6174,7 +6186,7 @@ def create_runner_app(
             time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
 
     async def _handle_hermes_native_compact(conv_id: str) -> Response:
-        from omnigent.hermes_native_bridge import (
+        from omnigent.harnesses.hermes_native.bridge import (
             bridge_dir_for_session_id,
             inject_compress_command,
         )
@@ -6193,7 +6205,10 @@ def create_runner_app(
         return Response(status_code=200)
 
     async def _handle_qwen_native_compact(conv_id: str) -> Response:
-        from omnigent.qwen_native_bridge import bridge_dir_for_session_id, submit_user_message
+        from omnigent.harnesses.qwen_native.bridge import (
+            bridge_dir_for_session_id,
+            submit_user_message,
+        )
 
         bridge_dir = bridge_dir_for_session_id(conv_id)
         _publish_event(conv_id, {"type": "response.compaction.in_progress", "task_id": conv_id})
@@ -6216,7 +6231,7 @@ def create_runner_app(
         message: str,
         policy_name: str | None = None,
     ) -> Response:
-        from omnigent.claude_native_bridge import (
+        from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
             display_cost_approval_popup,
         )
@@ -6254,7 +6269,7 @@ def create_runner_app(
         message: str,
         policy_name: str | None = None,
     ) -> Response:
-        from omnigent.native_cost_popup import launch_cost_popup
+        from omnigent.native.native_cost_popup import launch_cost_popup
 
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "codex", "main") if registry is not None else None
@@ -6288,7 +6303,7 @@ def create_runner_app(
         message: str,
         policy_name: str | None = None,
     ) -> Response:
-        from omnigent.native_cost_popup import launch_cost_popup
+        from omnigent.native.native_cost_popup import launch_cost_popup
 
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "opencode", "main") if registry is not None else None
@@ -6321,7 +6336,7 @@ def create_runner_app(
         message: str,
         policy_name: str | None = None,
     ) -> Response:
-        from omnigent.native_cost_popup import launch_blocked_notice
+        from omnigent.native.native_cost_popup import launch_blocked_notice
 
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "opencode", "main") if registry is not None else None
@@ -6349,24 +6364,24 @@ def create_runner_app(
 
     async def _native_cost_popup_config_file(conv_id: str, harness: str) -> Path:
         from omnigent.cli_auth import databricks_request_headers
-        from omnigent.opencode_native_bridge import write_cost_popup_config
+        from omnigent.harnesses.opencode_native.bridge import write_cost_popup_config
         from omnigent.runner._entry import _make_auth_token_factory
 
         if harness == "claude-native":
-            from omnigent import claude_native_bridge as _cnb
+            from omnigent.harnesses.claude_native import bridge as _cnb
 
             bridge_id = await _claude_native_bridge_id_for_session(
                 server_client=server_client, session_id=conv_id
             )
             bridge_dir = _cnb.bridge_dir_for_bridge_id(bridge_id)
         elif harness == "opencode-native":
-            from omnigent.opencode_native_bridge import (
+            from omnigent.harnesses.opencode_native.bridge import (
                 bridge_dir_for_bridge_id as _oc_bridge_dir,
             )
 
             bridge_dir = _oc_bridge_dir(conv_id)
         else:  # codex-native
-            from omnigent import codex_native_bridge as _cxb
+            from omnigent.harnesses.codex_native import bridge as _cxb
 
             bridge_dir = _cxb.bridge_dir_for_bridge_id(conv_id)
 
@@ -6388,7 +6403,7 @@ def create_runner_app(
         harness = _session_harness_name(conv_id)
         if harness not in ("claude-native", "codex-native", "opencode-native"):
             return
-        from omnigent.native_cost_popup import launch_cost_popup, wait_for_tmux_client
+        from omnigent.native.native_cost_popup import launch_cost_popup, wait_for_tmux_client
 
         attached = await asyncio.to_thread(
             wait_for_tmux_client, socket_path, tmux_target, timeout_s=5.0
@@ -7074,7 +7089,7 @@ def create_runner_app(
     ) -> None:
         import json as _json
 
-        from omnigent.claude_native_bridge import (
+        from omnigent.harnesses.claude_native.bridge import (
             BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
             post_tools_changed,
@@ -7468,7 +7483,7 @@ def create_runner_app(
         # a plugin harness may accept efforts this registry has never heard of.
         _reasoning = _turn_reasoning(conv, msg_body)
         if _reasoning is not None:
-            from omnigent.reasoning_effort import efforts_for_harness, format_supported
+            from omnigent.util.reasoning_effort import efforts_for_harness, format_supported
 
             _effort = _reasoning["effort"]
             _supported = efforts_for_harness(harness_name)
@@ -7610,11 +7625,11 @@ def create_runner_app(
                 session_labels=startup_labels,
             )
         elif harness_name == "codex-native":
-            from omnigent.codex_native_bridge import (
+            from omnigent.harnesses.codex_native.bridge import (
                 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
                 write_mcp_bridge_config,
             )
-            from omnigent.codex_native_bridge import (
+            from omnigent.harnesses.codex_native.bridge import (
                 bridge_dir_for_bridge_id as codex_bridge_dir_for_id,
             )
 
@@ -7629,11 +7644,11 @@ def create_runner_app(
                 conv, explicit_bridge_dir=codex_bdir, await_notify=False
             )
         elif harness_name == "antigravity-native":
-            from omnigent.antigravity_native_bridge import (
+            from omnigent.harnesses.antigravity_native.bridge import (
                 ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
                 write_mcp_bridge_config,
             )
-            from omnigent.antigravity_native_bridge import (
+            from omnigent.harnesses.antigravity_native.bridge import (
                 bridge_dir_for_bridge_id as antigravity_bridge_dir_for_id,
             )
 
@@ -7648,7 +7663,7 @@ def create_runner_app(
                 conv, explicit_bridge_dir=antigravity_bdir, await_notify=False
             )
         elif harness_name == "hermes":
-            from omnigent.hermes_native_bridge import (
+            from omnigent.harnesses.hermes_native.bridge import (
                 bridge_dir_for_session_id as hermes_bridge_dir_for_session,
             )
 
@@ -10070,6 +10085,27 @@ def create_runner_app(
         )
         return JSONResponse(status_code=200, content=result)
 
+    @app.post("/v1/sessions/{session_id}/resources/github/preferences")
+    async def set_github_preference_route(
+        session_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        # Apply the panel's account / remote selection (gh repo set-default +
+        # a per-repo account preference), then return the refreshed info payload.
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import set_github_preference
+
+        body = await request.json()
+        root = await _github_workspace_root(session_id)
+        info = await _asyncio.to_thread(
+            set_github_preference,
+            root,
+            account=body.get("account"),
+            remote=body.get("remote"),
+        )
+        return JSONResponse(status_code=200, content=info)
+
     @app.get(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"
@@ -10353,13 +10389,29 @@ def create_runner_app(
             merged: list[SkillSpec] = [s for s in spec.skills if s.user_invocable]
             seen = {s.name for s in spec.skills}
             seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
+            harness = canonicalize_harness(spec.executor.harness_kind)
+            # Claude Code resolves its user scope from $CLAUDE_CONFIG_DIR
+            # (default ~/.claude); the terminal inherits this env, so the
+            # menu must read the same tier or the two surfaces diverge.
+            configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+            # Native Codex honors $CODEX_HOME for its skills; resolve the same
+            # host home the launch seeds from so the menu matches the terminal
+            # (only the native provider reads it — see codex_host_skills).
+            codex_home: Path | None = None
+            if harness is not None and "codex" in harness:
+                from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+
+                codex_home = _codex_home_config_source_from_env()
             ctx = SkillSourceContext(
                 roots=tuple(roots),
                 home=Path.home(),
                 skills_filter=spec.skills_filter,
                 bundle_dir=_resolved_spec_workdir(entry),
+                claude_config_dir=(
+                    Path(configured_claude_dir).expanduser() if configured_claude_dir else None
+                ),
+                codex_home=codex_home,
             )
-            harness = canonicalize_harness(spec.executor.harness_kind)
             for hs in resolve_harness_skills(ctx, harness):
                 if hs.name in seen:
                     continue
@@ -10391,7 +10443,7 @@ def create_runner_app(
         spec = await _resolve_session_agent_spec(session_id)
         if spec is None:
             return JSONResponse(status_code=200, content={"workers": {}})
-        from omnigent.model_catalog import catalog_for_spec
+        from omnigent.models.model_catalog import catalog_for_spec
 
         try:
             catalog = await asyncio.to_thread(catalog_for_spec, spec)
@@ -10473,7 +10525,7 @@ def create_runner_app(
     async def get_session_kiro_model_options(session_id: str) -> JSONResponse:
         if _session_harness_name(session_id) != "kiro-native":
             return JSONResponse(status_code=200, content={"models": []})
-        from omnigent.kiro_native import list_kiro_cli_model_options
+        from omnigent.harnesses.kiro_native.main import list_kiro_cli_model_options
 
         try:
             models = await asyncio.to_thread(list_kiro_cli_model_options)
@@ -10500,7 +10552,7 @@ def create_runner_app(
     async def get_session_cursor_model_options(session_id: str) -> JSONResponse:
         if _session_harness_name(session_id) != "cursor-native":
             return JSONResponse(status_code=200, content={"models": []})
-        from omnigent.cursor_native import list_cursor_cli_model_options
+        from omnigent.harnesses.cursor_native.main import list_cursor_cli_model_options
 
         try:
             models = await asyncio.to_thread(list_cursor_cli_model_options)
@@ -10532,7 +10584,10 @@ def create_runner_app(
 
     def _model_configuration_source(session_id: str) -> dict[str, str] | None:
         """Return the session's non-secret model-provider coordinates."""
-        from omnigent.model_catalog import model_configuration_source, resolve_model_provider
+        from omnigent.models.model_catalog import (
+            model_configuration_source,
+            resolve_model_provider,
+        )
 
         spec_entry = _session_spec_cache.get(session_id)
         if spec_entry is None:
@@ -10592,7 +10647,7 @@ def create_runner_app(
                     ),
                 },
             )
-        from omnigent.claude_native import claude_launch_catalog
+        from omnigent.harnesses.claude_native.main import claude_launch_catalog
 
         rows: list[dict[str, object]] | None
         try:
@@ -11541,7 +11596,7 @@ def create_runner_app(
         and _pane_reaper_registry is not None
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
-        from omnigent.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
+        from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
             PANE_OUTPUT_BUSY_WINDOW_S,

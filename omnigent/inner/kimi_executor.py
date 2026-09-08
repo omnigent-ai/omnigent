@@ -69,6 +69,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 
 from omnigent.harness_startup_config import resolve_harness_path
+from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
@@ -86,7 +87,6 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.kimi_native_credentials import resolve_user_kimi_home
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 
 _logger = logging.getLogger(__name__)
@@ -500,7 +500,7 @@ class KimiExecutor(Executor):
             # kimi is a curl-installed single binary: it must read its own
             # install dir and write its config dir ($KIMI_CODE_HOME, default
             # ~/.kimi-code) and /tmp, or it can't start inside the jail.
-            from omnigent.kimi_native_credentials import resolve_user_kimi_home
+            from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
 
             resolved_bin = shutil.which(self._binary_path) or self._binary_path
             bin_dir = Path(resolved_bin).resolve(strict=False).parent

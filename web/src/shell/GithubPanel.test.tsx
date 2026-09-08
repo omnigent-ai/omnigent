@@ -36,6 +36,14 @@ vi.mock("@/hooks/useGithub", () => ({
     isFetching: false,
   }),
   fetchGithubFileContents: async () => ({ before: "old", after: "new" }),
+  // The account selector (shown in the repo-unresolved empty state) calls this;
+  // stub the mutation shape it reads.
+  useSetGithubPreference: () => ({
+    mutate: () => {},
+    isPending: false,
+    isError: false,
+    error: null,
+  }),
 }));
 
 // The diff rendering (@pierre/diffs) is exercised by the library itself; here

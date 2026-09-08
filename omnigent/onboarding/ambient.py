@@ -36,10 +36,10 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.onboarding import codex_auth_readiness
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.onboarding.providers import PROVIDER_ENV_VARS
+from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 
 DetectedKind = Literal["key", "subscription", "local", "cli-config"]
 
@@ -499,7 +499,7 @@ def claude_managed_gateway(
 
     The single canonical parser for Claude Code's managed-settings credential,
     shared by ambient detection, the readiness gate, and the Smart-Routing
-    gateway check (:func:`omnigent.claude_native.managed_claude_gateway_signal`
+    gateway check (:func:`omnigent.harnesses.claude_native.main.managed_claude_gateway_signal`
     delegates here). A credential counts as delivered when the file carries a
     top-level ``apiKeyHelper`` (a token-printing command) or a truthy
     ``env.CLAUDE_CODE_USE_GATEWAY``.
