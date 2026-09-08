@@ -62,13 +62,15 @@ class MainActivity : AppCompatActivity() {
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var historyCleared = false // drop pre-auth/login-redirect history once
 
-    // Renderer-crash budget: real crashes (didCrash) clustered within a sliding
-    // time window are counted so a page that reliably kills its renderer can't
-    // wedge the app in an invisible rebuild→reload→crash loop. Not reset on page
-    // load (a load-then-crash loop would clear it every cycle); crashes spaced
-    // beyond the window reset it. System reclaims (didCrash=false) don't count.
+    // Renderer-crash budget: real crashes (didCrash) chained less than
+    // RENDERER_CRASH_WINDOW_MS apart are counted so a page that reliably kills
+    // its renderer can't wedge the app in an invisible rebuild→reload→crash loop.
+    // Not reset on page load (a load-then-crash loop would clear it every cycle);
+    // a long gap since the last crash resets it. System reclaims (didCrash=false)
+    // don't count. lastRendererCrashAt is the wall-clock time of the last counted
+    // crash, used to measure that gap.
     private var rendererCrashes = 0
-    private var rendererCrashWindowStart = 0L
+    private var lastRendererCrashAt = 0L
 
     // Floating server switcher — mirrors the iOS `ServerSwitcher`. Always
     // visible so it's always available as a recovery path (backward compatible
@@ -384,17 +386,21 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Consume one unit of the renderer-crash budget, returning whether recovery
-     * may auto-reload the route. A sliding window: the window start advances to
-     * now whenever [RENDERER_CRASH_WINDOW_MS] has elapsed since the last counted
-     * crash, so only crashes clustered tightly in time accumulate toward
-     * [MAX_RENDERER_CRASHES]. A healthy page load ([onPageReady]) also resets it.
+     * may auto-reload the route. Gap-based, not a fixed window: the counter
+     * resets only when more than [RENDERER_CRASH_WINDOW_MS] has elapsed since the
+     * previous crash, so crashes chained closer than that accumulate toward
+     * [MAX_RENDERER_CRASHES] regardless of total span, while a genuinely isolated
+     * crash (a long gap since the last one) starts fresh. Deliberately NOT reset
+     * on a healthy page load — a load-then-crash loop fires a good load every
+     * cycle, so a page-load reset would clear the budget before each next crash
+     * and the guard would never trip.
      */
     private fun withinCrashBudget(): Boolean {
         val now = System.currentTimeMillis()
-        if (now - rendererCrashWindowStart > RENDERER_CRASH_WINDOW_MS) {
+        if (now - lastRendererCrashAt > RENDERER_CRASH_WINDOW_MS) {
             rendererCrashes = 0
         }
-        rendererCrashWindowStart = now
+        lastRendererCrashAt = now
         rendererCrashes++
         return rendererCrashes <= MAX_RENDERER_CRASHES
     }
